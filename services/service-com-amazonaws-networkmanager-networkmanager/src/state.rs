@@ -4,7 +4,9 @@
 //!
 //! The global-network / site / link lifecycle is the core resource tree of Network
 //! Manager: a global network owns sites, a site owns links (and, in a later slice,
-//! devices). Everything
+//! devices). A global network also owns its CORE network — the Cloud WAN managed network
+//! whose segments and edges are a function of the core network policy document it holds.
+//! Everything
 //! the implemented operations answer is computed from the records below — no handler
 //! echoes its input back without storing it.
 
@@ -12,8 +14,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Bandwidth, GlobalNetwork, Link, Location, ResourceNotFoundException, Site, Tag,
-    ValidationException, ValidationExceptionField,
+    Bandwidth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
+    CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment, GlobalNetwork, Link,
+    Location, ResourceNotFoundException, Site, Tag, ValidationException, ValidationExceptionField,
 };
 
 /// Members of `GlobalNetworkState` / `SiteState` / `LinkState` this slice uses. All three
@@ -26,6 +29,13 @@ pub const STATE_AVAILABLE: &str = "AVAILABLE";
 /// See [`STATE_PENDING`].
 pub const STATE_DELETING: &str = "DELETING";
 
+/// The state a freshly created CORE network is in. `CoreNetworkState` is a different enum
+/// from the three above — CREATING, UPDATING, AVAILABLE, DELETING (`smithy_query
+/// shape=CoreNetworkState`, mirrored in `ops::types::CORE_NETWORK_STATE_VALUES`) — so a
+/// core network waits in CREATING where the resources above wait in [`STATE_PENDING`];
+/// AVAILABLE and DELETING it shares with them.
+pub const STATE_CREATING: &str = "CREATING";
+
 /// The ARN namespace the model declares for this service (`arnNamespace: networkmanager`).
 const ARN_NAMESPACE: &str = "networkmanager";
 
@@ -37,6 +47,11 @@ pub const GLOBAL_NETWORK_KIND: &str = "global-network";
 pub const SITE_KIND: &str = "site";
 /// See [`GLOBAL_NETWORK_KIND`].
 pub const LINK_KIND: &str = "link";
+/// See [`GLOBAL_NETWORK_KIND`]. The model constrains this one's id itself:
+/// `CoreNetworkId` carries `pattern ^core-network-([0-9a-f]{8,17})$`
+/// (`smithy_query shape=CoreNetworkId`), which the 17 hex digits of
+/// [`ComAmazonawsNetworkmanagerNetworkmanagerState::next_id`] satisfy.
+pub const CORE_NETWORK_KIND: &str = "core-network";
 
 /// Network Manager is a global (partition-scoped) service, so its ARNs carry an empty
 /// region segment: `arn:aws:networkmanager::<account>:global-network/<id>`.
@@ -54,6 +69,9 @@ pub const LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT: &str = "global-networks-per-account
 pub const LIMIT_SITES_PER_GLOBAL_NETWORK: &str = "sites-per-global-network";
 /// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`].
 pub const LIMIT_LINKS_PER_SITE: &str = "links-per-site";
+/// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota
+/// [`MAX_CORE_NETWORKS_PER_GLOBAL_NETWORK`] bounds.
+pub const LIMIT_CORE_NETWORKS_PER_GLOBAL_NETWORK: &str = "core-networks-per-global-network";
 /// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota [`MAX_TAGS_PER_RESOURCE`] bounds.
 pub const LIMIT_TAGS_PER_RESOURCE: &str = "tags-per-resource";
 
@@ -160,6 +178,15 @@ pub const MAX_SITES_PER_GLOBAL_NETWORK: usize = 100;
 /// [`MAX_SITES_PER_GLOBAL_NETWORK`]: the model carries no number and the published quota
 /// is per-account adjustable, so this one only bounds the store.
 pub const MAX_LINKS_PER_SITE: usize = 100;
+
+/// How many core networks one global network may hold.
+///
+/// Unlike the three bounds above this one is the SERVICE's number, not a chosen bound:
+/// Cloud WAN gives a global network a single core network ("Each global network can have
+/// one core network", AWS Cloud WAN documentation), so a second create against the same
+/// global network is answered with the operation's modelled
+/// `ServiceQuotaExceededException` (HTTP 402) and stores nothing.
+pub const MAX_CORE_NETWORKS_PER_GLOBAL_NETWORK: usize = 1;
 
 /// How long after the creating call a `PENDING` resource settles to `AVAILABLE`.
 ///
@@ -309,6 +336,76 @@ impl LinkRecord {
     }
 }
 
+/// A stored core network: the Cloud WAN managed network a global network owns.
+///
+/// Its `state` is a function of the clock, like the records above, and its topology
+/// (`Segments`, `NetworkFunctionGroups`, `Edges`) is derived from the policy document
+/// once, where that document is accepted — nothing about a core network is kept twice and
+/// no read re-parses the document.
+#[derive(Debug, Clone)]
+pub struct CoreNetworkRecord {
+    pub id: String,
+    pub arn: String,
+    pub global_network_id: String,
+    pub description: Option<String>,
+    pub created_at: SystemTime,
+    /// The instant the `CREATING` -> `AVAILABLE` transition the clock owes becomes due.
+    pub available_at: SystemTime,
+    /// The LIVE core network policy document, verbatim as the request supplied it, or
+    /// `None` when the core network was created without one.
+    pub policy_document: Option<String>,
+    /// The topology [`policy_topology`] derived from [`Self::policy_document`] when it was
+    /// accepted: what the core network reports once its policy is in force.
+    pub topology: PolicyTopology,
+    /// The `ClientToken` of the request that minted this record, kept so a retry of that
+    /// request answers this record instead of minting a second one.
+    pub client_token: Option<String>,
+    pub tags: Vec<Tag>,
+}
+
+impl CoreNetworkRecord {
+    /// This core network's lifecycle state as of `now`.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.available_at {
+            STATE_AVAILABLE
+        } else {
+            STATE_CREATING
+        }
+    }
+
+    /// The modelled `CoreNetwork` for this record, as of `now`.
+    pub fn to_shape(&self, now: SystemTime) -> CoreNetwork {
+        self.to_shape_with_state(self.state_at(now))
+    }
+
+    /// The modelled `CoreNetwork` for this record, forcing `state` — used by a delete,
+    /// which reports the record it just removed as `DELETING`.
+    ///
+    /// A core network's segments and edges exist only once its policy is in force, which
+    /// is what the `CREATING` -> `AVAILABLE` transition stands for, so before that instant
+    /// the topology is reported empty and afterwards it is the one derived from the stored
+    /// policy document.
+    pub fn to_shape_with_state(&self, state: &str) -> CoreNetwork {
+        let topology = if state == STATE_AVAILABLE {
+            ::std::borrow::Cow::Borrowed(&self.topology)
+        } else {
+            ::std::borrow::Cow::Owned(PolicyTopology::default())
+        };
+        CoreNetwork {
+            global_network_id: Some(self.global_network_id.clone()),
+            core_network_id: Some(self.id.clone()),
+            core_network_arn: Some(self.arn.clone()),
+            description: self.description.clone(),
+            created_at: Some(epoch_seconds(self.created_at)),
+            state: Some(state.to_string()),
+            segments: Some(topology.to_segments()),
+            network_function_groups: Some(topology.to_network_function_groups()),
+            edges: Some(topology.edges.clone()),
+            tags: Some(self.tags.clone()),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-networkmanager-networkmanager. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
@@ -319,6 +416,8 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     pub sites: BTreeMap<String, SiteRecord>,
     /// Links by `LinkId`, each carrying the `SiteId` and `GlobalNetworkId` it belongs to.
     pub links: BTreeMap<String, LinkRecord>,
+    /// Core networks by `CoreNetworkId`, each carrying its owning `GlobalNetworkId`.
+    pub core_networks: BTreeMap<String, CoreNetworkRecord>,
     /// Monotonic source for generated resource-id suffixes, so ids are unique within a
     /// run and deterministic across runs.
     pub id_counter: u64,
@@ -365,6 +464,23 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .count()
     }
 
+    /// How many core networks `global_network_id` owns, for the per-global-network quota.
+    pub fn core_network_count_of(&self, global_network_id: &str) -> usize {
+        self.core_networks
+            .values()
+            .filter(|core_network| core_network.global_network_id == global_network_id)
+            .count()
+    }
+
+    /// The ids of the core networks owned by `global_network_id`, in `CoreNetworkId` order.
+    pub fn core_network_ids_of(&self, global_network_id: &str) -> Vec<String> {
+        self.core_networks
+            .values()
+            .filter(|core_network| core_network.global_network_id == global_network_id)
+            .map(|core_network| core_network.id.clone())
+            .collect()
+    }
+
     /// How many resources of `resource_type` the global network `global_network_id`
     /// holds, for the network-resource inventory.
     ///
@@ -376,6 +492,7 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
         let held = match resource_type {
             SITE_KIND => self.site_count_of(global_network_id),
             LINK_KIND => self.link_count_of_network(global_network_id),
+            CORE_NETWORK_KIND => self.core_network_count_of(global_network_id),
             _ => 0,
         };
         i32::try_from(held).unwrap_or(i32::MAX)
@@ -422,6 +539,11 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 .get(parts.id)
                 .filter(|record| record.arn == arn)
                 .map(|record| &record.tags),
+            CORE_NETWORK_KIND => self
+                .core_networks
+                .get(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &record.tags),
             _ => None,
         }
     }
@@ -442,6 +564,11 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 .map(|record| &mut record.tags),
             LINK_KIND => self
                 .links
+                .get_mut(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &mut record.tags),
+            CORE_NETWORK_KIND => self
+                .core_networks
                 .get_mut(parts.id)
                 .filter(|record| record.arn == arn)
                 .map(|record| &mut record.tags),
@@ -651,6 +778,603 @@ pub fn remove_tags(existing: &mut Vec<Tag>, keys: &[String]) {
             .as_deref()
             .is_none_or(|key| !keys.iter().any(|wanted| wanted == key))
     });
+}
+
+/// The keys of a core network policy document this service reads.
+///
+/// A core network policy is a JSON document whose schema AWS publishes (Cloud WAN "Core
+/// network policy" documentation): a `version`, a `core-network-configuration` carrying
+/// `asn-ranges` and `edge-locations`, a `segments` list and a `network-function-groups`
+/// list. The model types the document as an opaque string (`CoreNetworkPolicyDocument`,
+/// len 0..10000000, `smithy_query shape=CoreNetworkPolicyDocument`), so these names come
+/// from that published schema rather than from the model.
+const POLICY_VERSION: &str = "version";
+/// See [`POLICY_VERSION`].
+const POLICY_CONFIGURATION: &str = "core-network-configuration";
+/// See [`POLICY_VERSION`].
+const POLICY_ASN_RANGES: &str = "asn-ranges";
+/// See [`POLICY_VERSION`].
+const POLICY_EDGE_LOCATIONS: &str = "edge-locations";
+/// See [`POLICY_VERSION`].
+const POLICY_LOCATION: &str = "location";
+/// See [`POLICY_VERSION`].
+const POLICY_ASN: &str = "asn";
+/// See [`POLICY_VERSION`].
+const POLICY_INSIDE_CIDR_BLOCKS: &str = "inside-cidr-blocks";
+/// See [`POLICY_VERSION`].
+const POLICY_SEGMENTS: &str = "segments";
+/// See [`POLICY_VERSION`].
+const POLICY_NETWORK_FUNCTION_GROUPS: &str = "network-function-groups";
+/// See [`POLICY_VERSION`].
+const POLICY_NAME: &str = "name";
+
+/// How many entries of one list a policy document may carry.
+///
+/// The derived topology is the PRODUCT of the edge-location count and the segment (or
+/// network-function-group) count — a segment that restricts itself to no edge location
+/// exists in all of them — so a document whose lists are unbounded would expand into a
+/// response orders of magnitude larger than the request. These three caps are CHOSEN,
+/// like [`MAX_GLOBAL_NETWORKS`]: AWS's own Cloud WAN quotas for edge locations and
+/// segments per core network are in the tens, the model carries no number (the document
+/// is an opaque `CoreNetworkPolicyDocument`, len 0..10000000), and their purpose here is
+/// that one caller cannot make this emulator hold or compute without bound. A document
+/// past a cap is refused with `CoreNetworkPolicyException` (HTTP 400) and stored nowhere,
+/// so the derived topology is at most
+/// `MAX_POLICY_EDGE_LOCATIONS * (MAX_POLICY_SEGMENTS + MAX_POLICY_NETWORK_FUNCTION_GROUPS)`
+/// edge-location strings.
+pub const MAX_POLICY_EDGE_LOCATIONS: usize = 100;
+/// See [`MAX_POLICY_EDGE_LOCATIONS`].
+pub const MAX_POLICY_SEGMENTS: usize = 100;
+/// See [`MAX_POLICY_EDGE_LOCATIONS`].
+pub const MAX_POLICY_NETWORK_FUNCTION_GROUPS: usize = 100;
+
+/// How long one value inside a policy document may be, in characters.
+///
+/// These two are the MODEL's own numbers, not chosen: the shapes the derived topology is
+/// reported through constrain them. An edge location is reported as
+/// `CoreNetworkEdge$EdgeLocation`, an `ExternalRegionCode` of length 1..63, and a segment
+/// or group name as a `ConstrainedString` of length 0..256 (`smithy_query
+/// shape=CoreNetworkEdge,CoreNetworkSegment`). Capping them is also what bounds the
+/// derived topology in BYTES, not merely in entries: at most
+/// `MAX_POLICY_EDGE_LOCATIONS * MAX_POLICY_LOCATION_CHARS` characters of location text,
+/// expanded into at most `MAX_POLICY_SEGMENTS + MAX_POLICY_NETWORK_FUNCTION_GROUPS`
+/// entries, however large the document that carried them.
+pub const MAX_POLICY_LOCATION_CHARS: usize = 63;
+/// See [`MAX_POLICY_LOCATION_CHARS`].
+pub const MAX_POLICY_NAME_CHARS: usize = 256;
+
+/// The ASN domain an `asn-ranges` entry has to lie inside: a BGP AS number is a 32-bit
+/// number and AS 0 is reserved, so the assignable numbers are 1..=4294967295. A range
+/// reaching outside it assigns nothing (see [`parse_asn_range`]).
+const ASN_MIN: i64 = 1;
+/// See [`ASN_MIN`].
+const ASN_MAX: i64 = 4_294_967_295;
+
+/// The `ErrorCode` each policy refusal carries. The model types
+/// `CoreNetworkPolicyError$ErrorCode` as a free-form string and enumerates no values
+/// (`smithy_query shape=CoreNetworkPolicyError`), so each code names its own rule and the
+/// identifying detail travels in the shape's `Path` (the JSON path of the offending node).
+pub const POLICY_ERROR_INVALID_JSON: &str = "INVALID_JSON";
+/// See [`POLICY_ERROR_INVALID_JSON`].
+pub const POLICY_ERROR_MISSING_FIELD: &str = "MISSING_REQUIRED_FIELD";
+/// See [`POLICY_ERROR_INVALID_JSON`].
+pub const POLICY_ERROR_INVALID_TYPE: &str = "INVALID_TYPE";
+/// See [`POLICY_ERROR_INVALID_JSON`]; raised past one of the [`MAX_POLICY_EDGE_LOCATIONS`]
+/// list caps.
+pub const POLICY_ERROR_TOO_MANY_ENTRIES: &str = "TOO_MANY_ENTRIES";
+/// See [`POLICY_ERROR_INVALID_JSON`]; raised for a value outside the length the shape it
+/// is reported through allows ([`MAX_POLICY_LOCATION_CHARS`],
+/// [`MAX_POLICY_NAME_CHARS`]).
+pub const POLICY_ERROR_INVALID_VALUE: &str = "INVALID_VALUE";
+
+/// One entry of a `CoreNetworkPolicyException`'s `Errors` list.
+fn policy_error(code: &str, message: String, path: &str) -> CoreNetworkPolicyError {
+    CoreNetworkPolicyError {
+        error_code: code.to_string(),
+        message,
+        path: Some(path.to_string()),
+    }
+}
+
+/// Check the structure of a policy document a request asks to store.
+///
+/// Only the document's SHAPE is judged here, which is what every operation that accepts a
+/// policy document has to agree on: it must parse as JSON, its root must be an object,
+/// the `version` and `core-network-configuration` the schema requires must be present and
+/// of the right type, and a `segments` list, when given, must be a list of objects that
+/// each name themselves, and no list may carry more entries than its cap allows, so a
+/// stored document expands into a bounded topology. The deeper semantics of the document
+/// (which segments may share routes, which attachments map where) belong to the operations
+/// that act on a policy.
+///
+/// Every problem found is reported, not just the first, which is why the answer is a list:
+/// `CoreNetworkPolicyException` carries one entry per offending node.
+pub fn validate_policy_document(document: &str) -> Result<(), Vec<CoreNetworkPolicyError>> {
+    let parsed: ::serde_json::Value = match ::serde_json::from_str(document) {
+        Ok(parsed) => parsed,
+        Err(problem) => {
+            return Err(vec![policy_error(
+                POLICY_ERROR_INVALID_JSON,
+                format!("the policy document is not valid JSON: {problem}"),
+                "$",
+            )]);
+        }
+    };
+    let Some(root) = parsed.as_object() else {
+        return Err(vec![policy_error(
+            POLICY_ERROR_INVALID_TYPE,
+            "the policy document must be a JSON object".to_string(),
+            "$",
+        )]);
+    };
+
+    let mut errors = Vec::new();
+    for (key, wanted, holds) in [
+        (
+            POLICY_VERSION,
+            "a string",
+            ::serde_json::Value::is_string as fn(&::serde_json::Value) -> bool,
+        ),
+        (
+            POLICY_CONFIGURATION,
+            "an object",
+            ::serde_json::Value::is_object as fn(&::serde_json::Value) -> bool,
+        ),
+    ] {
+        match root.get(key) {
+            None => errors.push(policy_error(
+                POLICY_ERROR_MISSING_FIELD,
+                format!("the policy document must carry {key:?}"),
+                &format!("$.{key}"),
+            )),
+            Some(value) if !holds(value) => errors.push(policy_error(
+                POLICY_ERROR_INVALID_TYPE,
+                format!("{key:?} must be {wanted}"),
+                &format!("$.{key}"),
+            )),
+            Some(_) => {}
+        }
+    }
+
+    match root.get(POLICY_SEGMENTS) {
+        None => {}
+        Some(::serde_json::Value::Array(segments)) => {
+            // `.take` bounds how many problems one document can be reported for: a list
+            // longer than its cap is refused by the cap check below, so there is nothing
+            // to gain from walking the rest of it.
+            for (index, segment) in segments.iter().enumerate().take(MAX_POLICY_SEGMENTS) {
+                if segment
+                    .get(POLICY_NAME)
+                    .and_then(::serde_json::Value::as_str)
+                    .is_none()
+                {
+                    errors.push(policy_error(
+                        POLICY_ERROR_MISSING_FIELD,
+                        format!("every entry of {POLICY_SEGMENTS:?} must carry a {POLICY_NAME:?} string"),
+                        &format!("$.{POLICY_SEGMENTS}[{index}].{POLICY_NAME}"),
+                    ));
+                }
+            }
+        }
+        Some(_) => errors.push(policy_error(
+            POLICY_ERROR_INVALID_TYPE,
+            format!("{POLICY_SEGMENTS:?} must be an array"),
+            &format!("$.{POLICY_SEGMENTS}"),
+        )),
+    }
+
+    // The caps that bound the derived topology. Each is checked on the list's own length,
+    // so a document past one is refused before anything is stored or expanded.
+    let edge_locations = root
+        .get(POLICY_CONFIGURATION)
+        .and_then(::serde_json::Value::as_object)
+        .and_then(|configuration| configuration.get(POLICY_EDGE_LOCATIONS))
+        .and_then(::serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    for (path, held, cap) in [
+        (
+            format!("$.{POLICY_CONFIGURATION}.{POLICY_EDGE_LOCATIONS}"),
+            edge_locations,
+            MAX_POLICY_EDGE_LOCATIONS,
+        ),
+        (
+            format!("$.{POLICY_SEGMENTS}"),
+            root.get(POLICY_SEGMENTS)
+                .and_then(::serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+            MAX_POLICY_SEGMENTS,
+        ),
+        (
+            format!("$.{POLICY_NETWORK_FUNCTION_GROUPS}"),
+            root.get(POLICY_NETWORK_FUNCTION_GROUPS)
+                .and_then(::serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+            MAX_POLICY_NETWORK_FUNCTION_GROUPS,
+        ),
+    ] {
+        if held > cap {
+            errors.push(policy_error(
+                POLICY_ERROR_TOO_MANY_ENTRIES,
+                format!("{path} carries {held} entries, but at most {cap} are allowed"),
+                &path,
+            ));
+        }
+    }
+
+    // The per-value lengths the shapes this topology is reported through allow. Capping
+    // them is what bounds the derived topology in BYTES as well as in entries.
+    for (index, entry) in root
+        .get(POLICY_CONFIGURATION)
+        .and_then(::serde_json::Value::as_object)
+        .and_then(|configuration| configuration.get(POLICY_EDGE_LOCATIONS))
+        .and_then(::serde_json::Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .enumerate()
+        .take(MAX_POLICY_EDGE_LOCATIONS)
+    {
+        let path =
+            format!("$.{POLICY_CONFIGURATION}.{POLICY_EDGE_LOCATIONS}[{index}].{POLICY_LOCATION}");
+        match entry
+            .get(POLICY_LOCATION)
+            .and_then(::serde_json::Value::as_str)
+        {
+            None => errors.push(policy_error(
+                POLICY_ERROR_MISSING_FIELD,
+                format!(
+                    "every entry of {POLICY_EDGE_LOCATIONS:?} must carry a {POLICY_LOCATION:?} string"
+                ),
+                &path,
+            )),
+            Some(location) => {
+                let length = location.chars().count();
+                if length == 0 || length > MAX_POLICY_LOCATION_CHARS {
+                    errors.push(policy_error(
+                        POLICY_ERROR_INVALID_VALUE,
+                        format!(
+                            "a {POLICY_LOCATION:?} must be 1 to {MAX_POLICY_LOCATION_CHARS} characters, but {length} were given"
+                        ),
+                        &path,
+                    ));
+                }
+            }
+        }
+    }
+
+    for (key, cap) in [
+        (POLICY_SEGMENTS, MAX_POLICY_SEGMENTS),
+        (
+            POLICY_NETWORK_FUNCTION_GROUPS,
+            MAX_POLICY_NETWORK_FUNCTION_GROUPS,
+        ),
+    ] {
+        for (index, entry) in root
+            .get(key)
+            .and_then(::serde_json::Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .enumerate()
+            .take(cap)
+        {
+            let Some(name) = entry.get(POLICY_NAME).and_then(::serde_json::Value::as_str) else {
+                continue;
+            };
+            let length = name.chars().count();
+            if length > MAX_POLICY_NAME_CHARS {
+                errors.push(policy_error(
+                    POLICY_ERROR_INVALID_VALUE,
+                    format!(
+                        "a {POLICY_NAME:?} must be at most {MAX_POLICY_NAME_CHARS} characters, but {length} were given"
+                    ),
+                    &format!("$.{key}[{index}].{POLICY_NAME}"),
+                ));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// The modelled `CoreNetworkPolicyException` (HTTP 400) reporting the problems
+/// [`validate_policy_document`] found, so every operation that takes a policy document
+/// refuses a bad one the same way.
+pub fn policy_rejection(errors: Vec<CoreNetworkPolicyError>) -> CoreNetworkPolicyException {
+    CoreNetworkPolicyException {
+        message: format!(
+            "the core network policy document is not valid: {} problem(s) found",
+            errors.len()
+        ),
+        errors: Some(errors),
+    }
+}
+
+/// What a `CoreNetwork` reports about the policy in force on it, kept in the COMPACT form
+/// the document describes: a segment or group that restricts itself to no edge location is
+/// held as "every edge location" rather than as a copy of the whole location list, so the
+/// stored topology is linear in the document it came from and only a response expands it.
+#[derive(Debug, Clone, Default)]
+pub struct PolicyTopology {
+    /// One entry per `core-network-configuration.edge-locations[]` of the document.
+    pub edges: Vec<CoreNetworkEdge>,
+    /// One entry per named `segments[]` of the document.
+    pub segments: Vec<NamedGroup>,
+    /// One entry per named `network-function-groups[]` of the document.
+    pub network_function_groups: Vec<NamedGroup>,
+}
+
+/// One named `segments[]` / `network-function-groups[]` entry of a policy document.
+#[derive(Debug, Clone)]
+pub struct NamedGroup {
+    /// The entry's `name`.
+    pub name: String,
+    /// The edge locations the entry restricts itself to, or `None` for "every edge
+    /// location this core network has" — the case a stored copy would duplicate.
+    pub edge_locations: Option<Vec<String>>,
+}
+
+impl PolicyTopology {
+    /// The edge locations this core network has, in the order the document configures
+    /// them: what an entry restricting itself to none is present in.
+    fn everywhere(&self) -> Vec<String> {
+        self.edges
+            .iter()
+            .filter_map(|edge| edge.edge_location.clone())
+            .collect()
+    }
+
+    /// The modelled `Segments` of this topology.
+    pub fn to_segments(&self) -> Vec<CoreNetworkSegment> {
+        let everywhere = self.everywhere();
+        self.segments
+            .iter()
+            .map(|group| CoreNetworkSegment {
+                name: Some(group.name.clone()),
+                edge_locations: Some(
+                    group
+                        .edge_locations
+                        .clone()
+                        .unwrap_or_else(|| everywhere.clone()),
+                ),
+                // Which segments a segment shares routes with is decided by the
+                // document's segment actions, which no operation of this slice acts on,
+                // so the member is absent rather than guessed.
+                shared_segments: None,
+            })
+            .collect()
+    }
+
+    /// The modelled `NetworkFunctionGroups` of this topology.
+    pub fn to_network_function_groups(&self) -> Vec<CoreNetworkNetworkFunctionGroup> {
+        let everywhere = self.everywhere();
+        self.network_function_groups
+            .iter()
+            .map(|group| CoreNetworkNetworkFunctionGroup {
+                name: Some(group.name.clone()),
+                edge_locations: Some(
+                    group
+                        .edge_locations
+                        .clone()
+                        .unwrap_or_else(|| everywhere.clone()),
+                ),
+                // As with `shared_segments` above: a group's send-via / send-to segments
+                // come from the document's segment actions, which this slice does not act
+                // on.
+                segments: None,
+            })
+            .collect()
+    }
+}
+
+/// Derive the reported topology of a core network from its policy document.
+///
+/// The rules are the published policy schema's own: an edge exists in each location the
+/// `core-network-configuration` lists, carrying that entry's `asn` — or, where the entry
+/// names none, the next ASN of the configuration's `asn-ranges` that no entry claims, as
+/// Cloud WAN assigns one from the ranges — and its `inside-cidr-blocks`; a segment exists
+/// for each named entry of `segments`, present in the edge locations it restricts itself
+/// to or, where it names none, in every edge location of the core network; and the same
+/// location rule holds for each named entry of `network-function-groups`.
+///
+/// A document this service cannot parse describes no topology, so it answers the empty
+/// one rather than guessing: a document is only stored once
+/// [`validate_policy_document`] has accepted it, which also caps every list this walks,
+/// so the work and the result are bounded by those caps.
+///
+/// Called ONCE, where the document is accepted, and the answer is stored on the record
+/// beside it: a read of a core network reports the derived topology and never re-parses
+/// the document.
+pub fn policy_topology(document: &str) -> PolicyTopology {
+    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(document) else {
+        return PolicyTopology::default();
+    };
+    let Some(root) = parsed.as_object() else {
+        return PolicyTopology::default();
+    };
+    let configuration = root
+        .get(POLICY_CONFIGURATION)
+        .and_then(::serde_json::Value::as_object);
+    let declared = configuration
+        .and_then(|configuration| configuration.get(POLICY_EDGE_LOCATIONS))
+        .and_then(::serde_json::Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let ranges = configuration
+        .and_then(|configuration| configuration.get(POLICY_ASN_RANGES))
+        .and_then(::serde_json::Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+
+    let mut pool = AsnPool::new(ranges, declared);
+    let edges: Vec<CoreNetworkEdge> = declared
+        .iter()
+        .filter_map(|entry| {
+            let location = entry
+                .get(POLICY_LOCATION)
+                .and_then(::serde_json::Value::as_str)?;
+            let asn = entry
+                .get(POLICY_ASN)
+                .and_then(::serde_json::Value::as_i64)
+                .or_else(|| pool.take());
+            Some(CoreNetworkEdge {
+                edge_location: Some(location.to_string()),
+                asn,
+                inside_cidr_blocks: entry
+                    .get(POLICY_INSIDE_CIDR_BLOCKS)
+                    .and_then(::serde_json::Value::as_array)
+                    .map(|blocks| strings_of(blocks)),
+            })
+        })
+        .collect();
+
+    let named = |key: &str| -> Vec<NamedGroup> {
+        root.get(key)
+            .and_then(::serde_json::Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .filter_map(|entry| {
+                let name = entry
+                    .get(POLICY_NAME)
+                    .and_then(::serde_json::Value::as_str)?;
+                Some(NamedGroup {
+                    name: name.to_string(),
+                    // An entry naming no edge locations is held as "every edge location",
+                    // not as a copy of the list: the expansion happens where a response
+                    // is built, so nothing quadratic is retained.
+                    edge_locations: entry
+                        .get(POLICY_EDGE_LOCATIONS)
+                        .and_then(::serde_json::Value::as_array)
+                        .map(|listed| strings_of(listed)),
+                })
+            })
+            .collect()
+    };
+
+    PolicyTopology {
+        segments: named(POLICY_SEGMENTS),
+        network_function_groups: named(POLICY_NETWORK_FUNCTION_GROUPS),
+        edges,
+    }
+}
+
+/// The strings of a JSON array, skipping any entry that is not one.
+fn strings_of(values: &[::serde_json::Value]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(::serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Hands out the ASNs a policy document's `asn-ranges` makes available, in ascending
+/// order, skipping every ASN an edge location claims explicitly.
+///
+/// A range is written `"<low>-<high>"` (inclusive) or as a single ASN, and a range can
+/// span millions of numbers, so the candidates are walked with a cursor rather than
+/// materialised.
+#[derive(Debug)]
+struct AsnPool {
+    /// The inclusive `(low, high)` ranges, in the order the document lists them.
+    ranges: Vec<(i64, i64)>,
+    /// How far into `ranges` the walk has got: the index and the next candidate in it.
+    cursor: usize,
+    /// The next candidate inside `ranges[cursor]`.
+    next: i64,
+    /// The ASNs edge locations claim explicitly, which an assignment skips.
+    claimed: BTreeSet<i64>,
+}
+
+impl AsnPool {
+    /// The pool `ranges` describes, with every ASN the `edge-locations` entries claim
+    /// explicitly already taken.
+    fn new(ranges: &[::serde_json::Value], edge_locations: &[::serde_json::Value]) -> Self {
+        let ranges: Vec<(i64, i64)> = ranges.iter().filter_map(parse_asn_range).collect();
+        let claimed = edge_locations
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .get(POLICY_ASN)
+                    .and_then(::serde_json::Value::as_i64)
+            })
+            .collect();
+        let next = ranges.first().map_or(0, |(low, _)| *low);
+        Self {
+            ranges,
+            cursor: 0,
+            next,
+            claimed,
+        }
+    }
+
+    /// The next free ASN, or `None` once the ranges are exhausted (or none were given).
+    fn take(&mut self) -> Option<i64> {
+        while let Some((low, high)) = self.ranges.get(self.cursor).copied() {
+            let candidate = self.next.max(low);
+            if candidate > high {
+                self.advance();
+                continue;
+            }
+            match candidate.checked_add(1) {
+                Some(next) => self.next = next,
+                // The candidate is the largest number there is, so this range holds
+                // nothing after it: the walk moves on to the next range whether or not
+                // the candidate itself is free. Advancing unconditionally is what keeps
+                // the walk strictly monotonic — a saturating increment would re-derive
+                // this same candidate forever once it is claimed.
+                None => self.advance(),
+            }
+            if self.claimed.insert(candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Move the walk on to the next range.
+    fn advance(&mut self) {
+        self.cursor = self.cursor.saturating_add(1);
+        self.next = self.ranges.get(self.cursor).map_or(0, |(low, _)| *low);
+    }
+}
+
+/// One `asn-ranges` entry: `"64512-64555"`, `"64512"` or a bare number.
+///
+/// A range that is empty, or that reaches outside the [`ASN_MIN`]..=[`ASN_MAX`] domain a
+/// BGP AS number lives in, names no assignable ASN and is answered `None` — an entry no
+/// assignment can be made from, rather than one that is quietly reinterpreted.
+fn parse_asn_range(value: &::serde_json::Value) -> Option<(i64, i64)> {
+    let (low, high) = if let Some(single) = value.as_i64() {
+        (single, single)
+    } else {
+        let text = value.as_str()?.trim();
+        match text.split_once('-') {
+            Some((low, high)) => (low.trim().parse::<i64>().ok()?, high.trim().parse::<i64>().ok()?),
+            None => {
+                let single = text.parse::<i64>().ok()?;
+                (single, single)
+            }
+        }
+    };
+    (low <= high && low >= ASN_MIN && high <= ASN_MAX).then_some((low, high))
+}
+
+/// Whether two tag sets hold the same keys with the same values, whatever order they
+/// arrived in. Used by the idempotency check of a create: a retry that carries the same
+/// `ClientToken` must carry the same tags to be the same request. `Tag` is a generated
+/// shape with no `PartialEq`, so the comparison goes through the key/value pairs.
+pub fn same_tags(left: &[Tag], right: &[Tag]) -> bool {
+    let pairs = |tags: &[Tag]| -> BTreeMap<String, String> {
+        tags.iter()
+            .map(|tag| {
+                (
+                    tag.key.clone().unwrap_or_default(),
+                    tag.value.clone().unwrap_or_default(),
+                )
+            })
+            .collect()
+    };
+    pairs(left) == pairs(right)
 }
 
 /// `SystemTime` as a Smithy timestamp (epoch seconds, sub-second part kept).

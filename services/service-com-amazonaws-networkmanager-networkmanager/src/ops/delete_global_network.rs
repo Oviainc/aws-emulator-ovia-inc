@@ -147,16 +147,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A global network that still owns children cannot be deleted: the caller has to
-        // empty it first (DeleteSite, and the delete of each other child kind as that
-        // slice lands).
-        let children = store.site_ids_of(&input.global_network_id);
-        if !children.is_empty() {
+        // empty it first (DeleteSite, DeleteCoreNetwork, and the delete of each other
+        // child kind as that slice lands).
+        let sites = store.site_ids_of(&input.global_network_id);
+        let core_networks = store.core_network_ids_of(&input.global_network_id);
+        if !sites.is_empty() || !core_networks.is_empty() {
             return Err(DeleteGlobalNetworkErrorModeled::ConflictException(
                 ConflictException {
                     message: format!(
-                        "global network {} still contains {} site(s)",
+                        "global network {} still contains {} site(s) and {} core network(s)",
                         input.global_network_id,
-                        children.len()
+                        sites.len(),
+                        core_networks.len()
                     ),
                     resource_id: input.global_network_id.clone(),
                     resource_type: crate::state::GLOBAL_NETWORK_KIND.to_string(),
