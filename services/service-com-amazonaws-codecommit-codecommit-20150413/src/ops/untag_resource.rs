@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +170,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        let repository_name = repository_name_of(&input.resource_arn)?;
+
+        // `tagKeys` is required, so the boundary refused a request that omitted
+        // it; an EMPTY list still reaches here. "A list of tag keys is required.
+        // The list cannot be empty or null."
+        if input.tag_keys.is_empty() {
+            return Err(UntagResourceErrorModeled::TagKeysListRequiredException(
+                TagKeysListRequiredException {
+                    message: Some(
+                        "A list of tag keys is required. The list cannot be empty or null."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "The specified tag is not valid. Key names cannot be prefixed with aws:."
+        // A system tag is AWS's to set and AWS's to remove.
+        if let Some(key) = input
+            .tag_keys
+            .iter()
+            .find(|key| crate::state::is_system_tag_key(key))
+        {
+            return Err(UntagResourceErrorModeled::InvalidSystemTagUsageException(
+                InvalidSystemTagUsageException {
+                    message: Some(format!(
+                        "the tag key {key} is not valid: key names cannot be prefixed with {}",
+                        crate::state::SYSTEM_TAG_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every key must satisfy `TagKey`'s modelled length; the boundary
+        // validator applies a `length` to the `tagKeys` MEMBER rather than to the
+        // keys inside the list, so the list is checked here. "The list of tags is
+        // not valid."
+        if let Some(key) = input
+            .tag_keys
+            .iter()
+            .find(|key| !crate::state::is_tag_key(key))
+        {
+            return Err(UntagResourceErrorModeled::InvalidTagKeysListException(
+                InvalidTagKeysListException {
+                    message: Some(format!(
+                        "the list of tags is not valid: a tag key must be {}-{} characters, got one of {}",
+                        crate::state::TAG_KEY_MIN_LENGTH,
+                        crate::state::TAG_KEY_MAX_LENGTH,
+                        key.chars().count()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        let repository = store.repositories.get_mut(repository_name).ok_or_else(|| {
+            UntagResourceError::from(UntagResourceErrorModeled::RepositoryDoesNotExistException(
+                RepositoryDoesNotExistException {
+                    message: Some(crate::state::repository_does_not_exist_message(
+                        repository_name,
+                    )),
+                },
+            ))
+        })?;
+
+        // Removing tags is idempotent: a key the resource does not carry leaves
+        // the stored set as it was, exactly as removing it a second time does.
+        for key in &input.tag_keys {
+            repository.tags.remove(key);
+        }
+        // `lastModifiedDate` is deliberately left alone: it reports when the
+        // repository itself last changed, which `GetRepository` serves, and tags
+        // are not part of that metadata.
+
+        Ok(UntagResourceOutput)
     }
+}
+
+/// The repository the request's `resourceArn` names, or the modelled error for
+/// why that ARN addresses no CodeCommit resource.
+fn repository_name_of(resource_arn: &str) -> Result<&str, UntagResourceError> {
+    crate::state::repository_name_of_resource_arn(resource_arn).map_err(|problem| {
+        match problem {
+            crate::state::ResourceArnProblem::Missing => {
+                UntagResourceErrorModeled::ResourceArnRequiredException(
+                    ResourceArnRequiredException {
+                        message: Some(
+                            "A valid Amazon Resource Name (ARN) for an CodeCommit resource is required."
+                                .to_string(),
+                        ),
+                    },
+                )
+            }
+            crate::state::ResourceArnProblem::Invalid => {
+                UntagResourceErrorModeled::InvalidResourceArnException(
+                    InvalidResourceArnException {
+                        message: Some(format!(
+                            "the value for the resource ARN {resource_arn} is not valid"
+                        )),
+                    },
+                )
+            }
+            crate::state::ResourceArnProblem::RepositoryName => {
+                UntagResourceErrorModeled::InvalidRepositoryNameException(
+                    InvalidRepositoryNameException {
+                        message: Some(format!(
+                            "the repository name in the resource ARN {resource_arn} is not valid"
+                        )),
+                    },
+                )
+            }
+        }
+        .into()
+    })
 }

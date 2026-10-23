@@ -23,6 +23,8 @@ mod findings_archive_state;
 mod findings_feedback;
 #[path = "all/investigation_lifecycle.rs"]
 mod investigation_lifecycle;
+#[path = "all/ip_set_lifecycle.rs"]
+mod ip_set_lifecycle;
 #[path = "all/member_association.rs"]
 mod member_association;
 #[path = "all/modeled_constraint_refusals.rs"]

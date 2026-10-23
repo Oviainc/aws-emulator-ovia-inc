@@ -111,6 +111,134 @@ pub const MAX_BRANCHES_PER_REPOSITORY: usize = 64;
 /// 6 MB".
 pub const MAX_FOLDER_CONTENT_BYTES: i64 = 6 * 1024 * 1024;
 
+/// How many tags one CodeCommit resource carries before a tagging request is
+/// refused with the modelled `TooManyTagsException`.
+///
+/// AWS's tagging limit for a CodeCommit resource: "You can add up to 50 tags to
+/// a single CodeCommit repository" (CodeCommit User Guide, "Tag a repository"),
+/// which is also the general AWS limit of 50 user-created tags per resource.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// `TagKey`'s and `TagValue`'s modelled `length` bounds
+/// (`smithy_query(query="shape",shape="TagKey,TagValue")`). The boundary
+/// validator applies a `length` to a MEMBER, not to the keys and values inside a
+/// map or list, so the tagging operations apply these themselves — a request
+/// outside them is `InvalidTagsMapException` / `InvalidTagKeysListException`.
+pub const TAG_KEY_MIN_LENGTH: usize = 1;
+pub const TAG_KEY_MAX_LENGTH: usize = 128;
+pub const TAG_VALUE_MIN_LENGTH: usize = 0;
+pub const TAG_VALUE_MAX_LENGTH: usize = 256;
+
+/// Is this within `TagKey`'s modelled length? Smithy counts a string's length in
+/// Unicode code points.
+pub fn is_tag_key(candidate: &str) -> bool {
+    (TAG_KEY_MIN_LENGTH..=TAG_KEY_MAX_LENGTH).contains(&candidate.chars().count())
+}
+
+/// Is this within `TagValue`'s modelled length?
+pub fn is_tag_value(candidate: &str) -> bool {
+    (TAG_VALUE_MIN_LENGTH..=TAG_VALUE_MAX_LENGTH).contains(&candidate.chars().count())
+}
+
+/// The tag key prefix AWS reserves for its own system tags. A request that sets
+/// or removes a key carrying it is refused with `InvalidSystemTagUsageException`:
+/// "The specified tag is not valid. Key names cannot be prefixed with aws:."
+pub const SYSTEM_TAG_PREFIX: &str = "aws:";
+
+/// Is this a tag key only AWS itself may set, i.e. one carrying
+/// [`SYSTEM_TAG_PREFIX`]?
+pub fn is_system_tag_key(key: &str) -> bool {
+    key.starts_with(SYSTEM_TAG_PREFIX)
+}
+
+/// `RepositoryName`'s modelled `length` bounds
+/// (`smithy_query(query="shape",shape="RepositoryName")`).
+pub const REPOSITORY_NAME_MIN_LENGTH: usize = 1;
+pub const REPOSITORY_NAME_MAX_LENGTH: usize = 100;
+
+/// Does `candidate` satisfy `RepositoryName` — its modelled `length` 1..100 and
+/// its modelled `pattern` `^[\w\.-]+$`
+/// (`smithy_query(query="shape",shape="RepositoryName")`)? The boundary
+/// validator already applies both to a `repositoryName` MEMBER; this is for a
+/// name that arrives inside another value, such as the resource portion of a
+/// resource ARN.
+pub fn is_repository_name(candidate: &str) -> bool {
+    let length = candidate.chars().count();
+    (REPOSITORY_NAME_MIN_LENGTH..=REPOSITORY_NAME_MAX_LENGTH).contains(&length)
+        // `\w` in a Smithy (ECMA-262) pattern is ASCII `[A-Za-z0-9_]`, so a
+        // non-ASCII letter or digit does NOT satisfy `RepositoryName`.
+        && candidate
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+        // The one name rule the model cannot express, which the operations that
+        // take a name apply too: "The suffix .git is prohibited." A name no
+        // repository can ever carry is not a valid repository name here either.
+        && !has_prohibited_git_suffix(candidate)
+}
+
+/// Why a `resourceArn` cannot address a CodeCommit resource. Each variant is the
+/// modelled error the tagging operations answer for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceArnProblem {
+    /// The ARN is absent or blank: `ResourceArnRequiredException`.
+    Missing,
+    /// The value is not an ARN of a CodeCommit resource at all:
+    /// `InvalidResourceArnException`.
+    Invalid,
+    /// A well-formed CodeCommit ARN whose resource portion is not a valid
+    /// repository name: `InvalidRepositoryNameException`.
+    RepositoryName,
+}
+
+/// The number of digits in an AWS account id, the fourth field of an ARN.
+const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// The repository a CodeCommit resource ARN names.
+///
+/// The only resource CodeCommit's tagging operations address is a repository, and
+/// its ARN is `arn:<partition>:codecommit:<region>:<account-id>:<repository-name>`
+/// — the form [`Repository::new`] stores and every CodeCommit response reports.
+/// Anything else is refused; see [`ResourceArnProblem`] for which modelled error
+/// each kind of refusal carries. Region and account are checked for FORM only:
+/// this emulator's store holds one set of repositories rather than one per region
+/// or account, so a well-formed ARN is resolved by the repository it names.
+pub fn repository_name_of_resource_arn(raw: &str) -> Result<&str, ResourceArnProblem> {
+    if raw.trim().is_empty() {
+        return Err(ResourceArnProblem::Missing);
+    }
+    // An ARN is six colon-separated fields, `arn:<partition>:<vendor>:<region>:
+    // <account>:<resource>`; `splitn` leaves the whole resource — any further
+    // colons included — as the last of them, so a multi-segment resource is read
+    // as one value and then refused by the repository-name rule below.
+    let [prefix, partition, vendor, region, account, resource] =
+        raw.splitn(6, ':').collect::<Vec<_>>()[..]
+    else {
+        return Err(ResourceArnProblem::Invalid);
+    };
+    if prefix != "arn"
+        || partition.is_empty()
+        // The ARN namespace is a fixed lowercase token, so a value differing in
+        // case names another vendor.
+        || vendor != "codecommit"
+        || region.is_empty()
+        || account.len() != ACCOUNT_ID_DIGITS
+        || !account.bytes().all(|byte| byte.is_ascii_digit())
+        || resource.is_empty()
+    {
+        return Err(ResourceArnProblem::Invalid);
+    }
+    if !is_repository_name(resource) {
+        return Err(ResourceArnProblem::RepositoryName);
+    }
+    Ok(resource)
+}
+
+/// The message AWS returns with `RepositoryDoesNotExistException`: the requested
+/// repository name, then `" for "`, then the account the lookup ran in.
+pub fn repository_does_not_exist_message(name: &str) -> String {
+    format!("{name} for {}", ::engine::emulator_account_id())
+}
+
 /// The combined size of all the file content one commit may carry, in bytes.
 /// CodeCommit documents this on `FileContentSizeLimitExceededException`: "The
 /// maximum file size is 6 MB, and the combined file content change size is 7 MB."
