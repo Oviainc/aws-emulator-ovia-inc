@@ -231,7 +231,10 @@ pub struct CreateHostedConfigurationVersionOutput {
     pub kms_key_arn: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appconfig#Deployment")]
+/// `StartedAt` and `CompletedAt` target `Iso8601DateTime` (`@timestampFormat("date-time")`),
+/// so this shape's schema and serializer come from `ac_deployment_shape!` rather than from
+/// `#[smithy_macros::smithy(shape = ...)]` — see `types/deployment_wire.rs`, which also
+/// states where the `Type` member below comes from.
 #[derive(Debug, Clone, Default)]
 pub struct GetDeploymentOutput {
     pub application_id: Option<String>,
@@ -256,9 +259,15 @@ pub struct GetDeploymentOutput {
     pub kms_key_arn: Option<String>,
     pub kms_key_identifier: Option<String>,
     pub version_label: Option<String>,
+    pub r#type: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appconfig#DeploymentEvent")]
+ac_deployment_shape!(GetDeploymentOutput, GET_DEPLOYMENT_OUTPUT_SCHEMA);
+
+/// `OccurredAt` targets `Iso8601DateTime` (`@timestampFormat("date-time")`), so this
+/// shape's schema and serializer come from `ac_schema_and_codec!` — see
+/// `types/deployment_wire.rs`. Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="DeploymentEvent")`.
 #[derive(Debug, Clone, Default)]
 pub struct DeploymentEvent {
     pub event_type: Option<String>,
@@ -267,6 +276,26 @@ pub struct DeploymentEvent {
     pub action_invocations: Option<Vec<ActionInvocation>>,
     pub occurred_at: Option<::aws_smithy_types::DateTime>,
 }
+
+ac_schema_and_codec!(
+    DeploymentEvent,
+    DEPLOYMENT_EVENT_SCHEMA,
+    "com.amazonaws.appconfig#DeploymentEvent",
+    "com.amazonaws.appconfig",
+    "DeploymentEvent",
+    (M_EVENT_TYPE, event_type, "EventType", 0, opt, string),
+    (M_TRIGGERED_BY, triggered_by, "TriggeredBy", 1, opt, string),
+    (M_DESCRIPTION, description, "Description", 2, opt, string),
+    (
+        M_ACTION_INVOCATIONS,
+        action_invocations,
+        "ActionInvocations",
+        3,
+        opt,
+        list_of(ActionInvocation)
+    ),
+    (M_OCCURRED_AT, occurred_at, "OccurredAt", 4, opt, date_time),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.appconfig#ActionInvocation")]
 #[derive(Debug, Clone, Default)]

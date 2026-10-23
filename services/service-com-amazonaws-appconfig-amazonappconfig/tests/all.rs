@@ -17,6 +17,8 @@ mod appconfig_workflow;
 mod control_plane_fidelity;
 #[path = "all/create_deployment_strategy.rs"]
 mod create_deployment_strategy;
+#[path = "all/deployment_wire_fidelity.rs"]
+mod deployment_wire_fidelity;
 #[path = "all/environment_update.rs"]
 mod environment_update;
 #[path = "all/extensions.rs"]
