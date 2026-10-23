@@ -1437,6 +1437,10 @@ pub struct ApprovalRuleTemplateRecord {
     pub template_id: String,
     pub name: String,
     pub description: Option<String>,
+    /// The approval rule document in its canonical form — see
+    /// [`canonical_json_document`]. It is canonicalized once, here, on the way in,
+    /// so every reader of a stored template reports the same bytes and
+    /// `ruleContentSha256` is the digest of those bytes.
     pub content: String,
     pub creation_date: SystemTime,
     pub last_modified_date: SystemTime,
@@ -1464,7 +1468,10 @@ impl ApprovalRuleTemplateRecord {
             // recorded behaviour the corpus names
             // "approval-rule-template-empty-description-normalized-to-absent").
             description: description.filter(|text| !text.is_empty()),
-            content,
+            // The document is held canonicalized, never as the caller happened to
+            // format it: whatever the submitted whitespace, the stored content,
+            // `ruleContentSha256` and every later read agree.
+            content: canonical_json_document(&content),
             creation_date: created,
             last_modified_date: created,
             last_modified_user,
@@ -1491,20 +1498,84 @@ impl ApprovalRuleTemplateRecord {
     /// Replace this template's content, recording who changed it and when.
     ///
     /// The one place a stored template's content is overwritten, so every updater
-    /// attributes the change the same way: the content (and with it the
-    /// `ruleContentSha256` derived from it) is what the caller supplied, while the
-    /// template's id, name, description and creation date are untouched.
+    /// attributes the change the same way: the content is canonicalized exactly as a
+    /// created template's is ([`canonical_json_document`]) — an update can therefore
+    /// not leave a template in a serialization a create would never have stored —
+    /// and with it the `ruleContentSha256` derived from it, while the template's id,
+    /// name, description and creation date are untouched.
     pub fn replace_content(&mut self, content: String, by: String, at: SystemTime) {
-        self.content = content;
+        self.content = canonical_json_document(&content);
         self.last_modified_user = by;
         self.last_modified_date = at;
     }
 }
 
 /// The SHA-256 hash signature CodeCommit reports for a template's content
-/// (`ruleContentSha256`): the digest of the content bytes, hex encoded.
+/// (`ruleContentSha256`): the digest of the content bytes, hex encoded. Those bytes
+/// are the canonical ones ([`canonical_json_document`]), so the signature of a
+/// document does not depend on how its submitter formatted it.
 pub fn content_sha256(content: &str) -> String {
     ::hex::encode(Sha256::digest(content.as_bytes()))
+}
+
+/// A JSON document CodeCommit stores and hands back, in its canonical form:
+/// minified — every byte of RFC 8259 insignificant whitespace (space, tab, CR, LF
+/// between tokens) removed — with the member order, the string literals and the
+/// number literals exactly as submitted. A service that accepts a JSON document and
+/// reports it back does not echo the submitted formatting: a caller that stores the
+/// returned text, diffs it against a later read, or hashes it to detect drift sees a
+/// change only when the document itself changed.
+///
+/// Whitespace is dropped by scanning the text rather than by re-serializing the
+/// parsed value, because a re-serialization would sort the members (`serde_json`'s
+/// `Map` is a `BTreeMap` unless its `preserve_order` feature is on) and renormalise
+/// number literals (`1e3` to `1000.0`), both of which this canonical form preserves.
+/// Whitespace inside a string literal is part of the value, so it survives, escapes
+/// included.
+///
+/// Callers hand this a document `serde_json` has already accepted (for approval rule
+/// template content, [`validate_approval_rule_template_content`]); given text that
+/// is not JSON it is still total, simply stripping whitespace outside quotes.
+///
+/// Two sibling services canonicalize a document of their own:
+/// `service-com-amazonaws-rum-rum`'s `canonical_policy_document` scans the text the
+/// same way, and `service-com-amazonaws-schemas-schemas`'s `canonical_json`
+/// re-encodes through `serde_transcode`. The re-encode route is not used here
+/// because, as that function's own doc comment records, it keeps a number's VALUE
+/// but not its literal (`1e3` comes back `1000.0`), and this canonical form keeps
+/// the literal a caller submitted.
+pub fn canonical_json_document(document: &str) -> String {
+    let mut canonical = String::with_capacity(document.len());
+    // Where the scan is: inside a string literal, and whether the previous
+    // character was the backslash of an escape (so an escaped quote does not close
+    // the literal).
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in document.chars() {
+        if in_string {
+            canonical.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => {
+                in_string = true;
+                canonical.push(character);
+            }
+            // The four insignificant whitespace characters JSON defines. Everything
+            // else outside a string literal is structure or a bare literal, and is
+            // kept exactly as it came in.
+            ' ' | '\t' | '\r' | '\n' => {}
+            _ => canonical.push(character),
+        }
+    }
+    canonical
 }
 
 /// Could `value` be a `RuleContentSha256` at all — the hex form [`content_sha256`]

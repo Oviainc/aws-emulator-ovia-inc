@@ -47,6 +47,8 @@ mod list_deployment_configs;
 mod list_deployment_groups;
 #[path = "all/list_deployment_targets.rs"]
 mod list_deployment_targets;
+#[path = "all/list_on_premises_instances.rs"]
+mod list_on_premises_instances;
 #[path = "all/on_premises_instances.rs"]
 mod on_premises_instances;
 #[path = "all/on_premises_revisions_and_blue_green.rs"]

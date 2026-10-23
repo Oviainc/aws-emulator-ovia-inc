@@ -89,10 +89,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The one `UpdateRecommendationLifecycleStage` value that resolves a
-/// recommendation (see `UPDATE_RECOMMENDATION_LIFECYCLE_STAGE_VALUES` in
-/// `ops::types::shared_types`).
-const LIFECYCLE_STAGE_RESOLVED: &str = "resolved";
+// The one `UpdateRecommendationLifecycleStage` value that resolves a
+// recommendation. It lives in `crate::state` because the organization-level
+// lifecycle update stamps `resolvedAt` on the same stage.
+use crate::state::LIFECYCLE_STAGE_RESOLVED;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the

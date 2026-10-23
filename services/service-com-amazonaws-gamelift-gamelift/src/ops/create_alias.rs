@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the alias the request describes and persists it, so this response and every
+//! later read of the alias (`DescribeAlias`) are served from the one stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +170,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAlias"))
+        use crate::state::MAX_ALIASES_PER_ACCOUNT;
+
+        let invalid = |message: String| -> Self::Error {
+            CreateAliasErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // "To create a fleet alias, specify an alias name, routing strategy, and optional
+        // description": the routing strategy must be one of the two forms the model
+        // declares, which is what makes the stored alias resolvable (or deliberately
+        // terminal). Refused BEFORE any state is locked and before anything is stored.
+        // The fleet a simple strategy names is NOT looked up here — an alias outlives the
+        // fleets it points at, so resolving the alias is what discovers a missing target.
+        if let Err(reason) = crate::state::validate_routing_strategy(&input.routing_strategy) {
+            return Err(invalid(reason));
+        }
+
+        // A resource's tags are a key-value MAP ("Tags are developer-defined key-value
+        // pairs"), so one key cannot carry two values; `TaggingFailedException`'s doc:
+        // "This may be due to invalid tag format". The modelled `TagList` length (0..200)
+        // and each tag's own lengths are refused by the boundary walk before this handler
+        // runs.
+        let tags = input.tags.clone().unwrap_or_default();
+        let mut keys = ::std::collections::HashSet::new();
+        if let Some(duplicate) = tags.iter().find(|tag| !keys.insert(tag.key.clone())) {
+            return Err(CreateAliasErrorModeled::TaggingFailedException(
+                TaggingFailedException {
+                    message: Some(format!(
+                        "Tags assigns the key {} more than once; a resource's tags carry each key \
+                         at most once.",
+                        duplicate.key
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAliasErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // An alias lives until it is deleted, so the quota is what keeps the store bounded
+        // as well as what makes the modelled error reachable. "Alias names do not need to
+        // be unique", so a name another alias already carries is NOT refused here.
+        if state.aliases.len() >= MAX_ALIASES_PER_ACCOUNT {
+            return Err(CreateAliasErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already has the maximum of {MAX_ALIASES_PER_ACCOUNT} aliases."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        // `AliasId` matches the modelled `^alias-\S+$`, and the ARN the format
+        // `Alias$AliasArn` documents
+        // (`arn:aws:gamelift:<region>::alias/alias-a1234567-...`), whose "resource ID
+        // matches the alias ID value".
+        let alias_id = format!(
+            "alias-{}",
+            crate::state::mint_uuid(&mut state.minted_ids, "alias")
+        );
+        let alias_arn = crate::state::gamelift_arn(&region, &format!("alias/{alias_id}"));
+        let record = crate::state::AliasRecord {
+            alias_id: alias_id.clone(),
+            alias_arn,
+            name: input.name.clone(),
+            description: input.description.clone(),
+            routing_strategy: input.routing_strategy.clone(),
+            tags,
+            creation_time: now,
+            // A freshly created alias has not been modified since it was created, so both
+            // timestamps are the same instant until `UpdateAlias` moves one of them.
+            last_updated_time: now,
+            region,
+        };
+        state.aliases.insert(alias_id.clone(), record);
+
+        // Report the STORED record, so this response and every later read of the same
+        // alias can only agree.
+        let Some(stored) = state.aliases.get(&alias_id) else {
+            return Err(CreateAliasErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the new alias could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(CreateAliasOutput {
+            alias: Some(stored.to_modelled()),
+        })
     }
 }

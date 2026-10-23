@@ -3,7 +3,10 @@
 //! @op DeleteExport
 //!
 //! Removes the export the ARN names from state and returns that ARN. After it, `GetExport`
-//! answers 404 for the ARN and `ListExports` no longer carries it.
+//! answers the modelled `ResourceNotFoundException` for the ARN (at
+//! `crate::state::EXPORT_NOT_FOUND_STATUS`, the status this service answers that condition
+//! with) and `ListExports` no longer
+//! carries it.
 //!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
 //! reaching this service's state and the modelled contract still apply.

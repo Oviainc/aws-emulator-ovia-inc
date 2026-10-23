@@ -4,9 +4,11 @@
 //!
 //! Reports one recorded execution of one export: the `ExecutionId`, that execution's
 //! `ExecutionStatus`, and the snapshot of the export definition the execution was
-//! generated from. Both lookups answer the modelled `ResourceNotFoundException` — for an
-//! `ExportArn` naming no export, and for an `ExecutionId` naming no execution of that
-//! export.
+//! generated from. Both lookups answer the modelled `ResourceNotFoundException`, reporting
+//! the EXECUTION as absent — the resource this operation addresses — for an `ExportArn`
+//! naming no export and for an `ExecutionId` naming no execution of that export, while the
+//! modelled `ResourceId` / `ResourceType` members name whichever identifier resolved to
+//! nothing.
 //!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
 //! reaching this service's state and the modelled contract still apply.
@@ -171,11 +173,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         // The export is resolved first: an `ExecutionId` is only ever an id WITHIN an
         // export, so an ARN naming no export has no execution namespace to look in. The
-        // miss goes through `crate::state::export_not_found_error`, the one place that
-        // states the status this service answers the not-found condition with.
+        // miss goes through `crate::state::not_found_error`, the one place that states the
+        // status this service answers the not-found condition with. The resource this
+        // operation ADDRESSES is the execution, so the miss is worded as an absent
+        // EXECUTION while the modelled members name the ARN that resolved to nothing —
+        // see `crate::state::execution_export_not_found`.
         if !store.exports.contains_key(&input.export_arn) {
-            return Err(crate::state::export_not_found_error(
-                &input.export_arn,
+            return Err(crate::state::not_found_error(
+                crate::state::execution_export_not_found(&input.export_arn),
                 GetExecutionErrorModeled::ResourceNotFoundException,
             ));
         }

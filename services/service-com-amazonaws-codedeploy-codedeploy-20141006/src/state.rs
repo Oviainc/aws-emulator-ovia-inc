@@ -522,6 +522,19 @@ pub const MAX_TAG_SET_GROUPS: usize = 3;
 /// be unbounded work on each `CreateDeployment`.
 pub const MAX_TAG_FILTERS_PER_LIST: usize = 10;
 
+/// The refusal message for a tag filter list longer than this service accepts:
+/// it names the member and the limit, which is what a caller has to fix.
+///
+/// Shared by every operation that takes a caller-chosen tag filter list — the
+/// deployment-group selectors and `ListOnPremisesInstances`'s `tagFilters` — so
+/// one bound is stated once.
+pub fn too_many_tag_filters(member: &str) -> String {
+    format!(
+        "The number of tag filters in {member} exceeded the maximum allowed limit of {}",
+        MAX_TAG_FILTERS_PER_LIST
+    )
+}
+
 /// How many application revisions one application's registry keeps.
 ///
 /// CodeDeploy publishes no quota for retained revisions and does not refuse a
@@ -924,6 +937,15 @@ pub struct DeploymentConfig {
     pub create_time_ms: i64,
 }
 
+/// The `RegistrationStatus` of an on-premises instance that is still
+/// registered, one of the two values the model's `RegistrationStatus` enum
+/// carries (the generated `crate::ops::types::REGISTRATION_STATUS_VALUES`:
+/// Deregistered | Registered).
+pub const REGISTRATION_STATUS_REGISTERED: &str = "Registered";
+/// See [`REGISTRATION_STATUS_REGISTERED`]: the status of an instance whose
+/// registration has ended, whose record CodeDeploy keeps.
+pub const REGISTRATION_STATUS_DEREGISTERED: &str = "Deregistered";
+
 /// A registered on-premises instance.
 ///
 /// The record OUTLIVES its registration: CodeDeploy keeps a deregistered
@@ -1324,6 +1346,41 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
             .get(iam_arn)
             .and_then(|name| self.on_premises_instances.get(name))
             .filter(|instance| instance.is_registered())
+    }
+
+    /// The names of the on-premises instances a listing answers for one
+    /// `registrationStatus` and one tag filter list, in REGISTRATION order so
+    /// the listing is deterministic and pages stably.
+    ///
+    /// Both members RESTRICT what the full registry would answer, and an absent
+    /// member restricts nothing: "unless otherwise specified, both registered
+    /// and deregistered on-premises instance names are listed"
+    /// (`smithy_query(query="doc",shape="ListOnPremisesInstances")`), and the
+    /// tags "are used to restrict the on-premises instance names returned"
+    /// (`smithy_query(query="doc",shape="ListOnPremisesInstancesInput",member="tagFilters")`).
+    /// A record the registry keeps for a DEREGISTERED instance is as listable
+    /// as a registered one — which is what the `Deregistered` status selects —
+    /// and it is reported with the tags it still carries.
+    pub fn on_premises_instance_names(
+        &self,
+        registration_status: Option<&str>,
+        tag_filters: &[TagFilter],
+    ) -> Vec<String> {
+        self.on_premises_instance_order
+            .iter()
+            .filter_map(|name| self.on_premises_instances.get(name))
+            .filter(|instance| match registration_status {
+                None => true,
+                Some(REGISTRATION_STATUS_REGISTERED) => instance.is_registered(),
+                Some(REGISTRATION_STATUS_DEREGISTERED) => !instance.is_registered(),
+                // A status outside the modelled enum is refused at the request
+                // boundary, so it never reaches here; selecting nothing for it
+                // is the conservative answer if it ever did.
+                Some(_) => false,
+            })
+            .filter(|instance| tag_filters_select(tag_filters, &instance.tags))
+            .map(|instance| instance.instance_name.clone())
+            .collect()
     }
 
     /// Record `instance` as this store's newest registration, keeping the
@@ -2005,6 +2062,20 @@ fn tag_filter_matches(filter: &TagFilter, tags: &[Tag]) -> bool {
                 })
         }
     }
+}
+
+/// Whether a list of on-premises instance tag filters selects an instance
+/// carrying `tags`.
+///
+/// An EMPTY list is no restriction at all, so it selects every instance; a
+/// non-empty one selects an instance that matches ANY of its filters — the same
+/// rule a deployment group's `onPremisesInstanceTagFilters` follows (see
+/// [`group_selects_instance`]), which is the one semantics CodeDeploy gives a
+/// flat list of tag filters. Each filter is matched by [`tag_filter_matches`],
+/// so a filter that describes no tag (`KEY_AND_VALUE` naming one member, or a
+/// filter naming neither) selects nothing through it.
+pub fn tag_filters_select(filters: &[TagFilter], tags: &[Tag]) -> bool {
+    filters.is_empty() || filters.iter().any(|filter| tag_filter_matches(filter, tags))
 }
 
 /// The terminal status a deployment with `target_count` targets reaches:

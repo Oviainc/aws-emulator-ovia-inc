@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOnPremisesInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOnPremisesInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the names of the stored on-premises instances, one page at a time:
+//! registered and deregistered alike unless the request restricts the
+//! registration status, and restricted to the instances its tag filters select.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOnPremisesInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +151,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOnPremisesInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOnPremisesInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        // A `registrationStatus` outside the modelled `RegistrationStatus` enum,
+        // and a `tagFilters` entry whose `type` is outside `TagFilterType`, are
+        // refused at the request boundary with this operation's
+        // `InvalidRegistrationStatusException` / `InvalidTagFilterException`
+        // (`crate::service`'s refusal table), so reaching here means both members
+        // hold values this service accepts and the refusals left are a filter
+        // list longer than this service scans and a continuation token it did
+        // not issue.
+        let registration_status = input.registration_status;
+        let tag_filters = input.tag_filters.unwrap_or_default();
+        // The filter list is a CALLER-CHOSEN factor of the work this listing
+        // does — every filter is matched against the tags of every stored
+        // record, under the store lock — so it is clamped to the same
+        // `MAX_TAG_FILTERS_PER_LIST` bound this service applies to a deployment
+        // group's tag filter lists, BEFORE the store is touched, and the excess
+        // is refused with this operation's `InvalidTagFilterException`. That
+        // keeps one request's scan bounded by a constant.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOnPremisesInstances"))
+        // CodeDeploy publishes no `tagFilters` quota for THIS operation, so the
+        // figure is the CHOSEN one `crate::state::MAX_TAG_FILTERS_PER_LIST`
+        // documents (the 10-filters-per-tag-type limit the service states for a
+        // deployment group's selectors), applied here for the same reason: it is
+        // what bounds the work of one call.
+        if tag_filters.len() > crate::state::MAX_TAG_FILTERS_PER_LIST {
+            return Err(ListOnPremisesInstancesErrorModeled::InvalidTagFilterException(
+                InvalidTagFilterException {
+                    message: Some(crate::state::too_many_tag_filters("tagFilters")),
+                },
+            )
+            .into());
+        }
+        let token = input.next_token;
+
+        let page = crate::state::with_state(&*self.engine, |state| {
+            // The restriction is applied BEFORE paging, so every name a page
+            // carries is one the request selected and the token continues the
+            // selected listing rather than the whole registry.
+            let selected =
+                state.on_premises_instance_names(registration_status.as_deref(), &tag_filters);
+            crate::state::paginate(&selected, token.as_deref())
+        })
+        .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE))?
+        .ok_or_else(|| {
+            ListOnPremisesInstancesErrorModeled::InvalidNextTokenException(
+                InvalidNextTokenException {
+                    message: Some("The next token was specified in an invalid format".to_string()),
+                },
+            )
+        })?;
+
+        let (instance_names, next_token) = page;
+        Ok(ListOnPremisesInstancesOutput {
+            instance_names: Some(instance_names),
+            next_token,
+        })
     }
 }
