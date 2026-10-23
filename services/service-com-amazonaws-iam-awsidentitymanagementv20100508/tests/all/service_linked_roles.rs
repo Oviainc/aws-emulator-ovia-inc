@@ -540,8 +540,12 @@ async fn a_derived_name_past_the_published_bound_is_refused() {
     }
 }
 
-/// RULE: `GetRole` reports a role the account holds; a name it does not hold is a
-/// `NoSuchEntity` (HTTP 404) rather than an invented role.
+/// RULE: `GetRole` reports a role the account holds; a name that neither the account
+/// holds nor any service publishes for its own service-linked role is a
+/// `NoSuchEntity` (HTTP 404) rather than an invented role. (The roles a service keeps
+/// provisioned under the names AWS publishes are the subject of
+/// `tests/all/service_provisioned_roles.rs`; every name below is outside that
+/// catalog.)
 #[tokio::test]
 async fn reading_a_role_the_account_does_not_hold_is_not_found() {
     let router = router();

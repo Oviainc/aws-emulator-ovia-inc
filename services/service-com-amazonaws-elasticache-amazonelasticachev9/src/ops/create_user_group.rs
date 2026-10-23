@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUserGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUserGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateUserGroup::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -175,18 +171,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUserGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        let engine = match crate::state::normalize_user_engine(&input.engine) {
+            Ok(engine) => engine,
+            Err(message) => {
+                return Err(CreateUserGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+        };
+        let tags = match crate::state::tag_pairs(input.tags) {
+            Ok(tags) => tags,
+            Err(crate::state::TagRefusal::TooMany(count)) => {
+                return Err(CreateUserGroupErrorModeled::TagQuotaPerResourceExceeded(
+                    TagQuotaPerResourceExceeded {
+                        message: Some(format!(
+                            "{count} tags were supplied; the maximum number of tags permitted on \
+                             a resource is {}.",
+                            crate::state::MAX_TAGS_PER_RESOURCE
+                        )),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::TagRefusal::MissingKey) => {
+                return Err(CreateUserGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(
+                            "Invalid value for Tags: a tag's Key may not be null.".to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        if store.user_groups.contains_key(&input.user_group_id) {
+            return Err(CreateUserGroupErrorModeled::UserGroupAlreadyExistsFault(
+                UserGroupAlreadyExistsFault {
+                    message: Some(format!(
+                        "User group {} already exists.",
+                        input.user_group_id
+                    )),
+                },
+            )
+            .into());
+        }
+        // CC-02 growth bound: the store must not grow per request without a
+        // ceiling, so a create past the account's user-group quota is refused
+        // rather than stored.
+        if store.user_groups.len() >= crate::state::USER_GROUP_QUOTA {
+            return Err(CreateUserGroupErrorModeled::UserGroupQuotaExceededFault(
+                UserGroupQuotaExceededFault {
+                    message: Some(format!(
+                        "This account already holds the maximum of {} user groups.",
+                        crate::state::USER_GROUP_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every member has to be a user this account holds: a group that
+        // referenced a user that was never created would claim access for an id
+        // nothing can authenticate as. The group is NOT created — the refusal
+        // happens before anything is stored.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUserGroup"))
+        // CC-02 growth bound: one accepted record must not be arbitrarily
+        // large. Each member must resolve to a stored user and no user may be
+        // named twice, so the stored member list is at most as long as the
+        // user store, which `crate::state::USER_QUOTA` bounds.
+        let mut members: Vec<String> = Vec::new();
+        for requested in input.user_ids.clone().unwrap_or_default() {
+            // `UserId` "is stored as a lowercase string", so that is what a
+            // membership resolves against.
+            let key = requested.to_ascii_lowercase();
+            let Some(user) = store.users.get(&key) else {
+                return Err(CreateUserGroupErrorModeled::UserNotFoundFault(
+                    UserNotFoundFault {
+                        message: Some(format!("User {requested} not found.")),
+                    },
+                )
+                .into());
+            };
+            // One user cannot be in a group twice: `DuplicateUserNameFault` is
+            // "a user with this username already exists", which is what a
+            // repeated member amounts to.
+            if members.contains(&user.user_id) {
+                return Err(CreateUserGroupErrorModeled::DuplicateUserNameFault(
+                    DuplicateUserNameFault {
+                        message: Some(format!(
+                            "User {} is named more than once in UserIds.",
+                            user.user_name
+                        )),
+                    },
+                )
+                .into());
+            }
+            members.push(user.user_id.clone());
+        }
+        // "A user group must contain the default user": the user every account
+        // starts with, see `crate::state::DEFAULT_USER_ID`.
+        if !members.iter().any(|id| id == crate::state::DEFAULT_USER_ID) {
+            return Err(CreateUserGroupErrorModeled::DefaultUserRequired(
+                DefaultUserRequired {
+                    message: Some(format!(
+                        "A user group must contain the {} user.",
+                        crate::state::DEFAULT_USER_ID
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A created group is NOT ready: `UserGroup$Status` "can be creating,
+        // active, modifying, deleting", and the clock owes it `active` once the
+        // transition span has passed.
+        let record = crate::state::UserGroupRecord {
+            arn: crate::state::user_group_arn(&region, &input.user_group_id),
+            user_group_id: input.user_group_id,
+            engine,
+            user_ids: members.clone(),
+            status: crate::state::STATUS_CREATING.to_string(),
+            pending_status: crate::state::user_group_transition(now),
+            replication_group_ids: Vec::new(),
+            serverless_cache_names: Vec::new(),
+            region,
+            tags,
+        };
+        // The membership lives on the GROUP record only: `User$UserGroupIds` is
+        // derived from the groups that list the user (see
+        // `crate::state::ComAmazonawsElasticacheAmazonelasticachev9State::user_group_ids_of`),
+        // so there is no second copy to keep in step.
+        let stored = store
+            .user_groups
+            .entry(record.user_group_id.clone())
+            .or_insert(record)
+            .to_modeled();
+        Ok(stored)
     }
 }

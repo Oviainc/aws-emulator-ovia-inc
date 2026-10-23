@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DecreaseNodeGroupsInGlobalReplicationGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DecreaseNodeGroupsInGlobalReplicationGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DecreaseNodeGroupsInGlobalReplicationGroup::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -162,18 +158,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DecreaseNodeGroupsInGlobalReplicationGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DecreaseNodeGroupsInGlobalReplicationGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DecreaseNodeGroupsInGlobalReplicationGroup"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // A deferred change has nowhere to be reported — see
+        // `crate::state::APPLY_IMMEDIATELY_REQUIRED`.
+        if !input.apply_immediately {
+            return Err(
+                DecreaseNodeGroupsInGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::APPLY_IMMEDIATELY_REQUIRED.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        let to_remove = input.global_node_groups_to_remove.clone().unwrap_or_default();
+        let to_retain = input.global_node_groups_to_retain.clone().unwrap_or_default();
+        // The two lists are the two ways of saying the same thing, so naming
+        // both is the incompatible combination that error is for.
+        if !to_remove.is_empty() && !to_retain.is_empty() {
+            return Err(
+                DecreaseNodeGroupsInGlobalReplicationGroupErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(
+                            "GlobalNodeGroupsToRemove cannot be combined with \
+                             GlobalNodeGroupsToRetain."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        if input.node_group_count < 1 {
+            return Err(
+                DecreaseNodeGroupsInGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {} for NodeGroupCount: a Global datastore keeps at \
+                             least one node group.",
+                            input.node_group_count
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let key = input.global_replication_group_id.to_ascii_lowercase();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(group) = store.settled_global_replication_group_mut(&key, now) else {
+            return Err(
+                DecreaseNodeGroupsInGlobalReplicationGroupErrorModeled::GlobalReplicationGroupNotFoundFault(
+                    GlobalReplicationGroupNotFoundFault {
+                        message: Some(format!(
+                            "Global Replication Group {} not found.",
+                            input.global_replication_group_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        if !crate::state::GLOBAL_ACTIONABLE_STATUSES.contains(&group.status.as_str()) {
+            return Err(
+                DecreaseNodeGroupsInGlobalReplicationGroupErrorModeled::InvalidGlobalReplicationGroupStateFault(
+                    InvalidGlobalReplicationGroupStateFault {
+                        message: Some(format!(
+                            "Global Replication Group {key} is in {} state, not {}.",
+                            group.status,
+                            crate::state::GLOBAL_ACTIONABLE_STATUSES.join(" or ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "Decrease": a count that is not smaller than the current one is not a
+        // decrease.
+        let current = i32::try_from(group.global_node_groups.len()).unwrap_or(0);
+        if input.node_group_count >= current {
+            return Err(
+                DecreaseNodeGroupsInGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {} for NodeGroupCount: Global Replication Group {key} \
+                             has {current} node groups.",
+                            input.node_group_count
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Every id either list names has to be a slice group of this datastore.
+        let known: Vec<String> = group
+            .global_node_groups
+            .iter()
+            .map(|node_group| node_group.global_node_group_id.clone())
+            .collect();
+        for named in to_remove.iter().chain(to_retain.iter()) {
+            if !known.contains(named) {
+                return Err(
+                    DecreaseNodeGroupsInGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(format!(
+                                "Invalid value {named} for GlobalNodeGroupsToRemove: Global \
+                                 Replication Group {key} has no such node group."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        // Whichever list the request used, what is kept has to be exactly the
+        // count it asked for: the two members cannot disagree behind a 200.
+        let retained: Vec<String> = if !to_retain.is_empty() {
+            to_retain.clone()
+        } else if !to_remove.is_empty() {
+            known
+                .iter()
+                .filter(|id| !to_remove.contains(id))
+                .cloned()
+                .collect()
+        } else {
+            // Neither list: the datastore keeps its first `NodeGroupCount` slice
+            // groups, the way a resize with no named shards does.
+            known
+                .iter()
+                .take(usize::try_from(input.node_group_count).unwrap_or(0))
+                .cloned()
+                .collect()
+        };
+        if i32::try_from(retained.len()).unwrap_or(0) != input.node_group_count {
+            return Err(
+                DecreaseNodeGroupsInGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {} for NodeGroupCount: the node groups named leave {} \
+                             of them.",
+                            input.node_group_count,
+                            retained.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The keyspace is re-divided over what is left, so every slot stays
+        // owned by exactly one slice group.
+        group.retain_node_groups(&retained);
+        group.begin_transition(crate::state::STATUS_MODIFYING, now);
+
+        Ok(DecreaseNodeGroupsInGlobalReplicationGroupOutput {
+            global_replication_group: Some(group.to_modeled(true)),
+        })
     }
 }

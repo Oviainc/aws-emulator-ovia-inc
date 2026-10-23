@@ -178,10 +178,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The token is opaque: anything this operation did not issue is malformed.
+        // The token is opaque: anything this operation did not issue is malformed, and
+        // only a token that decodes to a key of the form this store is keyed by — an
+        // authorized account id of twelve digits and an authorized Region within the
+        // modelled length — can be one it issued.
         let resume_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_page_token(token) {
+            Some(token) => match crate::state::decode_aggregation_authorization_token(token) {
                 Some(resume_at) => Some(resume_at),
                 None => {
                     return Err(
@@ -210,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut next_token = None;
         for (key, entry) in store.aggregation_authorizations.range(resume_at..) {
             if page.len() == page_size {
-                next_token = Some(crate::state::encode_page_token(key));
+                next_token = Some(crate::state::encode_aggregation_authorization_token(key));
                 break;
             }
             page.push(entry.to_shape());

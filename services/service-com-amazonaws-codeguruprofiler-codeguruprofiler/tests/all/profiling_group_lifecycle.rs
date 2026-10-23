@@ -116,6 +116,23 @@ impl Harness {
         )
     }
 
+    /// The revision of one group's STORED resource-based policy, or `None` when the
+    /// stored group holds none — the only way to tell a policy that was deleted from
+    /// one that merely reads back as granting nothing.
+    pub(crate) fn stored_policy_revision(&self, name: &str) -> Option<String> {
+        let state = self
+            .engine
+            .state::<service_com_amazonaws_codeguruprofiler_codeguruprofiler::ComAmazonawsCodeguruprofilerCodeguruprofilerState>();
+        let guard = state.lock();
+        guard
+            .groups
+            .get(name)
+            .unwrap_or_else(|| panic!("no stored group named {name}"))
+            .policy
+            .as_ref()
+            .map(|policy| policy.revision_id.clone())
+    }
+
     /// Profile bytes retained across every group — what the store-wide budget bounds.
     fn retained_profile_bytes(&self) -> usize {
         self.engine

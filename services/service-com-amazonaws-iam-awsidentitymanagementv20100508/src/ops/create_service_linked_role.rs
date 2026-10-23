@@ -88,23 +88,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// What every service-linked role name starts with. AWS's "Using service-linked
-/// roles" guidance, echoed by `CreateServiceLinkedRole$CustomSuffix`'s
-/// documentation ("a string that you provide, which is combined with the
-/// service-provided prefix to form the complete role name"), is that the role a
-/// service links to itself is named for the service behind this prefix.
-const SERVICE_LINKED_ROLE_NAME_PREFIX: &str = "AWSServiceRoleFor";
-
-/// The character that joins a `CustomSuffix` to the service-provided prefix, as in
-/// `AWSServiceRoleForElasticBeanstalk_debug`. It is inside `roleNameType`'s
-/// `^[\w+=,.@-]+$`, so a name carrying a suffix is still a legal role name.
-const CUSTOM_SUFFIX_SEPARATOR: char = '_';
-
-/// The IAM policy language version a generated trust policy declares. It is the
-/// current version of the policy grammar IAM documents, and the one AWS emits in
-/// the trust policy of a role it creates.
-const POLICY_LANGUAGE_VERSION: &str = "2012-10-17";
-
 /// Whether `aws_service_name` is shaped like a service principal.
 ///
 /// `CreateServiceLinkedRole$AWSServiceName`'s documentation describes it as "a
@@ -118,156 +101,15 @@ fn is_service_principal(aws_service_name: &str) -> bool {
     labels.len() >= 2 && labels.iter().all(|label| !label.is_empty())
 }
 
-/// The path a service-linked role for `service_principal` is filed under:
-/// [`crate::state::SERVICE_LINKED_ROLE_PATH_PREFIX`] — the path AWS reserves for
-/// service-linked roles, shared because a role's path is what tells every
-/// operation the role is service-linked — followed by the principal and a closing
-/// `/`, which is `pathType`'s required form
-/// (`^(\u002F)|(\u002F[\u0021-\u007E]+\u002F)$`).
-fn service_linked_role_path(service_principal: &str) -> String {
-    format!(
-        "{}{service_principal}/",
-        crate::state::SERVICE_LINKED_ROLE_PATH_PREFIX
-    )
-}
+/// The character that joins a `CustomSuffix` to the service-provided prefix, as in
+/// `AWSServiceRoleForElasticBeanstalk_debug`. It is inside `roleNameType`'s
+/// `^[\w+=,.@-]+$`, so a name carrying a suffix is still a legal role name.
+const CUSTOM_SUFFIX_SEPARATOR: char = '_';
 
-/// The role name AWS PUBLISHES for a service principal's service-linked role.
-///
-/// The service-provided prefix is [`SERVICE_LINKED_ROLE_NAME_PREFIX`] followed by
-/// the service's own AWS-assigned label, and that label is NOT the first label of
-/// the principal and is not derivable from it: `ssm-sap.amazonaws.com` links
-/// `AWSServiceRoleForAWSSSMForSAP`, `ops.apigateway.amazonaws.com` links
-/// `AWSServiceRoleForAPIGateway`, `replication.cassandra.amazonaws.com` links
-/// `AWSServiceRoleForKeyspacesReplication`, and each Application Auto Scaling
-/// principal links a name suffixed with the resource type it scales. No part of the
-/// IAM model carries that label — `CreateServiceLinkedRole$CustomSuffix`'s
-/// documentation only says a suffix "is combined with the service-provided prefix to
-/// form the complete role name" — so the published names are listed here, and a
-/// principal this list does not name falls back to
-/// [`derived_service_linked_role_name`].
-///
-/// Source: the "Using service-linked roles for <service>" page of each service's own
-/// user guide, which names the role that service creates; AWS's "Amazon Web Services
-/// services that work with IAM" table links them all. Rows marked `[model]` are
-/// additionally corroborated by the documentation a Smithy model in THIS repository
-/// carries, quoted in the named handler.
-///
-/// Sorted by principal, which is also the lookup key
-/// ([`published_service_linked_role_name`]).
-const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
-    ("access-analyzer.amazonaws.com", "AWSServiceRoleForAccessAnalyzer"),
-    // [model] service-com-amazonaws-applicationsignals-applicationsignals
-    // `src/ops/start_discovery.rs`: "creating the
-    // AWSServiceRoleForCloudWatchApplicationSignals service-linked role".
-    (
-        "application-signals.amazonaws.com",
-        "AWSServiceRoleForCloudWatchApplicationSignals",
-    ),
-    // [model] service-com-amazonaws-autoscaling-autoscaling-2011-01-01
-    // `src/ops/create_auto_scaling_group.rs`: "service-linked role named
-    // AWSServiceRoleForAutoScaling".
-    ("autoscaling.amazonaws.com", "AWSServiceRoleForAutoScaling"),
-    ("backup.amazonaws.com", "AWSServiceRoleForBackup"),
-    // [model] service-com-amazonaws-batch-awsbatchv20160810
-    // `src/ops/update_compute_environment.rs`: "the AWSServiceRoleForBatch
-    // service-linked role".
-    ("batch.amazonaws.com", "AWSServiceRoleForBatch"),
-    ("cloudtrail.amazonaws.com", "AWSServiceRoleForCloudTrail"),
-    // [model] service-com-amazonaws-configservice-starlingdoveservice
-    // `src/ops/put_service_linked_configuration_recorder.rs`: "creates a
-    // service-linked role AWSServiceRoleForConfig in your account".
-    ("config.amazonaws.com", "AWSServiceRoleForConfig"),
-    // Application Auto Scaling publishes one role per scaled service, named
-    // `AWSServiceRoleForApplicationAutoScaling_<resource type>` — the suffixes this
-    // repository already lists in
-    // service-com-amazonaws-applicationautoscaling-anyscalefrontendservice
-    // `src/state.rs` (`SERVICE_LINKED_ROLE_SUFFIXES`).
-    (
-        "dynamodb.application-autoscaling.amazonaws.com",
-        "AWSServiceRoleForApplicationAutoScaling_DynamoDBTable",
-    ),
-    ("ec2fleet.amazonaws.com", "AWSServiceRoleForEC2Fleet"),
-    // [model] service-com-amazonaws-ecs-amazonec2containerservicev20141113
-    // `src/state.rs`: `role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS`.
-    ("ecs.amazonaws.com", "AWSServiceRoleForECS"),
-    (
-        "ecs.application-autoscaling.amazonaws.com",
-        "AWSServiceRoleForApplicationAutoScaling_ECSService",
-    ),
-    ("eks-fargate.amazonaws.com", "AWSServiceRoleForAmazonEKSForFargate"),
-    ("eks-nodegroup.amazonaws.com", "AWSServiceRoleForAmazonEKSNodegroup"),
-    ("eks.amazonaws.com", "AWSServiceRoleForAmazonEKS"),
-    ("elasticache.amazonaws.com", "AWSServiceRoleForElastiCache"),
-    ("elasticbeanstalk.amazonaws.com", "AWSServiceRoleForElasticBeanstalk"),
-    (
-        "elasticloadbalancing.amazonaws.com",
-        "AWSServiceRoleForElasticLoadBalancing",
-    ),
-    // [model] service-com-amazonaws-fms-awsfms-20180101
-    // `src/ops/put_notification_channel.rs`: "a role other than the
-    // AWSServiceRoleForFMS".
-    ("fms.amazonaws.com", "AWSServiceRoleForFMS"),
-    ("globalaccelerator.amazonaws.com", "AWSServiceRoleForGlobalAccelerator"),
-    ("guardduty.amazonaws.com", "AWSServiceRoleForAmazonGuardDuty"),
-    // [model] service-com-amazonaws-lakeformation-awslakeformation
-    // `src/ops/register_resource.rs`: "choose the
-    // AWSServiceRoleForLakeFormationDataAccess".
-    (
-        "lakeformation.amazonaws.com",
-        "AWSServiceRoleForLakeFormationDataAccess",
-    ),
-    ("lex.amazonaws.com", "AWSServiceRoleForLexBots"),
-    ("macie.amazonaws.com", "AWSServiceRoleForAmazonMacie"),
-    (
-        "opensearchservice.amazonaws.com",
-        "AWSServiceRoleForAmazonOpenSearchService",
-    ),
-    ("ops.apigateway.amazonaws.com", "AWSServiceRoleForAPIGateway"),
-    ("organizations.amazonaws.com", "AWSServiceRoleForOrganizations"),
-    ("rds.amazonaws.com", "AWSServiceRoleForRDS"),
-    (
-        "rds.application-autoscaling.amazonaws.com",
-        "AWSServiceRoleForApplicationAutoScaling_RDSCluster",
-    ),
-    // [model] service-com-amazonaws-keyspaces-keyspacesservice
-    // `src/ops/update_keyspace.rs`:
-    // `role/aws-service-role/replication.cassandra.amazonaws.com/AWSServiceRoleForKeyspacesReplication`.
-    (
-        "replication.cassandra.amazonaws.com",
-        "AWSServiceRoleForKeyspacesReplication",
-    ),
-    ("securityhub.amazonaws.com", "AWSServiceRoleForSecurityHub"),
-    // Amazon EC2 Spot and Spot Fleet: each role is assumed through the FEATURE's own
-    // principal (`spot.amazonaws.com`, `spotfleet.amazonaws.com`), which is neither
-    // the role's name nor the `ec2` endpoint prefix.
-    ("spot.amazonaws.com", "AWSServiceRoleForEC2Spot"),
-    ("spotfleet.amazonaws.com", "AWSServiceRoleForEC2SpotFleet"),
-    // AWS Systems Manager for SAP: the role AWS SSM for SAP requires in the account
-    // before it will register an application.
-    ("ssm-sap.amazonaws.com", "AWSServiceRoleForAWSSSMForSAP"),
-    ("ssm.amazonaws.com", "AWSServiceRoleForAmazonSSM"),
-    ("sso.amazonaws.com", "AWSServiceRoleForSSO"),
-    ("support.amazonaws.com", "AWSServiceRoleForSupport"),
-    ("trustedadvisor.amazonaws.com", "AWSServiceRoleForTrustedAdvisor"),
-];
-
-/// AWS's own role name for `service_principal`, when it publishes one.
-///
-/// Matched without regard to ASCII case: a service principal is a DNS-style name
-/// (`CreateServiceLinkedRole$AWSServiceName` — "a string similar to a URL but
-/// without the http:// in front"), so a differently-cased spelling addresses the
-/// same service, and IAM holds the resulting role name case-folded anyway
-/// (`crate::state::name_key`).
-fn published_service_linked_role_name(service_principal: &str) -> Option<&'static str> {
-    PUBLISHED_SERVICE_LINKED_ROLE_NAMES
-        .iter()
-        .find(|(principal, _)| principal.eq_ignore_ascii_case(service_principal))
-        .map(|(_, role_name)| *role_name)
-}
-
-/// The fallback name for a principal [`PUBLISHED_SERVICE_LINKED_ROLE_NAMES`] does
-/// not name: [`SERVICE_LINKED_ROLE_NAME_PREFIX`] followed by the principal's first
-/// label, capitalised.
+/// The fallback name for a principal
+/// [`crate::state::PUBLISHED_SERVICE_LINKED_ROLE_NAMES`] does not name:
+/// [`crate::state::SERVICE_LINKED_ROLE_NAME_PREFIX`] followed by the principal's
+/// first label, capitalised.
 ///
 /// AWS's label for such a service is not knowable here, so the name stays a function
 /// of the request alone — the same principal always names the same role, and two
@@ -277,7 +119,7 @@ fn derived_service_linked_role_name(service_principal: &str) -> String {
         .split('.')
         .next()
         .unwrap_or(service_principal);
-    let mut role_name = String::from(SERVICE_LINKED_ROLE_NAME_PREFIX);
+    let mut role_name = String::from(crate::state::SERVICE_LINKED_ROLE_NAME_PREFIX);
     let mut characters = service_label.chars();
     if let Some(first) = characters.next() {
         role_name.extend(first.to_uppercase());
@@ -289,12 +131,13 @@ fn derived_service_linked_role_name(service_principal: &str) -> String {
 /// The name of the service-linked role for `service_principal`, with
 /// `custom_suffix` appended when the request supplied one.
 ///
-/// The name is the one AWS publishes for that principal where it publishes one, and
-/// the derived fallback otherwise; a `CustomSuffix` is joined to either with
-/// [`CUSTOM_SUFFIX_SEPARATOR`], which is what that member's documentation describes
-/// ("combined with the service-provided prefix to form the complete role name").
+/// The name is the one AWS publishes for that principal where it publishes one
+/// ([`crate::state::published_service_linked_role_name`]), and the derived fallback
+/// otherwise; a `CustomSuffix` is joined to either with [`CUSTOM_SUFFIX_SEPARATOR`],
+/// which is what that member's documentation describes ("combined with the
+/// service-provided prefix to form the complete role name").
 fn service_linked_role_name(service_principal: &str, custom_suffix: Option<&str>) -> String {
-    let mut role_name = match published_service_linked_role_name(service_principal) {
+    let mut role_name = match crate::state::published_service_linked_role_name(service_principal) {
         Some(published) => published.to_string(),
         None => derived_service_linked_role_name(service_principal),
     };
@@ -303,23 +146,6 @@ fn service_linked_role_name(service_principal: &str, custom_suffix: Option<&str>
         role_name.push_str(custom_suffix);
     }
     role_name
-}
-
-/// The trust policy of a service-linked role: the one statement that lets the
-/// service principal the role is linked to assume it.
-///
-/// Computed from the request's principal, so the document a read returns says
-/// which service controls the role rather than being a fixed blob.
-fn service_linked_role_trust_policy(service_principal: &str) -> String {
-    ::serde_json::json!({
-        "Version": POLICY_LANGUAGE_VERSION,
-        "Statement": [{
-            "Effect": "Allow",
-            "Principal": { "Service": service_principal },
-            "Action": ["sts:AssumeRole"],
-        }],
-    })
-    .to_string()
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -434,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let path = service_linked_role_path(&input.aws_service_name);
+        let path = crate::state::service_linked_role_path(&input.aws_service_name);
 
         let mut store = state.lock();
 
@@ -448,6 +274,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `EntityAlreadyExistsException`
         // (`smithy_query(query="operation", operation="CreateServiceLinkedRole")`),
         // so the duplicate is refused through `InvalidInputException`.
+        //
+        // The duplicate is taken against the ACCOUNT's own roles only. A name
+        // `crate::state::service_provisioned_role` resolves — the role the owning
+        // service keeps provisioned, which `GetRole` reports — is not a record of
+        // the account's, and this create is how the account asks for one of its
+        // own, so it is accepted and every later read reports the created record
+        // (that contract is written out beside `service_provisioned_role`).
         let key = crate::state::name_key(&role_name);
         if store.roles.contains_key(&key) {
             return Err(CreateServiceLinkedRoleErrorModeled::InvalidInputException(
@@ -481,7 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             role_id: store.next_role_id(),
             create_date: crate::state::now(),
             // The service that controls the role is the one that can assume it.
-            assume_role_policy_document: Some(service_linked_role_trust_policy(
+            assume_role_policy_document: Some(crate::state::service_linked_role_trust_policy(
                 &input.aws_service_name,
             )),
             description: input.description,

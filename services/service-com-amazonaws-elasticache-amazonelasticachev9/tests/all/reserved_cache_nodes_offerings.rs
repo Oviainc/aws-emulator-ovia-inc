@@ -6,9 +6,9 @@
 //! served through.
 //!
 //! Every assertion goes over the wire, through the same router the production
-//! emulator mounts (the harness in [`super::cache_cluster_lifecycle`]), so only
-//! the HTTP status and the XML body are inspected and nothing reaches into the
-//! service's state struct.
+//! emulator mounts (the shared harness in [`crate::harness`]), so only the HTTP
+//! status and the XML body are inspected and nothing reaches into the service's
+//! state struct.
 //!
 //! The tests are tables and invariants rather than one recorded answer: a row
 //! per filter member and per documented value of it, the published `MaxRecords`
@@ -17,7 +17,7 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use super::cache_cluster_lifecycle::{params, Emulator, Reply};
+use crate::harness::{params, Emulator, Reply};
 
 /// The operation under test.
 const DESCRIBE: &str = "DescribeReservedCacheNodesOfferings";

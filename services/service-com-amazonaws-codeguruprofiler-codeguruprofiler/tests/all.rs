@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/findings_reports_listing.rs"]
 mod findings_reports_listing;
+#[path = "all/permission_writes.rs"]
+mod permission_writes;
 #[path = "all/profile_times.rs"]
 mod profile_times;
 #[path = "all/profiling_group_lifecycle.rs"]

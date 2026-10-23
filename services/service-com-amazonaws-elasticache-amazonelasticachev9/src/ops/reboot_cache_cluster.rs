@@ -225,8 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // parameter value can ever be pending here and the association is
         // already reported `in-sync` (`crate::state::PARAMETER_APPLY_STATUS`).
         // The cluster event the reboot's completion creates belongs to
-        // `DescribeEvents`, which is still a scaffolded 501 and owns that gap:
-        // this slice holds no event log to append to.
+        // `DescribeEvents`, which records it from the clock-owed transition.
         Ok(RebootCacheClusterOutput {
             cache_cluster: Some(cluster.to_modeled(true)),
         })

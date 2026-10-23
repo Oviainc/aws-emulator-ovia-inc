@@ -608,9 +608,44 @@ impl AccountClass {
 /// `ValidationExceptionReason`'s value for a request the caller's account class does not
 /// permit (smithy_query: `shape="ValidationExceptionReason"` → `unknownOperation |
 /// cannotParse | fieldValidationFailed | invalidRequestFromMember | disallowedRate |
-/// other`). The wire value is the model's own spelling, so a client that matches on the
-/// modelled enum recognises it.
+/// other`), as the MODEL spells it. The account-class gate puts it on the wire in the
+/// spelling [`gate_reason`] renders, which is what a client reads.
 pub const VALIDATION_REASON_INVALID_REQUEST_FROM_MEMBER: &str = "invalidRequestFromMember";
+
+/// The fixed sentence the account-class gate refuses with.
+///
+/// RECORDED behaviour: the gate's message is operation-INDEPENDENT — it is byte-identical
+/// across every recorded refusal, of seven different operations — so it names no operation
+/// and is one constant rather than a per-operation rendering.
+pub const MEMBER_ACCOUNT_REFUSAL_MESSAGE: &str = "Operation not permitted for member \
+     accounts. This API is only allowed for regular or payer accounts.";
+
+/// A `ValidationExceptionReason` value in the spelling the ACCOUNT-CLASS GATE puts it on
+/// the wire in: the SCREAMING_SNAKE_CASE rendering of the model's lowerCamel enum value
+/// (`invalidRequestFromMember` → `INVALID_REQUEST_FROM_MEMBER`).
+///
+/// RECORDED behaviour, and not a property of the enum: the gate sits in FRONT of the
+/// modelled application layer and spells the reason it names this way for every operation
+/// it refuses, while a refusal raised by the modelled input validator carries the model's
+/// own spelling (`fieldValidationFailed`) — see `crate::service`. Rendering it rather than
+/// restating a second literal keeps the model's value the single source: the value named
+/// at a call site is always one of the enum's own.
+///
+/// Each boundary between a lowercase (or digit) character and an uppercase one becomes an
+/// `_`, which is the inverse of the lowerCamel spelling Smithy enum values use; a value
+/// already in that form is returned unchanged in upper case.
+pub fn gate_reason(modelled_value: &str) -> String {
+    let mut rendered = String::with_capacity(modelled_value.len() + 4);
+    let mut previous_was_lower = false;
+    for character in modelled_value.chars() {
+        if character.is_uppercase() && previous_was_lower {
+            rendered.push('_');
+        }
+        previous_was_lower = character.is_lowercase() || character.is_numeric();
+        rendered.extend(character.to_uppercase());
+    }
+    rendered
+}
 
 /// The account's Pricing Calculator preferences: the preferred rate types for each
 /// kind of account, written by `UpdatePreferences` and reported by `GetPreferences`.
@@ -727,17 +762,19 @@ impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
     /// `reason` ([`VALIDATION_REASON_INVALID_REQUEST_FROM_MEMBER`]) so a client can tell
     /// an account-class refusal from a malformed-field one.
     ///
-    /// `fieldList` is left unset: no field of the request is at fault.
-    pub fn member_account_refusal(&self, operation: &str) -> Option<ValidationException> {
+    /// It takes no operation: the gate's refusal is operation-INDEPENDENT, in both halves
+    /// a client reads — the `reason` and the fixed [`MEMBER_ACCOUNT_REFUSAL_MESSAGE`] —
+    /// so there is nothing per-operation for a caller to pass in. `fieldList` is left
+    /// unset: no field of the request is at fault.
+    pub fn member_account_refusal(&self) -> Option<ValidationException> {
         if self.account_class.may_plan_bills() {
             return None;
         }
         Some(ValidationException {
-            message: format!(
-                "Operation {operation} is not permitted for member accounts. This API is \
-                 only allowed for regular or payer accounts."
-            ),
-            reason: Some(VALIDATION_REASON_INVALID_REQUEST_FROM_MEMBER.to_string()),
+            message: MEMBER_ACCOUNT_REFUSAL_MESSAGE.to_string(),
+            reason: Some(gate_reason(
+                VALIDATION_REASON_INVALID_REQUEST_FROM_MEMBER,
+            )),
             field_list: None,
         })
     }
