@@ -11,6 +11,12 @@
 //! `DescribeStacks` reports once the create completes. A request naming a live stack's
 //! name is refused with the modelled `AlreadyExistsException`.
 //!
+//! It then CREATES those resources in the services that own them, through this
+//! emulator's own in-process callback: see [`crate::state::provisioning`] for which
+//! resource types are created and what a type with no provisioner yet records instead. A
+//! resource an owning service refuses leaves the stack in `CREATE_FAILED` with that
+//! service's own refusal as the reason.
+//!
 //! Members this handler stores but does not act on: `StackPolicyBody` (a stack policy
 //! governs which resources an update may change; `GetStackPolicy` reports it back) and
 //! `ResourceTypes` (which resource types the stack's operations may work with).
@@ -344,7 +350,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(template_body),
             now,
         );
-        stack.region = region;
+        stack.region = region.clone();
         // What the stack reports as `Parameters`: the values the request supplied, plus
         // the template's own `Default` for a declared parameter it passed none for.
         stack.parameters = crate::state::parameters_in_force(
@@ -374,57 +380,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DescribeStacks` reports once the create completes.
         stack.deploy_template();
 
-        let mut store = state.lock();
-        store.settle(now);
+        // The store lock is taken for the write and RELEASED at the end of this block:
+        // the calls that create the stack's resources run after it, and each of those
+        // reaches another service's own handler, which takes that service's lock — a
+        // client reading THIS service meanwhile must not be blocked behind them.
+        let (stack_id, declared) = {
+            let mut store = state.lock();
+            store.settle(now);
 
-        // "The name must be unique in the Region in which you are creating the stack" —
-        // unique among the LIVE stacks: a name is free again once its stack's deletion
-        // has completed.
-        if store
-            .live_stacks()
-            .any(|live| live.stack_name == input.stack_name)
-        {
-            return Err(CreateStackErrorModeled::AlreadyExistsException(
-                AlreadyExistsException {
-                    message: Some(format!("Stack [{}] already exists", input.stack_name)),
-                },
-            )
-            .into());
-        }
+            // "The name must be unique in the Region in which you are creating the stack"
+            // — unique among the LIVE stacks: a name is free again once its stack's
+            // deletion has completed.
+            if store
+                .live_stacks()
+                .any(|live| live.stack_name == input.stack_name)
+            {
+                return Err(CreateStackErrorModeled::AlreadyExistsException(
+                    AlreadyExistsException {
+                        message: Some(format!("Stack [{}] already exists", input.stack_name)),
+                    },
+                )
+                .into());
+            }
 
-        // "The quota for the resource has already been reached": the store holds at most
-        // `MAX_STACKS` live stacks, which is what bounds its growth. Nothing above this
-        // point touched the store, so a refused request leaves it exactly as it was.
-        if store.live_stacks().count() >= crate::state::MAX_STACKS {
-            return Err(CreateStackErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(format!(
-                        "Limit for stacks exceeded: no more than {} stacks can exist in this \
-                         account and Region",
-                        crate::state::MAX_STACKS
-                    )),
-                },
-            )
-            .into());
-        }
+            // "The quota for the resource has already been reached": the store holds at
+            // most `MAX_STACKS` live stacks, which is what bounds its growth. Nothing
+            // above this point touched the store, so a refused request leaves it exactly
+            // as it was.
+            if store.live_stacks().count() >= crate::state::MAX_STACKS {
+                return Err(CreateStackErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Limit for stacks exceeded: no more than {} stacks can exist in \
+                             this account and Region",
+                            crate::state::MAX_STACKS
+                        )),
+                    },
+                )
+                .into());
+            }
 
-        // "After the call completes successfully, the stack creation starts": the stack
-        // is answered in CREATE_IN_PROGRESS and settles to CREATE_COMPLETE once the
-        // clock makes that due. `begin_transition` is what records the operation the
-        // stack reports as its last.
-        stack.begin_transition(
-            now,
-            status::CREATE_IN_PROGRESS,
-            status::CREATE_COMPLETE,
-            Some(operation_id.clone()),
-            input.client_request_token.clone(),
-        );
-        let stack_id = stack.stack_id.clone();
-        store.stacks.push(stack);
+            // "After the call completes successfully, the stack creation starts": the
+            // stack is answered in CREATE_IN_PROGRESS and settles to CREATE_COMPLETE once
+            // the clock makes that due. `begin_transition` is what records the operation
+            // the stack reports as its last.
+            stack.begin_transition(
+                now,
+                status::CREATE_IN_PROGRESS,
+                status::CREATE_COMPLETE,
+                Some(operation_id.clone()),
+                input.client_request_token.clone(),
+            );
+            let stack_id = stack.stack_id.clone();
+            // What the template declared, as the deployment computed it: the resources
+            // whose owning services now have to create them.
+            let declared = stack.current_resources().to_vec();
+            store.stacks.push(stack);
+            (stack_id, declared)
+        };
 
-        Ok(CreateStackOutput {
-            stack_id: Some(stack_id),
+        // "Creates a stack as specified in the template": each declared resource is
+        // created in the service that owns it, and what that service answered is what the
+        // stack records for it. A create has nothing to reconcile against, so the previous
+        // set is empty.
+        let materialised =
+            crate::state::provisioning::reconcile(ctx, &region, declared, &[]).await;
+
+        let output = CreateStackOutput {
+            stack_id: Some(stack_id.clone()),
             operation_id: Some(operation_id),
-        })
+        };
+        let mut store = state.lock();
+        // Unreachable unless the stack was deleted while its resources were being created:
+        // there is then nothing left to record them on.
+        let Some(stack) = store.resolve_mut(&stack_id) else {
+            return Ok(output);
+        };
+        stack.record_materialised_resources(materialised.resources);
+        if let Some(failure) = materialised.failure {
+            // A resource an owning service refused to create: the stack never reaches
+            // CREATE_COMPLETE, and the reason reported is the one that service gave.
+            stack.fail_transition(
+                ::std::time::SystemTime::now(),
+                status::CREATE_FAILED,
+                failure,
+            );
+        }
+
+        Ok(output)
     }
 }
