@@ -196,6 +196,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         let region = crate::state::request_region(ctx);
 
+        // The CMK the request asks for is judged FIRST, before the stream it would be
+        // recorded against is resolved: whether `KeyARN` has to accompany the `KeyType`
+        // asked for is a property of the request alone, so the fault — and the argument
+        // error that reports it — cannot depend on whether the named stream exists.
+        crate::state::check_encryption_configuration_input(&requested, &region)
+            .map_err(refusal_error)?;
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.materialise_due(now);
@@ -255,12 +262,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stream.encryption_status().unwrap_or_default()
             )));
         }
-
-        // The CMK the request asks for is judged only once the stream it would be
-        // recorded against has been found, so a request naming no stream is answered as
-        // the missing stream it is.
-        crate::state::check_encryption_configuration_input(&requested, &region)
-            .map_err(refusal_error)?;
 
         // "The StartDeliveryStreamEncryption and StopDeliveryStreamEncryption operations
         // have a combined limit of 25 calls per Firehose stream per 24 hours." Charged

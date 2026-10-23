@@ -571,9 +571,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        // The group a cluster joins has to exist. Parameter groups are records
-        // this store holds, so a named one can be checked; cluster security
-        // groups and subnet groups are not modelled by this service yet, so a
+        // The group a cluster joins has to exist. Parameter groups and subnet
+        // groups are records this store holds, so a named one is resolved against
+        // it; cluster security groups are not modelled by this service yet, so a
         // request naming one of those is taken at its word.
         let parameter_group_name = match input.cluster_parameter_group_name.as_deref() {
             Some(requested) => {
@@ -660,10 +660,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| snapshot.master_password_secret_arn.is_some());
         let hsm_requested = input.hsm_client_certificate_identifier.is_some()
             || input.hsm_configuration_identifier.is_some();
-        let subnet_group_name = input
+        // "You must provide subnet group name where you want the cluster
+        // restored": the request's own group, or the one the snapshot's source
+        // cluster was in. Either way it is resolved against the store, and the
+        // cluster takes that group's stored name and VPC.
+        let requested_subnet_group = input
             .cluster_subnet_group_name
             .clone()
             .or_else(|| source.and_then(|cluster| cluster.cluster_subnet_group_name.clone()));
+        let subnet_group = match requested_subnet_group.as_deref() {
+            Some(requested) => match store.subnet_group(requested) {
+                Some(group) => Some(group.clone()),
+                None => {
+                    return Err(
+                        RestoreFromClusterSnapshotErrorModeled::ClusterSubnetGroupNotFoundFault(
+                            ClusterSubnetGroupNotFoundFault {
+                                message: Some(format!(
+                                    "Cluster subnet group '{requested}' does not exist."
+                                )),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
 
         let cluster = Cluster {
             cluster_identifier: Some(identifier.clone()),
@@ -738,8 +760,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 parameter_apply_status: Some("in-sync".to_string()),
                 cluster_parameter_status_list: None,
             }]),
-            cluster_subnet_group_name: subnet_group_name.clone(),
-            vpc_id: subnet_group_name.as_deref().map(st::derived_vpc_id),
+            cluster_subnet_group_name: subnet_group
+                .as_ref()
+                .and_then(|group| group.cluster_subnet_group_name.clone()),
+            vpc_id: subnet_group.as_ref().and_then(|group| group.vpc_id.clone()),
             // "Default: A random, system-chosen Availability Zone" — the
             // emulator's choice, derived from the new identifier so it is stable
             // across reads.

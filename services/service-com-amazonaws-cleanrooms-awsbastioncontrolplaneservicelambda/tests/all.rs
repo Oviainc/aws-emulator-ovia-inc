@@ -25,6 +25,8 @@ mod cleanrooms_refusal_classification;
 mod collaboration_change_request_decisions;
 #[path = "all/collaboration_change_requests.rs"]
 mod collaboration_change_requests;
+#[path = "all/configured_table_analysis_rules.rs"]
+mod configured_table_analysis_rules;
 #[path = "all/membership_updates.rs"]
 mod membership_updates;
 #[path = "all/protected_queries.rs"]

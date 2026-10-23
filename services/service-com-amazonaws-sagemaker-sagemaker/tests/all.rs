@@ -29,6 +29,8 @@ mod automl_job_v2_lifecycle;
 mod batch_describe_model_packages;
 #[path = "all/batch_transform_jobs.rs"]
 mod batch_transform_jobs;
+#[path = "all/cluster_scheduler_config_lifecycle.rs"]
+mod cluster_scheduler_config_lifecycle;
 #[path = "all/code_repositories.rs"]
 mod code_repositories;
 #[path = "all/code_repository_deletion.rs"]

@@ -42,6 +42,10 @@ const SOURCE_GROUP: &str = "restore-source-group";
 /// A second group, for the row that names one on the restore request.
 const TARGET_GROUP: &str = "restore-target-group";
 
+/// The cluster subnet group the "restored into a VPC" row names. A restore
+/// resolves the name against the store, so the seeded emulator creates it.
+const SUBNET_GROUP: &str = "restore-subnets";
+
 /// The admin password the source cluster is created with: a restored cluster
 /// uses "the admin credentials the cluster had at the time the snapshot was
 /// taken", and no response may ever echo it.
@@ -110,8 +114,8 @@ type RefusalCase<'a> = (&'a str, Vec<(&'a str, &'a str)>, u16, &'a str);
 type LocatorCase<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
 
 /// An emulator holding [`SOURCE`] and an AVAILABLE snapshot of it, plus the two
-/// parameter groups the cases name. Returns the snapshot's ARN, which one case
-/// restores by.
+/// parameter groups and the one subnet group the cases name. Returns the
+/// snapshot's ARN, which one case restores by.
 async fn seeded_emulator() -> (Emulator, String) {
     let emulator = Emulator::new();
     let family = state::parameter_group_family(state::DEFAULT_CLUSTER_VERSION);
@@ -132,6 +136,24 @@ async fn seeded_emulator() -> (Emulator, String) {
             created.status, created.body
         );
     }
+
+    // A restore into a VPC resolves its `ClusterSubnetGroupName` against the
+    // store, so the group one case names has to exist before it is named.
+    let subnets = emulator
+        .call(
+            "CreateClusterSubnetGroup",
+            &[
+                ("ClusterSubnetGroupName", SUBNET_GROUP),
+                ("Description", "the subnet group a restore case names"),
+                ("SubnetIds.SubnetIdentifier.1", "subnet-restore-a"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        subnets.status, 200,
+        "case seed subnet group {SUBNET_GROUP}: expected 200, got {} with body {}",
+        subnets.status, subnets.body
+    );
 
     let created = emulator.call("CreateCluster", &source_parameters()).await;
     assert_eq!(
@@ -432,9 +454,9 @@ async fn a_request_member_overrides_the_captured_value() {
         (
             "a subnet group puts the restored cluster in a vpc",
             "restored-in-vpc",
-            vec![("ClusterSubnetGroupName", "restore-subnets")],
+            vec![("ClusterSubnetGroupName", SUBNET_GROUP)],
             vec![
-                ("ClusterSubnetGroupName", "restore-subnets"),
+                ("ClusterSubnetGroupName", SUBNET_GROUP),
                 ("VpcId", "placeholder"),
             ],
         ),
@@ -449,11 +471,11 @@ async fn a_request_member_overrides_the_captured_value() {
         );
         let described = describe(&emulator, target).await;
         for (member, expected) in expectations {
-            // The VPC id is DERIVED from the subnet group, so the row names the
-            // group and the expectation is computed the same way the service
-            // does rather than spelled out.
+            // The VPC id is the one the SUBNET GROUP holds, so the row names the
+            // group and the expectation is derived the same way the group's own
+            // record was rather than spelled out.
             let expected = if member == "VpcId" {
-                state::derived_vpc_id("restore-subnets")
+                state::derived_vpc_id(SUBNET_GROUP)
             } else {
                 expected.to_string()
             };
@@ -611,6 +633,16 @@ async fn a_restore_the_service_cannot_perform_is_refused_with_its_modelled_fault
             ],
             404,
             "ClusterParameterGroupNotFound",
+        ),
+        (
+            "a subnet group no record names",
+            vec![
+                ("ClusterIdentifier", "restored-unknown-subnets"),
+                ("SnapshotIdentifier", &lowercased),
+                ("ClusterSubnetGroupName", "no-such-subnet-group"),
+            ],
+            400,
+            "ClusterSubnetGroupNotFoundFault",
         ),
         (
             "a snapshot another account owns",

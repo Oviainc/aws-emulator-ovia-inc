@@ -153,6 +153,19 @@ pub(crate) fn error_code(body: &Value) -> String {
         .unwrap_or_else(|| format!("no __type in {body:?}"))
 }
 
+/// The `message` of an error body. The firehose exceptions model the member as
+/// `message`; a refusal the framework renders uses the same key.
+///
+/// `pub(crate)` beside [`error_code`] so every suite in this test crate reads a refusal
+/// the same way instead of carrying its own copy.
+pub(crate) fn error_message(body: &Value) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("no message in {body:?}"))
+}
+
 /// Walk a `/`-separated path of object keys.
 pub(crate) fn at<'v>(value: &'v Value, path: &str) -> &'v Value {
     let mut cursor = value;

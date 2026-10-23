@@ -84,6 +84,245 @@ fn case_of(row: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// The `VersionStatus` members, from the model:
+/// `smithy_query(query="shape", shape="VersionStatus")` gives
+/// `UNSUPPORTED | STANDARD_SUPPORT | EXTENDED_SUPPORT`.
+const MODELLED_VERSION_STATUS: &[&str] = &["UNSUPPORTED", "STANDARD_SUPPORT", "EXTENDED_SUPPORT"];
+
+/// The `ClusterVersionStatus` members, from the model:
+/// `smithy_query(query="shape", shape="ClusterVersionStatus")` gives
+/// `unsupported | standard-support | extended-support`. These are the tokens the
+/// DEPRECATED `status` FILTER accepts; they are not what a reported row carries.
+const MODELLED_CLUSTER_VERSION_STATUS: &[&str] =
+    &["unsupported", "standard-support", "extended-support"];
+
+// ---------------------------------------------------------------------------
+// RULE: a row's `defaultPlatformVersion` is the platform version a cluster of
+// that Kubernetes version is created at — an `eks.<n>` revision — so the catalog
+// and the cluster slice cannot disagree about which platform a new cluster runs.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_row_publishes_the_platform_version_a_new_cluster_runs() {
+    let (router, _engine) = emulator();
+    let listed = whole_calendar(&router).await;
+
+    // Rows: every Kubernetes version the catalog publishes, pinned on the create,
+    // plus the create that names NO version at all (which lands on the row the
+    // catalog marks `defaultVersion`).
+    let mut cases: Vec<(String, Option<String>)> = listed
+        .iter()
+        .map(|row| (case_of(row), Some(case_of(row))))
+        .collect();
+    cases.push(("version absent".to_string(), None));
+
+    for (case, version) in cases {
+        let name = format!("platform-{}", case.replace(['.', ' '], "-"));
+        let mut body = minimal_request(&name);
+        if let Some(version) = &version {
+            body["version"] = serde_json::Value::String(version.clone());
+        }
+        let created = call(&router, REGION, "POST", "/clusters", &body.to_string()).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: expected HTTP 200 creating a cluster, got {} ({:?})",
+            created.status, created.body
+        );
+        let described = call(
+            &router,
+            REGION,
+            "GET",
+            &format!("/clusters/{}", encode_label(&name)),
+            "",
+        )
+        .await;
+        assert_eq!(
+            described.status, 200,
+            "case {case}: expected HTTP 200 reading the cluster back, got {} ({:?})",
+            described.status, described.body
+        );
+        let cluster = &described.body["cluster"];
+        let ran_version = cluster["version"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: expected a cluster version, got {cluster:?}"))
+            .to_string();
+        let row = listed
+            .iter()
+            .find(|row| case_of(row) == ran_version)
+            .unwrap_or_else(|| {
+                panic!("case {case}: the cluster runs {ran_version:?}, which the catalog must publish")
+            });
+        let published = row["defaultPlatformVersion"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {case}: expected a defaultPlatformVersion, got {row:?}")
+            })
+            .to_string();
+        assert_eq!(
+            cluster["platformVersion"].as_str(),
+            Some(published.as_str()),
+            "case {case}: a new cluster must run the platform version its own row publishes \
+             ({published:?}), got {:?}",
+            cluster["platformVersion"]
+        );
+        // An EKS platform version is `eks.<n>`, the n-th platform revision of a
+        // Kubernetes minor version, so the published value is that form and its
+        // revision is a positive number.
+        let revision = published
+            .strip_prefix("eks.")
+            .unwrap_or_else(|| panic!("case {case}: expected an eks.<n> form, got {published:?}"))
+            .parse::<u32>()
+            .unwrap_or_else(|_| {
+                panic!("case {case}: expected a numeric platform revision, got {published:?}")
+            });
+        assert!(
+            revision >= 1,
+            "case {case}: platform revisions are numbered from 1, got {published:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE: both lifecycle members a row reports carry the SAME state in the current
+// `VersionStatus` spelling — `status` "is deprecated. Use `versionStatus`
+// instead, as that field matches for input and output of this action", so only
+// the current member's tokens match in both directions, while the deprecated
+// member's FILTER keeps the `ClusterVersionStatus` spelling.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn both_lifecycle_members_report_the_current_status_spelling() {
+    let (router, engine) = emulator();
+
+    // Rows: one calendar row per support class, placed by its OWN dates relative
+    // to the clock, so every token the rule can produce is exercised; each row
+    // carries the deprecated spelling of the same state for the filter leg.
+    let now = std::time::SystemTime::now();
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    let cases = [
+        ("4.1", "STANDARD_SUPPORT", "standard-support", 60, 425),
+        ("4.2", "EXTENDED_SUPPORT", "extended-support", -30, 300),
+        ("4.3", "UNSUPPORTED", "unsupported", -600, -200),
+    ];
+    let store = state::service_state(&*engine).expect("the eks store is reachable in-process");
+    store.lock().cluster_versions = cases
+        .iter()
+        .map(|(version, _, _, standard, extended)| ClusterVersionRecord {
+            cluster_version: (*version).to_string(),
+            cluster_type: state::CLUSTER_TYPE_EKS.to_string(),
+            default_version: false,
+            release_date: now - 1000 * day,
+            end_of_standard_support: offset(now, *standard, day),
+            end_of_extended_support: offset(now, *extended, day),
+        })
+        .collect();
+
+    let listed = whole_calendar(&router).await;
+    for (version, expected, deprecated_spelling, _, _) in cases {
+        let row = listed
+            .iter()
+            .find(|row| case_of(row) == version)
+            .unwrap_or_else(|| panic!("case {version}: expected the row to be reported, got {listed:?}"));
+        assert_eq!(
+            row["versionStatus"].as_str(),
+            Some(expected),
+            "case {version}: expected versionStatus {expected:?}, got {:?}",
+            row["versionStatus"]
+        );
+        assert_eq!(
+            row["status"].as_str(),
+            Some(expected),
+            "case {version}: the deprecated member reports the same state in the same (current) \
+             spelling, got {:?}",
+            row["status"]
+        );
+        let reported = row["status"].as_str().unwrap_or_default();
+        assert!(
+            MODELLED_VERSION_STATUS.contains(&reported),
+            "case {version}: a reported status must be a modelled VersionStatus member \
+             ({MODELLED_VERSION_STATUS:?}), got {reported:?}"
+        );
+        assert!(
+            !MODELLED_CLUSTER_VERSION_STATUS.contains(&reported),
+            "case {version}: the ClusterVersionStatus spelling is the FILTER's, not the \
+             report's, got {reported:?}"
+        );
+
+        // The input side is unchanged: the deprecated filter still takes its own
+        // spelling, and the row it selects reports the current one.
+        let filtered = describe_versions(&router, &format!("status={deprecated_spelling}")).await;
+        assert_eq!(
+            filtered.status, 200,
+            "case {version}: expected HTTP 200 filtering on {deprecated_spelling:?}, got {} ({:?})",
+            filtered.status, filtered.body
+        );
+        let selected: Vec<String> = rows(&filtered).iter().map(case_of).collect();
+        assert_eq!(
+            selected,
+            vec![version.to_string()],
+            "case {version}: the deprecated filter spelling {deprecated_spelling:?} must select \
+             the row in that state, got {selected:?}"
+        );
+    }
+}
+
+/// `now` shifted by `days`, which may be negative — the calendar rows above are
+/// placed relative to the clock so the suite never depends on the wall date.
+fn offset(now: std::time::SystemTime, days: i64, day: std::time::Duration) -> std::time::SystemTime {
+    if days >= 0 {
+        now + day * u32::try_from(days).unwrap_or(0)
+    } else {
+        now - day * u32::try_from(-days).unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE: every published scaling tier reports the control-plane component
+// configuration a cluster on that tier runs with — this service publishes one
+// such configuration per version, so a tier's
+// `controlPlaneComponentConfigOverrides` is that version's own configuration
+// rather than a value invented per tier.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_tier_publishes_the_component_configuration_it_runs() {
+    let (router, _engine) = emulator();
+
+    // Rows: every row of the shipped calendar, and within each, every published
+    // tier — the rule is about a tier, not about the first one.
+    for row in whole_calendar(&router).await {
+        let case = case_of(&row);
+        let version_config = &row["controlPlaneComponentConfig"];
+        assert!(
+            version_config.is_object(),
+            "case {case}: expected a controlPlaneComponentConfig object, got {row:?}"
+        );
+        let tiers = row["controlPlaneScalingTiers"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!("case {case}: expected a controlPlaneScalingTiers list, got {row:?}")
+            })
+            .clone();
+        for tier in &tiers {
+            let tier_name = tier["tierName"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case}: expected a tierName, got {tier:?}"))
+                .to_string();
+            let overrides = &tier["controlPlaneComponentConfigOverrides"];
+            assert!(
+                overrides.is_object(),
+                "case {case}/{tier_name}: a tier must publish the component configuration it \
+                 runs with, got {overrides:?}"
+            );
+            assert_eq!(
+                overrides, version_config,
+                "case {case}/{tier_name}: one configuration is published per version, so a \
+                 tier's must be that one, got {overrides:?}"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RULE: every row the catalog reports carries a `kubernetesPatchVersion` of its
 // OWN minor version — the minor version plus a patch level — so a caller reading

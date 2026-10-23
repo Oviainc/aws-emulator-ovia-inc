@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfiguredTableAnalysisRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfiguredTableAnalysisRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints the analysis rule of one configured table and persists it, so a later
+//! `GetConfiguredTableAnalysisRule` reports exactly what was created and the configured
+//! table itself reports the rule's type in `analysisRuleTypes`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfiguredTableAnalysisRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every member the SERVICE decides is computed from the STORED configured table, never
+//! echoed: `configuredTableId` and `configuredTableArn` come from the persisted table the
+//! identifier resolves to, and `createTime` / `updateTime` are the creation instant. The
+//! caller decides only the rule's `type` and its `policy`.
+//!
+//! The two rules the model cannot express are enforced here with the errors the
+//! operation declares:
+//!
+//! * each member of the `ConfiguredTableAnalysisRulePolicyV1` union is the policy of
+//!   exactly one rule type, so a request whose `analysisRuleType` names another type is a
+//!   `ValidationException`
+//!   (`crate::state::configured_table_analysis_rule_policy_type`);
+//! * "Currently, only one analysis rule can be created for a given configured table", so
+//!   a create against a table that already holds one is a `ConflictException` with reason
+//!   `ALREADY_EXISTS`
+//!   (`crate::state::CleanRoomsState::analysis_rule_of_configured_table`).
 //!
 //! ## Shape of an operation
 //!
@@ -157,20 +168,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfiguredTableAnalysisRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfiguredTableAnalysisRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfiguredTableAnalysisRule"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateConfiguredTableAnalysisRuleErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("cleanrooms state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+
+        // The rule belongs to a configured table, so an identifier the store does not
+        // hold is a 404 before anything about the policy is considered.
+        let Some(table) = store
+            .configured_tables
+            .get(&input.configured_table_identifier)
+        else {
+            return Err(
+                CreateConfiguredTableAnalysisRuleErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "configured table {} not found",
+                            input.configured_table_identifier
+                        ),
+                        resource_id: input.configured_table_identifier,
+                        resource_type: st::RESOURCE_TYPE_CONFIGURED_TABLE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let configured_table_id = table.id.clone();
+        let configured_table_arn = table.arn.clone();
+
+        // Each member of the policy union carries the policy of exactly one analysis rule
+        // type, so an `analysisRuleType` naming another type is a combination the model
+        // cannot refuse at the boundary but the service can.
+        let policy_type =
+            st::configured_table_analysis_rule_policy_type(&input.analysis_rule_policy);
+        if input.analysis_rule_type != policy_type {
+            return Err(
+                CreateConfiguredTableAnalysisRuleErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "analysisRulePolicy carries a {policy_type} policy, which does not match analysisRuleType {}",
+                            input.analysis_rule_type
+                        )),
+                        reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "analysisRulePolicy".to_string(),
+                            message: format!(
+                                "must carry the policy of analysisRuleType {}",
+                                input.analysis_rule_type
+                            ),
+                        }]),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Currently, only one analysis rule can be created for a given configured
+        // table." A further create collides with the stored rule whatever type it asks
+        // for; `UpdateConfiguredTableAnalysisRule` is what replaces an existing policy.
+        if let Some(existing) = store.analysis_rule_of_configured_table(&configured_table_id) {
+            let existing_type = existing.r#type.clone();
+            return Err(
+                CreateConfiguredTableAnalysisRuleErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "configured table {configured_table_id} already has a {existing_type} analysis rule; only one analysis rule can be created for a given configured table"
+                        )),
+                        resource_id: Some(configured_table_id.clone()),
+                        resource_type: Some(st::RESOURCE_TYPE_CONFIGURED_TABLE.to_string()),
+                        reason: Some(st::CONFLICT_REASON_ALREADY_EXISTS.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let created_at = st::now();
+        store.insert_configured_table_analysis_rule(ConfiguredTableAnalysisRule {
+            configured_table_id: configured_table_id.clone(),
+            configured_table_arn,
+            policy: input.analysis_rule_policy,
+            r#type: input.analysis_rule_type.clone(),
+            create_time: created_at,
+            update_time: created_at,
+        });
+
+        // Answer from the store, so the response is the persisted rule rather than a
+        // value computed beside it.
+        let Some(analysis_rule) = store
+            .configured_table_analysis_rule(&configured_table_id, &input.analysis_rule_type)
+            .cloned()
+        else {
+            return Err(
+                CreateConfiguredTableAnalysisRuleErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!(
+                            "the {} analysis rule of configured table {configured_table_id} was not persisted",
+                            input.analysis_rule_type
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(CreateConfiguredTableAnalysisRuleOutput { analysis_rule })
     }
 }

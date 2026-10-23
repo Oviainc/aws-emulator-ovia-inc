@@ -159,6 +159,7 @@ pub mod bedrock;
 pub mod db_data_sources;
 pub mod front_door;
 pub mod iam_authorization;
+pub mod iam_role;
 pub mod iam_trust_policy;
 pub mod iot_commands;
 pub mod iot_job_executions;

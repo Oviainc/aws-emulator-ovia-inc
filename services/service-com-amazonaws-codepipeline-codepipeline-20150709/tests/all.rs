@@ -19,6 +19,8 @@ mod action_executions;
 mod action_revisions;
 #[path = "all/action_type_catalog.rs"]
 mod action_type_catalog;
+#[path = "all/custom_action_jobs.rs"]
+mod custom_action_jobs;
 #[path = "all/custom_action_types.rs"]
 mod custom_action_types;
 #[path = "all/execution_engine.rs"]

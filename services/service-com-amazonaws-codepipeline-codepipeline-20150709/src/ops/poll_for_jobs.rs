@@ -1,15 +1,56 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PollForJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PollForJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PollForJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation serves, and to whom
+//!
+//! `PollForJobs` is the CUSTOM action worker's end of the service: a job worker the
+//! ACCOUNT runs polls CodePipeline for the jobs its own action type has waiting.
+//! "PollForJobs is valid only for action types with `Custom` in the owner field. If the
+//! action type contains `AWS` or `ThirdParty` in the owner field, the PollForJobs action
+//! returns an error." Four rules follow from that, and this handler is all four:
+//!
+//! 1. **Only a custom action is polled this way.** An `actionTypeId` naming any other
+//!    `ActionOwner` is refused `ValidationException` (HTTP 400) before anything is
+//!    reported: an `AWS` action is run by AWS, and a `ThirdParty` one by its partner,
+//!    whose jobs `PollForThirdPartyJobs` serves.
+//! 2. **The action type has to exist.** A `Custom` action type exists only because this
+//!    account registered it (`CreateCustomActionType`), so an id the registry does not
+//!    hold is refused `ActionTypeNotFoundException` (HTTP 400) — the built-in catalog
+//!    holds no `Custom` entry, and a job waiting is not what makes an action type
+//!    exist.
+//! 3. **`queryParam` selects.** "For an action type with no queryable properties, this
+//!    value must be null or an empty map. For an action type with a queryable property,
+//!    you must supply that property as a key in the map. Only jobs whose action
+//!    configuration matches the mapped value are returned." A poll that disagrees with
+//!    the registered action type's queryable property is refused
+//!    `ValidationException`; one that agrees selects the jobs whose action
+//!    configuration maps that property to the value it supplied.
+//! 4. **A poll CLAIMS what it reports.** `Job$nonce` is "a system-generated random
+//!    number that CodePipeline uses to ensure that the job is being worked on by only
+//!    one job worker", so a job this poll reports is handed to the worker that polled:
+//!    a fresh nonce is minted for it and it is withheld from later polls until that
+//!    claim lapses ([`crate::state::JOB_POLL_LEASE`]), after which it is available
+//!    again — with a NEW nonce, so the one the lapsed claim published no longer reaches
+//!    it. Everything else about the job is REPORTED from the store, not from the poll.
+//!
+//! The jobs themselves are queued by the execution plane: when an execution reaches an
+//! action whose action type is `Custom`, CodePipeline cannot run it, so
+//! [`crate::state::driver`] queues the job this operation hands out and leaves the
+//! action `InProgress` until a worker reports its result. A poll therefore first
+//! materialises the execution steps the CLOCK has already made due (the sanctioned "a
+//! call may write only to materialise a change the clock already made due" case, the
+//! same one `GetPipelineState` performs) — for the pipelines with an execution that can
+//! still move, since the request names no pipeline of its own — and then reports what is
+//! waiting. A custom action type with nothing waiting is answered with no jobs rather
+//! than with an invented one.
+//!
+//! `JobData$artifactCredentials` — the "temporary credentials for the S3 bucket used to
+//! store artifacts" the doc below mentions — stays ABSENT, for the reason
+//! [`crate::state::JobRecord::to_data`] records: it is an STS session SCOPED to the
+//! artifact bucket, this emulator's credential store holds no policies to scope one
+//! with, and a job is released by paths with no credential store in reach, so nothing
+//! would ever revoke it. The artifact LOCATIONS a worker needs are reported in full.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +153,52 @@ impl From<PollForJobsErrorModeled> for PollForJobsError {
     }
 }
 
+/// The refusal for an `actionTypeId` whose owner is not `Custom`, built from the four
+/// identifying fields the request named.
+fn not_a_custom_action_message(id: &ActionTypeId) -> String {
+    format!(
+        "PollForJobs is valid only for an action type whose owner is {}, but \
+         ActionType.Category='{}' ActionType.Owner='{}' ActionType.Provider='{}' \
+         ActionType.Version='{}'",
+        crate::state::ACTION_OWNER_CUSTOM,
+        id.category,
+        id.owner,
+        id.provider,
+        id.version
+    )
+}
+
+/// The `queryParam` entry a poll supplied, checked against the queryable configuration
+/// property the registered action type declares, if any.
+///
+/// Both halves of what the model states about the member, in one place: an action type
+/// with no queryable property takes no `queryParam` at all, and one that declares a
+/// queryable property is polled BY it. The refusal names the property, so a caller can
+/// correct the call from the message alone.
+fn selector<'a>(
+    queryable: Option<&str>,
+    query: &'a [(String, String)],
+) -> Result<Option<(&'a str, &'a str)>, String> {
+    match (queryable, query) {
+        (None, []) => Ok(None),
+        (None, [(name, _), ..]) => Err(format!(
+            "queryParam: the action type declares no queryable configuration property, \
+             so queryParam must be null or an empty map, but it names {name}"
+        )),
+        (Some(property), []) => Err(format!(
+            "queryParam: the action type declares the queryable configuration property \
+             {property}, which a poll must supply as a key in queryParam"
+        )),
+        (Some(property), [(name, value), ..]) if name == property => {
+            Ok(Some((name.as_str(), value.as_str())))
+        }
+        (Some(property), [(name, _), ..]) => Err(format!(
+            "queryParam: {name} is not a queryable configuration property of the action \
+             type, whose queryable property is {property}"
+        )),
+    }
+}
+
 /// The `PollForJobs` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -148,18 +235,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PollForJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PollForJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PollForJobs"))
+        let state = crate::state::require_state(&*self.engine)?;
+        let action_type = &input.action_type_id;
+
+        // Rule 1: only a custom action's jobs are polled for here.
+        if action_type.owner != crate::state::ACTION_OWNER_CUSTOM {
+            return Err(PollForJobsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(not_a_custom_action_message(action_type)),
+                },
+            )
+            .into());
+        }
+
+        // Rule 2: the action type has to be one this account registered — and rule 3
+        // is checked against that registration's queryable property. At most one
+        // property of an action type is queryable (the registration refuses more).
+        let queryable = {
+            let store = state.lock();
+            let Some(registered) =
+                store.registered_action_type(&crate::state::ActionTypeKey::from_id(action_type))
+            else {
+                return Err(PollForJobsErrorModeled::ActionTypeNotFoundException(
+                    ActionTypeNotFoundException {
+                        message: Some(crate::state::action_type_not_found_message(action_type)),
+                    },
+                )
+                .into());
+            };
+            registered
+                .configuration_properties
+                .iter()
+                .find(|property| property.queryable)
+                .map(|property| property.name.clone())
+        };
+
+        // Rule 3: what this poll selects on, or the refusal for a `queryParam` the
+        // action type cannot be polled by. The member is modelled `len 0..1`, so there
+        // is at most one pair to consider.
+        let query: Vec<(String, String)> = input
+            .query_param
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let selected = selector(queryable.as_deref(), &query).map_err(|message| {
+            PollForJobsError::from(PollForJobsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            ))
+        })?;
+
+        // A job is queued when an execution REACHES a custom action, which is a step
+        // the clock owes (see `state::driver`). The request names no pipeline, so the
+        // pipelines with an execution that can still move are the ones walked; one
+        // whose executions have all settled is owed nothing.
+        let pipelines = state.lock().pipelines_with_live_executions();
+        for pipeline in pipelines {
+            crate::state::advance(&*self.engine, ctx, &pipeline).await;
+        }
+
+        // Rule 4: the jobs still waiting for this action type, oldest first, at most
+        // `maxBatchSize` of them, each handed to this worker with a fresh nonce.
+        let now = ::std::time::SystemTime::now();
+        let leased = {
+            let mut store = state.lock();
+            // A job whose action is no longer waiting for a worker (it was abandoned by
+            // a stop, or it reached an outcome) is not work any more: it is forgotten
+            // rather than handed out.
+            store.retire_finished_jobs();
+            store.lease_jobs(
+                action_type,
+                crate::state::poll_limit(input.max_batch_size),
+                selected,
+                now,
+            )
+        };
+
+        Ok(PollForJobsOutput {
+            // An absent list and an empty one state the same fact, and AWS omits the
+            // member.
+            jobs: (!leased.is_empty())
+                .then(|| leased.iter().map(crate::state::JobRecord::to_job).collect()),
+        })
     }
 }

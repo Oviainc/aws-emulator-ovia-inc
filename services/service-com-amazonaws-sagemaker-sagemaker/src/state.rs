@@ -71,6 +71,11 @@ use crate::ops::types::{
     TransformOutput, TransformResources, UserContext, VpcConfig,
 };
 
+/// The cluster-policy slice of this state: HyperPod clusters and the cluster policies
+/// on them, with their own records, quota, status span and id mint. Reached through the
+/// single [`ComAmazonawsSagemakerSagemakerState::cluster_policies`] field.
+pub mod cluster_policy;
+
 /// The ARN service namespace (`arnNamespace` in the model's `aws.api#service` trait,
 /// also SageMaker's sigv4 signing name).
 pub const ARN_SERVICE: &str = "sagemaker";
@@ -1470,6 +1475,9 @@ pub fn model_package_lookup_key(identifier: &str) -> &str {
 /// Per-service state for com-amazonaws-sagemaker-sagemaker. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSagemakerSagemakerState {
+    /// HyperPod clusters and the cluster policies on them: one field for that whole
+    /// slice, whose records, quota, statuses and id mint live in [`cluster_policy`].
+    pub cluster_policies: cluster_policy::Store,
     /// Keyed by [`entity_key`] of `ExperimentName`. See [`Experiment`], with the rest
     /// of the experiment-management slice.
     pub experiments: BTreeMap<String, Experiment>,
@@ -3330,6 +3338,18 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// inherent `impl` block, beside this slice's own types rather than in the one above.
     pub fn clusters_below_quota(&self) -> bool {
         self.clusters.len() < CLUSTER_QUOTA
+    }
+
+    /// The cluster whose `ClusterArn` is `arn`, if this account holds one.
+    ///
+    /// [`Self::clusters`] is keyed by `ClusterName` — the identifier `CreateCluster`
+    /// takes — while another resource that BELONGS to a cluster names it by ARN
+    /// (`CreateClusterSchedulerConfig$ClusterArn`), so the lookup is by the stored
+    /// `Cluster::arn`. One place for it, so every operation resolving a `ClusterArn`
+    /// resolves it against the same records `CreateCluster` writes and `ListClusters`
+    /// reports, rather than against a second copy of the cluster.
+    pub fn cluster_by_arn(&self, arn: &str) -> Option<&Cluster> {
+        self.clusters.values().find(|cluster| cluster.arn == arn)
     }
 }
 

@@ -183,8 +183,8 @@ use crate::state::{
     self, CertificateAuthorityRecord, ClusterRecord, CLUSTER_ACTIVATION_DELAY,
     DEFAULT_AUTHENTICATION_MODE,
     DEFAULT_KUBERNETES_VERSION, DEFAULT_PUBLIC_ACCESS_CIDR_V4, DEFAULT_PUBLIC_ACCESS_CIDR_V6,
-    DEFAULT_SERVICE_IPV4_CIDR, DEFAULT_SUPPORT_TYPE, INITIAL_PLATFORM_VERSION, IP_FAMILY_IPV4,
-    IP_FAMILY_IPV6, MAX_CLUSTERS, MAX_STORED_CLUSTERS, STATUS_CREATING,
+    DEFAULT_SERVICE_IPV4_CIDR, DEFAULT_SUPPORT_TYPE, IP_FAMILY_IPV4,
+    IP_FAMILY_IPV6, MAX_CLUSTERS, MAX_STORED_CLUSTERS, PLATFORM_VERSION, STATUS_CREATING,
 };
 use std::time::SystemTime;
 
@@ -564,7 +564,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .clone()
                     .unwrap_or_else(|| DEFAULT_KUBERNETES_VERSION.to_string()),
             ),
-            platform_version: Some(INITIAL_PLATFORM_VERSION.to_string()),
+            platform_version: Some(PLATFORM_VERSION.to_string()),
             role_arn: Some(input.role_arn.clone()),
             resources_vpc_config: Some(resources_vpc_config),
             kubernetes_network_config: Some(kubernetes_network_config),

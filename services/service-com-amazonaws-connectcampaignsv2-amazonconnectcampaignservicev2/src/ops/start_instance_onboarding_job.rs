@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartInstanceOnboardingJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartInstanceOnboardingJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartInstanceOnboardingJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Onboards a Connect instance to Campaigns: persists the `encryptionConfig` the call
+//! carries as that instance's onboarding record and reports the record's job status,
+//! which starts `IN_PROGRESS` and the clock moves to `SUCCEEDED`.
 //!
 //! ## Shape of an operation
 //!
@@ -118,6 +112,53 @@ impl From<StartInstanceOnboardingJobErrorModeled> for StartInstanceOnboardingJob
     }
 }
 
+/// Refuse an `encryptionConfig` whose members cannot hold together, with the
+/// modelled `ValidationException` (HTTP 400) naming the member at fault.
+///
+/// Only what `EncryptionConfig`'s own documentation states, which the shape cannot
+/// express: a KMS key id is needed when encryption is enabled, and KMS is the only
+/// supported encryption type. The doc says nothing about a key sent with encryption
+/// disabled, so that combination is accepted and persisted as sent rather than
+/// refused on a rule the service is not known to enforce.
+fn check_encryption_config(
+    config: &EncryptionConfig,
+) -> Result<(), StartInstanceOnboardingJobError> {
+    let key = config.key_arn.as_deref().unwrap_or_default();
+    let refuse = |message: String| -> Result<(), StartInstanceOnboardingJobError> {
+        Err(StartInstanceOnboardingJobErrorModeled::ValidationException(
+            ValidationException {
+                message,
+                x_amz_error_type: None,
+            },
+        )
+        .into())
+    };
+
+    // `EncryptionType`'s catalog (`ENCRYPTION_TYPE_VALUES`) holds KMS alone, so any
+    // other type is refused whether or not encryption is enabled. A backstop rather
+    // than the first line of defence: `encryptionType` targets a modelled enum, so
+    // the boundary validator refuses an off-catalog value before `handle` runs — but
+    // only this check keeps the handler's own contract if that walk ever widens.
+    if let Some(encryption_type) = config.encryption_type.as_deref() {
+        if !ENCRYPTION_TYPE_VALUES.contains(&encryption_type) {
+            return refuse(format!(
+                "encryptionConfig.encryptionType: {encryption_type} is not a supported encryption \
+                 type; supported types are {}",
+                ENCRYPTION_TYPE_VALUES.join(", ")
+            ));
+        }
+    }
+
+    if config.enabled && key.is_empty() {
+        return refuse(
+            "encryptionConfig.keyArn: a KMS key arn is required when encryption is enabled"
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
 /// The `StartInstanceOnboardingJob` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -154,18 +195,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartInstanceOnboardingJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartInstanceOnboardingJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartInstanceOnboardingJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartInstanceOnboardingJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the ConnectCampaignsV2 instance onboarding store is unavailable"
+                        .to_string(),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // The rules the `EncryptionConfig` shape cannot express, which its own
+        // documentation states: "If disabled, service will perform encryption with
+        // its own key. If enabled, a KMS key id needs to be provided ... KMS is only
+        // type supported".
+        if let Err(refusal) = check_encryption_config(&input.encryption_config) {
+            crate::state::audit_onboarding_change(
+                ctx.parts(),
+                Self::NAME,
+                &input.connect_instance_id,
+                "ValidationException",
+            );
+            return Err(refusal);
+        }
+
+        // Starting the job is what persists the instance's config, so the write
+        // happens here rather than in the reporting operations; the job itself is
+        // owed by the clock, which is why the record carries the instant it is due
+        // to have finished rather than a status nothing would ever move.
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(stored) =
+            store.start_instance_onboarding(&input.connect_instance_id, input.encryption_config, now)
+        else {
+            // The store is bounded: past its ceiling the call is refused rather than
+            // growing the process without limit. Of the errors this operation
+            // models, the conflict is the one that fits — the service's own state,
+            // not the request, is what stops it.
+            crate::state::audit_onboarding_change(
+                ctx.parts(),
+                Self::NAME,
+                &input.connect_instance_id,
+                "ConflictException",
+            );
+            return Err(StartInstanceOnboardingJobErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "The maximum number of onboarded Connect instances ({}) already exist",
+                        crate::state::MAX_ONBOARDED_INSTANCES
+                    ),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // The call changed what this service holds for the instance, so it leaves an
+        // audit record naming the caller, the instance and the outcome.
+        crate::state::audit_onboarding_change(
+            ctx.parts(),
+            Self::NAME,
+            &stored.connect_instance_id,
+            "accepted",
+        );
+
+        Ok(StartInstanceOnboardingJobOutput {
+            connect_instance_onboarding_job_status: Some(stored.to_job_status(now)),
+        })
     }
 }

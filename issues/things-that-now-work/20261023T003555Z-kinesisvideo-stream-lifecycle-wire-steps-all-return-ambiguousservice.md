@@ -34,6 +34,41 @@ Issue-Commit: 0adaad19e8652dfd7295bc52b170efe472707b44
 
 # kinesisvideo stream lifecycle wire steps all return AmbiguousService 500
 
+## Resolution
+
+FIXED by the request-claim rule, which each of the five services that share the SigV4
+signing name AND the endpointPrefix `kinesisvideo` (Kinesis Video, Kinesis Video Media,
+Kinesis Video Archived Media, Kinesis Video WebRTC Storage, Kinesis Video Signaling) now
+applies in its `can_handle`: the request's resolved routing key must name this endpoint AND
+the request must address this service's OWN modelled URI path space — the framework's
+`emulator_server::can_handle_based_on_route_key_and_path` over each crate's generated
+`ROUTE_PATH_SEGMENTS`, matched by exact segment equality — instead of claiming every
+`kinesisvideo`-signed request on the signing name alone. The five models' path spaces are
+disjoint at the first segment, so exactly one service claims each request, the router no
+longer refuses any of them as `500 AmbiguousService`, and every answer is rendered in the
+owning service's own `restJson1` envelope (`application/json`, with the modelled code in
+`x-amzn-errortype`) rather than the router's `awsJson1.1` one. That claim conjunct landed
+on mainline from the sibling report
+`20261022T145739Z-kinesis-video-media-router-rejects-every-kinesisvideo-prefix-request-with-ambiguousservice.md`,
+which is the same emulator defect seen from the behavioural corpus; this change keeps it and
+adds the coverage the wire causes above need, in
+`core/router/tests/all/kinesisvideo_signing_name_routing.rs`: that every answer from the
+assembled router carries the `restJson1` envelope (over a success, a handler's modelled 404,
+a boundary refusal and a scaffolded operation's 501), and that a stream created through the
+shared endpoint reads back BY THE `StreamARN` IT RETURNED through `DescribeStream` and
+`ListStreams`, with that ARN checked against the modelled `ResourceARN` form.
+
+ONE CAUSE IS DECLINED, and is recorded here so it is not lost: cause 5, `DescribeStream`
+after a delete reporting `200` with `StreamInfo.Status` `DELETING`
+(`kinesis-video-stream-lifecycle-create-describe-delete#task#7`). Its `500 AmbiguousService`
+is gone, but that step now answers `404 ResourceNotFoundException`, because `DeleteStream`
+removes the record when the call returns rather than holding it in a transient `DELETING`
+status for a clock-owed span. That is `DeleteStream`'s own behaviour — not a routing
+failure — and it is asserted as it stands by that crate's landed
+`tests/all/stream_lifecycle.rs` (describe-after-delete is `404`, a second delete of the same
+ARN is `404`, and the freed quota slot is reusable), so changing it belongs to its own issue
+for the transient `DELETING` state rather than to this one.
+
 > _Note: this issue was identified against the code base at commit `0adaad19e8652dfd7295bc52b170efe472707b44`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

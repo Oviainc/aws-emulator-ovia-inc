@@ -57,6 +57,29 @@ use std::sync::Arc;
 /// code and the message together.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
+/// The error code Firehose answers a value that is not an IAM role ARN with.
+///
+/// NOT a modelled shape — the service model carries no `InvalidParameterValueException`,
+/// and `CreateDeliveryStream`'s modelled error set is `InvalidArgumentException`,
+/// `InvalidKMSResourceException`, `LimitExceededException`, `ResourceInUseException`
+/// (`smithy_query(query="operation", operation="CreateDeliveryStream")`). Firehose
+/// nevertheless answers a role ARN of the wrong SHAPE under this code rather than under
+/// the generic constraint error: it validates the role itself, and it is the code a
+/// client branches on, so it is what this service answers too.
+const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValueException";
+
+/// The `@pattern` a `RoleARN` member carries
+/// (`smithy_query(query="shape", shape="RoleARN")`), which is what says a value is being
+/// read as an IAM role ARN rather than as any other constrained string. Every `RoleARN`
+/// member of every operation targets that one shape, so matching the expression — and not
+/// a member path — is what makes the rule below hold wherever a role is taken.
+const ROLE_ARN_PATTERN: &str = r"^arn:.*:iam::\d{12}:role/[a-zA-Z_0-9+=,.@\-_/]+$";
+
+/// What Firehose states for a role ARN that does not have the shape of one: the fault is
+/// the role, and the sentence names neither the value nor the member, because a role is
+/// validated by the service and not by the generic constraint walk.
+const INVALID_ROLE_ARN: &str = "Invalid role ARN.";
+
 /// Render one constraint violation the way Firehose states it: the member path and the
 /// violated constraint, and NOTHING of the value that was rejected.
 ///
@@ -285,6 +308,30 @@ pub fn exactly_one_of_message(members: &[&str]) -> String {
     format!("Exactly one of {alternatives} must be specified.")
 }
 
+/// Whether a boundary refusal is ABOUT a role ARN: one of its violations is a `@pattern`
+/// violation of the `RoleARN` expression.
+///
+/// Keyed to the expression the model constrains every `RoleARN` member with, so the rule
+/// holds for whichever member of whichever operation carried the value — the destination
+/// role of a create, the source role, a VPC or secret role, the role of an update — and
+/// never to a path spelled out here. A refusal that ALSO carries other violations is
+/// still answered as the role fault: Firehose validates the role itself, so that is the
+/// fault it reports.
+fn refused_role_arn(violations: &[Violation]) -> bool {
+    violations.iter().any(|violation| {
+        matches!(&violation.kind, ViolationKind::Pattern(pattern) if pattern == ROLE_ARN_PATTERN)
+    })
+}
+
+/// A role Firehose could not assume: the ARN the request named, and what to do about it.
+///
+/// The role ARN is the caller's own value and the sentence is built from it, which is why
+/// it is stated — unlike a stream name, a role ARN is not a name in this account's
+/// namespace that a refusal could disclose by echoing.
+pub fn unassumable_role_message(role_arn: &str) -> String {
+    format!("Firehose is unable to assume role {role_arn}. Please check the role provided.")
+}
+
 /// The `com-amazonaws-firehose-firehose-20150804` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -346,9 +393,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // string. The code stays the `ValidationException` (HTTP 400) the framework would
         // have answered; only the wording changes.
         //
+        // A role ARN is the exception: Firehose validates a `RoleARN` member itself, so a
+        // value that is not shaped like an IAM role ARN is answered under the service's
+        // own parameter-value code and sentence, and the generic constraint walk is not
+        // the terminal responder for it ([`refused_role_arn`]).
+        //
         // An authentication refusal keeps the framework's wording: it is not an
         // input-constraint failure.
         match refusal {
+            Refusal::Invalid(violations) if refused_role_arn(violations) => Some(Refused {
+                code: INVALID_PARAMETER_VALUE.to_string(),
+                message: INVALID_ROLE_ARN.to_string(),
+            }),
             Refusal::Invalid(violations) => Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),
                 message: constraint_envelope(violations)?,

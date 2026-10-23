@@ -155,10 +155,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Removing the export frees its name: the ARN a later CreateExport mints for that
         // name in that region is this key, and it is no longer taken.
         store.exports.remove(&input.export_arn).ok_or_else(|| {
-            DeleteExportErrorModeled::ResourceNotFoundException(crate::state::export_not_found(
+            crate::state::export_not_found_error(
                 &input.export_arn,
-            ))
+                DeleteExportErrorModeled::ResourceNotFoundException,
+            )
         })?;
+        // An execution is an execution OF this export, addressed by `(ExportArn,
+        // ExecutionId)`: with the export gone there is nothing for its executions to
+        // belong to, so the delete takes them with it and no reader reports the history of
+        // an export that no longer exists.
+        store.remove_executions_of(&input.export_arn);
         drop(store);
 
         Ok(DeleteExportOutput {

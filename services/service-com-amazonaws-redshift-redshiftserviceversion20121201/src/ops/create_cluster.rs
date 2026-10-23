@@ -8,6 +8,12 @@
 //! it cannot reach the wire. A second create with the same identifier is refused
 //! with `ClusterAlreadyExistsFault`.
 //!
+//! The groups the request names the cluster into are resolved against the store
+//! BEFORE the cluster is allocated: an unknown `ClusterSubnetGroupName` answers
+//! `ClusterSubnetGroupNotFoundFault` and an unknown `ClusterParameterGroupName`
+//! answers `ClusterParameterGroupNotFoundFault`, so a refused create leaves no
+//! cluster behind for a later read to report.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -472,6 +478,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cluster_version
             .clone()
             .unwrap_or_else(|| st::DEFAULT_CLUSTER_VERSION.to_string());
+
+        // Every group the request names a cluster into has to EXIST: each is a
+        // record of this service's control plane, so the name is resolved against
+        // the store and a name that resolves to nothing is answered with that
+        // resource's own modelled NotFound fault — before any cluster is
+        // allocated, so a refused create leaves no cluster behind. Cluster
+        // security groups, HSM configurations and snapshot schedules are resources
+        // this service does not model yet (their creates are still 501 stubs), so
+        // there is no state to resolve those names against and a request naming
+        // one is taken at its word.
+        let subnet_group = match input.cluster_subnet_group_name.as_deref() {
+            Some(requested) => match store.subnet_group(requested) {
+                Some(group) => Some(group.clone()),
+                None => {
+                    return Err(
+                        CreateClusterErrorModeled::ClusterSubnetGroupNotFoundFault(
+                            ClusterSubnetGroupNotFoundFault {
+                                message: Some(format!(
+                                    "Cluster subnet group '{requested}' does not exist."
+                                )),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+        // "Default: The default Amazon Redshift cluster parameter group" — the
+        // default group of this engine version's family, which every account has.
+        let parameter_group_name = match input.cluster_parameter_group_name.as_deref() {
+            Some(requested) => {
+                let name = st::normalized_parameter_group_name(requested);
+                if store.parameter_group(&name).is_none() {
+                    return Err(
+                        CreateClusterErrorModeled::ClusterParameterGroupNotFoundFault(
+                            ClusterParameterGroupNotFoundFault {
+                                message: Some(format!(
+                                    "Cluster parameter group not found: {requested}"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                name
+            }
+            None => st::default_parameter_group(&cluster_version),
+        };
+
         let hsm_requested = input.hsm_client_certificate_identifier.is_some()
             || input.hsm_configuration_identifier.is_some();
         let cluster = Cluster {
@@ -521,20 +577,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect(),
             ),
             cluster_parameter_groups: Some(vec![ClusterParameterGroupStatus {
-                parameter_group_name: Some(
-                    input
-                        .cluster_parameter_group_name
-                        .clone()
-                        .unwrap_or_else(|| st::default_parameter_group(&cluster_version)),
-                ),
+                parameter_group_name: Some(parameter_group_name),
                 parameter_apply_status: Some(st::PARAMETER_APPLY_STATUS_IN_SYNC.to_string()),
                 cluster_parameter_status_list: None,
             }]),
-            cluster_subnet_group_name: input.cluster_subnet_group_name.clone(),
-            vpc_id: input
-                .cluster_subnet_group_name
-                .as_deref()
-                .map(st::derived_vpc_id),
+            // The group's OWN stored name and VPC: a cluster launched into a
+            // subnet group is in the VPC that group's subnets are in, so the two
+            // records cannot disagree.
+            cluster_subnet_group_name: subnet_group
+                .as_ref()
+                .and_then(|group| group.cluster_subnet_group_name.clone()),
+            vpc_id: subnet_group.as_ref().and_then(|group| group.vpc_id.clone()),
             availability_zone: Some(
                 input
                     .availability_zone
