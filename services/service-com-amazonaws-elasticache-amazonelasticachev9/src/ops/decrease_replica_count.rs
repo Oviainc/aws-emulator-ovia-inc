@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DecreaseReplicaCount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DecreaseReplicaCount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DecreaseReplicaCount::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -190,18 +186,191 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DecreaseReplicaCount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DecreaseReplicaCountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DecreaseReplicaCount"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `ApplyImmediately` is documented with one accepted value — "if True,
+        // the number of replica nodes is decreased immediately.
+        // ApplyImmediately=False is not currently supported" — so a deferred
+        // request is refused rather than accepted and never applied.
+        if !input.apply_immediately {
+            return Err(DecreaseReplicaCountErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(
+                        "Invalid value false for ApplyImmediately: ApplyImmediately=False is not \
+                         currently supported."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Argument validation FIRST: this operation validates its arguments
+        // before it resolves `ReplicationGroupId`, which is why an id the
+        // account does not hold is answered `InvalidParameterValue` below
+        // rather than `ReplicationGroupNotFoundFault`. See
+        // `crate::state::replica_count_targets`.
+        let targets = match crate::state::replica_count_targets(
+            input.new_replica_count,
+            input.replica_configuration.as_deref().unwrap_or_default(),
+        ) {
+            Ok(targets) => targets,
+            Err(crate::state::ReplicaCountRefusal::Value(message)) => {
+                return Err(DecreaseReplicaCountErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::ReplicaCountRefusal::Combination(message)) => {
+                return Err(
+                    DecreaseReplicaCountErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+        let replicas_to_remove = input.replicas_to_remove.clone().unwrap_or_default();
+
+        let key = input.replication_group_id.to_ascii_lowercase();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(group) = store.settled_replication_group_mut(&key, now) else {
+            return Err(DecreaseReplicaCountErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "Replication group {} does not exist.",
+                        input.replication_group_id
+                    )),
+                },
+            )
+            .into());
+        };
+        if group.status != crate::state::STATUS_AVAILABLE {
+            return Err(
+                DecreaseReplicaCountErrorModeled::InvalidReplicationGroupStateFault(
+                    InvalidReplicationGroupStateFault {
+                        message: Some(format!(
+                            "Replication group {key} is in {} state, not {}.",
+                            group.status,
+                            crate::state::STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // What each shard is asked to end up with, resolved against the shards
+        // the group actually has.
+        let requested: Vec<(String, i32)> = match targets {
+            crate::state::ReplicaTargets::EveryShard(count) => group
+                .node_groups
+                .iter()
+                .map(|node_group| (node_group.node_group_id.clone(), count))
+                .collect(),
+            crate::state::ReplicaTargets::PerShard(targets) => targets,
+        };
+        for (node_group_id, target) in &requested {
+            if !group
+                .node_groups
+                .iter()
+                .any(|node_group| &node_group.node_group_id == node_group_id)
+            {
+                return Err(DecreaseReplicaCountErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {node_group_id} for NodeGroupId: replication group \
+                             {key} has no such node group."
+                        )),
+                    },
+                )
+                .into());
+            }
+            // "Decrease": a target that is not below the shard's current
+            // replica count asks for nothing, which is what `NoOperationFault`
+            // is for.
+            let current = group
+                .shard_replica_count(node_group_id)
+                .unwrap_or_default();
+            if *target >= current {
+                return Err(DecreaseReplicaCountErrorModeled::NoOperationFault(
+                    NoOperationFault {
+                        message: Some(format!(
+                            "Node group {node_group_id} of replication group {key} already has \
+                             {current} replicas."
+                        )),
+                    },
+                )
+                .into());
+            }
+            // "The minimum number of replicas in a shard or replication group
+            // is: … if Multi-AZ: 1", because a Multi-AZ group needs a replica
+            // to fail over to.
+            if *target == 0 && group.multi_az == crate::state::FAILOVER_ENABLED {
+                return Err(DecreaseReplicaCountErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value 0 for NewReplicaCount: replication group {key} has \
+                             Multi-AZ enabled, so each node group keeps at least one replica."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        // "A list of the node ids to remove from the replication group or node
+        // group (shard)": each has to be a replica this group holds — removing
+        // the primary is what a failover is for.
+        for named in &replicas_to_remove {
+            let is_replica = requested
+                .iter()
+                .any(|(node_group_id, _)| group.is_shard_replica(node_group_id, named));
+            if !is_replica {
+                return Err(DecreaseReplicaCountErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {named} for ReplicasToRemove: replication group {key} \
+                             has no such replica."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The change is applied to the stored shards — the named replicas go
+        // first, and the rest from the end, each taking its member CLUSTER with
+        // it — and the group answers `modifying` until the clock settles it.
+        for (node_group_id, target) in &requested {
+            store.set_shard_replica_count(&key, node_group_id, *target, &replicas_to_remove, now);
+        }
+        let Some(group) = store.replication_groups.get_mut(&key) else {
+            // Unreachable: resolved under this same lock above.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        group.begin_transition(crate::state::STATUS_MODIFYING, now);
+
+        let Some(answer) = store.modeled_replication_group(&key) else {
+            // Unreachable, for the same reason.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        Ok(DecreaseReplicaCountOutput {
+            replication_group: Some(answer),
+        })
     }
 }

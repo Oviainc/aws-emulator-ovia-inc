@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCacheSecurityGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCacheSecurityGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeCacheSecurityGroups::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -153,18 +149,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCacheSecurityGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCacheSecurityGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The whole cache-security-group surface is closed for this account, so
+        // this reporting operation has nothing to report FROM and does not
+        // answer an empty list: a client probing whether the construct is usable
+        // is told that it is not. See
+        // `crate::state::CACHE_SECURITY_GROUPS_UNSUPPORTED`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCacheSecurityGroups"))
+        // The refusal is account-wide, not per name, which is why the request is
+        // not read: a cache security group is the pre-VPC (EC2-Classic) access
+        // construct, this emulator provisions no EC2-Classic network (every
+        // cluster is placed in a VPC `CacheSubnetGroup`), and the recorded
+        // behaviour for such an account is this same refusal to every call on
+        // the surface — the traces are listed in the issue this was filed from,
+        // `issues/.../elasticache-nine-operation-families-answer-notimplemented-instead-of.md`
+        // (cause 1). If an account that DOES have EC2-Classic is ever modelled,
+        // this is the handler that reads the stored groups instead.
+        let _ = (input, ctx, &self.engine);
+        Err(
+            DescribeCacheSecurityGroupsErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(crate::state::CACHE_SECURITY_GROUPS_UNSUPPORTED.to_string()),
+                },
+            )
+            .into(),
+        )
     }
 }

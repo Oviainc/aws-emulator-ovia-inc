@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::cache_cluster_lifecycle::{params, Emulator, Reply};
+use crate::harness::{params, Emulator, Reply};
 
 /// Long enough past [`state::SERVERLESS_CACHE_TRANSITION`] that the clock owes a
 /// serverless cache its next status; the handlers never sleep, so only the test

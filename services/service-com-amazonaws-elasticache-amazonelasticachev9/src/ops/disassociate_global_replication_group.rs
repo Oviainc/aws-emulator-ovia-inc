@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateGlobalReplicationGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateGlobalReplicationGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DisassociateGlobalReplicationGroup::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -153,18 +149,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateGlobalReplicationGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateGlobalReplicationGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateGlobalReplicationGroup"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        let key = input.global_replication_group_id.to_ascii_lowercase();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(group) = store.settled_global_replication_group_mut(&key, now) else {
+            return Err(
+                DisassociateGlobalReplicationGroupErrorModeled::GlobalReplicationGroupNotFoundFault(
+                    GlobalReplicationGroupNotFoundFault {
+                        message: Some(format!(
+                            "Global Replication Group {} not found.",
+                            input.global_replication_group_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        if !crate::state::GLOBAL_ACTIONABLE_STATUSES.contains(&group.status.as_str()) {
+            return Err(
+                DisassociateGlobalReplicationGroupErrorModeled::InvalidGlobalReplicationGroupStateFault(
+                    InvalidGlobalReplicationGroupStateFault {
+                        message: Some(format!(
+                            "Global Replication Group {key} is in {} state, not {}.",
+                            group.status,
+                            crate::state::GLOBAL_ACTIONABLE_STATUSES.join(" or ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The replication group has to be a member of THIS datastore, in the
+        // region the request names: a pair that is not one is refused rather
+        // than leaving the membership untouched behind a 200.
+        let Some(member) = group.member(&input.replication_group_id, &input.replication_group_region)
+        else {
+            return Err(
+                DisassociateGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {} for ReplicationGroupId: it is not a member of \
+                             Global Replication Group {key} in {}.",
+                            input.replication_group_id, input.replication_group_region
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "Remove a secondary cluster from the Global datastore": the primary
+        // is what the datastore is built around, so it leaves only with the
+        // datastore itself (`DeleteGlobalReplicationGroup`).
+        if member.role == crate::state::GLOBAL_ROLE_PRIMARY {
+            return Err(
+                DisassociateGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {} for ReplicationGroupId: the primary of Global \
+                             Replication Group {key} cannot be disassociated.",
+                            input.replication_group_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        group.members.retain(|member| {
+            member.replication_group_id != input.replication_group_id
+                || member.region != input.replication_group_region
+        });
+        // The datastore answers `modifying` until the clock settles it — at
+        // `primary-only` once the last secondary has gone.
+        group.begin_transition(crate::state::STATUS_MODIFYING, now);
+        let answer = group.to_modeled(true);
+
+        // The replication group that left stops reporting the datastore, so the
+        // two records agree.
+        if let Some(replication_group) = store
+            .replication_groups
+            .get_mut(&input.replication_group_id.to_ascii_lowercase())
+        {
+            replication_group.global_replication_group_id = None;
+            replication_group.global_member_role = None;
+        }
+
+        Ok(DisassociateGlobalReplicationGroupOutput {
+            global_replication_group: Some(answer),
+        })
     }
 }

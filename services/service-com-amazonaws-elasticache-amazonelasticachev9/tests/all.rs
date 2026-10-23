@@ -23,6 +23,10 @@ mod cache_parameter_groups;
 mod engine_default_parameters;
 #[path = "all/events.rs"]
 mod events;
+#[path = "all/harness.rs"]
+mod harness;
+#[path = "all/modeled_error_surfaces.rs"]
+mod modeled_error_surfaces;
 #[path = "all/rbac_users.rs"]
 mod rbac_users;
 #[path = "all/replication_group_lifecycle.rs"]
@@ -48,12 +52,10 @@ mod update_actions;
 
 // Declared after the list above rather than inside it: suites land in this file
 // concurrently, and every insertion into the sorted run collides with another
-// branch's insertion at the same place. These two are the snapshot-rule suite
-// and the two drivers it calls through.
+// branch's insertion at the same place. This is the snapshot-rule suite; the two
+// drivers it calls through live in the shared `harness` module declared above.
 #[path = "all/snapshot_lifecycle.rs"]
 mod snapshot_lifecycle;
-#[path = "all/harness.rs"]
-mod harness;
 
 // Appended for the same reason: these two are the `DescribeUsers` describe-axis
 // suite and the page walk that calls through its helpers.
