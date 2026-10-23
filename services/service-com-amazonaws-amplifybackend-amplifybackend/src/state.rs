@@ -68,6 +68,57 @@ pub fn invalid_app_id_message() -> String {
     format!("{ERROR_MESSAGE_PREFIX}Invalid appId passed.")
 }
 
+/// The message every AmplifyBackend operation AWS has WITHDRAWN from SDK and AWS CLI
+/// callers answers with: [`ERROR_MESSAGE_PREFIX`] plus the sentence that names the
+/// channel the operation is still reachable through.
+///
+/// Recorded behaviour, not modelled: AmplifyBackend's Studio-only mutations are refused
+/// for EVERY SDK/CLI call, input-independent, with HTTP 400, the error code
+/// `ValidationException` and this fixed text. The status and the code are the
+/// requirement; the sentence is the one the recordings of this family carry.
+pub fn studio_only_message() -> String {
+    format!(
+        "{ERROR_MESSAGE_PREFIX}Operation not supported through SDK/AWS CLI. \
+         Please use Amplify Studio"
+    )
+}
+
+/// Refuse an operation AWS serves only through Amplify Studio.
+///
+/// The refusal is the operation's WHOLE behaviour: it is answered before the request is
+/// read or any state is touched, so the call is deterministic in the operation alone and
+/// leaves nothing behind. HTTP 400 with the error code `ValidationException`, which is
+/// not a shape this service's model declares, so it is raised through the crate's own
+/// [`crate::scaffolded::Scaffolded::validation`] channel — the same channel the
+/// app-identity gate uses ([`require_registered_app`]), for the same reason: the code is
+/// what a client matches on, and the recording decides it.
+///
+/// Generic over the operation's modelled error enum, so one refusal serves every
+/// withdrawn operation and cannot be worded two ways.
+pub fn studio_only<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::validation(studio_only_message())
+}
+
+/// The refusal a RESOURCE READ whose lookup does not resolve answers: HTTP 404 with the
+/// error code `ResourceNotFoundException`, and a message that says what was asked for,
+/// built from the request and carrying this service's fixed [`ERROR_MESSAGE_PREFIX`].
+///
+/// Recorded behaviour, not modelled: AmplifyBackend's resource reads answer the wire
+/// error code `ResourceNotFoundException` for a resource that was never created, which no
+/// shape in this service's model carries — the modelled `NotFoundException` would put a
+/// different code on the wire than the service does, and the code is what a client
+/// matches on. It is therefore raised through the crate's own
+/// [`crate::scaffolded::Scaffolded::resource_not_found`] channel.
+///
+/// `sentence` is the service's own sentence, WITHOUT the prefix, which this function
+/// adds: a caller passes "no storage resource … exists …", never the whole message.
+pub fn resource_not_found<E>(sentence: impl AsRef<str>) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::resource_not_found(format!(
+        "{ERROR_MESSAGE_PREFIX}{}",
+        sentence.as_ref()
+    ))
+}
+
 /// Whether `app_id` identifies an Amplify app this emulator has registered.
 ///
 /// The registry is this service's own `apps` map: `CreateBackend` is the one operation in

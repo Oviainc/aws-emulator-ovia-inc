@@ -164,8 +164,12 @@ struct Op {
     body: Option<Value>,
     /// The status this same call answers for a REGISTERED app that holds one backend
     /// environment (`ENVIRONMENT`) and nothing else: either the success, or the
-    /// per-resource `NotFoundException` the request's other identifiers earn.
+    /// per-resource not-found refusal the request's other identifiers earn.
     registered_status: u16,
+    /// The error code that refusal carries, empty when the call succeeds. Not one code
+    /// for every operation: this service answers the modelled `NotFoundException` for
+    /// some resources and the recorded `ResourceNotFoundException` for others.
+    registered_code: &'static str,
 }
 
 /// Every operation this service implements that addresses an existing app, with the
@@ -180,6 +184,7 @@ fn operations(app_id: &str) -> Vec<Op> {
             path: format!("/backend/{app_id}/details"),
             body: Some(json!({})),
             registered_status: 200,
+            registered_code: "",
         },
         Op {
             name: "ListBackendJobs",
@@ -187,6 +192,7 @@ fn operations(app_id: &str) -> Vec<Op> {
             path: format!("/backend/{app_id}/job/{ENVIRONMENT}"),
             body: Some(json!({})),
             registered_status: 200,
+            registered_code: "",
         },
         Op {
             name: "GetBackendJob",
@@ -195,6 +201,7 @@ fn operations(app_id: &str) -> Vec<Op> {
             body: None,
             // The app exists; job 999 does not.
             registered_status: 404,
+            registered_code: "NotFoundException",
         },
         Op {
             name: "DeleteBackend",
@@ -202,6 +209,7 @@ fn operations(app_id: &str) -> Vec<Op> {
             path: format!("/backend/{app_id}/environments/{ENVIRONMENT}/remove"),
             body: Some(json!({})),
             registered_status: 200,
+            registered_code: "",
         },
         Op {
             name: "GetBackendAuth",
@@ -210,6 +218,7 @@ fn operations(app_id: &str) -> Vec<Op> {
             body: Some(json!({ "resourceName": "authone" })),
             // The app and the environment exist; no auth resource was created.
             registered_status: 404,
+            registered_code: "NotFoundException",
         },
         Op {
             name: "CreateBackendAuth",
@@ -221,6 +230,18 @@ fn operations(app_id: &str) -> Vec<Op> {
                 "resourceConfig": auth_config(),
             })),
             registered_status: 200,
+            registered_code: "",
+        },
+        Op {
+            name: "GetBackendStorage",
+            method: "POST",
+            path: format!("/backend/{app_id}/storage/{ENVIRONMENT}/details"),
+            body: Some(json!({ "resourceName": "storageone" })),
+            // The app and the environment exist; no storage resource was recorded. That
+            // read answers the recorded `ResourceNotFoundException`, not the modelled
+            // shape — see `src/ops/get_backend_storage.rs`.
+            registered_status: 404,
+            registered_code: "ResourceNotFoundException",
         },
         Op {
             name: "CreateToken",
@@ -228,6 +249,7 @@ fn operations(app_id: &str) -> Vec<Op> {
             path: format!("/backend/{app_id}/challenge"),
             body: Some(json!({})),
             registered_status: 200,
+            registered_code: "",
         },
         Op {
             name: "GetToken",
@@ -236,6 +258,7 @@ fn operations(app_id: &str) -> Vec<Op> {
             body: None,
             // The app exists; no token with that session id was minted.
             registered_status: 404,
+            registered_code: "NotFoundException",
         },
         Op {
             name: "DeleteToken",
@@ -243,6 +266,7 @@ fn operations(app_id: &str) -> Vec<Op> {
             path: format!("/backend/{app_id}/challenge/sess-1/remove"),
             body: Some(json!({})),
             registered_status: 404,
+            registered_code: "NotFoundException",
         },
     ]
 }
@@ -433,8 +457,8 @@ async fn a_registered_app_reaches_its_own_resources() {
         if answer.status == 404 {
             assert_eq!(
                 answer.code(),
-                "NotFoundException",
-                "case {:?}: a missing resource is the modelled NotFoundException, got {}",
+                op.registered_code,
+                "case {:?}: a missing resource answers this operation's not-found code, got {}",
                 op.name,
                 answer.body
             );
@@ -455,8 +479,9 @@ struct ErrorCase {
 }
 
 /// The envelope rule holds for every error this service renders, not just the identity
-/// refusal: the rows differ in the error KIND — a modelled 404, a modelled 400, the
-/// identity 400 and the scaffold's 501 — and each carries the `code`, the
+/// refusal: the rows differ in the error KIND — a modelled 404, the recorded
+/// `ResourceNotFoundException` 404, a modelled 400, the identity 400, the Studio-only
+/// withdrawal's 400 and the scaffold's 501 — and each carries the `code`, the
 /// charset-qualified media type and an `ETag`.
 #[tokio::test]
 async fn every_error_response_carries_the_code_and_the_service_headers() {
@@ -487,6 +512,30 @@ async fn every_error_response_carries_the_code_and_the_service_headers() {
             method: "POST",
             path: "/backend/dnotregistered9/details".to_string(),
             body: Some(json!({})),
+        },
+        ErrorCase {
+            name: "a storage resource that was never recorded",
+            status: 404,
+            code: "ResourceNotFoundException",
+            method: "POST",
+            path: format!("/backend/{REGISTERED_APP}/storage/{ENVIRONMENT}/details"),
+            body: Some(json!({ "resourceName": "storageone" })),
+        },
+        ErrorCase {
+            name: "an operation AWS serves only through Amplify Studio",
+            status: 400,
+            code: VALIDATION_EXCEPTION,
+            method: "POST",
+            path: format!("/backend/{REGISTERED_APP}/storage"),
+            body: Some(json!({
+                "backendEnvironmentName": ENVIRONMENT,
+                "resourceName": "storageone",
+                "resourceConfig": {
+                    "bucketName": "gate-storage-bucket",
+                    "permissions": { "authenticated": ["READ"] },
+                    "serviceName": "S3"
+                },
+            })),
         },
         ErrorCase {
             name: "an operation this emulator has not implemented",

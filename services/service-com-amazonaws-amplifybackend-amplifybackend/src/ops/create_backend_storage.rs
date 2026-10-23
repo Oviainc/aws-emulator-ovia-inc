@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBackendStorage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBackendStorage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBackendStorage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! WITHDRAWN from SDK and AWS CLI callers by AWS: every call is refused, deterministically
+//! and input-independently, with HTTP 400, the error code `ValidationException` and the
+//! fixed message [`crate::state::studio_only_message`] — the operation is reachable only
+//! through Amplify Studio. Nothing is read and nothing is stored, so no storage resource,
+//! no job record and no `JobId` comes into being for a caller on this channel, and a
+//! later `GetBackendStorage` reports no such resource.
+//!
+//! Recorded behaviour, not modelled: the model describes `CreateBackendStorage` as an
+//! ordinary 200 operation answering a job record (`AppId`, `BackendEnvironmentName`,
+//! `JobId`, `Status`), and declares no `ValidationException` at all — so the refusal is
+//! raised through [`crate::state::studio_only`], the crate's own channel for a
+//! client-input error this service's model does not carry. The recordings of this family
+//! show the same fixed refusal for AmplifyBackend's Studio-only mutations, and the
+//! emulator serves SDK/CLI callers exclusively.
+//!
+//! This is NOT the scaffold's 501: a 501 says "nobody has written this yet", while this
+//! refusal is the operation's real, permanent answer on this channel — a client that
+//! branches on `ValidationException`, or retries a 5xx, has to see the AWS answer.
+//!
+//! What is deliberately NOT here, so a reader can tell a decision from a gap: no app or
+//! environment lookup, no `ResourceName` or `ResourceConfig` validation and no quota
+//! check. The refusal precedes all of them on the recorded path, so adding one would make
+//! a withdrawn operation answer a second error code for some inputs and leak whether a
+//! resource exists.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +167,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
+        // The refusal is input-independent: it is the answer to the OPERATION, on every
+        // SDK/CLI call, so neither the request nor the store decides anything here. The
+        // engine is left untouched, which is what "the call stores nothing" means.
         let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBackendStorage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBackendStorageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBackendStorage"))
+        Err(crate::state::studio_only())
     }
 }

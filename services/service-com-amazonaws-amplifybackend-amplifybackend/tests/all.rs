@@ -17,6 +17,8 @@ mod app_registration_gate;
 mod backend_job_listing;
 #[path = "all/backend_lifecycle.rs"]
 mod backend_lifecycle;
+#[path = "all/backend_storage.rs"]
+mod backend_storage;
 #[path = "all/challenge_tokens.rs"]
 mod challenge_tokens;
 #[path = "all/s3_buckets.rs"]

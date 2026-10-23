@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBackendStorage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBackendStorage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBackendStorage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the storage resource held under (AppId, BackendEnvironmentName,
+//! ResourceName): its `BucketName`, `ServiceName` and `Permissions` exactly as they were
+//! recorded, plus `Imported`. A REPORTING operation — it writes nothing, so two calls
+//! with no intervening mutation answer identically.
+//!
+//! A lookup that does not resolve answers HTTP 404 with the error code
+//! `ResourceNotFoundException` ([`crate::state::resource_not_found`]): recorded
+//! behaviour, and NOT the modelled `NotFoundException`, whose wire code would differ from
+//! the one the service puts on the wire. The three ways the lookup can fail — the app
+//! holds no backend, the environment was never created, no storage resource of that name
+//! exists — are ONE refusal, so the branch it failed on is not leaked. An `AppId` that
+//! identifies no registered Amplify app is still refused first, with HTTP 400
+//! `ValidationException` ([`crate::state::require_registered_app`]), because that is a
+//! statement about the request rather than about a resource.
+//!
+//! Note what this means today: `CreateBackendStorage` is WITHDRAWN from SDK/CLI callers
+//! by AWS and stores nothing (see that operation's own module doc), and
+//! `ImportBackendStorage` is still a scaffold, so no operation an SDK/CLI caller can
+//! reach brings a storage resource into being — this read reports what the store holds,
+//! which for such a caller is "no such resource", exactly as the recording shows after a
+//! refused create.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +91,17 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The sentence AmplifyBackend's storage read answers a lookup that does not resolve
+/// with, after this service's fixed [`crate::state::ERROR_MESSAGE_PREFIX`].
+///
+/// Recorded behaviour, not modelled, and NOT built from the request: the refusal is one
+/// fixed sentence whatever app, environment or resource name was asked about — the same
+/// shape of rule as the app-identity refusal's
+/// [`crate::state::invalid_app_id_message`]. It names `amplify-meta.json` because that
+/// is the file Amplify keeps a backend's resource metadata in, which is what the service
+/// reports it could not find the resource in.
+const STORAGE_NOT_FOUND_SENTENCE: &str = "Given Storage resource not found in amplify-meta.json";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,18 +174,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBackendStorage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBackendStorageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBackendStorage"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetBackendStorageError::from(GetBackendStorageErrorModeled::GatewayTimeoutException(
+                crate::state::store_unavailable(),
+            ))
+        })?;
+
+        // The app-identity gate, BEFORE any per-resource lookup: a well-formed app id
+        // that identifies no registered Amplify app is a client-input error (400
+        // `ValidationException`), not a missing resource.
+        crate::state::require_registered_app(&*self.engine, &input.app_id)?;
+
+        // ONE refusal for the whole lookup: this read does not distinguish "this app has
+        // no backend" from "that environment was never created" from "no storage resource
+        // of that name exists" — the recorded answer for an unresolvable
+        // (app, environment, resource) triple is a single `ResourceNotFoundException`
+        // (404) carrying one FIXED sentence, so the branch the lookup failed on, and the
+        // identifiers it was asked about, are not leaked to the caller.
+        let store = state.lock();
+        let storage = store
+            .app(&input.app_id)
+            .and_then(|app| app.environment(&input.backend_environment_name))
+            .and_then(|environment| environment.storage.get(&input.resource_name))
+            .ok_or_else(|| {
+                crate::state::resource_not_found::<GetBackendStorageErrorModeled>(
+                    STORAGE_NOT_FOUND_SENTENCE,
+                )
+            })?;
+
+        Ok(GetBackendStorageOutput {
+            app_id: Some(input.app_id.clone()),
+            backend_environment_name: Some(input.backend_environment_name.clone()),
+            resource_config: Some(GetBackendStorageResourceConfig {
+                // Reported as stored: absent for a resource recorded without a bucket
+                // name, never invented here.
+                bucket_name: storage.bucket_name.clone(),
+                // `Imported` separates a bucket this service created from one ADOPTED
+                // from a bucket that already existed. The map this read answers from is
+                // filled by a create, so a resource it holds is not an imported one; the
+                // adopting operation, `ImportBackendStorage`, is still a scaffold and
+                // will have to record the distinction when it is implemented.
+                imported: false,
+                permissions: Some(storage.permissions.clone()),
+                service_name: storage.service_name.clone(),
+            }),
+            resource_name: Some(input.resource_name.clone()),
+        })
     }
 }
