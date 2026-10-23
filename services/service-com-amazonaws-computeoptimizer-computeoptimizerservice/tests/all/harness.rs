@@ -55,17 +55,31 @@ pub(crate) async fn call(
     operation: &str,
     body: Value,
 ) -> (u16, Value) {
+    call_in_region(router, "us-east-1", operation, body).await
+}
+
+/// The same call at the endpoint of `region` — the region a client's SigV4 credential scope
+/// names — for a suite that asserts what a regional endpoint reports.
+pub(crate) async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
         .header("content-type", "application/x-amz-json-1.0")
         .header("x-amz-target", format!("ComputeOptimizerService.{operation}"))
-        // The SigV4 credential scope is what routes a request to its service.
+        // The SigV4 credential scope is what routes a request to its service, and the
+        // region it names is the regional endpoint the request addressed.
         .header(
             "authorization",
-            "AWS4-HMAC-SHA256 \
-             Credential=AKIDEXAMPLE/20260101/us-east-1/compute-optimizer/aws4_request, \
-             SignedHeaders=host;x-amz-target, Signature=not-verified",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIDEXAMPLE/20260101/{region}/compute-optimizer/aws4_request, \
+                 SignedHeaders=host;x-amz-target, Signature=not-verified"
+            ),
         )
         .body(Bytes::from(body.to_string()))
         .expect("build the request");

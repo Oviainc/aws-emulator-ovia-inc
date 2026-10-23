@@ -37,7 +37,8 @@ use crate::ops::types::{
     CachedMethods, CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
     DefaultCacheBehavior, Distribution, DistributionConfig, DistributionSummary,
     EntityAlreadyExists, EntityNotFound, ForwardedValues, FunctionAssociations, GeoRestriction,
-    Invalidation, InvalidationBatch, InvalidTagging, KGKeyPairIds, KeyPairIds, KeyValueStore,
+    Invalidation, InvalidationBatch, InvalidationSummary, InvalidTagging, KGKeyPairIds, KeyPairIds,
+    KeyValueStore,
     LambdaFunctionAssociations, LoggingConfig, NoSuchDistribution, NoSuchInvalidation,
     NoSuchResource, Origin, OriginSslProtocols, Paths, Restrictions, Signer, Tag, Tags,
     TrustedKeyGroups, TrustedSigners, ViewerCertificate,
@@ -480,6 +481,18 @@ impl StoredInvalidation {
             invalidation_batch: self.batch.clone(),
         }
     }
+
+    /// The `InvalidationSummary` projection a list page carries — "a summary of an
+    /// invalidation request" — read from the SAME stored record
+    /// [`StoredInvalidation::to_invalidation`] reports, so a summary and a read of the
+    /// same invalidation can never disagree about its status or its creation time.
+    pub fn to_summary(&self) -> InvalidationSummary {
+        InvalidationSummary {
+            id: self.id.clone(),
+            create_time: ::aws_smithy_types::DateTime::from(self.create_time),
+            status: self.status.clone(),
+        }
+    }
 }
 
 /// One CloudFront distribution, as this emulator persists it.
@@ -528,6 +541,29 @@ impl StoredDistribution {
                 invalidation.status = STATUS_COMPLETED.to_string();
             }
         }
+    }
+
+    /// This distribution's invalidations in the order a list serves them.
+    ///
+    /// CloudFront documents the order on `ListInvalidations`'s `Marker`: "the results are
+    /// returned in decreasing order from most recent to oldest, [so] the most recent
+    /// results are on the first page". Two invalidations stamped with the SAME instant are
+    /// ordered by id, which makes this a stable TOTAL order rather than merely a sorted
+    /// one — and that is what lets a `Marker` naming one of them resume at exactly one
+    /// position.
+    ///
+    /// Reads [`StoredInvalidation::status`] nowhere, so the caller decides whether to
+    /// settle the clock first; every list handler does, because the summaries it builds
+    /// from these records report that status.
+    pub fn invalidations_most_recent_first(&self) -> Vec<&StoredInvalidation> {
+        let mut ordered: Vec<&StoredInvalidation> = self.invalidations.values().collect();
+        ordered.sort_by(|left, right| {
+            right
+                .create_time
+                .cmp(&left.create_time)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        ordered
     }
 
     /// "The number of invalidation batches currently in progress" — counted from the

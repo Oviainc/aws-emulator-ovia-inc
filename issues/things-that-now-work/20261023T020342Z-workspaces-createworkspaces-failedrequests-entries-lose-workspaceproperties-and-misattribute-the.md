@@ -46,3 +46,34 @@ Model grounding: FailedCreateWorkspaceRequest.WorkspaceRequest is documented as 
 2. Call CreateWorkspaces with a batch in which at least one WorkspaceRequest carries WorkspaceProperties (e.g. RunningMode ALWAYS_ON) and cannot be created, and one whose DirectoryId resolves but whose BundleId does not.
 3. Inspect the 200 response: each FailedRequests[].WorkspaceRequest has no WorkspaceProperties member (step task#3 / setup#3).
 4. Inspect the entry with the unknown BundleId: ErrorCode is 'ResourceNotFound.Directory' where the recording has 'ResourceNotFound.Bundle'.
+
+## Resolution
+
+Cause 1 — FIXED. `state::effective_workspace_properties()` resolves a create element's
+`WorkspaceProperties` once (the submitted properties plus the service's default
+`RunningMode` = `ALWAYS_ON` for an omitted one, `state::DEFAULT_RUNNING_MODE`), and that
+effective set is both echoed in every `FailedRequests` entry and persisted on the record
+`PendingRequests` and `DescribeWorkspaces` report, so the member is never absent and a
+retry of an echoed `WorkspaceRequest` asks for the same WorkSpace. Pinned by
+`tests/all/create_workspaces_effective_properties.rs`.
+Declined within cause 1: `$.FailedRequests[*].WorkspaceRequest.WorkspaceProperties.RecycleMode`.
+`RecycleMode` is not a member of `com.amazonaws.workspaces#WorkspaceProperties` in the
+on-disk model (nine members, none of that name), so no echo can carry it on the wire; this
+report itself records it as recorded behaviour only, with the requirement being that
+`WorkspaceProperties` is present and reflects the effective properties.
+
+Cause 2 — DECLINED (keys `$.FailedRequests[*].ErrorCode` and `$.FailedRequests[*].ErrorMessage`,
+one unit: workspaces-create-workspaces-batch-start-stop-reboot). The emulator already
+reports the resource that actually failed to resolve — `ResourceNotFound.Bundle` for a
+`BundleId` the store does not hold, `ResourceNotFound.Directory` only for an unregistered
+`DirectoryId` — which `a_refusal_names_the_resource_that_failed_to_resolve` pins over a
+table; the hypothesis that the handler never reaches the bundle lookup does not hold. The
+recorded element's `DirectoryId` resolves only in the recording's account (see step 2
+above), and no step of the fixture calls `RegisterWorkspaceDirectory`, so in the emulator
+BOTH of that element's references are unresolvable and naming the directory is the truthful
+report (an element with two failures and one `ErrorCode` reports the first in the model's
+`WorkspaceRequest` member order, `DirectoryId` before `BundleId`). Resolving the bundle
+first was tried and measured: it makes this entry answer `Bundle` but makes the entry this
+and the other five fixtures record as `Directory` answer `Bundle` too, because its recorded
+`BundleId` is an AWS catalog id the emulator's seeded catalog does not hold — six units
+broken to fix one, and only a case keyed to the recorded ids could separate them.

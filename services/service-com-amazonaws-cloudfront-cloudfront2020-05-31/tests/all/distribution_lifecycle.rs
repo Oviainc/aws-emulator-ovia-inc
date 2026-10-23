@@ -354,7 +354,7 @@ pub(crate) async fn list_distributions(router: &MultiServiceRouter, query: &str)
     .await
 }
 
-async fn create_invalidation(
+pub(crate) async fn create_invalidation(
     router: &MultiServiceRouter,
     distribution_id: &str,
     batch: &str,
@@ -369,7 +369,7 @@ async fn create_invalidation(
     .await
 }
 
-async fn get_invalidation(
+pub(crate) async fn get_invalidation(
     router: &MultiServiceRouter,
     distribution_id: &str,
     invalidation_id: &str,
@@ -612,7 +612,7 @@ pub(crate) fn config_table() -> Vec<Config> {
 
 /// An `InvalidationBatch` XML body for `paths` under `reference`, stating the quantity
 /// `paths` really has.
-fn batch_xml(reference: &str, paths: &[&str]) -> String {
+pub(crate) fn batch_xml(reference: &str, paths: &[&str]) -> String {
     batch_xml_with_quantity(reference, paths, paths.len() as i32)
 }
 
@@ -648,7 +648,7 @@ pub(crate) fn is_distribution_id(value: &str) -> bool {
 }
 
 /// An invalidation id's shape: `I` followed by 13 uppercase alphanumerics.
-fn is_invalidation_id(value: &str) -> bool {
+pub(crate) fn is_invalidation_id(value: &str) -> bool {
     match value.strip_prefix('I') {
         Some(body) => {
             body.len() == 13

@@ -247,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {
-                let cursor = crate::state::decode_idle_page_token(token).filter(|cursor| {
+                let cursor = crate::state::decode_offset_page_token(token).filter(|cursor| {
                     cursor.selection_fingerprint == selection_fingerprint
                 });
                 let Some(cursor) = cursor else {
@@ -347,7 +347,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|arn| guard.idle_recommendations.get(arn).is_none())
             .map(|arn| IdleRecommendationError {
                 identifier: Some(arn.clone()),
-                code: Some(crate::state::IDLE_NO_RECOMMENDATION_CODE.to_string()),
+                code: Some(crate::state::NO_RECOMMENDATION_CODE.to_string()),
                 message: Some(
                     "Compute Optimizer has no idle resource recommendation for the resource this \
                      identifier names."
@@ -368,7 +368,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let has_more = page.len() > page_size;
         let page: Vec<IdleRecommendation> = page.into_iter().take(page_size).collect();
         let next_token = has_more.then(|| {
-            crate::state::encode_idle_page_token(&crate::state::IdlePageCursor {
+            crate::state::encode_offset_page_token(&crate::state::PageCursor {
                 offset: offset.saturating_add(page.len()),
                 selection_fingerprint,
             })
