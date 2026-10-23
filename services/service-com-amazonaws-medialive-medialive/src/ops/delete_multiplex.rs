@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMultiplex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMultiplex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMultiplex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +153,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMultiplex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMultiplexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMultiplex"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Transitions the clock had already made due were owed whether or not
+        // this delete ran, so they are materialised before anything is read: a
+        // multiplex whose `CREATING` or `STOPPING` span has passed is `IDLE`,
+        // and that is the state this delete is judged against.
+        state.settle(now);
+
+        let multiplex = state.multiplexes.get_mut(&input.multiplex_id).ok_or_else(|| {
+            DeleteMultiplexErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    "Multiplex",
+                    &input.multiplex_id,
+                )),
+            })
+        })?;
+
+        // "Delete a multiplex. The multiplex must be idle." — so deleting one
+        // that is still creating, starting, running, stopping, already deleting
+        // or deleted is the resource being in a condition that prevents the
+        // action, which is the 409 `ConflictException` this operation models (the
+        // same answer `DeleteChannel` gives a channel that is not idle), and it
+        // writes nothing: a refused delete is never a no-op.
+        if !multiplex.is_deletable() {
+            return Err(DeleteMultiplexErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::not_idle_message(
+                    "Multiplex",
+                    &input.multiplex_id,
+                    multiplex.state(),
+                )),
+            })
+            .into());
+        }
+        multiplex.begin_delete(now);
+
+        // The response is the multiplex as it now stands: `DELETING`. The clock
+        // owes it the terminal `DELETED` state, which the multiplex then keeps —
+        // the record stays in the account, so `DescribeMultiplex` goes on
+        // reporting the multiplex in that state (what the SDK's
+        // `MultiplexDeleted` waiter polls for) instead of losing it, while every
+        // mutation of that id is refused from then on.
+        let multiplex = state
+            .multiplex_description(&input.multiplex_id)
+            .ok_or_else(unavailable)?;
+
+        Ok(crate::state::multiplex_description_output!(
+            DeleteMultiplexOutput,
+            multiplex
+        ))
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no multiplex store to delete from. A modelled server error, never
+/// a fresh engine (which would drop the deletion on return).
+fn unavailable() -> DeleteMultiplexError {
+    DeleteMultiplexErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

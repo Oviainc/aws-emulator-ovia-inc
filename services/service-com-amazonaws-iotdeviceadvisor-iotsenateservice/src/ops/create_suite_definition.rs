@@ -3,8 +3,8 @@
 //! @op CreateSuiteDefinition
 //!
 //! Mints a suite definition and PERSISTS it in [`crate::state`]: a new UUID id, the ARN,
-//! the creation timestamps, the configuration snapshot as version `v1`, and the tags. The
-//! response is projected from the stored record, so `GetSuiteDefinition` and
+//! the creation timestamps, the live configuration under version label `v1`, and the tags.
+//! The response is projected from the stored record, so `GetSuiteDefinition` and
 //! `ListSuiteDefinitions` answer from the same bytes.
 //!
 //! `clientToken` is an `@idempotencyToken`: a retry carrying a token this service already
@@ -234,7 +234,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: id.clone(),
             arn: arn.clone(),
             latest_version: first_version.clone(),
-            versions: [(first_version, config)].into_iter().collect(),
+            versions: [first_version].into_iter().collect(),
+            configuration: config,
             created_at: now,
             last_modified_at: now,
         };

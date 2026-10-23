@@ -148,10 +148,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // Tags belong to a resource, so there has to be one: the only resource this
-        // service's ARNs name is an invoice unit, and one a delete has retired is no
-        // longer a resource.
-        if store.live_invoice_unit(&input.resource_arn).is_none() {
+        // Tags belong to a resource, so there has to be one: any resource this
+        // service's ARNs name, and an invoice unit a delete has retired is no longer a
+        // resource (see `crate::state::resource_exists`).
+        if !store.resource_exists(&input.resource_arn) {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::no_such_resource(&input.resource_arn),
             )

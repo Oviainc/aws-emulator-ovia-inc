@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProcurementPortalPreference
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProcurementPortalPreference`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProcurementPortalPreference::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one procurement portal preference and persists it, so
+//! `ListProcurementPortalPreferences` (and the rest of the preference plane) reports
+//! exactly what this call stored. `@idempotent`: a replay of the same request answers
+//! with the ARN the first call minted.
 //!
 //! ## Shape of an operation
 //!
@@ -163,6 +159,16 @@ impl From<CreateProcurementPortalPreferenceErrorModeled> for CreateProcurementPo
     }
 }
 
+/// The `resourceType` a `ConflictException` of this operation names: the resource the
+/// ARN it reports is one of.
+const RESOURCE_TYPE: &str = "procurement-portal-preference";
+
+/// `ProcurementPortalName$COUPA` — the portal whose Marketplace PunchOut configuration
+/// the model documents as required (`MarketplacePunchOutPreference`: "Required for Coupa
+/// when MarketplacePunchOutEnabled is true"). One of the values the modelled enum admits
+/// ([`PROCUREMENT_PORTAL_NAME_VALUES`]).
+const PORTAL_COUPA: &str = "COUPA";
+
 /// The `CreateProcurementPortalPreference` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -199,18 +205,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProcurementPortalPreference` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProcurementPortalPreferenceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProcurementPortalPreference"))
+        let _ = ctx;
+
+        // `MarketplacePunchOutEnabled` "defaults to false if not provided", and
+        // `MarketplacePunchOutPreference` is "required for Coupa when
+        // MarketplacePunchOutEnabled is true" — a combination of members the model
+        // cannot express, so the boundary validator passed it and it is refused here as
+        // the modelled 400.
+        let marketplace_punch_out_enabled = input.marketplace_punch_out_enabled.unwrap_or(false);
+        if marketplace_punch_out_enabled
+            && input.procurement_portal_name == PORTAL_COUPA
+            && input.marketplace_punch_out_preference.is_none()
+        {
+            return Err(CreateProcurementPortalPreferenceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "MarketplacePunchOutPreference is required when \
+                         MarketplacePunchOutEnabled is true and ProcurementPortalName is \
+                         {PORTAL_COUPA}"
+                    )),
+                    reason: Some("invalidInput".to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let identity = crate::state::procurement_portal_preference_identity(
+            &input.procurement_portal_name,
+            &input.buyer_domain,
+            &input.buyer_identifier,
+            &input.supplier_domain,
+            &input.supplier_identifier,
+        );
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateProcurementPortalPreferenceErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let mut store = state.lock();
+        let client_token = input.client_token.as_deref();
+
+        // `@idempotent`: a replay of the same request (same `ClientToken` against the
+        // same preference identity) answers with the ARN the first call minted rather
+        // than creating a second preference. A record whose preference has since been
+        // deleted is not a replay: there is nothing left to answer with, so the request
+        // creates.
+        if let Some(arn) = store.replayed_result(Self::NAME, &identity, client_token) {
+            if store.procurement_portal_preferences.contains_key(&arn) {
+                return Ok(CreateProcurementPortalPreferenceOutput {
+                    procurement_portal_preference_arn: arn,
+                });
+            }
+        }
+
+        // A preference is identified by the portal and the buyer/supplier pair it routes
+        // between, so a second create of that same identity is the modelled
+        // `ConflictException` — "attempting to create a resource that already exists".
+        if let Some(existing) = store.procurement_portal_preference_by_identity(&identity) {
+            return Err(CreateProcurementPortalPreferenceErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(
+                        "A procurement portal preference already exists for this portal and \
+                         buyer/supplier pair"
+                            .to_string(),
+                    ),
+                    resource_id: Some(existing.preference.procurement_portal_preference_arn.clone()),
+                    resource_type: Some(RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        if store.procurement_portal_preferences.len()
+            >= crate::state::MAX_PROCUREMENT_PORTAL_PREFERENCES
+        {
+            return Err(
+                CreateProcurementPortalPreferenceErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "This account already holds the maximum of {} procurement portal \
+                             preferences",
+                            crate::state::MAX_PROCUREMENT_PORTAL_PREFERENCES
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let arn = store.mint_procurement_portal_preference_arn();
+        let created_at = crate::state::now();
+        // Each plane starts PENDING_VERIFICATION, and only a plane this request ENABLES
+        // has a verification status at all: the portal connection for an enabled plane
+        // has not been verified yet, and the service models
+        // `SendProcurementPortalValidation`/`VerifyProcurementPortalValidation` as the
+        // calls that carry it past that status.
+        let pending =
+            |enabled: bool| enabled.then(|| crate::state::STATUS_PENDING_VERIFICATION.to_string());
+        let preference = ProcurementPortalPreference {
+            aws_account_id: ::engine::emulator_account_id().to_string(),
+            procurement_portal_preference_arn: arn.clone(),
+            procurement_portal_name: input.procurement_portal_name,
+            buyer_domain: input.buyer_domain,
+            buyer_identifier: input.buyer_identifier,
+            supplier_domain: input.supplier_domain,
+            supplier_identifier: input.supplier_identifier,
+            selector: input.selector,
+            procurement_portal_shared_secret: input.procurement_portal_shared_secret,
+            procurement_portal_instance_endpoint: input.procurement_portal_instance_endpoint,
+            // `PurchaseOrderRetrievalEndpoint` is a member of the stored preference that
+            // this operation's input does not carry (`smithy_query(query="operation",
+            // operation="CreateProcurementPortalPreference,GetProcurementPortalPreference")`),
+            // so a create leaves it unset rather than inventing an endpoint.
+            purchase_order_retrieval_endpoint: None,
+            test_env_preference: input.test_env_preference.map(|test| TestEnvPreference {
+                buyer_domain: test.buyer_domain,
+                buyer_identifier: test.buyer_identifier,
+                supplier_domain: test.supplier_domain,
+                supplier_identifier: test.supplier_identifier,
+                procurement_portal_shared_secret: test.procurement_portal_shared_secret,
+                procurement_portal_instance_endpoint: test.procurement_portal_instance_endpoint,
+                // Not carried by `TestEnvPreferenceInput` either.
+                purchase_order_retrieval_endpoint: None,
+            }),
+            einvoice_delivery_enabled: input.einvoice_delivery_enabled,
+            einvoice_delivery_preference: input.einvoice_delivery_preference,
+            purchase_order_retrieval_enabled: input.purchase_order_retrieval_enabled,
+            marketplace_punch_out_enabled: Some(marketplace_punch_out_enabled),
+            marketplace_punch_out_preference: input.marketplace_punch_out_preference,
+            contacts: Some(input.contacts),
+            einvoice_delivery_preference_status: pending(input.einvoice_delivery_enabled),
+            einvoice_delivery_preference_status_reason: None,
+            purchase_order_retrieval_preference_status: pending(
+                input.purchase_order_retrieval_enabled,
+            ),
+            purchase_order_retrieval_preference_status_reason: None,
+            // The first version of this configuration; a later configuration write
+            // reports the next one.
+            version: 1,
+            create_date: created_at,
+            last_update_date: created_at,
+        };
+        store.procurement_portal_preferences.insert(
+            arn.clone(),
+            crate::state::StoredProcurementPortalPreference {
+                preference,
+                // Nothing has requested a portal validation for this preference yet.
+                validation: None,
+            },
+        );
+
+        // The tag plane is the one this service already serves for every taggable
+        // resource, keyed by ARN, so `ListTagsForResource` reports these without knowing
+        // what kind of resource they are on.
+        if let Some(tags) = input.resource_tags {
+            let tags = tags
+                .into_iter()
+                .map(|tag| (tag.key, tag.value))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            store.resource_tags.insert(arn.clone(), tags);
+        }
+
+        store.record_result(Self::NAME, &identity, client_token, &arn);
+        Ok(CreateProcurementPortalPreferenceOutput {
+            procurement_portal_preference_arn: arn,
+        })
     }
 }
