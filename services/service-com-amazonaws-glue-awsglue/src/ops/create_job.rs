@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a job definition and persists it in [`crate::state`] under its name, which
+//! `CreateJob$Name` documents as unique in the account; a later `GetJob` reads back
+//! what this stored. The members the SERVICE fills (the documented defaults for an
+//! absent `JobMode`, `GlueVersion`, `ExecutionProperty` and `Timeout`, the capacity the
+//! worker configuration maps to, and the create instant) are filled by
+//! [`crate::state::JobEntry::from_create_input`], so every read reports the same
+//! projection.
 //!
 //! ## Shape of an operation
 //!
@@ -257,18 +256,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // An unreachable store is an internal mounting fault, and this operation
+            // DOES model a server fault — so it is reported as that, the same shape
+            // `GetJob` reports it with, rather than as a client-side timeout.
+            return Err(CreateJobErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue job store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `Name`, `Role` and `Command` are `@required`, and `Name`'s length and pattern
+        // and `Timeout`'s `range 1..` are refused at the boundary — so the checks below
+        // are the ones the MODEL cannot express.
+
+        // "The name or Amazon Resource Name (ARN) of the IAM role associated with this
+        // job": `RoleString` carries no length constraint, so a blank role reaches here
+        // and names no role at all.
+        if input.role.trim().is_empty() {
+            return Err(CreateJobErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some("Role is required and cannot be blank".to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // "For an Apache Spark ETL job, this must be `glueetl`. For a Python shell job,
+        // it must be `pythonshell`. For an Apache Spark streaming ETL job, this must be
+        // `gluestreaming`. For a Ray job, this must be `glueray`." A command naming
+        // anything else names no job this service can run.
+        let command_name = input.command.name.as_deref().unwrap_or_default();
+        if !crate::state::JOB_COMMAND_NAMES.contains(&command_name) {
+            return Err(CreateJobErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Command Name should be one of {:?}, got {command_name:?}",
+                        crate::state::JOB_COMMAND_NAMES
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // "Jobs must have timeout values less than 7 days or 10080 minutes. Otherwise,
+        // the jobs will throw an exception."
+        if input
+            .timeout
+            .is_some_and(|timeout| timeout > crate::state::MAX_TIMEOUT_MINUTES)
+        {
+            return Err(CreateJobErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Timeout must be at most {} minutes",
+                        crate::state::MAX_TIMEOUT_MINUTES
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // "Do not set `MaxCapacity` if using `WorkerType` and `NumberOfWorkers`": the
+        // two name the same capacity two ways, so a request carrying both is ambiguous
+        // rather than merely redundant.
+        if input.max_capacity.is_some()
+            && (input.worker_type.is_some() || input.number_of_workers.is_some())
+        {
+            return Err(CreateJobErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        "Please do not set MaxCapacity if using WorkerType and NumberOfWorkers"
+                            .to_string(),
+                    ),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // "It must be unique in your account."
+        if store.jobs.contains_key(&input.name) {
+            return Err(CreateJobErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!("Job already exists: {}", input.name)),
+                },
+            )
+            .into());
+        }
+        // The store is resident memory and this create is reachable by any caller, so
+        // the number of records one process will hold is bounded. Past the ceiling the
+        // request is refused with the operation's own modelled limit error.
+        if !store.can_store_job() {
+            return Err(
+                CreateJobErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} jobs",
+                            crate::state::MAX_JOBS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let entry =
+            crate::state::JobEntry::from_create_input(&input, ::std::time::SystemTime::now());
+        store.jobs.insert(input.name.clone(), entry);
+        ::tracing::info!(
+            operation = "CreateJob",
+            job = %input.name,
+            command = %command_name,
+            "created a Glue job definition"
+        );
+
+        Ok(CreateJobOutput {
+            // "The unique name that was provided for this job definition."
+            name: Some(input.name),
+        })
     }
 }

@@ -21,11 +21,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    Column, Crawler, CrawlerTargets, CreateCrawlerInput, Database, DataLakePrincipal,
-    DatabaseIdentifier, DatabaseInput, ErrorDetail, FederatedDatabase, FederatedTable,
-    LakeFormationConfiguration, LineageConfiguration, PrincipalPermissions, RecrawlPolicy,
-    RLSProperties, Schedule, SchemaChangePolicy, StorageDescriptor, Table, TableIdentifier,
-    TableInput,
+    CodeGenConfigurationNode, Column, ConnectionsList, Crawler, CrawlerTargets, CreateCrawlerInput,
+    CreateJobInput, DataLakePrincipal, Database, DatabaseIdentifier, DatabaseInput, ErrorDetail,
+    ExecutionProperty, FederatedDatabase, FederatedTable, Job, JobCommand,
+    LakeFormationConfiguration, LineageConfiguration, NotificationProperty, PrincipalPermissions,
+    RLSProperties, RecrawlPolicy, Schedule, SchemaChangePolicy, SourceControlDetails,
+    StorageDescriptor, Table, TableIdentifier, TableInput,
 };
 
 /// Ceiling on the databases one catalog may hold.
@@ -50,6 +51,11 @@ pub const MAX_STORED_TABLES: usize = 10_000;
 /// can reach. A create past it is refused with `CreateCrawler`'s own modelled
 /// `ResourceNumberLimitExceededException`.
 pub const MAX_CRAWLERS: usize = 1_000;
+
+/// Ceiling on the job definitions this emulator will hold, for the same reason as
+/// [`MAX_CRAWLERS`]. A create past it is refused with `CreateJob`'s own modelled
+/// `ResourceNumberLimitExceededException`.
+pub const MAX_JOBS: usize = 1_000;
 
 /// The `CrawlerState` of a crawler with no run in progress — the state a crawler is in
 /// the moment `CreateCrawler` returns, and the only one this emulator stores until
@@ -201,6 +207,14 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// `DatabaseInput$Name`/`TableInput$Name`, the model documents no case fold for
     /// `Crawler$Name`.
     pub crawlers: HashMap<String, CrawlerEntry>,
+    /// Every job definition this emulator holds, keyed by its name.
+    ///
+    /// Jobs live BESIDE the catalog tree, like crawlers: `GetJob`, `UpdateJob`,
+    /// `DeleteJob` and `StartJobRun` address a job by name alone, with no `CatalogId`
+    /// member, and `CreateJob$Name` is documented as unique per account ("It must be
+    /// unique in your account"). The key is the name exactly as sent — the model
+    /// documents no case fold for `Job$Name`.
+    pub jobs: HashMap<String, JobEntry>,
 }
 
 impl ComAmazonawsGlueAwsglueState {
@@ -242,6 +256,11 @@ impl ComAmazonawsGlueAwsglueState {
     /// Whether the store can hold another crawler, i.e. is below [`MAX_CRAWLERS`].
     pub fn can_store_crawler(&self) -> bool {
         self.crawlers.len() < MAX_CRAWLERS
+    }
+
+    /// Whether the store can hold another job definition, i.e. is below [`MAX_JOBS`].
+    pub fn can_store_job(&self) -> bool {
+        self.jobs.len() < MAX_JOBS
     }
 }
 
@@ -689,6 +708,239 @@ impl CrawlerEntry {
             catalog_id: Some(self.catalog_id.clone()),
         }
     }
+}
+
+/// `JobCommand$Name` values the model documents: "For an Apache Spark ETL job, this
+/// must be `glueetl`. For a Python shell job, it must be `pythonshell`. For an Apache
+/// Spark streaming ETL job, this must be `gluestreaming`. For a Ray job, this must be
+/// `glueray`." A command naming anything else is not a job this service can run.
+pub const JOB_COMMAND_NAMES: [&str; 4] = ["glueetl", "pythonshell", "gluestreaming", "glueray"];
+
+/// The `JobMode` stored for a create that named none: "When the JobMode field is
+/// missing or null, SCRIPT is assigned as the default value" (`CreateJob$JobMode`).
+pub const DEFAULT_JOB_MODE: &str = "SCRIPT";
+
+/// The `GlueVersion` stored for a create that named none: "Jobs that are created
+/// without specifying a Glue version default to Glue 5.1" (`CreateJob$GlueVersion`).
+pub const DEFAULT_GLUE_VERSION: &str = "5.1";
+
+/// `ExecutionProperty$MaxConcurrentRuns` for a job whose create named no execution
+/// property: "The maximum number of concurrent runs allowed for the job. The default
+/// is 1." The model's `@default` of 0 is what an ABSENT integer deserializes to, not a
+/// concurrency a job can run at.
+pub const DEFAULT_MAX_CONCURRENT_RUNS: i32 = 1;
+
+/// `Job$Timeout` when the create left it blank, for Glue 4.0 and earlier: "When the
+/// value is left blank, the timeout is defaulted to 2,880 minutes for Glue version 4.0
+/// and earlier, or 480 minutes for Glue version 5.0 and later."
+pub const DEFAULT_TIMEOUT_MINUTES_THROUGH_GLUE_4: i32 = 2_880;
+
+/// `Job$Timeout` when the create left it blank, for Glue 5.0 and later — the second
+/// half of the sentence quoted on [`DEFAULT_TIMEOUT_MINUTES_THROUGH_GLUE_4`].
+pub const DEFAULT_TIMEOUT_MINUTES_FROM_GLUE_5: i32 = 480;
+
+/// The largest `Timeout` a job may carry: "Jobs must have timeout values less than 7
+/// days or 10080 minutes. Otherwise, the jobs will throw an exception." (`Job$Timeout`)
+pub const MAX_TIMEOUT_MINUTES: i32 = 10_080;
+
+/// The first Glue major version that takes [`DEFAULT_TIMEOUT_MINUTES_FROM_GLUE_5`].
+const FIRST_GLUE_MAJOR_VERSION_WITH_SHORT_DEFAULT_TIMEOUT: u32 = 5;
+
+/// The DPUs one worker of `worker_type` maps to, as `CreateJob$WorkerType` documents
+/// each predefined worker ("For the `G.1X` worker type, each worker maps to 1 DPU", "…
+/// `G.2X` … 2 DPU", "… `G.4X` … 4 DPU", "… `G.8X` … 8 DPU", "… `G.025X` … 0.25 DPU",
+/// "… `Z.2X` … 2 M-DPU").
+///
+/// `None` for anything the model gives no per-worker DPU figure for — the `Standard`
+/// worker type among them — so no capacity is derived where the service documents none.
+pub fn dpu_per_worker(worker_type: &str) -> Option<f64> {
+    match worker_type {
+        "G.025X" => Some(0.25),
+        "G.1X" => Some(1.0),
+        "G.2X" | "Z.2X" => Some(2.0),
+        "G.4X" => Some(4.0),
+        "G.8X" => Some(8.0),
+        _ => None,
+    }
+}
+
+/// The `Timeout` a job created without one carries, which depends on its Glue version
+/// (see [`DEFAULT_TIMEOUT_MINUTES_THROUGH_GLUE_4`]). The major version is the leading
+/// integer of the `GlueVersion` string (`^(\w+\.)+\w+$`); a version whose major part is
+/// not a number is treated as the current default, which is what an absent
+/// `GlueVersion` resolves to.
+pub fn default_timeout_minutes(glue_version: &str) -> i32 {
+    let major = glue_version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .unwrap_or(FIRST_GLUE_MAJOR_VERSION_WITH_SHORT_DEFAULT_TIMEOUT);
+    if major >= FIRST_GLUE_MAJOR_VERSION_WITH_SHORT_DEFAULT_TIMEOUT {
+        DEFAULT_TIMEOUT_MINUTES_FROM_GLUE_5
+    } else {
+        DEFAULT_TIMEOUT_MINUTES_THROUGH_GLUE_4
+    }
+}
+
+/// A stored job definition.
+///
+/// Every member of the modelled `Job` shape a create can fill is held here, so a later
+/// `GetJob` reports what the create stored and nothing else. The members only a RUN
+/// produces are not part of this shape at all, and `ProfileName` is not a
+/// `CreateJob` member, so a created job carries none.
+#[derive(Debug, Clone)]
+pub struct JobEntry {
+    /// The job's name, which is also its key in [`ComAmazonawsGlueAwsglueState::jobs`].
+    pub name: String,
+    /// One of the modelled `JobMode` values; [`DEFAULT_JOB_MODE`] when the create
+    /// named none.
+    pub job_mode: String,
+    pub job_run_queuing_enabled: Option<bool>,
+    pub description: Option<String>,
+    pub log_uri: Option<String>,
+    pub role: String,
+    /// Always stored, because the service documents a default concurrency
+    /// ([`DEFAULT_MAX_CONCURRENT_RUNS`]) rather than "no execution property".
+    pub execution_property: ExecutionProperty,
+    pub command: JobCommand,
+    pub default_arguments: Option<HashMap<String, String>>,
+    pub non_overridable_arguments: Option<HashMap<String, String>>,
+    pub connections: Option<ConnectionsList>,
+    pub max_retries: i32,
+    /// The job's capacity in DPUs: what the create named, else what its worker
+    /// configuration maps to (see [`JobEntry::from_create_input`]). `None` when the
+    /// create named neither, because this service documents no figure for that job.
+    pub max_capacity: Option<f64>,
+    /// The job timeout in minutes: what the create named, else the documented default
+    /// for its Glue version.
+    pub timeout: i32,
+    pub worker_type: Option<String>,
+    pub number_of_workers: Option<i32>,
+    pub security_configuration: Option<String>,
+    pub notification_property: Option<NotificationProperty>,
+    /// [`DEFAULT_GLUE_VERSION`] when the create named none.
+    pub glue_version: String,
+    pub code_gen_configuration_nodes: Option<HashMap<String, CodeGenConfigurationNode>>,
+    pub execution_class: Option<String>,
+    pub source_control_details: Option<SourceControlDetails>,
+    pub maintenance_window: Option<String>,
+    /// Server-set, written once at create so every later read reports the same instant.
+    pub created_on: SystemTime,
+    /// Server-set; moves with every write to this job.
+    pub last_modified_on: SystemTime,
+    /// The request's `Tags`, which are not part of the `Job` shape — they are read back
+    /// through the tagging operations.
+    pub tags: HashMap<String, String>,
+}
+
+impl JobEntry {
+    /// Build a stored job from a `CreateJob` request plus the members the SERVICE
+    /// fills: the documented defaults for an absent `JobMode`, `GlueVersion`,
+    /// `ExecutionProperty` and `Timeout`, the capacity its worker configuration maps
+    /// to, and the create instant.
+    pub fn from_create_input(input: &CreateJobInput, now: SystemTime) -> Self {
+        let glue_version = input
+            .glue_version
+            .clone()
+            .unwrap_or_else(|| DEFAULT_GLUE_VERSION.to_string());
+        let max_concurrent_runs = input
+            .execution_property
+            .as_ref()
+            .map(|property| property.max_concurrent_runs)
+            .filter(|runs| *runs > 0)
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_RUNS);
+        Self {
+            name: input.name.clone(),
+            job_mode: input
+                .job_mode
+                .clone()
+                .unwrap_or_else(|| DEFAULT_JOB_MODE.to_string()),
+            job_run_queuing_enabled: input.job_run_queuing_enabled,
+            description: input.description.clone(),
+            log_uri: input.log_uri.clone(),
+            role: input.role.clone(),
+            execution_property: ExecutionProperty {
+                max_concurrent_runs,
+            },
+            command: input.command.clone(),
+            default_arguments: input.default_arguments.clone(),
+            non_overridable_arguments: input.non_overridable_arguments.clone(),
+            connections: input.connections.clone(),
+            max_retries: input.max_retries,
+            max_capacity: capacity_of(input),
+            timeout: input
+                .timeout
+                .unwrap_or_else(|| default_timeout_minutes(&glue_version)),
+            worker_type: input.worker_type.clone(),
+            number_of_workers: input.number_of_workers,
+            security_configuration: input.security_configuration.clone(),
+            notification_property: input.notification_property.clone(),
+            glue_version,
+            code_gen_configuration_nodes: input.code_gen_configuration_nodes.clone(),
+            execution_class: input.execution_class.clone(),
+            source_control_details: input.source_control_details.clone(),
+            maintenance_window: input.maintenance_window.clone(),
+            created_on: now,
+            last_modified_on: now,
+            tags: input.tags.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Rebuild the modelled `Job` output shape from what is stored.
+    pub fn to_job(&self) -> Job {
+        Job {
+            name: Some(self.name.clone()),
+            job_mode: Some(self.job_mode.clone()),
+            job_run_queuing_enabled: self.job_run_queuing_enabled,
+            description: self.description.clone(),
+            log_uri: self.log_uri.clone(),
+            role: Some(self.role.clone()),
+            created_on: Some(to_date_time(self.created_on)),
+            last_modified_on: Some(to_date_time(self.last_modified_on)),
+            execution_property: Some(self.execution_property.clone()),
+            command: Some(self.command.clone()),
+            default_arguments: self.default_arguments.clone(),
+            non_overridable_arguments: self.non_overridable_arguments.clone(),
+            connections: self.connections.clone(),
+            max_retries: self.max_retries,
+            // `AllocatedCapacity` is the same quantity as `MaxCapacity` — "This field
+            // is deprecated. Use MaxCapacity instead" — so it reports the same number
+            // of whole DPUs rather than a second, disagreeing figure. A job with no
+            // capacity figure reports the model's own default of 0.
+            allocated_capacity: self.max_capacity.map_or(0, |capacity| capacity as i32),
+            timeout: Some(self.timeout),
+            max_capacity: self.max_capacity,
+            worker_type: self.worker_type.clone(),
+            number_of_workers: self.number_of_workers,
+            security_configuration: self.security_configuration.clone(),
+            notification_property: self.notification_property.clone(),
+            glue_version: Some(self.glue_version.clone()),
+            code_gen_configuration_nodes: self.code_gen_configuration_nodes.clone(),
+            execution_class: self.execution_class.clone(),
+            source_control_details: self.source_control_details.clone(),
+            maintenance_window: self.maintenance_window.clone(),
+            // `ProfileName` names a usage profile, which `CreateJob` cannot set.
+            profile_name: None,
+        }
+    }
+}
+
+/// The capacity, in DPUs, a `CreateJob` request asks for: `MaxCapacity` when it names
+/// one, else the deprecated `AllocatedCapacity` ("This parameter is deprecated. Use
+/// MaxCapacity instead", so the two are one quantity), else what the worker
+/// configuration maps to — `NumberOfWorkers` workers of `WorkerType`, at the DPUs per
+/// worker [`dpu_per_worker`] quotes from the model. `None` when the request names no
+/// capacity and no worker configuration the model gives a DPU figure for.
+fn capacity_of(input: &CreateJobInput) -> Option<f64> {
+    if let Some(max_capacity) = input.max_capacity {
+        return Some(max_capacity);
+    }
+    if input.allocated_capacity > 0 {
+        return Some(f64::from(input.allocated_capacity));
+    }
+    let workers = input.number_of_workers.filter(|count| *count > 0)?;
+    let per_worker = dpu_per_worker(input.worker_type.as_deref()?)?;
+    Some(per_worker * f64::from(workers))
 }
 
 /// Whether `targets` names at least one data store to crawl, across every target list
