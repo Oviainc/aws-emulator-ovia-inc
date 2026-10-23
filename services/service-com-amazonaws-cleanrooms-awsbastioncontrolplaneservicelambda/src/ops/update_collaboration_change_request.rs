@@ -11,9 +11,10 @@
 //! decide the request's status ([`crate::state::change_request_status_from_approvals`]);
 //! the collaboration owner CANCELs a request outright, or COMMITs one the parties have
 //! approved — which is when the request's changes are applied to the collaboration. A
-//! request that has reached a terminal status (COMMITTED, DENIED, CANCELLED) admits no
-//! further decision, and a COMMIT before the parties have approved is refused, so nothing
-//! is applied twice and nothing is applied unapproved.
+//! request that can no longer be modified at all (COMMITTED, CANCELLED — see
+//! [`crate::state::change_request_is_terminal`]) is refused with the `ValidationException`
+//! the operation declares, and a COMMIT before the parties have approved is refused, so
+//! nothing is applied twice and nothing is applied unapproved.
 //!
 //! ## Shape of an operation
 //!
@@ -233,13 +234,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // Every action is a decision on a request that is still open: a COMMITTED,
-        // DENIED or CANCELLED request has already reached the end of its lifecycle.
+        // Every action modifies the change request, and a request that has been applied
+        // (COMMITTED) or withdrawn (CANCELLED) can no longer be modified: the action is
+        // refused as a ValidationException whose message states that rule.
         if st::change_request_is_terminal(&request.status) {
-            return Err(conflict(format!(
-                "change request {change_request_id} is {} and admits no further action",
-                request.status
-            )));
+            return Err(not_modifiable(&change_request_id, &request.status));
         }
 
         let is_owner = caller == record.creator_account_id;
@@ -347,6 +346,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             collaboration_change_request: stored.clone(),
         })
     }
+}
+
+/// A `ValidationException` (HTTP 400) for an action on a change request that can no
+/// longer be modified, with the model's `INVALID_CONFIGURATION` reason: the request's own
+/// members are well formed, so no `fieldList` entry names a failing member — what the
+/// request asks for is not admitted by the state of the resource it addresses.
+fn not_modifiable(change_request_id: &str, status: &str) -> UpdateCollaborationChangeRequestError {
+    UpdateCollaborationChangeRequestErrorModeled::ValidationException(ValidationException {
+        message: Some(crate::state::change_request_not_modifiable_message(
+            change_request_id,
+            status,
+        )),
+        reason: Some(crate::state::VALIDATION_REASON_INVALID_CONFIGURATION.to_string()),
+        field_list: None,
+    })
+    .into()
 }
 
 /// A `ConflictException` (HTTP 409) for a change request whose current status does not
