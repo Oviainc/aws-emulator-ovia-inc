@@ -172,16 +172,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) so this service can
+        // state it its own way. This model is `restJson1`, where AWS states a
+        // constraint refusal as the `400 ValidationException` envelope the framework
+        // already renders — `N validation error(s) detected: Value '<value>' at
+        // '<member path>' failed to satisfy constraint: <requirement>` — except that it
+        // quotes a `@pattern` requirement WITHOUT the `^`/`$` anchors the whole-value
+        // Smithy pattern carries (`ImageName`'s `^[a-zA-Z0-9-_]+$` is stated as
+        // `[a-zA-Z0-9-_]+`). That wording is shared by every service on a JSON
+        // protocol, so it lives in `service-common`; the check itself still uses the
+        // model's pattern as written, so only the RENDERING changes.
+        service_common::aws_validation_refusal(refusal)
     }
 
     fn override_routing_error(

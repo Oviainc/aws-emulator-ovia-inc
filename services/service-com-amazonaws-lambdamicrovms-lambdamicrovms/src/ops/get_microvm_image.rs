@@ -170,7 +170,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(::std::time::Instant::now());
 
-        let Some(image) = store.image(&input.image_identifier) else {
+        // `MicrovmImageIdentifier` is "The ARN or ID of the MicroVmImage", so the
+        // identifier is resolved as an id this account holds and, failing that, read as
+        // an ARN. The three outcomes mean different things to a caller, and a client
+        // polling for an image it believes is being built has to be able to tell them
+        // apart: a malformed identifier is a request that can NEVER succeed (400), and
+        // only a well-formed identifier naming nothing is the not-yet-created condition
+        // a poll may retry (404).
+        let image = match store.resolve_image_reference(&input.image_identifier) {
+            crate::state::ImageReference::Resolved(name) => store.images.get(&name),
+            crate::state::ImageReference::Absent => None,
+            crate::state::ImageReference::Malformed => {
+                return Err(GetMicrovmImageErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::invalid_arn_format_message(
+                            &input.image_identifier,
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let Some(image) = image else {
             // `ResourceNotFoundException` models `message` as the only required
             // member; `resourceType` and `resourceId` are optional and this service
             // leaves them unset, so the message — built from the identifier the
@@ -192,7 +214,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             latest_active_image_version: image.latest_active_image_version.clone(),
             latest_failed_image_version: image.latest_failed_image_version.clone(),
             created_at: image.created_at,
-            tags: crate::state::wire_map(&image.tags),
+            // `tags` is projected as a map even when the image carries none, so a
+            // client reading it always gets a map to iterate.
+            tags: crate::state::wire_map_present(&image.tags),
             updated_at: image.updated_at,
         })
     }
