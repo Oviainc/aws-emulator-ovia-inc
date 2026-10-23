@@ -13,7 +13,7 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     DashboardReference, DateTimeRange, HealthStatus, ResourceTag, ScheduleConfig, ScheduledReport,
-    Widget,
+    ScheduledReportSummary, Widget,
 };
 
 /// The only `DashboardType` the model declares (`DASHBOARD_TYPE_VALUES`), and the
@@ -26,9 +26,21 @@ pub const DASHBOARD_TYPE_CUSTOM: &str = "CUSTOM";
 /// `bcm-dashboards.scheduled-report-default-schedule-state-enabled` reads back.
 pub const SCHEDULE_STATE_ENABLED: &str = "ENABLED";
 
-/// The prefix a `ListDashboards` pagination cursor carries, so a token this
-/// service did not mint is rejected instead of being read as a resume point.
+/// The `HealthStatusCode` (`HEALTH_STATUS_CODE_VALUES`) a scheduled report reports
+/// while nothing has refreshed its health: the model documents `HEALTHY` as "the
+/// scheduled report is configured properly and has all required permissions to
+/// execute", which is what a report this service accepted at create time is.
+pub const HEALTH_STATUS_HEALTHY: &str = "HEALTHY";
+
+/// The prefix a pagination cursor carries, so a token this service did not mint is
+/// rejected instead of being read as a resume point.
 const PAGE_TOKEN_PREFIX: &str = "v1:";
+
+/// The ARN resource-type segment a `ListDashboards` cursor names.
+pub const DASHBOARD_ARN_SEGMENT: &str = ":dashboard/";
+
+/// The ARN resource-type segment a `ListScheduledReports` cursor names.
+pub const SCHEDULED_REPORT_ARN_SEGMENT: &str = ":scheduled-report/";
 
 /// The most dashboards this emulator stores for the account before `CreateDashboard`
 /// answers its modelled `ServiceQuotaExceededException`.
@@ -130,6 +142,49 @@ impl ScheduledReportRecord {
             updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
             last_execution_at: self.last_execution_at.map(::aws_smithy_types::DateTime::from),
             health_status: self.health_status.clone(),
+        }
+    }
+
+    /// This record projected onto the modelled `ScheduledReportSummary` shape that
+    /// `ListScheduledReports` pages over: the stored record's own fields, never
+    /// request input.
+    ///
+    /// Two members the summary declares `@required` are optional on the stored
+    /// record, so each is resolved here rather than by every reader:
+    ///
+    /// * `scheduleExpression` is optional inside `ScheduleConfig`, and a
+    ///   `GenericString` of length 0..1024 — so a schedule stored without an
+    ///   expression summarises as the empty string rather than inventing one.
+    /// * `healthStatus` is optional on `ScheduledReport` and absent until something
+    ///   refreshes it, so a report whose health nothing has refreshed summarises as
+    ///   [`HEALTH_STATUS_HEALTHY`] with no `lastRefreshedAt` (no refresh has
+    ///   happened) and no `statusReasons` (the model documents those as present
+    ///   only when the status is `UNHEALTHY`).
+    pub fn summary(&self) -> ScheduledReportSummary {
+        ScheduledReportSummary {
+            arn: self.arn.clone(),
+            name: self.name.clone(),
+            dashboard_arn: self.dashboard_arn.clone(),
+            schedule_expression: self
+                .schedule_config
+                .schedule_expression
+                .clone()
+                .unwrap_or_default(),
+            state: self
+                .schedule_config
+                .state
+                .clone()
+                .unwrap_or_else(|| SCHEDULE_STATE_ENABLED.to_string()),
+            health_status: self.health_status.clone().unwrap_or_else(|| HealthStatus {
+                status_code: HEALTH_STATUS_HEALTHY.to_string(),
+                last_refreshed_at: None,
+                status_reasons: None,
+            }),
+            schedule_expression_time_zone: self
+                .schedule_config
+                .schedule_expression_time_zone
+                .clone(),
+            widget_ids: self.widget_ids.clone(),
         }
     }
 }
@@ -282,26 +337,29 @@ pub fn resolve_schedule_config(mut config: ScheduleConfig) -> ScheduleConfig {
     config
 }
 
-/// Encode the ARN a `ListDashboards` page resumes at as an opaque `nextToken`.
+/// Encode the ARN a listing page resumes at as an opaque `nextToken`.
 pub fn encode_page_token(arn: &str) -> String {
     format!("{PAGE_TOKEN_PREFIX}{}", hex::encode(arn))
 }
 
 /// The ARN a `nextToken` resumes at, or `None` when the token is not one this
-/// service minted (the caller answers that with a `ValidationException`).
-pub fn decode_page_token(token: &str) -> Option<String> {
+/// service minted for a listing over `arn_segment`'s resource type (the caller
+/// answers that with a `ValidationException`).
+///
+/// A cursor this service minted always names an ARN of the resource the listing
+/// walks. It is checked against the fixed segments of that resource's ARN pattern
+/// (`^arn:aws[-a-z0-9]*:bcm-dashboards::[0-9]{12}:<resource>/...`), so a token that
+/// decodes to anything else — including a cursor minted by a listing over the other
+/// resource type — is rejected rather than read as a resume point past every stored
+/// record.
+pub fn decode_page_token(token: &str, arn_segment: &str) -> Option<String> {
     let body = token.strip_prefix(PAGE_TOKEN_PREFIX)?;
     let bytes = hex::decode(body).ok()?;
     let arn = String::from_utf8(bytes).ok()?;
-    // A cursor this service minted always names a dashboard ARN. Checked against the
-    // fixed segments of `DashboardArn`'s pattern
-    // (`^arn:aws[-a-z0-9]*:bcm-dashboards::[0-9]{12}:dashboard/...`), so a token that
-    // decodes to anything else is rejected rather than read as a resume point past
-    // every stored dashboard.
-    let names_a_dashboard = arn.starts_with("arn:aws")
+    let names_the_resource = arn.starts_with("arn:aws")
         && arn.contains(":bcm-dashboards::")
-        && arn.contains(":dashboard/");
-    names_a_dashboard.then_some(arn)
+        && arn.contains(arn_segment);
+    names_the_resource.then_some(arn)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

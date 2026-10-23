@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListScheduledReports
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListScheduledReports`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListScheduledReports::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the stored scheduled reports in ARN order, projecting each stored record
+//! onto a `ScheduledReportSummary`. The page holds at most `maxResults` items (the
+//! model's default, 50, when the member is absent); `nextToken` is returned only when
+//! reports remain after the page, and carries the ARN the next page resumes at. A
+//! `nextToken` this service did not mint for a scheduled-report listing is refused with
+//! `ValidationException` (400); `maxResults` outside 1..100 is refused by the boundary
+//! validator before this handler runs.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +151,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListScheduledReports` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListScheduledReportsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListScheduledReports"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListScheduledReportsErrorModeled::InternalServerException(InternalServerException {
+                message: "the dashboard store is unavailable".to_string(),
+            })
+        })?;
+        // A read: it walks the stored scheduled reports and writes nothing.
+        let state = state.lock();
+
+        // Where this page starts. An absent token starts at the first report; a token
+        // this service minted for a scheduled-report listing names the ARN to resume at.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(
+                token,
+                crate::state::SCHEDULED_REPORT_ARN_SEGMENT,
+            ) {
+                Some(arn) => Some(arn),
+                None => {
+                    return Err(ListScheduledReportsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "Member must be a nextToken returned by a previous \
+                                      ListScheduledReports call: nextToken"
+                                .to_string(),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // `max_results` carries the model's declared default (50) when the client
+        // omitted it, and its @range (1..100) is already enforced at the boundary. A
+        // non-positive page size is refused rather than clamped: a zero-item page that
+        // still carried a cursor would be a client loop that never terminates.
+        let page_size = match usize::try_from(input.max_results) {
+            Ok(size) if size >= 1 => size,
+            _ => {
+                return Err(ListScheduledReportsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "Member must have value greater than or equal to 1: maxResults {}",
+                            input.max_results
+                        ),
+                    },
+                )
+                .into())
+            }
+        };
+        // The page starts at the cursor's ARN when there is one, else at the first
+        // stored report. Borrowed bounds, so resuming copies no ARN.
+        let start = match resume_from.as_deref() {
+            Some(arn) => ::std::ops::Bound::Included(arn),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut remaining = state
+            .scheduled_reports
+            .range::<str, _>((start, ::std::ops::Bound::Unbounded));
+
+        let mut scheduled_reports = Vec::new();
+        for (_, report) in remaining.by_ref().take(page_size) {
+            scheduled_reports.push(report.summary());
+        }
+        // The cursor is the first report AFTER this page, so `nextToken` is present
+        // exactly when one remains.
+        let next_token = remaining
+            .next()
+            .map(|(arn, _)| crate::state::encode_page_token(arn));
+
+        Ok(ListScheduledReportsOutput {
+            scheduled_reports,
+            next_token,
+        })
     }
 }
