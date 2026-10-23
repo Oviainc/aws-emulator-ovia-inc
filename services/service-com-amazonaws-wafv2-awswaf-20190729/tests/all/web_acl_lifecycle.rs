@@ -1561,7 +1561,10 @@ async fn state_changing_calls_leave_an_audit_record() {
 /// `ManagedRuleGroupStatement`), plus a reference reached only through a nested
 /// statement and one naming an entity that exists in the OTHER scope. Rule groups
 /// are covered by [`crate::rule_group_lifecycle`], which references one that
-/// EXISTS; the row here is a rule group ARN naming nothing stored.
+/// EXISTS; the row here is a rule group ARN naming nothing stored. The managed
+/// rule groups a save MAY reference are covered by
+/// [`crate::managed_rule_groups`]; the rows here name a group the catalogue does
+/// not list, and one that it does.
 #[tokio::test]
 async fn rule_references_must_name_a_stored_entity() {
     let waf = Waf::new();
@@ -1628,14 +1631,34 @@ async fn rule_references_must_name_a_stored_entity() {
             false,
         ),
         (
-            "a ManagedRuleGroupStatement, with no managed catalogue",
+            "a ManagedRuleGroupStatement naming a group no vendor publishes",
+            json!({
+                "ManagedRuleGroupStatement": {
+                    "VendorName": "AWS",
+                    "Name": "AWSManagedRulesNoSuchRuleSet",
+                }
+            }),
+            false,
+        ),
+        (
+            "a ManagedRuleGroupStatement naming a group of an unknown vendor",
+            json!({
+                "ManagedRuleGroupStatement": {
+                    "VendorName": "NoSuchVendor",
+                    "Name": "AWSManagedRulesCommonRuleSet",
+                }
+            }),
+            false,
+        ),
+        (
+            "a ManagedRuleGroupStatement naming a catalogued group",
             json!({
                 "ManagedRuleGroupStatement": {
                     "VendorName": "AWS",
                     "Name": "AWSManagedRulesCommonRuleSet",
                 }
             }),
-            false,
+            true,
         ),
     ];
 
