@@ -606,6 +606,17 @@ pub fn decode_page_token(token: &str) -> Option<String> {
 }
 
 /// Decode a page token [`encode_page_token`] produced for a report positioned by
+/// `HostArn` (`ListHosts`), or `None` when it is not one.
+///
+/// The same rule as [`decode_page_token`], applied to the other ARN-positioned report:
+/// a token names a position only if it decodes to a host ARN of the kind this service
+/// mints, so a connection ARN's token names no position in the host store either.
+pub fn decode_host_arn_page_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    is_service_arn(&decoded, "host").then_some(decoded)
+}
+
+/// Decode a page token [`encode_page_token`] produced for a report positioned by
 /// `ResourceName` (`ListSyncConfigurations`), or `None` when it is not one.
 ///
 /// A token only names a position if it decodes to a value the API could have stored as
@@ -660,10 +671,16 @@ fn is_region_token(candidate: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-/// Whether `candidate` has the shape of a connection ARN this service mints:
-/// `arn:<partition>:codeconnections:<region>:<12 digits>:connection/<id>`.
-fn is_connection_arn(candidate: &str) -> bool {
+/// Whether `candidate` has the shape of an ARN this service mints for `resource_type`:
+/// `arn:<partition>:codeconnections:<region>:<12 digits>:<resource_type>/<id>`.
+///
+/// ONE rule for every resource type, so the ARN of one resource can never be read as
+/// the ARN of another: the modeled patterns put the resource type in the ARN
+/// (`connection/…` vs `host/…` vs `repository-link/…`), which is exactly the field
+/// compared here.
+fn is_service_arn(candidate: &str, resource_type: &str) -> bool {
     let fields: Vec<&str> = candidate.splitn(6, ':').collect();
+    let prefix = format!("{resource_type}/");
     fields.len() == 6
         && fields[0] == "arn"
         && ARN_PARTITIONS.contains(&fields[1])
@@ -671,8 +688,14 @@ fn is_connection_arn(candidate: &str) -> bool {
         && is_region_token(fields[3])
         && fields[4].len() == 12
         && fields[4].bytes().all(|byte| byte.is_ascii_digit())
-        && fields[5].starts_with("connection/")
-        && fields[5].len() > "connection/".len()
+        && fields[5].starts_with(&prefix)
+        && fields[5].len() > prefix.len()
+}
+
+/// Whether `candidate` has the shape of a connection ARN this service mints:
+/// `arn:<partition>:codeconnections:<region>:<12 digits>:connection/<id>`.
+fn is_connection_arn(candidate: &str) -> bool {
+    is_service_arn(candidate, "connection")
 }
 
 /// The region this request was signed for, or [`DEFAULT_REGION`] when it is unsigned
