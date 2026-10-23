@@ -110,6 +110,9 @@ mod state_roundtrip;
 #[path = "all/template_deletion.rs"]
 mod template_deletion;
 
+#[path = "all/template_updates.rs"]
+mod template_updates;
+
 // Not a suite of its own: the cloudwatch alarm template group request helpers
 // the group suites share, layered on `wire`. Declared because every file under
 // `tests/all/` must be.

@@ -1557,6 +1557,35 @@ impl ComAmazonawsMedialiveMedialiveState {
             .or_else(|| self.event_bridge_rule_template_group_named(region, identifier))
     }
 
+    /// Apply the members an `UpdateEventBridgeRuleTemplateGroup` request
+    /// supplied onto the group `identifier` names in `region`, and answer that
+    /// group's id — or `None` when this region holds no such group.
+    ///
+    /// "Updates the specified eventbridge rule template group": a member the
+    /// request carries replaces the stored one, a member it omits leaves that
+    /// value as it was, and `ModifiedAt` becomes the instant of the call, which
+    /// is when the record was last written. The identifier resolves through
+    /// [`Self::event_bridge_rule_template_group`], so an update reaches its
+    /// group by either form `Identifier` documents.
+    pub fn update_event_bridge_rule_template_group(
+        &mut self,
+        region: &str,
+        identifier: &str,
+        description: Option<String>,
+        now: SystemTime,
+    ) -> Option<String> {
+        let id = self
+            .event_bridge_rule_template_group(region, identifier)?
+            .id
+            .clone();
+        let group = self.event_bridge_rule_template_groups.get_mut(&id)?;
+        if let Some(description) = description {
+            group.description = Some(description);
+        }
+        group.modified_at = now;
+        Some(id)
+    }
+
     /// Remove the eventbridge rule template group `identifier` names in
     /// `region`, answering the record that was removed — or refuse.
     ///
@@ -3602,9 +3631,9 @@ pub(crate) use input_security_group_description_output;
 
 /// Project a stored [`EventBridgeRuleTemplateGroupRecord`] onto one of the
 /// structurally identical per-operation group output shapes
-/// (`CreateEventBridgeRuleTemplateGroupOutput` and
-/// `GetEventBridgeRuleTemplateGroupOutput` today;
-/// `UpdateEventBridgeRuleTemplateGroupOutput` when its own issue lands).
+/// (`CreateEventBridgeRuleTemplateGroupOutput`,
+/// `GetEventBridgeRuleTemplateGroupOutput` and
+/// `UpdateEventBridgeRuleTemplateGroupOutput`).
 ///
 /// One macro rather than a hand-written copy per operation, so the operations
 /// that report a group cannot drift from each other. `Tags` is always reported,
