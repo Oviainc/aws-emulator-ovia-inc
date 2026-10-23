@@ -261,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let filter = input.filter.as_ref();
         let bounding_box = filter.and_then(|filter| filter.bounding_box.as_deref());
         let circle = filter.and_then(|filter| filter.circle.as_ref());
-        // A bias that is not a two-element position is refused, not ignored.
+        // A bias that is not a WGS 84 two-element position is refused, not ignored.
         let bias = match input.bias_position.as_deref() {
             None => None,
             Some(values) => match crate::state::position(values) {

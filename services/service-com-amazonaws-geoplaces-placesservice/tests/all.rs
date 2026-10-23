@@ -17,5 +17,7 @@ mod catalog_coverage_and_position_resolution;
 mod places_catalog;
 #[path = "all/result_item_composition.rs"]
 mod result_item_composition;
+#[path = "all/reverse_geocode_positions.rs"]
+mod reverse_geocode_positions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

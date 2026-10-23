@@ -285,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Distance` is the distance from the position the caller biased towards; with
         // no bias there is no reference point, so it keeps its modeled default of 0.
-        // A bias that is not a two-element position is refused, not ignored.
+        // A bias that is not a WGS 84 two-element position is refused, not ignored.
         let bias = match input.bias_position.as_deref() {
             None => None,
             Some(values) => match crate::state::position(values) {

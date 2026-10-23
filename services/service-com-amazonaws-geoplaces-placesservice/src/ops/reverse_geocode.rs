@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReverseGeocode
-//! Resolves a position to the places around it, out of the seeded catalog in
+//! Resolves a position to the places that COVER it, out of the seeded catalog in
 //! [`crate::state`] — so feeding back a `Position` any other operation returned
-//! yields that place, at a `Distance` of zero.
+//! yields that place, at a `Distance` of zero, and a position no place covers
+//! yields no result at all.
 //!
 //! ## Shape of an operation
 //!
@@ -216,6 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The modeled `len 2..2` is refused at the boundary; this keeps an
         // in-process caller to the same contract instead of guessing a position.
+        // `position` also holds the pair to the WGS 84 range the member documents.
         let Some(query_position) = crate::state::position(&input.query_position) else {
             return Err(ReverseGeocodeErrorModeled::ValidationException(
                 crate::state::validation_exception(

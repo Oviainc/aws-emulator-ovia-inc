@@ -10,8 +10,8 @@
 //! what that catalog has to cover and why.
 //!
 //! Every handler PROJECTS its response out of these records, so the results of
-//! different operations agree: a `PlaceId` handed out by Geocode, SearchText or
-//! SearchNearby resolves through GetPlace to the same `Title`, `Position` and
+//! different operations agree: a `PlaceId` handed out by Geocode, SearchText,
+//! SearchNearby or ReverseGeocode resolves through GetPlace to the same `Title` and
 //! `Address`, and a `Position` handed out by any of them reverse-geocodes back to the
 //! place it came from.
 //!
@@ -193,10 +193,19 @@ const METRES_PER_DEGREE_LAT: f64 = EARTH_RADIUS_M * std::f64::consts::PI / 180.0
 
 /// A `[longitude, latitude]` pair taken from a modeled `Position` list, or `None`
 /// when the list is not exactly two elements (the modeled `len 2..2` is refused at
-/// the boundary, so this only guards an in-process caller).
+/// the boundary, so that part only guards an in-process caller) or the pair is not
+/// a position at all.
+///
+/// Every `Position` the model carries is documented as being "in World Geodetic
+/// System (WGS 84) format", so a pair outside that range — or a non-finite one — is
+/// no position, whichever member it arrived on: refusing it here is what holds a
+/// `QueryPosition`, a `BiasPosition` and a filter circle's centre to one contract,
+/// instead of ranking places by a distance computed from a meaningless coordinate.
 pub fn position(values: &[f64]) -> Option<[f64; 2]> {
     match values {
-        [longitude, latitude] => Some([*longitude, *latitude]),
+        [longitude, latitude] if is_wgs84([*longitude, *latitude]) => {
+            Some([*longitude, *latitude])
+        }
         _ => None,
     }
 }
@@ -238,6 +247,20 @@ fn map_view_around(position: [f64; 2], extent_metres: f64) -> [f64; 4] {
         position[0] + longitude_delta,
         position[1] + latitude_delta,
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Positions a caller supplies
+// ---------------------------------------------------------------------------
+
+/// Is `[longitude, latitude]` a position in the World Geodetic System (WGS 84)
+/// range the modeled `Position` documents?
+pub fn is_wgs84(position: [f64; 2]) -> bool {
+    let [longitude, latitude] = position;
+    longitude.is_finite()
+        && latitude.is_finite()
+        && (-180.0..=180.0).contains(&longitude)
+        && (-90.0..=90.0).contains(&latitude)
 }
 
 // ---------------------------------------------------------------------------
@@ -1394,8 +1417,7 @@ impl PlaceRecord {
         })
     }
 
-    /// Is this place's position inside `[west, south, east, north]`? A box whose
-    /// west edge is east of its east edge crosses the antimeridian.
+    /// Is this place's position inside `[west, south, east, north]`?
     pub fn within_bounding_box(&self, box_: [f64; 4]) -> bool {
         box_contains(box_, self.position)
     }
@@ -2128,24 +2150,59 @@ impl ComAmazonawsGeoplacesPlacesserviceState {
     /// An explicit radius is the caller's own bound and replaces the extent test:
     /// "the maximum distance in meters from the QueryPosition from which a result
     /// will be returned" (`ReverseGeocodeRequest$QueryRadius`).
+    ///
+    /// Either way the `Distance` a candidate carries is its distance from the
+    /// queried position to the AREA the result covers, not to the record's own
+    /// centre: a place whose `MapView` — "the bounding box enclosing the geometric
+    /// shape (area or line) that an individual result covers" — contains the point
+    /// is AT the point, zero metres away, because the point is inside it. A record
+    /// that does not cover the position keeps its great-circle distance, so a
+    /// `Distance` of zero and a result covering the queried position mean each
+    /// other.
     pub fn at_position(&self, position: [f64; 2], radius: Option<i64>) -> Vec<Scored> {
-        if radius.is_some() {
-            return self.nearby(position, radius);
-        }
-        let mut candidates: Vec<Scored> = self
-            .places
-            .iter()
-            .enumerate()
-            .filter(|(_, place)| place.covers(position))
-            .map(|(index, place)| Scored {
-                index,
-                score: 1.0,
-                name_score: 0.0,
-                distance: distance_metres(position, place.position),
+        let candidates = match radius {
+            Some(_) => self.nearby(position, radius),
+            None => self
+                .places
+                .iter()
+                .enumerate()
+                .filter(|(_, place)| place.covers(position))
+                .map(|(index, place)| Scored {
+                    index,
+                    score: 1.0,
+                    name_score: 0.0,
+                    distance: distance_metres(position, place.position),
+                })
+                .collect(),
+        };
+        // What each candidate REPORTS, computed once: zero where the record covers
+        // the position, beside the distance to the record's own position, which is
+        // what puts the finest record at the position first among the records that
+        // all contain the point and so all report zero.
+        let mut reported: Vec<(Scored, i64)> = candidates
+            .into_iter()
+            .map(|candidate| {
+                let covers = self.places[candidate.index].covers(position);
+                let own = candidate.distance;
+                (
+                    Scored {
+                        distance: if covers { 0 } else { own },
+                        ..candidate
+                    },
+                    own,
+                )
             })
             .collect();
-        self.order_by_distance(&mut candidates);
-        candidates
+        reported.sort_by(|(left, left_own), (right, right_own)| {
+            left.distance
+                .cmp(&right.distance)
+                .then(left_own.cmp(right_own))
+                .then_with(|| self.tie_break(left, right))
+        });
+        reported
+            .into_iter()
+            .map(|(candidate, _)| candidate)
+            .collect()
     }
 
     /// Order candidates nearest first, breaking ties by title and then by `PlaceId`
@@ -3229,6 +3286,37 @@ mod tests {
                 "case {unassigned}: a code the register assigns to no country resolves \
                  to nothing, got {:?}",
                 country_alpha3(unassigned)
+            );
+        }
+    }
+
+    /// A position outside the World Geodetic System range the modeled `Position`
+    /// documents is no position at all, whatever its length.
+    #[test]
+    fn a_position_outside_the_wgs84_range_is_not_a_position() {
+        for inside in [
+            [0.0, 0.0],
+            [180.0, 90.0],
+            [-180.0, -90.0],
+            [33.859_39, 45.714_2],
+        ] {
+            assert!(
+                is_wgs84(inside),
+                "case {inside:?}: a position on or inside the published bounds is one"
+            );
+        }
+        for outside in [
+            [180.000_001, 0.0],
+            [-180.000_001, 0.0],
+            [0.0, 90.000_001],
+            [0.0, -90.000_001],
+            [1.0e9, 0.0],
+            [f64::NAN, 0.0],
+            [0.0, f64::INFINITY],
+        ] {
+            assert!(
+                !is_wgs84(outside),
+                "case {outside:?}: a pair outside the WGS 84 range is no position"
             );
         }
     }
