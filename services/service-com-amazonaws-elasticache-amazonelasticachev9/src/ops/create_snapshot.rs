@@ -272,6 +272,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // A snapshot whose removal a `DeleteSnapshot` made due is gone, so the
+        // name it held is free again and it does not count against the quota:
+        // the removal is owed by the clock, so this call materialises it before
+        // reading the store, the same way `settled_snapshot_mut` does.
+        store.purge_deleted_snapshots(now);
 
         if store.snapshots.contains_key(&snapshot_name) {
             return Err(CreateSnapshotErrorModeled::SnapshotAlreadyExistsFault(

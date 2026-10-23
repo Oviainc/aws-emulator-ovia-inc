@@ -22,8 +22,13 @@
 //! owed `AVAILABLE`.
 //!
 //! A snapshot is a copy of a cluster as of the time it was taken:
-//! `CreateSnapshot` mints one from a stored cluster and `DescribeSnapshots`
-//! reports it, so [`SnapshotRecord`] below is the one copy both read.
+//! `CreateSnapshot` mints one from a stored cluster, `CopySnapshot` mints a
+//! second from a stored snapshot, `DescribeSnapshots` reports it and
+//! `DeleteSnapshot` takes it away, so [`SnapshotRecord`] below is the one copy
+//! all of them read. A deleted snapshot does not vanish at the call: it answers
+//! `deleting` and the clock owes its removal
+//! ([`SnapshotRecord::pending_removal`]), the same way a created one is owed
+//! `available`.
 //!
 //! Beside the resources sits the event log: every change this service makes to
 //! one of them records an [`EventRecord`], and `DescribeEvents` reports that log
@@ -319,11 +324,14 @@ pub fn maintenance_window_refusal(value: &str) -> Option<String> {
 /// reads it — nothing sleeps.
 pub const CLUSTER_TRANSITION: Duration = Duration::from_millis(500);
 
-/// How long a snapshot stays `creating` before the clock owes it `available`.
+/// How long a snapshot stays in the status the call that started the work
+/// returned — `creating` after a create or a copy before the clock owes it
+/// `available`, and `deleting` after a delete before the clock owes its removal.
 ///
 /// The same reasoning as [`CLUSTER_TRANSITION`]: ElastiCache takes minutes, the
 /// emulator chooses a span, and it is deliberately NOT zero so a caller acting
-/// straight after `CreateSnapshot` still observes the transient status.
+/// straight after `CreateSnapshot` or `DeleteSnapshot` still observes the
+/// transient status.
 pub const SNAPSHOT_TRANSITION: Duration = Duration::from_millis(500);
 
 /// How many clusters, and how many subnet groups, the store holds before a
@@ -2055,6 +2063,19 @@ pub fn identifier_refusal(
 /// resource it could not resolve — words it the one way the service does.
 pub fn cache_cluster_not_found_message(cache_cluster_id: &str) -> String {
     format!("CacheCluster not found: {cache_cluster_id}")
+}
+
+/// How ElastiCache words a snapshot this account does not hold: the name the
+/// request asked for, which is all the service knows about a snapshot that does
+/// not exist.
+///
+/// One helper, so every operation that acts on a NAMED snapshot
+/// (`DeleteSnapshot`, `CopySnapshot`, and the tag operations when they land)
+/// words its `SnapshotNotFoundFault` the one way the service does. The name is
+/// reported as the caller sent it rather than lowercased, because the message is
+/// built from the request.
+pub fn snapshot_not_found_message(snapshot_name: &str) -> String {
+    format!("Snapshot with name {snapshot_name} not found")
 }
 
 /// The ARN of a cache cluster: `arn:aws:elasticache:<region>:<account>:cluster:<id>`.
@@ -5026,6 +5047,11 @@ pub struct SnapshotRecord {
     pub status: String,
     /// The status change the clock owes this snapshot, if any.
     pub pending_status: Option<PendingTransition>,
+    /// When the clock owes this snapshot's REMOVAL, set by `DeleteSnapshot`:
+    /// "ElastiCache immediately begins deleting the snapshot", so the record
+    /// answers [`STATUS_DELETING`] from that call and is dropped once the span
+    /// has passed. `None` on a snapshot nobody has deleted.
+    pub pending_removal: Option<SystemTime>,
     /// [`SNAPSHOT_SOURCE_MANUAL`] or [`SNAPSHOT_SOURCE_AUTOMATED`].
     pub source: String,
     /// When the snapshot was taken. `Snapshot` has no member for it — each
@@ -5091,6 +5117,7 @@ impl SnapshotRecord {
                 due: new.now + SNAPSHOT_TRANSITION,
                 status: STATUS_AVAILABLE.to_string(),
             }),
+            pending_removal: None,
             source: new.source,
             created_at: new.now,
             cache_node_type: cluster.cache_node_type.clone(),
@@ -5136,6 +5163,9 @@ impl SnapshotRecord {
                 due: new.now + SNAPSHOT_TRANSITION,
                 status: STATUS_AVAILABLE.to_string(),
             }),
+            // The copy is its own resource: whatever the source's deletion
+            // owes, nothing is owed on the record stored under the new name.
+            pending_removal: None,
             source: SNAPSHOT_SOURCE_MANUAL.to_string(),
             // "The ID of the KMS key used to encrypt the target snapshot": the
             // copy keeps the source's key when the request names none.
@@ -5163,6 +5193,22 @@ impl SnapshotRecord {
         self.status = pending.status.clone();
         self.pending_status = None;
         Some(settled)
+    }
+
+    /// Put this snapshot into [`STATUS_DELETING`] and let the clock owe its
+    /// removal [`SNAPSHOT_TRANSITION`] later.
+    ///
+    /// `DeleteSnapshot` documents exactly this: "When you receive a successful
+    /// response from this operation, ElastiCache immediately begins deleting the
+    /// snapshot; you cannot cancel or revert this operation" — so the record is
+    /// still there, reporting `deleting`, and the removal is what the clock
+    /// materialises ([`ComAmazonawsElasticacheAmazonelasticachev9State::purge_deleted_snapshots`]).
+    /// Any status change that was still pending is dropped: a snapshot that is
+    /// going away is not owed `available` any more.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        self.status = STATUS_DELETING.to_string();
+        self.pending_status = None;
+        self.pending_removal = Some(now + SNAPSHOT_TRANSITION);
     }
 
     /// This record as the modelled `Snapshot`.
@@ -7195,9 +7241,27 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         name: &str,
         now: SystemTime,
     ) -> Option<&mut SnapshotRecord> {
+        // A snapshot whose removal the clock has already carried through is
+        // gone, so it resolves to nothing rather than to a record reporting
+        // `deleting` for ever.
+        self.purge_deleted_snapshots(now);
         let snapshot = self.snapshots.get_mut(name)?;
         snapshot.settle(now);
         Some(snapshot)
+    }
+
+    /// Drop every snapshot whose removal the clock already owes — the snapshots
+    /// a `DeleteSnapshot` put into [`STATUS_DELETING`] at least
+    /// [`SNAPSHOT_TRANSITION`] ago.
+    ///
+    /// Owed by the clock alone (due at this instant whether or not anybody
+    /// called), so a reporting operation materialises it too, the same way it
+    /// materialises a status change — see
+    /// [`Self::purge_deleted_serverless_caches`], the same rule for the other
+    /// resource a delete only begins.
+    pub fn purge_deleted_snapshots(&mut self, now: SystemTime) {
+        self.snapshots
+            .retain(|_, snapshot| snapshot.pending_removal.is_none_or(|due| now < due));
     }
 
     /// Materialise every status change the clock owes, for a caller that is
@@ -7208,6 +7272,7 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         // A deletion the clock has carried through removes the record before
         // anything is reported from it.
         self.purge_deleted_serverless_caches(now);
+        self.purge_deleted_snapshots(now);
         let mut settled: Vec<(String, SettledTransition)> = Vec::new();
         for cluster in self.cache_clusters.values_mut() {
             if let Some(transition) = cluster.settle(now) {

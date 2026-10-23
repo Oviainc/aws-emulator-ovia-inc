@@ -110,3 +110,7 @@ mod rbac_user_access_string_and_deletion;
 // Appended for the same reason: the `CacheNodeType` catalogue-validation suite.
 #[path = "all/cache_node_type_validation.rs"]
 mod cache_node_type_validation;
+
+// Appended for the same reason: the `DeleteSnapshot` suite.
+#[path = "all/snapshot_delete.rs"]
+mod snapshot_delete;

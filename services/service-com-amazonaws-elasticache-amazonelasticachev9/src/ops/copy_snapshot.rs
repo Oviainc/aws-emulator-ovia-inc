@@ -252,9 +252,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(source) = store.settled_snapshot_mut(&source_snapshot_name, now) else {
                 return Err(CopySnapshotErrorModeled::SnapshotNotFoundFault(
                     SnapshotNotFoundFault {
-                        message: Some(format!(
-                            "Snapshot {} not found.",
-                            input.source_snapshot_name
+                        message: Some(crate::state::snapshot_not_found_message(
+                            &input.source_snapshot_name,
                         )),
                     },
                 )

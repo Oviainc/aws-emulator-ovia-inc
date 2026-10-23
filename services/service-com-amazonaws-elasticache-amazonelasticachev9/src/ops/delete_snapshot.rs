@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: this operation puts a stored snapshot into `deleting` and lets the clock
+//! owe its removal, so a later `DescribeSnapshots` first reports the snapshot going away
+//! and then does not report it at all. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +140,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSnapshot"))
+        // This operation MUTATES: it "deletes an existing snapshot", and
+        // "ElastiCache immediately begins deleting the snapshot; you cannot
+        // cancel or revert this operation".
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Same identity rule as `CreateSnapshot` and `CopySnapshot`: a snapshot
+        // name "is stored as a lowercase string", so the record this request
+        // resolves is the one stored under the lowercased name.
+        let snapshot_name = input.snapshot_name.to_ascii_lowercase();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The record read here is the one this instant owes: a snapshot whose
+        // removal an earlier delete made due is already gone, and one that has
+        // become `available` since it was created or copied is available now.
+        let Some(snapshot) = store.settled_snapshot_mut(&snapshot_name, now) else {
+            // No form check precedes this lookup: nothing ElastiCache documents
+            // constrains the shape of a snapshot name beyond its lowercasing,
+            // and `SnapshotNotFoundFault` is exactly "the requested snapshot
+            // name does not refer to an existing snapshot" — true of any name
+            // no stored snapshot carries. The fault names the snapshot the
+            // request asked for, which is all the service knows about one that
+            // does not exist.
+            return Err(DeleteSnapshotErrorModeled::SnapshotNotFoundFault(
+                SnapshotNotFoundFault {
+                    message: Some(crate::state::snapshot_not_found_message(
+                        &input.snapshot_name,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A snapshot is deletable only from its settled status: one still
+        // `creating`, one being `copied` or `restored`, and one already
+        // `deleting` from an earlier call all have work in flight over them —
+        // which is what `InvalidSnapshotStateFault` ("the current state of the
+        // snapshot does not allow the requested operation to occur") refuses,
+        // rather than deleting a snapshot twice or part-way through being
+        // written.
+        if snapshot.status != crate::state::STATUS_AVAILABLE {
+            return Err(DeleteSnapshotErrorModeled::InvalidSnapshotStateFault(
+                InvalidSnapshotStateFault {
+                    message: Some(format!(
+                        "Snapshot {snapshot_name} is in {} state, not {}.",
+                        snapshot.status,
+                        crate::state::STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The snapshot is leaving: it answers `deleting` now, and the clock owes
+        // its removal, so a caller reading it straight after this call still
+        // sees it going away and a later one sees it gone. The response is built
+        // from the record this call just wrote, so it reports persisted state.
+        snapshot.begin_deletion(now);
+        let deleted = snapshot.to_modeled(true);
+        let source_cluster = snapshot.cache_cluster_id.clone();
+        // Deleting a snapshot is one of the events this service records, under
+        // the CLUSTER the snapshot was taken from — the source the event
+        // happened to, as `crate::state::SOURCE_TYPE_CACHE_CLUSTER` explains; a
+        // snapshot with no source cluster is recorded under its own name.
+        store.record_event(
+            crate::state::SOURCE_TYPE_CACHE_CLUSTER,
+            source_cluster.as_deref().unwrap_or(&snapshot_name),
+            format!("Snapshot {snapshot_name} deleted"),
+            now,
+        );
+
+        Ok(DeleteSnapshotOutput {
+            snapshot: Some(deleted),
+        })
     }
 }
