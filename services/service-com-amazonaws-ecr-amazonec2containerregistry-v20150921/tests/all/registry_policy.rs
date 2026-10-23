@@ -4,18 +4,25 @@
 //!
 //! The rule under test: this registry carries at most ONE permissions policy.
 //! `PutRegistryPolicy` validates the document as a resource-based IAM policy and then
-//! stores it verbatim, replacing whatever was there; `GetRegistryPolicy` reports the
-//! stored document unchanged, as often as it is asked, and changes nothing;
+//! stores it, replacing whatever was there; `GetRegistryPolicy` reports the
+//! stored document, as often as it is asked, and changes nothing;
 //! `DeleteRegistryPolicy` removes it and reports what it removed; and a read or a delete
 //! of a registry that carries no policy is refused with `RegistryPolicyNotFoundException`
 //! (HTTP 400). A document that is not a usable registry policy is refused with
 //! `InvalidParameterException` (HTTP 400) and leaves the stored policy as it was.
+//!
+//! The document the three operations report is the submitted one in the canonical
+//! IAM-policy rendering, so what is compared here is the policy's CONTENT
+//! ([`crate::policy_document_canonical_form::document_content`]) plus the three
+//! operations agreeing on the same text; the rendering itself is pinned byte for byte in
+//! `policy_document_canonical_form.rs`.
 //!
 //! Every case goes through the router, so it exercises routing, deserialization, the
 //! handler, the persisted state and serialization — the same path a client takes.
 
 use serde_json::{json, Value};
 
+use crate::policy_document_canonical_form::document_content;
 use crate::wire::{call, emulator, ok, refused, REGISTRY_ID};
 
 /// The documented ceiling on a registry policy document: `RegistryPolicyText` is
@@ -26,7 +33,7 @@ const MAX_POLICY_TEXT: usize = 10_240;
 /// A policy document the registry accepts, used wherever a case only needs one stored.
 const A_STORED_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Sid":"Baseline","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::210987654321:root"},"Action":["ecr:ReplicateImage"],"Resource":"*"}]}"#;
 
-/// A document written across several lines, whose own whitespace must come back.
+/// A document written across several lines, whose own layout the rendering replaces.
 const PRETTY_PRINTED_POLICY: &str = r#"{
   "Version": "2012-10-17",
   "Statement": [
@@ -62,7 +69,8 @@ fn policy_of_size(size: usize) -> String {
     document(&"a".repeat(size - skeleton))
 }
 
-/// The policy documents a put must accept and a get must report back unchanged. The rows
+/// The policy documents a put must accept and a get must report back with its content
+/// intact. The rows
 /// differ along what the rule generalises over: the shape of `Statement` (one object or
 /// an array), the policy version, the principal form, the action element, the document's
 /// whitespace, its character set and its size.
@@ -105,7 +113,7 @@ fn accepted_documents() -> Vec<(&'static str, String)> {
                 .to_string(),
         ),
         (
-            "a pretty-printed document, whose own whitespace must survive",
+            "a pretty-printed document, whose own layout the rendering replaces",
             PRETTY_PRINTED_POLICY.to_string(),
         ),
         ("a document whose text is not ASCII", UNICODE_POLICY.to_string()),
@@ -191,10 +199,19 @@ fn policy_text(body: &Value) -> Value {
     body["policyText"].clone()
 }
 
-/// A document the registry accepts is stored verbatim, read back unchanged however many
+/// The policy document a call reported, as a comparison sees it.
+fn reported_content(body: &Value) -> Value {
+    document_content(
+        body["policyText"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the answer must carry a policyText, got {body:?}")),
+    )
+}
+
+/// A document the registry accepts is read back with its content intact however many
 /// times it is asked for, and replaced — not merged — by the next put.
 #[tokio::test]
-async fn a_stored_policy_document_round_trips_verbatim_and_the_last_put_wins() {
+async fn a_stored_policy_document_round_trips_and_the_last_put_wins() {
     let router = emulator();
 
     for (case, document) in accepted_documents() {
@@ -206,8 +223,8 @@ async fn a_stored_policy_document_round_trips_verbatim_and_the_last_put_wins() {
         )
         .await;
         assert_eq!(
-            policy_text(&put),
-            json!(document),
+            reported_content(&put),
+            document_content(&document),
             "case {case:?}: the put reports the document it stored, got {:?}",
             policy_text(&put)
         );
@@ -224,7 +241,13 @@ async fn a_stored_policy_document_round_trips_verbatim_and_the_last_put_wins() {
             let got = ok(&router, case, "GetRegistryPolicy", &json!({})).await;
             assert_eq!(
                 policy_text(&got),
-                json!(document),
+                policy_text(&put),
+                "case {case:?}: read {read} must report the text the put did, got {:?}",
+                policy_text(&got)
+            );
+            assert_eq!(
+                reported_content(&got),
+                document_content(&document),
                 "case {case:?}: read {read} must report the stored document, got {:?}",
                 policy_text(&got)
             );
@@ -245,18 +268,18 @@ async fn a_stored_policy_document_round_trips_verbatim_and_the_last_put_wins() {
         .1;
     let got = ok(&router, "after every put", "GetRegistryPolicy", &json!({})).await;
     assert_eq!(
-        policy_text(&got),
-        json!(last),
+        reported_content(&got),
+        document_content(&last),
         "the stored policy is the last one put, got {:?}",
         policy_text(&got)
     );
 
-    // And the delete reports the document it removed.
+    // And the delete reports the document it removed, in the same text the read did.
     let deleted = ok(&router, "after every put", "DeleteRegistryPolicy", &json!({})).await;
     assert_eq!(
         policy_text(&deleted),
-        json!(last),
-        "the delete reports the document it removed, got {:?}",
+        policy_text(&got),
+        "the delete reports the text the read did, got {:?}",
         policy_text(&deleted)
     );
     assert_eq!(
@@ -292,8 +315,8 @@ async fn a_document_that_is_not_a_registry_policy_is_refused_and_stores_nothing(
 
         let got = ok(&router, case, "GetRegistryPolicy", &json!({})).await;
         assert_eq!(
-            policy_text(&got),
-            json!(A_STORED_POLICY),
+            reported_content(&got),
+            document_content(A_STORED_POLICY),
             "case {case:?}: a refused put leaves the stored policy as it was, got {:?}",
             policy_text(&got)
         );
@@ -313,8 +336,8 @@ async fn a_document_that_is_not_a_registry_policy_is_refused_and_stores_nothing(
     .await;
     let got = ok(&router, "past the ceiling", "GetRegistryPolicy", &json!({})).await;
     assert_eq!(
-        policy_text(&got),
-        json!(A_STORED_POLICY),
+        reported_content(&got),
+        document_content(A_STORED_POLICY),
         "an over-long document stores nothing, got {:?}",
         policy_text(&got)
     );
@@ -346,8 +369,8 @@ async fn reading_or_deleting_a_policy_that_is_not_there_is_refused() {
     .await;
     let deleted = ok(&router, "the delete", "DeleteRegistryPolicy", &json!({})).await;
     assert_eq!(
-        policy_text(&deleted),
-        json!(A_STORED_POLICY),
+        reported_content(&deleted),
+        document_content(A_STORED_POLICY),
         "the delete reports the document it removed, got {:?}",
         policy_text(&deleted)
     );
@@ -374,8 +397,8 @@ async fn reading_or_deleting_a_policy_that_is_not_there_is_refused() {
     .await;
     let got = ok(&router, "a put after the delete", "GetRegistryPolicy", &json!({})).await;
     assert_eq!(
-        policy_text(&got),
-        json!(A_STORED_POLICY),
+        reported_content(&got),
+        document_content(A_STORED_POLICY),
         "a put after a delete stores the policy again, got {:?}",
         policy_text(&got)
     );
@@ -418,17 +441,20 @@ async fn concurrent_puts_leave_exactly_one_of_the_documents_they_put() {
             answer.status, answer.body
         );
         assert_eq!(
-            policy_text(&answer.body),
-            json!(documents[index]),
+            reported_content(&answer.body),
+            document_content(&documents[index]),
             "case {index}: each put reports its OWN document, got {:?}",
             policy_text(&answer.body)
         );
     }
 
     let got = ok(&router, "after the concurrent puts", "GetRegistryPolicy", &json!({})).await;
-    let stored = policy_text(&got);
+    let stored = reported_content(&got);
     assert!(
-        documents.iter().any(|document| stored == json!(document)),
-        "the stored policy must be one of the documents put, got {stored:?}"
+        documents
+            .iter()
+            .any(|document| stored == document_content(document)),
+        "the stored policy must be one of the documents put, got {:?}",
+        policy_text(&got)
     );
 }
