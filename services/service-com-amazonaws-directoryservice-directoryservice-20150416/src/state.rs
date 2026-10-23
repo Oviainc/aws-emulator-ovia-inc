@@ -11,7 +11,7 @@
 //! * [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`], which
 //!   materialises the status transitions the clock has already made due (a directory
 //!   leaving `Requested`, a snapshot leaving `Creating`, an IP route leaving `Adding`, an
-//!   assessment leaving `IN_PROGRESS`).
+//!   assessment leaving `IN_PROGRESS`, a directory's data access leaving `Enabling`).
 //!   Every handler calls it before reading or writing, so a reporting operation reports
 //!   what the clock already owed and nothing more.
 //! * [`Directory::to_description`], the one place a stored directory is rendered as the
@@ -253,6 +253,26 @@ pub const MAX_SNAPSHOTS: usize = MAX_DIRECTORIES * MAX_MANUAL_SNAPSHOTS_PER_DIRE
 /// the other values describe a topic the SNS data plane this emulator does not have
 /// would have to report on.
 pub const TOPIC_STATUS_REGISTERED: &str = "Registered";
+
+/// The `DataAccessStatus` of a directory nothing has enabled the Directory Service Data
+/// API for: the `Disabled` value of the modelled `DataAccessStatus` enum
+/// (`smithy_query(query="shape", shape="DataAccessStatus")` answers
+/// `["Disabled", "Disabling", "Enabled", "Enabling", "Failed"]`), and the status
+/// `DescribeDirectoryDataAccess` therefore reports for every freshly created directory.
+pub const DATA_ACCESS_DISABLED: &str = "Disabled";
+
+/// The `DataAccessStatus` a directory carries between `EnableDirectoryDataAccess` and
+/// [`TRANSITION_SPAN`]: the modelled enum's `Enabling` value.
+///
+/// The enable answers before data access is in service — the enum carries both the
+/// transient `Enabling` and the settled `Enabled` — so the move to
+/// [`DATA_ACCESS_ENABLED`] is owed by the clock, on the same span a create's stage
+/// transition uses.
+pub const DATA_ACCESS_ENABLING: &str = "Enabling";
+
+/// The `DataAccessStatus` a directory reaches once the enable's [`TRANSITION_SPAN`] has
+/// elapsed: the modelled enum's `Enabled` value.
+pub const DATA_ACCESS_ENABLED: &str = "Enabled";
 
 /// The ARN service segment of an Amazon SNS topic, so a reported `TopicArn` is built
 /// through [`::engine::emulator_arn`] rather than written as a literal.
@@ -542,6 +562,14 @@ pub struct Directory {
     /// associations live on the directory record, so deleting the directory takes its
     /// associations with it.
     pub event_topics: BTreeMap<String, EventTopicRegistration>,
+    /// Whether this directory's data is reachable through the Directory Service Data
+    /// API, as `DescribeDirectoryDataAccess` reports it: one of the modelled
+    /// `DataAccessStatus` values, [`DATA_ACCESS_DISABLED`] until
+    /// `EnableDirectoryDataAccess` records otherwise.
+    pub data_access_status: String,
+    /// When the data-access status transition an enable owes falls due; `None` once
+    /// there is none left to make. See [`TRANSITION_SPAN`].
+    pub data_access_due_at: Option<SystemTime>,
     /// Creation rank, from
     /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::next_seq`]. A
     /// listing pages over directories sorted by this, and its opaque `NextToken`
@@ -894,7 +922,8 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// when the record it belongs to was created — a directory's stage when
     /// `CreateDirectory` ran, a snapshot's status when `CreateSnapshot` ran, an IP
     /// route's status when `AddIpRoutes` ran, an assessment's status when
-    /// `StartADAssessment` ran.
+    /// `StartADAssessment` ran, a directory's data-access status when
+    /// `EnableDirectoryDataAccess` ran.
     pub fn advance_clock(&mut self, now: SystemTime) {
         for directory in self.directories.values_mut() {
             if let Some(due) = directory.stage_due_at {
@@ -911,6 +940,17 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                 if now >= due {
                     route.status = IP_ROUTE_STATUS_ADDED.to_string();
                     route.status_due_at = None;
+                }
+            }
+            // The data-access transition `EnableDirectoryDataAccess` owes: the
+            // transient `Enabling` settles on `Enabled`. The mirrored transition out of
+            // `Disabling` belongs to `DisableDirectoryDataAccess`, which is still
+            // scaffolded, so it lands with that handler rather than as a branch nothing
+            // can reach.
+            if let Some(due) = directory.data_access_due_at {
+                if now >= due && directory.data_access_status == DATA_ACCESS_ENABLING {
+                    directory.data_access_status = DATA_ACCESS_ENABLED.to_string();
+                    directory.data_access_due_at = None;
                 }
             }
         }
