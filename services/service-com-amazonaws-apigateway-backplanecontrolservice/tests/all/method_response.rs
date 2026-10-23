@@ -25,7 +25,10 @@ use crate::method_integration::{get_method, resource_with_a_method};
 use crate::rest_api_lifecycle::{assert_failure, create_api, Answer, Gateway};
 
 /// `PutMethodResponse` for `status` on the `verb` method of `resource`.
-async fn put_method_response(
+///
+/// Shared with the sibling `delete_method_response` suite, so both suites create a
+/// method response the same way.
+pub(crate) async fn put_method_response(
     gateway: &Gateway,
     api: &str,
     resource: &str,
@@ -42,8 +45,9 @@ async fn put_method_response(
         .await
 }
 
-/// `GetMethodResponse` for `status` on the `verb` method of `resource`.
-async fn get_method_response(
+/// `GetMethodResponse` for `status` on the `verb` method of `resource`. Shared with the
+/// sibling `delete_method_response` suite, which reads a response back through it.
+pub(crate) async fn get_method_response(
     gateway: &Gateway,
     api: &str,
     resource: &str,
@@ -60,8 +64,9 @@ async fn get_method_response(
 }
 
 /// A `method.response.header.{name}` mapping expression for `name`, built from the prefix
-/// the handler publishes rather than spelled out per case.
-fn response_header(name: &str) -> String {
+/// the handler publishes rather than spelled out per case. Shared with the sibling
+/// `delete_method_response` suite.
+pub(crate) fn response_header(name: &str) -> String {
     format!("{METHOD_RESPONSE_HEADER_PREFIX}{name}")
 }
 
