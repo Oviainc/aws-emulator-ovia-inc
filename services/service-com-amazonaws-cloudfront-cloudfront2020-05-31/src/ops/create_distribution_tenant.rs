@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDistributionTenant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDistributionTenant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a distribution tenant of a MULTI-TENANT distribution, and persists it: the
+//! record this handler stores is what every later read of the tenant answers from.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDistributionTenant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation decides
 //!
-//! ## Shape of an operation
+//! * the tenant's identity — its id, its ARN and its first version token — is MINTED
+//!   here and never derived from the request;
+//! * `Domains` is where the tenant's viewers reach it, so every domain is checked for
+//!   shape, for a conflict with any domain or alias another CloudFront resource in this
+//!   emulator already claims, and against the documented per-tenant domain quota;
+//! * `Parameters` has to satisfy the multi-tenant distribution's
+//!   `TenantConfig$ParameterDefinitions`, and every caller-chosen list the request carries
+//!   (`Domains`, `Parameters`, a customization's locations, `Tags`) is count-bounded
+//!   BEFORE the store lock is taken, so no request's length decides how long the store is
+//!   held or how large the stored record is;
+//! * a tenant that names no `ConnectionGroupId` is routed through the account's DEFAULT
+//!   connection group, which this call mints the first time one is needed.
 //!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `CreateDistributionTenant::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! Every refusal is decided BEFORE anything is minted, so a refused create leaves the
+//! store exactly as it was.
 //!
 //! ## Reaching this service's state
 //!
@@ -97,6 +101,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeSet;
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -136,6 +143,16 @@ impl From<CreateDistributionTenantErrorModeled> for CreateDistributionTenantErro
     }
 }
 
+/// This operation's modelled refusal for a request whose arguments describe no
+/// distribution tenant — "An argument is invalid." — carrying the reason the argument was
+/// unusable.
+fn invalid_argument(reason: String) -> CreateDistributionTenantError {
+    CreateDistributionTenantErrorModeled::InvalidArgument(InvalidArgument {
+        message: Some(format!("An argument is invalid: {reason}")),
+    })
+    .into()
+}
+
 /// The `CreateDistributionTenant` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -172,18 +189,231 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDistributionTenant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDistributionTenantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // ---- Request shape, decided BEFORE the store lock is taken ----------------
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDistributionTenant"))
+        // Everything below is a property of the request alone, and every list the
+        // request carries is bounded here: a caller-chosen length never drives work
+        // while the single store lock is held, and never reaches the record that is
+        // stored.
+
+        // "The domains associated with the distribution tenant. You must specify at least
+        // one domain in the request." `DomainList` carries no `@length`, so an empty list
+        // satisfies every modelled constraint and is refused here instead.
+        let domains: Vec<String> = input
+            .domains
+            .iter()
+            .map(|item| item.domain.clone())
+            .collect();
+        if domains.is_empty() {
+            return Err(invalid_argument(
+                "you must specify at least one domain for a distribution tenant".to_string(),
+            ));
+        }
+        // "Each distribution tenant can have up to 5 domains" — refused HERE, before the
+        // per-domain shape check and before the store-wide conflict scan below, so neither
+        // the work this request causes nor the record it would store grows with a list the
+        // caller chose the length of.
+        if domains.len() > crate::state::MAX_DOMAINS_PER_TENANT {
+            return Err(invalid_argument(format!(
+                "a distribution tenant holds at most {} domains but the request names {}",
+                crate::state::MAX_DOMAINS_PER_TENANT,
+                domains.len()
+            )));
+        }
+
+        // A domain is where viewers reach the tenant, so each one has to be a domain name
+        // at all, and a request that names one twice describes no single association.
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for domain in &domains {
+            if let Some(reason) = crate::state::domain_name_refusal(domain) {
+                return Err(invalid_argument(reason));
+            }
+            if !seen.insert(domain.to_ascii_lowercase()) {
+                return Err(invalid_argument(format!(
+                    "the domain {domain} is named more than once"
+                )));
+            }
+        }
+
+        // The parameter values and the customizations are both caller-chosen lists that
+        // END UP IN THE STORED RECORD, so each is count-bounded before anything walks it:
+        // one bound on how many values a tenant may carry, one on the locations a
+        // geographic restriction may name.
+        let parameters = input.parameters.unwrap_or_default();
+        if parameters.len() > crate::state::MAX_PARAMETERS_PER_TENANT {
+            return Err(invalid_argument(format!(
+                "a distribution tenant carries at most {} parameter values but the request \
+                 names {}",
+                crate::state::MAX_PARAMETERS_PER_TENANT,
+                parameters.len()
+            )));
+        }
+        if let Some(reason) = input
+            .customizations
+            .as_ref()
+            .and_then(crate::state::customizations_refusal)
+        {
+            return Err(invalid_argument(reason));
+        }
+
+        // A tag set no resource can carry is refused with the error this operation models
+        // for an invalid tag set, under the service's one tagging rule (which bounds the
+        // tag count too).
+        let tags = input
+            .tags
+            .as_ref()
+            .map(crate::state::tag_set)
+            .transpose()
+            .map_err(|reason| {
+                CreateDistributionTenantErrorModeled::InvalidTagging(crate::state::invalid_tagging(
+                    reason,
+                ))
+            })?
+            .unwrap_or_default();
+
+        // ---- The store ------------------------------------------------------------
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // "The ID of the multi-tenant distribution to use for creating the distribution
+        // tenant": the distribution has to exist, and it has to be one that HAS tenants —
+        // a standard distribution serves its own traffic and no tenant can be associated
+        // with it, which is what `InvalidAssociation` ("The specified CloudFront resource
+        // can't be associated") says.
+        let Some(distribution) = store.distribution(&input.distribution_id) else {
+            return Err(CreateDistributionTenantErrorModeled::EntityNotFound(
+                crate::state::distribution_not_found(&input.distribution_id),
+            )
+            .into());
+        };
+        if !crate::state::is_multi_tenant(&distribution.config) {
+            return Err(CreateDistributionTenantErrorModeled::InvalidAssociation(
+                InvalidAssociation {
+                    message: Some(format!(
+                        "The distribution {} is not a multi-tenant distribution, so it has no \
+                         distribution tenants",
+                        input.distribution_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "A valid parameter value must exist for any parameter that is marked as required
+        // in the multi-tenant distribution" — checked against the definitions the
+        // distribution really carries, so the rule follows the stored record rather than
+        // the request. The check indexes the definitions once rather than scanning them
+        // per submitted value, so its cost is no product of two lengths.
+        let definitions = distribution
+            .config
+            .tenant_config
+            .as_ref()
+            .and_then(|config| config.parameter_definitions.as_deref())
+            .unwrap_or_default();
+        if let Some(reason) = crate::state::parameter_refusal(definitions, &parameters) {
+            return Err(invalid_argument(reason));
+        }
+
+        // "The ID of the connection group to associate with the distribution tenant." A
+        // connection group this emulator does not hold is no entity; naming none asks for
+        // the account's default connection group, which the first create that needs one
+        // mints.
+        if let Some(connection_group_id) = &input.connection_group_id {
+            if !store.holds_connection_group(connection_group_id) {
+                return Err(CreateDistributionTenantErrorModeled::EntityNotFound(
+                    crate::state::connection_group_not_found(connection_group_id),
+                )
+                .into());
+            }
+        }
+
+        // "Enter a friendly identifier that is unique within your Amazon Web Services
+        // account": a name identifies ONE tenant for its whole life, so a name the store
+        // already holds cannot name a second one.
+        if store
+            .distribution_tenants
+            .values()
+            .any(|tenant| tenant.name == input.name)
+        {
+            return Err(CreateDistributionTenantErrorModeled::EntityAlreadyExists(
+                crate::state::distribution_tenant_already_exists(&input.name),
+            )
+            .into());
+        }
+
+        // "The CNAME specified is already defined for CloudFront": a domain routes to at
+        // most one CloudFront resource, across tenants and distribution aliases alike.
+        for domain in &domains {
+            if store.domain_in_use(domain, None) {
+                return Err(CreateDistributionTenantErrorModeled::CNAMEAlreadyExists(
+                    crate::state::cname_already_exists(domain),
+                )
+                .into());
+            }
+        }
+
+        // "The entity limit has been exceeded." The store grows only here and a tenant
+        // cannot be evicted, so the bound is an entry count refused before the insert.
+        if store.distribution_tenants.len() >= crate::state::MAX_DISTRIBUTION_TENANTS {
+            return Err(CreateDistributionTenantErrorModeled::EntityLimitExceeded(
+                EntityLimitExceeded {
+                    message: Some(format!(
+                        "This emulator holds at most {} distribution tenants; delete one before \
+                         creating another",
+                        crate::state::MAX_DISTRIBUTION_TENANTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let connection_group_id = match input.connection_group_id {
+            Some(named) => named,
+            None => store.default_connection_group(),
+        };
+        let id = store.allocate_distribution_tenant_id();
+        let etag = store.next_etag();
+        let stored = crate::state::StoredDistributionTenant {
+            arn: crate::state::distribution_tenant_arn(&id),
+            id: id.clone(),
+            name: input.name,
+            distribution_id: input.distribution_id,
+            domains,
+            connection_group_id,
+            // Customizations are the tenant's overrides of its distribution's settings, so
+            // they are stored exactly as submitted: the service supplies nothing of its
+            // own here, and a tenant that named none carries none.
+            customizations: input.customizations,
+            parameters,
+            // Held, not acted on: no certificate is issued here, and nothing in this
+            // response claims one was. The certificate surface answers for itself.
+            managed_certificate_request: input.managed_certificate_request,
+            tags,
+            enabled: input.enabled.unwrap_or(crate::state::DEFAULT_TENANT_ENABLED),
+            // A tenant CloudFront has just accepted has not propagated to the edge
+            // locations yet, so it reports the transient status until the clock owes it
+            // the terminal one.
+            status: crate::state::STATUS_IN_PROGRESS.to_string(),
+            deployed_due: now + crate::state::PROPAGATION_DELAY,
+            created_time: now,
+            last_modified_time: now,
+            etag: etag.clone(),
+        };
+        let distribution_tenant = stored.to_distribution_tenant();
+        store.distribution_tenants.insert(id, stored);
+
+        Ok(CreateDistributionTenantOutput {
+            // "The distribution tenant that you created" — read from the record just
+            // stored, so the answer and every later read are the same document.
+            distribution_tenant: Some(distribution_tenant),
+            // "The current version of the distribution tenant."
+            e_tag: Some(etag),
+        })
     }
 }
