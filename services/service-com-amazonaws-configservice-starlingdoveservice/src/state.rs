@@ -27,6 +27,11 @@ use crate::ops::types::{
     StoredQuery, Tag,
 };
 
+// `ScopeConfiguration` is named here rather than in the import list above: that list
+// is shared by every operation's state and is edited by whichever slice lands next, so
+// staying out of it keeps this change from colliding with theirs.
+use crate::ops::types::ScopeConfiguration;
+
 /// The ARN namespace of this service (`awsService.arnNamespace` in the model), used
 /// for every ARN this emulator mints.
 pub const ARN_SERVICE: &str = "config";
@@ -109,6 +114,76 @@ pub const CONFIGURATION_RECORDER_FILTER_RECORDING_SCOPE: &str = "recordingScope"
 /// default of 0, is served a page of this size — a page of zero would never report a
 /// recorder the store holds.
 pub const LIST_CONFIGURATION_RECORDERS_PAGE_SIZE: usize = 20;
+
+/// The Amazon Web Services service principals that can own a THIRD-PARTY
+/// service-linked configuration recorder — the ones
+/// `PutThirdPartyServiceLinkedConfigurationRecorder` records a third-party cloud
+/// service provider's resources for, through a connector.
+///
+/// That operation "can only be called by the Amazon Web Services service linked to the
+/// configuration recorder", and Security Hub CSPM is the service documented as
+/// recording a third-party cloud service provider's resources through a Config
+/// connector, so a WELL-FORMED service principal naming any other service names no
+/// third-party service-linked recorder and is refused
+/// ([`unsupported_third_party_service_principal_message`]). Extend this table as Config
+/// links further services.
+///
+/// This set bounds only the THIRD-PARTY operation:
+/// `PutServiceLinkedConfigurationRecorder`, which records this account's own resources,
+/// takes any Amazon Web Services service principal (see
+/// [`service_linked_recorder_name`]). Both operations derive the recorder's name the
+/// same way, so one service has ONE service-linked recorder however it was created.
+pub const THIRD_PARTY_SERVICE_LINKED_PRINCIPALS: [&str; 1] = ["securityhub.amazonaws.com"];
+
+/// Whether the service `service_principal` names can own a third-party service-linked
+/// configuration recorder ([`THIRD_PARTY_SERVICE_LINKED_PRINCIPALS`]).
+pub fn supports_third_party_service_linked_recording(service_principal: &str) -> bool {
+    THIRD_PARTY_SERVICE_LINKED_PRINCIPALS.contains(&service_principal)
+}
+
+/// How Config words `ValidationException` for a `ServicePrincipal` that names no
+/// service Config links a configuration recorder for a third-party cloud service
+/// provider to — whether the value is no service principal at all or names a service
+/// that owns no such recorder.
+///
+/// The model states the condition (`ValidationException`: "You have provided a service
+/// principal for service-linked configuration recorder that is not valid") and Config
+/// answers it with this FIXED sentence — the same shape as the wording it uses for a
+/// configuration recorder name it cannot find — so the text is request-independent: it
+/// quotes nothing the caller sent.
+pub const UNRECOGNIZED_RECORDER_SERVICE_PRINCIPAL_MESSAGE: &str =
+    "The service principal of the configuration recorder you entered cannot be found. \
+     Verify the configuration recorder service principal, and try again.";
+
+/// The `scopeType` values a `ScopeConfiguration` may carry
+/// (`ScopeConfiguration$scopeType`: "Valid values include `tenant` and
+/// `subscription`").
+pub const SCOPE_TYPES: [&str; 2] = ["tenant", "subscription"];
+
+/// Why `scope` is not a valid `ScopeConfiguration`, or `None` when it is.
+///
+/// The ONE constraint checked here is the one the shape documents: the scope type is
+/// one of the published [`SCOPE_TYPES`] (`ScopeConfiguration$scopeType`). The message
+/// is BUILT FROM THE REQUEST — it names the member and the constraint it failed.
+///
+/// `includedRegions` is NOT checked against `allRegions`: the shape documents it as
+/// "the list of regions from the third-party cloud service provider to include when
+/// recording resources. Used when allRegions is set to false", which says the list is
+/// consulted only when every region is not recorded — not that carrying both is
+/// refused. A recorder stores the list as sent and records every region while
+/// `allRegions` is true, rather than this emulator inventing a refusal the service
+/// may not make.
+pub fn scope_configuration_violation(scope: &ScopeConfiguration) -> Option<String> {
+    if !SCOPE_TYPES.contains(&scope.scope_type.as_str()) {
+        return Some(format!(
+            "Value '{}' at 'scopeConfiguration.scopeType' failed to satisfy constraint: \
+             Member must be one of [{}]",
+            scope.scope_type,
+            SCOPE_TYPES.join(", "),
+        ));
+    }
+    None
+}
 
 /// The `RuleEvaluationVisibility` of a rule whose `Evaluation`s the caller can read
 /// back (`ConfigRule$RuleEvaluationVisibility`: "You can get Evaluations for the
@@ -556,11 +631,23 @@ pub struct RecorderEntry {
     /// recorder's ARN and never changes once minted.
     pub id: String,
     pub arn: String,
-    pub role_arn: String,
+    /// The IAM role Config records with. A CUSTOMER MANAGED recorder carries the role
+    /// the request named; a SERVICE-LINKED one carries Config's own service-linked role
+    /// ([`config_service_linked_role_arn`]), which it creates in the account rather
+    /// than taking from the caller. The model leaves `roleARN` optional, so a recorder
+    /// stored without one reports none rather than an invented role.
+    pub role_arn: Option<String>,
     pub recording_group: Option<RecordingGroup>,
     pub recording_mode: Option<RecordingMode>,
     pub recording_scope: Option<String>,
     pub service_principal: Option<String>,
+    /// The connector linking this recorder to a third-party cloud service provider,
+    /// set only on a recorder
+    /// `PutThirdPartyServiceLinkedConfigurationRecorder` created.
+    pub connector_arn: Option<String>,
+    /// The scope of third-party resources this recorder records, set only on a
+    /// recorder linked to a connector.
+    pub scope_configuration: Option<ScopeConfiguration>,
     /// The third-party cloud service provider whose resources a service-linked
     /// recorder records (`ConfigurationRecorderSummary$provider`: "For service-linked
     /// configuration recorders that record resources from a third-party cloud service
@@ -581,14 +668,21 @@ impl RecorderEntry {
         ConfigurationRecorder {
             arn: Some(self.arn.clone()),
             name: Some(self.name.clone()),
-            role_arn: Some(self.role_arn.clone()),
+            role_arn: self.role_arn.clone(),
             recording_group: self.recording_group.clone(),
             recording_mode: self.recording_mode.clone(),
             recording_scope: self.recording_scope.clone(),
             service_principal: self.service_principal.clone(),
-            connector_arn: None,
-            scope_configuration: None,
+            connector_arn: self.connector_arn.clone(),
+            scope_configuration: self.scope_configuration.clone(),
         }
+    }
+
+    /// Whether this recorder is linked to (and managed by) an Amazon Web Services
+    /// service rather than created and paid for by this account — which is what
+    /// carrying a service principal means.
+    pub fn is_service_linked(&self) -> bool {
+        self.service_principal.is_some()
     }
 
     /// The modelled `ConfigurationRecorderSummary`, read back out of state: the
@@ -613,6 +707,9 @@ impl RecorderEntry {
 pub struct RecorderStatusEntry {
     pub name: String,
     pub arn: String,
+    /// For a service-linked recorder, the service it is linked to; `None` for a
+    /// customer managed one.
+    pub service_principal: Option<String>,
     pub recording: bool,
     pub last_start_time: Option<SystemTime>,
     pub last_stop_time: Option<SystemTime>,
@@ -634,9 +731,9 @@ impl RecorderStatusEntry {
         }
     }
 
-    /// A status record for a recorder that is ALREADY recording at `started_at`,
-    /// because the service it is linked to turned it on when it created it: the
-    /// caller cannot start or stop a service-linked configuration recorder
+    /// A status record for a SERVICE-LINKED recorder that is ALREADY recording at
+    /// `started_at`, because the service it is linked to turned it on when it created
+    /// it: the caller cannot start or stop a service-linked configuration recorder
     /// (`UnmodifiableEntityException`: "For StartConfigurationRecorder and
     /// StopConfigurationRecorder ... these operations do not affect service-linked
     /// configuration recorders"), and the linked service holds it in use
@@ -644,12 +741,17 @@ impl RecorderStatusEntry {
     /// cannot delete the service-linked recorder because it is currently in use by
     /// the linked Amazon Web Services service").
     ///
+    /// `service_principal` is the service the recorder is linked to, which the status
+    /// reports for exactly this kind of recorder
+    /// (`ConfigurationRecorderStatus$servicePrincipal`).
+    ///
     /// Like a start the caller asked for, the recording event is `Pending` until the
     /// clock makes the move to `Success` due; [`Self::settle`] materialises it.
-    pub fn started(name: &str, arn: &str, started_at: SystemTime) -> Self {
+    pub fn started(name: &str, arn: &str, service_principal: &str, started_at: SystemTime) -> Self {
         Self {
             name: name.to_string(),
             arn: arn.to_string(),
+            service_principal: Some(service_principal.to_string()),
             recording: true,
             last_start_time: Some(started_at),
             last_stop_time: None,
@@ -686,7 +788,7 @@ impl RecorderStatusEntry {
             last_error_code: None,
             last_error_message: None,
             last_status_change_time: self.last_status_change_time.map(timestamp),
-            service_principal: None,
+            service_principal: self.service_principal.clone(),
         }
     }
 }
@@ -1614,13 +1716,17 @@ impl StoredQueryEntry {
 pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Every configuration recorder of this account and Region, keyed by name: the
     /// customer managed one `PutConfigurationRecorder` creates and the service-linked
-    /// ones `PutServiceLinkedConfigurationRecorder` creates, which carry a
+    /// ones `PutServiceLinkedConfigurationRecorder` and
+    /// `PutThirdPartyServiceLinkedConfigurationRecorder` create, which carry a
     /// `service_principal`.
     ///
     /// BOUNDED at [`CUSTOMER_MANAGED_RECORDERS_QUOTA`] customer managed entries plus
     /// [`SERVICE_LINKED_RECORDERS_QUOTA`] service-linked ones — one engine's store
     /// stands for one account in one Region, and both per-Region quotas are enforced
-    /// over the whole store, so no sequence of calls can grow this map further.
+    /// over the whole store, so no sequence of calls can grow this map further. A
+    /// third-party service-linked recorder is named from its service principal exactly
+    /// as the other service-linked ones are, so it occupies one of the same entries
+    /// rather than adding a class of its own.
     pub recorders: HashMap<String, RecorderEntry>,
     /// The status record of each recorder, keyed by recorder name. Holds at most one
     /// entry per recorder in [`Self::recorders`], so the same bound holds.
@@ -1719,6 +1825,21 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
 }
 
 impl ComAmazonawsConfigserviceStarlingdoveserviceState {
+    /// The CUSTOMER MANAGED configuration recorders this account holds: the ones it
+    /// created and is billed for. A service-linked recorder records for the Amazon Web
+    /// Services service it is linked to, so it neither counts against the customer
+    /// managed recorder quota nor stands in for one where an operation needs one.
+    pub fn customer_managed_recorders(&self) -> impl Iterator<Item = &RecorderEntry> {
+        self.recorders
+            .values()
+            .filter(|recorder| !recorder.is_service_linked())
+    }
+
+    /// Whether this account holds a customer managed configuration recorder.
+    pub fn has_customer_managed_recorder(&self) -> bool {
+        self.customer_managed_recorders().next().is_some()
+    }
+
     /// Record `entry` as a started resource evaluation, with the `ClientToken` that
     /// started it indexed back to it.
     ///

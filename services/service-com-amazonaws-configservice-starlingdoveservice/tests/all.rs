@@ -39,6 +39,8 @@ mod config_setup_and_rule_loop;
 mod config_stored_queries;
 #[path = "all/config_tagging.rs"]
 mod config_tagging;
+#[path = "all/config_third_party_service_linked_recorder.rs"]
+mod config_third_party_service_linked_recorder;
 #[path = "all/discovered_resources.rs"]
 mod discovered_resources;
 #[path = "all/error_message_rules.rs"]

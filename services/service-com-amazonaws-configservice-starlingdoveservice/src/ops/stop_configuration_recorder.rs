@@ -197,6 +197,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let arn = recorder.arn.clone();
 
+        // This operation does not affect a service-linked configuration recorder:
+        // "Service-linked configuration recorders are always recording. To stop
+        // recording, you must delete the service-linked configuration recorder."
+        if recorder.is_service_linked() {
+            return Err(
+                StopConfigurationRecorderErrorModeled::UnmodifiableEntityException(
+                    UnmodifiableEntityException {
+                        message: Some(format!(
+                            "'{name}' is a service-linked configuration recorder, which is \
+                             always recording; use DeleteServiceLinkedConfigurationRecorder to \
+                             stop it"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let now = ::std::time::SystemTime::now();
         let status = store
             .recorder_status

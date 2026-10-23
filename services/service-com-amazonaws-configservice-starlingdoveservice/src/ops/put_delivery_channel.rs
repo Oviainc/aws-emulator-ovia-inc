@@ -199,8 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // A delivery channel needs a configuration recorder to deliver for.
-        if store.recorders.is_empty() {
+        // A delivery channel needs a CUSTOMER MANAGED configuration recorder to
+        // deliver for: a service-linked recorder delivers to the service it is linked
+        // to, not to this account's channel.
+        if !store.has_customer_managed_recorder() {
             return Err(
                 PutDeliveryChannelErrorModeled::NoAvailableConfigurationRecorderException(
                     NoAvailableConfigurationRecorderException {

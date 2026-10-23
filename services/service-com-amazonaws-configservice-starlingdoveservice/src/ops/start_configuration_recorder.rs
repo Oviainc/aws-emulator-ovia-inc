@@ -202,6 +202,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let arn = recorder.arn.clone();
 
+        // This operation does not affect a service-linked configuration recorder:
+        // "Service-linked configuration recorders are always recording", so there is
+        // nothing for a caller to start.
+        if recorder.is_service_linked() {
+            return Err(
+                StartConfigurationRecorderErrorModeled::UnmodifiableEntityException(
+                    UnmodifiableEntityException {
+                        message: Some(format!(
+                            "'{name}' is a service-linked configuration recorder, which is \
+                             always recording"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // Config needs somewhere to deliver what it records before it can record.
         if store.delivery_channels.is_empty() {
             return Err(

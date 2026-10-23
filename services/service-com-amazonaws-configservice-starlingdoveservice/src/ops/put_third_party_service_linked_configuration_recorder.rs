@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutThirdPartyServiceLinkedConfigurationRecorder
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutThirdPartyServiceLinkedConfigurationRecorder`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutThirdPartyServiceLinkedConfigurationRecorder::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates the service-linked configuration recorder that records a
+//! third-party cloud service provider's resources through a connector.
+//!
+//! What this handler enforces, and where each rule comes from:
+//!
+//! * the service principal must name an Amazon Web Services service
+//!   ([`crate::state::service_linked_recorder_name`], which is also what names the
+//!   recorder), and that service must be one Config records a third-party cloud
+//!   service provider for ([`crate::state::THIRD_PARTY_SERVICE_LINKED_PRINCIPALS`]);
+//!   any other value — malformed or merely well formed — is refused with the
+//!   `ValidationException` the model states for it
+//!   ([`crate::state::UNRECOGNIZED_RECORDER_SERVICE_PRINCIPAL_MESSAGE`]);
+//! * the `ScopeConfiguration` must satisfy its own documented constraints
+//!   ([`crate::state::scope_configuration_violation`]);
+//! * `ConnectorArn` ("The specified connector must exist") must name a connector this
+//!   account holds;
+//! * the recorder's name, recording group, recording mode and recording scope are set
+//!   by the linked service rather than by the request, and the name carries the
+//!   reserved `AWSConfigurationRecorderFor` prefix;
+//! * a second call for the same principal and connector UPDATES the scope
+//!   configuration; one naming a different connector for a principal that already has
+//!   a recorder is a `ConflictException`;
+//! * tags are taken at creation and are not updated here.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +199,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutThirdPartyServiceLinkedConfigurationRecorder` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutThirdPartyServiceLinkedConfigurationRecorderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutThirdPartyServiceLinkedConfigurationRecorder"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // The name Config assigns the recorder is derived from the service principal
+        // and from nothing else, and only a service Config records a third-party cloud
+        // service provider for can own one: this operation "can only be called by the
+        // Amazon Web Services service linked to the configuration recorder". A value
+        // that is no service principal, and a well-formed one naming any other service,
+        // therefore name no recorder of this operation at all and get the same refusal.
+        // The derivation is shared with `PutServiceLinkedConfigurationRecorder`, so one
+        // service has ONE service-linked recorder however it was created.
+        let service_principal = input.service_principal;
+        let name = match crate::state::service_linked_recorder_name(&service_principal) {
+            Some(name)
+                if crate::state::supports_third_party_service_linked_recording(
+                    &service_principal,
+                ) =>
+            {
+                name
+            }
+            _ => {
+                return Err(validation(
+                    crate::state::UNRECOGNIZED_RECORDER_SERVICE_PRINCIPAL_MESSAGE.to_string(),
+                ))
+            }
+        };
+
+        if let Some(violation) =
+            crate::state::scope_configuration_violation(&input.scope_configuration)
+        {
+            return Err(validation(violation));
+        }
+
+        let connector_arn = input.connector_arn;
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // A value that is not a connector ARN at all cannot name a connector, and this
+        // operation models no `ResourceNotFoundException`, so both a malformed ARN and
+        // one that names no connector of this Region are refused the way the model
+        // states ("The specified connector must exist"), with the same wording every
+        // operation that takes a connector ARN uses.
+        let Some((connector_region, _)) = crate::state::connector_arn_parts(&connector_arn) else {
+            return Err(validation(crate::state::invalid_connector_arn_message(
+                &connector_arn,
+            )));
+        };
+        let serves_region = connector_region == region;
+
+        let mut store = state.lock();
+
+        // The connector carries the connection to the third-party cloud service
+        // provider whose resources the recorder records, so it has to exist before a
+        // recorder can be linked to it, and the provider the recorder reports is the
+        // one that connector was created for.
+        let Some(provider) = store
+            .connectors
+            .get(&connector_arn)
+            .filter(|_| serves_region)
+            .map(|connector| connector.provider.clone())
+        else {
+            return Err(validation(crate::state::no_such_connector_message(
+                &connector_arn,
+            )));
+        };
+
+        // A service Config links a configuration recorder to has ONE: the recorder is
+        // named after that service, so a second connector for the same service cannot
+        // get a recorder of its own — and neither can a service that already holds the
+        // service-linked recorder `PutServiceLinkedConfigurationRecorder` created,
+        // which carries no connector at all.
+        if let Some(existing) = store.recorders.get_mut(&name) {
+            if existing.connector_arn.as_deref() != Some(connector_arn.as_str()) {
+                return Err(PutThirdPartyServiceLinkedConfigurationRecorderErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::service_linked_recorder_conflict_message(
+                            &service_principal,
+                        )),
+                    },
+                )
+                .into());
+            }
+            // Same principal and same connector: this call updates the scope of the
+            // resources the recorder records and nothing else. Tags are added at
+            // creation and are not updated by this operation.
+            existing.scope_configuration = Some(input.scope_configuration);
+            return Ok(PutThirdPartyServiceLinkedConfigurationRecorderOutput {
+                arn: existing.arn.clone(),
+                name: existing.name.clone(),
+            });
+        }
+
+        let sequence = store.next_recorder_seq;
+        // A u64 counter cannot be exhausted by API calls, so it never reissues an id;
+        // saturating rather than wrapping keeps that true by construction.
+        store.next_recorder_seq = sequence.saturating_add(1);
+        let id = crate::state::mint_recorder_id(sequence);
+        let arn = crate::state::recorder_arn(&region, &name, &id);
+
+        store.recorders.insert(
+            name.clone(),
+            crate::state::RecorderEntry {
+                name: name.clone(),
+                id,
+                arn: arn.clone(),
+                // Config records with the service-linked role it creates in the
+                // account for its service-linked recorders, not with a role the caller
+                // names: this operation takes no `roleARN`, exactly as
+                // `PutServiceLinkedConfigurationRecorder` does not.
+                role_arn: Some(crate::state::config_service_linked_role_arn()),
+                // The linked service sets the recording group and the recording mode,
+                // so the request carries neither: the recorder records every resource
+                // type the provider supports, continuously.
+                recording_group: Some(crate::state::materialised_recording_group(None)),
+                recording_mode: Some(crate::state::materialised_recording_mode(None)),
+                // The `ConfigurationItems` a service-linked recorder records are
+                // recorded for free, which is what the INTERNAL scope means.
+                recording_scope: Some(crate::state::RECORDING_SCOPE_INTERNAL.to_string()),
+                service_principal: Some(service_principal.clone()),
+                connector_arn: Some(connector_arn),
+                scope_configuration: Some(input.scope_configuration),
+                provider: provider.into(),
+                tags: crate::state::tag_set(input.tags.as_deref().unwrap_or(&[])),
+            },
+        );
+        // A service-linked configuration recorder is always recording: it starts when
+        // the linked service creates it and stops only when it is deleted.
+        store.recorder_status.insert(
+            name.clone(),
+            crate::state::RecorderStatusEntry::started(&name, &arn, &service_principal, now),
+        );
+
+        Ok(PutThirdPartyServiceLinkedConfigurationRecorderOutput { arn, name })
     }
+}
+
+/// A request this operation refuses as not valid, as the modeled `ValidationException`
+/// it declares.
+fn validation(message: String) -> PutThirdPartyServiceLinkedConfigurationRecorderError {
+    PutThirdPartyServiceLinkedConfigurationRecorderErrorModeled::ValidationException(
+        ValidationException {
+            message: Some(message),
+        },
+    )
+    .into()
 }
