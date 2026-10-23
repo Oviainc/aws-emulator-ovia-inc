@@ -90,6 +90,67 @@ impl Stream {
     }
 }
 
+/// The most tags one stream carries at once.
+///
+/// `ResourceTags`, the map every tagging operation reads and writes, is modeled
+/// `@length(min: 1, max: 50)` (`smithy_query(query="shape", shape="ResourceTags")`),
+/// and `TagsPerResourceExceededLimitException` states the same bound in prose: "You
+/// have exceeded the limit of tags that you can associate with the resource. A
+/// Kinesis video stream can support up to 50 tags." One request cannot carry more
+/// than this (the boundary validator refuses it), so the ceiling bites when a
+/// request's tags are MERGED into the ones a stream already holds.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// `TagKey`'s modeled minimum length, from
+/// `smithy_query(query="shape", shape="TagKey")` (`@length(min: 1, max: 128)`).
+pub const MIN_TAG_KEY_LENGTH: usize = 1;
+
+/// `TagKey`'s modeled maximum length. See [`MIN_TAG_KEY_LENGTH`].
+pub const MAX_TAG_KEY_LENGTH: usize = 128;
+
+/// `TagValue`'s modeled maximum length, from
+/// `smithy_query(query="shape", shape="TagValue")` (`@length(min: 0, max: 256)`);
+/// its minimum is 0, so an empty value is valid.
+pub const MAX_TAG_VALUE_LENGTH: usize = 256;
+
+/// Why `key` is not a `TagKey`, or `None` when it is one.
+///
+/// A MAP KEY's own `@length` is not among the constraints the request walk's validator
+/// checks — an empty key reaches the handler — so the operations that accept tag keys
+/// enforce it themselves. The message is built from the request, naming the member and
+/// the constraint it failed, in the form the framework's own validation envelope uses.
+///
+/// `TagKey`'s `@pattern` (`^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`, a regular expression over
+/// Unicode general categories) is NOT evaluated here: `@pattern` checking belongs to
+/// the framework's validating walk, which owns it for every member it does reach, and
+/// a key the pattern rejects is therefore stored rather than refused. Closing that gap
+/// belongs in that walk rather than in one service's handlers.
+pub fn tag_key_violation(member: &str, key: &str) -> Option<String> {
+    let length = key.chars().count();
+    if !(MIN_TAG_KEY_LENGTH..=MAX_TAG_KEY_LENGTH).contains(&length) {
+        return Some(format!(
+            "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
+             Member must have length greater than or equal to {MIN_TAG_KEY_LENGTH} and less \
+             than or equal to {MAX_TAG_KEY_LENGTH}"
+        ));
+    }
+    None
+}
+
+/// Why `value` is not a `TagValue`, or `None` when it is one. The companion of
+/// [`tag_key_violation`]: a map VALUE's `@length` is checked by the request walk for a
+/// list or structure member, but not for the value side of a map, so the tagging
+/// operations check it here.
+pub fn tag_value_violation(member: &str, value: &str) -> Option<String> {
+    if value.chars().count() > MAX_TAG_VALUE_LENGTH {
+        return Some(format!(
+            "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
+             Member must have length less than or equal to {MAX_TAG_VALUE_LENGTH}"
+        ));
+    }
+    None
+}
+
 /// Why a `StreamName`/`StreamARN` pair did not name a stored stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamLookupError {
@@ -170,6 +231,21 @@ impl ComAmazonawsKinesisvideoKinesisvideo20170930State {
             }
         };
         self.streams.get(&name).ok_or(StreamLookupError::NotFound)
+    }
+
+    /// [`Self::resolve`] for an operation that MUTATES the stream it names, so the
+    /// two forms of identifier reach the one stored record through the same rule.
+    pub fn resolve_mut(
+        &mut self,
+        stream_name: Option<&str>,
+        stream_arn: Option<&str>,
+    ) -> Result<&mut Stream, StreamLookupError> {
+        // The immutable resolution decides WHICH record this is; the name it yields
+        // is then re-borrowed mutably, so the lookup rule lives in one place.
+        let name = self.resolve(stream_name, stream_arn)?.stream_name.clone();
+        self.streams
+            .get_mut(&name)
+            .ok_or(StreamLookupError::NotFound)
     }
 }
 

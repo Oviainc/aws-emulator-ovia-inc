@@ -17,6 +17,8 @@ mod access_keys;
 mod entities_for_policy;
 #[path = "all/instance_profile_role_binding.rs"]
 mod instance_profile_role_binding;
+#[path = "all/instance_profile_role_removal.rs"]
+mod instance_profile_role_removal;
 #[path = "all/instance_profile_roles.rs"]
 mod instance_profile_roles;
 #[path = "all/instance_profiles.rs"]
