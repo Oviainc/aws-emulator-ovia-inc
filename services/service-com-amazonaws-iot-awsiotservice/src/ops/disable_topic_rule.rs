@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableTopicRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableTopicRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableTopicRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Disabling a rule is a one-member UPDATE of the rule the store already holds: it
+//! sets that record's `ruleDisabled` flag and touches nothing else, so a later
+//! `GetTopicRule` reports the same rule with `ruleDisabled: true`. It is the mirror
+//! of [`crate::ops::enable_topic_rule`] — same rule, opposite value — hence
+//! idempotent, and a name the store does not hold is refused with the modelled
+//! `UnauthorizedException` (HTTP 401), the same refusal `GetTopicRule` gives, because
+//! AWS authorizes `iot:DisableTopicRule` against the rule's own ARN and a name that
+//! names no rule cannot be authorized.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +164,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableTopicRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableTopicRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableTopicRule"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisableTopicRuleErrorModeled::InternalException(InternalException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+
+        // The rule's name is its identity, so the rule to disable is the record the
+        // store holds under that name. `DisableTopicRule` models no not-found error,
+        // because AWS authorizes `iot:DisableTopicRule` against the rule's own ARN: a
+        // name that names no rule cannot be authorized, so the refusal is the modelled
+        // `UnauthorizedException` (HTTP 401) — never an empty 200, which would claim a
+        // rule was disabled when none exists. The message names the action and the ARN
+        // the request asked for and does not state that the rule is absent, exactly as
+        // `GetTopicRule`'s refusal does.
+        let rule = store
+            .topic_rules
+            .get_mut(&input.rule_name)
+            .ok_or_else(|| {
+                DisableTopicRuleErrorModeled::UnauthorizedException(UnauthorizedException {
+                    message: Some(format!(
+                        "Not authorized to perform: iot:DisableTopicRule on resource: {}",
+                        crate::state::topic_rule_arn(&region, &input.rule_name)
+                    )),
+                })
+            })?;
+
+        // "Disables the rule" is exactly this one member: everything else about the
+        // rule — its SQL, actions, description, SQL version, error action, creation
+        // instant and ARN — is left as it was, and writing the flag unconditionally is
+        // what makes the call idempotent.
+        rule.rule_disabled = true;
+
+        // `DisableTopicRule`'s output shape is `Unit`: a successful disable reports no
+        // members at all, and what it persisted is read back through `GetTopicRule`.
+        Ok(DisableTopicRuleOutput)
     }
 }
