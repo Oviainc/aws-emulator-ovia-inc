@@ -59,6 +59,8 @@ mod default_branch;
 mod differences;
 #[path = "all/file_commit_history.rs"]
 mod file_commit_history;
+#[path = "all/file_deletion.rs"]
+mod file_deletion;
 #[path = "all/folder_listing.rs"]
 mod folder_listing;
 #[path = "all/git_object_ids.rs"]

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAuthorizer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAuthorizer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAuthorizer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A PURE READ of this service's authorizer store
+//! ([`crate::state::ComAmazonawsIotAwsiotserviceState::authorizers`]): it reports the
+//! record `CreateAuthorizer` persisted under that name as an
+//! `AuthorizerDescription`, member for member, and writes nothing — two reads of one
+//! authorizer are identical. A name the store does not hold is refused
+//! `ResourceNotFoundException` (404), never a 200 carrying no description.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +143,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAuthorizer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAuthorizerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAuthorizer"))
+        // `ctx` carries request metadata only; a read of an existing record needs
+        // none of it — the authorizer's ARN was minted in the region of the call that
+        // CREATED it, and a read reports what was stored rather than re-minting it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeAuthorizerErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A pure read: the record is cloned out as the modelled
+        // `AuthorizerDescription`, and a name the store does not hold is the modelled
+        // `ResourceNotFoundException` ("The specified resource does not exist", HTTP
+        // 404) rather than a hollow 200.
+        let store = state.lock();
+        let authorizer = store
+            .authorizers
+            .get(&input.authorizer_name)
+            .ok_or_else(|| {
+                DescribeAuthorizerErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Authorizer {} does not exist",
+                            input.authorizer_name
+                        )),
+                    },
+                )
+            })?;
+
+        Ok(DescribeAuthorizerOutput {
+            authorizer_description: Some(authorizer.description()),
+        })
     }
 }

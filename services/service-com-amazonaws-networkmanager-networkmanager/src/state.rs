@@ -466,6 +466,19 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     pub links: BTreeMap<String, LinkRecord>,
     /// Core networks by `CoreNetworkId`, each carrying its owning `GlobalNetworkId`.
     pub core_networks: BTreeMap<String, CoreNetworkRecord>,
+    /// Resource policies by the ARN of the resource they are attached to — the one store
+    /// `PutResourcePolicy`, `GetResourcePolicy` and `DeleteResourcePolicy` share, holding
+    /// the document exactly as it was accepted so a reader reports what was put.
+    ///
+    /// Keyed by ARN rather than hung off a resource record: none of the three operations
+    /// models a `ResourceNotFoundException` (`smithy_query query="operation"
+    /// operation="GetResourcePolicy,PutResourcePolicy,DeleteResourcePolicy"`), unlike every
+    /// other reader of a resource in this service, so the policy store does not assert
+    /// that the ARN names a resource this account holds — only that it is an ARN of this
+    /// service ([`parse_resource_arn`]). The store is bounded instead by its own quota:
+    /// at most [`MAX_RESOURCE_POLICIES`] ARNs hold a policy, each document at most
+    /// [`MAX_RESOURCE_POLICY_CHARS`] characters, so no caller can grow it without end.
+    pub resource_policies: BTreeMap<String, String>,
     /// Monotonic source for generated resource-id suffixes, so ids are unique within a
     /// run and deterministic across runs.
     pub id_counter: u64,
@@ -669,6 +682,193 @@ pub fn parse_resource_arn(arn: &str) -> Option<ArnParts<'_>> {
         return None;
     }
     Some(ArnParts { kind, id })
+}
+
+/// The `Reason` a `ValidationException` of this service carries when one input MEMBER is
+/// at fault, and the one it carries when the member's text could not be parsed at all.
+/// Both are values the modelled enumeration lists
+/// (`ops::types::VALIDATION_EXCEPTION_REASON_VALUES`: `CannotParse`,
+/// `FieldValidationFailed`, `Other`, `UnknownOperation`).
+pub const REASON_FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
+/// See [`REASON_FIELD_VALIDATION_FAILED`].
+pub const REASON_CANNOT_PARSE: &str = "CannotParse";
+
+/// The input member the resource-policy operations name in a refusal: the ARN of the
+/// resource whose policy is addressed, and the policy document itself.
+pub const FIELD_RESOURCE_ARN: &str = "ResourceArn";
+/// See [`FIELD_RESOURCE_ARN`].
+pub const FIELD_POLICY_DOCUMENT: &str = "PolicyDocument";
+
+/// The modelled `ValidationException` (HTTP 400) for a refusal of the single input member
+/// `member`, carrying `reason` and one `Fields` entry explaining `message`.
+pub fn field_rejection(member: &str, reason: &str, message: String) -> ValidationException {
+    ValidationException {
+        message: message.clone(),
+        reason: Some(reason.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message,
+        }]),
+    }
+}
+
+/// The modelled `ValidationException` (HTTP 400) an operation answers when the string in
+/// its ARN member `member` is not an ARN of this service at all.
+///
+/// A string that does not parse as `arn:<partition>:networkmanager::<account>:<type>/<id>`
+/// (see [`parse_resource_arn`]) names no resource of this service, which is a FIELD
+/// failure on the member that carried it — a different answer from a well-formed ARN that
+/// names nothing stored.
+///
+/// The wording is the one the tagging operations of this service already answer for the
+/// same input class (`ops/list_tags_for_resource.rs`, `ops/tag_resource.rs`,
+/// `ops/untag_resource.rs`), so one malformed ARN reads the same whichever operation it
+/// arrived on.
+pub fn malformed_resource_arn(member: &str) -> ValidationException {
+    ValidationException {
+        message: format!("{member} is not a networkmanager resource ARN"),
+        reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: "must read arn:<partition>:networkmanager::<account>:<type>/<id>".to_string(),
+        }]),
+    }
+}
+
+/// How many resource policies this account may hold here, and how long one policy
+/// document may be, in characters.
+///
+/// Both are CHOSEN, like [`MAX_GLOBAL_NETWORKS`], and for the same reason: the
+/// `resource_policies` store is keyed by the ARN a request carries, so without a bound a
+/// caller could grow this emulator's store without end. AWS publishes an account-level
+/// resource-policy quota (adjustable per account) and a per-policy size limit for its
+/// resource-based policies, and the model carries neither number — the document is an
+/// opaque `SynthesizedJsonResourcePolicyDocument` of length 0..10000000 — so the numbers
+/// here are the emulator's own: 20,480 characters is the size AWS's resource-based policy
+/// limits are commonly stated at, well inside the modelled maximum.
+///
+/// Asking to store a policy for one more ARN than [`MAX_RESOURCE_POLICIES`] is refused
+/// with `PutResourcePolicy`'s modelled `ServiceQuotaExceededException` (HTTP 402) and
+/// stores nothing; replacing the policy of an ARN already held never trips it. A document
+/// longer than [`MAX_RESOURCE_POLICY_CHARS`] is refused with the same operation's
+/// `ValidationException` (HTTP 400), naming [`FIELD_POLICY_DOCUMENT`].
+pub const MAX_RESOURCE_POLICIES: usize = 100;
+/// See [`MAX_RESOURCE_POLICIES`].
+pub const MAX_RESOURCE_POLICY_CHARS: usize = 20_480;
+
+/// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota [`MAX_RESOURCE_POLICIES`] bounds.
+pub const LIMIT_RESOURCE_POLICIES_PER_ACCOUNT: &str = "resource-policies-per-account";
+
+/// The message a refusal past the [`MAX_RESOURCE_POLICIES`] quota carries: `resulting` is
+/// how many ARNs would hold a policy if the request were accepted.
+pub fn too_many_resource_policies_message(resulting: usize) -> String {
+    format!(
+        "an account may hold resource policies for at most {MAX_RESOURCE_POLICIES} resources, but the request would leave {resulting}"
+    )
+}
+
+/// The members of a resource policy document this service judges.
+///
+/// A resource policy is an IAM JSON policy document, so its grammar is IAM's (AWS IAM
+/// User Guide, "IAM JSON policy element reference"): the document is a JSON object whose
+/// `Statement` is one statement object or a list of them, and every statement names its
+/// `Effect`, which is either `Allow` or `Deny`. The model types the document as an opaque
+/// string carrying `mediaType: application/json` (`smithy_query
+/// shape=SynthesizedJsonResourcePolicyDocument`), so these names come from that grammar
+/// rather than from the model.
+const POLICY_STATEMENT: &str = "Statement";
+/// See [`POLICY_STATEMENT`].
+const POLICY_EFFECT: &str = "Effect";
+/// See [`POLICY_STATEMENT`]: the two values IAM's `Effect` element allows.
+pub const POLICY_EFFECT_VALUES: [&str; 2] = ["Allow", "Deny"];
+
+/// Check the document a `PutResourcePolicy` asks to attach to a resource.
+///
+/// The document's SIZE is judged first, against [`MAX_RESOURCE_POLICY_CHARS`], so an
+/// over-long document is refused before it is parsed. Then its SHAPE, against the IAM
+/// policy grammar ([`POLICY_STATEMENT`]): it must parse as JSON, its root must be an
+/// object, it must carry at least one statement, and every statement must be an object
+/// naming an `Effect` of `Allow` or `Deny`. Whom the statements grant what is the deeper
+/// semantics of a policy and is not interpreted here — this service only stores and
+/// reports the document it accepted.
+///
+/// A document that fails any of these is refused with a `ValidationException` (HTTP 400)
+/// naming [`FIELD_POLICY_DOCUMENT`] and nothing is stored, so a rejected request leaves
+/// the resource's policy exactly as it was.
+pub fn validate_resource_policy_document(document: &str) -> Result<(), ValidationException> {
+    let reject = |reason: &str, message: String| {
+        field_rejection(FIELD_POLICY_DOCUMENT, reason, message)
+    };
+
+    let length = document.chars().count();
+    if length > MAX_RESOURCE_POLICY_CHARS {
+        return Err(reject(
+            REASON_FIELD_VALIDATION_FAILED,
+            format!(
+                "a resource policy document must be at most {MAX_RESOURCE_POLICY_CHARS} characters, but {length} were given"
+            ),
+        ));
+    }
+
+    let parsed: ::serde_json::Value = ::serde_json::from_str(document).map_err(|problem| {
+        reject(
+            REASON_CANNOT_PARSE,
+            format!("the resource policy document is not valid JSON: {problem}"),
+        )
+    })?;
+    let root = parsed.as_object().ok_or_else(|| {
+        reject(
+            REASON_FIELD_VALIDATION_FAILED,
+            "the resource policy document must be a JSON object".to_string(),
+        )
+    })?;
+
+    // IAM allows `Statement` to be a single statement object as well as a list of them.
+    let statements: Vec<&::serde_json::Value> = match root.get(POLICY_STATEMENT) {
+        Some(::serde_json::Value::Array(entries)) => entries.iter().collect(),
+        Some(single @ ::serde_json::Value::Object(_)) => vec![single],
+        Some(_) => {
+            return Err(reject(
+                REASON_FIELD_VALIDATION_FAILED,
+                format!("{POLICY_STATEMENT} must be a statement object or a list of them"),
+            ));
+        }
+        None => {
+            return Err(reject(
+                REASON_FIELD_VALIDATION_FAILED,
+                format!("the resource policy document must carry a {POLICY_STATEMENT}"),
+            ));
+        }
+    };
+    if statements.is_empty() {
+        return Err(reject(
+            REASON_FIELD_VALIDATION_FAILED,
+            format!("{POLICY_STATEMENT} must carry at least one statement"),
+        ));
+    }
+
+    for (index, statement) in statements.iter().enumerate() {
+        let entry = statement.as_object().ok_or_else(|| {
+            reject(
+                REASON_FIELD_VALIDATION_FAILED,
+                format!("{POLICY_STATEMENT}[{index}] must be a JSON object"),
+            )
+        })?;
+        let effect = entry
+            .get(POLICY_EFFECT)
+            .and_then(::serde_json::Value::as_str);
+        if !effect.is_some_and(|effect| POLICY_EFFECT_VALUES.contains(&effect)) {
+            return Err(reject(
+                REASON_FIELD_VALIDATION_FAILED,
+                format!(
+                    "{POLICY_STATEMENT}[{index}].{POLICY_EFFECT} must be one of {}",
+                    POLICY_EFFECT_VALUES.join(", ")
+                ),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Why a requested tag set or key list was refused: the input member to blame and the

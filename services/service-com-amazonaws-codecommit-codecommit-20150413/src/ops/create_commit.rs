@@ -306,19 +306,6 @@ fn file_metadata(path: &str, entry: &crate::state::FileEntry) -> FileMetadata {
     }
 }
 
-/// Every folder a path lives under, from its immediate parent outwards:
-/// `"a/b/c.txt"` lives under `"a/b"` and `"a"`. Empty for a path at the root of the
-/// tree, which is not a folder a commit can empty.
-fn ancestor_folders(path: &str) -> Vec<&str> {
-    let mut folders = Vec::new();
-    let mut rest = path;
-    while let Some((folder, _)) = rest.rsplit_once('/') {
-        folders.push(folder);
-        rest = folder;
-    }
-    folders
-}
-
 /// The entries of one commit request with every path in canonical form, after the
 /// cross-entry rules that need no stored state have been checked: at least one
 /// entry, no more than the per-commit maximum, one change per path, and no path
@@ -798,37 +785,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deleted.push(file_metadata(path, &removed));
         }
 
-        // "If the commit contains deletions, whether to keep a folder or folder
-        // structure if the changes leave the folders empty. If true, a .gitkeep file
-        // is created for empty folders." Nothing else recreates a folder: a git tree
-        // holds no empty subtree. A deletion can empty a whole chain of folders
-        // ("a/b/c.txt" empties "a/b" and then "a"), so every ANCESTOR folder of a
-        // deleted path is considered, deepest first: the placeholder written in the
-        // deepest emptied folder is what keeps each folder above it non-empty, so the
-        // whole structure is kept with one placeholder.
+        // The folders this commit's deletions emptied are kept only when the
+        // caller asked for it, with the placeholder `crate::state::keep_empty_folders`
+        // writes — the one reading of that rule this crate has, shared with
+        // `DeleteFile`, which takes the same member.
         if input.keep_empty_folders {
-            let mut candidates: Vec<&str> = deleted
+            let emptied: Vec<&str> = deleted
                 .iter()
                 .filter_map(|entry| entry.absolute_path.as_deref())
-                .flat_map(ancestor_folders)
                 .collect();
-            candidates.sort_unstable_by_key(|folder| {
-                (std::cmp::Reverse(folder.matches('/').count()), *folder)
-            });
-            candidates.dedup();
-            for folder in candidates {
-                let prefix = format!("{folder}/");
-                if files.keys().any(|path| path.starts_with(&prefix)) {
-                    continue;
-                }
-                let path = format!("{prefix}{}", crate::state::KEEP_EMPTY_FOLDERS_PLACEHOLDER);
-                let stored = crate::state::FileEntry {
-                    blob_id: crate::state::blob_id(&[]),
-                    file_mode: crate::state::FILE_MODE_NORMAL.to_string(),
-                    size: 0,
-                };
+            let placeholders = crate::state::keep_empty_folders(&mut files, emptied);
+            for path in placeholders {
+                let stored = crate::state::keep_empty_folders_entry();
                 new_blobs.insert(stored.blob_id.clone(), Vec::new());
-                files.insert(path.clone(), stored.clone());
                 added.push(file_metadata(&path, &stored));
             }
         }

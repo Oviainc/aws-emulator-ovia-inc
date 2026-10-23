@@ -11,6 +11,12 @@
 //! next to the record is what makes the readers agree: they render the same stored
 //! cluster the same way.
 //!
+//! The MSK configuration registry lives here for the same reason:
+//! `CreateConfiguration` stores a [`ConfigurationRecord`] and both
+//! `ListConfigurations` and `DescribeConfiguration` render it with
+//! [`ConfigurationRecord::to_configuration`], so the writer and every reader
+//! agree on one record.
+//!
 //! The topic registry lives beside it, keyed by (cluster ARN, topic name): a topic
 //! belongs to exactly one cluster, so `CreateTopic`, `DescribeTopic`, `ListTopics`
 //! and `DeleteTopic` all resolve the cluster first and then the topic, through
@@ -58,8 +64,9 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     BrokerEBSVolumeInfo, BrokerNodeGroupInfo, BrokerSoftwareInfo, ChannelLoggingInfo,
-    ClientAuthentication, ClusterInfo, ClusterOperationInfo, ConfigurationInfo, ConnectivityInfo,
-    CreateChannelInput, CreateClusterInput, CreateReplicatorInput, CreateVpcConnectionInput,
+    ClientAuthentication, ClusterInfo, ClusterOperationInfo, Configuration, ConfigurationInfo,
+    ConfigurationRevision, ConnectivityInfo, CreateChannelInput, CreateClusterInput,
+    CreateConfigurationInput, CreateReplicatorInput, CreateVpcConnectionInput,
     DescribeChannelOutput, EBSStorageInfo, EncryptionAtRest, EncryptionConfiguration,
     EncryptionInTransit, EncryptionInfo, IcebergDestinationConfiguration, JmxExporter,
     JmxExporterInfo, KafkaCluster, KafkaClusterDescription, KafkaClusterSummary, LogDelivery,
@@ -764,6 +771,69 @@ impl ClusterOperation {
     }
 }
 
+/// A stored MSK configuration (a `server.properties` bundle a cluster can be
+/// created with), holding every property its readers report so each one is
+/// computed from the record rather than echoed from a request.
+///
+/// A configuration is revisioned: `CreateConfiguration` stores revision 1 and an
+/// update appends the next one, so the record keeps the revisions rather than a
+/// single body.
+#[derive(Debug, Clone)]
+pub struct ConfigurationRecord {
+    pub arn: String,
+    pub name: String,
+    /// The region the configuration lives in: the signing region of the request
+    /// that created it, and the region segment of its ARN. A configuration name
+    /// is unique per account and region, so this is half of its registry key.
+    pub region: String,
+    /// The description as the request gave it — empty when it gave none, since
+    /// `Configuration$Description` is a required member of the reported shape.
+    pub description: String,
+    /// The Apache Kafka versions the configuration may be used with, as
+    /// submitted; empty when the request named none.
+    pub kafka_versions: Vec<String>,
+    pub creation_time: SystemTime,
+    /// A `ConfigurationState` value. A configuration AWS accepts is usable at
+    /// once, so it is created `ACTIVE` and no clock transition is owed to it.
+    pub state: String,
+    /// Every revision in revision order, so the first is revision 1 and the last
+    /// is the latest. Never empty: a configuration exists only once its first
+    /// revision has been stored.
+    pub revisions: Vec<ConfigurationRevisionRecord>,
+}
+
+/// One revision of a stored configuration: the `server.properties` body plus the
+/// description and instant that went with it.
+#[derive(Debug, Clone)]
+pub struct ConfigurationRevisionRecord {
+    /// 1-based revision number, as `ConfigurationRevision$Revision` reports it.
+    pub revision: i64,
+    pub creation_time: SystemTime,
+    pub description: String,
+    /// The `server.properties` contents exactly as submitted, kept as bytes
+    /// because the member is a blob and may hold any byte string.
+    pub server_properties: Vec<u8>,
+}
+
+/// The state a configuration this emulator accepts is in, from the
+/// `ConfigurationState` enum (`ACTIVE | DELETING | DELETE_FAILED`): AWS returns a
+/// freshly created configuration ready to use, so it starts `ACTIVE` and the
+/// clock owes it no transition.
+pub const CONFIGURATION_STATE_ACTIVE: &str = "ACTIVE";
+
+/// Configurations one account may hold in one region, from the Amazon MSK
+/// service quota "Number of configurations per account" (100, per Region). A
+/// create past it is refused with the modelled `TooManyRequestsException`, so the
+/// registry's cardinality is bounded rather than growing with the number of
+/// calls.
+pub const MAX_CONFIGURATIONS_PER_REGION: usize = 100;
+
+/// Absolute ceiling on the configuration registry across every region a caller
+/// signs for, for the same reason [`MAX_CLUSTERS_IN_REGISTRY`] exists: the
+/// signing region comes from the request, so the per-region quota alone would
+/// still let a caller grow the store by naming new regions.
+pub const MAX_CONFIGURATIONS_IN_REGISTRY: usize = MAX_CONFIGURATIONS_PER_REGION * 64;
+
 /// One MSK VPC connection: a client VPC's private (PrivateLink) connection to a
 /// cluster, as `CreateVpcConnection` requested it. The whole submitted
 /// configuration is held here so every reader computes its answer from the
@@ -1222,19 +1292,22 @@ fn indexed_alias(
         .map(|alias| (*alias).to_string())
 }
 
-/// Why [`ComAmazonawsKafkaKafkaState::register_cluster`] or
+/// Why [`ComAmazonawsKafkaKafkaState::register_cluster`],
+/// [`ComAmazonawsKafkaKafkaState::register_configuration`] or
 /// [`ComAmazonawsKafkaKafkaState::register_replicator`] refused to register a
 /// resource. Every variant leaves the registry exactly as it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegisterRejected {
-    /// The region already holds [`MAX_CLUSTERS_PER_REGION`] clusters.
+    /// The region is at its per-region quota for this kind of resource
+    /// ([`MAX_CLUSTERS_PER_REGION`], [`MAX_CONFIGURATIONS_PER_REGION`]).
     RegionQuota,
     /// The registry already holds its ceiling of resources of this kind
-    /// ([`MAX_CLUSTERS_IN_REGISTRY`], [`MAX_REPLICATORS_IN_REGISTRY`]).
+    /// ([`MAX_CLUSTERS_IN_REGISTRY`], [`MAX_CONFIGURATIONS_IN_REGISTRY`],
+    /// [`MAX_REPLICATORS_IN_REGISTRY`]).
     RegistryCeiling,
-    /// A cluster with this ARN is already registered. The registry's monotonic
+    /// A resource with this ARN is already registered. The registry's monotonic
     /// ordinal makes this unreachable; it is refused rather than overwriting an
-    /// existing cluster.
+    /// existing resource.
     DuplicateArn,
 }
 
@@ -1345,6 +1418,20 @@ pub struct ComAmazonawsKafkaKafkaState {
     /// Monotonic counter feeding the ARN and DNS suffixes, so each cluster gets a
     /// distinct identity and a rebuilt emulator reproduces the same ones.
     pub next_cluster_suffix: u64,
+    /// Every stored configuration, keyed by ARN. `BTreeMap` for the same reason
+    /// the clusters are: `ListConfigurations` needs one total order to page
+    /// through.
+    pub configurations: BTreeMap<String, ConfigurationRecord>,
+    /// (region, configuration name) -> ARN. A configuration name is unique
+    /// within an account and region, so the key carries the region too.
+    pub configuration_arn_by_name: HashMap<(String, String), String>,
+    /// region -> how many configurations it holds, maintained by
+    /// [`Self::register_configuration`] so the per-region quota costs a lookup
+    /// rather than a walk of the registry.
+    pub configurations_per_region: HashMap<String, usize>,
+    /// Monotonic counter feeding the configuration ARNs, so each configuration
+    /// gets a distinct identity.
+    pub next_configuration_suffix: u64,
     /// Every cluster operation an update call recorded, keyed by its own ARN.
     /// `BTreeMap` so a reader walking the history has one total order.
     pub cluster_operations: BTreeMap<String, ClusterOperation>,
@@ -1521,6 +1608,73 @@ impl ComAmazonawsKafkaKafkaState {
         }
         cluster.settle(now);
         Some(cluster)
+    }
+
+    /// The ARN registered for the configuration `name` in `region`, if any. This
+    /// is the lookup that makes a repeated `CreateConfiguration` a conflict.
+    pub fn configuration_arn_for_name(&self, region: &str, name: &str) -> Option<&String> {
+        self.configuration_arn_by_name
+            .get(&(region.to_string(), name.to_string()))
+    }
+
+    /// How many configurations `region` currently holds — what the per-region
+    /// quota is checked against. O(1): the count is maintained as they come and
+    /// go.
+    pub fn configuration_count_in(&self, region: &str) -> usize {
+        self.configurations_per_region
+            .get(region)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The configuration `arn` names, as an endpoint for `region` sees it.
+    ///
+    /// A regional endpoint serves only its own region's configurations, so a
+    /// well-formed ARN belonging to another region resolves to `None` exactly as
+    /// an absent one does — the same rule [`Self::cluster_in`] follows, so the
+    /// readers and `ListConfigurations` agree on which configurations this
+    /// endpoint holds.
+    pub fn configuration_in(&self, region: &str, arn: &str) -> Option<&ConfigurationRecord> {
+        self.configurations
+            .get(arn)
+            .filter(|configuration| configuration.region == region)
+    }
+
+    /// Add `configuration` to every index that must know about it: the one
+    /// insertion path, so the ARN registry, the (region, name) index and the
+    /// per-region count cannot drift apart, and the one place the registry's
+    /// ceilings are enforced.
+    ///
+    /// Refuses, changing nothing, when the region is at
+    /// [`MAX_CONFIGURATIONS_PER_REGION`], when the whole registry is at
+    /// [`MAX_CONFIGURATIONS_IN_REGISTRY`], or when the ARN is already registered.
+    pub fn register_configuration(
+        &mut self,
+        configuration: ConfigurationRecord,
+    ) -> Result<(), RegisterRejected> {
+        if self.configurations.contains_key(&configuration.arn) {
+            return Err(RegisterRejected::DuplicateArn);
+        }
+        if self.configurations.len() >= MAX_CONFIGURATIONS_IN_REGISTRY {
+            return Err(RegisterRejected::RegistryCeiling);
+        }
+        if self.configuration_count_in(&configuration.region) >= MAX_CONFIGURATIONS_PER_REGION {
+            return Err(RegisterRejected::RegionQuota);
+        }
+        *self
+            .configurations_per_region
+            .entry(configuration.region.clone())
+            .or_insert(0) += 1;
+        self.configuration_arn_by_name.insert(
+            (
+                configuration.region.clone(),
+                configuration.name.clone(),
+            ),
+            configuration.arn.clone(),
+        );
+        self.configurations
+            .insert(configuration.arn.clone(), configuration);
+        Ok(())
     }
 
     /// Add `connection` to the VPC-connection registry. The one insertion path,
@@ -2363,11 +2517,12 @@ where
     None
 }
 
-/// Encode the ARN a page stopped at as a token. Base64 of a marked plaintext:
-/// the token is ENCODED, not authenticated, so a caller could decode it or mint
-/// one. That is harmless here — the ARN inside is only used as a `>` comparison
-/// against the keys of the caller's own registry, so a forged resume point can
-/// only skip or repeat entries the caller may already list.
+/// Encode the ARN a page stopped at as a token, through the one page-token
+/// codec of this service ([`encode_page_token`]) under the cluster listings' own
+/// marker. The token is ENCODED, not authenticated, so a caller could decode it
+/// or mint one. That is harmless here — the ARN inside is only used as a `>`
+/// comparison against the keys of the caller's own registry, so a forged resume
+/// point can only skip or repeat entries the caller may already list.
 pub fn encode_cluster_page_token(last_arn: &str) -> String {
     encode_page_token(CLUSTER_PAGE_TOKEN_PREFIX, last_arn)
 }
@@ -2379,24 +2534,84 @@ pub fn decode_cluster_page_token(token: &str) -> Option<String> {
     decode_page_token(CLUSTER_PAGE_TOKEN_PREFIX, token)
 }
 
-/// Mint a page token for `value`, marked with `prefix` so a token minted for one
-/// listing cannot be mistaken for another's.
-///
-/// The ONE place a page token is encoded, whatever listing mints it, so a change
-/// to the encoding cannot leave two listings disagreeing. Base64 of a marked
-/// plaintext: a token is ENCODED, not authenticated — see
-/// [`encode_cluster_page_token`] for why that is harmless for these listings.
-fn encode_page_token(prefix: &str, value: &str) -> String {
-    ::aws_smithy_types::base64::encode(format!("{prefix}{value}"))
-}
+impl ConfigurationRecord {
+    /// Mint a configuration from the submitted request: derive its identity from
+    /// `suffix` (the registry's monotonic counter) and store the submitted body
+    /// as revision 1.
+    ///
+    /// `region` is the caller's signing region, `now` the creation instant. The
+    /// ARN takes the form the real service mints,
+    /// `arn:<partition>:kafka:<region>:<account>:configuration/<name>/<id>-<ordinal>`.
+    pub fn created(
+        region: &str,
+        suffix: u64,
+        now: SystemTime,
+        input: CreateConfigurationInput,
+    ) -> Self {
+        let name = input.name;
+        // The registry's counter, as the 1-based ordinal AWS puts at the end of
+        // a configuration ARN; the SAME value seeds the opaque id before it.
+        let ordinal = suffix + 1;
+        let digest = stable_digest(&format!(
+            "configuration:{}:{region}:{name}:{ordinal}",
+            ::engine::emulator_account_id()
+        ));
+        let arn = ::engine::emulator_arn(
+            "kafka",
+            region,
+            &format!(
+                "configuration/{name}/{}-{ordinal}",
+                uuid_v4_shaped_from_digest(&digest)
+            ),
+        );
+        // `Configuration$Description` is a required member of the reported
+        // shape, so a request that named none stores the empty description
+        // rather than leaving the reader with nothing to report.
+        let description = input.description.unwrap_or_default();
+        Self {
+            arn,
+            name,
+            region: region.to_string(),
+            kafka_versions: input.kafka_versions.unwrap_or_default(),
+            creation_time: now,
+            state: CONFIGURATION_STATE_ACTIVE.to_string(),
+            revisions: vec![ConfigurationRevisionRecord {
+                revision: 1,
+                creation_time: now,
+                description: description.clone(),
+                server_properties: input.server_properties,
+            }],
+            description,
+        }
+    }
 
-/// The value a token carries, or `None` when it is not a token minted with
-/// `prefix` — the inverse of [`encode_page_token`], and the one place a page
-/// token is decoded.
-fn decode_page_token(prefix: &str, token: &str) -> Option<String> {
-    let decoded = ::aws_smithy_types::base64::decode(token).ok()?;
-    let decoded = String::from_utf8(decoded).ok()?;
-    decoded.strip_prefix(prefix).map(ToString::to_string)
+    /// The newest stored revision. Infallible on a registered configuration:
+    /// [`Self::created`] stores revision 1 and an update only ever appends.
+    pub fn latest_revision(&self) -> &ConfigurationRevisionRecord {
+        self.revisions
+            .last()
+            .expect("a configuration always holds at least revision 1")
+    }
+
+    /// The configuration as the `Configuration` shape `ListConfigurations` and
+    /// `DescribeConfiguration` report, so every reader of this record renders it
+    /// the same way.
+    pub fn to_configuration(&self) -> Configuration {
+        let latest = self.latest_revision();
+        Configuration {
+            arn: self.arn.clone(),
+            creation_time: ::aws_smithy_types::DateTime::from(self.creation_time),
+            description: self.description.clone(),
+            kafka_versions: self.kafka_versions.clone(),
+            latest_revision: ConfigurationRevision {
+                creation_time: ::aws_smithy_types::DateTime::from(latest.creation_time),
+                description: Some(latest.description.clone()),
+                revision: latest.revision,
+            },
+            name: self.name.clone(),
+            state: self.state.clone(),
+        }
+    }
 }
 
 /// The alias of one `KafkaCluster` entry: an Amazon MSK cluster is aliased by its
@@ -3297,6 +3512,26 @@ fn current_version_token(arn: &str, revision: u64) -> String {
     token
 }
 
+/// Encode the registry key a page stopped at as a pagination token, marked with
+/// `prefix` so a token minted for one list cannot be mistaken for another's.
+///
+/// Base64 of a marked plaintext: the token is ENCODED, not authenticated, so a
+/// caller could decode it or mint one. That is harmless here — the key inside is
+/// only used as a `>` comparison against the keys of the caller's own registry,
+/// so a forged resume point can only skip or repeat entries the caller may
+/// already list.
+pub fn encode_page_token(prefix: &str, last_key: &str) -> String {
+    ::aws_smithy_types::base64::encode(format!("{prefix}{last_key}"))
+}
+
+/// The registry key a token resumes after, or `None` when the token is not one
+/// `prefix` was minted with.
+pub fn decode_page_token(prefix: &str, token: &str) -> Option<String> {
+    let decoded = ::aws_smithy_types::base64::decode(token).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    decoded.strip_prefix(prefix).map(ToString::to_string)
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -3368,6 +3603,13 @@ pub fn is_cluster_arn(value: &str) -> bool {
     is_kafka_arn_for(value, "cluster")
 }
 
+/// Whether `value` is shaped like an MSK configuration ARN —
+/// `arn:<partition>:kafka:<region>:<account>:configuration/<name>/<id>`. The same
+/// distinction as [`is_cluster_arn`], for the configuration readers.
+pub fn is_configuration_arn(value: &str) -> bool {
+    is_kafka_arn_for(value, "configuration")
+}
+
 /// Whether `value` is shaped like an MSK replicator ARN —
 /// `arn:<partition>:kafka:<region>:<account>:replicator/<name>/<id>`.
 ///
@@ -3378,9 +3620,9 @@ pub fn is_replicator_arn(value: &str) -> bool {
     is_kafka_arn_for(value, "replicator")
 }
 
-/// Whether `value`'s resource part is `<kind>/<name>/<id>` — the shape both a
-/// cluster and a replicator ARN take, so the two predicates above cannot
-/// disagree about what a well-formed ARN of their kind is.
+/// Whether `value`'s resource part is `<kind>/<name>/<id>` — the shape a
+/// cluster, a configuration and a replicator ARN all take, so the predicates
+/// above cannot disagree about what a well-formed ARN of their kind is.
 fn is_kafka_arn_for(value: &str, kind: &str) -> bool {
     let Some(resource) = kafka_arn_resource(value) else {
         return false;

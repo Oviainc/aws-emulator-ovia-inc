@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tag set the resource `resourceArn` names holds, read from that resource's own
+//! record (`crate::state::ComAmazonawsCloudwatchlogsLogs20140328State::resource_tags`) — the
+//! same set `TagResource` writes. This is a report: it changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +138,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // The tag set is reached by ARN alone, so nothing here is read off the request
+        // metadata `ctx` carries.
+        let _ = ctx;
+
+        // "A parameter is specified incorrectly" — this operation's refusal for a
+        // `resourceArn` the service cannot resolve to a tagging target.
+        let invalid = |message: &str| {
+            ListTagsForResourceError::from(
+                ListTagsForResourceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                ),
+            )
+        };
+
+        // A value that is not an ARN at all is refused with the service's validation-error
+        // message naming the member and the value it could not parse; the kind check below
+        // answers a well-formed ARN naming a resource that carries no tags.
+        if let Some(message) =
+            crate::state::unparsable_arn_message("resourceArn", &input.resource_arn)
+        {
+            return Err(invalid(&message));
+        }
+        let Some(resource) = crate::state::tagged_resource(&input.resource_arn) else {
+            return Err(invalid(crate::state::UNTAGGABLE_RESOURCE_ARN));
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceError::from(
+                ListTagsForResourceErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        let Some(tags) = store.resource_tags(&resource) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(resource.kind())),
+                },
+            )
+            .into());
+        };
+
+        // "The list of tags associated with the requested resource": a resource that carries
+        // none has an EMPTY list of them, which is what the member reports — the absence of
+        // the member would say the service has nothing to say about the resource's tags,
+        // and here it does.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(
+                tags.iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+        })
     }
 }

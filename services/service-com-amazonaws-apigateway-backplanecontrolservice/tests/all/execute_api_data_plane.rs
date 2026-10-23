@@ -1,0 +1,1331 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for the `execute-api` DATA plane: a request addressed to a deployed
+//! REST API stage's invoke URL.
+//!
+//! Every case drives the real wire path — an HTTP request through the multi-service router
+//! into the mounted service, on the api's own
+//! `{rest-api-id}.execute-api.{region}.amazonaws.com` host — so what is asserted is what a
+//! client of the published invoke URL sees, not what a handler returns. The control plane
+//! is driven through the same emulator ([`Gateway`], this crate's one wire-test harness) to
+//! build the records the data plane then resolves, so nothing here reaches into state.
+//!
+//! The tests assert RULES over sets of inputs, not one recorded call:
+//!
+//! * every request to a deployed stage is ANSWERED, and which status it gets is decided by
+//!   the api's own records, over a table of paths (root, literal, path parameter, greedy
+//!   parameter, unmatched), verbs (the method's own, the `ANY` catch-all, one not
+//!   deployed), and stages (deployed, unknown) — plus the deployment-snapshot rule in both
+//!   directions, by redeploying;
+//! * a `MOCK` integration's response is built from the selected integration response, over
+//!   a table of status codes, response templates, negotiated content types and header
+//!   mappings;
+//! * the method's deployed `authorizationType` and `apiKeyRequired` decide the refusal,
+//!   over a table spanning each documented authorization type and each way an API key can
+//!   fail to admit a call;
+//! * an integration that names a backend this emulator cannot call is answered as an
+//!   integration that could not be performed, over a table of the integration types and
+//!   configurations that cannot be served;
+//! * a gateway-response customization of the refused type reaches the caller;
+//! * `PutIntegrationResponse` round-trips through `GetIntegration`, and its refusals are
+//!   the modelled ones.
+
+use bytes::Bytes;
+use serde_json::{json, Value};
+
+use crate::rest_api_lifecycle::{create_api, create_resource, string_member, Gateway};
+
+/// The region the invoke host is addressed in. Any region is served — the host's region
+/// label is not matched against a list — so one is enough to drive the data plane, and
+/// `src/service/invoke.rs`'s own unit test varies the label.
+const REGION: &str = "us-east-1";
+
+/// One answered invoke: the status line, the headers asserted on, and the body verbatim.
+struct Invoked {
+    status: u16,
+    headers: std::collections::HashMap<String, String>,
+    body: String,
+}
+
+impl Invoked {
+    /// One response header, lowercased as HTTP names compare.
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).map(String::as_str)
+    }
+
+    /// The `message` member of a JSON body, which is what every API Gateway gateway
+    /// response carries; `None` for a body that is not such an object.
+    fn message(&self) -> Option<String> {
+        serde_json::from_str::<Value>(&self.body)
+            .ok()?
+            .get("message")?
+            .as_str()
+            .map(str::to_owned)
+    }
+}
+
+/// The invoke host of `api`: the endpoint `RestApi$disableExecuteApiEndpoint` documents,
+/// `https://{api_id}.execute-api.{region}.amazonaws.com`.
+fn invoke_host(api: &str) -> String {
+    format!("{api}.execute-api.{REGION}.amazonaws.com")
+}
+
+/// Issue one request to `api`'s invoke endpoint at `path`, carrying `headers` and no body.
+///
+/// `host` is the api's own endpoint rather than the control plane's, which is the whole
+/// point: the data plane is reached by HOST.
+async fn invoke(
+    gateway: &Gateway,
+    api: &str,
+    verb: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Invoked {
+    invoke_on_host(gateway, &invoke_host(api), verb, path, headers).await
+}
+
+/// [`invoke`] against an arbitrary host, for the cases that assert which hosts this
+/// service does NOT claim.
+async fn invoke_on_host(
+    gateway: &Gateway,
+    host: &str,
+    verb: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Invoked {
+    let mut builder = http::Request::builder()
+        .method(verb)
+        .uri(format!("https://{host}{path}"))
+        .header("host", host);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder
+        .body(Bytes::new())
+        .expect("the invoke request is well formed");
+    let response = gateway.send(request).await;
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_ascii_lowercase(), value.to_owned()))
+        })
+        .collect();
+    let body = String::from_utf8_lossy(&response.into_body()).into_owned();
+    Invoked {
+        status,
+        headers,
+        body,
+    }
+}
+
+/// A SigV4 credential scope naming this service, as a signed SDK request carries it. The
+/// signature itself is the emulator's business and is not verified in these tests (the
+/// harness runs the router with request authentication off), so only its PRESENCE is what
+/// a case varies.
+const SIGNED: &str =
+    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/apigateway/aws4_request, \
+     SignedHeaders=host, Signature=0123456789abcdef";
+
+/// `PutMethod` for `verb` on `resource`, with `request` as its body.
+async fn put_method(gateway: &Gateway, api: &str, resource: &str, verb: &str, request: Value) {
+    let answer = gateway
+        .call(
+            "PUT",
+            &format!("/restapis/{api}/resources/{resource}/methods/{verb}"),
+            Some(request),
+        )
+        .await;
+    assert_eq!(
+        answer.status, 201,
+        "case PutMethod({resource}/{verb}): expected 201, got {} with {:?}",
+        answer.status, answer.body
+    );
+}
+
+/// `PutIntegration` for `verb` on `resource`, with `request` as its body.
+async fn put_integration(gateway: &Gateway, api: &str, resource: &str, verb: &str, request: Value) {
+    let answer = gateway
+        .call(
+            "PUT",
+            &format!("/restapis/{api}/resources/{resource}/methods/{verb}/integration"),
+            Some(request),
+        )
+        .await;
+    assert_eq!(
+        answer.status, 201,
+        "case PutIntegration({resource}/{verb}): expected 201, got {} with {:?}",
+        answer.status, answer.body
+    );
+}
+
+/// `PutIntegrationResponse` for `status` on the integration of `verb`.
+async fn put_integration_response(
+    gateway: &Gateway,
+    api: &str,
+    resource: &str,
+    verb: &str,
+    status: &str,
+    request: Value,
+) -> crate::rest_api_lifecycle::Answer {
+    gateway
+        .call(
+            "PUT",
+            &format!(
+                "/restapis/{api}/resources/{resource}/methods/{verb}/integration/responses/{status}"
+            ),
+            Some(request),
+        )
+        .await
+}
+
+/// `PutIntegrationResponse`, asserting the modelled 201.
+async fn integration_response(
+    gateway: &Gateway,
+    api: &str,
+    resource: &str,
+    verb: &str,
+    status: &str,
+    request: Value,
+) {
+    let answer = put_integration_response(gateway, api, resource, verb, status, request).await;
+    assert_eq!(
+        answer.status, 201,
+        "case PutIntegrationResponse({resource}/{verb}/{status}): expected 201, got {} with {:?}",
+        answer.status, answer.body
+    );
+}
+
+/// `PutMethodResponse` for `status` on `verb`, asserting the modelled 201.
+async fn method_response(
+    gateway: &Gateway,
+    api: &str,
+    resource: &str,
+    verb: &str,
+    status: &str,
+    request: Value,
+) {
+    let answer = gateway
+        .call(
+            "PUT",
+            &format!("/restapis/{api}/resources/{resource}/methods/{verb}/responses/{status}"),
+            Some(request),
+        )
+        .await;
+    assert_eq!(
+        answer.status, 201,
+        "case PutMethodResponse({resource}/{verb}/{status}): expected 201, got {} with {:?}",
+        answer.status, answer.body
+    );
+}
+
+/// `CreateDeployment` of `api` to `stage`, asserting the modelled 201 and answering the
+/// deployment id.
+async fn deploy(gateway: &Gateway, api: &str, stage: &str) -> String {
+    let answer = gateway
+        .call(
+            "POST",
+            &format!("/restapis/{api}/deployments"),
+            Some(json!({ "stageName": stage })),
+        )
+        .await;
+    assert_eq!(
+        answer.status, 201,
+        "case CreateDeployment({api} -> {stage}): expected 201, got {} with {:?}",
+        answer.status, answer.body
+    );
+    string_member(&answer.body, "id", "CreateDeployment")
+}
+
+/// A resource under `parent` carrying one `MOCK` method that answers `status` with
+/// `templates` as its response templates, answering the resource id.
+///
+/// This is the one integration type that needs no backend — "for testing without actually
+/// invoking the backend" (`IntegrationType`) — so it is what a data-plane case that asserts
+/// a SERVED response is built from.
+async fn mock_resource(
+    gateway: &Gateway,
+    api: &str,
+    parent: &str,
+    path_part: &str,
+    verb: &str,
+    status: &str,
+    templates: Value,
+) -> String {
+    let resource = create_resource(gateway, api, parent, path_part).await;
+    let resource_id = string_member(&resource, "id", path_part);
+    mock_method(gateway, api, &resource_id, verb, status, templates).await;
+    resource_id
+}
+
+/// One `MOCK` method on an existing resource: the method, its integration, the integration
+/// response that maps the call and the method response the status is declared by.
+async fn mock_method(
+    gateway: &Gateway,
+    api: &str,
+    resource: &str,
+    verb: &str,
+    status: &str,
+    templates: Value,
+) {
+    put_method(gateway, api, resource, verb, json!({ "authorizationType": "NONE" })).await;
+    put_integration(gateway, api, resource, verb, json!({ "type": "MOCK" })).await;
+    method_response(gateway, api, resource, verb, status, json!({})).await;
+    integration_response(
+        gateway,
+        api,
+        resource,
+        verb,
+        status,
+        json!({ "responseTemplates": templates }),
+    )
+    .await;
+}
+
+/// A JSON response-template map answering `body` for `application/json` callers.
+fn json_template(body: &str) -> Value {
+    json!({ "application/json": body })
+}
+
+#[tokio::test]
+async fn every_request_to_a_deployed_stage_is_answered_from_the_apis_own_records() {
+    let gateway = Gateway::new();
+    let (api, root) = create_api(&gateway, "invoke-routing").await;
+
+    // The api's resource tree spans what the routing rule generalises over: the root
+    // resource, a literal child, a path parameter, a greedy parameter, and a method put on
+    // the api AFTER the deployment is created.
+    mock_method(&gateway, &api, &root, "GET", "200", json_template(r#"{"at":"root"}"#)).await;
+    let pets = mock_resource(
+        &gateway,
+        &api,
+        &root,
+        "pets",
+        "GET",
+        "200",
+        json_template(r#"{"at":"pets"}"#),
+    )
+    .await;
+    mock_resource(
+        &gateway,
+        &api,
+        &pets,
+        "{petId}",
+        "GET",
+        "200",
+        json_template(r#"{"at":"one-pet"}"#),
+    )
+    .await;
+    let files = create_resource(&gateway, &api, &root, "files").await;
+    let files = string_member(&files, "id", "files");
+    mock_resource(
+        &gateway,
+        &api,
+        &files,
+        "{proxy+}",
+        "ANY",
+        "200",
+        json_template(r#"{"at":"proxy"}"#),
+    )
+    .await;
+    let late = create_resource(&gateway, &api, &root, "late").await;
+    let late = string_member(&late, "id", "late");
+
+    deploy(&gateway, &api, "prod").await;
+    // Put AFTER the deployment, so it is not in the stage's snapshot.
+    mock_method(&gateway, &api, &late, "GET", "200", json_template(r#"{"at":"late"}"#)).await;
+
+    // Rows differ along the verb, the path shape, the stage and the segment count.
+    let cases: &[(&str, &str, &str, u16, &str)] = &[
+        (
+            "the root resource of the stage",
+            "GET",
+            "/prod/",
+            200,
+            r#"{"at":"root"}"#,
+        ),
+        (
+            "the stage with no trailing slash is still the root resource",
+            "GET",
+            "/prod",
+            200,
+            r#"{"at":"root"}"#,
+        ),
+        ("a literal path", "GET", "/prod/pets", 200, r#"{"at":"pets"}"#),
+        (
+            "a path parameter takes one segment",
+            "GET",
+            "/prod/pets/42",
+            200,
+            r#"{"at":"one-pet"}"#,
+        ),
+        (
+            "a greedy parameter takes the rest of the path",
+            "GET",
+            "/prod/files/a/b/c.txt",
+            200,
+            r#"{"at":"proxy"}"#,
+        ),
+        (
+            "the ANY catch-all serves a verb of its own",
+            "DELETE",
+            "/prod/files/a",
+            200,
+            r#"{"at":"proxy"}"#,
+        ),
+        (
+            "a path the deployment holds no resource for",
+            "GET",
+            "/prod/nope",
+            403,
+            "Missing Authentication Token",
+        ),
+        (
+            "one segment past a path parameter",
+            "GET",
+            "/prod/pets/42/toys",
+            403,
+            "Missing Authentication Token",
+        ),
+        (
+            "a verb the resource has no method for",
+            "POST",
+            "/prod/pets",
+            403,
+            "Missing Authentication Token",
+        ),
+        (
+            "a method put on the api after this stage was deployed",
+            "GET",
+            "/prod/late",
+            403,
+            "Missing Authentication Token",
+        ),
+        (
+            "a stage the api does not have",
+            "GET",
+            "/beta/pets",
+            403,
+            "Forbidden",
+        ),
+        ("no stage at all", "GET", "/", 403, "Forbidden"),
+    ];
+
+    for (case, verb, path, status, expected) in cases {
+        let answered = invoke(&gateway, &api, verb, path, &[]).await;
+        assert_eq!(
+            answered.status, *status,
+            "case {case:?} ({verb} {path}): expected {status}, got {} with {:?}",
+            answered.status, answered.body
+        );
+        if *status == 200 {
+            assert_eq!(
+                answered.body, *expected,
+                "case {case:?} ({verb} {path}): expected the body {expected:?}, got {:?}",
+                answered.body
+            );
+        } else {
+            assert_eq!(
+                answered.message().as_deref(),
+                Some(*expected),
+                "case {case:?} ({verb} {path}): expected the message {expected:?}, got {:?}",
+                answered.body
+            );
+        }
+    }
+
+    // The snapshot rule in the other direction: redeploying the api takes the methods as
+    // they stand now, so the late method is served and nothing else changed.
+    deploy(&gateway, &api, "prod").await;
+    let answered = invoke(&gateway, &api, "GET", "/prod/late", &[]).await;
+    assert_eq!(
+        answered.status, 200,
+        "case redeployed late method: expected 200, got {} with {:?}",
+        answered.status, answered.body
+    );
+    assert_eq!(
+        answered.body, r#"{"at":"late"}"#,
+        "case redeployed late method: expected the late body, got {:?}",
+        answered.body
+    );
+}
+
+#[tokio::test]
+async fn a_mock_integrations_response_is_built_from_the_selected_integration_response() {
+    // Rows differ along what the rule generalises over: the integration response's status
+    // code (a 2xx, a 4xx and a 5xx), the response templates it carries (one, several,
+    // none), the content type the caller accepts, and whether a static header mapping is
+    // declared by the method response.
+    struct Case {
+        name: &'static str,
+        /// The `statusCode` of the integration response and of the method response.
+        status: &'static str,
+        templates: Value,
+        /// The `responseParameters` of the integration response.
+        mapped: Value,
+        /// The `responseParameters` of the method response: only a header DECLARED here is
+        /// returned, which is the rule the `responseParameters` members document.
+        declared: Value,
+        accept: Option<&'static str>,
+        expected_status: u16,
+        expected_body: &'static str,
+        expected_content_type: &'static str,
+        expected_headers: &'static [(&'static str, &'static str)],
+        absent_headers: &'static [&'static str],
+    }
+
+    let cases = vec![
+        Case {
+            name: "a literal JSON template on a 200",
+            status: "200",
+            templates: json_template(r#"{"ok":true}"#),
+            mapped: json!({}),
+            declared: json!({}),
+            accept: None,
+            expected_status: 200,
+            expected_body: r#"{"ok":true}"#,
+            expected_content_type: "application/json",
+            expected_headers: &[],
+            absent_headers: &[],
+        },
+        Case {
+            name: "a 404 the integration response maps to",
+            status: "404",
+            templates: json_template(r#"{"missing":true}"#),
+            mapped: json!({}),
+            declared: json!({}),
+            accept: None,
+            expected_status: 404,
+            expected_body: r#"{"missing":true}"#,
+            expected_content_type: "application/json",
+            expected_headers: &[],
+            absent_headers: &[],
+        },
+        Case {
+            name: "a 503 the integration response maps to",
+            status: "503",
+            templates: json_template(r#"{"down":true}"#),
+            mapped: json!({}),
+            declared: json!({}),
+            accept: None,
+            expected_status: 503,
+            expected_body: r#"{"down":true}"#,
+            expected_content_type: "application/json",
+            expected_headers: &[],
+            absent_headers: &[],
+        },
+        Case {
+            name: "the template of the accepted content type is chosen",
+            status: "200",
+            templates: json!({
+                "application/json": r#"{"form":"json"}"#,
+                "text/plain": "form=plain",
+            }),
+            mapped: json!({}),
+            declared: json!({}),
+            accept: Some("text/plain"),
+            expected_status: 200,
+            expected_body: "form=plain",
+            expected_content_type: "text/plain",
+            expected_headers: &[],
+            absent_headers: &[],
+        },
+        Case {
+            name: "an Accept with parameters still selects its media type",
+            status: "200",
+            templates: json!({
+                "application/json": r#"{"form":"json"}"#,
+                "text/plain": "form=plain",
+            }),
+            accept: Some("text/plain; charset=utf-8"),
+            mapped: json!({}),
+            declared: json!({}),
+            expected_status: 200,
+            expected_body: "form=plain",
+            expected_content_type: "text/plain",
+            expected_headers: &[],
+            absent_headers: &[],
+        },
+        Case {
+            name: "an Accept no template carries falls back to the JSON template",
+            status: "200",
+            templates: json!({
+                "application/json": r#"{"form":"json"}"#,
+                "text/plain": "form=plain",
+            }),
+            accept: Some("application/xml"),
+            mapped: json!({}),
+            declared: json!({}),
+            expected_status: 200,
+            expected_body: r#"{"form":"json"}"#,
+            expected_content_type: "application/json",
+            expected_headers: &[],
+            absent_headers: &[],
+        },
+        Case {
+            name: "no response template at all answers an empty body",
+            status: "201",
+            templates: json!({}),
+            mapped: json!({}),
+            declared: json!({}),
+            accept: None,
+            expected_status: 201,
+            expected_body: "",
+            expected_content_type: "application/json",
+            expected_headers: &[],
+            absent_headers: &[],
+        },
+        Case {
+            name: "a literal body carrying characters a template language uses",
+            status: "200",
+            templates: json_template(r##"{"color":"#fff","price":"$5"}"##),
+            mapped: json!({}),
+            declared: json!({}),
+            accept: None,
+            expected_status: 200,
+            expected_body: r##"{"color":"#fff","price":"$5"}"##,
+            expected_content_type: "application/json",
+            expected_headers: &[],
+            absent_headers: &[],
+        },
+        Case {
+            // Nothing restricts a stored template to ASCII, and serving one must not fail.
+            name: "a literal body carrying non-ASCII text",
+            status: "200",
+            templates: json_template(r#"{"msg":"café ☃ 🙂"}"#),
+            mapped: json!({}),
+            declared: json!({}),
+            accept: None,
+            expected_status: 200,
+            expected_body: r#"{"msg":"café ☃ 🙂"}"#,
+            expected_content_type: "application/json",
+            expected_headers: &[],
+            absent_headers: &[],
+        },
+        Case {
+            // Two templates and nothing to choose between them: the call is served with no
+            // body rather than with a template the caller did not ask for.
+            name: "an Accept no template carries, with no JSON template to fall back to",
+            status: "200",
+            templates: json!({
+                "text/plain": "form=plain",
+                "text/csv": "form,csv",
+            }),
+            accept: Some("application/xml"),
+            mapped: json!({}),
+            declared: json!({}),
+            expected_status: 200,
+            expected_body: "",
+            expected_content_type: "application/json",
+            expected_headers: &[],
+            absent_headers: &[],
+        },
+        Case {
+            // A stored mapping the wire cannot carry must not fail the request: the header
+            // is skipped and the rest of the response is still served.
+            name: "a declared static header whose value cannot be sent is skipped",
+            status: "200",
+            templates: json_template(r#"{"served":true}"#),
+            mapped: json!({ "method.response.header.X-Bad": "'one\ntwo'" }),
+            declared: json!({ "method.response.header.X-Bad": true }),
+            accept: None,
+            expected_status: 200,
+            expected_body: r#"{"served":true}"#,
+            expected_content_type: "application/json",
+            expected_headers: &[],
+            absent_headers: &["x-bad"],
+        },
+        Case {
+            name: "a declared static header mapping is returned, an undeclared one is not",
+            status: "200",
+            templates: json_template(r#"{"cors":true}"#),
+            mapped: json!({
+                "method.response.header.Access-Control-Allow-Origin": "'*'",
+                "method.response.header.X-Undeclared": "'dropped'",
+            }),
+            declared: json!({ "method.response.header.Access-Control-Allow-Origin": true }),
+            accept: None,
+            expected_status: 200,
+            expected_body: r#"{"cors":true}"#,
+            expected_content_type: "application/json",
+            expected_headers: &[("access-control-allow-origin", "*")],
+            absent_headers: &["x-undeclared"],
+        },
+    ];
+
+    for (index, case) in cases.iter().enumerate() {
+        let gateway = Gateway::new();
+        let (api, root) = create_api(&gateway, "invoke-mock").await;
+        let resource = create_resource(&gateway, &api, &root, &format!("case{index}")).await;
+        let resource = string_member(&resource, "id", case.name);
+        put_method(
+            &gateway,
+            &api,
+            &resource,
+            "GET",
+            json!({ "authorizationType": "NONE" }),
+        )
+        .await;
+        put_integration(&gateway, &api, &resource, "GET", json!({ "type": "MOCK" })).await;
+        method_response(
+            &gateway,
+            &api,
+            &resource,
+            "GET",
+            case.status,
+            json!({ "responseParameters": case.declared }),
+        )
+        .await;
+        integration_response(
+            &gateway,
+            &api,
+            &resource,
+            "GET",
+            case.status,
+            json!({
+                "responseTemplates": case.templates,
+                "responseParameters": case.mapped,
+            }),
+        )
+        .await;
+        deploy(&gateway, &api, "prod").await;
+
+        let headers: Vec<(&str, &str)> = case
+            .accept
+            .map(|accept| vec![("accept", accept)])
+            .unwrap_or_default();
+        let answered = invoke(
+            &gateway,
+            &api,
+            "GET",
+            &format!("/prod/case{index}"),
+            &headers,
+        )
+        .await;
+        assert_eq!(
+            answered.status, case.expected_status,
+            "case {:?}: expected {}, got {} with {:?}",
+            case.name, case.expected_status, answered.status, answered.body
+        );
+        assert_eq!(
+            answered.body, case.expected_body,
+            "case {:?}: expected the body {:?}, got {:?}",
+            case.name, case.expected_body, answered.body
+        );
+        assert_eq!(
+            answered.header("content-type"),
+            Some(case.expected_content_type),
+            "case {:?}: expected content-type {:?}, got {:?}",
+            case.name,
+            case.expected_content_type,
+            answered.header("content-type")
+        );
+        for (name, value) in case.expected_headers {
+            assert_eq!(
+                answered.header(name),
+                Some(*value),
+                "case {:?}: expected the header {name}: {value}, got {:?}",
+                case.name,
+                answered.header(name)
+            );
+        }
+        for name in case.absent_headers {
+            assert_eq!(
+                answered.header(name),
+                None,
+                "case {:?}: expected no {name} header, got {:?}",
+                case.name,
+                answered.header(name)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_deployed_methods_authorization_decides_which_requests_are_served() {
+    let gateway = Gateway::new();
+    let (api, root) = create_api(&gateway, "invoke-authorization").await;
+
+    // One resource per authorization type the `Method$authorizationType` documentation
+    // lists, each with the same MOCK integration behind it, so only the authorization
+    // varies between the rows.
+    let open = mock_resource(
+        &gateway,
+        &api,
+        &root,
+        "open",
+        "GET",
+        "200",
+        json_template(r#"{"open":true}"#),
+    )
+    .await;
+    // Named for the row that invokes `/prod/open`; the id itself is not needed again.
+    drop(open);
+
+    let iam = create_resource(&gateway, &api, &root, "iam").await;
+    let iam = string_member(&iam, "id", "iam");
+    put_method(
+        &gateway,
+        &api,
+        &iam,
+        "GET",
+        json!({ "authorizationType": "AWS_IAM" }),
+    )
+    .await;
+    put_integration(&gateway, &api, &iam, "GET", json!({ "type": "MOCK" })).await;
+    method_response(&gateway, &api, &iam, "GET", "200", json!({})).await;
+    integration_response(
+        &gateway,
+        &api,
+        &iam,
+        "GET",
+        "200",
+        json!({ "responseTemplates": json_template(r#"{"iam":true}"#) }),
+    )
+    .await;
+
+    let authorizer = gateway
+        .call(
+            "POST",
+            &format!("/restapis/{api}/authorizers"),
+            Some(json!({
+                "name": "token-authorizer",
+                "type": "TOKEN",
+                "identitySource": "method.request.header.Auth",
+                "authorizerUri": format!(
+                    "arn:aws:apigateway:{REGION}:lambda:path/2015-03-31/functions/\
+                     arn:aws:lambda:{REGION}:123456789012:function:authorize/invocations"
+                ),
+            })),
+        )
+        .await;
+    assert_eq!(
+        authorizer.status, 201,
+        "case CreateAuthorizer: expected 201, got {} with {:?}",
+        authorizer.status, authorizer.body
+    );
+    let authorizer = string_member(&authorizer.body, "id", "CreateAuthorizer");
+    let custom = create_resource(&gateway, &api, &root, "custom").await;
+    let custom = string_member(&custom, "id", "custom");
+    put_method(
+        &gateway,
+        &api,
+        &custom,
+        "GET",
+        json!({ "authorizationType": "CUSTOM", "authorizerId": authorizer }),
+    )
+    .await;
+    put_integration(&gateway, &api, &custom, "GET", json!({ "type": "MOCK" })).await;
+
+    // A CUSTOM method that names no authorizer at all: the call cannot be authorized, which
+    // is a configuration the stage cannot serve.
+    let unauthorized = create_resource(&gateway, &api, &root, "no-authorizer").await;
+    let unauthorized = string_member(&unauthorized, "id", "no-authorizer");
+    put_method(
+        &gateway,
+        &api,
+        &unauthorized,
+        "GET",
+        json!({ "authorizationType": "CUSTOM" }),
+    )
+    .await;
+    put_integration(&gateway, &api, &unauthorized, "GET", json!({ "type": "MOCK" })).await;
+
+    let keyed = create_resource(&gateway, &api, &root, "keyed").await;
+    let keyed = string_member(&keyed, "id", "keyed");
+    put_method(
+        &gateway,
+        &api,
+        &keyed,
+        "GET",
+        json!({ "authorizationType": "NONE", "apiKeyRequired": true }),
+    )
+    .await;
+    put_integration(&gateway, &api, &keyed, "GET", json!({ "type": "MOCK" })).await;
+    method_response(&gateway, &api, &keyed, "GET", "200", json!({})).await;
+    integration_response(
+        &gateway,
+        &api,
+        &keyed,
+        "GET",
+        "200",
+        json!({ "responseTemplates": json_template(r#"{"keyed":true}"#) }),
+    )
+    .await;
+
+    deploy(&gateway, &api, "prod").await;
+
+    // The key is created after the stage exists, because a `stageKeys` entry must name a
+    // stored stage. One key is associated with this stage and enabled; the others differ in
+    // exactly one of those two properties, which is what the rule generalises over.
+    let associated = "0123456789abcdef0123456789abcdef01234567";
+    let disabled = "fedcba9876543210fedcba9876543210fedcba98";
+    let unassociated = "aaaabbbbccccddddeeeeffff00001111222233334";
+    for (value, enabled, stages) in [
+        (associated, true, json!([{ "restApiId": api, "stageName": "prod" }])),
+        (disabled, false, json!([{ "restApiId": api, "stageName": "prod" }])),
+        (unassociated, true, json!([])),
+    ] {
+        let created = gateway
+            .call(
+                "POST",
+                "/apikeys",
+                Some(json!({ "value": value, "enabled": enabled, "stageKeys": stages })),
+            )
+            .await;
+        assert_eq!(
+            created.status, 201,
+            "case CreateApiKey({value}): expected 201, got {} with {:?}",
+            created.status, created.body
+        );
+    }
+
+    // Rows differ along the authorization type, the credential or key the request carries,
+    // and the identity source the authorizer declares.
+    struct AuthorizationCase<'c> {
+        name: &'c str,
+        path: &'c str,
+        headers: &'c [(&'c str, &'c str)],
+        expected_status: u16,
+        /// The body for a served call, or the gateway response's `message` for a refusal.
+        expected: &'c str,
+    }
+    let cases: &[AuthorizationCase] = &[
+        AuthorizationCase {
+            name: "an open method is served to an anonymous caller",
+            path: "/prod/open",
+            headers: &[],
+            expected_status: 200,
+            expected: r#"{"open":true}"#,
+        },
+        AuthorizationCase {
+            name: "an AWS_IAM method reached with no credential",
+            path: "/prod/iam",
+            headers: &[],
+            expected_status: 403,
+            expected: "Missing Authentication Token",
+        },
+        AuthorizationCase {
+            name: "an AWS_IAM method reached with a SigV4 credential",
+            path: "/prod/iam",
+            headers: &[("authorization", SIGNED)],
+            expected_status: 200,
+            expected: r#"{"iam":true}"#,
+        },
+        AuthorizationCase {
+            name: "an AWS_IAM method reached with a presigned credential",
+            path: "/prod/iam",
+            headers: &[],
+            expected_status: 200,
+            expected: r#"{"iam":true}"#,
+        },
+        AuthorizationCase {
+            name: "a CUSTOM method whose identity source is absent is refused before the \
+                   authorizer runs",
+            path: "/prod/custom",
+            headers: &[],
+            expected_status: 401,
+            expected: "Unauthorized",
+        },
+        AuthorizationCase {
+            name: "a CUSTOM method whose identity source is present needs the authorizer's \
+                   decision",
+            path: "/prod/custom",
+            headers: &[("auth", "a-token")],
+            expected_status: 500,
+            expected: "Internal server error",
+        },
+        AuthorizationCase {
+            name: "a CUSTOM method that names no authorizer",
+            path: "/prod/no-authorizer",
+            headers: &[("auth", "a-token")],
+            expected_status: 500,
+            expected: "Internal server error",
+        },
+        AuthorizationCase {
+            name: "a method requiring an API key reached with none",
+            path: "/prod/keyed",
+            headers: &[],
+            expected_status: 403,
+            expected: "Forbidden",
+        },
+        AuthorizationCase {
+            name: "a method requiring an API key reached with an unknown value",
+            path: "/prod/keyed",
+            headers: &[("x-api-key", "not-a-key")],
+            expected_status: 403,
+            expected: "Forbidden",
+        },
+        AuthorizationCase {
+            name: "a key associated with the stage but disabled",
+            path: "/prod/keyed",
+            headers: &[("x-api-key", disabled)],
+            expected_status: 403,
+            expected: "Forbidden",
+        },
+        AuthorizationCase {
+            name: "an enabled key associated with no stage",
+            path: "/prod/keyed",
+            headers: &[("x-api-key", unassociated)],
+            expected_status: 403,
+            expected: "Forbidden",
+        },
+        AuthorizationCase {
+            name: "an enabled key associated with this stage",
+            path: "/prod/keyed",
+            headers: &[("x-api-key", associated)],
+            expected_status: 200,
+            expected: r#"{"keyed":true}"#,
+        },
+    ];
+
+    for case in cases {
+        // A presigned invoke carries its credential scope in the query string instead of a
+        // header, and must be admitted by the same rule a header-signed one is.
+        let path = if case.name.contains("presigned") {
+            format!(
+                "{}?X-Amz-Credential=AKIDEXAMPLE%2F20260101%2Fus-east-1%2Fapigateway%2F\
+                 aws4_request",
+                case.path
+            )
+        } else {
+            case.path.to_string()
+        };
+        let answered = invoke(&gateway, &api, "GET", &path, case.headers).await;
+        assert_eq!(
+            answered.status, case.expected_status,
+            "case {:?} (GET {path}): expected {}, got {} with {:?}",
+            case.name, case.expected_status, answered.status, answered.body
+        );
+        if case.expected_status == 200 {
+            assert_eq!(
+                answered.body, case.expected,
+                "case {:?} (GET {path}): expected the body {:?}, got {:?}",
+                case.name, case.expected, answered.body
+            );
+        } else {
+            assert_eq!(
+                answered.message().as_deref(),
+                Some(case.expected),
+                "case {:?} (GET {path}): expected the message {:?}, got {:?}",
+                case.name, case.expected, answered.body
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_integration_this_emulator_cannot_perform_is_answered_as_one_that_failed() {
+    let gateway = Gateway::new();
+    let (api, root) = create_api(&gateway, "invoke-integration-failure").await;
+
+    // Rows differ along the integration configuration that cannot be served: each type
+    // that names a backend (Lambda, another AWS action, an HTTP endpoint, a private
+    // endpoint), a method with no integration at all, a MOCK with no default integration
+    // response, and a MOCK whose response template is a Velocity template rather than a
+    // literal body.
+    let lambda_uri = format!(
+        "arn:aws:apigateway:{REGION}:lambda:path/2015-03-31/functions/\
+         arn:aws:lambda:{REGION}:123456789012:function:handler/invocations"
+    );
+    let cases: Vec<(&str, &str, Option<Value>, Option<Value>)> = vec![
+        (
+            "a Lambda proxy integration",
+            "proxy",
+            Some(json!({
+                "type": "AWS_PROXY",
+                // The integration's own verb: the input member is `integrationHttpMethod`,
+                // whose `jsonName` is `httpMethod`, so that is the name a request carries.
+                "httpMethod": "POST",
+                "uri": lambda_uri,
+            })),
+            None,
+        ),
+        (
+            "an AWS service action integration",
+            "ddb",
+            Some(json!({
+                "type": "AWS",
+                "httpMethod": "POST",
+                "uri": format!("arn:aws:apigateway:{REGION}:dynamodb:action/PutItem"),
+            })),
+            None,
+        ),
+        (
+            "an HTTP proxy integration",
+            "http",
+            Some(json!({
+                "type": "HTTP_PROXY",
+                "httpMethod": "GET",
+                "uri": "https://example.com/upstream",
+            })),
+            None,
+        ),
+        (
+            "an HTTP integration",
+            "upstream",
+            Some(json!({
+                "type": "HTTP",
+                "httpMethod": "GET",
+                "uri": "https://example.com/upstream",
+            })),
+            None,
+        ),
+        ("a method carrying no integration", "bare", None, None),
+        (
+            "a MOCK whose only integration response carries a selection pattern",
+            "patterned",
+            Some(json!({ "type": "MOCK" })),
+            Some(json!({ "selectionPattern": "4\\d\\d" })),
+        ),
+        (
+            "a MOCK whose response template is a Velocity template",
+            "velocity",
+            Some(json!({ "type": "MOCK" })),
+            Some(json!({
+                "responseTemplates": {
+                    "application/json": "#set($root = $input.path('$'))\n{\"id\":\"$root.id\"}",
+                },
+            })),
+        ),
+    ];
+
+    for (case, path_part, integration, integration_response_body) in &cases {
+        let resource = create_resource(&gateway, &api, &root, path_part).await;
+        let resource = string_member(&resource, "id", case);
+        put_method(
+            &gateway,
+            &api,
+            &resource,
+            "GET",
+            json!({ "authorizationType": "NONE" }),
+        )
+        .await;
+        if let Some(integration) = integration {
+            put_integration(&gateway, &api, &resource, "GET", integration.clone()).await;
+        }
+        if let Some(body) = integration_response_body {
+            method_response(&gateway, &api, &resource, "GET", "200", json!({})).await;
+            integration_response(&gateway, &api, &resource, "GET", "200", body.clone()).await;
+        }
+    }
+    deploy(&gateway, &api, "prod").await;
+
+    for (case, path_part, _, _) in &cases {
+        let answered = invoke(&gateway, &api, "GET", &format!("/prod/{path_part}"), &[]).await;
+        assert_eq!(
+            answered.status, 500,
+            "case {case:?}: expected 500, got {} with {:?}",
+            answered.status, answered.body
+        );
+        assert_eq!(
+            answered.message().as_deref(),
+            Some("Internal server error"),
+            "case {case:?}: expected the API Gateway integration-failure message, got {:?}",
+            answered.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_customized_gateway_response_is_what_the_refused_caller_sees() {
+    // Rows differ along which customization applies: the refused type's own, the class
+    // fallback for a type with no customization of its own, and none at all (the status
+    // code the response type documents).
+    struct Case {
+        name: &'static str,
+        /// The `responseType` `PutGatewayResponse` is called for, with its body.
+        customization: Option<(&'static str, Value)>,
+        /// The path invoked, which decides which response type the refusal takes.
+        path: &'static str,
+        expected_status: u16,
+        expected_body: &'static str,
+    }
+
+    let cases = vec![
+        Case {
+            name: "no customization: the response type's own documented status",
+            customization: None,
+            path: "/prod/nope",
+            expected_status: 403,
+            expected_body: r#"{"message":"Missing Authentication Token"}"#,
+        },
+        Case {
+            name: "the refused type's own customization",
+            customization: Some((
+                "MISSING_AUTHENTICATION_TOKEN",
+                json!({
+                    "statusCode": "404",
+                    "responseTemplates": { "application/json": r#"{"message":"no route"}"# },
+                }),
+            )),
+            path: "/prod/nope",
+            expected_status: 404,
+            expected_body: r#"{"message":"no route"}"#,
+        },
+        Case {
+            name: "the 4xx class customization applies to a type with none of its own",
+            customization: Some((
+                "DEFAULT_4XX",
+                json!({
+                    "statusCode": "400",
+                    "responseTemplates": { "application/json": r#"{"message":"client"}"# },
+                }),
+            )),
+            path: "/prod/nope",
+            expected_status: 400,
+            expected_body: r#"{"message":"client"}"#,
+        },
+        Case {
+            name: "the 5xx class customization applies to an integration that cannot run",
+            customization: Some((
+                "DEFAULT_5XX",
+                json!({
+                    "statusCode": "502",
+                    "responseTemplates": { "application/json": r#"{"message":"backend"}"# },
+                }),
+            )),
+            path: "/prod/bare",
+            expected_status: 502,
+            expected_body: r#"{"message":"backend"}"#,
+        },
+        Case {
+            // Nothing restricts a stored template to ASCII, and every refusal of this api
+            // renders through one, so serving one must not fail.
+            name: "a customization whose template carries non-ASCII text",
+            customization: Some((
+                "MISSING_AUTHENTICATION_TOKEN",
+                json!({
+                    "statusCode": "403",
+                    "responseTemplates": { "application/json": r#"{"message":"introuvable ☃"}"# },
+                }),
+            )),
+            path: "/prod/nope",
+            expected_status: 403,
+            expected_body: r#"{"message":"introuvable ☃"}"#,
+        },
+    ];
+
+    for case in &cases {
+        let gateway = Gateway::new();
+        let (api, root) = create_api(&gateway, "invoke-gateway-responses").await;
+        // One method with no integration, so the 5xx class is reachable too.
+        let bare = create_resource(&gateway, &api, &root, "bare").await;
+        let bare = string_member(&bare, "id", case.name);
+        put_method(
+            &gateway,
+            &api,
+            &bare,
+            "GET",
+            json!({ "authorizationType": "NONE" }),
+        )
+        .await;
+        if let Some((response_type, body)) = &case.customization {
+            let put = gateway
+                .call(
+                    "PUT",
+                    &format!("/restapis/{api}/gatewayresponses/{response_type}"),
+                    Some(body.clone()),
+                )
+                .await;
+            assert_eq!(
+                put.status, 201,
+                "case {:?}: expected 201 from PutGatewayResponse, got {} with {:?}",
+                case.name, put.status, put.body
+            );
+        }
+        deploy(&gateway, &api, "prod").await;
+
+        let answered = invoke(&gateway, &api, "GET", case.path, &[]).await;
+        assert_eq!(
+            answered.status, case.expected_status,
+            "case {:?}: expected {}, got {} with {:?}",
+            case.name, case.expected_status, answered.status, answered.body
+        );
+        assert_eq!(
+            answered.body, case.expected_body,
+            "case {:?}: expected the body {:?}, got {:?}",
+            case.name, case.expected_body, answered.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn only_the_invoke_endpoint_of_an_api_this_service_holds_is_served() {
+    let gateway = Gateway::new();
+    let (api, root) = create_api(&gateway, "invoke-claim").await;
+    mock_resource(
+        &gateway,
+        &api,
+        &root,
+        "pets",
+        "GET",
+        "200",
+        json_template(r#"{"at":"pets"}"#),
+    )
+    .await;
+    deploy(&gateway, &api, "prod").await;
+
+    // Rows differ along the host and the path: the dimensions the claim rule generalises
+    // over. A host this service does not hold an api for is NOT claimed — the same host
+    // shape is the invoke endpoint of an api of the V2 service, and `@connections` on this
+    // very host is ApiGatewayManagementApi's modelled path space — so the front door
+    // answers its own `404 UnknownService` rather than this service answering for another.
+    let other_api = "zzzzzzzzzz";
+    let cases: &[(&str, String, &str, u16)] = &[
+        (
+            "this api's own invoke endpoint",
+            invoke_host(&api),
+            "/prod/pets",
+            200,
+        ),
+        (
+            "an execute-api host for an api id this service does not hold",
+            invoke_host(other_api),
+            "/prod/pets",
+            404,
+        ),
+        (
+            "the @connections path space on this api's host",
+            invoke_host(&api),
+            "/prod/@connections/abc123",
+            404,
+        ),
+        (
+            "the @connections path space without a stage prefix",
+            invoke_host(&api),
+            "/@connections/abc123",
+            404,
+        ),
+        (
+            "the control plane's own host carrying an invoke path",
+            format!("apigateway.{REGION}.amazonaws.com"),
+            "/prod/pets",
+            404,
+        ),
+    ];
+
+    for (case, host, path, status) in cases {
+        let answered = invoke_on_host(&gateway, host, "GET", path, &[]).await;
+        assert_eq!(
+            answered.status, *status,
+            "case {case:?} ({host}{path}): expected {status}, got {} with {:?}",
+            answered.status, answered.body
+        );
+        if *status == 404 {
+            assert!(
+                answered.body.contains("UnknownService"),
+                "case {case:?} ({host}{path}): expected the front door's own refusal, got {:?}",
+                answered.body
+            );
+        }
+    }
+}
+
+// `PutIntegrationResponse`'s own round trip and its refusals are the sibling
+// `integration_response` suite's: this file asserts only what the stage SERVES from the
+// records that suite writes.

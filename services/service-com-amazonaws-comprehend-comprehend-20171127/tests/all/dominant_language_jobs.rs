@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Comprehend's asynchronous dominant-language detection job:
-//! `StartDominantLanguageDetectionJob` and `DescribeDominantLanguageDetectionJob`.
+//! `StartDominantLanguageDetectionJob`, `DescribeDominantLanguageDetectionJob` and
+//! `StopDominantLanguageDetectionJob`.
 //!
 //! The job is not a record-keeping exercise: starting it READS the input documents
 //! from the Amazon S3 location `InputDataConfig` names, identifies each document's
@@ -30,7 +31,11 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use service_com_amazonaws_comprehend_comprehend_20171127::ops::types::JOB_STATUS_VALUES;
 
-use crate::comprehend_client::{error_code, Comprehend, ACCOUNT_ID, REGION};
+use service_com_amazonaws_comprehend_comprehend_20171127::state::{
+    JOB_ALREADY_TERMINAL_MESSAGE, JOB_NOT_FOUND_MESSAGE, TERMINAL_JOB_STATUSES,
+};
+
+use crate::comprehend_client::{error_code, error_message, Comprehend, ACCOUNT_ID, REGION};
 use crate::sync_inference::DOCUMENTS;
 
 /// The bucket every suite writes its input documents to.
@@ -795,5 +800,387 @@ async fn describe_refuses_a_job_id_it_never_minted() {
     assert_eq!(
         status, 404,
         "case \"another family's id\": expected 404, got {status}: {body}"
+    );
+}
+
+/// Poll `job_id` until `DescribeDominantLanguageDetectionJob` reports one of
+/// `targets`, and return its properties then.
+///
+/// `settled` waits for the status the clock owes a RUN; this waits for whatever
+/// status a row is about, which for a cancelled job is `STOPPED`.
+async fn wait_for(comprehend: &Comprehend, case: &str, job_id: &str, targets: &[&str]) -> Value {
+    let started = Instant::now();
+    loop {
+        let properties = describe(comprehend, job_id).await;
+        let status = properties["JobStatus"].as_str().unwrap_or_default();
+        assert!(
+            JOB_STATUS_VALUES.contains(&status),
+            "case {case:?}: {status:?} is not a modelled JobStatus, got {properties}"
+        );
+        if targets.contains(&status) {
+            return properties;
+        }
+        assert!(
+            started.elapsed() < SETTLE_TIMEOUT,
+            "case {case:?}: the job never reached any of {targets:?}, last {properties}"
+        );
+        sleep(Duration::from_millis(40));
+    }
+}
+
+/// One job a stop is driven against: the submission it was started with and whether
+/// the emulator it runs on answers the job's object-storage calls at all (so the run
+/// it is racing against would end `COMPLETED` or `FAILED`).
+struct StopCase {
+    case: &'static str,
+    with_object_storage: bool,
+    submission: fn() -> Value,
+}
+
+/// A job whose run reads one document and completes.
+fn completing_submission() -> Value {
+    json!({
+        "JobName": "stop-completing",
+        "InputDataConfig": { "S3Uri": format!("s3://{BUCKET}/in/") },
+        "OutputDataConfig": { "S3Uri": format!("s3://{BUCKET}/out/") },
+        "DataAccessRoleArn": ROLE_ARN,
+    })
+}
+
+/// A job carrying every optional member the submission models, whose run reads
+/// several documents of several languages.
+fn decorated_submission() -> Value {
+    json!({
+        "JobName": "stop.decorated/2026",
+        "InputDataConfig": { "S3Uri": format!("s3://{BUCKET}/in/"), "InputFormat": "ONE_DOC_PER_LINE" },
+        "OutputDataConfig": {
+            "S3Uri": format!("s3://{BUCKET}/out/"),
+            "KmsKeyId": "arn:aws:kms:eu-west-1:000000000000:key/abcd-1234",
+        },
+        "DataAccessRoleArn": ROLE_ARN,
+        "VolumeKmsKeyId": "1234abcd-12ab-34cd-56ef-1234567890ab",
+        "VpcConfig": {
+            "SecurityGroupIds": ["sg-0123456789abcdef0"],
+            "Subnets": ["subnet-0123456789abcdef0"],
+        },
+        "Tags": [{ "Key": "team", "Value": "research" }],
+        "ClientRequestToken": "stop-token-1",
+    })
+}
+
+/// A job whose run cannot be carried out, because nothing answers its
+/// object-storage calls: it is racing a `FAILED` rather than a `COMPLETED`.
+fn failing_submission() -> Value {
+    json!({
+        "InputDataConfig": { "S3Uri": format!("s3://{BUCKET}/in/") },
+        "OutputDataConfig": { "S3Uri": format!("s3://{BUCKET}/out/") },
+        "DataAccessRoleArn": ROLE_ARN,
+    })
+}
+
+/// The jobs the stop suites below are driven over. The rows differ along what the
+/// rule generalises over: the optional members the submission carries, the number
+/// and form of the input documents, and the outcome the run the stop races would
+/// otherwise have reported.
+const STOP_CASES: &[StopCase] = &[
+    StopCase {
+        case: "a run that would complete",
+        with_object_storage: true,
+        submission: completing_submission,
+    },
+    StopCase {
+        case: "every optional member set, several documents per file",
+        with_object_storage: true,
+        submission: decorated_submission,
+    },
+    StopCase {
+        case: "a run nothing can carry out",
+        with_object_storage: false,
+        submission: failing_submission,
+    },
+];
+
+/// An emulator for `row`, with the input documents in place when it holds object
+/// storage.
+async fn emulator_for(row: &StopCase) -> Comprehend {
+    if !row.with_object_storage {
+        return Comprehend::new();
+    }
+    let comprehend = Comprehend::with_object_storage();
+    create_bucket(&comprehend).await;
+    put_object(&comprehend, "in/english.txt", document("en").as_bytes()).await;
+    put_object(
+        &comprehend,
+        "in/mixed.txt",
+        format!("{}\n{}", document("fr"), document("ja")).as_bytes(),
+    )
+    .await;
+    comprehend
+}
+
+/// Cancelling an analysis job is two-phase: a job that has not reached a status it
+/// can never leave is MARKED for termination, so the stop answers `STOP_REQUESTED`
+/// — never a terminal status — and the clock then owes the job `STOPPED`. Asserted
+/// over every row, so it holds whatever the job was submitted with and whatever its
+/// run would otherwise have reported.
+#[tokio::test]
+async fn a_stop_on_a_non_terminal_job_answers_stop_requested_then_settles_to_stopped() {
+    let mut stopped_rows = 0usize;
+
+    for row in STOP_CASES {
+        let case = row.case;
+        let comprehend = emulator_for(row).await;
+        let submission = (row.submission)();
+        let (job_id, _) = start(&comprehend, case, &submission).await;
+
+        let (http_status, stopped) = comprehend
+            .call(
+                "StopDominantLanguageDetectionJob",
+                &json!({ "JobId": job_id }),
+            )
+            .await;
+        if http_status == 400 {
+            // The clock owed this job its terminal status before the stop reached
+            // it, which is a refusal — the other suite's case, so this row has
+            // nothing left to assert.
+            let properties = describe(&comprehend, &job_id).await;
+            let status = properties["JobStatus"].as_str().unwrap_or_default();
+            assert!(
+                TERMINAL_JOB_STATUSES.contains(&status),
+                "case {case:?}: a stop was refused for a job that is not terminal: \
+                 {stopped} with {properties}"
+            );
+            continue;
+        }
+        assert_eq!(
+            http_status, 200,
+            "case {case:?}: expected 200, got {http_status}: {stopped}"
+        );
+        assert_eq!(
+            stopped["JobId"].as_str(),
+            Some(job_id.as_str()),
+            "case {case:?}: Stop reported a different JobId: {stopped}"
+        );
+        assert_eq!(
+            stopped["JobStatus"].as_str(),
+            Some("STOP_REQUESTED"),
+            "case {case:?}: a stop on a non-terminal job must answer STOP_REQUESTED, got {stopped}"
+        );
+
+        // The mark is PERSISTED: the very next read of the record reports it, and a
+        // repeated stop while the job is being stopped reports the same mark again
+        // rather than minting a second one.
+        let marked = describe(&comprehend, &job_id).await;
+        let marked_status = marked["JobStatus"].as_str().unwrap_or_default();
+        assert!(
+            marked_status == "STOP_REQUESTED" || marked_status == "STOPPED",
+            "case {case:?}: a stopped job must read back as STOP_REQUESTED or STOPPED, got {marked}"
+        );
+        if marked_status == "STOP_REQUESTED" {
+            let repeated = comprehend
+                .ok(
+                    "StopDominantLanguageDetectionJob",
+                    &json!({ "JobId": job_id }),
+                )
+                .await;
+            assert_eq!(
+                repeated["JobStatus"].as_str(),
+                Some("STOP_REQUESTED"),
+                "case {case:?}: a repeated stop must report the mark already made, got {repeated}"
+            );
+        }
+
+        // And the clock owes the marked job `STOPPED` — not the status its run
+        // would otherwise have reported.
+        let settled = wait_for(&comprehend, case, &job_id, &["STOPPED"]).await;
+        assert_eq!(
+            settled["JobStatus"].as_str(),
+            Some("STOPPED"),
+            "case {case:?}: a marked job must settle into STOPPED, got {settled}"
+        );
+        assert!(
+            settled["EndTime"].as_f64().is_some_and(|at| at > 0.0),
+            "case {case:?}: a terminal job carries an EndTime, got {settled}"
+        );
+        assert!(
+            settled["Message"]
+                .as_str()
+                .is_some_and(|message| !message.trim().is_empty()),
+            "case {case:?}: a stopped job reports why it stopped, got {settled}"
+        );
+        // Reading a terminal job does not move it on.
+        let again = describe(&comprehend, &job_id).await;
+        assert_eq!(
+            settled, again,
+            "case {case:?}: reading a stopped job changed it: {settled} then {again}"
+        );
+        stopped_rows += 1;
+    }
+
+    assert!(
+        stopped_rows > 0,
+        "every row's job had already finished before its stop arrived, so the \
+         two-phase stop was never exercised"
+    );
+}
+
+/// A stop on a job that already holds a status it can never leave has nothing to
+/// mark for termination: it is refused with 400 `InvalidRequestException` and the
+/// stored record is left exactly as it was.
+///
+/// The rows are the terminal statuses a dominant-language job can be driven into:
+/// `COMPLETED`, which the clock owes a run that read every document, `FAILED`,
+/// which it owes a run nothing could carry out, and `STOPPED`, which it owes a
+/// cancelled job.
+#[tokio::test]
+async fn a_stop_on_a_terminal_job_is_refused_and_changes_nothing() {
+    for terminal in TERMINAL_JOB_STATUSES {
+        let row = match *terminal {
+            "COMPLETED" => &STOP_CASES[0],
+            "FAILED" => &STOP_CASES[2],
+            _ => &STOP_CASES[1],
+        };
+        let comprehend = emulator_for(row).await;
+        let (job_id, _) = start(&comprehend, terminal, &(row.submission)()).await;
+
+        let mut expected = *terminal;
+        if *terminal == "STOPPED" {
+            let (http_status, stopped) = comprehend
+                .call(
+                    "StopDominantLanguageDetectionJob",
+                    &json!({ "JobId": job_id }),
+                )
+                .await;
+            // A 200 means the mark landed, so this job's terminal status will be
+            // STOPPED; a 400 means the clock had already finished the run, which is
+            // the COMPLETED row over again and is asserted identically below.
+            if http_status == 200 {
+                assert_eq!(
+                    stopped["JobStatus"].as_str(),
+                    Some("STOP_REQUESTED"),
+                    "case {terminal}: the accepted stop must answer STOP_REQUESTED, got {stopped}"
+                );
+            } else {
+                expected = "COMPLETED";
+            }
+        }
+
+        let before = wait_for(&comprehend, terminal, &job_id, TERMINAL_JOB_STATUSES).await;
+        assert_eq!(
+            before["JobStatus"].as_str(),
+            Some(expected),
+            "case {terminal}: expected the job to settle into {expected}, got {before}"
+        );
+
+        // Twice, so the refusal is not a one-off and neither call moves the job.
+        for attempt in 1..=2 {
+            let (status, body) = comprehend
+                .call(
+                    "StopDominantLanguageDetectionJob",
+                    &json!({ "JobId": job_id }),
+                )
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {terminal} attempt {attempt}: expected 400, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "InvalidRequestException",
+                "case {terminal} attempt {attempt}: expected InvalidRequestException, got {body}"
+            );
+            assert_eq!(
+                error_message(&body),
+                JOB_ALREADY_TERMINAL_MESSAGE,
+                "case {terminal} attempt {attempt}: unexpected refusal message in {body}"
+            );
+            let after = describe(&comprehend, &job_id).await;
+            assert_eq!(
+                after, before,
+                "case {terminal} attempt {attempt}: a refused stop must leave the job \
+                 unchanged: {before} became {after}"
+            );
+        }
+    }
+}
+
+/// A stop names a job that must exist: an id this family never minted is refused
+/// with 404 `JobNotFoundException`, whatever form the id takes, and the refusal
+/// echoes none of it.
+#[tokio::test]
+async fn stop_refuses_a_job_id_this_family_never_minted() {
+    let comprehend = Comprehend::with_object_storage();
+    create_bucket(&comprehend).await;
+    put_object(&comprehend, "in/english.txt", document("en").as_bytes()).await;
+    // One real job of this family, so each refusal is about the id and not about an
+    // empty store.
+    let (job_id, _) = start(&comprehend, "seed", &completing_submission()).await;
+
+    // Every row satisfies the modelled `JobId` constraints (length 1..32, pattern
+    // ^([\p{L}\p{Z}\p{N}_.:/=+\-%@]*)$), so each reaches the handler.
+    let mut rows: Vec<String> = vec![
+        "a".to_string(),
+        "0".repeat(32),
+        "doesnotexist".to_string(),
+        "Job.Name:with/odd=chars".to_string(),
+        // The real job's id with its last character changed.
+        format!("{}0", &job_id[..job_id.len() - 1]),
+    ];
+    // Each family has its own id space: a sentiment-detection job's id names no
+    // dominant-language job, so stopping it here is a not-found too.
+    let other_family = comprehend
+        .ok(
+            "StartSentimentDetectionJob",
+            &json!({
+                "LanguageCode": "en",
+                "InputDataConfig": { "S3Uri": format!("s3://{BUCKET}/in/") },
+                "OutputDataConfig": { "S3Uri": format!("s3://{BUCKET}/out/") },
+                "DataAccessRoleArn": ROLE_ARN,
+            }),
+        )
+        .await;
+    rows.push(
+        other_family["JobId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a sentiment JobId, got {other_family}"))
+            .to_string(),
+    );
+
+    for case in rows {
+        if case == job_id {
+            continue;
+        }
+        let (status, body) = comprehend
+            .call(
+                "StopDominantLanguageDetectionJob",
+                &json!({ "JobId": case }),
+            )
+            .await;
+        assert_eq!(
+            status, 404,
+            "case JobId={case:?}: expected 404, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "JobNotFoundException",
+            "case JobId={case:?}: expected JobNotFoundException, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            JOB_NOT_FOUND_MESSAGE,
+            "case JobId={case:?}: expected the fixed not-found sentence, got {body}"
+        );
+        assert!(
+            !error_message(&body).contains(case.as_str()),
+            "case JobId={case:?}: the refusal must echo no caller-supplied id, got {body}"
+        );
+    }
+
+    // The refused stops wrote nothing: the one real job is untouched and still the
+    // only job this family holds.
+    let properties = describe(&comprehend, &job_id).await;
+    assert!(
+        properties["JobId"].as_str() == Some(job_id.as_str()),
+        "the seeded job must still be readable, got {properties}"
     );
 }
