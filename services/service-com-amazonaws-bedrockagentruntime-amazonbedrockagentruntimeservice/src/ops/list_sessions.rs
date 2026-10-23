@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSessions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSessions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSessions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages every session this service's store holds, account-wide, in store
+//! order, exactly as `ListInvocations` pages one session's invocations. The model marks
+//! the operation `@readonly`, so it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +79,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The resource id standing for EVERY session in the account: what an identity-based
+/// policy names for a listing that acts on no single session. IAM's own wildcard, read
+/// by the one shared policy evaluator
+/// (`service_common::iam_authorization::wildcard_match`).
+const ALL_SESSIONS: &str = "*";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -156,18 +156,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSessions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSessionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSessions"))
+        // This listing names no session: it reports every session in the account, so the
+        // resource an identity-based policy for `bedrock:ListSessions` names is all of
+        // them in the region the caller signed for. Built through the one shared helper
+        // with the wildcard resource id, so this operation and the session-scoped ones
+        // agree on the ARN form a session resource takes.
+        let resource = crate::state::session_resource_arn(ctx, ALL_SESSIONS);
+        if let Err(denied) = crate::state::authorize(&*self.engine, ctx, Self::NAME, &resource) {
+            return Err(ListSessionsErrorModeled::AccessDeniedException(denied).into());
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSessionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the session store is unavailable".to_string()),
+                    reason: None,
+                },
+            )
+            .into());
+        };
+
+        let guard = state.lock();
+
+        // The cursor is the store order of the last session already handed out, so a
+        // page resumes strictly after it. It is bound to THIS listing, which is
+        // account-wide and so carries no session in its scope: a token issued by one of
+        // the session-scoped listings is therefore refused here rather than silently
+        // resuming at an unrelated offset.
+        let scope = crate::state::pagination_scope(Self::NAME, "", None);
+        let after = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_next_token(&scope, token) {
+                Some(order) => order,
+                None => {
+                    return Err(ListSessionsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "nextToken is not a pagination token this service issued for \
+                                 this account's sessions"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // `maxResults` is modelled 1..1000 with a default of 10. The deserialized member
+        // is a plain `i32`, so it CANNOT distinguish an absent member from an explicit
+        // zero: both arrive as 0. The boundary validator is what refuses an explicitly
+        // sent 0 (and any other out-of-range value) before this handler runs; here, 0 can
+        // therefore only be an absent member and takes the modelled default. The range
+        // check below is this handler's own defence-in-depth for every value the member
+        // CAN carry distinctly, i.e. all the non-zero ones.
+        let requested = if input.max_results == 0 {
+            crate::state::DEFAULT_LIST_PAGE
+        } else {
+            input.max_results
+        };
+        if !(crate::state::MIN_LIST_PAGE..=crate::state::MAX_LIST_PAGE).contains(&requested) {
+            return Err(ListSessionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "maxResults must be between {} and {}, got {requested}",
+                        crate::state::MIN_LIST_PAGE,
+                        crate::state::MAX_LIST_PAGE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every stored session, whatever its status: a session leaves this listing only
+        // when `DeleteSession` releases it, so an ENDED one is still a session in the
+        // account. The store is keyed by UUID, so the listing sorts on store order and a
+        // page boundary is stable across calls.
+        let mut ordered: Vec<&crate::state::Session> = guard
+            .sessions
+            .values()
+            .filter(|session| session.order > after)
+            .collect();
+        ordered.sort_by_key(|session| session.order);
+
+        let limit = requested as usize;
+        let has_more = ordered.len() > limit;
+        ordered.truncate(limit);
+
+        // A token is emitted ONLY when a further page exists.
+        let next_token = if has_more {
+            ordered
+                .last()
+                .map(|session| crate::state::encode_next_token(&scope, session.order))
+        } else {
+            None
+        };
+
+        Ok(ListSessionsOutput {
+            session_summaries: ordered
+                .into_iter()
+                .map(|session| SessionSummary {
+                    session_id: session.session_id.clone(),
+                    session_arn: session.session_arn.clone(),
+                    session_status: session.status.as_wire().to_string(),
+                    created_at: session.created_at,
+                    last_updated_at: session.last_updated_at,
+                })
+                .collect(),
+            next_token,
+        })
     }
 }
+
