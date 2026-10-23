@@ -21,7 +21,10 @@
 //!   `GetResourceShareAssociations` and `DisassociateResourceShare` report the same
 //!   value for the same record, and that value follows the entity: the owning account
 //!   and anything inside the owner's Organizations hierarchy are in-organization, any
-//!   other account is external.
+//!   other account is external. The second `external` test pins the other half of that
+//!   rule — the flag is a property of the ENTITY and the OWNER alone, so neither the
+//!   share's `allowExternalPrincipals` switch (before or after an update flips it), nor
+//!   a repeat of the association, nor which operation reports the record moves it.
 
 use std::collections::BTreeSet;
 
@@ -354,6 +357,22 @@ fn external_cases() -> Vec<ExternalCase> {
             entity: "arn:aws:organizations::111122223333:account/o-abc123exam/999988887777",
             external: false,
         },
+        // The third part of an Organizations hierarchy a RAM principal may name, beside
+        // the organization and the organizational unit: a ROOT, by its bare `r-` id or
+        // by its `organizations` ARN (`state::ORGANIZATIONS_ID_PREFIXES`, which lists
+        // `ou-`, `o-` and `r-`). Inside the owner's hierarchy, hence in-organization.
+        ExternalCase {
+            case: "an organization root id",
+            association_type: "PRINCIPAL",
+            entity: "r-ab12",
+            external: false,
+        },
+        ExternalCase {
+            case: "an organization root ARN in the management account",
+            association_type: "PRINCIPAL",
+            entity: "arn:aws:organizations::111122223333:root/o-abc123exam/r-ab12",
+            external: false,
+        },
         ExternalCase {
             case: "a service principal",
             association_type: "PRINCIPAL",
@@ -498,6 +517,197 @@ async fn external_is_derived_from_the_owning_organization_and_is_one_value_per_r
             after_teardown, external,
             "case {case:?}: the read after the teardown expected external {external}, \
              got {after_teardown}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// …and of the entity and the owner ALONE
+// ---------------------------------------------------------------------------
+
+/// A row of the "nothing else moves the flag" table: an entity, the
+/// `allowExternalPrincipals` the share is created with, and the value the documented
+/// rule gives `external` for a share owned by [`ACCOUNT`].
+///
+/// `ResourceShare$allowExternalPrincipals` is the share-level switch for WHETHER
+/// principals outside the owner's organization may be associated at all ("Indicates
+/// whether principals outside your organization in Organizations can be associated
+/// with a resource share"); it says nothing about where an already-associated
+/// principal sits, so it cannot move `external`.
+struct ExternalInvariantCase {
+    case: &'static str,
+    entity: &'static str,
+    allow_external_principals: Option<bool>,
+    external: bool,
+}
+
+/// Whether a reported share allows external principals.
+fn allows_external_principals(label: &str, share: &Value) -> bool {
+    share
+        .get("allowExternalPrincipals")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            panic!("case {label:?}: share reported no allowExternalPrincipals: {share:?}")
+        })
+}
+
+#[tokio::test]
+async fn external_is_a_property_of_the_entity_and_the_owner_alone() {
+    let router = emulator();
+
+    // The rows span the entity forms on one axis and the share's external-sharing
+    // switch on the other — including the forms the cited case did not use (an
+    // Organizations root, a service principal) and a share created with the switch
+    // explicitly off, which the default (`true`, from `allowExternalPrincipals`'s own
+    // documentation) never exercises.
+    let cases = vec![
+        ExternalInvariantCase {
+            case: "the owning account on a share that allows external principals",
+            entity: ACCOUNT,
+            allow_external_principals: Some(true),
+            external: false,
+        },
+        ExternalInvariantCase {
+            case: "the owning account on a share that forbids them",
+            entity: ACCOUNT,
+            allow_external_principals: Some(false),
+            external: false,
+        },
+        ExternalInvariantCase {
+            case: "another account on a share that forbids external principals",
+            entity: "111122223333",
+            allow_external_principals: Some(false),
+            external: true,
+        },
+        ExternalInvariantCase {
+            case: "another account on a share created with the default switch",
+            entity: "111122223333",
+            allow_external_principals: None,
+            external: true,
+        },
+        ExternalInvariantCase {
+            case: "an organization id on a share that forbids external principals",
+            entity: "o-abc123exam",
+            allow_external_principals: Some(false),
+            external: false,
+        },
+        ExternalInvariantCase {
+            case: "an organization root id on a share that allows them",
+            entity: "r-ab12",
+            allow_external_principals: Some(true),
+            external: false,
+        },
+        ExternalInvariantCase {
+            case: "a role in another account on a share that forbids them",
+            entity: "arn:aws:iam::777788889999:role/consumer",
+            allow_external_principals: Some(false),
+            external: true,
+        },
+        ExternalInvariantCase {
+            case: "a service principal on a share created with the default switch",
+            entity: "lambda.amazonaws.com",
+            allow_external_principals: None,
+            external: true,
+        },
+    ];
+
+    for (index, row) in cases.into_iter().enumerate() {
+        let ExternalInvariantCase {
+            case,
+            entity,
+            allow_external_principals,
+            external,
+        } = row;
+
+        let mut create_body = json!({ "name": format!("external-invariant-{index}") });
+        if let Some(allow) = allow_external_principals {
+            create_body["allowExternalPrincipals"] = json!(allow);
+        }
+        let created = create_ok(&router, case, &create_body).await;
+        let arn = arn_of(case, &created);
+        let created_allows = allows_external_principals(case, &created);
+        assert_eq!(
+            created_allows,
+            allow_external_principals.unwrap_or(true),
+            "case {case:?}: the share did not keep the external-sharing switch it was \
+             created with, got {created_allows}"
+        );
+        let request = json!({ "resourceShareArn": arn, "principals": [entity] });
+
+        let (status, associated) = associate(&router, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: AssociateResourceShare expected 200, got {status} with {associated:?}"
+        );
+        assert_no_discriminator(case, &associated);
+        let on_associate = external_of(case, &association_for(case, &associated, entity));
+        assert_eq!(
+            on_associate, external,
+            "case {case:?}: AssociateResourceShare expected external {external}, \
+             got {on_associate} for {entity}"
+        );
+
+        // Flip the share's external-sharing switch. The share records the flip…
+        let (status, updated) = update(
+            &router,
+            &json!({ "resourceShareArn": arn, "allowExternalPrincipals": !created_allows }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: UpdateResourceShare expected 200, got {status} with {updated:?}"
+        );
+        let after_flip = updated
+            .get("resourceShare")
+            .map(|share| allows_external_principals(case, share))
+            .unwrap_or_else(|| panic!("case {case:?}: update reported no share: {updated:?}"));
+        assert_eq!(
+            after_flip, !created_allows,
+            "case {case:?}: expected allowExternalPrincipals {} after the flip, got {after_flip}",
+            !created_allows
+        );
+        // …and the association's own flag does not move with it.
+        let read_request = json!({ "associationType": "PRINCIPAL", "resourceShareArns": [arn] });
+        let (status, read) = get_associations(&router, &read_request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetResourceShareAssociations expected 200, got {status} with {read:?}"
+        );
+        assert_no_discriminator(case, &read);
+        let on_read = external_of(case, &association_for(case, &read, entity));
+        assert_eq!(
+            on_read, external,
+            "case {case:?}: after flipping allowExternalPrincipals the read expected \
+             external {external}, got {on_read} for {entity}"
+        );
+
+        // Re-associating the same entity re-derives the same flag from the same owner.
+        let (status, again) = associate(&router, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the repeated AssociateResourceShare expected 200, got {status} \
+             with {again:?}"
+        );
+        let on_repeat = external_of(case, &association_for(case, &again, entity));
+        assert_eq!(
+            on_repeat, external,
+            "case {case:?}: the repeated association expected external {external}, \
+             got {on_repeat} for {entity}"
+        );
+
+        // And the teardown reports the record it tore down, flag included.
+        let (status, disassociated) = disassociate(&router, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DisassociateResourceShare expected 200, got {status} \
+             with {disassociated:?}"
+        );
+        assert_no_discriminator(case, &disassociated);
+        let on_disassociate = external_of(case, &association_for(case, &disassociated, entity));
+        assert_eq!(
+            on_disassociate, external,
+            "case {case:?}: DisassociateResourceShare expected external {external}, \
+             got {on_disassociate} for {entity}"
         );
     }
 }

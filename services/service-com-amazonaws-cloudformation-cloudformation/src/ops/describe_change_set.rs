@@ -305,9 +305,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             execution_status: Some(change_set.execution_status.clone()),
             status: Some(change_set.status.clone()),
             status_reason: change_set.status_reason.clone(),
-            // Drift detection has never run against the stack this change set is for,
-            // which is what `NOT_CHECKED` reports (as `DescribeStacks` does).
-            stack_drift_status: Some(crate::state::DRIFT_STATUS_NOT_CHECKED.to_string()),
+            // "The drift status of the stack when the change set was created", captured on
+            // the change set then (as `DescribeStacks` reports the stack's current one).
+            stack_drift_status: Some(change_set.stack_drift_status.clone()),
             // `NotificationARNs`, `RollbackConfiguration` and `Capabilities` are carried on
             // every change set CloudFormation describes, empty for a request that named
             // none of them — which is what the recorded responses show, so an empty one is

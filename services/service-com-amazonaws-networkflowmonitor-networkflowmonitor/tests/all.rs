@@ -19,6 +19,8 @@ mod monitor_update;
 mod query_lifecycle;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/scope_listing.rs"]
+mod scope_listing;
 #[path = "all/scope_monitor_lifecycle.rs"]
 mod scope_monitor_lifecycle;
 #[path = "all/state_roundtrip.rs"]
