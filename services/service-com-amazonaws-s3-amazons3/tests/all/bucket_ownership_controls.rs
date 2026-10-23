@@ -59,7 +59,10 @@ fn ownership_controls_payload(rules: &[&str]) -> String {
 }
 
 /// `PUT /<bucket>?ownershipControls` — `PutBucketOwnershipControls`.
-async fn put_ownership_controls(
+///
+/// `pub(crate)`, like the harness it borrows: the ACL suite in this same test crate
+/// disables a bucket's ACLs through it rather than spelling the subresource a second time.
+pub(crate) async fn put_ownership_controls(
     router: &MultiServiceRouter,
     bucket: &str,
     rules: &[&str],

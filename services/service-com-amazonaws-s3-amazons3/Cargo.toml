@@ -29,13 +29,16 @@ hex = { workspace = true }
 # An object version id is the SHA-256 of the bucket, the key and the store's mint
 # sequence, Base64 encoded (`state::mint_version_id`).
 sha2 = { workspace = true }
+# Normalizes the ONE member this service's model marks `@xmlAttribute` between the
+# attribute the API publishes and the element the framework's XML codec binds
+# (`src/service/wire.rs`), rather than editing XML documents as strings.
+quick-xml = "0.41"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-# Reads the restXml bodies the tagging tests assert on, instead of slicing strings.
-quick-xml = "0.41"
+# `quick-xml` above is also what the tests read a restXml body with.
 
 [lints]
 workspace = true
