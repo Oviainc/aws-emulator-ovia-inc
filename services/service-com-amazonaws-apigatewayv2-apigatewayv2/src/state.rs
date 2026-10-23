@@ -78,6 +78,20 @@ pub const MAX_ROUTES_PER_API: usize = 300;
 /// AWS's published API Gateway quota is 300 integrations per API.
 pub const MAX_INTEGRATIONS_PER_API: usize = 300;
 
+/// The most deployments one api may hold, after which CreateDeployment is refused.
+///
+/// API Gateway publishes a quota of 500 deployments per API, so this is the faithful
+/// bound AND what stops a loop of CreateDeployment calls growing this store without
+/// end — every call mints a new deployment, so nothing else bounds it.
+pub const MAX_DEPLOYMENTS_PER_API: usize = 500;
+
+/// The `DeploymentStatus` a deployment carries once the service has released it, from
+/// `DEPLOYMENT_STATUS_VALUES` (`DEPLOYED | FAILED | PENDING`). Deploying an api is
+/// synchronous here — the deployment captures the api's current routes and
+/// integrations, which this store already holds — so a minted deployment is reported
+/// released, the terminal status, and never moves again.
+pub const DEPLOYMENT_STATUS_DEPLOYED: &str = "DEPLOYED";
+
 /// The `ConnectionType` an integration gets when the request names none. From
 /// `Integration$ConnectionType`: "Specify INTERNET for connections through the public
 /// routable internet … The default value is INTERNET."
@@ -152,6 +166,11 @@ pub struct Api {
     pub integration_id_seed: u64,
     /// This api's stages, keyed by `StageName`. Reserved for the stage slice.
     pub stages: BTreeMap<String, Stage>,
+    /// This api's deployments, keyed by `DeploymentId`.
+    pub deployments: BTreeMap<String, Deployment>,
+    /// Drives [`Api::mint_deployment_id`]. Per-api, for the same reason as
+    /// [`Api::route_id_seed`]: a `DeploymentId` is unique within its api.
+    pub deployment_id_seed: u64,
 }
 
 impl Api {
@@ -167,6 +186,13 @@ impl Api {
     pub fn mint_integration_id(&mut self) -> String {
         self.integration_id_seed = self.integration_id_seed.wrapping_add(1);
         mint_id(self.integration_id_seed)
+    }
+
+    /// Mint a fresh `DeploymentId` for this api: ten lowercase alphanumerics, never
+    /// one this api already minted.
+    pub fn mint_deployment_id(&mut self) -> String {
+        self.deployment_id_seed = self.deployment_id_seed.wrapping_add(1);
+        mint_id(self.deployment_id_seed)
     }
 }
 
@@ -344,13 +370,50 @@ impl Integration {
 }
 
 /// A persisted `Stage`. Reserved so the stage operations can land without a state
-/// rewrite; nothing writes one yet.
+/// rewrite; nothing creates one yet, but [`Deployment`] already points stages at the
+/// deployment they serve.
 #[derive(Debug, Clone, Default)]
 pub struct Stage {
     pub stage_name: String,
     pub description: Option<String>,
     pub auto_deploy: bool,
     pub tags: BTreeMap<String, String>,
+    /// The `DeploymentId` this stage serves, set by the create that deployed to it:
+    /// "A Deployment must be associated with a Stage for it to be callable over the
+    /// internet" (the `Deployment` shape's own doc).
+    pub deployment_id: Option<String>,
+}
+
+/// A persisted `Deployment` resource, owned by its parent [`Api`].
+///
+/// "An immutable representation of an API that can be called by users" (the
+/// `Deployment` shape doc), so nothing but its description is ever rewritten.
+#[derive(Debug, Clone)]
+pub struct Deployment {
+    pub deployment_id: String,
+    pub description: Option<String>,
+    /// One of `DEPLOYMENT_STATUS_VALUES`.
+    pub deployment_status: String,
+    pub deployment_status_message: Option<String>,
+    /// True only for a deployment the service released by itself, for a stage whose
+    /// `AutoDeploy` is on: "Specifies whether a deployment was automatically released"
+    /// (`Deployment$AutoDeployed`). A deployment the caller asked for is not one.
+    pub auto_deployed: bool,
+    pub created_date: SystemTime,
+}
+
+impl Deployment {
+    /// Project the record onto the modelled `Deployment` shape.
+    pub fn to_wire(&self) -> wire::Deployment {
+        wire::Deployment {
+            auto_deployed: Some(self.auto_deployed),
+            created_date: Some(to_timestamp(self.created_date)),
+            deployment_id: Some(self.deployment_id.clone()),
+            deployment_status: Some(self.deployment_status.clone()),
+            deployment_status_message: self.deployment_status_message.clone(),
+            description: self.description.clone(),
+        }
+    }
 }
 
 /// Render a stored instant as the modelled `__timestampIso8601` member.

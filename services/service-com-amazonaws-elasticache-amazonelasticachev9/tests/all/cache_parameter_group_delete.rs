@@ -28,9 +28,8 @@
 //! (the family, the name's case, the tag count, the kind of resource holding the group),
 //! so no single recorded request is what makes them pass.
 
-use crate::cache_cluster_lifecycle::{
-    create_available_cluster, params, Emulator, Reply, PAST_TRANSITION,
-};
+use crate::cache_cluster_lifecycle::create_available_cluster;
+use crate::harness::{params, Emulator, Reply, PAST_TRANSITION};
 
 /// Create one cache parameter group, with whatever tags `tags` names.
 async fn create_group(

@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The account-class gate, before anything is read: the whole bill-scenario
         // subject belongs to the account that pays the bills being modelled, the read
         // of it as much as the write.
-        if let Some(refusal) = state.member_account_refusal(Self::NAME) {
+        if let Some(refusal) = state.member_account_refusal() {
             return Err(ListBillScenariosErrorModeled::ValidationException(refusal).into());
         }
         // Materialise the expiry the clock has already made due, so a scenario past its

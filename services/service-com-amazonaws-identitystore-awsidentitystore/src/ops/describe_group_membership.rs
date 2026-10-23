@@ -190,7 +190,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::membership_not_found(&input.membership_id),
             )
         };
-        let store = state.store(&input.identity_store_id).ok_or_else(not_found)?;
+        // The identity store the request names must exist; one that does not is the
+        // missing resource, reported as `IDENTITY_STORE` rather than as a missing
+        // membership of a store that is not there either.
+        let store = state
+            .resolve_store(&input.identity_store_id)
+            .map_err(DescribeGroupMembershipErrorModeled::ResourceNotFoundException)?;
         let membership = store
             .memberships
             .get(&crate::state::resource_key(&input.membership_id))
@@ -204,12 +209,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             member_id: membership.modeled_member_id(),
             created_at: Some(::aws_smithy_types::DateTime::from(membership.created_at)),
             updated_at: Some(::aws_smithy_types::DateTime::from(membership.updated_at)),
-            // No modelled operation of this slice resolves a caller to an
-            // identity-store principal, so the record carries no creating or updating
-            // identity and these optional members stay absent rather than carrying a
-            // fabricated value — the same choice `ListGroupMemberships` reports.
-            created_by: None,
-            updated_by: None,
+            // The audit members come from the RECORD, exactly as the timestamps beside
+            // them do: `CreateGroupMembership` records the principal that created the
+            // membership, so this read reports the same value `ListGroupMemberships`
+            // reports for the same record rather than a second answer for one resource.
+            // A membership has no modelled update operation, so `UpdatedBy` stays
+            // whatever the record holds — absent until something updates it.
+            created_by: membership.created_by.clone(),
+            updated_by: membership.updated_by.clone(),
         })
     }
 }

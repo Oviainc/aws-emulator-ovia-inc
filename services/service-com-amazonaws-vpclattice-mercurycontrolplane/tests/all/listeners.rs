@@ -95,6 +95,10 @@ async fn get_listener(
 
 /// Rules 1, 3 and 4, over a table that varies protocol, port, action kind, target-group
 /// count, weights and name shape. The recorded case is one row of it.
+///
+/// Every row carries its own port: a listener's port is unique within one service (see
+/// `listener_conflicts_and_deletion.rs`), so a table of listeners under ONE service is a
+/// table of distinct ports.
 #[tokio::test]
 async fn creating_listeners_persists_them_and_both_identifier_forms_read_them_back() {
     let lattice = Lattice::new();
@@ -153,7 +157,7 @@ async fn creating_listeners_persists_them_and_both_identifier_forms_read_them_ba
             serde_json::json!({
                 "name": "tls-passthrough",
                 "protocol": "TLS_PASSTHROUGH",
-                "port": 443,
+                "port": 8443,
                 "defaultAction": {
                     "forward": {
                         "targetGroups": [
@@ -162,7 +166,7 @@ async fn creating_listeners_persists_them_and_both_identifier_forms_read_them_ba
                     },
                 },
             }),
-            443,
+            8443,
             // A weight the caller sent is kept, floor included — no default replaces it.
             serde_json::json!({
                 "forward": {
@@ -396,8 +400,8 @@ async fn an_omitted_port_takes_the_documented_default_for_its_protocol_only() {
             case: "an explicit port wins over the protocol default",
             name: "p-explicit",
             protocol: "HTTPS",
-            sent: Some(80),
-            expected: Some(80),
+            sent: Some(8443),
+            expected: Some(8443),
         },
         PortCase {
             case: "the range floor",
@@ -429,14 +433,17 @@ async fn an_omitted_port_takes_the_documented_default_for_its_protocol_only() {
         },
     ];
 
-    for PortCase {
+    for (index, PortCase {
         case,
         name,
         protocol,
         sent,
         expected,
-    } in cases
+    }) in cases.into_iter().enumerate()
     {
+        // A port a row leaves free for the retry below, so the retry can only fail on
+        // the name it reuses and never on an occupied port.
+        let retry_port = 9_000 + i64::try_from(index).expect("the table is small");
         let mut body = serde_json::json!({
             "name": name,
             "protocol": protocol,
@@ -481,7 +488,7 @@ async fn an_omitted_port_takes_the_documented_default_for_its_protocol_only() {
                     serde_json::json!({
                         "name": name,
                         "protocol": "HTTP",
-                        "port": 8080,
+                        "port": retry_port,
                         "defaultAction": { "fixedResponse": { "statusCode": 404 } },
                     }),
                 )
@@ -515,13 +522,17 @@ async fn a_fixed_response_action_accepts_only_the_documented_status_codes() {
         ("599, the range ceiling, is unsupported", 599, false),
     ];
 
-    for (case, status_code, supported) in cases {
+    for (index, (case, status_code, supported)) in cases.into_iter().enumerate() {
+        // Each accepted row stores a listener, and a listener's port is unique within
+        // its service, so every row asks for its own port.
+        let port = 10_000 + i64::try_from(index).expect("the table is small");
         let created = create_listener(
             &lattice,
             &service_id,
             serde_json::json!({
                 "name": format!("fixed-{status_code}"),
                 "protocol": "HTTP",
+                "port": port,
                 "defaultAction": { "fixedResponse": { "statusCode": status_code } },
             }),
         )
@@ -562,16 +573,19 @@ async fn a_listener_name_is_unique_within_its_service_but_not_across_services() 
     let (first, _) = a_service(&lattice, "names-one").await;
     let (second, _) = a_service(&lattice, "names-two").await;
 
-    let body = |name: &str| {
+    let body = |name: &str, port: i64| {
         serde_json::json!({
             "name": name,
             "protocol": "HTTP",
+            "port": port,
             "defaultAction": { "fixedResponse": { "statusCode": 404 } },
         })
     };
 
-    for name in ["api", "web-tier", &"n".repeat(63)] {
-        let created = create_listener(&lattice, &first, body(name)).await;
+    for (index, name) in ["api", "web-tier", &"n".repeat(63)].into_iter().enumerate() {
+        // Its own port per row, so the duplicate below can only be refused for its name.
+        let port = 11_000 + i64::try_from(index).expect("the table is small");
+        let created = create_listener(&lattice, &first, body(name, port)).await;
         assert_eq!(
             created.status, 201,
             "case first create of {name:?}: expected 201, got {} / {}",
@@ -579,7 +593,7 @@ async fn a_listener_name_is_unique_within_its_service_but_not_across_services() 
         );
         let first_id = created.str_field("id");
 
-        let duplicate = create_listener(&lattice, &first, body(name)).await;
+        let duplicate = create_listener(&lattice, &first, body(name, port)).await;
         assert_eq!(
             duplicate.status, 409,
             "case duplicate {name:?} in one service: expected 409, got {} / {}",
@@ -594,7 +608,7 @@ async fn a_listener_name_is_unique_within_its_service_but_not_across_services() 
         );
 
         // The same name under another service is a different listener, not a conflict.
-        let elsewhere = create_listener(&lattice, &second, body(name)).await;
+        let elsewhere = create_listener(&lattice, &second, body(name, port)).await;
         assert_eq!(
             elsewhere.status, 201,
             "case {name:?} under a second service: expected 201, got {} / {}",
@@ -817,13 +831,15 @@ async fn deleting_a_service_deletes_its_listeners() {
 
     // Two listeners on the service being deleted, one on the service that stays.
     let mut doomed_listeners = Vec::new();
-    for name in ["first", "second"] {
+    for (index, name) in ["first", "second"].into_iter().enumerate() {
         let created = create_listener(
             &lattice,
             &doomed,
             serde_json::json!({
                 "name": name,
                 "protocol": "HTTP",
+                // One port each: a listener's port is unique within its service.
+                "port": 12_000 + i64::try_from(index).expect("the table is small"),
                 "defaultAction": { "fixedResponse": { "statusCode": 404 } },
             }),
         )

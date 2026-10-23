@@ -31,6 +31,8 @@ mod domain_deprecation;
 mod domain_tag_resource;
 #[path = "all/domain_tagging.rs"]
 mod domain_tagging;
+#[path = "all/domain_undeprecation.rs"]
+mod domain_undeprecation;
 #[path = "all/list_open_workflow_executions.rs"]
 mod list_open_workflow_executions;
 #[path = "all/pending_activity_task_count.rs"]

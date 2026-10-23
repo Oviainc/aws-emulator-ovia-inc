@@ -948,10 +948,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `parameters` is `@httpQueryParams`, so it carries this request's query string
         // rather than a member of its own. Its documented key, `ignore=documentation`,
-        // excludes the definition's DocumentationParts from the import — and this
-        // emulator records no DocumentationPart at all (`ImportDocumentationParts` and
-        // `CreateDocumentationPart` are still stubs), so there is nothing for that key to
-        // change here and nothing it could silently drop.
+        // excludes the definition's DocumentationParts from the import — and THIS
+        // operation imports no documentation part either way: a definition's
+        // `x-amazon-apigateway-documentation` set is read by
+        // `ImportDocumentationParts`, which is the operation that writes those records,
+        // so there is nothing here for that key to change and nothing it could silently
+        // drop.
         let _ = &input.parameters;
 
         // `failOnWarnings` is "a query parameter to indicate whether to rollback the API

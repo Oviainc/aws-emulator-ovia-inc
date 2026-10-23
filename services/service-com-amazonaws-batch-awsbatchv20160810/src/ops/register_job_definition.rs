@@ -16,6 +16,11 @@
 //! an execution role", which is checked for EVERY container-properties object a job
 //! definition carries, not only the top-level one.
 //!
+//! The per-node-range requirement — every `nodeProperties.nodeRangeProperties` entry must
+//! carry the containers its nodes run — is checked BEFORE the properties
+//! mutual-exclusion rule, so a multi-node definition with an empty node range is told
+//! which range is empty whatever else the request names.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -224,6 +229,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // Each `nodeProperties.nodeRangeProperties` entry describes the containers the
+        // nodes in its range run, so an entry carrying none describes nothing runnable.
+        // `NodeRangeProperty` models three ways to carry them — `container`,
+        // `ecsProperties` and `eksProperties` — and an entry with none of the three is
+        // refused naming the range it left empty. This runs BEFORE the properties
+        // mutual-exclusion check below, so a malformed node range is reported as such
+        // even when the request also names another properties object.
+        if let Some(node_properties) = input.node_properties.as_ref() {
+            if let Some(empty) = node_properties
+                .node_range_properties
+                .iter()
+                .find(|range| {
+                    range.container.is_none()
+                        && range.ecs_properties.is_none()
+                        && range.eks_properties.is_none()
+                })
+            {
+                return Err(client_exception(&format!(
+                    "Must specify container for node range {}.",
+                    empty.target_nodes
+                )));
+            }
+        }
+
         // A job definition describes its work exactly once: `JobDefinition`'s own
         // docs say each of these members "can't be used in addition to" the others.
         let declared: Vec<&str> = [
@@ -273,8 +302,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             MULTINODE => {
                 if input.node_properties.is_none() {
+                    // The detail AWS is recorded to state for this refusal, verbatim.
                     return Err(client_exception(
-                        "nodeProperties is required for job definitions of type multinode",
+                        "Node properties of multinode job is required.",
                     ));
                 }
             }

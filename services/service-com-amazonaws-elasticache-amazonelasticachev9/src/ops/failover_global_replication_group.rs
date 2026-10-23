@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op FailoverGlobalReplicationGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `FailoverGlobalReplicationGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`FailoverGlobalReplicationGroup::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -152,18 +148,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `FailoverGlobalReplicationGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(FailoverGlobalReplicationGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("FailoverGlobalReplicationGroup"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        let key = input.global_replication_group_id.to_ascii_lowercase();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(group) = store.settled_global_replication_group_mut(&key, now) else {
+            return Err(
+                FailoverGlobalReplicationGroupErrorModeled::GlobalReplicationGroupNotFoundFault(
+                    GlobalReplicationGroupNotFoundFault {
+                        message: Some(format!(
+                            "Global Replication Group {} not found.",
+                            input.global_replication_group_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        if !crate::state::GLOBAL_ACTIONABLE_STATUSES.contains(&group.status.as_str()) {
+            return Err(
+                FailoverGlobalReplicationGroupErrorModeled::InvalidGlobalReplicationGroupStateFault(
+                    InvalidGlobalReplicationGroupStateFault {
+                        message: Some(format!(
+                            "Global Replication Group {key} is in {} state, not {}.",
+                            group.status,
+                            crate::state::GLOBAL_ACTIONABLE_STATUSES.join(" or ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Used to failover the primary region to a selected secondary region":
+        // the region and replication group named have to be a member of THIS
+        // datastore, and promoting the member that is already primary changes
+        // nothing, so both are refused rather than answered 200.
+        let Some(member) = group.member(&input.primary_replication_group_id, &input.primary_region)
+        else {
+            return Err(
+                FailoverGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {} for PrimaryReplicationGroupId: it is not a member \
+                             of Global Replication Group {key} in {}.",
+                            input.primary_replication_group_id, input.primary_region
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        if member.role == crate::state::GLOBAL_ROLE_PRIMARY {
+            return Err(
+                FailoverGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {} for PrimaryReplicationGroupId: it is already the \
+                             primary of Global Replication Group {key}.",
+                            input.primary_replication_group_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The promotion: the named member takes the primary role, and every
+        // other member becomes a secondary — which is what demotes the member
+        // that held the primary role until now.
+        for member in &mut group.members {
+            let promoted = member.replication_group_id == input.primary_replication_group_id
+                && member.region == input.primary_region;
+            member.role = if promoted {
+                crate::state::GLOBAL_ROLE_PRIMARY.to_string()
+            } else {
+                crate::state::GLOBAL_ROLE_SECONDARY.to_string()
+            };
+        }
+        group.begin_transition(crate::state::STATUS_MODIFYING, now);
+        let answer = group.to_modeled(true);
+        // Each member replication group reports its own role in the datastore,
+        // so those records agree with the one above.
+        let roles: Vec<(String, String)> = answer
+            .members
+            .iter()
+            .flatten()
+            .filter_map(|member| {
+                Some((
+                    member.replication_group_id.clone()?.to_ascii_lowercase(),
+                    member.role.clone()?,
+                ))
+            })
+            .collect();
+        for (id, role) in roles {
+            if let Some(replication_group) = store.replication_groups.get_mut(&id) {
+                if replication_group.global_replication_group_id.is_some() {
+                    replication_group.global_member_role = Some(role);
+                }
+            }
+        }
+
+        Ok(FailoverGlobalReplicationGroupOutput {
+            global_replication_group: Some(answer),
+        })
     }
 }

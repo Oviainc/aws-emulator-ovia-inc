@@ -666,9 +666,9 @@ async fn a_string_naming_no_rule_of_this_service_is_unauthorized() {
 
     // Every operation whose input names a resource by ARN: the member is
     // `ruleArn` on the rule operations and `resourceArn` on the tagging ones
-    // (`smithy_query(query="operation",operation="...")`). `TagResource` is
-    // still a scaffold stub, which is the point of including it —
-    // authorization answers before dispatch, implemented or not.
+    // (`smithy_query(query="operation",operation="...")`). Authorization
+    // answers before dispatch, so the list is the same whether or not an
+    // operation is implemented.
     let operations = [
         "GetAutomationRule",
         "UpdateAutomationRule",
@@ -692,7 +692,7 @@ async fn a_string_naming_no_rule_of_this_service_is_unauthorized() {
         // The control, on a rule of this operation's own so a mutating one
         // cannot disturb another row: a string that DOES name a rule of this
         // service is never answered as unauthorized — it reaches the operation,
-        // which answers on its own terms (a stub still answers 501).
+        // which answers on its own terms.
         let case = format!("{operation}-names-a-rule");
         let (own_arn, own_revision) = rule_with_tags(
             &router,

@@ -17,9 +17,8 @@
 //! are the copy's own. The tests are tables whose rows differ along the source
 //! snapshot's content and the copy's own members, never a single case.
 
-use crate::cache_cluster_lifecycle::{
-    create_available_cluster, params, Emulator, RefusalCase, Reply, PAST_TRANSITION,
-};
+use crate::cache_cluster_lifecycle::create_available_cluster;
+use crate::harness::{params, Emulator, RefusalCase, Reply, PAST_TRANSITION};
 use crate::snapshots::{create_snapshot, describe_snapshots, reported_names};
 
 /// Every `Snapshot` member that describes WHAT the snapshot captured, so a copy

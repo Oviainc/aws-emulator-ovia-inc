@@ -31,6 +31,8 @@ mod deployment_configs;
 mod deployment_group_defaults;
 #[path = "all/deployment_group_update.rs"]
 mod deployment_group_update;
+#[path = "all/deployment_targets.rs"]
+mod deployment_targets;
 #[path = "all/git_hub_account_token_names.rs"]
 mod git_hub_account_token_names;
 #[path = "all/github_account_tokens.rs"]

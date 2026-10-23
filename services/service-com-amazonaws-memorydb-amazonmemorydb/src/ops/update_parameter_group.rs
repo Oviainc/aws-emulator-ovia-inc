@@ -178,9 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 UpdateParameterGroupErrorModeled::InvalidParameterCombinationException(
                     InvalidParameterCombinationException {
                         message: Some(format!(
-                            "At most {} parameters may be updated per request — got {}.",
-                            crate::state::MAX_PARAMETERS_PER_UPDATE,
-                            input.parameter_name_values.len()
+                            "Cannot modify more than {} parameters in a single request",
+                            crate::state::MAX_PARAMETERS_PER_UPDATE
                         )),
                     },
                 )
@@ -207,8 +206,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let not_found = || {
             UpdateParameterGroupErrorModeled::ParameterGroupNotFoundFault(
                 ParameterGroupNotFoundFault {
-                    message: Some(format!(
-                        "Parameter group {parameter_group_name} not found."
+                    message: Some(crate::state::parameter_group_not_found_message(
+                        &parameter_group_name,
                     )),
                 },
             )
@@ -235,9 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // EVERY pair is checked before ANY is applied, so a request carrying one bad
-        // pair leaves the whole group unchanged rather than half-applied. A name
-        // supplied twice in one request takes its last value, as the map insert below
-        // does.
+        // pair leaves the whole group unchanged rather than half-applied. A parameter
+        // named twice in one request is refused rather than silently taking one of the
+        // two values: the caller asked for two things at once and the service cannot
+        // tell which it meant.
         let mut applied: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
         for pair in &input.parameter_name_values {
@@ -247,8 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     UpdateParameterGroupErrorModeled::InvalidParameterValueException(
                         InvalidParameterValueException {
                             message: Some(format!(
-                                "Unknown parameter {name:?} for parameter group family \
-                                 {family}."
+                                "Could not find parameter with name: {name}"
                             )),
                         },
                     )
@@ -269,7 +268,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             };
-            if let Err(reason) = parameter.domain.accepts(parameter.name, &value) {
+            // The value is held to the domain the service PUBLISHES for that parameter
+            // (`Parameter$AllowedValues`, as `DescribeParameters` reports it), and the
+            // refusal is built from that same published domain.
+            if let Err(reason) = parameter.domain.accepts(&value) {
                 return Err(
                     UpdateParameterGroupErrorModeled::InvalidParameterValueException(
                         InvalidParameterValueException {
@@ -279,7 +281,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-            applied.insert(parameter.name.to_string(), value);
+            if applied
+                .insert(parameter.name.to_string(), value)
+                .is_some()
+            {
+                return Err(
+                    UpdateParameterGroupErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(
+                                "Duplicate parameters specified in the same call".to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
 
         let Some(group) = state.parameter_groups.get_mut(&parameter_group_name) else {

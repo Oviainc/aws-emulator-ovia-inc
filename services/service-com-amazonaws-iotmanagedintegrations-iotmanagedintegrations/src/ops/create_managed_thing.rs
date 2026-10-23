@@ -204,12 +204,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // `Role` and `AuthenticationMaterialType` are modelled enums, so a value
-        // outside the enum is a client error rather than a stored record.
+        // outside the enum is a client error rather than a stored record. The model's
+        // own constraint walk refuses one before this handler runs; this second line
+        // states it through the SAME formatter, so the two cannot word one refusal two
+        // ways (`crate::service::enum_value_set_refusal`).
         if !crate::state::ROLE_VALUES.contains(&input.role.as_str()) {
             return Err(CreateManagedThingErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "Role must be one of {:?}, got {:?}",
-                    crate::state::ROLE_VALUES, input.role
+                message: Some(crate::service::enum_value_set_refusal(
+                    "role",
+                    crate::state::ROLE_VALUES,
+                    &input.role,
                 )),
             })
             .into());
@@ -218,9 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .contains(&input.authentication_material_type.as_str())
         {
             return Err(CreateManagedThingErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "AuthenticationMaterialType must be one of {:?}, got {:?}",
-                    crate::state::AUTH_MATERIAL_TYPE_VALUES, input.authentication_material_type
+                message: Some(crate::service::enum_value_set_refusal(
+                    "authenticationMaterialType",
+                    crate::state::AUTH_MATERIAL_TYPE_VALUES,
+                    &input.authentication_material_type,
                 )),
             })
             .into());

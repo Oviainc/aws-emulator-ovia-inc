@@ -22,7 +22,7 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use super::cache_cluster_lifecycle::{params, Emulator, Reply, PAST_TRANSITION};
+use crate::harness::{params, Emulator, Reply, PAST_TRANSITION};
 
 /// The operations under test.
 const DESCRIBE: &str = "DescribeReservedCacheNodes";

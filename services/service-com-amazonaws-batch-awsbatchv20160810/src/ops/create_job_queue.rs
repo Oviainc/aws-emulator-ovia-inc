@@ -224,9 +224,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested_order = input.compute_environment_order.unwrap_or_default();
         let requested_services = input.service_environment_order.unwrap_or_default();
         if requested_order.is_empty() && requested_services.is_empty() {
-            return Err(CreateJobQueueErrorModeled::ClientException(batch::client_exception(
-                "computeEnvironmentOrder or serviceEnvironmentOrder must name at least one environment",
-            ))
+            // A queue allocates jobs to environments, so it cannot be created over none.
+            // AWS states this as the missing `computeEnvironmentOrder` — the order a
+            // queue carries unless it is a service queue — inside the frontend envelope.
+            return Err(CreateJobQueueErrorModeled::ClientException(
+                batch::client_exception_enveloped("computeEnvironmentOrder is required."),
+            )
             .into());
         }
 

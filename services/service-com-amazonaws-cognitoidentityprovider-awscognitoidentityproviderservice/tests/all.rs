@@ -25,3 +25,5 @@ mod group_membership;
 mod state_roundtrip;
 #[path = "all/token_signing.rs"]
 mod token_signing;
+#[path = "all/update_user_pool.rs"]
+mod update_user_pool;

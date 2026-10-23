@@ -33,7 +33,11 @@ const SERVICE_ROLE: &str = "arn:aws:iam::123456789012:role/CodeDeployRole";
 const GROUP: &str = "dg";
 
 /// Register an on-premises instance carrying `tags`.
-async fn register(emulator: &Emulator, instance: &str, tags: &[(&str, &str)]) {
+///
+/// `pub(crate)` because the `deployment_targets` suite drives the same fleet
+/// through the readers of a single target; there is one set of fleet helpers for
+/// the target suites, not one per suite.
+pub(crate) async fn register(emulator: &Emulator, instance: &str, tags: &[(&str, &str)]) {
     emulator
         .ok(
             "RegisterOnPremisesInstance",
@@ -60,7 +64,12 @@ async fn register(emulator: &Emulator, instance: &str, tags: &[(&str, &str)]) {
 
 /// Create an application on `platform` and a deployment group of it carrying
 /// `extras`.
-async fn group_with(emulator: &Emulator, application: &str, platform: &str, extras: &Value) {
+pub(crate) async fn group_with(
+    emulator: &Emulator,
+    application: &str,
+    platform: &str,
+    extras: &Value,
+) {
     emulator
         .ok(
             "CreateApplication",
@@ -80,7 +89,7 @@ async fn group_with(emulator: &Emulator, application: &str, platform: &str, extr
 
 /// Deploy a revision to the one deployment group of `application`, answering the
 /// deployment id.
-async fn deploy(emulator: &Emulator, application: &str) -> String {
+pub(crate) async fn deploy(emulator: &Emulator, application: &str) -> String {
     emulator
         .ok(
             "CreateDeployment",
@@ -131,7 +140,12 @@ async fn list_all(emulator: &Emulator, deployment_id: &str) -> Vec<String> {
 /// connection no API creates. The due instants are pushed out of reach so the
 /// clock, which every request advances, does not move the record off the status
 /// under test.
-fn force_status(emulator: &Emulator, deployment_id: &str, status: &str, started: bool) {
+pub(crate) fn force_status(
+    emulator: &Emulator,
+    deployment_id: &str,
+    status: &str,
+    started: bool,
+) {
     let state = codedeploy::state::service_state(&*emulator.engine)
         .expect("the shared in-memory store is reachable");
     let mut guard = state.lock();

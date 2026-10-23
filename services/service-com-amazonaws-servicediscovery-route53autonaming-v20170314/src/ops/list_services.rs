@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the services this emulator holds, one page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## How this listing answers
+//!
+//! * The stored services are scanned in service-id order, which is this listing's
+//!   stable order, and the page `MaxResults` asks for is taken from that scan
+//!   (`page_size` defaults it to the documented 100). The `NextToken` a truncated page
+//!   hands back is an opaque token naming the first id NOT served, so a resumed call
+//!   continues there and a token this listing never issued is refused with the
+//!   modelled `InvalidInput`.
+//! * `Filters` are applied to the services the page SCANNED, which is what `MaxResults`
+//!   documents ("Cloud Map gets MaxResults services and then filters them based on the
+//!   specified criteria"), so a page can come back empty while services remain.
+//! * A filter the model does not allow — an unknown `Name`, a `Condition` other than
+//!   `EQ` (the only one `ServiceFilter$Condition` lists), more or fewer than one value,
+//!   a `RESOURCE_OWNER` value outside its enumeration — is refused with `InvalidInput`
+//!   (HTTP 400).
+//! * Nothing here writes: the listing reports the records `CreateService` persisted,
+//!   with `InstanceCount` derived from the service's instance map.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +130,113 @@ impl From<ListServicesErrorModeled> for ListServicesError {
     }
 }
 
+/// The scope the `NextToken` this operation issues is tagged with, so a token minted by
+/// another paginated read is not honoured here.
+const NEXT_TOKEN_SCOPE: &str = "ListServices";
+
+/// `EQ`, the ONLY condition `ServiceFilter$Condition` lists for a service filter:
+/// "Valid values for `Condition` include the following: `EQ`: When you specify `EQ`,
+/// specify one value. `EQ` is the default condition and can be omitted." The other
+/// members of the generated `FILTER_CONDITION_VALUES` are not declared supported here.
+const CONDITION_EQ: &str = "EQ";
+
+/// The `ServiceFilterName` values, which are the generated `SERVICE_FILTER_NAME_VALUES`:
+/// `NAMESPACE_ID` selects by the namespace a service belongs to, `RESOURCE_OWNER` by
+/// whose account created that namespace.
+const FILTER_NAMESPACE_ID: &str = "NAMESPACE_ID";
+const FILTER_RESOURCE_OWNER: &str = "RESOURCE_OWNER";
+
+/// The values `ServiceFilter$Values` documents for `RESOURCE_OWNER`: "Specify one of
+/// `SELF` or `OTHER_ACCOUNTS`."
+const RESOURCE_OWNERS: [&str; 2] = ["SELF", "OTHER_ACCOUNTS"];
+
+/// The owner every resource this emulator holds belongs to: it shares no namespace in
+/// from another account, so `SELF` selects all of them and `OTHER_ACCOUNTS` none.
+const RESOURCE_OWNER_SELF: &str = "SELF";
+
+/// Refuse the request with the modelled `InvalidInput` (HTTP 400), the only client
+/// error this operation declares.
+fn invalid_input(message: String) -> ListServicesError {
+    ListServicesErrorModeled::InvalidInput(InvalidInput {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// One validated request filter, ready to match a stored service record.
+#[derive(Debug)]
+enum Matcher {
+    /// `NAMESPACE_ID`: the service belongs to this namespace id. The filter value is
+    /// "one namespace ID or ARN", so it is resolved to an id once, before any record is
+    /// compared; a value naming no stored namespace stays as written and so matches
+    /// nothing.
+    Namespace(String),
+    /// `RESOURCE_OWNER`: whether services whose namespace this account created match.
+    OwnedBySelf(bool),
+}
+
+impl Matcher {
+    /// Whether `record` satisfies this one filter.
+    fn matches(&self, record: &crate::state::ServiceRecord) -> bool {
+        match self {
+            Self::Namespace(namespace_id) => &record.namespace_id == namespace_id,
+            Self::OwnedBySelf(owned) => *owned,
+        }
+    }
+}
+
+/// Compile one request filter into a [`Matcher`], or say why the request is invalid.
+///
+/// Every rule here comes from the documentation on `ServiceFilter`: the filter names are
+/// the modelled `ServiceFilterName` enum, `EQ` is the only condition it lists (and the
+/// default when `Condition` is omitted), `EQ` takes exactly one value ("When you specify
+/// `EQ`, specify one value"), a `NAMESPACE_ID` value is "one namespace ID or ARN", and a
+/// `RESOURCE_OWNER` value is one of `SELF` or `OTHER_ACCOUNTS`.
+fn compile(
+    filter: &ServiceFilter,
+    state: &crate::state::ComAmazonawsServicediscoveryRoute53autonamingV20170314State,
+) -> Result<Matcher, String> {
+    if !SERVICE_FILTER_NAME_VALUES.contains(&filter.name.as_str()) {
+        return Err(format!(
+            "Filters.Name {} isn't valid. Valid values are {}.",
+            filter.name,
+            SERVICE_FILTER_NAME_VALUES.join(", ")
+        ));
+    }
+    let condition = filter.condition.as_deref().unwrap_or(CONDITION_EQ);
+    if condition != CONDITION_EQ {
+        return Err(format!(
+            "Filters.Condition {condition} isn't supported for a service filter. The only \
+             supported value is {CONDITION_EQ}."
+        ));
+    }
+    if filter.values.len() != 1 {
+        return Err(format!(
+            "Filters.Values must contain exactly one value, but {} were specified.",
+            filter.values.len()
+        ));
+    }
+    let value = filter.values[0].as_str();
+    match filter.name.as_str() {
+        FILTER_NAMESPACE_ID => Ok(Matcher::Namespace(
+            state
+                .resolve_namespace_id(value)
+                .unwrap_or_else(|| value.to_string()),
+        )),
+        // `RESOURCE_OWNER`, the only name left.
+        _ => {
+            debug_assert_eq!(filter.name.as_str(), FILTER_RESOURCE_OWNER);
+            if !RESOURCE_OWNERS.contains(&value) {
+                return Err(format!(
+                    "Filters.Values {value} isn't a valid resource owner. Valid values are {}.",
+                    RESOURCE_OWNERS.join(", ")
+                ));
+            }
+            Ok(Matcher::OwnedBySelf(value == RESOURCE_OWNER_SELF))
+        }
+    }
+}
+
 /// The `ListServices` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +273,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServicesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServices"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(invalid_input(
+                crate::state::UNREACHABLE_STATE_MESSAGE.to_string(),
+            ));
+        };
+
+        // A `NextToken` is opaque, so the only tokens this listing can resume from are
+        // the ones it issued; anything else is a bad request rather than an empty page.
+        // The modelled length is 0..4096, so the empty token is legal and means "start
+        // at the beginning".
+        let resume_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => match crate::state::decode_next_token(NEXT_TOKEN_SCOPE, token) {
+                Some(cursor) => Some(cursor),
+                // The rejected token is NOT echoed: it is the caller's own opaque bytes
+                // (up to the modelled 4096 characters), so repeating it tells the caller
+                // nothing and makes the error envelope's size caller-controlled.
+                None => {
+                    return Err(invalid_input(
+                        "The NextToken isn't a token ListServices issued.".to_string(),
+                    ))
+                }
+            },
+        };
+
+        let state = state.lock();
+
+        // "If you specify more than one filter, an operation must match all filters to
+        // be returned by ListServices." Every filter is compiled BEFORE any record is
+        // read, so an invalid filter is refused rather than silently matching nothing.
+        let mut matchers = Vec::new();
+        for filter in input.filters.iter().flatten() {
+            matchers.push(compile(filter, &state).map_err(invalid_input)?);
+        }
+
+        // The service id is this listing's stable order: a token names the first id NOT
+        // returned, so a resumed call continues at the first id at or after it even if
+        // that service was deleted between the two calls.
+        let mut ordered: Vec<(&String, &crate::state::ServiceRecord)> =
+            state.services.iter().collect();
+        ordered.sort_by_key(|(id, _)| *id);
+
+        let (records, next_token) = crate::state::page(
+            ordered,
+            resume_at.as_deref(),
+            crate::state::page_size(input.max_results),
+            NEXT_TOKEN_SCOPE,
+        );
+
+        // The page is taken first and filtered afterwards, as `MaxResults` documents:
+        // "Cloud Map gets MaxResults services and then filters them based on the
+        // specified criteria", so a page can come back empty while `NextToken` still
+        // points at services that may match.
+        let services = records
+            .iter()
+            .filter(|record| matchers.iter().all(|matcher| matcher.matches(record)))
+            .map(crate::state::service_summary_view)
+            .collect();
+
+        Ok(ListServicesOutput {
+            services: Some(services),
+            next_token,
+        })
     }
 }

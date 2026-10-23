@@ -28,9 +28,9 @@
 
 use serde_json::{json, Value};
 
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
 use crate::identity_store_lifecycle::{
-    assert_resource_arn, create_group, create_user, emulator, ok, refused, string, user_name,
-    walk_memberships, MAX_RESULTS_MIN, OTHER_STORE, STORE,
+    assert_resource_arn, create_group, create_user, user_name, walk_memberships, MAX_RESULTS_MIN,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -166,10 +166,8 @@ async fn deleting_a_group_removes_it_with_its_memberships_and_frees_its_display_
         let router = emulator();
         let display_name = format!("group-{}", case.replace(' ', "-"));
         let (group, group_arn) = create_group_with_arn(&router, STORE, &display_name, case).await;
-        // A second group in the same store, and a group carrying the SAME display name
-        // in another store: neither is this delete's to touch.
+        // A second group in the same store: not this delete's to touch.
         let bystander = create_group(&router, STORE, "bystanders", case).await;
-        let elsewhere = create_group(&router, OTHER_STORE, &display_name, case).await;
 
         let mut victim_memberships: Vec<String> = Vec::new();
         let mut bystander_memberships: Vec<String> = Vec::new();
@@ -209,8 +207,7 @@ async fn deleting_a_group_removes_it_with_its_memberships_and_frees_its_display_
             )
             .await;
         }
-        // And nothing else moved: the bystander group keeps every membership, and the
-        // same-named group in the other store is untouched.
+        // And nothing else moved: the bystander group keeps every membership.
         let surviving =
             walk_memberships(&router, STORE, &bystander, Some(MAX_RESULTS_MIN), case).await;
         assert_eq!(
@@ -218,15 +215,6 @@ async fn deleting_a_group_removes_it_with_its_memberships_and_frees_its_display_
             "case {case:?}: expected the bystander group's memberships to survive, \
              got {surviving:?}"
         );
-        assert_described(
-            &router,
-            OTHER_STORE,
-            &elsewhere,
-            &display_name,
-            CREATED_REVISION,
-            case,
-        )
-        .await;
 
         // The `DisplayName` claim the group held is released, so the name is free: the
         // recreated group is a NEW group, with its own id and no memberships.
@@ -292,13 +280,8 @@ async fn deleting_a_group_that_was_never_created_is_a_success_that_removes_nothi
     // `ResourceId` pattern admits the bare UUID, the resource ARN, an optional
     // ten-hex-digit prefix and either letter case, and none of them names a group this
     // emulator minted.
-    let rows: [(&str, &str, String); 5] = [
+    let rows: [(&str, &str, String); 4] = [
         ("a store that holds another group", STORE, UNMINTED_ID.to_string()),
-        (
-            "an identity store nothing ever created",
-            OTHER_STORE,
-            UNMINTED_ID.to_string(),
-        ),
         (
             "the ARN of a group nothing created",
             STORE,
@@ -329,12 +312,60 @@ async fn deleting_a_group_that_was_never_created_is_a_success_that_removes_nothi
         .await;
 
         assert_described(&router, STORE, &kept, "engineering", CREATED_REVISION, case).await;
-        // A delete of a store nothing created must not bring that store into being
-        // either: its (still absent) groups stay absent.
+    }
+}
+
+/// Idempotence covers the GROUP, not the identity store: a delete addressed to a store
+/// that does not exist is refused with the modelled 404 — the same refusal every other
+/// operation of this service answers one with — and brings no store into being.
+#[tokio::test]
+async fn deleting_a_group_in_an_identity_store_that_does_not_exist_is_refused() {
+    // Rows differ along the form the unknown store id takes and whether the group id it
+    // names was ever minted, so the refusal is the STORE's and not the group's.
+    let router = emulator();
+    let kept = create_group(&router, STORE, "engineering", "seed").await;
+    let rows: [(&str, String, String); 3] = [
+        (
+            "an unknown store and a group nothing created",
+            MISSING_STORE.to_string(),
+            UNMINTED_ID.to_string(),
+        ),
+        (
+            "an unknown store and a group that exists in the real one",
+            MISSING_STORE.to_string(),
+            kept.clone(),
+        ),
+        (
+            "an unknown store named by its ARN",
+            format!(
+                "arn:aws:identitystore::{}:identitystore/{MISSING_STORE}",
+                engine::emulator_account_id()
+            ),
+            kept.clone(),
+        ),
+    ];
+
+    for (case, store, group_id) in rows {
+        let body = refused(
+            &router,
+            "DeleteGroup",
+            json!({ "IdentityStoreId": store, "GroupId": group_id }),
+            404,
+            "ResourceNotFoundException",
+            case,
+        )
+        .await;
+        assert_eq!(
+            body["ResourceType"].as_str().unwrap_or_default(),
+            "IDENTITY_STORE",
+            "case {case:?}: expected the identity store to be the missing resource, got {body}"
+        );
+        // The refused delete removed nothing and created no store.
+        assert_described(&router, STORE, &kept, "engineering", CREATED_REVISION, case).await;
         refused(
             &router,
             "DescribeGroup",
-            json!({ "IdentityStoreId": OTHER_STORE, "GroupId": kept }),
+            json!({ "IdentityStoreId": MISSING_STORE, "GroupId": kept.clone() }),
             404,
             "ResourceNotFoundException",
             case,

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `DeploymentId` and persists a [`crate::state::Deployment`]
+//! record under its parent api, pointing the named stage at it when the request names
+//! one. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +151,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDeployment"))
+        let _ = ctx;
+
+        // The request's own members are checked before any resource is resolved:
+        // `Description` targets `StringWithLengthBetween0And1024`, and the request walk
+        // does not enforce a modelled length, so this operation does. The message names
+        // the member and the constraint it broke, which is all a caller has to fix it.
+        if let Some(description) = input.description.as_ref() {
+            let length = description.chars().count();
+            if length > MAX_DESCRIPTION_LEN {
+                return Err(CreateDeploymentErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "Invalid value for Description: must have length less than or equal \
+                             to {MAX_DESCRIPTION_LEN}, got {length}."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateDeployment",
+            ));
+        };
+        let mut store = state.lock();
+
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(CreateDeploymentErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Invalid API identifier specified {}:{}",
+                        ::engine::emulator_account_id(),
+                        input.api_id
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // A deployment is released to a stage the caller already created: this
+        // operation deploys an api, it does not mint stages (`CreateStage` does), so a
+        // `StageName` naming no stage of this api names a resource that is not there.
+        if let Some(stage_name) = input.stage_name.as_ref() {
+            if !api.stages.contains_key(stage_name) {
+                return Err(CreateDeploymentErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(format!(
+                            "Invalid stage identifier specified {}:{}",
+                            ::engine::emulator_account_id(),
+                            stage_name
+                        )),
+                        resource_type: ::std::option::Option::None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Bound the growth a caller drives: every call mints a NEW deployment, so
+        // without a bound a loop of them grows this store without end.
+        // `TooManyRequestsException` is the modelled error for "a limit has been
+        // exceeded" and carries the limit's name in `LimitType`.
+        if api.deployments.len() >= crate::state::MAX_DEPLOYMENTS_PER_API {
+            return Err(CreateDeploymentErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("Deployment".to_string()),
+                    message: Some(format!(
+                        "The maximum number of deployments ({}) for this API has been reached.",
+                        crate::state::MAX_DEPLOYMENTS_PER_API
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let deployment_id = api.mint_deployment_id();
+
+        let record = crate::state::Deployment {
+            deployment_id: deployment_id.clone(),
+            description: input.description,
+            // Deploying captures the api's current routes and integrations, which this
+            // store already holds, so the deployment is released by the time this call
+            // answers and reports the terminal status rather than `PENDING`.
+            deployment_status: crate::state::DEPLOYMENT_STATUS_DEPLOYED.to_string(),
+            // `DeploymentStatusMessage` carries "additional feedback on the status of an
+            // API deployment": a released deployment has none to add.
+            deployment_status_message: ::std::option::Option::None,
+            // The caller asked for this deployment, so the service did not release it
+            // by itself for an auto-deploying stage.
+            auto_deployed: false,
+            created_date: ::std::time::SystemTime::now(),
+        };
+
+        // A stage serves ONE deployment, so deploying to it moves the stage onto this
+        // one; a later GetStage reports the move.
+        if let Some(stage) = input
+            .stage_name
+            .as_ref()
+            .and_then(|stage_name| api.stages.get_mut(stage_name))
+        {
+            stage.deployment_id = Some(deployment_id.clone());
+        }
+
+        // Read the response back out of the STORE, so what the caller gets is what a
+        // later GetDeployment will report. `deployment_id` comes from this api's own id
+        // bijection, so it names no existing deployment and this inserts.
+        let stored = api
+            .deployments
+            .entry(deployment_id)
+            .or_insert(record)
+            .to_wire();
+        Ok(CreateDeploymentOutput {
+            auto_deployed: stored.auto_deployed,
+            created_date: stored.created_date,
+            deployment_id: stored.deployment_id,
+            deployment_status: stored.deployment_status,
+            deployment_status_message: stored.deployment_status_message,
+            description: stored.description,
+        })
     }
 }
+
+/// The longest `Description` this operation accepts: the upper bound of
+/// `StringWithLengthBetween0And1024`, the shape `CreateDeployment$Description`
+/// targets.
+const MAX_DESCRIPTION_LEN: usize = 1024;

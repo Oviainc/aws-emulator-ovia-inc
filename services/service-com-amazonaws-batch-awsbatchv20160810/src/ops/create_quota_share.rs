@@ -206,10 +206,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(queue) = state.job_queue(&input.job_queue) else {
+            // The share's PARENT queue, which this call only refers to: AWS is recorded
+            // echoing the reference the request gave here (a name stays a name), unlike
+            // the resolvers that act ON the queue (`UpdateJobQueue`), which name the ARN
+            // they resolved it to.
             return Err(CreateQuotaShareErrorModeled::ClientException(
                 batch::client_exception_enveloped(format!(
-                    "{} does not exist.",
-                    input.job_queue
+                    "{}.",
+                    batch::does_not_exist_message(&input.job_queue)
                 )),
             )
             .into());

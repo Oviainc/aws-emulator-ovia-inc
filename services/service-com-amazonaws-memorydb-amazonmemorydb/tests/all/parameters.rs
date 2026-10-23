@@ -115,8 +115,9 @@ const FAMILY_EXPECTATIONS: &[FamilyExpectation] = &[
 ];
 
 /// The settings every family carries, each with a value from a DIFFERENT kind of
-/// domain: a token set, two integer ranges (one open-ended, one closed at its top
-/// bound) and free text. The rows are what an update must persist unchanged.
+/// domain: a token set, two integer domains (one a pair of disjoint ranges, one a single
+/// range closed at its top bound) and free text. The rows are what an update must
+/// persist unchanged.
 const UPDATES: &[(&str, &str)] = &[
     ("maxmemory-policy", "allkeys-lru"),
     ("activerehashing", "no"),
@@ -250,12 +251,13 @@ fn field(parameter: &Value, member: &str, case: &str) -> String {
 /// The domain a reported parameter publishes, parsed from its `DataType` and
 /// `AllowedValues`.
 ///
-/// The catalog publishes no negative bound, so a range is `"<min>-<max>"` or the
-/// open-ended `"<min>-"`; a token set is comma-separated; free text publishes no
+/// The catalog publishes no negative bound, so a numeric domain is a comma-separated
+/// list of ranges, each `"<min>-<max>"`, the open-ended `"<min>-"` or a single value
+/// (`timeout` publishes `0,20-`); a token set is comma-separated; free text publishes no
 /// `AllowedValues` member at all.
 #[derive(Debug, PartialEq, Eq)]
 enum Domain {
-    Range { min: i64, max: Option<i64> },
+    Ranges(Vec<(i64, Option<i64>)>),
     Tokens(Vec<String>),
     Text,
 }
@@ -278,21 +280,28 @@ fn domain_of(parameter: &Value, case: &str) -> Domain {
         "case {case:?}: expected DataType integer or string, got {data_type:?}"
     );
     if data_type == "integer" {
-        let bounds = allowed
-            .split_once('-')
-            .unwrap_or_else(|| panic!("case {case:?}: expected a range, got {allowed:?}"));
-        let min: i64 = bounds
-            .0
-            .parse()
-            .unwrap_or_else(|_| panic!("case {case:?}: expected a numeric min in {allowed:?}"));
-        let max = if bounds.1.is_empty() {
-            None
-        } else {
-            Some(bounds.1.parse().unwrap_or_else(|_| {
-                panic!("case {case:?}: expected a numeric max in {allowed:?}")
-            }))
-        };
-        return Domain::Range { min, max };
+        let ranges = allowed
+            .split(',')
+            .map(|part| {
+                let (min, max) = match part.split_once('-') {
+                    // `"<min>-<max>"`, or the open-ended `"<min>-"`.
+                    Some((min, max)) => (min, if max.is_empty() { None } else { Some(max) }),
+                    // A single published value is its own one-value range.
+                    None => (part, Some(part)),
+                };
+                let number = |text: &str| {
+                    text.parse::<i64>().unwrap_or_else(|_| {
+                        panic!("case {case:?}: expected a numeric bound in {allowed:?}")
+                    })
+                };
+                (number(min), max.map(number))
+            })
+            .collect::<Vec<(i64, Option<i64>)>>();
+        assert!(
+            !ranges.is_empty(),
+            "case {case:?}: an integer parameter must publish a range, got {allowed:?}"
+        );
+        return Domain::Ranges(ranges);
     }
     if allowed.is_empty() {
         Domain::Text
@@ -381,13 +390,16 @@ async fn a_groups_parameters_are_the_engine_defaults_of_its_family() {
             );
             // The default value must itself satisfy the domain the parameter publishes.
             match domain_of(parameter, &case) {
-                Domain::Range { min, max } => {
+                Domain::Ranges(ranges) => {
                     let number: i64 = value.parse().unwrap_or_else(|_| {
                         panic!("case {case:?}: expected an integer value, got {value:?}")
                     });
                     assert!(
-                        number >= min && max.is_none_or(|max| number <= max),
-                        "case {case:?}: the default {value:?} must lie in {min}-{max:?}"
+                        ranges
+                            .iter()
+                            .any(|(min, max)| number >= *min
+                                && max.is_none_or(|max| number <= max)),
+                        "case {case:?}: the default {value:?} must lie in {ranges:?}"
                     );
                 }
                 Domain::Tokens(tokens) => assert!(
@@ -632,10 +644,14 @@ async fn every_published_bound_is_accepted_and_one_past_it_is_refused() {
     for (name, parameter) in parameters(&router, GROUP).await {
         let case = format!("{FAMILY}/{name}");
         match domain_of(&parameter, &case) {
-            Domain::Range { min, max } => {
+            Domain::Ranges(ranges) => {
                 // At each published bound: accepted, and the value is what a later read
                 // reports.
-                for bound in [Some(min), max].into_iter().flatten() {
+                let bounds: Vec<i64> = ranges
+                    .iter()
+                    .flat_map(|(min, max)| [Some(*min), *max].into_iter().flatten())
+                    .collect();
+                for bound in bounds {
                     let value = bound.to_string();
                     let (status, answered) =
                         update(&router, GROUP, &[(&name, value.as_str())]).await;
@@ -652,19 +668,26 @@ async fn every_published_bound_is_accepted_and_one_past_it_is_refused() {
                         reported[&name]
                     );
                 }
-                // One past each published bound: refused, and the accepted value stands.
+                // Outside what the parameter publishes: below the first minimum, inside
+                // any gap between two published ranges, and above a closed top bound.
                 let accepted = parameters(&router, GROUP).await[&name]["Value"].clone();
-                let past: Vec<i64> = [Some(min - 1), max.map(|max| max + 1)]
-                    .into_iter()
-                    .flatten()
-                    .collect();
+                let mut past: Vec<i64> = vec![ranges[0].0 - 1];
+                for window in ranges.windows(2) {
+                    let gap_top = window[1].0 - 1;
+                    if window[0].1.is_some_and(|max| gap_top > max) {
+                        past.push(gap_top);
+                    }
+                }
+                if let Some((_, Some(max))) = ranges.last() {
+                    past.push(max + 1);
+                }
                 for outside in past {
                     let value = outside.to_string();
                     let (status, refused) =
                         update(&router, GROUP, &[(&name, value.as_str())]).await;
                     assert_eq!(
                         status, 400,
-                        "case {case:?}: {value} is outside {min}-{max:?} and must be \
+                        "case {case:?}: {value} is outside {ranges:?} and must be \
                          refused, got {status} with {refused}"
                     );
                     assert_eq!(

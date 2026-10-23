@@ -14,6 +14,9 @@
 #[path = "all/network_connector_lifecycle.rs"]
 mod network_connector_lifecycle;
 
+#[path = "all/not_found_message.rs"]
+mod not_found_message;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

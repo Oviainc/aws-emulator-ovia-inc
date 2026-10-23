@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComputeQuotas
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComputeQuotas`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComputeQuotas::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: filters, sorts and pages the compute allocation definitions stored in
+//! `crate::state`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +132,16 @@ impl<Eng> ListComputeQuotas<Eng> {
     }
 }
 
+/// `SortBy`'s members, the sort keys this listing accepts (`SortQuotaBy`).
+const SORT_KEYS: [&str; 4] = ["Name", "CreationTime", "Status", "ClusterArn"];
+
+// The sort key used when the request names none is `crate::state::DEFAULT_SORT_BY`:
+// `ListComputeQuotas`' `SortBy` documents no default, so this listing follows the one
+// the service's other listings document ("The default is `CreationTime`") rather than
+// inventing a second answer. `SortOrder`'s default is documented here ("By default,
+// listed in Descending order according to by SortBy") and is the same
+// `crate::state::DEFAULT_SORT_ORDER` they use.
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListComputeQuotas<Eng>
 {
@@ -156,18 +159,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComputeQuotas` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComputeQuotasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComputeQuotas"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `SortBy`, `SortOrder` and `Status` are modelled enums, so the boundary
+        // constraint walk has ALREADY refused a value outside any of their value sets
+        // before this handler runs (the suite pins that with a 400 for each). The two
+        // checks below are belt-and-braces for a model that stops declaring the enum:
+        // the default each falls back to must never be read as a sort the code cannot
+        // perform, which is why neither silently falls through to the default branch.
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_BY);
+        if !SORT_KEYS.contains(&sort_by) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                SORT_KEYS.join(", ")
+            )));
+        }
+        let descending = match input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_ORDER)
+        {
+            crate::state::ORDER_DESCENDING => true,
+            "Ascending" => false,
+            other => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "SortOrder must be one of Ascending, Descending; got \"{other}\"."
+                )))
+            }
+        };
+
+        let after = input.created_after.map(crate::state::timestamp_key);
+        let before = input.created_before.map(crate::state::timestamp_key);
+
+        // Scoped so the store guard is released before anything is logged, and so the
+        // borrows the page is built from end with it.
+        let (output, settled) = {
+            let mut store = state.lock();
+            // The only write this reporting call makes, and the one
+            // `DescribeComputeQuota` makes too: the `Creating` -> `Created` transitions
+            // the clock already owed. Each was due at its stored instant whether or not
+            // anybody listed, so settling them here changes no outcome — and it is what
+            // makes the `Status` filter below select on the status a describe would
+            // report at this same instant.
+            let now = ::std::time::SystemTime::now();
+            let settled: Vec<String> = store
+                .compute_quotas
+                .values_mut()
+                .filter_map(|quota| quota.settle_status(now).then(|| quota.arn.clone()))
+                .collect();
+
+            let mut matching: Vec<&crate::state::ComputeQuota> = store
+                .compute_quotas
+                .values()
+                .filter(|quota| {
+                    input
+                        .name_contains
+                        .as_deref()
+                        .is_none_or(|needle| quota.name.contains(needle))
+                })
+                .filter(|quota| {
+                    input
+                        .status
+                        .as_deref()
+                        .is_none_or(|status| quota.status == status)
+                })
+                .filter(|quota| {
+                    input
+                        .cluster_arn
+                        .as_deref()
+                        .is_none_or(|cluster| quota.cluster_arn == cluster)
+                })
+                .filter(|quota| {
+                    // Both bounds are inclusive, so a timestamp copied straight out of a
+                    // prior response's `CreationTime` still selects that quota.
+                    let created =
+                        crate::state::timestamp_key(crate::state::timestamp(quota.creation_time));
+                    after.is_none_or(|bound| created >= bound)
+                        && before.is_none_or(|bound| created <= bound)
+                })
+                .collect();
+            // `SortOrder` reverses the SORT KEY only. The tie-break stays
+            // `ComputeQuotaId` ascending in both directions, so two quotas sharing a
+            // sort value (the same status, cluster or creation instant) keep one order
+            // whichever way the page is sorted — and a `NextToken` resolved against a
+            // freshly computed result set lands on the same boundary.
+            matching.sort_by(|left, right| {
+                let by_key = match sort_by {
+                    "Name" => left.name.cmp(&right.name),
+                    "Status" => left.status.cmp(&right.status),
+                    "ClusterArn" => left.cluster_arn.cmp(&right.cluster_arn),
+                    _ => crate::state::timestamp_key(crate::state::timestamp(left.creation_time))
+                        .cmp(&crate::state::timestamp_key(crate::state::timestamp(
+                            right.creation_time,
+                        ))),
+                };
+                let by_key = if descending { by_key.reverse() } else { by_key };
+                by_key.then_with(|| left.id.cmp(&right.id))
+            });
+
+            let start = match input.next_token.as_deref() {
+                None => 0,
+                Some(token) => {
+                    let resumed_after = crate::state::decode_page_token(token)
+                        .and_then(|id| matching.iter().position(|quota| quota.id == id))
+                        .ok_or_else(|| {
+                            crate::scaffolded::Scaffolded::validation(
+                                crate::state::STALE_PAGE_TOKEN,
+                            )
+                        })?;
+                    resumed_after + 1
+                }
+            };
+
+            // `MaxResults` caps the page, and so does the service's own ceiling
+            // (`state::MAX_PAGE_SIZE`): that ceiling sits BELOW the modelled
+            // `MaxResults` maximum deliberately, so an absent or larger `MaxResults`
+            // still cannot make one call serialise the whole store — the same bound
+            // `ListModels` applies in this crate. A `MaxResults` outside the modelled
+            // `range 1..100` never reaches here (the boundary refuses it, which the
+            // suite pins), so the clamp only ever lowers an in-range request to the
+            // ceiling. The token below is emitted whenever anything is left, so a
+            // paginating client walks the full result set exactly once either way.
+            let start = start.min(matching.len());
+            let page_size = input
+                .max_results
+                .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                    max.clamp(1, crate::state::MAX_PAGE_SIZE)
+                })
+                .unsigned_abs() as usize;
+            let end = start.saturating_add(page_size).min(matching.len());
+            let page = &matching[start..end];
+
+            let next_token = match page.last() {
+                // A token only where a further page exists, so a paginating client stops.
+                Some(last) if end < matching.len() => {
+                    Some(crate::state::encode_page_token(&last.id))
+                }
+                _ => None,
+            };
+
+            let output = ListComputeQuotasOutput {
+                compute_quota_summaries: Some(
+                    page.iter()
+                        .map(|quota| ComputeQuotaSummary {
+                            compute_quota_arn: quota.arn.clone(),
+                            compute_quota_id: quota.id.clone(),
+                            name: quota.name.clone(),
+                            compute_quota_version: Some(quota.version),
+                            status: quota.status.clone(),
+                            cluster_arn: Some(quota.cluster_arn.clone()),
+                            compute_quota_config: Some(quota.config.clone()),
+                            compute_quota_target: quota.target.clone(),
+                            activation_state: Some(quota.activation_state.clone()),
+                            creation_time: crate::state::timestamp(quota.creation_time),
+                            last_modified_time: Some(crate::state::timestamp(
+                                quota.last_modified_time,
+                            )),
+                        })
+                        .collect(),
+                ),
+                next_token,
+            };
+            (output, settled)
+        };
+
+        for arn in &settled {
+            // Each transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, arn, ctx);
+        }
+        Ok(output)
     }
 }

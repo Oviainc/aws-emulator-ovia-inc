@@ -45,6 +45,8 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+pub mod env_endpoint;
+
 /// The error code this service answers an input-constraint violation with: the modeled
 /// `ValidationException`, which every operation that can be refused declares with
 /// `@httpError 400`. It is also the framework's own default code for a refusal, restated
@@ -115,6 +117,10 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The wrapper `override_operation` hands back for the one operation served through
+    /// the environment's Apache Airflow proxy, built once because that seam returns a
+    /// reference to it. See [`env_endpoint`].
+    env_endpoint: env_endpoint::EnvDataEndpoint,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -124,6 +130,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            env_endpoint: env_endpoint::EnvDataEndpoint,
         }
     }
 }
@@ -150,12 +157,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // The operation the model declares as a PROXY to the Apache Airflow REST API of
+        // an environment's web server is served through a wrapper: it runs the operation
+        // the generated routing table names — the framework still owns the whole walk and
+        // every status, code and header it answers with — and then answers its not-found
+        // refusal with the environment data endpoint's own document payload rather than
+        // with a serialized modelled exception (see [`env_endpoint`]). Every other request
+        // resolves through the generated routing table.
+        env_endpoint::proxies_the_airflow_rest_api(&self.entry, req)
+            .then_some(&self.env_endpoint as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

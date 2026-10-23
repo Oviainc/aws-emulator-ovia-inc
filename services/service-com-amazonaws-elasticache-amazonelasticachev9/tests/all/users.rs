@@ -24,7 +24,7 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::cache_cluster_lifecycle::{params, Emulator, Reply};
+use crate::harness::{params, Emulator, Reply};
 
 /// Create one user over the wire, failing the test if it is not created.
 ///

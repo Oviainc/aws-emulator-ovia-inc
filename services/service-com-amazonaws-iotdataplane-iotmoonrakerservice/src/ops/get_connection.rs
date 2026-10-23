@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the MQTT session the broker holds for one client id — whether its connection
+//! is open, since when, the session's own settings, and the thing its principal is
+//! associated with — all of it read from the stored session (`crate::state::MqttSession`)
+//! and none of it from the request.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A client id the broker holds no session for has no connection information to report,
+//! so it is a 404 `ResourceNotFoundException`: that is the normal, expected outcome for a
+//! client that has never connected, and it is what every operation of this family
+//! answers for one.
+//!
+//! Socket information (`sourceIp`, `sourcePort`, `targetIp`, `targetPort`) is reported
+//! only to a request that asked for it with `includeSocketInformation`.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +186,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConnection"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetConnectionErrorModeled::InternalFailureException(InternalFailureException::new(
+                "An unexpected error has occurred.",
+            ))
+        })?;
+
+        let mut guard = state.lock();
+        // Reporting only. The one write this takes is the release of the sessions whose
+        // disconnect information the service no longer reports — owed at this instant
+        // whether or not anybody called — and it never touches the session being read.
+        let session = guard
+            .session(&input.client_id, crate::state::now_millis())
+            .ok_or_else(|| {
+                GetConnectionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException::new(crate::state::CLIENT_NOT_FOUND),
+                )
+            })?;
+
+        // Socket information is reported only when the request asked for it; the members
+        // stay at their modelled defaults otherwise, so a caller cannot read an address
+        // out of a response that did not opt in.
+        let socket = input.include_socket_information;
+        Ok(GetConnectionOutput {
+            client_id: Some(session.client_id.clone()),
+            connected: session.connected,
+            clean_session: session.clean_session,
+            thing_name: session.thing_name.clone(),
+            keep_alive_duration: session.keep_alive_seconds,
+            session_expiry: session.session_expiry_seconds,
+            // `connectedSince` is present only while the connection is open, and
+            // `disconnectedSince` / `disconnectReason` only once it has closed.
+            connected_since: if session.connected {
+                session.connected_since_millis
+            } else {
+                0
+            },
+            disconnected_since: if session.connected {
+                0
+            } else {
+                session.disconnected_since_millis
+            },
+            disconnect_reason: if session.connected {
+                None
+            } else {
+                session.disconnect_reason.clone()
+            },
+            source_ip: socket.then(|| session.source_ip.clone()).flatten(),
+            source_port: if socket { session.source_port } else { 0 },
+            target_ip: socket.then(|| session.target_ip.clone()).flatten(),
+            target_port: if socket { session.target_port } else { 0 },
+            vpc_endpoint_id: session.vpc_endpoint_id.clone(),
+        })
     }
 }

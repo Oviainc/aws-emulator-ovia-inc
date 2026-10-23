@@ -382,6 +382,13 @@ pub enum ParameterDomain {
     /// A whole number, at least `min` and — when the engine publishes an upper bound —
     /// at most `max`.
     Integer { min: i64, max: Option<i64> },
+    /// A whole number from one of several DISJOINT ranges, in the order the engine
+    /// publishes them, each `(min, max)` with `None` for an open-ended top.
+    ///
+    /// Not every numeric setting takes one contiguous range: `timeout` takes 0 (never
+    /// close an idle connection) or 20 seconds and up, which the service publishes as
+    /// `0,20-`. A single-value range is published as that value alone.
+    IntegerRanges(&'static [(i64, Option<i64>)]),
     /// One of a fixed set of tokens, in the order the engine documents them.
     Tokens(&'static [&'static str]),
     /// Free text: a parameter the engine itself parses (a flag string, or a size that
@@ -393,13 +400,27 @@ impl ParameterDomain {
     /// `Parameter$DataType`, in the two type names MemoryDB reports.
     pub fn data_type(&self) -> &'static str {
         match self {
-            Self::Integer { .. } => "integer",
+            Self::Integer { .. } | Self::IntegerRanges(_) => "integer",
             Self::Tokens(_) | Self::Text => "string",
         }
     }
 
+    /// The numeric ranges this domain publishes, empty for a non-numeric one.
+    ///
+    /// One source for both the published `AllowedValues` and the accept/refuse
+    /// decision, so what the service says a parameter takes and what it actually takes
+    /// cannot drift apart.
+    fn number_ranges(&self) -> Vec<(i64, Option<i64>)> {
+        match self {
+            Self::Integer { min, max } => vec![(*min, *max)],
+            Self::IntegerRanges(ranges) => ranges.to_vec(),
+            Self::Tokens(_) | Self::Text => Vec::new(),
+        }
+    }
+
     /// `Parameter$AllowedValues`, rendered the way MemoryDB publishes it: `<min>-<max>`
-    /// for a number (an open-ended range keeps the trailing hyphen) and a
+    /// for a number (an open-ended range keeps the trailing hyphen, a single-value one
+    /// is just that value, and several ranges are comma-separated) and a
     /// comma-separated list for a token set.
     ///
     /// `None` for free text: the service publishes no value set for a parameter the
@@ -407,8 +428,17 @@ impl ParameterDomain {
     /// client could read as "no value is allowed".
     pub fn allowed_values(&self) -> Option<String> {
         match self {
-            Self::Integer { min, max: Some(max) } => Some(format!("{min}-{max}")),
-            Self::Integer { min, max: None } => Some(format!("{min}-")),
+            Self::Integer { .. } | Self::IntegerRanges(_) => Some(
+                self.number_ranges()
+                    .iter()
+                    .map(|(min, max)| match max {
+                        Some(max) if max == min => format!("{min}"),
+                        Some(max) => format!("{min}-{max}"),
+                        None => format!("{min}-"),
+                    })
+                    .collect::<Vec<String>>()
+                    .join(","),
+            ),
             Self::Tokens(tokens) => Some(tokens.join(",")),
             Self::Text => None,
         }
@@ -416,35 +446,35 @@ impl ParameterDomain {
 
     /// Whether this domain accepts `value`, or why it does not.
     ///
-    /// The message is BUILT FROM the request and the broken constraint — the parameter
-    /// named by the caller, and the range or value set this domain publishes — so a
-    /// caller is told which of its pairs was refused and what the parameter takes.
-    pub fn accepts(&self, name: &str, value: &str) -> Result<(), String> {
+    /// The message is BUILT FROM the broken constraint — the value the caller sent and
+    /// the range or value set this domain PUBLISHES for the parameter (the same string
+    /// `DescribeParameters` reports in `Parameter$AllowedValues`) — in the service's
+    /// own three wordings: a value that is not a whole number at all, a number outside
+    /// the published range, and a token outside the published set.
+    pub fn accepts(&self, value: &str) -> Result<(), String> {
         match self {
-            Self::Integer { min, max } => {
+            Self::Integer { .. } | Self::IntegerRanges(_) => {
                 let Ok(number) = value.parse::<i64>() else {
-                    return Err(format!(
-                        "Invalid parameter value {value:?} for parameter {name}: an integer \
-                         in {} is required.",
-                        self.allowed_values().unwrap_or_default()
-                    ));
+                    return Err(format!("invalid integer value: {value}"));
                 };
-                if number < *min || max.is_some_and(|max| number > max) {
-                    return Err(format!(
-                        "Invalid parameter value {value:?} for parameter {name}: the \
-                         allowed values are {}.",
-                        self.allowed_values().unwrap_or_default()
-                    ));
+                let ranges = self.number_ranges();
+                if ranges
+                    .iter()
+                    .any(|(min, max)| number >= *min && max.is_none_or(|max| number <= max))
+                {
+                    return Ok(());
                 }
-                Ok(())
+                Err(format!(
+                    "value:{value} is outside of range:{}",
+                    self.allowed_values().unwrap_or_default()
+                ))
             }
             Self::Tokens(tokens) => {
                 if tokens.contains(&value) {
                     Ok(())
                 } else {
                     Err(format!(
-                        "Invalid parameter value {value:?} for parameter {name}: the \
-                         allowed values are {}.",
+                        "invalid parameter value, allowed values are:{}",
                         self.allowed_values().unwrap_or_default()
                     ))
                 }
@@ -574,9 +604,18 @@ pub fn default_parameter_group_description(family: &str) -> String {
 /// and are immutable, so every write path over a parameter group refuses one. The
 /// caller maps the refusal onto its own modelled `InvalidParameterValueException`.
 pub fn immutable_parameter_group_rejection(name: &str) -> Option<String> {
-    name.starts_with(DEFAULT_PARAMETER_GROUP_PREFIX).then(|| {
-        format!("Parameter group {name} is a default parameter group and cannot be modified.")
-    })
+    name.starts_with(DEFAULT_PARAMETER_GROUP_PREFIX)
+        .then(|| "Cannot modify a default parameter group.".to_string())
+}
+
+/// The message a `ParameterGroupNotFoundFault` carries for the group `name` the request
+/// named.
+///
+/// Every operation that resolves a parameter group by name answers the absent one
+/// through this, so one request's name is reported back in one template whichever
+/// operation it was sent to.
+pub fn parameter_group_not_found_message(name: &str) -> String {
+    format!("ParameterGroup not found: {name}")
 }
 
 /// The engine default parameter of one family by name, or `None` when that family
@@ -761,7 +800,10 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         default_value: "0",
         description: "The seconds of client idleness after which the engine closes the \
                       connection; 0 never closes it.",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        // Published as `0,20-`: the engine either never closes an idle connection (0)
+        // or waits at least 20 seconds, so the seconds between are not a value the
+        // parameter takes.
+        domain: ParameterDomain::IntegerRanges(&[(0, Some(0)), (20, None)]),
         since: 0,
         until: None,
     },
@@ -950,10 +992,15 @@ pub mod cluster_status {
 
 /// `ACL$Status`: "Indicates ACL status. Can be \"creating\", \"active\",
 /// \"modifying\", \"deleting\"."
+///
+/// `DELETING` is TERMINAL for this store, exactly as it is for a user: a deleted ACL is
+/// removed outright, so the status only ever appears on the response that reports the
+/// deletion, never on an ACL a later call can still read.
 pub mod acl_status {
     pub const CREATING: &str = "creating";
     pub const ACTIVE: &str = "active";
     pub const MODIFYING: &str = "modifying";
+    pub const DELETING: &str = "deleting";
 }
 
 /// `User$Status`: "Indicates the user status. Can be \"active\", \"modifying\" or
@@ -1770,15 +1817,21 @@ pub fn authentication_from_mode(
     match mode_type {
         input_authentication_type::PASSWORD => {
             if passwords.is_empty() {
+                // The service's own wording for the combination it cannot act on: the
+                // authentication type the request ASKED for, and what that type needs.
                 return Err(AuthenticationModeRejection::Combination(format!(
-                    "AuthenticationMode.Passwords is required when \
-                     AuthenticationMode.Type is {}.",
+                    "A user with Authentication Mode: {}, must have at least one \
+                     password",
                     input_authentication_type::PASSWORD
                 )));
             }
             if passwords.len() > MAX_PASSWORDS_PER_USER {
+                // The service's own wording for the password quota, built from the
+                // bound `Authentication$PasswordCount` documents, so a caller reads
+                // which limit it broke and what the limit is.
                 return Err(AuthenticationModeRejection::Value(format!(
-                    "A user can have at most {MAX_PASSWORDS_PER_USER} passwords."
+                    "Maximum number of passwords allowed in this service is \
+                     {MAX_PASSWORDS_PER_USER}."
                 )));
             }
             for password in passwords {
@@ -1792,9 +1845,10 @@ pub fn authentication_from_mode(
         }
         input_authentication_type::IAM => {
             if !passwords.is_empty() {
+                // The same rule from the other side: the refusal names the member that
+                // does not belong with the authentication type the request asked for.
                 return Err(AuthenticationModeRejection::Combination(format!(
-                    "AuthenticationMode.Passwords cannot be supplied when \
-                     AuthenticationMode.Type is {}.",
+                    "Password field is not allowed with authentication type: {}",
                     input_authentication_type::IAM
                 )));
             }
@@ -1815,9 +1869,12 @@ pub fn authentication_from_mode(
 /// rule and never repeats the password itself.
 fn validate_password(password: &str) -> Result<(), AuthenticationModeRejection> {
     if !(MIN_PASSWORD_LEN..=MAX_PASSWORD_LEN).contains(&password.chars().count()) {
+        // The refusal names the member being refused and the documented bound, in the
+        // service's own wording: `<member> length must be between <min>-<max>
+        // characters.`
         return Err(AuthenticationModeRejection::Value(format!(
-            "A user password must be between {MIN_PASSWORD_LEN} and {MAX_PASSWORD_LEN} \
-             characters long."
+            "Passwords length must be between {MIN_PASSWORD_LEN}-{MAX_PASSWORD_LEN} \
+             characters."
         )));
     }
     // "Must be only printable ASCII characters": the ASCII graphic range plus the
@@ -1858,18 +1915,20 @@ pub fn fold_name(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
-/// Why `name` cannot name a MemoryDB resource, or `None` when it can.
+/// Why `name` cannot name a MemoryDB resource of this kind, or `None` when it can.
 ///
 /// The service enforces a TIGHTER rule than the model's `^[a-zA-Z][a-zA-Z0-9\-]*$`:
 /// at most [`MAX_RESOURCE_NAME_LEN`] characters, beginning with a letter, only ASCII
 /// letters, digits and hyphens, and neither a trailing hyphen nor two consecutive
-/// hyphens. `member` is the request member being refused, so the message names what
-/// the caller has to fix; the caller maps the refusal onto its own modelled
-/// `InvalidParameterValueException`.
-pub fn resource_name_rejection(member: &str, name: &str) -> Option<String> {
+/// hyphens. Both refusals name the identifier the way the SERVICE names it
+/// ([`ResourceKind::name_label`]) rather than the wire member the request carried it
+/// in, which is how a caller learns which rule it broke; the caller maps the refusal
+/// onto its own modelled `InvalidParameterValueException`.
+pub fn resource_name_rejection(kind: ResourceKind, name: &str) -> Option<String> {
+    let label = kind.name_label();
     if name.chars().count() > MAX_RESOURCE_NAME_LEN {
         return Some(format!(
-            "{member} length must not exceed {MAX_RESOURCE_NAME_LEN} characters."
+            "{label} length must be less than {MAX_RESOURCE_NAME_LEN}."
         ));
     }
     let well_formed = name.starts_with(|first: char| first.is_ascii_alphabetic())
@@ -1880,9 +1939,76 @@ pub fn resource_name_rejection(member: &str, name: &str) -> Option<String> {
         && !name.contains("--");
     (!well_formed).then(|| {
         format!(
-            "{member} must begin with a letter; must contain only ASCII letters, digits, \
+            "{label} must begin with a letter; must contain only ASCII letters, digits, \
              and hyphens; and must not end with a hyphen or contain two consecutive \
              hyphens."
+        )
+    })
+}
+
+/// The message a create's already-exists refusal carries, built from the kind of
+/// resource and the FOLDED name the request named.
+///
+/// Each kind has the service's OWN template for it, which is what a caller keying on
+/// the refusal reads: an ACL's also says what to do about it, and a parameter group's
+/// names no group at all.
+pub fn already_exists_message(kind: ResourceKind, name: &str) -> String {
+    match kind {
+        ResourceKind::Acl => {
+            format!("ACL {name} already exists. Please retry with another name.")
+        }
+        ResourceKind::ParameterGroup | ResourceKind::MultiRegionParameterGroup => {
+            "Parameter Group already exists.".to_string()
+        }
+        _ => format!("{} {name} already exists.", kind.label()),
+    }
+}
+
+/// What a request asks of a resource, in the word the service's refusal uses for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mutation {
+    /// An update of the resource (`UpdateUser`, `UpdateACL`, …).
+    Modify,
+    /// A delete of the resource (`DeleteUser`, `DeleteACL`, …).
+    Delete,
+}
+
+impl Mutation {
+    /// How a refusal names what was asked.
+    fn participle(self) -> &'static str {
+        match self {
+            Self::Modify => "modified",
+            Self::Delete => "deleted",
+        }
+    }
+}
+
+/// Why a resource MemoryDB itself provides is not the caller's to change, or `None`
+/// when the request names a resource the caller owns.
+///
+/// The built-ins are the ones [`ComAmazonawsMemorydbAmazonmemorydbState::ensure_builtins`]
+/// materialises — the `default` user and the `open-access` ACL — and EVERY write path
+/// over one reads this, so a caller is refused with one template whichever operation it
+/// sent: the resource named by the name the service gives it, and the action refused.
+/// The caller maps the refusal onto its own modelled `InvalidParameterValueException`.
+pub fn builtin_resource_rejection(
+    kind: ResourceKind,
+    name: &str,
+    mutation: Mutation,
+) -> Option<String> {
+    let built_in = match kind {
+        ResourceKind::User => name == DEFAULT_USER_NAME,
+        ResourceKind::Acl => name == OPEN_ACCESS_ACL_NAME,
+        // The `default.<family>` parameter groups are built-in too, but the service
+        // refuses a write to one with its own wording, which names no group — see
+        // [`immutable_parameter_group_rejection`].
+        _ => false,
+    };
+    built_in.then(|| {
+        format!(
+            "{name} {} can't be {}.",
+            kind.noun(),
+            mutation.participle()
         )
     })
 }
@@ -2255,6 +2381,43 @@ impl ResourceKind {
             Self::SubnetGroup => "Subnet group",
             Self::MultiRegionCluster => "Multi-Region cluster",
             Self::MultiRegionParameterGroup => "Multi-Region parameter group",
+        }
+    }
+
+    /// How a message names this kind of resource mid-sentence, after the resource's own
+    /// name (`"<name> user can't be modified."`): the same word as [`label`], lower
+    /// case except where the service's word for the kind is an acronym.
+    ///
+    /// [`label`]: ResourceKind::label
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Acl => "ACL",
+            Self::Cluster => "cluster",
+            Self::User => "user",
+            Self::ParameterGroup => "parameter group",
+            Self::Snapshot => "snapshot",
+            Self::SubnetGroup => "subnet group",
+            Self::MultiRegionCluster => "Multi-Region cluster",
+            Self::MultiRegionParameterGroup => "Multi-Region parameter group",
+        }
+    }
+
+    /// How the service names this kind of resource's IDENTIFIER when it refuses one:
+    /// a user is identified by its "User id", every other kind by its name.
+    ///
+    /// This is the service's own vocabulary rather than the wire member a request
+    /// carried the name in (`UserName`, `ACLName`, …), so a refusal built from it says
+    /// which rule of the service the name broke — see [`resource_name_rejection`].
+    pub fn name_label(self) -> &'static str {
+        match self {
+            Self::User => "User id",
+            Self::Acl => "ACL name",
+            Self::Cluster => "Cluster name",
+            Self::ParameterGroup => "Parameter group name",
+            Self::Snapshot => "Snapshot name",
+            Self::SubnetGroup => "Subnet group name",
+            Self::MultiRegionCluster => "Multi-Region cluster name",
+            Self::MultiRegionParameterGroup => "Multi-Region parameter group name",
         }
     }
 }

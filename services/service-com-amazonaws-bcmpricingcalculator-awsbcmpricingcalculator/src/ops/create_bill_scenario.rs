@@ -216,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The account-class gate, before the request is read and before anything is
         // written: a bill scenario models what some account will be billed, so planning
         // one belongs to the account that pays that bill.
-        if let Some(refusal) = state.member_account_refusal(Self::NAME) {
+        if let Some(refusal) = state.member_account_refusal() {
             return Err(CreateBillScenarioErrorModeled::ValidationException(refusal).into());
         }
         let now = crate::state::now_secs();

@@ -7,9 +7,13 @@
 //! The operation is a MUTATION with two preconditions the model's own doc states:
 //! "Before you can delete a compute environment, you must set its state to DISABLED with
 //! the UpdateComputeEnvironment API operation and disassociate it from any job queues
-//! with the UpdateJobQueue API operation." A request that breaks either, or that names an
-//! environment this service does not hold, is refused with the modelled `ClientException`
-//! (HTTP 400) and changes nothing.
+//! with the UpdateJobQueue API operation." A request that breaks either is refused with
+//! the modelled `ClientException` (HTTP 400) and changes nothing.
+//!
+//! It is also IDEMPOTENT: an identifier naming an environment this service does not hold
+//! asks for a post-state that already holds, so it answers the same empty success body
+//! rather than a not-found refusal (AWS is recorded answering 200 for a delete of an
+//! absent compute environment).
 //!
 //! A delete AWS accepts does not make the environment vanish inside the call: it moves to
 //! the non-terminal `DELETING` status and the removal is owed by the CLOCK
@@ -160,13 +164,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(now);
 
         let Some(name) = state.compute_environment_name(&input.compute_environment) else {
-            return Err(DeleteComputeEnvironmentErrorModeled::ClientException(
-                batch::client_exception(format!(
-                    "Compute environment {} does not exist",
-                    input.compute_environment
-                )),
-            )
-            .into());
+            // A removal of something that is not there is ALREADY DONE: this operation's
+            // post-state ("the environment is gone") already holds, so it answers its
+            // empty success body and changes nothing. The not-found refusal belongs to
+            // the calls that must read or reconfigure the resource.
+            return Ok(DeleteComputeEnvironmentOutput {});
         };
         let Some(environment) = state.compute_environments.get(&name) else {
             return Err(DeleteComputeEnvironmentErrorModeled::ServerException(

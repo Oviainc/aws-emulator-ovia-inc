@@ -479,12 +479,26 @@ impl ComAmazonawsMwaaAmazonmwaaState {
 /// environment the REQUEST asked for.
 ///
 /// Request-derived, so the form is the rule and the name is whatever the request carried.
-/// Every operation addressed by `Name` — `GetEnvironment`, `UpdateEnvironment`,
-/// `DeleteEnvironment`, `CreateCliToken`, `CreateWebLoginToken`, `InvokeRestApi` — words
-/// the same condition through this one builder, so none of them can drift from the rest.
+/// Every CONTROL-PLANE operation addressed by `Name` — `GetEnvironment`,
+/// `UpdateEnvironment`, `DeleteEnvironment`, `CreateCliToken`, `CreateWebLoginToken` —
+/// words the same condition through this one builder, so none of them can drift from the
+/// rest. `InvokeRestApi` is refused by the environment data endpoint it proxies through
+/// instead, which words it differently: see
+/// [`ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE`].
 pub fn environment_not_found_message(name: &str) -> String {
     format!("Environment {name} not found.")
 }
+
+/// What the environment data endpoint says about an environment it could not resolve.
+///
+/// `InvokeRestApi` is served through that endpoint's proxy to an environment's Apache
+/// Airflow web server, so its not-found refusal is worded by the front door that resolves
+/// the request to a web server — ahead of the request-derived builder above — and names no
+/// environment: the sentence is fixed, and it is carried as the endpoint's own document
+/// payload rather than as a serialized exception (see [`crate::service::env_endpoint`]).
+/// The text itself is only an example of that payload; what a client branches on is the 404
+/// and the `x-amzn-errortype` code beside it.
+pub const ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE: &str = "Environment not found";
 
 /// The message the `/tags/{ResourceArn}` operations' not-found refusal carries.
 ///

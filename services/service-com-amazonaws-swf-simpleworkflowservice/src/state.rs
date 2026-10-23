@@ -716,6 +716,17 @@ impl Domain {
         self.status = STATUS_DEPRECATED.to_string();
     }
 
+    /// Return this domain to [`STATUS_REGISTERED`], the move `UndeprecateDomain` makes:
+    /// "Undeprecates a previously deprecated domain. After a domain has been
+    /// undeprecated it can be used to create new workflow executions or register new
+    /// types." Like [`Domain::deprecate`] it touches the ONE record's own
+    /// `RegistrationStatus` and nothing else: the types registered in the domain keep
+    /// their own status, and the executions, tags, ARN and retention period are left
+    /// exactly as they are.
+    pub fn undeprecate(&mut self) {
+        self.status = STATUS_REGISTERED.to_string();
+    }
+
     /// How many decision tasks are waiting in `task_list` across this domain — what
     /// `CountPendingDecisionTasks` answers with. A task list is scoped to its domain,
     /// so only this domain's runs contribute, and a list no decision task was ever

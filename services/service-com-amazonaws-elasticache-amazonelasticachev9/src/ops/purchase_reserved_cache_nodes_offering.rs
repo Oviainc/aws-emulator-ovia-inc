@@ -181,6 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CacheNodeCount` is "the number of cache node instances to reserve.
         // Default: 1" and carries no modelled `@range`, so a count that cannot
         // be a number of nodes is refused here.
+        //
+        // CC-02 growth bound: the nodes a purchase reserves are bounded below
+        // here and above by the account's reserved-node quota, checked against
+        // the nodes already reserved before anything is stored.
         let cache_node_count = input
             .cache_node_count
             .unwrap_or(crate::state::DEFAULT_CACHE_NODE_COUNT);
@@ -273,9 +277,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => store.mint_reservation_id(now),
         };
 
-        // The store is bounded: past its quota a purchase is refused rather
-        // than reserving another node, which is what
-        // `ReservedCacheNodeQuotaExceededFault` refuses.
+        // CC-02 growth bound: the store is bounded: past its quota a purchase is
+        // refused rather than reserving another node, which is what
+        // `ReservedCacheNodeQuotaExceededFault` refuses. The check counts the
+        // NODES already reserved plus the ones this purchase asks for, so
+        // neither many small purchases nor one large one can pass it.
         let quota = i64::from(crate::state::RESERVED_CACHE_NODE_QUOTA);
         if store.reserved_node_count() + i64::from(cache_node_count) > quota {
             return Err(

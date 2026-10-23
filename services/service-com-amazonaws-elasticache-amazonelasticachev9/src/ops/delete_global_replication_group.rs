@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGlobalReplicationGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteGlobalReplicationGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DeleteGlobalReplicationGroup::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -156,18 +152,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteGlobalReplicationGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteGlobalReplicationGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteGlobalReplicationGroup"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        let key = input.global_replication_group_id.to_ascii_lowercase();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(group) = store.settled_global_replication_group_mut(&key, now) else {
+            return Err(
+                DeleteGlobalReplicationGroupErrorModeled::GlobalReplicationGroupNotFoundFault(
+                    GlobalReplicationGroupNotFoundFault {
+                        message: Some(format!(
+                            "Global Replication Group {} not found.",
+                            input.global_replication_group_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        if !crate::state::GLOBAL_ACTIONABLE_STATUSES.contains(&group.status.as_str()) {
+            return Err(
+                DeleteGlobalReplicationGroupErrorModeled::InvalidGlobalReplicationGroupStateFault(
+                    InvalidGlobalReplicationGroupStateFault {
+                        message: Some(format!(
+                            "Global Replication Group {key} is in {} state, not {}.",
+                            group.status,
+                            crate::state::GLOBAL_ACTIONABLE_STATUSES.join(" or ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "Deleting a Global datastore is a two-step process: first, you must
+        // DisassociateGlobalReplicationGroup to remove the secondary clusters
+        // in the Global datastore" — so a datastore that still has a secondary
+        // member is refused with the modelled state fault rather than taking
+        // the secondaries down with it.
+        if group
+            .members
+            .iter()
+            .any(|member| member.role != crate::state::GLOBAL_ROLE_PRIMARY)
+        {
+            return Err(
+                DeleteGlobalReplicationGroupErrorModeled::InvalidGlobalReplicationGroupStateFault(
+                    InvalidGlobalReplicationGroupStateFault {
+                        message: Some(format!(
+                            "Global Replication Group {key} still has secondary members: \
+                             disassociate them before deleting it."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // `RetainPrimaryReplicationGroup` decides what happens to the primary:
+        // it is kept as a standalone replication group, or it goes with the
+        // datastore.
+        let primary = group
+            .primary()
+            // `replication_groups` is keyed by the lowercased id, the way every
+            // identifier in this service resolves.
+            .map(|member| member.replication_group_id.to_ascii_lowercase());
+        group.status = crate::state::STATUS_DELETING.to_string();
+        group.pending_status = None;
+
+        // The datastore is leaving: the caller is handed it back reporting
+        // `deleting`, and the record is removed so a following describe answers
+        // `GlobalReplicationGroupNotFoundFault`.
+        let deleted = store
+            .global_replication_groups
+            .remove(&key)
+            .map(|group| group.to_modeled(true));
+        if let Some(id) = primary {
+            match store.replication_groups.get(&id) {
+                // A retained primary keeps existing and simply stops belonging
+                // to a datastore; one that is not retained goes with the
+                // datastore — and so do the member CLUSTERS it is made of,
+                // because a replication group's members are real clusters in
+                // this store (see
+                // `crate::state::ComAmazonawsElasticacheAmazonelasticachev9State::set_shard_replica_count`),
+                // and leaving them behind would have `DescribeCacheClusters`
+                // reporting clusters whose `ReplicationGroupId` resolves to
+                // nothing.
+                Some(group) if !input.retain_primary_replication_group => {
+                    let members = group.member_clusters();
+                    for cluster_id in members {
+                        store.cache_clusters.remove(&cluster_id);
+                    }
+                    store.replication_groups.remove(&id);
+                }
+                Some(_) => {
+                    if let Some(replication_group) = store.replication_groups.get_mut(&id) {
+                        replication_group.global_replication_group_id = None;
+                        replication_group.global_member_role = None;
+                    }
+                }
+                None => {}
+            }
+        }
+
+        Ok(DeleteGlobalReplicationGroupOutput {
+            global_replication_group: deleted,
+        })
     }
 }

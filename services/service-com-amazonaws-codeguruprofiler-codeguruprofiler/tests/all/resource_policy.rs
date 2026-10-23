@@ -22,9 +22,9 @@
 //! The harness is the one `profiling_group_lifecycle` exports for this test target, so
 //! the router wiring is assembled in exactly one place.
 //!
-//! The policy itself is seeded into the stored state because the operations that WRITE
-//! it — `PutPermission` and `RemovePermission` — are still scaffold stubs with their own
-//! open issue; what is under test here is the read, which runs over HTTP.
+//! The policy itself is seeded into the stored state here, so what this suite drives
+//! over HTTP is the READ alone; the operations that WRITE a policy, `PutPermission` and
+//! `RemovePermission`, are driven over HTTP by [`crate::permission_writes`].
 
 use std::collections::BTreeMap;
 

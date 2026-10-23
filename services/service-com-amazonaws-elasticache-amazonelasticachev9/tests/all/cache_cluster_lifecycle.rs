@@ -3,233 +3,29 @@
 //! End-to-end tests for the ElastiCache cache-cluster and cache-subnet-group
 //! lifecycle.
 //!
-//! Every assertion goes over the wire: an `awsQuery` form-urlencoded request is
-//! built, dispatched through the same [`MultiServiceRouter`] the production
-//! emulator mounts, and only the HTTP status and the XML body are inspected.
-//! Nothing reaches into the service's state struct, so a response that is not
-//! computed from persisted state cannot pass.
+//! Every assertion goes over the wire through [`crate::harness`]: an
+//! `awsQuery` form-urlencoded request is built, dispatched through the same
+//! `MultiServiceRouter` the production emulator mounts, and only the HTTP
+//! status and the XML body are inspected. Nothing reaches into the service's
+//! state struct, so a response that is not computed from persisted state cannot
+//! pass.
 //!
 //! The tests are tables: each row is one input along the axis the rule under
 //! test generalises over (engine, node count, port, region, page size, subnet
 //! count, apply-immediately), and the `demo-cluster` case from the bootstrap
 //! issue is only one row.
 //!
-//! The wire harness below ([`Emulator`], [`Reply`], [`params`]) is
-//! `pub(crate)`, so the other suites of this test target drive the same router
-//! through the same helpers instead of carrying a second copy of them.
+//! The wire harness this suite drives the emulator through lives in
+//! [`crate::harness`], so every suite of this test target drives the same
+//! router through the same helpers instead of carrying a second copy of them.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
-use service_com_amazonaws_elasticache_amazonelasticachev9::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every test signs with unless it is exercising the region rule
-/// itself.
-///
-/// `pub(crate)` here and below: the sibling suites in `tests/all/` share this
-/// one wire harness rather than carrying copies of it.
-pub(crate) const REGION: &str = "us-east-1";
+use crate::harness::{params, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION};
 
-/// The API version an `awsQuery` client sends beside `Action`, from the model's
-/// service version (`smithy_query(query="service_info")`: `version 2015-02-02`).
-const API_VERSION: &str = "2015-02-02";
-
-/// Long enough past [`state::CLUSTER_TRANSITION`] that the clock owes a cluster
-/// its next status; the handlers never sleep, so only the test waits.
-pub(crate) const PAST_TRANSITION: Duration = Duration::from_millis(750);
-
-/// One wire answer, reduced to what a client branches on: the status, and every
-/// text node in the XML body keyed by its element path.
-///
-/// `pub(crate)` because the other suites of this test target read their answers
-/// through it rather than keeping a second copy of the reader.
-#[derive(Debug)]
-pub(crate) struct Reply {
-    pub(crate) status: u16,
-    pub(crate) body: String,
-    pub(crate) nodes: Vec<(String, String)>,
-}
-
-impl Reply {
-    /// The first text node whose element path ends in `suffix`.
-    pub(crate) fn text(&self, suffix: &str) -> Option<&str> {
-        self.all(suffix).into_iter().next()
-    }
-
-    /// Every text node whose element path ends in `suffix`, in document order.
-    pub(crate) fn all(&self, suffix: &str) -> Vec<&str> {
-        self.nodes
-            .iter()
-            .filter(|(path, _)| path == suffix || path.ends_with(&format!("/{suffix}")))
-            .map(|(_, text)| text.as_str())
-            .collect()
-    }
-
-    /// The `awsQuery` error code (`<ErrorResponse><Error><Code>`), or the empty
-    /// string on a success.
-    pub(crate) fn error_code(&self) -> &str {
-        self.text("Error/Code").unwrap_or_default()
-    }
-
-    /// The pagination `Marker` a describe answered with, if any. `Marker` is the
-    /// only element of that name in either describe's output.
-    pub(crate) fn marker(&self) -> Option<&str> {
-        self.text("Marker")
-    }
-}
-
-/// Resolve the five predefined XML entities in an element's text.
-fn unescape_xml(text: &str) -> String {
-    text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        // `&amp;` last, so `&amp;lt;` does not become `<`.
-        .replace("&amp;", "&")
-}
-
-/// Parse an XML document into `(element path, text)` pairs in document order.
-///
-/// Deliberately a local scanner rather than an XML-crate dependency: adding one
-/// would put this crate's only edit into `Cargo.lock`, the one file every
-/// concurrent fix also edits, and that collision is what kept the merge gate's
-/// squash refusing this change. The bodies parsed here are the awsQuery
-/// envelopes the vendored protocol serializer emits — elements, text and an
-/// `xmlns` attribute — so a scanner over `<` / `>` reads them exactly.
-fn xml_text_nodes(body: &str) -> Vec<(String, String)> {
-    let mut path: Vec<String> = Vec::new();
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut rest = body;
-    while let Some(open) = rest.find('<') {
-        // Whatever precedes the tag is the text of the element now open.
-        let text = rest[..open].trim();
-        if !text.is_empty() && !path.is_empty() {
-            out.push((path.join("/"), unescape_xml(text)));
-        }
-        rest = &rest[open + 1..];
-        let Some(close) = rest.find('>') else {
-            panic!("unterminated XML tag in response body:\n{body}");
-        };
-        let tag = &rest[..close];
-        rest = &rest[close + 1..];
-        // `<?xml …?>`, `<!-- … -->` and `<![CDATA[…]]>` open no element.
-        if tag.starts_with('?') || tag.starts_with('!') {
-            continue;
-        }
-        if tag.starts_with('/') {
-            assert!(
-                path.pop().is_some(),
-                "closing tag with no open element in response body:\n{body}"
-            );
-            continue;
-        }
-        let self_closing = tag.ends_with('/');
-        let name = tag
-            .trim_end_matches('/')
-            .split_whitespace()
-            .next()
-            .unwrap_or_default();
-        if !self_closing {
-            path.push(name.to_string());
-        }
-    }
-    out
-}
-
-/// Percent-encode one form value, leaving only the unreserved characters.
-fn form_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(char::from(byte));
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
-}
-
-/// An emulator with just this service mounted on a fresh engine, driven
-/// in-process through the production router.
-///
-/// `pub(crate)` for the same reason as [`Reply`]: one harness per test target.
-pub(crate) struct Emulator {
-    router: MultiServiceRouter,
-}
-
-impl Emulator {
-    pub(crate) fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        // Signatures are not what these tests are about; the router still routes
-        // by the SigV4 credential scope below, which is also where an ARN's
-        // region comes from.
-        router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
-    }
-
-    /// Send one `awsQuery` call: `Action`, `Version` and the given form pairs.
-    pub(crate) async fn call_in(
-        &self,
-        region: &str,
-        action: &str,
-        params: &[(String, String)],
-    ) -> Reply {
-        let mut body = format!("Action={action}&Version={API_VERSION}");
-        for (key, value) in params {
-            body.push('&');
-            body.push_str(key);
-            body.push('=');
-            body.push_str(&form_encode(value));
-        }
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/elasticache/aws4_request, \
-             SignedHeaders=host, Signature=deadbeef"
-        );
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/")
-            .header("host", format!("elasticache.{region}.amazonaws.com"))
-            .header("authorization", authorization)
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body(Bytes::from(body))
-            .expect("build request");
-
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let bytes = response.into_body();
-        let body = String::from_utf8_lossy(&bytes).into_owned();
-        let nodes = if body.is_empty() {
-            Vec::new()
-        } else {
-            xml_text_nodes(&body)
-        };
-        Reply {
-            status,
-            body,
-            nodes,
-        }
-    }
-
-    pub(crate) async fn call(&self, action: &str, params: &[(String, String)]) -> Reply {
-        self.call_in(REGION, action, params).await
-    }
-}
-
-/// One refusal row: the case name, the form pairs that make the request, and
-/// the HTTP status plus `awsQuery` error code it must be answered with.
-pub(crate) type RefusalCase = (
-    &'static str,
-    &'static [(&'static str, &'static str)],
-    u16,
-    &'static str,
-);
 
 /// One refusal row whose request has to be BUILT rather than listed, because a
 /// value in it is derived (a subnet id the account has): the case name, the form
@@ -245,14 +41,6 @@ type PlacementCase = (
     usize,
     &'static str,
 );
-
-/// `[("A", "b")]` as the owned pairs [`Emulator::call`] takes.
-pub(crate) fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-    pairs
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect()
-}
 
 /// The subnets the account HAS in [`REGION`] — the only subnet ids a request may
 /// name, derived from the Region exactly as every service that places a resource
@@ -731,10 +519,10 @@ async fn a_create_naming_a_resource_this_emulator_does_not_hold_is_refused() {
             "ReplicationGroupNotFoundFault",
         ),
         (
-            "unknown cache security group",
+            "cache security group named at all",
             &[("CacheSecurityGroupNames.CacheSecurityGroupName.1", "sg-a")],
-            404,
-            "CacheSecurityGroupNotFound",
+            400,
+            "InvalidParameterValue",
         ),
         (
             "unknown parameter group",

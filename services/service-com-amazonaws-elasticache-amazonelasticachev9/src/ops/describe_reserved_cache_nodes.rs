@@ -215,7 +215,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Duration` is "specified in years or seconds" with its own valid
         // values, and `OfferingType` has its own documented value set; neither
         // carries a modelled constraint, so a value outside the set is refused
-        // here rather than quietly matching nothing.
+        // here rather than quietly matching nothing. Both go through the same
+        // helpers the offerings describe uses, so the two operations agree on
+        // the forms they accept.
         let duration_seconds = match input.duration.as_deref() {
             Some(value) => match crate::state::parse_offering_duration(value) {
                 Ok(seconds) => Some(seconds),

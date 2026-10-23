@@ -24,9 +24,8 @@
 use service_com_amazonaws_elasticache_amazonelasticachev9::ops::list_allowed_node_type_modifications as op;
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::cache_cluster_lifecycle::{
-    create_cluster, params, Emulator, RefusalCase, Reply, PAST_TRANSITION,
-};
+use crate::cache_cluster_lifecycle::create_cluster;
+use crate::harness::{params, Emulator, RefusalCase, Reply, PAST_TRANSITION};
 
 /// Create one cluster through the harness's own create helper, failing the case
 /// if the create itself did not land.

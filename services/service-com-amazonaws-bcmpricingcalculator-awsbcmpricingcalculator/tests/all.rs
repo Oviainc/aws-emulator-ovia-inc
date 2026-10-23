@@ -21,6 +21,8 @@ mod preferences;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_refusal_detail.rs"]
+mod validation_refusal_detail;
 #[path = "all/validation_refusal_framing.rs"]
 mod validation_refusal_framing;
 #[path = "all/workload_estimate_deletion.rs"]
