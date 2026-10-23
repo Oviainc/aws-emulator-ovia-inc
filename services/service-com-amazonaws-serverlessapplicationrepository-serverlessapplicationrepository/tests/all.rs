@@ -19,6 +19,8 @@ mod application_mutations;
 mod application_policies;
 #[path = "all/applications.rs"]
 mod applications;
+#[path = "all/cloudformation_templates.rs"]
+mod cloudformation_templates;
 #[path = "all/error_bodies.rs"]
 mod error_bodies;
 #[path = "all/state_roundtrip.rs"]

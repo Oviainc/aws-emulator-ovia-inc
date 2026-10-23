@@ -36,6 +36,10 @@ use smithy_server_runtime::MultiServiceRouter;
 /// building their own.
 pub(crate) struct Repo {
     router: MultiServiceRouter,
+    /// The one shared engine this service is mounted on, so a suite that asserts a
+    /// transition the CLOCK owes can hold the store's due instant instead of sleeping for
+    /// it. No test reaches it to write what a handler should have written.
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 /// One HTTP answer: the status, the raw body (so an empty 204 body can be asserted) and
@@ -64,8 +68,8 @@ impl Repo {
         let mut router = MultiServiceRouter::new();
         // The signature itself is not under test here; the handlers are.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
     }
 
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Answer {
@@ -1792,11 +1796,6 @@ async fn the_operations_this_slice_leaves_alone_still_answer_501() {
             "UnshareApplication",
             "POST",
             format!("/applications/{label}/unshare"),
-        ),
-        (
-            "CreateCloudFormationTemplate",
-            "POST",
-            format!("/applications/{label}/templates"),
         ),
         (
             "CreateCloudFormationChangeSet",
