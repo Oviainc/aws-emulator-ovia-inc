@@ -503,6 +503,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // source's resource tree only, so a cloned API starts with neither.
             stages: BTreeMap::new(),
             deployments: BTreeMap::new(),
+            // Nor with any documentation part: `CreateDocumentationPart` and
+            // `ImportDocumentationParts` are what write them, and a clone copies the
+            // source's resource tree only.
+            documentation_parts: BTreeMap::new(),
             // `CreateAuthorizer` is what adds an authorizer, and a clone copies the
             // source's resource tree only, so a created API starts with none.
             authorizers: BTreeMap::new(),

@@ -16,8 +16,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
-    CanarySettings, EndpointConfiguration, GetIntegrationOutput, GetMethodResponseOutput,
-    MethodSetting, MethodSnapshot,
+    CanarySettings, DocumentationPartLocation, EndpointConfiguration, GetIntegrationOutput,
+    GetMethodResponseOutput, MethodSetting, MethodSnapshot,
 };
 
 /// Per-service state for com-amazonaws-apigateway-backplanecontrolservice. A handler reaches it through [`service_state`].
@@ -71,6 +71,10 @@ pub struct RestApiEntry {
     pub stages: BTreeMap<String, StageEntry>,
     /// Every `Deployment` of this API, keyed by deployment id: what a stage points at.
     pub deployments: BTreeMap<String, DeploymentEntry>,
+    /// Every `DocumentationPart` of this API, keyed by documentation part id: the
+    /// records `CreateDocumentationPart` and `ImportDocumentationParts` write and
+    /// `GetDocumentationPart` / `GetDocumentationParts` report.
+    pub documentation_parts: BTreeMap<String, DocumentationPartEntry>,
     /// Every `Authorizer` of this API, keyed by authorizer id — the identifier a
     /// `Method`'s `authorizerId` names and `GetAuthorizer` takes in its path label.
     pub authorizers: BTreeMap<String, AuthorizerEntry>,
@@ -117,6 +121,14 @@ impl RestApiEntry {
             }
         }
         found.into_iter().collect()
+    }
+
+    /// This API's documentation parts in creation order — the stable sequence
+    /// [`page_of`] cuts a `GetDocumentationParts` page out of.
+    pub fn documentation_parts_in_creation_order(&self) -> Vec<&DocumentationPartEntry> {
+        let mut ordered: Vec<&DocumentationPartEntry> = self.documentation_parts.values().collect();
+        ordered.sort_by_key(|part| (part.sequence, part.id.clone()));
+        ordered
     }
 }
 
@@ -197,6 +209,26 @@ pub struct DeploymentEntry {
     pub api_summary: BTreeMap<String, BTreeMap<String, MethodSnapshot>>,
     /// This deployment's creation rank, from
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`].
+    pub sequence: u64,
+}
+
+/// One stored `DocumentationPart`: the API entity the documentation applies to, and the
+/// content map describing it.
+///
+/// `location` is kept as the modelled [`DocumentationPartLocation`] rather than a second
+/// hand-written mirror of its five members, for the reason the module docs give — and it
+/// is stored COMPLETED (the members the entity type makes valid, defaulted where the
+/// model documents a default), so every read of the part reports the same location.
+#[derive(Debug, Clone, Default)]
+pub struct DocumentationPartEntry {
+    pub id: String,
+    pub location: DocumentationPartLocation,
+    /// The content map, as the JSON text the request supplied: "The map must be encoded
+    /// as a JSON string" (`DocumentationPart$properties`).
+    pub properties: String,
+    /// This part's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
+    /// listing reports creation order rather than id order.
     pub sequence: u64,
 }
 
@@ -397,6 +429,9 @@ pub const MAX_API_KEYS: usize = 10_000;
 
 /// API Gateway's default quota "Resources per API: 300".
 pub const MAX_RESOURCES_PER_API: usize = 300;
+
+/// API Gateway's default quota "Documentation parts: 2000 per API".
+pub const MAX_DOCUMENTATION_PARTS_PER_API: usize = 2_000;
 
 /// API Gateway's default quota "Stages per API: 10".
 pub const MAX_STAGES_PER_API: usize = 10;
@@ -1084,6 +1119,10 @@ pub const NO_SUCH_DEPLOYMENT: &str = "Invalid deployment identifier specified";
 
 /// The `NotFoundException` message for an `apiKey` that names no stored API key.
 pub const NO_SUCH_API_KEY: &str = "Invalid API Key identifier specified";
+
+/// The `NotFoundException` message for a `documentationPartId` that names no stored
+/// documentation part of the API.
+pub const NO_SUCH_DOCUMENTATION_PART: &str = "Invalid Documentation part identifier specified";
 
 /// The `NotFoundException` message for an `authorizerId` that names no stored authorizer
 /// of the API.

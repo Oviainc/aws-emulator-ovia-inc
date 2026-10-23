@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDocumentationParts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDocumentationParts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDocumentationParts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored `DocumentationPart`s of `restApiId` in creation
+//! order, narrowed by the request's `type`, `name`, `path` and `locationStatus` filters
+//! and cut into a `position`/`limit` page.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +82,56 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::DocumentationPartEntry;
+
+/// Whether a stored part counts as `DOCUMENTED` for the request's `locationStatus`
+/// filter.
+///
+/// From `GetDocumentationPartsRequest$locationStatus`: "Valid values are `DOCUMENTED` for
+/// retrieving DocumentationPart resources with content and `UNDOCUMENTED` for
+/// DocumentationPart resources without content." A part's content is its `properties`
+/// content map, so a part whose map holds at least one key has content and one whose map
+/// is empty (`{}`) does not. The map is stored as the JSON object
+/// [`crate::ops::create_documentation_part::validated_properties`] read, so text that is
+/// no longer readable as one is judged by whether it carries anything at all.
+fn has_content(properties: &str) -> bool {
+    match ::serde_json::from_str::<::serde_json::Value>(properties) {
+        Ok(::serde_json::Value::Object(map)) => !map.is_empty(),
+        _ => !properties.trim().is_empty(),
+    }
+}
+
+/// Whether `part` satisfies every filter the request set.
+///
+/// Each filter names the documentation parts of the API entities it describes — their
+/// `type`, their `name`, their `path` — so a part is reported only when its stored
+/// location matches every one the request carries, and a request that carries none
+/// reports the API's parts as they stand.
+fn matches_filters(part: &DocumentationPartEntry, input: &GetDocumentationPartsInput) -> bool {
+    if let Some(entity_type) = &input.r#type {
+        if part.location.r#type != *entity_type {
+            return false;
+        }
+    }
+    if let Some(name) = &input.name_query {
+        if part.location.name.as_deref() != Some(name.as_str()) {
+            return false;
+        }
+    }
+    if let Some(path) = &input.path {
+        if part.location.path.as_deref() != Some(path.as_str()) {
+            return false;
+        }
+    }
+    match input.location_status.as_deref() {
+        Some("DOCUMENTED") => has_content(&part.properties),
+        Some("UNDOCUMENTED") => !has_content(&part.properties),
+        // The modelled enum has no third value, and the boundary validator refuses one:
+        // an absent `locationStatus` filters nothing.
+        _ => true,
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +203,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDocumentationParts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDocumentationPartsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDocumentationParts"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let store = state.lock();
+        let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+            GetDocumentationPartsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+        // The filters narrow the collection BEFORE it is paged, so `limit` counts the
+        // parts the caller asked for and a `position` cursor walks that same sequence.
+        let ordered: Vec<String> = api
+            .documentation_parts_in_creation_order()
+            .into_iter()
+            .filter(|part| matches_filters(part, &input))
+            .map(|part| part.id.clone())
+            .collect();
+        let page = crate::state::page_of(&ordered, input.position.as_deref(), input.limit)
+            .map_err(|message| {
+                GetDocumentationPartsErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+            })?;
+        let items = page
+            .ids
+            .iter()
+            .filter_map(|id| api.documentation_parts.get(id))
+            .map(super::create_documentation_part::documentation_part_body)
+            .collect();
+        Ok(GetDocumentationPartsOutput {
+            items: Some(items),
+            position: page.next_position,
+        })
     }
 }
