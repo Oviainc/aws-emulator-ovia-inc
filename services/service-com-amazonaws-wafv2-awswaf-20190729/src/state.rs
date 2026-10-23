@@ -22,9 +22,9 @@ use ::aws_smithy_schema_server::constraints::{
 };
 
 use crate::ops::types::{
-    IPSet, Rule, Statement, Tag, WAFAssociatedItemException, WAFDuplicateItemException,
-    WAFInvalidParameterException, WAFLimitsExceededException, WAFNonexistentItemException,
-    WAFOptimisticLockException, WebACL,
+    IPSet, OnSourceDDoSProtectionConfig, Rule, Statement, Tag, WAFAssociatedItemException,
+    WAFDuplicateItemException, WAFInvalidParameterException, WAFLimitsExceededException,
+    WAFNonexistentItemException, WAFOptimisticLockException, WebACL,
 };
 
 /// The `Scope` values the model declares
@@ -418,6 +418,10 @@ pub const MAX_IP_SET_ADDRESSES: usize = 10_000;
 ///
 /// One place names every nesting the model has, so the depth validator and both
 /// tree walks below agree on what "nested" means.
+///
+/// [`nested_statements_mut`] is its mutable twin, arm for arm: a nesting the model
+/// grows has to be added to BOTH, or a default would be applied on one walk and
+/// not the other.
 fn nested_statements(statement: &Statement) -> Vec<&Statement> {
     let mut nested: Vec<&Statement> = Vec::new();
     if let Some(and) = statement.and_statement.as_ref() {
@@ -440,6 +444,41 @@ fn nested_statements(statement: &Statement) -> Vec<&Statement> {
         .managed_rule_group_statement
         .as_ref()
         .and_then(|managed| managed.scope_down_statement.as_deref())
+    {
+        nested.push(scope_down);
+    }
+    nested
+}
+
+/// [`nested_statements`], mutably: the statements nested directly inside
+/// `statement`, in no particular order.
+///
+/// Used by [`apply_rule_defaults`] to reach every statement of a tree in place.
+/// Each arm borrows a DIFFERENT field of `statement`, so the borrows are disjoint.
+/// Kept arm for arm in step with [`nested_statements`]: a nesting the model grows
+/// belongs in both.
+fn nested_statements_mut(statement: &mut Statement) -> Vec<&mut Statement> {
+    let mut nested: Vec<&mut Statement> = Vec::new();
+    if let Some(and) = statement.and_statement.as_mut() {
+        nested.extend(and.statements.iter_mut());
+    }
+    if let Some(or) = statement.or_statement.as_mut() {
+        nested.extend(or.statements.iter_mut());
+    }
+    if let Some(not) = statement.not_statement.as_mut() {
+        nested.push(&mut not.statement);
+    }
+    if let Some(scope_down) = statement
+        .rate_based_statement
+        .as_mut()
+        .and_then(|rate| rate.scope_down_statement.as_deref_mut())
+    {
+        nested.push(scope_down);
+    }
+    if let Some(scope_down) = statement
+        .managed_rule_group_statement
+        .as_mut()
+        .and_then(|managed| managed.scope_down_statement.as_deref_mut())
     {
         nested.push(scope_down);
     }
@@ -729,6 +768,38 @@ pub fn web_acl_capacity(rules: &[Rule]) -> i64 {
         .sum()
 }
 
+/// The WCUs one `ByteMatchStatement` consumes.
+///
+/// The WCU table lives in the WAF Developer Guide, not in the Smithy model
+/// (`WebACL$Capacity` only points at that guide), so where the recorded wire corpus
+/// prices a statement it is the authority here: a recorded web ACL whose three
+/// rules each hold ONE `ByteMatchStatement` — over a single field, with one `NONE`
+/// text transformation and a `CONTAINS` positional constraint — reports `Capacity`
+/// 30, so one such statement costs 10 rather than the 1 a plain single-field match
+/// is often quoted at. Nothing available here prices the other positional
+/// constraints separately, so every byte match costs this.
+pub const BYTE_MATCH_WCU: i64 = 10;
+
+/// The WCUs one `RateBasedStatement` consumes before anything it nests.
+///
+/// Pinned by the recorded corpus: a web ACL holding exactly one rate-based rule
+/// that aggregates on `IP`, with no scope-down statement and no custom keys,
+/// reports `Capacity` 2.
+pub const RATE_BASED_WCU: i64 = 2;
+
+/// The WCUs a `RateBasedStatement` adds when it aggregates on CUSTOM KEYS.
+///
+/// Aggregating on request components costs more than aggregating on the source IP,
+/// because WAF has to extract and hash the components of every request:
+/// `RateBasedStatement$AggregateKeyType` documents `CUSTOM_KEYS` as "aggregate the
+/// request counts using one or more web request components as the aggregate keys",
+/// specified in `CustomKeys`. Pinned by the recorded corpus: the same web ACL,
+/// updated so its one rate-based rule aggregates on a custom key, reports
+/// `Capacity` 32 — [`RATE_BASED_WCU`] plus this. The recording pins the cost of
+/// aggregating on custom keys, not a price per key (`RateBasedStatementCustomKeys`
+/// is `length 0..5`), so it is charged once for the list.
+pub const RATE_BASED_CUSTOM_KEYS_WCU: i64 = 30;
+
 /// The WCU cost of one statement. See [`web_acl_capacity`].
 ///
 /// `depth_budget` bounds the descent exactly as in
@@ -740,10 +811,12 @@ fn statement_capacity(statement: &Statement, depth_budget: u32) -> i64 {
         return 0;
     }
     let mut capacity = 0_i64;
-    // Base cost 1: byte match, size constraint, geo match, IP set reference,
-    // label match and ASN match statements.
+    if statement.byte_match_statement.is_some() {
+        capacity += BYTE_MATCH_WCU;
+    }
+    // Base cost 1: size constraint, geo match, IP set reference, label match and
+    // ASN match statements.
     for present in [
-        statement.byte_match_statement.is_some(),
         statement.size_constraint_statement.is_some(),
         statement.geo_match_statement.is_some(),
         statement.ip_set_reference_statement.is_some(),
@@ -766,16 +839,104 @@ fn statement_capacity(statement: &Statement, depth_budget: u32) -> i64 {
     if statement.regex_pattern_set_reference_statement.is_some() {
         capacity += 25;
     }
-    // A rate-based statement costs 2 on its own; every nesting (logical operator
-    // or scope-down) costs what it nests, which `nested_statements` enumerates.
-    if statement.rate_based_statement.is_some() {
-        capacity += 2;
+    // A rate-based statement costs `RATE_BASED_WCU` on its own, plus
+    // `RATE_BASED_CUSTOM_KEYS_WCU` when it aggregates on custom keys; every nesting
+    // (logical operator or scope-down) costs what it nests, which
+    // `nested_statements` enumerates.
+    if let Some(rate) = statement.rate_based_statement.as_ref() {
+        capacity += RATE_BASED_WCU;
+        if !rate.custom_keys.as_deref().unwrap_or_default().is_empty() {
+            capacity += RATE_BASED_CUSTOM_KEYS_WCU;
+        }
     }
     capacity += nested_statements(statement)
         .into_iter()
         .map(|nested| statement_capacity(nested, depth_budget - 1))
         .sum::<i64>();
     capacity
+}
+
+/// The `Description` a WAFv2 entity reports when the save that created it supplied
+/// none.
+///
+/// Every WAFv2 response that carries an entity, or one of its `…Summary`
+/// projections, carries the `Description` member: the recorded wire responses show
+/// `""` for an entity saved without a description, rather than the member being
+/// omitted. So the empty string is what gets STORED, and `Get`, `Create` and
+/// `List` all report it from state instead of each deciding whether to emit the
+/// member. (`EntityDescription` is modelled `length 1..256`, which bounds what a
+/// REQUEST may carry; the empty description a RESPONSE reports is recorded
+/// behaviour.)
+pub fn stored_description(requested: Option<String>) -> Option<String> {
+    Some(requested.unwrap_or_default())
+}
+
+/// The DDoS-protection mode a web ACL carries when the save names none.
+///
+/// `OnSourceDDoSProtectionConfig$ALBLowReputationMode` documents
+/// `ACTIVE_UNDER_DDOS` as "enabled by default whenever a web ACL is associated with
+/// an Application Load Balancer", and the member is `required` inside the
+/// structure, so the account default is a real stored value — not an absent
+/// structure — and a read reports it.
+pub const DEFAULT_ALB_LOW_REPUTATION_MODE: &str = "ACTIVE_UNDER_DDOS";
+
+/// The evaluation window a rate-based statement carries when the save names none.
+///
+/// `RateBasedStatement$EvaluationWindowSec` documents "Valid settings are 60, 120,
+/// 300, and 600" and "Default: `300` (5 minutes)". The member's modelled
+/// zero-value default is `0`, which is not one of the valid settings, so a request
+/// that omits it arrives here as `0` and WAF's documented default is what gets
+/// stored.
+pub const DEFAULT_EVALUATION_WINDOW_SEC: i64 = 300;
+
+/// Materialise, in place, every default WAF applies inside a saved rule tree.
+///
+/// Walked with an explicit worklist, like [`validate_statement_nesting`]: the tree
+/// is supplied by the request, so nothing here may consume stack in proportion to
+/// its depth. A default is applied wherever the statement that carries it sits,
+/// top level or nested.
+pub fn apply_rule_defaults(rules: &mut [Rule]) {
+    let mut pending: Vec<&mut Statement> = rules.iter_mut().map(|rule| &mut rule.statement).collect();
+    while let Some(statement) = pending.pop() {
+        if let Some(rate) = statement
+            .rate_based_statement
+            .as_mut()
+            .filter(|rate| rate.evaluation_window_sec == 0)
+        {
+            rate.evaluation_window_sec = DEFAULT_EVALUATION_WINDOW_SEC;
+        }
+        pending.extend(nested_statements_mut(statement));
+    }
+}
+
+/// Materialise, on a web ACL about to be stored, every member WAF derives or
+/// defaults server-side on a save.
+///
+/// One place, called by both `CreateWebACL` and `UpdateWebACL`, so a read cannot
+/// see a web ACL that was created one way and updated another:
+///
+/// * `Description` — [`stored_description`].
+/// * `Rules` — always a list, so a read of a rule-less web ACL answers `[]` rather
+///   than omitting the member; `Rules` is "the Rule statements used to identify the
+///   web requests that you want to manage", and a web ACL with none has an empty
+///   collection of them, not an unknown one.
+/// * `OnSourceDDoSProtectionConfig` — [`DEFAULT_ALB_LOW_REPUTATION_MODE`].
+/// * `Capacity` — [`web_acl_capacity`] of the stored rules, which is why it is
+///   computed AFTER the rule defaults are applied.
+pub fn apply_web_acl_defaults(web_acl: &mut WebACL) {
+    web_acl.description = stored_description(web_acl.description.take());
+    let mut rules = web_acl.rules.take().unwrap_or_default();
+    apply_rule_defaults(&mut rules);
+    web_acl.capacity = web_acl_capacity(&rules);
+    web_acl.rules = Some(rules);
+    web_acl.on_source_d_do_s_protection_config = Some(
+        web_acl
+            .on_source_d_do_s_protection_config
+            .take()
+            .unwrap_or_else(|| OnSourceDDoSProtectionConfig {
+                alb_low_reputation_mode: DEFAULT_ALB_LOW_REPUTATION_MODE.to_string(),
+            }),
+    );
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

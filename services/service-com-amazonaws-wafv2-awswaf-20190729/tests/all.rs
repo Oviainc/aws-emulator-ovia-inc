@@ -15,6 +15,8 @@
 mod exception_messages;
 #[path = "all/parameter_validation.rs"]
 mod parameter_validation;
+#[path = "all/response_members.rs"]
+mod response_members;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/web_acl_lifecycle.rs"]

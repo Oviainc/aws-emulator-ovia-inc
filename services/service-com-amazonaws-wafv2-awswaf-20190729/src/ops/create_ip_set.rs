@@ -271,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name.clone(),
             id: id.clone(),
             arn: arn.clone(),
-            description: input.description.clone(),
+            description: crate::state::stored_description(input.description.clone()),
             ip_address_version: input.ip_address_version.clone(),
             addresses: input.addresses.clone(),
         };

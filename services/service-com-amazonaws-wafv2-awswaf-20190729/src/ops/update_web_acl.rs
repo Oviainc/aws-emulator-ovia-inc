@@ -384,14 +384,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // `Name`, `Id` and `ARN` are immutable; everything the request carries
         // replaces what was stored, and a member the request omits is cleared — an
-        // update is a whole-resource overwrite, not a merge.
-        let rules = input.rules.clone().unwrap_or_default();
+        // update is a whole-resource overwrite, not a merge. The server-side
+        // defaults and derived members are then materialised exactly as at create,
+        // so a web ACL reads back the same way however it was last saved.
         entry.web_acl.default_action = input.default_action;
         entry.web_acl.description = input.description;
         entry.web_acl.rules = input.rules;
         entry.web_acl.visibility_config = input.visibility_config;
         entry.web_acl.data_protection_config = input.data_protection_config;
-        entry.web_acl.capacity = crate::state::web_acl_capacity(&rules);
         entry.web_acl.custom_response_bodies = input.custom_response_bodies;
         entry.web_acl.captcha_config = input.captcha_config;
         entry.web_acl.challenge_config = input.challenge_config;
@@ -400,6 +400,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         entry.web_acl.on_source_d_do_s_protection_config = input.on_source_d_do_s_protection_config;
         entry.web_acl.application_config = input.application_config;
         entry.web_acl.monetization_config = input.monetization_config;
+        crate::state::apply_web_acl_defaults(&mut entry.web_acl);
 
         // The token rotates on every successful mutation, so the one the caller just
         // used stops working.

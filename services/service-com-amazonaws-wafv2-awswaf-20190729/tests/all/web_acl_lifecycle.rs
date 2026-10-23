@@ -149,7 +149,7 @@ pub(crate) fn rule(name: &str, statement: Value) -> Value {
 }
 
 /// A `SqliMatchStatement` over the query string.
-fn sqli_statement() -> Value {
+pub(crate) fn sqli_statement() -> Value {
     json!({
         "SqliMatchStatement": {
             "FieldToMatch": { "QueryString": {} },
@@ -623,8 +623,10 @@ async fn scopes_are_independent_namespaces_with_their_own_arn_form() {
 }
 
 /// `ListWebACLs` pages: at most `Limit` summaries per call, resumed with the
-/// `NextMarker` of the previous page, and no `NextMarker` on the last page. One
-/// row per page size, including a page size equal to and larger than the whole
+/// `NextMarker` of the previous page. WAF answers every non-empty page with a
+/// `NextMarker` — the name of its last summary, whether or not the page is full —
+/// so the paginator's loop ends on the empty page that follows the last full one.
+/// One row per page size, including a page size equal to and larger than the whole
 /// collection.
 #[tokio::test]
 async fn list_web_acls_pages_by_limit_and_next_marker() {
@@ -643,7 +645,7 @@ async fn list_web_acls_pages_by_limit_and_next_marker() {
         loop {
             pages += 1;
             assert!(
-                pages <= all_names.len() + 1,
+                pages <= all_names.len() + 2,
                 "case {case:?}: paging did not terminate after {pages} pages"
             );
             let mut request = json!({ "Scope": "REGIONAL", "Limit": limit });
@@ -668,12 +670,13 @@ async fn list_web_acls_pages_by_limit_and_next_marker() {
                 seen.push(name);
             }
             marker = page["NextMarker"].as_str().map(str::to_string);
-            let more_remain = seen.len() < all_names.len();
             assert_eq!(
-                marker.is_some(),
-                more_remain,
-                "case {case:?}: page {pages} must carry a NextMarker only while more \
-                 remain, got {page}"
+                marker.as_deref(),
+                summaries
+                    .last()
+                    .map(|summary| summary["Name"].as_str().expect("Name")),
+                "case {case:?}: page {pages} must carry the last summary's name as its \
+                 NextMarker, got {page}"
             );
             if marker.is_none() {
                 break;
@@ -686,12 +689,13 @@ async fn list_web_acls_pages_by_limit_and_next_marker() {
         );
         assert_eq!(
             pages,
-            all_names.len().div_ceil(limit),
-            "case {case:?}: expected ceil(5 / limit) pages, got {pages}"
+            all_names.len().div_ceil(limit) + 1,
+            "case {case:?}: expected ceil(5 / limit) full pages plus the empty page \
+             that ends the loop, got {pages}"
         );
     }
 
-    // No `Limit` at all: one page with everything on it.
+    // No `Limit` at all: one page with everything on it — and still a marker.
     let page = waf.ok("ListWebACLs", json!({ "Scope": "REGIONAL" })).await;
     let names: Vec<String> = page["WebACLs"]
         .as_array()
@@ -703,9 +707,11 @@ async fn list_web_acls_pages_by_limit_and_next_marker() {
         names, all_names,
         "an unlimited ListWebACLs must answer every web ACL, got {page}"
     );
-    assert!(
-        page["NextMarker"].is_null(),
-        "an unlimited ListWebACLs that answered everything must omit NextMarker, got {page}"
+    assert_eq!(
+        page["NextMarker"],
+        json!(all_names.last().expect("a last name")),
+        "an unlimited ListWebACLs must still carry its last summary's name as \
+         NextMarker, got {page}"
     );
 }
 
@@ -806,14 +812,26 @@ async fn delete_ip_set_refuses_while_any_rule_tree_references_it() {
 }
 
 /// `WebACL$Capacity` is "the web ACL capacity units (WCUs) currently being used by
-/// this web ACL", so it is derived from the stored rules: the base cost the WAF
-/// Developer Guide publishes per statement, summed, with a logical statement
-/// costing what it nests. One row per statement kind and per nesting form.
+/// this web ACL", so it is derived from the stored rules: each statement's own WCU
+/// cost, summed, with a logical statement costing what it nests. One row per
+/// statement kind and per nesting form. Three rows are the costs the recorded
+/// corpus pins: a web ACL of three byte-match rules reports 30
+/// (`state::BYTE_MATCH_WCU`), one holding a bare `IP`-aggregated rate-based rule
+/// reports 2 (`state::RATE_BASED_WCU`), and the same rule aggregating on a custom
+/// key reports 32 (plus `state::RATE_BASED_CUSTOM_KEYS_WCU`).
 #[tokio::test]
 async fn web_acl_capacity_is_derived_from_the_stored_rules() {
     let waf = Waf::new();
     let (_ip_set_id, ip_set_arn, _lock) = create_ip_set(&waf, "REGIONAL", "capacity-ips").await;
     let ip_set_reference = json!({ "IPSetReferenceStatement": { "ARN": ip_set_arn } });
+    let byte_match = json!({
+        "ByteMatchStatement": {
+            "SearchString": "YQ==",
+            "FieldToMatch": { "UriPath": {} },
+            "TextTransformations": [{ "Priority": 0, "Type": "NONE" }],
+            "PositionalConstraint": "CONTAINS",
+        }
+    });
 
     let cases: Vec<(&str, Value, i64)> = vec![
         ("no rules", json!([]), 0),
@@ -821,6 +839,61 @@ async fn web_acl_capacity_is_derived_from_the_stored_rules() {
             "one IP set reference",
             json!([rule("a", ip_set_reference.clone())]),
             1,
+        ),
+        ("one byte match", json!([rule("a", byte_match.clone())]), 10),
+        (
+            "three byte matches",
+            json!([
+                rule("a", byte_match.clone()),
+                rule("b", byte_match.clone()),
+                rule("c", byte_match.clone()),
+            ]),
+            30,
+        ),
+        (
+            "one bare rate-based statement",
+            json!([rule(
+                "a",
+                json!({
+                    "RateBasedStatement": {
+                        "Limit": 2000,
+                        "AggregateKeyType": "IP",
+                    }
+                })
+            )]),
+            2,
+        ),
+        (
+            "a rate-based statement aggregating on one custom key",
+            json!([rule(
+                "a",
+                json!({
+                    "RateBasedStatement": {
+                        "Limit": 2000,
+                        "AggregateKeyType": "CUSTOM_KEYS",
+                        "CustomKeys": [{ "HTTPMethod": {} }],
+                    }
+                })
+            )]),
+            32,
+        ),
+        (
+            "a rate-based statement aggregating on three custom keys",
+            json!([rule(
+                "a",
+                json!({
+                    "RateBasedStatement": {
+                        "Limit": 2000,
+                        "AggregateKeyType": "CUSTOM_KEYS",
+                        "CustomKeys": [
+                            { "HTTPMethod": {} },
+                            { "QueryString": { "TextTransformations": [{ "Priority": 0, "Type": "NONE" }] } },
+                            { "UriPath": { "TextTransformations": [{ "Priority": 0, "Type": "NONE" }] } },
+                        ],
+                    }
+                })
+            )]),
+            32,
         ),
         ("one SQLi match", json!([sqli_rule("a")]), 20),
         ("one XSS match", json!([rule("a", xss_statement())]), 40),
@@ -830,7 +903,7 @@ async fn web_acl_capacity_is_derived_from_the_stored_rules() {
             21,
         ),
         (
-            "an AndStatement of two",
+            "an AndStatement of two cheap statements",
             json!([rule(
                 "a",
                 json!({
@@ -842,6 +915,18 @@ async fn web_acl_capacity_is_derived_from_the_stored_rules() {
             2,
         ),
         (
+            "an AndStatement of two SQLi matches",
+            json!([rule(
+                "a",
+                json!({
+                    "AndStatement": {
+                        "Statements": [sqli_statement(), sqli_statement()]
+                    }
+                })
+            )]),
+            40,
+        ),
+        (
             "a NotStatement",
             json!([rule(
                 "a",
@@ -850,7 +935,7 @@ async fn web_acl_capacity_is_derived_from_the_stored_rules() {
             20,
         ),
         (
-            "a rate-based statement with a scope-down",
+            "a rate-based statement with a cheap scope-down",
             json!([rule(
                 "a",
                 json!({
@@ -862,6 +947,35 @@ async fn web_acl_capacity_is_derived_from_the_stored_rules() {
                 })
             )]),
             3,
+        ),
+        (
+            "a rate-based statement with an XSS scope-down",
+            json!([rule(
+                "a",
+                json!({
+                    "RateBasedStatement": {
+                        "Limit": 1000,
+                        "AggregateKeyType": "IP",
+                        "ScopeDownStatement": xss_statement(),
+                    }
+                })
+            )]),
+            42,
+        ),
+        (
+            "custom keys and a scope-down together",
+            json!([rule(
+                "a",
+                json!({
+                    "RateBasedStatement": {
+                        "Limit": 1000,
+                        "AggregateKeyType": "CUSTOM_KEYS",
+                        "CustomKeys": [{ "HTTPMethod": {} }],
+                        "ScopeDownStatement": ip_set_reference.clone(),
+                    }
+                })
+            )]),
+            33,
         ),
     ];
 
