@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AllocateAddress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AllocateAddress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AllocateAddress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: allocates an Elastic IP address out of Amazon's pool of IPv4 addresses,
+//! persists it in [`crate::state`] and answers with the STORED record — the same record
+//! `DescribeAddresses` reports. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +170,218 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AllocateAddress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AllocateAddressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AllocateAddress"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            address_limit_exceeded, address_payload_bytes, internal_error,
+            invalid_address_not_found, is_ipv4_address, network_border_group_of_region,
+            request_region, require_service_state, tag_list_bytes, tags_from_specifications,
+            ADDRESS_DOMAIN_STANDARD, ADDRESS_DOMAIN_VPC, ADDRESS_TAGGABLE_RESOURCE,
+            AMAZON_ADDRESS_POOL, MAX_STORED_ADDRESSES, MAX_STORED_BYTES,
+        };
+
+        // The Region of the request's SigV4 credential scope: an Elastic IP address is a
+        // Region's resource, and its network border group is named for that Region.
+        let region = request_region(ctx.parts());
+
+        // "The network (vpc)" (`AllocateAddressRequest$Domain`) — the modelled `DomainType`
+        // enum's only other member is the retired EC2-Classic network, which no account
+        // can allocate into, so a request naming it is refused rather than answered with a
+        // VPC address it did not ask for. The boundary validator has already refused every
+        // spelling that is not a member of that enum.
+        let domain = input
+            .domain
+            .clone()
+            .unwrap_or_else(|| ADDRESS_DOMAIN_VPC.to_string());
+        if domain != ADDRESS_DOMAIN_VPC {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{domain}' for domain. \
+                 An Elastic IP address is allocated into the '{ADDRESS_DOMAIN_VPC}' network; \
+                 the '{ADDRESS_DOMAIN_STANDARD}' network is not available"
+            )));
+        }
+
+        // "You can allocate an Elastic IP address from one of the following address pools"
+        // (`AllocateAddress`), and "To specify a specific address from the address pool, use
+        // the Address parameter instead" (`AllocateAddressRequest$PublicIpv4Pool`): the
+        // request names at most ONE source for the address it gets.
+        let sources: [(&str, Option<&str>); 4] = [
+            ("address", input.address.as_deref()),
+            ("publicIpv4Pool", input.public_ipv4_pool.as_deref()),
+            (
+                "customerOwnedIpv4Pool",
+                input.customer_owned_ipv4_pool.as_deref(),
+            ),
+            ("ipamPoolId", input.ipam_pool_id.as_deref()),
+        ];
+        let named: Vec<&str> = sources
+            .iter()
+            .filter(|(_, value)| value.is_some())
+            .map(|(member, _)| *member)
+            .collect();
+        if named.len() > 1 {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "An address comes from one source, so {} may not be given together",
+                named.join(" and ")
+            )));
+        }
+
+        // "Use this parameter to limit the IP address to this location"
+        // (`AllocateAddressRequest$NetworkBorderGroup`). Every Availability Zone of a Region
+        // shares the one border group named for that Region, and this emulator's zones are
+        // all Availability Zones, so any other value names a location the Region does not
+        // advertise addresses from.
+        let border_group = network_border_group_of_region(&region);
+        if let Some(requested) = input.network_border_group.as_deref() {
+            if requested != border_group {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{requested}' for networkBorderGroup. \
+                     Region '{region}' advertises addresses from '{border_group}'"
+                )));
+            }
+        }
+
+        // "The tags to assign to the Elastic IP address"
+        // (`AllocateAddressRequest$TagSpecifications`): the address is the only resource
+        // this call creates, so a specification naming any other resource type is refused
+        // rather than accepted and discarded. The shared helper also bounds the tag count,
+        // each key and value, and the reserved `aws:` prefix.
+        let tags = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            ADDRESS_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+        // The caller-chosen bytes this allocation would retain for the process's lifetime,
+        // counted by the ONE definition of that charge ([`address_payload_bytes`], which is
+        // exactly the stored tags) so the gate below and the insert agree.
+        let payload_bytes = tag_list_bytes(&tags);
+
+        // A pool is a resource of the account, and this emulator stores none of the three
+        // kinds a request can name here: `CreatePublicIpv4Pool`, `CreateIpamPool` and
+        // `CreateCoipPool` are all still stubs, and an Outpost's customer-owned pool cannot
+        // exist at all without an Outpost. So a pool id a caller names can only be one the
+        // account holds no pool for, and the value is refused instead of being quietly
+        // ignored and answered with an Amazon-pool address.
+        for (member, value) in [
+            ("publicIpv4Pool", input.public_ipv4_pool.as_deref()),
+            (
+                "customerOwnedIpv4Pool",
+                input.customer_owned_ipv4_pool.as_deref(),
+            ),
+            ("ipamPoolId", input.ipam_pool_id.as_deref()),
+        ] {
+            if let Some(pool) = value {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{pool}' for {member}. \
+                     This account holds no such address pool"
+                )));
+            }
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // "The Elastic IP address to recover or an IPv4 address from an address pool"
+        // (`AllocateAddressRequest$Address`). An address pool the request could draw from is
+        // already refused above, so the only remaining reading is a recovery: "To attempt to
+        // recover an Elastic IP address that you released, specify it in this operation".
+        // An address the account still holds is in use, and one it never released is not an
+        // address of this account at all.
+        if let Some(address) = input.address.as_deref() {
+            if !is_ipv4_address(address) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{address}' for address. It must be an IPv4 address"
+                )));
+            }
+            if store.allocation_id_for_public_ip(address).is_some() {
+                return Err(Scaffolded::invalid_ip_address_in_use(address));
+            }
+            return Err(invalid_address_not_found(address));
+        }
+
+        // Nothing in this emulator reclaims a stored address, so both ceilings — the number
+        // of records and the caller-chosen bytes they hold — are asked BEFORE the first
+        // write, a count being no bound on the bytes each record carries.
+        if store.addresses.len() >= MAX_STORED_ADDRESSES {
+            return Err(address_limit_exceeded(format!(
+                "This emulator holds {MAX_STORED_ADDRESSES} Elastic IP addresses, \
+                 which is as many as it stores"
+            )));
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(address_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The address and the allocation id are the service's to mint, never the caller's:
+        // the address comes out of Amazon's pool through the store's own monotonic source,
+        // which is also what keeps two allocations from holding one address.
+        let Some(public_ip) = store.mint_elastic_ip() else {
+            return Err(address_limit_exceeded(
+                "Amazon's pool of IPv4 addresses has no free address left in this emulator",
+            ));
+        };
+        let allocation_id = store.next_id("eipalloc");
+        let record = Address {
+            allocation_id: Some(allocation_id.clone()),
+            public_ip: Some(public_ip),
+            domain: Some(ADDRESS_DOMAIN_VPC.to_string()),
+            // "The ID of an address pool" (`Address$PublicIpv4Pool`): this address came out
+            // of Amazon's pool, which is the pool AWS names for one.
+            public_ipv4_pool: Some(AMAZON_ADDRESS_POOL.to_string()),
+            network_border_group: Some(border_group.clone()),
+            tags: Some(tags),
+            // A freshly allocated address is associated with nothing: `AssociateAddress` is
+            // the operation that would give it an association, an instance, a network
+            // interface and a private address, and it is still a stub.
+            association_id: None,
+            instance_id: None,
+            network_interface_id: None,
+            network_interface_owner_id: None,
+            private_ip_address: None,
+            // The address is in no subnet until something associates it.
+            subnet_id: None,
+            // "The service that manages the elastic IP address" (`Address$ServiceManaged`):
+            // this address is the caller's, not a load balancer's or a NAT service's.
+            service_managed: None,
+            // A carrier IP belongs to an address allocated in a Wavelength Zone, and a
+            // customer-owned IP to one taken from an Outpost's CoIP pool; this emulator has
+            // neither, and a request naming either pool is refused above.
+            carrier_ip: None,
+            customer_owned_ip: None,
+            customer_owned_ipv4_pool: None,
+        };
+        // Charged at the insert, so no path can store those bytes uncharged — and the gate
+        // above asked for exactly this many.
+        debug_assert_eq!(address_payload_bytes(&record), payload_bytes);
+        store.insert_address(record);
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // `DescribeAddresses` will see rather than the request object.
+        let stored = store.addresses.get(&allocation_id).ok_or_else(|| {
+            internal_error(format!(
+                "the newly allocated address '{allocation_id}' could not be read back"
+            ))
+        })?;
+        Ok(AllocateAddressOutput {
+            allocation_id: stored.allocation_id.clone(),
+            public_ip: stored.public_ip.clone(),
+            domain: stored.domain.clone(),
+            public_ipv4_pool: stored.public_ipv4_pool.clone(),
+            network_border_group: stored.network_border_group.clone(),
+            customer_owned_ip: stored.customer_owned_ip.clone(),
+            customer_owned_ipv4_pool: stored.customer_owned_ipv4_pool.clone(),
+            carrier_ip: stored.carrier_ip.clone(),
+        })
     }
 }

@@ -15,5 +15,7 @@
 mod dashboard_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/target_prefix_dispatch.rs"]
+mod target_prefix_dispatch;
 #[path = "all/trail_lifecycle.rs"]
 mod trail_lifecycle;

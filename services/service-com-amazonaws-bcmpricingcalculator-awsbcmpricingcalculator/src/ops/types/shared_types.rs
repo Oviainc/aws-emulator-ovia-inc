@@ -17,6 +17,17 @@ pub struct DataUnavailableException {
     pub message: String,
 }
 
+/// The service-wide server fault (`@error("server")`, HTTP 500). The model declares it
+/// on the SERVICE rather than on one operation, so a handler names it through
+/// `extra_errors` on its own `#[operation_error]` enum — which is what the tagging
+/// operations do, so an engine that holds no state has an honest answer.
+#[smithy_macros::smithy(shape = "com.amazonaws.bcmpricingcalculator#InternalServerException")]
+#[derive(Debug, Clone, Default)]
+pub struct InternalServerException {
+    pub message: String,
+    pub retry_after_seconds: Option<i32>,
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.bcmpricingcalculator#ResourceNotFoundException")]
 #[derive(Debug, Clone, Default)]
 pub struct ResourceNotFoundException {

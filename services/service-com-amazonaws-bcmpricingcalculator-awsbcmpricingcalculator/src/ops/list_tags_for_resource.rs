@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! Reports the tags stored on the resource its `arn` addresses — the same map
+//! `TagResource` writes and `UntagResource` removes from — and refuses an ARN naming no
+//! live resource with the modelled `ResourceNotFoundException` (HTTP 404). A resource
+//! carrying no tags reports an empty `tags` map rather than an error.
+//!
+//! WHICH RESOURCE AN ARN ADDRESSES: the ARN is matched in FULL against the one the
+//! resource was minted with (partition, region and the single account this emulator
+//! presents included), so an ARN naming another account's or another region's resource
+//! resolves to nothing and is answered with that 404 — this surface never reports the
+//! tags of a resource the ARN does not name. Caller-identity authorization beyond that
+//! (IAM policy evaluation, `AccessDeniedException`) is not modelled by this emulator at
+//! all, here or in any other operation of this service.
+//!
+//! This operation is `@readonly`: it changes nothing except materialising what the clock
+//! had already made due ([`crate::state::ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::settle`]),
+//! as every other reader of this service does.
 //!
 //! ## Shape of an operation
 //!
@@ -79,9 +89,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-bcmpricingcalculator-aw
 // here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.bcmpricingcalculator#ListTagsForResource")]
+// `InternalServerException` is widened in through `extra_errors`: this SERVICE models it
+// (see `types::shared_types`) but this operation does not list it, and it is the only
+// honest answer for "this service is mounted on an engine that holds no state" — a 400
+// would blame the caller's request and a 501 would claim the operation is unwritten.
+#[smithy_macros::operation_error(
+    "com.amazonaws.bcmpricingcalculator#ListTagsForResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -134,20 +152,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the bcm-pricing-calculator resource store is unavailable"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        // Materialise what the clock has already made due: a resource past its
+        // `expiresAt` reads as gone here exactly as it does from every other reader.
+        state.settle(crate::state::now_millis());
+
+        let Some(tags) = state.resource_tags(&input.arn) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("No resource found with ARN {}", input.arn),
+                    resource_id: input.arn.clone(),
+                    resource_type: crate::state::arn_resource_label(&input.arn),
+                },
+            )
+            .into());
+        };
+
+        // A resource carrying no tags reports an EMPTY map: the resource exists and the
+        // answer "it has no tags" is a fact about it, not a missing member.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(
+                tags.iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+        })
     }
 }

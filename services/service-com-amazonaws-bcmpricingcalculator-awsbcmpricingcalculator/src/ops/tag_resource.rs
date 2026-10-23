@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! Adds the request's tags to the resource its `arn` addresses, MERGING them into the
+//! tags that resource already carries: a key the request names takes the request's
+//! value, and a key it does not name keeps the value it had. The tags live on the
+//! resource itself in [`crate::state`], so `ListTagsForResource` reads back exactly what
+//! was written here, and `UntagResource` removes from the same map.
+//!
+//! Two refusals, both applied before anything is written, so a refused request changes
+//! nothing: a key carrying the prefix AWS reserves for its own tags
+//! ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) is a 400 `ValidationException`, and a
+//! request that would take the resource past [`crate::state::MAX_RESOURCE_TAGS`] tags is
+//! the modelled `ServiceQuotaExceededException` (HTTP 402).
+//!
+//! ORDER OF REFUSALS: the reserved-key 400 is answered BEFORE the ARN is resolved, so a
+//! request that is malformed in that way is refused as such even when its ARN names no
+//! live resource — a caller is told what is wrong with the request it sent rather than
+//! being sent to look for a resource that would not have accepted the key anyway. A test
+//! row pins that order.
+//!
+//! WHICH RESOURCE AN ARN ADDRESSES: the ARN is matched in FULL against the one the
+//! resource was minted with (partition, region and the single account this emulator
+//! presents included), so an ARN naming another account's or another region's resource
+//! resolves to nothing and is answered with the modelled `ResourceNotFoundException` —
+//! this surface never reads or writes a resource the ARN does not name. Caller-identity
+//! authorization beyond that (IAM policy evaluation, `AccessDeniedException`) is not
+//! modelled by this emulator at all, here or in any other operation of this service.
 //!
 //! ## Shape of an operation
 //!
@@ -78,9 +97,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-bcmpricingcalculator-aw
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.bcmpricingcalculator#TagResource")]
+// `InternalServerException` is widened in through `extra_errors`: this SERVICE models it
+// (see `types::shared_types`) but this operation does not list it, and it is the only
+// honest answer for "this service is mounted on an engine that holds no state" — a 400
+// would blame the caller's request and a 501 would claim the operation is unwritten.
+#[smithy_macros::operation_error(
+    "com.amazonaws.bcmpricingcalculator#TagResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
 }
@@ -134,20 +161,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the bcm-pricing-calculator resource store is unavailable"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        // Materialise what the clock has already made due, so a resource past the
+        // `expiresAt` it advertises is not tagged after it should have been dropped.
+        state.settle(crate::state::now_millis());
+
+        // The reserved prefix is refused BEFORE the resource is resolved and before
+        // anything is written, so a request carrying one such key stores none of its
+        // tags. The keys are sorted because a map's iteration order is not the
+        // request's, and the refusal names what the caller has to change.
+        let mut reserved: Vec<&str> = input
+            .tags
+            .keys()
+            .filter(|key| crate::state::is_reserved_tag_key(key))
+            .map(String::as_str)
+            .collect();
+        reserved.sort_unstable();
+        if !reserved.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "tags: the {} prefix is reserved for AWS use and cannot be set by a \
+                 caller, so these keys are not allowed: {}",
+                crate::state::RESERVED_TAG_KEY_PREFIX,
+                reserved.join(", ")
+            )));
+        }
+
+        // Resolved before the mutable borrow below, so a refusal can name the kind of
+        // resource the ARN addresses.
+        let resource_type = crate::state::arn_resource_label(&input.arn);
+
+        let Some(tags) = state.resource_tags_mut(&input.arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("No resource found with ARN {}", input.arn),
+                    resource_id: input.arn.clone(),
+                    resource_type,
+                },
+            )
+            .into());
+        };
+
+        // What the merge would leave: the keys the resource already carries that this
+        // request does not name, plus every key it does.
+        let merged = tags
+            .keys()
+            .filter(|key| !input.tags.contains_key(key.as_str()))
+            .count()
+            + input.tags.len();
+        if merged > crate::state::MAX_RESOURCE_TAGS {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "the request would leave {merged} tags on this resource, past the \
+                         maximum of {}",
+                        crate::state::MAX_RESOURCE_TAGS
+                    ),
+                    resource_id: input.arn.clone(),
+                    resource_type,
+                    service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
+                    quota_code: None,
+                },
+            )
+            .into());
+        }
+
+        for (key, value) in &input.tags {
+            tags.insert(key.clone(), value.clone());
+        }
+        Ok(TagResourceOutput {})
     }
 }

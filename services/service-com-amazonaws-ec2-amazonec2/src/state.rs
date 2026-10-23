@@ -81,6 +81,18 @@
 //! Keyed by `VolumeId` in a [`BTreeMap`], the same stable order the VPC and subnet stores
 //! are kept in, so a pagination token can name the id the next page starts at.
 //!
+//! ## Elastic IP addresses
+//!
+//! [`ComAmazonawsEc2Amazonec2State::addresses`] holds the account's Elastic IP addresses
+//! as the modelled [`Address`] shape itself, keyed by `AllocationId`, for the same reason
+//! the VPC store holds [`Vpc`]s: `AllocateAddress` and `DescribeAddresses` cannot report
+//! one address differently. The address itself is minted out of Amazon's pool by
+//! [`ComAmazonawsEc2Amazonec2State::mint_elastic_ip`], never taken from the request, and
+//! an allocation is reached by its public address through
+//! [`ComAmazonawsEc2Amazonec2State::allocation_id_for_public_ip`] because the API lets a
+//! caller name either. An Elastic IP address AWS hands back is usable at once — it has no
+//! non-terminal status — so no entry beside it records a clock-owed transition.
+//!
 //! ## AMIs: the published catalog, plus whatever a writer stores
 //!
 //! [`ComAmazonawsEc2Amazonec2State::images`] holds the AMIs the account can see as the
@@ -123,7 +135,7 @@ use std::net::Ipv6Addr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
+    Address, AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
     CreateVolumeOutput, EbsBlockDevice, GroupIdentifier, INSTANCE_TYPE_VALUES, Image, Instance,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
     LaunchTemplate, Monitoring, OperatorResponse, Placement, PrivateDnsNameOptionsOnLaunch,
@@ -789,6 +801,14 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateVolume` `ClientToken` and the volume id it minted, so a repeat of the
     /// same request answers with that volume instead of creating a second one.
     pub volume_client_tokens: HashMap<String, String>,
+    /// Every Elastic IP address the account holds, by `AllocationId`, as the modelled
+    /// [`Address`] shape itself — so a member a writer sets round-trips through
+    /// `DescribeAddresses` without a field-by-field copy. Ordered by id, which is the
+    /// order the describe reports in.
+    pub addresses: BTreeMap<String, Address>,
+    /// Monotonic source of the Elastic IP addresses [`Self::mint_elastic_ip`] hands out,
+    /// so one allocation can never be given an address another still holds.
+    next_elastic_ip: u64,
 }
 
 /// A fresh account's EC2 state: the ambient network AWS gives it — the default VPC, that
@@ -818,6 +838,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             id_counter: 0,
             volumes: BTreeMap::new(),
             volume_client_tokens: HashMap::new(),
+            addresses: BTreeMap::new(),
+            next_elastic_ip: 0,
         };
         let default_vpc = state.insert_vpc(
             DEFAULT_VPC_CIDR_BLOCK,
@@ -4371,5 +4393,211 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         Some(vpc)
     }
+}
+
+// =============================================================================
+// Elastic IP addresses
+// =============================================================================
+
+/// The one network an Elastic IP address is allocated into today: `DomainType`'s `vpc`
+/// ("The network (`vpc`)" — `AllocateAddressRequest$Domain`, and the same sentence on
+/// `Address$Domain`).
+pub const ADDRESS_DOMAIN_VPC: &str = "vpc";
+
+/// `DomainType`'s other member, the EC2-Classic network
+/// (`smithy_query(query="shape",shape="DomainType")`). The model documents only `vpc` as
+/// the network an address is allocated into, so this value names the network a request
+/// can no longer ask for.
+pub const ADDRESS_DOMAIN_STANDARD: &str = "standard";
+
+/// The one resource type `AllocateAddress`'s `TagSpecifications` can name: "The tags to
+/// assign to the Elastic IP address" (`AllocateAddressRequest$TagSpecifications`), which
+/// is the `elastic-ip` member of `ResourceType`.
+pub const ADDRESS_TAGGABLE_RESOURCE: &str = "elastic-ip";
+
+/// The address pool an Amazon-provided Elastic IP address comes from: "Amazon's pool of
+/// IPv4 addresses" (`AllocateAddress`). An address out of that pool carries no
+/// `PublicIpv4Pool` id — the member is "The ID of an address pool that you own" — so this
+/// is the value the pool members report as, and the describe filter compares against
+/// nothing for such an address.
+pub const AMAZON_ADDRESS_POOL: &str = "amazon";
+
+/// How many Elastic IP addresses this emulator stores before `AllocateAddress` is
+/// refused.
+///
+/// CHOSEN, like [`MAX_STORED_VOLUMES`] and for the same reason: nothing in this emulator
+/// reclaims a stored address, so the store needs a ceiling that is not the process's
+/// memory. It is well above the published per-Region Elastic IP quota (5 by default,
+/// which is adjustable), so a test that allocates more than a real account's default
+/// quota is not refused for a reason this emulator cannot have.
+pub const MAX_STORED_ADDRESSES: usize = 4096;
+
+/// How many candidate addresses [`ComAmazonawsEc2Amazonec2State::mint_elastic_ip`] probes
+/// before giving up, so the search cannot spin when the block it draws from is full.
+pub const MAX_ELASTIC_IP_PROBES: u32 = 4096;
+
+/// `AddressLimitExceeded` (HTTP 400): the allocation would take the account past the
+/// number of Elastic IP addresses it may hold.
+pub const ADDRESS_LIMIT_EXCEEDED: &str = "AddressLimitExceeded";
+
+/// `InvalidAddress.NotFound` (HTTP 400): the request named an Elastic IP address this
+/// account holds no allocation for.
+pub const INVALID_ADDRESS_NOT_FOUND: &str = "InvalidAddress.NotFound";
+
+/// `InvalidAllocationID.NotFound` (HTTP 400): the request named an allocation id this
+/// account holds no address for.
+pub const INVALID_ALLOCATION_ID_NOT_FOUND: &str = "InvalidAllocationID.NotFound";
+
+/// `InvalidAllocationID.Malformed` (HTTP 400): the request named something that is not an
+/// allocation id at all, so there is nothing to look up.
+pub const INVALID_ALLOCATION_ID_MALFORMED: &str = "InvalidAllocationID.Malformed";
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The next unused Elastic IP address, or `None` when the search is exhausted.
+    ///
+    /// Drawn from `54.0.0.0/8`, a block Amazon advertises EC2 public addresses from, which
+    /// is what "Amazon's pool of IPv4 addresses" (`AllocateAddress`) is here. The host
+    /// part comes from the store's own monotonic counter and never from the request — a
+    /// caller "cannot specify" which Amazon-pool address it gets — and the last octet skips
+    /// `0` and `255`, which no interface is given. An address some allocation still holds
+    /// is skipped, and the search probes at most [`MAX_ELASTIC_IP_PROBES`] candidates so it
+    /// cannot spin.
+    pub fn mint_elastic_ip(&mut self) -> Option<String> {
+        for _ in 0..MAX_ELASTIC_IP_PROBES {
+            self.next_elastic_ip = self.next_elastic_ip.wrapping_add(1);
+            let host = self.next_elastic_ip;
+            let candidate = format!(
+                "54.{}.{}.{}",
+                (host / (254 * 256)) % 256,
+                (host / 254) % 256,
+                1 + host % 254
+            );
+            if self.allocation_id_for_public_ip(&candidate).is_none() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// The allocation id of the stored address whose `PublicIp` is `public_ip`, or `None`
+    /// when the account holds no such address.
+    ///
+    /// A scan of the address store rather than a second map keyed by the address, so the
+    /// public IP of an allocation is read off the one record that holds it; the store is
+    /// bounded by [`MAX_STORED_ADDRESSES`], the way
+    /// [`ComAmazonawsEc2Amazonec2State::launch_template_id_for_name`] scans the template
+    /// store.
+    pub fn allocation_id_for_public_ip(&self, public_ip: &str) -> Option<String> {
+        self.addresses
+            .iter()
+            .find(|(_, address)| address.public_ip.as_deref() == Some(public_ip))
+            .map(|(allocation_id, _)| allocation_id.clone())
+    }
+
+    /// Store a newly allocated Elastic IP address, charging the caller-chosen bytes it
+    /// holds against the store's byte budget so no path can store them uncharged.
+    pub fn insert_address(&mut self, address: Address) -> String {
+        let allocation_id = address.allocation_id.clone().unwrap_or_default();
+        self.add_stored_bytes(address_payload_bytes(&address));
+        self.addresses.insert(allocation_id.clone(), address);
+        allocation_id
+    }
+}
+
+/// The caller-chosen bytes one stored Elastic IP address holds: its tags. Everything else
+/// on the record — the allocation id, the address, the domain, the network border group —
+/// is derived by this module or bounded by the model, so it is fixed-size.
+///
+/// The ONE definition of that charge: `AllocateAddress` asks it before the write and
+/// charges exactly it, and a removal path must give back the same number.
+pub fn address_payload_bytes(address: &Address) -> usize {
+    tag_list_bytes(address.tags.as_deref().unwrap_or_default())
+}
+
+/// Whether `id` is a well-formed Elastic IP allocation id.
+///
+/// An allocation id is `eipalloc-` followed by 8 or 17 lowercase hexadecimal digits — the
+/// short and the long id form, as the model's own id patterns read. EC2 answers
+/// `InvalidAllocationID.Malformed` for anything else, BEFORE it looks the id up.
+pub fn allocation_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix("eipalloc-") else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Whether `candidate` is a dotted-quad IPv4 address, the form
+/// `AllocateAddressRequest$Address` and `DescribeAddressesRequest$PublicIps` take.
+///
+/// `Ipv4Addr`'s own parser accepts exactly four decimal octets, so this is the one place
+/// the form is decided: the crate's CIDR helpers are about blocks, not single addresses.
+pub fn is_ipv4_address(candidate: &str) -> bool {
+    candidate.parse::<::std::net::Ipv4Addr>().is_ok()
+}
+
+/// Refuse an allocation id the request named that this service cannot resolve: a
+/// malformed one before an unknown one, the way the service orders the two.
+pub fn require_known_address<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    allocation_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if !allocation_id_is_well_formed(allocation_id) {
+        return Err(invalid_allocation_id_malformed(allocation_id));
+    }
+    if !store.addresses.contains_key(allocation_id) {
+        return Err(invalid_allocation_id_not_found(allocation_id));
+    }
+    Ok(())
+}
+
+/// Refuse a request that named something that is not an allocation id: HTTP 400
+/// `InvalidAllocationID.Malformed`.
+pub fn invalid_allocation_id_malformed<E>(allocation_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ALLOCATION_ID_MALFORMED,
+        400,
+        format!("Invalid id: '{allocation_id}'"),
+    )
+}
+
+/// Refuse a request that named an allocation id no address of the account has: HTTP 400
+/// `InvalidAllocationID.NotFound`.
+pub fn invalid_allocation_id_not_found<E>(allocation_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ALLOCATION_ID_NOT_FOUND,
+        400,
+        format!("The allocation ID '{allocation_id}' does not exist"),
+    )
+}
+
+/// Refuse a request that named an Elastic IP address this account holds no allocation
+/// for: HTTP 400 `InvalidAddress.NotFound`.
+pub fn invalid_address_not_found<E>(public_ip: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ADDRESS_NOT_FOUND,
+        400,
+        format!("Address '{public_ip}' not found"),
+    )
+}
+
+/// Refuse an allocation that would take the store past [`MAX_STORED_ADDRESSES`]: HTTP 400
+/// `AddressLimitExceeded`.
+pub fn address_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(ADDRESS_LIMIT_EXCEEDED, 400, message)
+}
+
+/// The network border group a Region's own addresses are advertised from.
+///
+/// "A unique set of Availability Zones, Local Zones, or Wavelength Zones from which Amazon
+/// Web Services advertises IP addresses" (`AllocateAddressRequest$NetworkBorderGroup`):
+/// every Availability Zone of a Region shares one border group named for the Region, and a
+/// Local or Wavelength Zone has its own. This emulator's zones are all
+/// `availability-zone`s ([`availability_zones_in_region`]), so a Region has exactly this
+/// one border group.
+pub fn network_border_group_of_region(region: &str) -> String {
+    region.to_string()
 }
 

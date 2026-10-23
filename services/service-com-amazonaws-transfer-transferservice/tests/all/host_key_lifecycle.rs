@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 
 use crate::harness::{
     assert_members, generated_host_key, host_key_algorithm, is_modelled_host_key_id, member_of,
-    Emulator, ACCOUNT, PAST_START_SPAN, REGION, SSH_KEY,
+    unix_seconds, Emulator, ACCOUNT, PAST_START_SPAN, REGION, SSH_KEY,
 };
 
 /// `SERVER_STOP_SPAN` in `src/state.rs` is 500 ms; wait past it. Kept here, next to the
@@ -130,14 +130,6 @@ fn tag_list(tags: &[(&str, &str)]) -> Value {
             .map(|(key, value)| json!({"Key": key, "Value": value}))
             .collect(),
     )
-}
-
-/// Seconds since the Unix epoch, at the clock's own precision — the unit the awsJson
-/// protocol puts a timestamp on the wire in.
-fn unix_seconds(at: SystemTime) -> f64 {
-    at.duration_since(SystemTime::UNIX_EPOCH)
-        .expect("the test clock is past the Unix epoch")
-        .as_secs_f64()
 }
 
 /// One `ImportHostKey` request built from a case.

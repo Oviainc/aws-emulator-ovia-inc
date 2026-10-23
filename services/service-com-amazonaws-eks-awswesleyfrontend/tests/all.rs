@@ -41,6 +41,8 @@ mod identity_provider_config_not_found;
 mod identity_provider_configs;
 #[path = "all/list_pod_identity_associations.rs"]
 mod list_pod_identity_associations;
+#[path = "all/nodegroup_lifecycle.rs"]
+mod nodegroup_lifecycle;
 #[path = "all/pod_identity_associations.rs"]
 mod pod_identity_associations;
 #[path = "all/state_roundtrip.rs"]
