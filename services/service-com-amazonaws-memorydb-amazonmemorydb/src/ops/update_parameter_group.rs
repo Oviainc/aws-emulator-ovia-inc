@@ -146,7 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in a mounted emulator (the router hands every service the
@@ -191,10 +191,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A parameter-group name is a case-insensitive identifier, so the name this
         // request updates is folded exactly as the store is keyed.
         let parameter_group_name = crate::state::fold_name(&input.parameter_group_name);
+        let region = crate::state::request_region(ctx);
         let mut state = state.lock();
-        // Besides this update's own write, the only one: the status transitions the
-        // clock already owed the stored clusters and ACLs at this instant.
+        // Besides this update's own write, the only ones: the status transitions the
+        // clock already owed the stored clusters and ACLs at this instant, and the
+        // resources the account ALREADY HAD before any call — among them the
+        // `default.<family>` parameter groups — materialised on first touch, so an
+        // update naming an existing one is refused as immutable rather than as absent.
         state.settle(std::time::Instant::now());
+        state.ensure_builtins(&region);
 
         // The borrow checker needs the group looked up twice (once to read its family,
         // once to write), so the not-found refusal is built HERE and cannot differ
@@ -212,6 +217,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found().into());
         };
         let family = group.family.clone();
+
+        // A group MemoryDB itself provides carries its family's engine defaults and is
+        // not the caller's to change, through the same rule the tag mutations refuse one
+        // with — so the group's values are left exactly as the family publishes them.
+        if let Some(message) =
+            crate::state::immutable_parameter_group_rejection(&parameter_group_name)
+        {
+            return Err(
+                UpdateParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
 
         // EVERY pair is checked before ANY is applied, so a request carrying one bad
         // pair leaves the whole group unchanged rather than half-applied. A name

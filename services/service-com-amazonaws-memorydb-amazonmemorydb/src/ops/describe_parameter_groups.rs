@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeParameterGroups
-//! IMPLEMENTED: answers from [`crate::state`] — every parameter group a
-//! `CreateParameterGroup` persisted, in name order, filtered to one group when the
-//! request names one, paged by `MaxResults`/`NextToken`.
+//! IMPLEMENTED: reads the parameter groups [`crate::state`] holds — including the
+//! `default.<family>` group MemoryDB owns for every parameter group family — answering
+//! the one a request names or all of them in name order, paged by
+//! `MaxResults`/`NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -151,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in a mounted emulator (the router hands every service the
@@ -180,10 +181,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .parameter_group_name
             .as_deref()
             .map(crate::state::fold_name);
+        let region = crate::state::request_region(ctx);
         let mut state = state.lock();
-        // The only write a describe makes: the status transitions the clock already
-        // owed the stored clusters and ACLs at this instant.
+        // The writes a describe makes, neither of them asked for by this caller: the
+        // status transitions the clock already owed the stored clusters and ACLs at this
+        // instant, and the resources the account ALREADY HAD before any call — among
+        // them the `default.<family>` parameter group MemoryDB owns for every family —
+        // which this store materialises on first touch because the engine hands every
+        // service an empty one.
         state.settle(std::time::Instant::now());
+        state.ensure_builtins(&region);
 
         let entries: Vec<(String, ParameterGroup)> = match parameter_group_name.as_deref()
         {
