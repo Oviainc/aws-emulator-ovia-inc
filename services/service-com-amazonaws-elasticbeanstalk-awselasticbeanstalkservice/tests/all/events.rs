@@ -46,6 +46,14 @@ fn managed_platform() -> &'static eb::state::SolutionStack {
         .expect("the service publishes at least one solution stack")
 }
 
+/// A SECOND managed platform version from the same catalog, so a test can tell
+/// two platform versions apart.
+fn other_managed_platform() -> &'static eb::state::SolutionStack {
+    eb::state::SOLUTION_STACKS
+        .get(1)
+        .expect("the service publishes more than one solution stack")
+}
+
 /// Where `severity` sits on [`SEVERITY_LADDER`].
 fn severity_rank(severity: &str, case: &str) -> usize {
     SEVERITY_LADDER
@@ -185,12 +193,35 @@ async fn the_lifecycle_calls_record_the_events_describe_events_reports() {
     .await;
     tokio::time::sleep(PAST_DUE).await;
 
-    // Oldest first: the message, and the resources the event is about.
+    // Oldest first: the message, and the resources the event is about. A
+    // synchronous call records the sequence its activity consists of — the
+    // operation starting, the resource it created, the operation completing —
+    // while a call the clock finishes later records its start now and its
+    // completion when that completion comes due.
     let expected: &[(&str, &str, &str, &str)] = &[
+        ("createApplication is starting.", "events-app", "", ""),
+        (
+            "Created new Application: events-app",
+            "events-app",
+            "",
+            "",
+        ),
         (
             "createApplication completed successfully.",
             "events-app",
             "",
+            "",
+        ),
+        (
+            "createApplicationVersion is starting.",
+            "events-app",
+            "v1",
+            "",
+        ),
+        (
+            "Created new Application Version: v1",
+            "events-app",
+            "v1",
             "",
         ),
         (
@@ -289,18 +320,34 @@ async fn the_lifecycle_calls_record_the_events_describe_events_reports() {
     // A change the clock owed belongs to the request that STARTED it, not to
     // whichever later call observed it as due.
     assert_eq!(
-        oldest_first[3].request_id, oldest_first[2].request_id,
+        oldest_first[7].request_id, oldest_first[6].request_id,
         "case {case:?}: the launch completion must carry the createEnvironment request id, got {:?} and {:?}",
-        oldest_first[3].request_id, oldest_first[2].request_id
+        oldest_first[7].request_id, oldest_first[6].request_id
     );
     assert_eq!(
-        oldest_first[5].request_id, oldest_first[4].request_id,
+        oldest_first[9].request_id, oldest_first[8].request_id,
         "case {case:?}: the termination completion must carry the terminateEnvironment request id, got {:?} and {:?}",
-        oldest_first[5].request_id, oldest_first[4].request_id
+        oldest_first[9].request_id, oldest_first[8].request_id
     );
+    // One call's activity is ONE RequestId: the start, the resource it created
+    // and the completion all carry it, which is what lets a client follow one
+    // operation by filtering the log on it.
+    for activity in [[0usize, 1, 2], [3, 4, 5]] {
+        let first = &oldest_first[activity[0]];
+        for index in activity {
+            assert_eq!(
+                oldest_first[index].request_id, first.request_id,
+                "case {case:?}: {:?} must carry the same RequestId as {:?}, got {:?} and {:?}",
+                oldest_first[index].message,
+                first.message,
+                oldest_first[index].request_id,
+                first.request_id
+            );
+        }
+    }
     // Two different calls are two different activities.
     assert_ne!(
-        oldest_first[0].request_id, oldest_first[1].request_id,
+        oldest_first[0].request_id, oldest_first[3].request_id,
         "case {case:?}: two calls must not share a RequestId, got {:?}",
         oldest_first[0].request_id
     );
@@ -347,7 +394,12 @@ async fn each_filter_selects_exactly_the_events_of_the_resource_it_names() {
         )
         .await;
     }
-    let solution_stack = managed_platform().name();
+    // env-one is launched by solution stack NAME and env-two by platform ARN,
+    // and the two name DIFFERENT platform versions — an environment reports the
+    // platform version it runs on however the request named it, so the
+    // `PlatformArn` filter has env-two's events to select and env-one's to
+    // reject.
+    let solution_stack = other_managed_platform().name();
     let platform_arn = managed_platform().platform_arn(HARNESS_REGION);
     let env_one = ok(
         &emulator,
@@ -362,8 +414,6 @@ async fn each_filter_selects_exactly_the_events_of_the_resource_it_names() {
     )
     .await;
     let env_one_id = env_one.expect("EnvironmentId", case).to_string();
-    // env-two is launched by `PlatformArn` rather than by solution stack name, so
-    // the `PlatformArn` filter has events to select and env-one's to reject.
     ok(
         &emulator,
         case,
@@ -383,8 +433,10 @@ async fn each_filter_selects_exactly_the_events_of_the_resource_it_names() {
     let all = events_of(&emulator, case, &[]).await;
     assert_eq!(
         all.len(),
-        8,
-        "case {case:?}: expected 8 events (per application: create, version, environment start, launch), got {all:?}"
+        16,
+        "case {case:?}: expected 16 events (per application: the createApplication and \
+         createApplicationVersion activities of three events each, the environment start and \
+         its launch), got {all:?}"
     );
 
     let launch_request_id = all
@@ -398,13 +450,13 @@ async fn each_filter_selects_exactly_the_events_of_the_resource_it_names() {
         FilterCase {
             member: "ApplicationName",
             value: "app-one".to_string(),
-            expected_count: 4,
+            expected_count: 8,
             matches: Box::new(|event| event.application_name == "app-one"),
         },
         FilterCase {
             member: "ApplicationName",
             value: "app-two".to_string(),
-            expected_count: 4,
+            expected_count: 8,
             matches: Box::new(|event| event.application_name == "app-two"),
         },
         FilterCase {
@@ -416,7 +468,7 @@ async fn each_filter_selects_exactly_the_events_of_the_resource_it_names() {
         FilterCase {
             member: "VersionLabel",
             value: "v1".to_string(),
-            expected_count: 3,
+            expected_count: 5,
             matches: Box::new(|event| event.version_label == "v1"),
         },
         FilterCase {
@@ -572,8 +624,9 @@ async fn a_backdated_clock_owed_event_is_reported_in_its_place_in_time() {
     // The launch completion is now due, and dated one transition span after the
     // create that owed it.
     tokio::time::sleep(PAST_DUE).await;
-    // `CreateApplication` does not consult the clock, so its event is APPENDED
-    // before the launch completion is materialised — yet it is DATED after it.
+    // `CreateApplication` settles only the application removals the clock owes,
+    // never an environment's launch, so the launch completion is MATERIALISED
+    // after this call's events are appended — yet it is DATED before them.
     ok(
         &emulator,
         case,
@@ -588,9 +641,13 @@ async fn a_backdated_clock_owed_event_is_reported_in_its_place_in_time() {
         messages,
         vec![
             "createApplication completed successfully.",
+            "Created new Application: order-app-later",
+            "createApplication is starting.",
             "Successfully launched environment: order-env",
             "createEnvironment is starting.",
             "createApplication completed successfully.",
+            "Created new Application: order-app",
+            "createApplication is starting.",
         ],
         "case {case:?}: the answer must be ordered by EventDate, not by the order the log was appended to"
     );
@@ -627,10 +684,14 @@ async fn describe_events_reports_most_recent_first_and_pages_through_the_whole_l
     }
 
     let all = events_of(&emulator, case, &[]).await;
+    // Each create records its whole activity: the operation starting, the
+    // application it created, and the operation completing.
+    const EVENTS_PER_CREATE: usize = 3;
     assert_eq!(
         all.len(),
-        COUNT,
-        "case {case:?}: expected one event per CreateApplication, got {all:?}"
+        COUNT * EVENTS_PER_CREATE,
+        "case {case:?}: expected one activity of {EVENTS_PER_CREATE} events per \
+         CreateApplication, got {all:?}"
     );
     // "beginning with the most recent event".
     let reported_order: Vec<&str> = all
@@ -639,7 +700,9 @@ async fn describe_events_reports_most_recent_first_and_pages_through_the_whole_l
         .collect();
     let newest_first: Vec<String> = (0..COUNT)
         .rev()
-        .map(|index| format!("page-app-{index:02}"))
+        .flat_map(|index| {
+            std::iter::repeat_n(format!("page-app-{index:02}"), EVENTS_PER_CREATE)
+        })
         .collect();
     assert_eq!(
         reported_order,
@@ -649,14 +712,14 @@ async fn describe_events_reports_most_recent_first_and_pages_through_the_whole_l
 
     // Every page size from one to past the log's length walks the same log in
     // the same order, in pages no larger than it asked for.
-    for page_size in [1usize, 2, 3, 6, 7, 8, 1000] {
+    for page_size in [1usize, 2, 3, 6, 7, 8, 20, 21, 22, 1000] {
         let case = format!("MaxRecords={page_size}");
         let max_records = page_size.to_string();
         let mut collected: Vec<ReportedEvent> = Vec::new();
         let mut token: Option<String> = None;
-        for round in 0..=COUNT + 1 {
+        for round in 0..=all.len() + 1 {
             assert!(
-                round <= COUNT,
+                round <= all.len(),
                 "case {case:?}: pagination did not terminate after {round} pages"
             );
             let carried = token.clone().unwrap_or_default();
@@ -754,6 +817,9 @@ async fn a_page_token_keeps_its_place_when_the_log_grows_between_calls() {
         .await;
     }
 
+    // The log as it stands before the second page is asked for: the walk must
+    // report its head, in its order.
+    let before = events_of(&emulator, case, &[]).await;
     let first = ok(&emulator, case, "DescribeEvents", &[("MaxRecords", "2")]).await;
     let page_one = reported(&first);
     let token = first
@@ -781,23 +847,16 @@ async fn a_page_token_keeps_its_place_when_the_log_grows_between_calls() {
     .await;
     let page_two = reported(&second);
 
-    let walked: Vec<&str> = page_one
-        .iter()
-        .chain(page_two.iter())
-        .map(|event| event.application_name.as_str())
-        .collect();
+    let walked: Vec<&ReportedEvent> = page_one.iter().chain(page_two.iter()).collect();
+    let expected: Vec<&ReportedEvent> = before.iter().take(walked.len()).collect();
     assert_eq!(
-        walked,
-        vec![
-            "token-app-03",
-            "token-app-02",
-            "token-app-01",
-            "token-app-00"
-        ],
+        walked, expected,
         "case {case:?}: the two pages must walk the log the first page saw, in order, with nothing repeated or skipped"
     );
     assert!(
-        !walked.contains(&"token-app-late"),
+        !walked
+            .iter()
+            .any(|event| event.application_name == "token-app-late"),
         "case {case:?}: an event recorded after the first page must not appear inside the walk, got {walked:?}"
     );
 }
@@ -982,8 +1041,8 @@ async fn the_time_window_includes_start_time_and_excludes_end_time() {
     let all = events_of(&emulator, case, &[]).await;
     assert_eq!(
         all.len(),
-        3,
-        "case {case:?}: expected one event per CreateApplication, got {all:?}"
+        9,
+        "case {case:?}: expected one activity of three events per CreateApplication, got {all:?}"
     );
     let dates: Vec<f64> = all
         .iter()

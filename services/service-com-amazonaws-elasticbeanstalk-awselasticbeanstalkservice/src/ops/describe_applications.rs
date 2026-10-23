@@ -140,7 +140,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the Elastic Beanstalk store is unavailable",
             )
         })?;
-        let store = state.lock();
+        let mut store = state.lock();
+        // This operation only REPORTS. The one write it performs is the clock's
+        // own: an application whose asynchronous deletion has come due is
+        // removed, and the event that completion owes recorded. That removal was
+        // owed at the same instant whether or not anybody called, so
+        // materialising it here shows no caller a state the clock had not
+        // already reached — and, just as importantly, an application whose
+        // deletion is still RUNNING is reported exactly as it stands.
+        store.materialize_due_transitions();
 
         // "If specified, Elastic Beanstalk restricts the returned descriptions to
         // only include those with the specified names." With no filter, every

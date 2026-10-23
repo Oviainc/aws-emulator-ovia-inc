@@ -13,12 +13,14 @@
 //! spells one of them a second way.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
     ApplicationDescription, ApplicationResourceLifecycleConfig, ApplicationVersionDescription,
-    ConfigurationOptionSetting, EnvironmentTier, EventDescription, PlatformBranchSummary,
-    PlatformDescription, PlatformSummary, S3Location, Tag,
+    ApplicationVersionLifecycleConfig, ConfigurationOptionSetting, EnvironmentTier,
+    EventDescription, MaxAgeRule, MaxCountRule, PlatformBranchSummary, PlatformDescription,
+    PlatformSummary, S3Location, Tag,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -107,7 +109,150 @@ const WEB_SERVER_ONLY: &[&str] = &[TIER_WEB_SERVER];
 
 /// The only `ApplicationVersionStatus` this service reports: it runs no version
 /// processing pipeline, so a stored version is never `Processing`/`Processed`.
+///
+/// The modelled enum spells its values in mixed case (`Unprocessed`), but the
+/// real service puts an application version's processing status on the wire
+/// UPPER-CASED (`UNPROCESSED`) — what the recorded responses of
+/// `CreateApplicationVersion`, `UpdateApplicationVersion` and
+/// `DescribeApplicationVersions` all carry — so a client comparing `Status` to
+/// what AWS answers reads the same text here. [`version_status_on_the_wire`] is
+/// that rendering, applied to whichever modelled value a record holds.
 pub const VERSION_STATUS_UNPROCESSED: &str = "Unprocessed";
+
+/// An `ApplicationVersionStatus` as this service puts it on the wire: the
+/// modelled value upper-cased. See [`VERSION_STATUS_UNPROCESSED`].
+pub fn version_status_on_the_wire(status: &str) -> String {
+    status.to_ascii_uppercase()
+}
+
+/// The S3 location of the sample application an application version falls back
+/// to, in the region the request was signed for.
+///
+/// From `CreateApplicationVersion$SourceBundle`: "Specify a source bundle in
+/// Amazon S3 or a commit in an CodeCommit repository (with
+/// `SourceBuildInformation`), but not both. If neither `SourceBundle` nor
+/// `SourceBuildInformation` are provided, Elastic Beanstalk uses a sample
+/// application." The bucket is the regional Elastic Beanstalk bucket and the key
+/// is the sample application's object, as the recorded responses report them, so
+/// a version created without a bundle still tells its caller where its source
+/// was recorded.
+pub fn sample_application_source_bundle(region: &str) -> S3Location {
+    S3Location {
+        s3_bucket: Some(format!("{SAMPLE_APPLICATION_S3_BUCKET_PREFIX}-{region}")),
+        s3_key: Some(SAMPLE_APPLICATION_S3_KEY.to_string()),
+    }
+}
+
+/// The bucket the sample application's source bundle is reported in, before the
+/// region: Elastic Beanstalk's own regional bucket. See
+/// [`sample_application_source_bundle`].
+pub const SAMPLE_APPLICATION_S3_BUCKET_PREFIX: &str = "elasticbeanstalk";
+
+/// The S3 key of the sample application's source bundle. See
+/// [`sample_application_source_bundle`].
+pub const SAMPLE_APPLICATION_S3_KEY: &str = "GenericSampleApplication";
+
+/// The version-lifecycle defaults an application carries when its caller
+/// specified none: both rules present and DISABLED, keeping a version's source
+/// bundle in S3, with the service's published retention figures — 180 days and
+/// 200 versions (Elastic Beanstalk's application version lifecycle defaults, as
+/// the recorded `CreateApplication` / `DescribeApplications` responses report
+/// them). The model gives neither figure, so they are named here once and every
+/// path that fills a rule in reads them.
+pub const DEFAULT_MAX_AGE_IN_DAYS: i32 = 180;
+/// See [`DEFAULT_MAX_AGE_IN_DAYS`].
+pub const DEFAULT_MAX_COUNT: i32 = 200;
+
+/// The `MaxAgeRule` an application reports when the request specified none.
+pub fn default_max_age_rule() -> MaxAgeRule {
+    MaxAgeRule {
+        enabled: false,
+        max_age_in_days: Some(DEFAULT_MAX_AGE_IN_DAYS),
+        delete_source_from_s3: Some(false),
+    }
+}
+
+/// The `MaxCountRule` an application reports when the request specified none.
+pub fn default_max_count_rule() -> MaxCountRule {
+    MaxCountRule {
+        enabled: false,
+        max_count: Some(DEFAULT_MAX_COUNT),
+        delete_source_from_s3: Some(false),
+    }
+}
+
+/// `requested` with every version-lifecycle setting it leaves out filled in from
+/// the service defaults.
+///
+/// An application ALWAYS has a resource lifecycle configuration: the service
+/// applies its own version-lifecycle policy to an application whose caller named
+/// none, so every read of the application reports both rules and a client can
+/// tell what the policy is before changing it. A rule the request omits is the
+/// default rule; a setting it omits inside a rule it did supply is that rule's
+/// default value. `ServiceRole` is NOT defaulted: it is the caller's own IAM
+/// role, and an application that was never given one has none.
+pub fn resource_lifecycle_config_with_defaults(
+    requested: Option<&ApplicationResourceLifecycleConfig>,
+) -> ApplicationResourceLifecycleConfig {
+    let requested_version_lifecycle = requested.and_then(|config| config.version_lifecycle_config.as_ref());
+    let max_age_rule = match requested_version_lifecycle.and_then(|config| config.max_age_rule.as_ref()) {
+        Some(rule) => MaxAgeRule {
+            enabled: rule.enabled,
+            max_age_in_days: rule.max_age_in_days.or(Some(DEFAULT_MAX_AGE_IN_DAYS)),
+            delete_source_from_s3: rule.delete_source_from_s3.or(Some(false)),
+        },
+        None => default_max_age_rule(),
+    };
+    let max_count_rule = match requested_version_lifecycle.and_then(|config| config.max_count_rule.as_ref()) {
+        Some(rule) => MaxCountRule {
+            enabled: rule.enabled,
+            max_count: rule.max_count.or(Some(DEFAULT_MAX_COUNT)),
+            delete_source_from_s3: rule.delete_source_from_s3.or(Some(false)),
+        },
+        None => default_max_count_rule(),
+    };
+    ApplicationResourceLifecycleConfig {
+        service_role: requested.and_then(|config| config.service_role.clone()),
+        version_lifecycle_config: Some(ApplicationVersionLifecycleConfig {
+            max_age_rule: Some(max_age_rule),
+            max_count_rule: Some(max_count_rule),
+        }),
+    }
+}
+
+/// The environment tier an environment reports, from the tier the request named.
+///
+/// "The default is `WebServer`" / "For Standard-mode EC2-based web server —
+/// `WebServer`" with type "`Standard`", and `EnvironmentTier$Version`: "The
+/// version of this environment tier. When you don't set a value to it, Elastic
+/// Beanstalk uses the latest compatible worker tier version" — which is
+/// [`DEFAULT_TIER_VERSION`] here, the only tier version this service publishes.
+/// So a member the request leaves out is filled in rather than reported absent,
+/// and a member it supplies is kept exactly as sent.
+pub fn environment_tier_with_defaults(requested: Option<&EnvironmentTier>) -> EnvironmentTier {
+    EnvironmentTier {
+        name: requested
+            .and_then(|tier| tier.name.clone())
+            .or_else(|| Some(TIER_NAME_WEB_SERVER.to_string())),
+        r#type: requested
+            .and_then(|tier| tier.r#type.clone())
+            .or_else(|| Some(TIER_TYPE_STANDARD.to_string())),
+        version: requested
+            .and_then(|tier| tier.version.clone())
+            .or_else(|| Some(DEFAULT_TIER_VERSION.to_string())),
+    }
+}
+
+/// The default `EnvironmentTier$Name`, from its own documentation ("For
+/// Standard-mode EC2-based web server — `WebServer`").
+pub const TIER_NAME_WEB_SERVER: &str = "WebServer";
+/// The default `EnvironmentTier$Type`, from its own documentation ("For Web
+/// server tier — `Standard`").
+pub const TIER_TYPE_STANDARD: &str = "Standard";
+/// The `EnvironmentTier$Version` this service publishes, which is what "the
+/// latest compatible worker tier version" resolves to here and what the recorded
+/// `CreateEnvironment` responses report.
+pub const DEFAULT_TIER_VERSION: &str = "1.0";
 
 /// `EventSeverity` from least to most severe, in the order the model declares the
 /// enum's members (`TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`) — the
@@ -177,6 +322,16 @@ pub const MAX_PLATFORM_VERSIONS: usize = 50;
 /// operation considers both the number of tags the resource already has and the
 /// tags this operation would add if it succeeded."
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// How many storage locations this account may hold — the bound
+/// `CreateStorageLocation`'s modelled `TooManyBucketsException` names ("The
+/// specified account has reached its limit of Amazon S3 buckets"), from Amazon
+/// S3's own default quota of 100 general-purpose buckets per account. One
+/// bucket per region, so this is also what bounds
+/// [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::storage_buckets`]:
+/// the region a bucket's name is built from comes from the request, so the
+/// number of names a caller can mint is capped like every other store here.
+pub const MAX_STORAGE_LOCATIONS: usize = 100;
 
 /// How many terminated environments the store keeps, so DescribeEnvironments can
 /// still report them for `IncludeDeleted`.
@@ -282,6 +437,17 @@ pub fn managed_platform_version(region: &str, platform_arn: &str) -> Option<&'st
     SOLUTION_STACKS
         .iter()
         .find(|stack| stack.platform_arn(region) == platform_arn)
+}
+
+/// The published managed platform version reported under the
+/// `SolutionStackName` `name`, if the catalog publishes one.
+///
+/// A solution stack name and a platform version ARN name the SAME platform
+/// version from the one catalog ([`SOLUTION_STACKS`]), so an operation handed
+/// either one resolves the other through here rather than reporting only the
+/// form the caller happened to use.
+pub fn solution_stack_named(name: &str) -> Option<&'static SolutionStack> {
+    SOLUTION_STACKS.iter().find(|stack| stack.name() == name)
 }
 
 /// The solution stacks this emulator offers, which is what
@@ -460,6 +626,20 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// crate declares no second path to the same crate.
 pub fn new_request_id() -> String {
     ::emulator_telemetry::BatchId::random().as_str().to_string()
+}
+
+/// The Amazon S3 bucket Elastic Beanstalk stores an account's application
+/// versions, logs and other environment files in, in `region`:
+/// `elasticbeanstalk-<region>-<account>`, the form `CreateStorageLocation`
+/// reports. One bucket per account per region, so the name is DERIVED rather
+/// than generated: "If the storage location already exists,
+/// `CreateStorageLocation` still returns the bucket name but does not create a
+/// new bucket."
+pub fn storage_bucket_name(region: &str) -> String {
+    format!(
+        "{ARN_NAMESPACE}-{region}-{}",
+        ::engine::emulator_account_id()
+    )
 }
 
 /// `arn:aws:elasticbeanstalk:<region>:<account>:application/<name>`.
@@ -701,14 +881,56 @@ pub struct Application {
     pub description: Option<String>,
     pub date_created: ::aws_smithy_types::DateTime,
     pub date_updated: ::aws_smithy_types::DateTime,
-    pub resource_lifecycle_config: Option<ApplicationResourceLifecycleConfig>,
+    /// The application's resource lifecycle configuration. NOT optional: the
+    /// service applies its own version-lifecycle policy to every application, so
+    /// a record always carries one and every read reports it. See
+    /// [`resource_lifecycle_config_with_defaults`].
+    pub resource_lifecycle_config: ApplicationResourceLifecycleConfig,
     /// Template names, carried so DescribeApplications reports them; creating a
     /// configuration template is its own (still scaffolded) operation.
     pub configuration_templates: Vec<String>,
     pub tags: Vec<Tag>,
+    /// The deletion the clock owes this application, once `DeleteApplication`
+    /// has started one. See [`PendingDeletion`].
+    pub pending_deletion: Option<PendingDeletion>,
+}
+
+/// The deletion of an application the clock owes: when it completes, and the
+/// request that asked for it.
+///
+/// `DeleteApplication` "deletes the specified application along with all
+/// associated versions and configurations" asynchronously: the call returns at
+/// once and the application is still described while the deletion runs, so a
+/// client polling the resource it owns is not told it has already gone. The
+/// removal is due one [`STATUS_TRANSITION_SPAN`] after the call that started it
+/// and is materialised by the next call that observes it as due — nothing
+/// sleeps.
+#[derive(Debug, Clone)]
+pub struct PendingDeletion {
+    pub due_at: Instant,
+    /// The same instant on the server clock, so the event the completed deletion
+    /// records is dated when the deletion came due.
+    pub due_date: ::aws_smithy_types::DateTime,
+    /// The request that started the deletion: the completion event belongs to
+    /// that request's activity, not to whichever later call observed it.
+    pub request_id: String,
 }
 
 impl Application {
+    /// Start the deletion this application owes: see [`PendingDeletion`].
+    pub fn begin_deletion(&mut self, request_id: &str) {
+        self.pending_deletion = Some(PendingDeletion {
+            due_at: Instant::now() + STATUS_TRANSITION_SPAN,
+            due_date: due_date(),
+            request_id: request_id.to_string(),
+        });
+    }
+
+    /// Whether a deletion of this application has already been started.
+    pub fn is_deleting(&self) -> bool {
+        self.pending_deletion.is_some()
+    }
+
     /// The modelled `ApplicationDescription` for this record. `versions` is
     /// derived by the caller from [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::version_labels`],
     /// so the list is never a second copy of the version store.
@@ -721,7 +943,7 @@ impl Application {
             date_updated: Some(self.date_updated),
             versions: Some(versions),
             configuration_templates: Some(self.configuration_templates.clone()),
-            resource_lifecycle_config: self.resource_lifecycle_config.clone(),
+            resource_lifecycle_config: Some(self.resource_lifecycle_config.clone()),
         }
     }
 }
@@ -762,7 +984,9 @@ impl ApplicationVersion {
             process: self.process,
             date_created: Some(self.date_created),
             date_updated: Some(self.date_updated),
-            status: Some(self.status.clone()),
+            // Reported in the wire form the service uses for the status, not in
+            // the modelled spelling: see [`version_status_on_the_wire`].
+            status: Some(version_status_on_the_wire(&self.status)),
         }
     }
 }
@@ -1315,6 +1539,11 @@ pub struct Environment {
     pub date_terminated: Option<::aws_smithy_types::DateTime>,
     pub tags: Vec<Tag>,
     pub pending_status: Option<PendingStatus>,
+    /// Creation order within this emulator. An `EnvironmentId` is an OPAQUE
+    /// random id, so the store's key order is not the order the environments
+    /// were created in; this is, which is what `DescribeEnvironments` reports
+    /// and pages in so two calls cannot disagree about the order.
+    pub sequence: u64,
 }
 
 impl Environment {
@@ -1620,6 +1849,12 @@ pub struct ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     /// and `DescribeEvents` reports from it. Append order is the record's
     /// `sequence`, which breaks a tie between two events the clock dated alike.
     pub events: Vec<Event>,
+    /// The Amazon S3 buckets `CreateStorageLocation` has created, by name — one
+    /// per region an account has asked for one in. "If the storage location
+    /// already exists, `CreateStorageLocation` still returns the bucket name but
+    /// does not create a new bucket", so the call reports the bucket this set
+    /// holds rather than minting a second one.
+    pub storage_buckets: BTreeSet<String>,
     /// The managed platform branches this account can see, by
     /// [`PlatformBranch::key`]. Service-owned reference data: seeded from
     /// [`MANAGED_PLATFORM_BRANCHES`] when the store is created, so every
@@ -1644,6 +1879,7 @@ impl Default for ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             environments: BTreeMap::new(),
             environment_name_index: BTreeMap::new(),
             events: Vec::new(),
+            storage_buckets: BTreeSet::new(),
             platform_branches: managed_platform_branch_catalog(),
             next_id_counter: 0,
         }
@@ -1651,10 +1887,24 @@ impl Default for ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
 }
 
 impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
-    /// A fresh unique `EnvironmentId`, in the `e-<8 lowercase alphanumerics>`
-    /// form the real service issues.
+    /// A fresh unique `EnvironmentId`, in the `e-<13 lowercase alphanumerics>`
+    /// form the real service issues one in.
+    ///
+    /// The id is OPAQUE — `EnvironmentDescription$EnvironmentId` is documented as
+    /// "The ID of this environment" and nothing else — so nothing is derived from
+    /// the request: the body is random, the way the service's own is, and
+    /// id-shape validation on the returned value sees the form it expects. The
+    /// randomness is the `uuid` crate's, reached through the same uuid-backed id
+    /// newtype [`new_request_id`] uses (its canonical rendering is lowercase hex,
+    /// which is inside the alphabet), and the store is checked so an id it
+    /// already holds is never handed out twice.
     pub fn next_environment_id(&mut self) -> String {
-        format!("e-{:0>8}", base36(self.next_counter()))
+        loop {
+            let candidate = format!("e-{}", random_id_body(ENVIRONMENT_ID_BODY_LENGTH));
+            if !self.environments.contains_key(&candidate) {
+                return candidate;
+            }
+        }
     }
 
     /// The next value of the shared counter.
@@ -1700,6 +1950,60 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             subject,
         });
         self.evict_retired_events();
+    }
+
+    /// Record the events ONE call's activity consists of.
+    ///
+    /// Elastic Beanstalk's event log reports the ACTIVITY of a call, not just
+    /// its outcome: a call records that the operation is starting, then what it
+    /// changed, then that the operation completed, and every one of those events
+    /// carries the same `RequestId` — which is what lets a client follow one
+    /// operation by filtering the log on it. `DescribeEvents` then reports them
+    /// newest-first, so the completion is read before the start.
+    ///
+    /// `operation_name` is the operation as the service names it in those two
+    /// messages (lower camel case: `createApplication`). `resource_event` is the
+    /// message naming the change itself, for a call that has one; a call whose
+    /// own resource message this emulator cannot name records only the two
+    /// bookends rather than inventing a third.
+    ///
+    /// A call whose work the CLOCK finishes later (an environment launch, an
+    /// application deletion) does not use this: it records its start here and
+    /// its completion when the change comes due. See
+    /// [`Self::record_activity_start`].
+    pub fn record_completed_activity(
+        &mut self,
+        request_id: &str,
+        operation_name: &str,
+        resource_event: Option<String>,
+        subject: EventSubject,
+    ) {
+        self.record_activity_start(request_id, operation_name, subject.clone());
+        if let Some(message) = resource_event {
+            self.record_event(request_id, SEVERITY_INFO, message, subject.clone());
+        }
+        self.record_event(
+            request_id,
+            SEVERITY_INFO,
+            format!("{operation_name} completed successfully."),
+            subject,
+        );
+    }
+
+    /// Record that `operation_name`'s activity has STARTED, the first event of
+    /// the sequence [`Self::record_completed_activity`] describes.
+    pub fn record_activity_start(
+        &mut self,
+        request_id: &str,
+        operation_name: &str,
+        subject: EventSubject,
+    ) {
+        self.record_event(
+            request_id,
+            SEVERITY_INFO,
+            format!("{operation_name} is starting."),
+            subject,
+        );
     }
 
     /// An application's version labels, newest first.
@@ -1871,14 +2175,15 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             .count()
     }
 
-    /// Materialise every status change the clock has already made due — an
-    /// environment's, and a platform version's — record the event each completed
-    /// environment change owes, and drop the events the clock has carried out of
-    /// the reporting window. Every handler that reads or acts on one of them
-    /// calls this first, so no two of them disagree about what state the store is
-    /// in.
+    /// Materialise every change the clock has already made due — an
+    /// environment's status, a platform version's status, and an application
+    /// whose deletion has completed — record the event each completed change
+    /// owes, and drop the events the clock has carried out of the reporting
+    /// window. Every handler that reads or acts on one of them calls this first,
+    /// so no two of them disagree about what state the store is in.
     pub fn materialize_due_transitions(&mut self) {
         let at = Instant::now();
+        self.materialize_due_application_deletions(at);
         // The event cannot be appended while `environments` is borrowed, so the
         // completions are collected first and recorded below.
         let mut completed: Vec<CompletedTransition> = Vec::new();
@@ -1901,6 +2206,49 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             platform_version.materialize_due(at);
         }
         self.evict_retired_environments();
+    }
+
+    /// Materialise just the application deletions the clock has already
+    /// completed — the part of [`Self::materialize_due_transitions`] that an
+    /// operation acting on an APPLICATION owes before it reads the application
+    /// store, so a name whose deletion is already due is not reported as taken
+    /// and a version is not created inside an application the clock has
+    /// removed. An operation that touches an environment or a platform version
+    /// calls the whole of it instead.
+    pub fn materialize_due_application_removals(&mut self) {
+        self.materialize_due_application_deletions(Instant::now());
+    }
+
+    /// Remove every application whose deletion the clock has already completed,
+    /// recording the event that completion owes.
+    ///
+    /// The removal was due at `due_at` whether or not anybody called, so
+    /// materialising it on a read cannot hide an application that was still
+    /// describable: until then the record is reported exactly as it stands, the
+    /// way the real service reports an application whose deletion is still
+    /// running.
+    fn materialize_due_application_deletions(&mut self, at: Instant) {
+        let due: Vec<(String, PendingDeletion)> = self
+            .applications
+            .values()
+            .filter_map(|application| {
+                let pending = application.pending_deletion.clone()?;
+                (pending.due_at <= at).then(|| (application.name.clone(), pending))
+            })
+            .collect();
+        for (application_name, pending) in due {
+            self.applications.remove(&application_name);
+            self.record_event_at(
+                &pending.request_id,
+                SEVERITY_INFO,
+                "deleteApplication completed successfully.",
+                EventSubject {
+                    application_name: Some(application_name),
+                    ..Default::default()
+                },
+                pending.due_date,
+            );
+        }
     }
 
     /// Drop every event older than [`EVENT_RETENTION`] — the window
@@ -2003,19 +2351,48 @@ pub fn missing_environment_message(
     }
 }
 
-/// Render `n` in lowercase base 36 — the alphabet an `EnvironmentId` body uses.
-fn base36(mut n: u64) -> String {
-    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    if n == 0 {
-        return "0".to_string();
+/// The message that records a created resource, the middle event of the
+/// sequence [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::record_completed_activity`]
+/// describes: `Created new <kind>: <identifier>`, the form the real service's
+/// `Created new Application: <name>` event uses. [`RESOURCE_APPLICATION`] and
+/// [`RESOURCE_APPLICATION_VERSION`] are the kinds this service creates
+/// synchronously.
+pub fn resource_created_event(kind: &str, identifier: &str) -> String {
+    format!("Created new {kind}: {identifier}")
+}
+
+/// The resource kind an application's created-event names. See
+/// [`resource_created_event`].
+pub const RESOURCE_APPLICATION: &str = "Application";
+/// The resource kind an application version's created-event names. See
+/// [`resource_created_event`].
+pub const RESOURCE_APPLICATION_VERSION: &str = "Application Version";
+
+/// How many characters an `EnvironmentId` body carries: `e-` plus 13 lowercase
+/// alphanumerics is the form the real service issues one in.
+pub const ENVIRONMENT_ID_BODY_LENGTH: usize = 13;
+
+/// `length` random lowercase hexadecimal characters, for an opaque
+/// server-generated id.
+///
+/// Taken from the canonical rendering of v4 UUIDs — lowercase hex, which is
+/// inside the lowercase-alphanumeric alphabet an id body uses — drawn through
+/// the same uuid-backed id newtype [`new_request_id`] uses, so this crate
+/// hand-rolls no generator and reaches the `uuid` crate by one path only. As
+/// many UUIDs are drawn as the length needs; 13 hex characters carry 52 bits,
+/// which is what makes a collision (checked for anyway) a non-event.
+fn random_id_body(length: usize) -> String {
+    let mut body = String::with_capacity(length);
+    while body.len() < length {
+        let drawn = ::emulator_telemetry::BatchId::random().as_str().to_string();
+        body.extend(
+            drawn
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .take(length - body.len()),
+        );
     }
-    let mut out = Vec::new();
-    while n > 0 {
-        out.push(DIGITS[(n % 36) as usize]);
-        n /= 36;
-    }
-    out.reverse();
-    String::from_utf8(out).expect("base36 digits are ASCII")
+    body
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

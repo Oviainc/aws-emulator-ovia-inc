@@ -136,6 +136,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             UpdateApplicationError::internal_failure("the Elastic Beanstalk store is unavailable")
         })?;
         let mut store = state.lock();
+        // An application the clock has already finished deleting is gone, so an
+        // update never applies to a record that no longer exists.
+        store.materialize_due_application_removals();
 
         // Read from the version store before the application is borrowed
         // mutably, so the reported `Versions` list is the version store's own

@@ -338,8 +338,8 @@ async fn a_described_version_carries_what_was_stored() {
         );
         assert_eq!(
             described.value("ApplicationVersions/member/Status"),
-            Some("Unprocessed"),
-            "case {name:?}: a version nothing processed is Unprocessed, got {}",
+            Some("UNPROCESSED"),
+            "case {name:?}: a version nothing processed is UNPROCESSED, got {}",
             described.body
         );
         assert!(
@@ -356,16 +356,29 @@ async fn a_described_version_carries_what_was_stored() {
             described.body
         );
         // Fully scoped under the reported member, so the assertion stays
-        // precise even when an answer holds more than one version.
+        // precise even when an answer holds more than one version. A version
+        // created with NEITHER a source bundle nor source build information
+        // carries the sample application's location: "If neither SourceBundle
+        // nor SourceBuildInformation are provided, Elastic Beanstalk uses a
+        // sample application."
+        let expected_bundle = case.bundle.map_or_else(
+            || {
+                (
+                    format!("elasticbeanstalk-{TEST_REGION}"),
+                    "GenericSampleApplication".to_string(),
+                )
+            },
+            |(bucket, key)| (bucket.to_string(), key.to_string()),
+        );
         assert_eq!(
             described.value("ApplicationVersions/member/SourceBundle/S3Bucket"),
-            case.bundle.map(|(bucket, _)| bucket),
+            Some(expected_bundle.0.as_str()),
             "case {name:?}: the stored S3Bucket must come back, got {}",
             described.body
         );
         assert_eq!(
             described.value("ApplicationVersions/member/SourceBundle/S3Key"),
-            case.bundle.map(|(_, key)| key),
+            Some(expected_bundle.1.as_str()),
             "case {name:?}: the stored S3Key must come back, got {}",
             described.body
         );

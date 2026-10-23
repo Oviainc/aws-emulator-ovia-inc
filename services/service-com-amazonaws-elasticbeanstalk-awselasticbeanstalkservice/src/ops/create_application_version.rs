@@ -201,6 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // Every event this call records belongs to this one request's activity.
         let request_id = crate::state::new_request_id();
+        // An application the clock has already finished deleting is gone, so a
+        // version is never created inside one that no longer exists and the name
+        // is free for the auto-create below.
+        store.materialize_due_application_removals();
 
         if !store.applications.contains_key(&input.application_name) {
             // `AutoCreateApplication`: "Set to true to create an application with
@@ -233,19 +237,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 description: None,
                 date_created: created,
                 date_updated: created,
-                resource_lifecycle_config: None,
+                // As on the CreateApplication path: an application always
+                // carries the service's version-lifecycle defaults.
+                resource_lifecycle_config:
+                    crate::state::resource_lifecycle_config_with_defaults(None),
                 configuration_templates: Vec::new(),
                 tags: Vec::new(),
+                pending_deletion: None,
             };
             store
                 .applications
                 .insert(application.name.clone(), application);
-            // Auto-creation is a create, so it records the same event
-            // `CreateApplication` does.
-            store.record_event(
+            // Auto-creation is a create, so it records the same activity
+            // `CreateApplication` does — under THIS request's id, because it is
+            // this one request that performed it.
+            store.record_completed_activity(
                 &request_id,
-                crate::state::SEVERITY_INFO,
-                "createApplication completed successfully.",
+                "createApplication",
+                Some(crate::state::resource_created_event(
+                    crate::state::RESOURCE_APPLICATION,
+                    &input.application_name,
+                )),
                 crate::state::EventSubject {
                     application_name: Some(input.application_name.clone()),
                     ..Default::default()
@@ -288,7 +300,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.version_label,
             ),
             description: input.description,
-            source_bundle: input.source_bundle,
+            // "Specify a source bundle in Amazon S3 or a commit in an CodeCommit
+            // repository (with SourceBuildInformation), but not both. If neither
+            // SourceBundle nor SourceBuildInformation are provided, Elastic
+            // Beanstalk uses a sample application" — so a version created
+            // without either one records the sample application's location in
+            // the request's region, and still tells its caller where its source
+            // bundle is.
+            source_bundle: input.source_bundle.clone().or_else(|| {
+                input
+                    .source_build_information
+                    .is_none()
+                    .then(|| crate::state::sample_application_source_bundle(&region))
+            }),
             process: input.process,
             // Nothing here builds or validates a source bundle, so the version
             // stays at the status a version has before processing: it is never
@@ -303,10 +327,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let description = version.to_description();
         store.application_versions.insert(key, version);
 
-        store.record_event(
+        store.record_completed_activity(
             &request_id,
-            crate::state::SEVERITY_INFO,
-            "createApplicationVersion completed successfully.",
+            "createApplicationVersion",
+            Some(crate::state::resource_created_event(
+                crate::state::RESOURCE_APPLICATION_VERSION,
+                &input.version_label,
+            )),
             crate::state::EventSubject {
                 application_name: Some(input.application_name.clone()),
                 version_label: Some(input.version_label.clone()),

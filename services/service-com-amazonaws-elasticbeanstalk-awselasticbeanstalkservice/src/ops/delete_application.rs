@@ -171,6 +171,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(DeleteApplicationOutput);
         }
 
+        // A deletion this application is already running is not started a second
+        // time: the post-condition the caller asked for is already on its way,
+        // and re-recording the activity would report one deletion twice.
+        if store
+            .applications
+            .get(&input.application_name)
+            .is_some_and(crate::state::Application::is_deleting)
+        {
+            return Ok(DeleteApplicationOutput);
+        }
+
         // "You cannot delete an application that has a running environment" —
         // unless "TerminateEnvByForce … running environments will be terminated
         // before deleting the application".
@@ -226,18 +237,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Deletes the specified application along with all associated versions
-        // and configurations." The terminated environments stay in the store, as
-        // deleted environments a DescribeEnvironments with `IncludeDeleted` can
-        // still report.
-        store.applications.remove(&input.application_name);
+        // and configurations." The delete is ASYNCHRONOUS: the call starts it and
+        // the application is still described while it runs — so the record is
+        // marked for removal one status-transition span out and dropped by the
+        // first call that observes that as due, which is also when the activity's
+        // completion event is recorded. Its versions and configurations go with
+        // the call that asked for them. The terminated environments stay in the
+        // store, as deleted environments a DescribeEnvironments with
+        // `IncludeDeleted` can still report.
+        if let Some(application) = store.applications.get_mut(&input.application_name) {
+            application.begin_deletion(&request_id);
+        }
         store
             .application_versions
             .retain(|(application_name, _), _| *application_name != input.application_name);
 
-        store.record_event(
+        // The deletion has STARTED here; the event for its completion is recorded
+        // when the clock makes that completion due.
+        store.record_activity_start(
             &request_id,
-            crate::state::SEVERITY_INFO,
-            "deleteApplication completed successfully.",
+            "deleteApplication",
             crate::state::EventSubject {
                 application_name: Some(input.application_name.clone()),
                 ..Default::default()

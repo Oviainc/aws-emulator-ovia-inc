@@ -40,6 +40,11 @@ const REGION: &str = "us-east-1";
 /// The wire error code the model's `@httpError` 404 shape is rendered under.
 const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 
+/// The one sentence a READ states for an absent managed thing, written out here rather
+/// than imported so the test pins the text a client reads and not the implementation's
+/// own formatter. It names no identifier, so it is the same for every request.
+const READ_REASON: &str = "Managed Thing resource not found.";
+
 /// One HTTP answer, reduced to what the assertions read.
 struct Reply {
     status: u16,
@@ -173,9 +178,41 @@ fn resolving_operations() -> Vec<Resolving> {
 /// the text a client reads and not the implementation's own formatter.
 fn expected_message(kind: Resolver, identifier: &str) -> String {
     match kind {
-        Resolver::Read => "Managed Thing resource not found.".to_string(),
+        Resolver::Read => READ_REASON.to_string(),
         Resolver::Mutation => format!("ManagedThing for identifier '{identifier}' not found"),
     }
+}
+
+/// The smallest `CreateManagedThing` body this service accepts, used only to obtain a
+/// managed thing whose id the SERVICE chose rather than the test.
+fn minimal_create() -> Value {
+    json!({
+        "Role": "DEVICE",
+        "AuthenticationMaterialType": "ZWAVE_QR_BAR_CODE",
+        "AuthenticationMaterial": "qr:0000000000",
+    })
+}
+
+/// Create one managed thing and delete it again, answering the service-generated id it
+/// was held under: an identifier the test did not choose, absent because it was removed.
+async fn create_then_delete(router: &MultiServiceRouter, case: &str) -> String {
+    let created = call(router, "POST", "/managed-things", Some(minimal_create())).await;
+    assert_eq!(
+        created.status, 201,
+        "case {case:?}: expected HTTP 201 from CreateManagedThing, got {} with body {:?}",
+        created.status, created.body
+    );
+    let id = created
+        .string("Id")
+        .unwrap_or_else(|| panic!("case {case:?}: expected an Id, got body {:?}", created.body))
+        .to_string();
+    let removed = call(router, "DELETE", &format!("/managed-things/{id}"), None).await;
+    assert_eq!(
+        removed.status, 204,
+        "case {case:?}: expected HTTP 204 from DeleteManagedThing, got {} with body {:?}",
+        removed.status, removed.body
+    );
+    id
 }
 
 /// Assert one answer against the rule.
@@ -258,41 +295,9 @@ async fn a_missing_managed_thing_is_stated_by_the_resolving_path() {
 async fn a_deleted_or_out_of_region_managed_thing_is_stated_the_same_way() {
     let router = emulator();
 
-    let create = json!({
-        "Role": "DEVICE",
-        "AuthenticationMaterialType": "ZWAVE_QR_BAR_CODE",
-        "AuthenticationMaterial": "qr:0000000000",
-    });
-
     // A record created and then deleted: every resolving operation states the
     // service-generated id it was holding.
-    let created = call(&router, "POST", "/managed-things", Some(create.clone())).await;
-    assert_eq!(
-        created.status, 201,
-        "case \"deleted\": expected HTTP 201 from CreateManagedThing, got {} with body {:?}",
-        created.status, created.body
-    );
-    let deleted_id = created
-        .string("Id")
-        .unwrap_or_else(|| {
-            panic!(
-                "case \"deleted\": expected an Id, got body {:?}",
-                created.body
-            )
-        })
-        .to_string();
-    let removed = call(
-        &router,
-        "DELETE",
-        &format!("/managed-things/{deleted_id}"),
-        None,
-    )
-    .await;
-    assert_eq!(
-        removed.status, 204,
-        "case \"deleted\": expected HTTP 204 from DeleteManagedThing, got {} with body {:?}",
-        removed.status, removed.body
-    );
+    let deleted_id = create_then_delete(&router, "deleted").await;
     for resolving in resolving_operations() {
         let case = format!("{}/deleted", resolving.operation);
         let reply = call(
@@ -307,7 +312,7 @@ async fn a_deleted_or_out_of_region_managed_thing_is_stated_the_same_way() {
 
     // A record that exists, addressed through another region's endpoint: a managed thing
     // is regional, so that region holds none under this id.
-    let elsewhere = call(&router, "POST", "/managed-things", Some(create)).await;
+    let elsewhere = call(&router, "POST", "/managed-things", Some(minimal_create())).await;
     assert_eq!(
         elsewhere.status, 201,
         "case \"other region\": expected HTTP 201 from CreateManagedThing, got {} with body {:?}",
@@ -380,4 +385,76 @@ async fn two_requests_are_stated_from_their_own_identifiers() {
             );
         }
     }
+}
+
+/// RULE: the READ path's reason is REQUEST-INDEPENDENT — `GetManagedThing` answers one
+/// constant sentence ([`READ_REASON`]) for every absent managed thing, so it is
+/// byte-identical across every form of identifier the model admits and across every cause
+/// of the absence, and it never echoes the identifier the request carried. The identifier
+/// is reported on `ResourceId` instead, which does differ per request.
+///
+/// This is the half of the rule the mutation paths do NOT share: their reason is built
+/// from the request, so a formatter change on that side must leave this one constant.
+#[tokio::test]
+async fn the_read_paths_reason_is_one_constant_request_independent_sentence() {
+    let router = emulator();
+
+    // `ManagedThingId`: `@length` 1..64, `@pattern` ^[a-zA-Z0-9:_-]*$
+    // (`smithy_query(query="operation",operation="GetManagedThing")`). The rows differ
+    // along every property of the request the reason could have varied with: the
+    // identifier's length at both ends of the bound, the punctuation the pattern admits,
+    // its character classes, and its case. The single-character row is spelled `z`, a
+    // letter [`READ_REASON`] does not contain, so the "does not echo the identifier"
+    // assertion below is meaningful for it too.
+    let longest = "f".repeat(64);
+    let mut cases: Vec<(String, String)> = vec![
+        ("the recorded id", "nonexistentmanagedthing0001"),
+        ("one character, the length minimum", "z"),
+        ("64 characters, the length maximum", longest.as_str()),
+        ("the punctuation the pattern admits", "thing:with_punctuation-0"),
+        ("digits only", "0123456789"),
+        ("mixed case", "MiXeDcAsEiD"),
+    ]
+    .into_iter()
+    .map(|(form, identifier)| (form.to_string(), identifier.to_string()))
+    .collect();
+
+    // The last row's absence has a different CAUSE — the record existed and was deleted —
+    // under an id the service minted rather than one this test chose.
+    cases.push((
+        "deleted, under the id the service minted".to_string(),
+        create_then_delete(&router, "deleted").await,
+    ));
+
+    let mut reasons: Vec<(String, String)> = Vec::new();
+    for (form, identifier) in &cases {
+        let case = format!("GetManagedThing/{form}");
+        let reply = call(&router, "GET", &format!("/managed-things/{identifier}"), None).await;
+        assert_not_found(&case, &reply, Resolver::Read, identifier);
+        let reason = reply
+            .string("Message")
+            .unwrap_or_else(|| panic!("case {case:?}: expected a Message, got {:?}", reply.body))
+            .to_string();
+        assert!(
+            !reason.contains(identifier.as_str()),
+            "case {case:?}: the read path's reason must not echo the identifier, got {reason:?}"
+        );
+        reasons.push((case, reason));
+    }
+
+    // One sentence, for all of them.
+    for (case, reason) in &reasons {
+        assert_eq!(
+            reason, READ_REASON,
+            "case {case:?}: expected the read path's constant reason {READ_REASON:?}, got \
+             {reason:?}"
+        );
+    }
+    let distinct: std::collections::BTreeSet<&str> =
+        reasons.iter().map(|(_, reason)| reason.as_str()).collect();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "every read must state the same sentence, got {distinct:?}"
+    );
 }

@@ -296,7 +296,8 @@ use crate::ops::types::{
     PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry,
     RequestLaunchTemplateData, RunInstancesOutput, SecondaryNetwork,
-    SecondaryNetworkIpv4CidrBlockAssociation, SecurityGroup, StateReason, Subnet, Tag,
+    SecondaryNetworkIpv4CidrBlockAssociation, SecurityGroup, SpotPlacementScore, StateReason,
+    Subnet, Tag,
     TagSpecification,
     TransitGateway, TransitGatewayOptions, TransitGatewayRequestOptions, TransitGatewayRouteTable,
     UserIdGroupPair, Vpc, VpcCidrBlockAssociation, VpcCidrBlockState, VpcEndpointConnection,
@@ -2997,6 +2998,222 @@ pub fn instance_type_offerings(
 /// reorder the two.
 pub fn offering_page_cursor(offering: &InstanceTypeOfferingRecord) -> String {
     format!("{} {}", offering.location, offering.instance_type)
+}
+
+// =============================================================================
+// Spot placement scores
+// =============================================================================
+
+/// The Regions of the commercial (`aws`) partition, in Region-code order: the ones a
+/// `GetSpotPlacementScores` request that narrows nothing is scored over.
+///
+/// `RegionNames` holds "the Regions used to narrow down the list of Regions to be
+/// scored" (`GetSpotPlacementScoresRequest$RegionNames`), so the list it narrows has to
+/// exist, and neither the Smithy model nor any operation of this emulator carries one —
+/// the model's endpoint rule set resolves ONE Region name rather than enumerating them,
+/// and no operation creates a Region. The catalog is therefore
+/// `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS region the wire may carry",
+/// already sorted for binary search) with the other partitions' Regions filtered out by
+/// [`NON_COMMERCIAL_REGION_PREFIXES`] — the same source two other services derive their
+/// Region catalogs from, rather than a second hand-written list that would drift from it.
+/// The order it inherits is what makes [`MAX_SCORED_REGIONS`] a prefix of this list.
+///
+/// Nothing here is tied to one operation: `DescribeRegions` is still a scaffold stub and
+/// wants exactly this catalog.
+pub fn commercial_regions() -> Vec<&'static str> {
+    ::emulator_telemetry::policy::KNOWN_REGIONS
+        .iter()
+        .copied()
+        .filter(|region| {
+            !NON_COMMERCIAL_REGION_PREFIXES
+                .iter()
+                .any(|prefix| region.starts_with(prefix))
+        })
+        .collect()
+}
+
+/// The region-code prefixes of the partitions that are not the commercial one: AWS China,
+/// GovCloud and the isolated partitions (`us-iso`, `us-isob`, `us-isof`, `eu-isoe` — the
+/// shorter prefixes cover the longer ones). They are AWS's own partition prefixes, the
+/// same ones `service-com-amazonaws-observabilityadmin-observabilityadmin` partitions
+/// `KNOWN_REGIONS` by.
+const NON_COMMERCIAL_REGION_PREFIXES: [&str; 4] = ["cn-", "us-gov-", "us-iso", "eu-iso"];
+
+/// The most Regions one `GetSpotPlacementScores` response scores: "The Spot placement
+/// score for the top 10 Regions or Availability Zones"
+/// (`GetSpotPlacementScoresResult$SpotPlacementScores`).
+///
+/// The ceiling is on REGIONS rather than on response items, so a request that scores
+/// single Availability Zones scores the zones OF these Regions and can report more items
+/// than this, paged by `MaxResults` and `NextToken`. That reading is the one the rest of
+/// the model supports: the same operation publishes `MaxResults` with a range of 10..1000
+/// and a `NextToken` on both its input and its output, and neither a page size above ten
+/// nor a continuation token could ever do anything if one response held at most ten items.
+pub const MAX_SCORED_REGIONS: usize = 10;
+
+/// The bottom of the published score scale: "The placement score, on a scale from 1 to
+/// 10. ... A score of 1 indicates that your Spot request is not likely to succeed"
+/// (`SpotPlacementScore$Score`).
+pub const MIN_PLACEMENT_SCORE: i32 = 1;
+
+/// The top of the published score scale: "A score of 10 indicates that your Spot request
+/// is highly likely to succeed in this Region or Availability Zone"
+/// (`SpotPlacementScore$Score`).
+pub const MAX_PLACEMENT_SCORE: i32 = 10;
+
+/// The instance type count a request is diversified from: "We recommend that you specify
+/// at least three instance types" (`GetSpotPlacementScoresRequest$InstanceTypes`).
+pub const RECOMMENDED_INSTANCE_TYPE_COUNT: usize = 3;
+
+/// The best score a request that names fewer than [`RECOMMENDED_INSTANCE_TYPE_COUNT`]
+/// instance types gets: "If you specify one or two instance types, or specify variations
+/// of a single instance type ... the returned placement score will always be low"
+/// (`GetSpotPlacementScoresRequest$InstanceTypes`) — low on the 1..10 scale.
+pub const UNDIVERSIFIED_PLACEMENT_SCORE: i32 = 3;
+
+/// The placement score for `capacity` of demand placed on ONE location, given how many
+/// DISTINCT instance types the request leaves Amazon EC2 to choose from (0 when it names
+/// none, and so leaves EC2 to choose).
+///
+/// A score "reflects how likely it is that each Region or Availability Zone will succeed
+/// at fulfilling the specified target capacity" (`GetSpotPlacementScoresResult$
+/// SpotPlacementScores`), so it falls as the demand on a location grows and as the set of
+/// instance types that could fulfil it narrows: the score starts at
+/// [`MAX_PLACEMENT_SCORE`] and drops by one for each decimal order of magnitude of the
+/// demand, down to [`MIN_PLACEMENT_SCORE`], and a request naming one or two instance types
+/// is never scored above [`UNDIVERSIFIED_PLACEMENT_SCORE`].
+///
+/// The unit the capacity is counted in does not enter the score: this emulator holds no
+/// vCPU-or-memory-per-instance-type data to convert `vcpu` or `memory-mib` into instances
+/// with (the modelled `InstanceType` enum is a list of names — see
+/// [`offered_instance_types`]), so the capacity is scored in whatever unit the request
+/// states it in rather than through a conversion invented here.
+pub fn placement_score(capacity: u64, instance_type_count: usize) -> i32 {
+    // `ilog10` of a `u64` is at most 19, so this conversion cannot actually saturate; the
+    // fallback is there so the arithmetic below needs no unchecked cast.
+    let orders_of_magnitude = i32::try_from(capacity.max(1).ilog10()).unwrap_or(i32::MAX);
+    let score = MAX_PLACEMENT_SCORE
+        .saturating_sub(orders_of_magnitude)
+        .clamp(MIN_PLACEMENT_SCORE, MAX_PLACEMENT_SCORE);
+    if (1..RECOMMENDED_INSTANCE_TYPE_COUNT).contains(&instance_type_count) {
+        score.min(UNDIVERSIFIED_PLACEMENT_SCORE)
+    } else {
+        score
+    }
+}
+
+/// One scored location of a `GetSpotPlacementScores` response: a whole Region, or one
+/// Availability Zone of a Region.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpotPlacementScoreRecord {
+    /// The Region scored, or the Region of the scored Availability Zone.
+    pub region: String,
+    /// The zone id of the scored Availability Zone — `None` when the whole Region is
+    /// scored, because then the response names no zone.
+    pub availability_zone_id: Option<String>,
+    /// The score, on the 1..10 scale.
+    pub score: i32,
+}
+
+impl SpotPlacementScoreRecord {
+    /// This record as the modelled `SpotPlacementScore` shape.
+    pub fn to_spot_placement_score(&self) -> SpotPlacementScore {
+        SpotPlacementScore {
+            region: Some(self.region.clone()),
+            availability_zone_id: self.availability_zone_id.clone(),
+            score: Some(self.score),
+        }
+    }
+}
+
+/// Every location of `regions` scored for `capacity` and `instance_type_count`, in report
+/// order: highest score first, then by location.
+///
+/// A request scores either whole Regions or single Availability Zones —
+/// "`SingleAvailabilityZone`: specify true so that the response returns a list of scored
+/// Availability Zones. Otherwise, the response returns a list of scored Regions." A
+/// Region's score "assumes that your fleet request will be configured to use all
+/// Availability Zones", whereas a caller scoring single zones "want[s] to launch all of
+/// [its] Spot capacity into a single Availability Zone": one zone carries the whole target
+/// capacity that a Region's zones would otherwise share, so a zone is scored for that
+/// larger per-location demand and therefore never scores above its own Region.
+pub fn spot_placement_scores(
+    regions: &[String],
+    capacity: u64,
+    instance_type_count: usize,
+    single_availability_zone: bool,
+) -> Vec<SpotPlacementScoreRecord> {
+    let per_zone_capacity =
+        capacity.saturating_mul(u64::try_from(AVAILABILITY_ZONES_PER_REGION).unwrap_or(1));
+    let mut scored: Vec<SpotPlacementScoreRecord> = regions
+        .iter()
+        .flat_map(|region| {
+            if single_availability_zone {
+                availability_zones_in_region(region)
+                    .into_iter()
+                    .map(|zone| SpotPlacementScoreRecord {
+                        region: region.clone(),
+                        availability_zone_id: Some(zone.zone_id),
+                        score: placement_score(per_zone_capacity, instance_type_count),
+                    })
+                    .collect::<Vec<SpotPlacementScoreRecord>>()
+            } else {
+                vec![SpotPlacementScoreRecord {
+                    region: region.clone(),
+                    availability_zone_id: None,
+                    score: placement_score(capacity, instance_type_count),
+                }]
+            }
+        })
+        .collect();
+    scored.sort_by_cached_key(placement_score_page_cursor);
+    scored
+}
+
+/// The pagination cursor naming `record`'s place in report order: its distance below the
+/// top of the scale, then its Region, then its zone id, joined by spaces.
+///
+/// Paging is by cursor rather than by index, the way [`encode_page_token`] and
+/// [`offering_page_cursor`] do it, so a token names the location the next page starts at.
+/// The distance below the top of the scale comes first and fixed-width, so ascending
+/// cursor order IS report order — highest score first, then location — and the separator
+/// sorts ahead of every character a Region name or a zone id can carry, so one Region
+/// being a prefix of another cannot reorder the two.
+pub fn placement_score_page_cursor(record: &SpotPlacementScoreRecord) -> String {
+    format!(
+        "{:02} {} {}",
+        MAX_PLACEMENT_SCORE.saturating_sub(record.score),
+        record.region,
+        record.availability_zone_id.as_deref().unwrap_or_default()
+    )
+}
+
+/// Whether `name` is shaped like a Region code — "enter the Region code, for example,
+/// us-east-1" (`GetSpotPlacementScoresRequest$RegionNames`).
+///
+/// A Region code is hyphen-joined lowercase groups ending in a number: `us-east-1`,
+/// `ap-northeast-3`, `us-gov-west-1`. This is the grammar alone, with no allowlist: it is
+/// what the Region taken from a SigV4 credential scope is held to, which is
+/// caller-controlled text rendered into the zone names and zone ids a scored zone reports,
+/// and that Region belongs to whichever partition the caller is calling. A Region a
+/// REQUEST names is held to the catalog itself ([`commercial_regions`]) by the handler,
+/// the way an instance type is held to [`offered_instance_types`].
+pub fn region_name_is_well_formed(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 {
+        return false;
+    }
+    let parts: Vec<&str> = name.split('-').collect();
+    let Some((number, words)) = parts.split_last() else {
+        return false;
+    };
+    // `us-east-1` is the shortest shape: a partition code, at least one word, then the
+    // Region's number — so at least two hyphen-separated words ahead of that number.
+    words.len() >= 2
+        && (1..=2).contains(&number.len())
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+        && words
+            .iter()
+            .all(|word| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase()))
 }
 
 /// One token of a compiled filter value.
