@@ -507,3 +507,90 @@ async fn deleting_an_arn_that_names_no_stored_credential_is_refused() {
         "after deleting the only credential the list must be empty"
     );
 }
+
+/// RULE: for the auth types whose `token` the model documents as another resource's
+/// ARN — `ImportSourceCredentialsInput$token`: "For the authType CODECONNECTIONS, this
+/// is the connectionArn. For the authType SECRETS_MANAGER, this is the secretArn." — a
+/// token that is not an ARN names no such resource, so the import is refused with HTTP
+/// 400 `InvalidInputException` and persists nothing; an ARN-shaped token is accepted and
+/// comes back as `SourceCredentialsInfo$resource`.
+#[tokio::test]
+async fn a_resource_arn_auth_type_refuses_a_token_that_is_not_an_arn() {
+    // Every way a value can fail to be an ARN, over each auth type whose token is one
+    // (catalog source: `smithy_query(query="shape",shape="AuthType")` and the
+    // `SourceCredentialsInfo$resource` doc, mirrored in `RESOURCE_ARN_AUTH_TYPES`).
+    let not_arns = [
+        "connection-id",
+        "arn",
+        "arn:aws:codeconnections",
+        "arn:aws:codeconnections:us-west-2:000000000000",
+        // Six fields, but an empty partition and an empty resource.
+        "arn::codeconnections:us-west-2:000000000000:connection/abc",
+        "arn:aws:codeconnections:us-west-2:000000000000:",
+    ];
+    for auth_type in state::RESOURCE_ARN_AUTH_TYPES {
+        for token in not_arns {
+            let router = emulator();
+            let case = format!("{auth_type} with token {token:?}");
+            let (status, body) = call(
+                &router,
+                "ImportSourceCredentials",
+                json!({
+                    "serverType": "GITHUB_ENTERPRISE",
+                    "authType": auth_type,
+                    "token": token,
+                }),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400, got {status} with {body}"
+            );
+            assert_eq!(
+                error_type(&body),
+                "InvalidInputException",
+                "case {case:?}: expected InvalidInputException, got {body}"
+            );
+            let listed = list_credentials(&router).await;
+            assert_eq!(
+                listed,
+                Vec::<Value>::new(),
+                "case {case:?}: a refused import must persist nothing, got {listed:?}"
+            );
+        }
+    }
+
+    // The same auth types with an ARN-shaped token are accepted, and that ARN — the
+    // token's one non-secret form — is what the list reports as `resource`.
+    let accepted = [
+        (
+            "CODECONNECTIONS",
+            "arn:aws:codeconnections:us-west-2:000000000000:connection/accepted",
+        ),
+        (
+            "SECRETS_MANAGER",
+            "arn:aws:secretsmanager:us-west-2:000000000000:secret:accepted",
+        ),
+    ];
+    for (auth_type, token) in accepted {
+        let router = emulator();
+        let row = Imported {
+            case: auth_type,
+            server_type: "GITHUB_ENTERPRISE",
+            auth_type,
+            token,
+            username: None,
+        };
+        let (status, body) = call(&router, "ImportSourceCredentials", row.request()).await;
+        assert_eq!(
+            status, 200,
+            "case {auth_type:?}: expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            list_credentials(&router).await,
+            vec![row.expected_info()],
+            "case {auth_type:?}: expected the stored record to carry the token's ARN as \
+             resource"
+        );
+    }
+}

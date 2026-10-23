@@ -1669,6 +1669,35 @@ pub fn project_arn(region: &str, name: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("project/{name}"))
 }
 
+/// Whether `value` has the six colon-separated fields of an ARN,
+/// `arn:<partition>:<service>:<region>:<account>:<resource>` — the syntactic
+/// check an operation that takes an ARN applies before it looks anything up.
+///
+/// The region and account fields may be empty (a global or account-less
+/// resource); the partition, service and resource fields may not.
+pub fn is_arn(value: &str) -> bool {
+    let mut fields = value.splitn(6, ':');
+    fields.next() == Some("arn")
+        && fields.next().is_some_and(|partition| !partition.is_empty())
+        && fields.next().is_some_and(|service| !service.is_empty())
+        && fields.next().is_some()
+        && fields.next().is_some()
+        && fields.next().is_some_and(|resource| !resource.is_empty())
+}
+
+/// Whether an auth type's `token` is another resource's ARN rather than a secret:
+/// the two [`RESOURCE_ARN_AUTH_TYPES`], read as a predicate.
+///
+/// The model says so twice: `ImportSourceCredentialsInput$token` — "For the
+/// authType CODECONNECTIONS, this is the connectionArn. For the authType
+/// SECRETS_MANAGER, this is the secretArn." — and
+/// `SourceCredentialsInfo$resource` — "The connection ARN if your authType is
+/// CODECONNECTIONS or SECRETS_MANAGER." For every other auth type the token is a
+/// password or an access token, which no operation reports.
+pub fn token_is_resource_arn(auth_type: &str) -> bool {
+    RESOURCE_ARN_AUTH_TYPES.contains(&auth_type)
+}
+
 /// `arn:aws:codebuild:<region>:<account>:build/<id>`.
 pub fn build_arn(region: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("build/{id}"))
