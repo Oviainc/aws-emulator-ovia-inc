@@ -72,3 +72,5 @@ mod aggregate_resource_config;
 mod resource_evaluation_surface;
 #[path = "all/delete_service_linked_recorder.rs"]
 mod delete_service_linked_recorder;
+#[path = "all/config_rules_on_demand_evaluation.rs"]
+mod config_rules_on_demand_evaluation;
