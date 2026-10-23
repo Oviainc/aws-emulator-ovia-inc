@@ -1,0 +1,70 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: route53-recovery-readiness.get-recovery-group-readiness-summary-nonexistent-not-found route53-recovery-readiness.readiness-check-repoint-resource-set route53-recovery-readiness.list-rules-invalid-resource-type-filter-rejected
+Issue-Shape-Id: com.amazonaws.route53recoveryreadiness#Route53RecoveryReadiness
+Issue-Key: route53-recovery-readiness.get-recovery-group-readiness-summary-nonexistent-not-found|run#5|AssertionError|assert code == "ResourceNotFoundException", f"expected ResourceNotFoundException, got {code}"
+Issue-Key: route53-recovery-readiness.readiness-check-repoint-resource-set|run#7|AssertionError|assert create_code == "AccessDenied", create_code
+Issue-Key: route53-recovery-readiness.list-rules-invalid-resource-type-filter-rejected|run#4|AssertionError|assert message == _UNKNOWN_TYPE_MESSAGE, message
+Issue-Commit: 17c220c4f82dc0c00315f2111baf55aa4ec61156
+
+# route53-recovery-readiness: unimplemented GetRecoveryGroupReadinessSummary, AccessDeniedException used as the wire error code, and a synthesized enum-constraint rejection on ListRules resourceType
+
+> _Note: this issue was identified against the code base at commit `17c220c4f82dc0c00315f2111baf55aa4ec61156`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetRecoveryGroupReadinessSummary
+
+## Description
+Three distinct root causes in the route53-recovery-readiness emulator, all found by replaying the behavioral suite (18/21 passed; these are the 3 mismatches). Each must be closed before this issue is resolved.
+
+=== Cause 1 of 3: GetRecoveryGroupReadinessSummary answers NotImplemented instead of the modeled errors ===
+AWS: GetRecoveryGroupReadinessSummary is GET /recoverygroupreadiness/{RecoveryGroupName} with a required httpLabel RecoveryGroupName, and models exactly these errors: AccessDeniedException 403, InternalServerException 500, ResourceNotFoundException 404, ThrottlingException 429, ValidationException 400 (Smithy: GetRecoveryGroupReadinessSummary errors + http {GET /recoverygroupreadiness/{RecoveryGroupName}}; ResourceNotFoundException errorKind=client httpError=404). For a RecoveryGroupName that was never created the recorded behavior is a 404 with error code ResourceNotFoundException (recorded message example: "Resource not found"). The requirement is the 404 status and the ResourceNotFoundException error code; NotImplemented is not a member of this operation's error set at all.
+Emulator: the call fails with error code "NotImplemented" (check assertion: "expected ResourceNotFoundException, got NotImplemented"). The positive control in the same check, ListRecoveryGroups, succeeds, so the service is reachable and credentials are healthy — the operation itself is a stub that has never been wired to the recovery-group state.
+Why: a client cannot read a recovery group's readiness roll-up at all, and cannot distinguish "this group does not exist" from a service fault. ResourceNotFoundException is a modeled, catchable client error that SDKs do not retry; an unmodeled NotImplemented falls through `catch ResourceNotFoundException` branches and, being an unknown code, is treated as an opaque/possibly-retryable server condition, so provisioning code that probes for a group before creating it breaks or loops.
+Fix: the GetRecoveryGroupReadinessSummary handler in the route53recoveryreadiness service crate — implement the operation against the recovery-group/readiness-check state and raise ResourceNotFoundException (404) when the named recovery group is absent.
+Traces: route53-recovery-readiness.get-recovery-group-readiness-summary-nonexistent-not-found.
+
+=== Cause 2 of 3: the AccessDenied rejection of CreateReadinessCheck carries the error code AccessDeniedException ===
+AWS: CreateReadinessCheck models AccessDeniedException at httpError 403 (Smithy: CreateReadinessCheck errors include AccessDeniedException errorKind=client httpError=403; AccessDeniedException doc: "User does not have sufficient access to perform this action."). Recorded behavior only: on this account the create is denied outright and the wire error code the client sees is "AccessDenied" — NOT the Smithy shape name — while the sibling Cell/ResourceSet/RecoveryGroup creates use "AccessDeniedException". For a REST-JSON service the error code (x-amzn-errortype / the body's code) is what the SDK matches to resolve the modeled exception, so it is a requirement. Recorded message example: "This operation is currently unavailable for new accounts."
+Emulator: returns the denial with error code "AccessDeniedException" (check assertion on the ClientError's Error.Code: "AssertionError: AccessDeniedException" where "AccessDenied" was expected). It appears to emit the modeled shape name verbatim rather than the wire code this operation uses. Because the check fails at that first assertion, the emulator's behavior for the subsequent GetReadinessCheck/UpdateReadinessCheck ResourceNotFoundException assertions in the same check is still unverified and must be re-checked after the fix.
+Why: the SDK selects the exception class from this code. With the wrong code a client's error-code comparison / `except AccessDenied` branch never fires, so the feature-gating denial degrades to an unknown 403 and callers cannot tell a closed-to-new-accounts capability from any other authorization failure.
+Fix: the error serializer / error-code mapping for the route53recoveryreadiness crate — map AccessDeniedException to the wire code "AccessDenied" on CreateReadinessCheck rather than emitting the shape name.
+Note: open issue 20261023T065059Z-route53-recovery-readiness-error-responses-diverge-wrong-status-errortype-header-and.md describes the same shape-name-as-code mapping from the WIRE corpus (its Cause 2, keyed route53-recovery-readiness|CreateReadinessCheck|4xx->4xx|$headers.x-amzn-errortype); it does not carry this behavioral check's replay key, so this cause is recorded here with that key. Fixing one should fix both.
+Traces: route53-recovery-readiness.readiness-check-repoint-resource-set.
+
+=== Cause 3 of 3: ListRules rejects an unsupported resourceType with a synthesized enum-constraint report ===
+AWS: ListRules.ResourceType is a plain __string bound to the query string `resourceType` — the model declares NO enum, no pattern and no value list (Smithy: ListRules.input.ResourceType target __string httpQuery resourceType; ListRules errors = AccessDeniedException 403, InternalServerException 500, ThrottlingException 429, ValidationException 400). Recorded behavior only: an unsupported resource type is rejected with ValidationException (400) produced by the operation's own unknown-type check, whose message is the fixed constant "Unknown resource type." — a constant, not a constraint report derived from the request. A supported filter (e.g. AWS::SQS::Queue) must still succeed and return only rules of that type.
+Emulator: the error code ValidationException matches, but the rejection is a framework enum-constraint report: "1 validation error detected: Value 'not_a_valid_type' at 'resourceType' failed to satisfy constraint: Member must be one of the supported resource types: AWS::ApiGateway::Stage, AWS::ApiGatewayV2::Stage, ... AWS::SQS::Queue". That prose is the symptom of the defect: a modeled-enum validator is being applied to a member the model does not constrain, so the emulator publishes its own internal catalog of supported types as part of the wire contract. The requirement being reported here is that the rejection come from the operation's unknown-type check and not from a synthesized enum constraint; the recorded "Unknown resource type." text is an example of that rejection, not a required string.
+Why: a client or test that reads the supported-type enumeration out of this error learns the emulator's catalog rather than the service's, and the generated-constraint framing makes the rejection look like generic input validation against a modeled enum that AWS does not have — so code written against the emulator carries assumptions about resourceType validation that do not hold on AWS. The check also never reaches its positive control (ListRules with ResourceType=AWS::SQS::Queue returning only SQS rules), so that path is unverified and must be confirmed with the fix.
+Fix: ListRules' input validation in the route53recoveryreadiness crate — drop the synthesized enum constraint on the unconstrained ResourceType member and reject an unsupported value from the ListRules handler's own unknown-type check.
+Note: open issue 20261023T065059Z-route53-recovery-readiness-error-responses-diverge-wrong-status-errortype-header-and.md covers the same cause from the WIRE corpus (its Cause 3, key route53-recovery-readiness|ListRules|4xx->4xx|$.message); this entry adds the behavioral replay key.
+Traces: route53-recovery-readiness.list-rules-invalid-resource-type-filter-rejected.
+
+## Evidence
+Suite: simparity-behavioral-aws-v1 — Total 18/21 passed, mismatched 3, errored 0, skipped 0, unloadable 0; bootstrap_signal false (the emulator was up and serving). Only service with failures: route53-recovery-readiness 18/21 (86%), 3 failed. None of the three was marked ALREADY FILED or OWNED by.
+
+Cause 1 — [mismatch] route53-recovery-readiness.get-recovery-group-readiness-summary-nonexistent-not-found:
+  positive control client.list_recovery_groups() succeeds.
+  client.get_recovery_group_readiness_summary(RecoveryGroupName='sim2real_ghost_rg_<unique>') raises a ClientError whose Error.Code is 'NotImplemented'.
+  assertion: "AssertionError: expected ResourceNotFoundException, got NotImplemented" (check line 38). Expected: 404 / ResourceNotFoundException (recorded message example 'Resource not found'). Actual: error code NotImplemented.
+
+Cause 2 — [mismatch] route53-recovery-readiness.readiness-check-repoint-resource-set:
+  positive control client.list_readiness_checks() returns a payload containing 'ReadinessChecks'.
+  client.create_readiness_check(ReadinessCheckName=..., ResourceSetName=...) is denied, but with Error.Code 'AccessDeniedException'.
+  assertion: "assert create_code == 'AccessDenied'" -> "AssertionError: AccessDeniedException" (check line 58). Expected error code: AccessDenied (403, recorded message example 'This operation is currently unavailable for new accounts.'). Actual: AccessDeniedException.
+  Not reached, therefore unverified: GetReadinessCheck and UpdateReadinessCheck on the never-created check must both answer ResourceNotFoundException.
+
+Cause 3 — [mismatch] route53-recovery-readiness.list-rules-invalid-resource-type-filter-rejected:
+  client.list_rules(ResourceType='not_a_valid_type') -> Error.Code 'ValidationException' (matches), Error.Message = "1 validation error detected: Value 'not_a_valid_type' at 'resourceType' failed to satisfy constraint: Member must be one of the supported resource types: AWS::ApiGateway::Stage, AWS::ApiGatewayV2::Stage, AWS::AutoScaling::AutoScalingGroup, AWS::CloudWatch::Alarm, AWS::DynamoDB::Table, AWS::EC2::CustomerGateway, AWS::EC2::VPC, AWS::EC2::VPNConnection, AWS::EC2::VPNGateway, AWS::EC2::Volume, AWS::ElasticLoadBalancing::LoadBalancer, AWS::ElasticLoadBalancingV2::LoadBalancer, AWS::Lambda::Function, AWS::MSK::Cluster, AWS::RDS::DBCluster, AWS::Route53::HealthCheck, AWS::Route53RecoveryReadiness::DNSTargetResource, AWS::SNS::Subscription, AWS::SNS::Topic, AWS::SQS::Queue".
+  assertion at check line 34; recorded rejection is the operation's own unknown-type ValidationException (message example 'Unknown resource type.'), not a generated enum-constraint report over an unconstrained member.
+  Not reached, therefore unverified: list_rules(ResourceType='AWS::SQS::Queue') must return a non-empty Rules page whose every entry has ResourceType == 'AWS::SQS::Queue'.
+
+Model consulted: services/service-com-amazonaws-route53recoveryreadiness-route53recoveryreadiness/smithy-model/com-amazonaws-route53recoveryreadiness-route53recoveryreadiness.json — operations GetRecoveryGroupReadinessSummary, ListRules, CreateReadinessCheck, GetReadinessCheck, UpdateReadinessCheck, ListRecoveryGroups (error sets, http bindings, ResourceType target __string).
+
+## Steps to Reproduce
+1. git_clone() the repo, then run the behavioral suite so the emulator is built, booted and the route53-recovery-readiness checks replay.
+2. Cause 1: replay check route53-recovery-readiness.get-recovery-group-readiness-summary-nonexistent-not-found — or by hand: GET /recoverygroupreadiness/<a RecoveryGroupName matching ^[a-zA-Z0-9_]+$ that was never created> (boto3: client.get_recovery_group_readiness_summary(RecoveryGroupName=name)). Observe Error.Code 'NotImplemented'; AWS answers 404 / ResourceNotFoundException. ListRecoveryGroups in the same check succeeds, confirming the service is up.
+3. Cause 2: replay check route53-recovery-readiness.readiness-check-repoint-resource-set — or by hand: POST /readinesschecks with readinessCheckName/resourceSetName (boto3: client.create_readiness_check(...)). Inspect the denial's error code: it reads 'AccessDeniedException' where AWS uses 'AccessDenied'. After fixing the code, let the check run on past line 58 so the GetReadinessCheck/UpdateReadinessCheck ResourceNotFoundException assertions are actually exercised.
+4. Cause 3: replay check route53-recovery-readiness.list-rules-invalid-resource-type-filter-rejected — or by hand: GET /rules?resourceType=not_a_valid_type. The 400 body's message is a generated enum-constraint report that enumerates the emulator's own supported-type catalog instead of the operation's unknown-type rejection. Then confirm the check's positive control: GET /rules?resourceType=AWS::SQS::Queue returns a non-empty rules list, all with resourceType AWS::SQS::Queue.
+5. Re-replay all three check ids listed in trace_ids to confirm the fix; each cause has its own id and all three must pass.
