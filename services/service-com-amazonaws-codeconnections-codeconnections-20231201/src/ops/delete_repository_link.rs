@@ -176,11 +176,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteRepositoryLinkErrorModeled::SyncConfigurationStillExistsException(
                     SyncConfigurationStillExistsException {
-                        message: Some(format!(
-                            "Unable to continue. The {} sync configuration for resource {} still uses repository link {}.",
-                            referencing.sync_type,
-                            referencing.resource_name,
-                            input.repository_link_id
+                        // The service's template for this refusal names the REPOSITORY
+                        // the still-referenced link points at, as `<owner>/<repository>`,
+                        // and carries the framework tail. Owner and repository are read
+                        // off the referencing configuration, which derives both from the
+                        // link it references (see `state::StoredSyncConfiguration`), so
+                        // they are the blocked link's own repository. See
+                        // `state::sync_configurations_still_exist_message`.
+                        message: Some(crate::state::sync_configurations_still_exist_message(
+                            &referencing.owner_id,
+                            &referencing.repository_name,
                         )),
                     },
                 )

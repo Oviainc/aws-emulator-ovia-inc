@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.hosts.get(&input.host_arn) else {
             return Err(GetHostErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("No host exists with the ARN: {}", input.host_arn)),
+                    message: Some(crate::state::host_not_found_message(&input.host_arn)),
                 },
             )
             .into());

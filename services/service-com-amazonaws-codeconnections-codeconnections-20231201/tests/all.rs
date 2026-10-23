@@ -27,6 +27,8 @@ mod list_repository_sync_definitions;
 mod list_sync_configurations;
 #[path = "all/modeled_input_refusals.rs"]
 mod modeled_input_refusals;
+#[path = "all/refusal_messages.rs"]
+mod refusal_messages;
 #[path = "all/repository_link_lifecycle.rs"]
 mod repository_link_lifecycle;
 #[path = "all/resource_sync_status.rs"]

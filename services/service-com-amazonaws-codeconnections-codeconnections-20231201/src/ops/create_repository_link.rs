@@ -228,9 +228,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateRepositoryLinkErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
-                        message: Some(format!(
-                            "Unable to create resource. Repository link {} already links {}/{} through that connection.",
-                            existing.repository_link_id, input.owner_id, input.repository_name
+                        // The service's duplicate template: the ARN of the link that
+                        // already holds the triple, so a caller can adopt it, plus the
+                        // framework tail. The ARN is the STORED one, not one rebuilt
+                        // from the request. See
+                        // `state::repository_link_already_exists_message`.
+                        message: Some(crate::state::repository_link_already_exists_message(
+                            &existing.repository_link_arn,
                         )),
                     },
                 )

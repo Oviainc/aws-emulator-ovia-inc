@@ -157,10 +157,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.connections.get(&input.connection_arn) else {
             return Err(GetConnectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Resource not found. Verify the connection resource ARN and try again: {}",
-                        input.connection_arn
-                    )),
+                    // The service's fixed sentence for an ARN that resolves to no
+                    // connection, stated once in `state` — the ARN is not echoed into
+                    // it. See `state::CONNECTION_NOT_FOUND_MESSAGE`.
+                    message: Some(crate::state::CONNECTION_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

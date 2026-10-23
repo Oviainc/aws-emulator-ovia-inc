@@ -47,6 +47,12 @@ use super::host_association::create_plain_host;
 /// crate's `SYNC_CONFIGURATION_TYPE_VALUES`).
 const SYNC_TYPE: &str = "CFN_STACK_SYNC";
 
+/// The sentence CodeConnections answers an unresolvable connection ARN with, written out
+/// here as the LITERAL the recorded service returns rather than read off the
+/// implementation's own constant, so editing that constant fails this test. The wording
+/// itself, and that no ARN is echoed into it, is asserted in `refusal_messages.rs`.
+const CONNECTION_NOT_FOUND_MESSAGE: &str = "No connection exists with the ARN";
+
 /// The published bounds of the modeled `ResourceName` member (`length 1..100`,
 /// `pattern ^[0-9A-Za-z]+[0-9A-Za-z_\-]*$`), from
 /// `smithy_query(query="operation", operation="GetResourceSyncStatus")`.
@@ -220,6 +226,10 @@ async fn a_host_arn_that_resolves_to_nothing_is_reported_as_not_found() {
 /// RULE 1 for a connection ARN too: the same absence, reported the same way by the
 /// operation that addresses a connection. Rows are ARNs the modeled `ConnectionArn`
 /// pattern `^arn:aws(-[\w]+)*:.+:.+:[0-9]{12}:.+$` admits.
+///
+/// A connection-scoped refusal states the service's FIXED sentence and does not echo the
+/// ARN back, so the needle here is that sentence rather than the ARN the host rows above
+/// use; `refusal_messages.rs` asserts the wording itself.
 #[tokio::test]
 async fn a_connection_arn_that_resolves_to_nothing_is_reported_as_not_found() {
     let router = router();
@@ -248,7 +258,7 @@ async fn a_connection_arn_that_resolves_to_nothing_is_reported_as_not_found() {
             serde_json::json!({ "ConnectionArn": connection_arn }),
         )
         .await;
-        assert_not_found(label, connection_arn, status, &body);
+        assert_not_found(label, CONNECTION_NOT_FOUND_MESSAGE, status, &body);
         assert!(
             body["Connection"].is_null(),
             "case {label:?}: a refused GetConnection reports no connection, got {body}"
