@@ -290,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetTableOutput {
-            table: Some(entry.to_table()),
+            table: Some(entry.to_table(&database.database_id)),
         })
     }
 }
