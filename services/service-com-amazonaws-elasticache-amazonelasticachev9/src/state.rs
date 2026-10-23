@@ -5361,6 +5361,24 @@ pub fn normalize_user_engine(engine: &str) -> Result<String, String> {
 /// no transition for the clock to owe; only a later modify or delete moves it.
 pub const USER_STATUS_ACTIVE: &str = "active";
 
+/// `User$Status` of a user `DeleteUser` has accepted: "Indicates the user status.
+/// Can be \"active\", \"modifying\" or \"deleting\"". A delete answers with the
+/// user in this status — it is the LAST thing this API reports about it, because
+/// the clock then owes its removal from the store ([`USER_DELETION_TRANSITION`]),
+/// after which the user is gone and every lookup of it answers the modelled
+/// `UserNotFoundFault`.
+pub const USER_STATUS_DELETING: &str = "deleting";
+
+/// How long a user stays `deleting` before the clock owes its removal from the
+/// store.
+///
+/// The same reasoning as [`CLUSTER_TRANSITION`]: ElastiCache takes its own time,
+/// the emulator chooses a span, and it is deliberately NOT zero so a caller
+/// acting straight after `DeleteUser` still observes the transient `deleting`
+/// status and the state error that goes with it. The due instant is stored on the
+/// record and materialised by whichever later call reads it — nothing sleeps.
+pub const USER_DELETION_TRANSITION: Duration = CLUSTER_TRANSITION;
+
 /// How many passwords one user may hold, as `CreateUser$Passwords` documents it:
 /// "Passwords used for this user. You can create up to two passwords for each
 /// user."
@@ -5370,6 +5388,25 @@ pub const MAX_PASSWORDS_PER_USER: usize = 2;
 /// `UserQuotaExceededFault`. The emulator's OWN bound on the store, for the
 /// reason [`CLUSTER_QUOTA`] gives.
 pub const USER_QUOTA: usize = 100;
+
+/// The length a `UserId` must stay UNDER, in the service's own words: a user id
+/// of this length or more is refused with "User id length must be less than
+/// 40." The model constrains `UserId` with `@length(min: 1)` and a pattern only,
+/// so the upper bound is enforced here, by every operation that NAMES a user and
+/// can report the modelled `InvalidParameterValueException` — before the id is
+/// looked up, because an id the service would never have stored names no user to
+/// look up.
+pub const USER_ID_LENGTH_LIMIT: usize = 40;
+
+/// Why `user_id` cannot name a user, or `None` when it can.
+///
+/// Stated once so `CreateUser` and `DeleteUser` cannot drift about which ids the
+/// service accepts: a create that stores an id and a delete that refuses the
+/// same one would leave a user nothing could remove.
+pub fn user_id_rejection(user_id: &str) -> Option<String> {
+    (user_id.chars().count() >= USER_ID_LENGTH_LIMIT)
+        .then(|| format!("User id length must be less than {USER_ID_LENGTH_LIMIT}."))
+}
 
 /// `User$MinimumEngineVersion` of a user that authenticates with a password or
 /// without one: "The minimum engine version required, which is Redis OSS 6.0" —
@@ -5994,14 +6031,79 @@ fn is_selector(group: &str) -> bool {
     rules.peek().is_some() && rules.all(is_access_rule)
 }
 
-/// An access string as the service STORES it: the rules it names, one space
-/// apart.
+/// The ACL rules that state a rule list's COMMAND BASELINE outright: whether the
+/// user starts from every command allowed or every command denied.
 ///
-/// Only the whitespace between rules is normalised — no rule is added, removed
-/// or reordered — so what a later read reports is the permission set the request
-/// asked for.
+/// `allcommands` and `nocommands` are the engine's own aliases for `+@all` and
+/// `-@all` — they are in [`ACCESS_STRING_KEYWORDS`] for that reason — so a rule
+/// list naming any of the four has already said where its command rules start
+/// from. Matched case-insensitively, as the engine reads its rule names.
+const ACCESS_STRING_COMMAND_BASELINE: [&str; 4] = ["+@all", "-@all", "allcommands", "nocommands"];
+
+/// The baseline term the normalised form carries when the request named none: a
+/// new user is created with every command denied, so the expanded rule list
+/// starts by denying them all and the rules that follow are what it grants back.
+pub const ACCESS_STRING_DENY_ALL: &str = "-@all";
+
+/// True when `rule` states the command baseline — see
+/// [`ACCESS_STRING_COMMAND_BASELINE`].
+fn is_command_baseline(rule: &str) -> bool {
+    ACCESS_STRING_COMMAND_BASELINE
+        .iter()
+        .any(|baseline| rule.eq_ignore_ascii_case(baseline))
+}
+
+/// True when `rule` grants or revokes a command or a command category (`+get`,
+/// `-@admin`): the rules whose effect depends on the baseline they start from.
+fn is_command_rule(rule: &str) -> bool {
+    (rule.starts_with('+') || rule.starts_with('-')) && is_access_rule(rule)
+}
+
+/// An access string as the service STORES and REPORTS it: the EXPANDED rule
+/// list, which states its command baseline explicitly.
+///
+/// A Valkey / Redis OSS user is created with no permissions at all — every
+/// command denied — and the rules of an access string are applied on top of that
+/// starting point, so the expanded form of a rule list that grants commands
+/// without saying where it starts from carries the deny-all term
+/// ([`ACCESS_STRING_DENY_ALL`]) before its command rules. A list that already
+/// states its baseline ([`ACCESS_STRING_COMMAND_BASELINE`]) expands to itself.
+/// The term goes in immediately before the FIRST command rule, so the rules it
+/// governs follow it, and at the end of a list that names no command rule, whose
+/// whole command baseline it then is.
+///
+/// Nothing else is changed: no other rule is added, removed or reordered, and a
+/// selector (`(+get ~key1)`) is one rule of the list it sits in, so the baseline
+/// of the list is decided by the rules AROUND it and the selector's own rules are
+/// kept exactly as sent. Beyond that only the whitespace between rules is
+/// normalised.
 pub fn canonical_access_string(access_string: &str) -> String {
-    access_string.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut rules: Vec<&str> = access_string.split_whitespace().collect();
+    // Where the deny-all term goes, if it is needed at all: before the first
+    // command rule of the list ITSELF, so a command rule inside a selector —
+    // which governs that selector alone — does not decide it.
+    let mut first_command = None;
+    let mut inside_selector = false;
+    for (index, rule) in rules.iter().enumerate() {
+        if inside_selector {
+            inside_selector = !rule.ends_with(')');
+            continue;
+        }
+        if rule.starts_with('(') {
+            inside_selector = !(rule.ends_with(')') && rule.len() > 1);
+            continue;
+        }
+        if is_command_baseline(rule) {
+            // The request said where its command rules start from, so the
+            // expanded form is the list as sent.
+            return rules.join(" ");
+        }
+        if first_command.is_none() && is_command_rule(rule) {
+            first_command = Some(index);
+        }
+    }
+    rules.insert(first_command.unwrap_or(rules.len()), ACCESS_STRING_DENY_ALL);
+    rules.join(" ")
 }
 
 /// Why a request's authentication members cannot make a user's `Authentication`.
@@ -6213,6 +6315,11 @@ pub struct UserRecord {
     /// The tags the create was given, for `ListTagsForResource` (still a
     /// scaffolded 501 with its own issue) to report.
     pub tags: Vec<(String, String)>,
+    /// When the clock owes this user's removal from the store: the instant
+    /// [`USER_DELETION_TRANSITION`] after the `DeleteUser` that moved it to
+    /// [`USER_STATUS_DELETING`], and `None` for a user nothing has deleted.
+    /// Materialised by [`ComAmazonawsElasticacheAmazonelasticachev9State::settle_users`].
+    pub pending_removal: Option<SystemTime>,
 }
 
 impl UserRecord {
@@ -6293,6 +6400,9 @@ pub fn built_in_users() -> BTreeMap<String, UserRecord> {
             status: USER_STATUS_ACTIVE.to_string(),
             arn: user_arn(DEFAULT_REGION, DEFAULT_USER_ID),
             tags: Vec::new(),
+            // No call creates the built-in user and none deletes it, so the
+            // clock never owes its removal.
+            pending_removal: None,
         },
     );
     users
@@ -6777,6 +6887,8 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
     /// Materialise every status change the clock owes, for a caller that is
     /// about to report on all of them.
     pub fn settle_all(&mut self, now: SystemTime) {
+        // A user's own clock-owed change: the removal `DeleteUser` started.
+        self.settle_users(now);
         // A deletion the clock has carried through removes the record before
         // anything is reported from it.
         self.purge_deleted_serverless_caches(now);
@@ -6856,6 +6968,40 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             );
         }
         self.expire_events(now);
+    }
+
+    /// Materialise the removal of every user whose deletion has fallen due by
+    /// `now`.
+    ///
+    /// `DeleteUser` answers with the user in [`USER_STATUS_DELETING`] — a
+    /// non-terminal status — and the clock owes its removal
+    /// [`USER_DELETION_TRANSITION`] later, whether or not anybody calls again;
+    /// this is where that change is made, which is why a reporting operation may
+    /// make it (see [`CacheClusterRecord::settle`]). The event the deletion is
+    /// was recorded by the call that asked for it, so nothing is logged here.
+    ///
+    /// Every path that resolves a user by id materialises it first — the user
+    /// operations and `CreateUserGroup`, which builds a group out of users — so
+    /// none of them can see a user whose removal has fallen due. A user still
+    /// WITHIN the span is a different matter: it exists, in
+    /// [`USER_STATUS_DELETING`], and is reported as such.
+    pub fn settle_users(&mut self, now: SystemTime) {
+        self.users
+            .retain(|_, user| user.pending_removal.is_none_or(|due| now < due));
+    }
+
+    /// Withdraw `user_id` from every user group that lists it.
+    ///
+    /// `DeleteUser` documents it: "The user will be removed from all user groups
+    /// and in turn removed from all replication groups." A group's `user_ids` is
+    /// the ONE copy of a membership (see [`Self::user_group_ids_of`]), so this is
+    /// where a membership ends — at the call that deletes the user, not when the
+    /// record is dropped, so the delete's own answer already reports the user in
+    /// no group.
+    pub fn withdraw_user_from_groups(&mut self, user_id: &str) {
+        for group in self.user_groups.values_mut() {
+            group.user_ids.retain(|member| member != user_id);
+        }
     }
 
     /// Append one event to the log, dated at the instant it happened.

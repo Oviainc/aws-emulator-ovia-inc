@@ -92,3 +92,8 @@ mod serverless_cache_delete;
 // cache-security-group-closure and cluster-message suite.
 #[path = "all/cache_cluster_gates_and_messages.rs"]
 mod cache_cluster_gates_and_messages;
+
+// Appended for the same reason: the RBAC access-string, `DeleteUser` and error-envelope
+// suite.
+#[path = "all/rbac_user_access_string_and_deletion.rs"]
+mod rbac_user_access_string_and_deletion;

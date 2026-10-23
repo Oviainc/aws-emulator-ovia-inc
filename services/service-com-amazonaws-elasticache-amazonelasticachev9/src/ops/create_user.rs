@@ -184,6 +184,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already refused an id that cannot name a user.
         let user_id = input.user_id.to_ascii_lowercase();
 
+        // The upper bound on a user id the model does not express; see
+        // `crate::state::user_id_rejection`. Checked before anything else looks
+        // at the id, so an id the service would never store is refused for what
+        // it is rather than for what it collides with.
+        if let Some(message) = crate::state::user_id_rejection(&user_id) {
+            return Err(CreateUserErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // "The options are valkey or redis": RBAC is a Valkey / Redis OSS feature,
         // so a cluster engine that has no ACLs is not a user engine.
         let engine = match crate::state::normalize_user_engine(&input.engine) {
@@ -278,6 +291,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // moment the user was created.
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // A user `DeleteUser` removed is gone once the clock owes its removal, so
+        // the id and the username it held are free again from that instant —
+        // materialised here, before the collision checks below read them.
+        store.settle_users(now);
         // The built-in `default` user the account already had is in the store
         // from the moment it is built, so a create naming it collides with it
         // instead of replacing it, and the quota below counts it.
@@ -335,6 +352,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // transition for the clock to owe it.
             status: crate::state::USER_STATUS_ACTIVE.to_string(),
             tags,
+            // Nothing has deleted this user, so the clock owes its removal
+            // nothing; `DeleteUser` is what sets this.
+            pending_removal: None,
         };
         store.users.insert(user_id.clone(), record);
 

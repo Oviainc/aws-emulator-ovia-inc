@@ -227,8 +227,10 @@ fn create_cases() -> [UserCase; 9] {
             user_name: "mixed-engine-user",
             engine: "redis",
             // Only the whitespace between rules is normalised; no rule is added,
-            // removed or reordered.
-            access_string: "on %RW~stats:* &news:* resetchannels +get +config|get",
+            // removed or reordered — except the command baseline the service
+            // expands the list with, which this list does not state (see the
+            // normalization table in `rbac_user_access_string_and_deletion.rs`).
+            access_string: "on %RW~stats:* &news:* resetchannels -@all +get +config|get",
             authentication_type: "no-password",
             password_count: None,
             minimum_engine_version: "6.0",
