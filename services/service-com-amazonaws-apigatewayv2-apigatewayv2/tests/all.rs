@@ -15,6 +15,8 @@
 mod api_endpoint_scheme;
 #[path = "all/api_lifecycle.rs"]
 mod api_lifecycle;
+#[path = "all/authorizer_lifecycle.rs"]
+mod authorizer_lifecycle;
 #[path = "all/deployment_lifecycle.rs"]
 mod deployment_lifecycle;
 #[path = "all/integration_lifecycle.rs"]

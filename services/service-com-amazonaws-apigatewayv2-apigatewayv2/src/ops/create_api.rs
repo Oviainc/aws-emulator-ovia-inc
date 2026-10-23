@@ -336,6 +336,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             model_id_seed: 0,
             deployments: ::std::collections::BTreeMap::new(),
             deployment_id_seed: 0,
+            authorizers: ::std::collections::BTreeMap::new(),
+            authorizer_id_seed: 0,
         };
 
         // `api_id` comes from the store's own id bijection, so it names no existing

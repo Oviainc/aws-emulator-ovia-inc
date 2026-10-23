@@ -104,6 +104,35 @@ pub const MAX_ROUTE_RESPONSES_PER_ROUTE: usize = 300;
 /// as a published models quota.
 pub const MAX_MODELS_PER_API: usize = 300;
 
+/// The most authorizers one api may hold, after which CreateAuthorizer is refused.
+///
+/// API Gateway publishes a quota of 10 authorizers per API, so this is the faithful
+/// bound AND what stops a loop of CreateAuthorizer calls growing this store without
+/// end — every call mints a new authorizer, so nothing else bounds it.
+pub const MAX_AUTHORIZERS_PER_API: usize = 10;
+
+/// The `AuthorizerType` value that selects a JWT authorizer, from the generated
+/// `AUTHORIZER_TYPE_VALUES` catalog (`JWT | REQUEST`); the integration test
+/// `the_authorizer_type_names_are_the_modelled_catalog` pins these two names against
+/// that catalog so the spelling here cannot drift from the model. From
+/// `CreateAuthorizer$AuthorizerType`: "Specify JWT to use JSON Web Tokens (supported
+/// only for HTTP APIs)."
+pub const AUTHORIZER_TYPE_JWT: &str = "JWT";
+
+/// The `AuthorizerType` value that selects a Lambda authorizer taking the incoming
+/// request, from the generated `AUTHORIZER_TYPE_VALUES` catalog (`JWT | REQUEST`). From
+/// `CreateAuthorizer$AuthorizerType`: "Specify REQUEST for a Lambda function using
+/// incoming request parameters."
+pub const AUTHORIZER_TYPE_REQUEST: &str = "REQUEST";
+
+/// The `AuthorizerPayloadFormatVersion` values the service accepts.
+///
+/// `StringWithLengthBetween1And64` carries no pattern, so the catalog is the member's
+/// own documentation rather than a modelled constraint
+/// (`CreateAuthorizer$AuthorizerPayloadFormatVersion`: "Supported values are 1.0 and
+/// 2.0").
+pub const AUTHORIZER_PAYLOAD_FORMAT_VERSIONS: &[&str] = &["1.0", "2.0"];
+
 /// The most deployments one api may hold, after which CreateDeployment is refused.
 ///
 /// API Gateway publishes a quota of 500 deployments per API, so this is the faithful
@@ -206,6 +235,11 @@ pub struct Api {
     /// Drives [`Api::mint_deployment_id`]. Per-api, for the same reason as
     /// [`Api::route_id_seed`]: a `DeploymentId` is unique within its api.
     pub deployment_id_seed: u64,
+    /// This api's authorizers, keyed by `AuthorizerId`.
+    pub authorizers: BTreeMap<String, Authorizer>,
+    /// Drives [`Api::mint_authorizer_id`]. Per-api, for the same reason as
+    /// [`Api::route_id_seed`]: an `AuthorizerId` is unique within its api.
+    pub authorizer_id_seed: u64,
 }
 
 impl Api {
@@ -235,6 +269,13 @@ impl Api {
     pub fn mint_deployment_id(&mut self) -> String {
         self.deployment_id_seed = self.deployment_id_seed.wrapping_add(1);
         mint_id(self.deployment_id_seed)
+    }
+
+    /// Mint a fresh `AuthorizerId` for this api: ten lowercase alphanumerics, never
+    /// one this api already minted.
+    pub fn mint_authorizer_id(&mut self) -> String {
+        self.authorizer_id_seed = self.authorizer_id_seed.wrapping_add(1);
+        mint_id(self.authorizer_id_seed)
     }
 }
 
@@ -489,6 +530,122 @@ impl Model {
             schema: Some(self.schema.clone()),
         }
     }
+}
+
+/// A persisted `Authorizer` resource, owned by its parent [`Api`].
+///
+/// The record keeps the configuration the create accepted, so every reader of the
+/// authorizer reports one record rather than its own reconstruction of it, and
+/// [`Authorizer::to_wire`] projects it onto the modelled shape the handlers serialize.
+#[derive(Debug, Clone, Default)]
+pub struct Authorizer {
+    pub authorizer_id: String,
+    /// Required on the modelled `Authorizer` shape, so the record always carries one.
+    pub name: String,
+    /// One of `AUTHORIZER_TYPE_VALUES` (`JWT | REQUEST`).
+    pub authorizer_type: String,
+    pub authorizer_uri: Option<String>,
+    pub authorizer_credentials_arn: Option<String>,
+    pub authorizer_payload_format_version: Option<String>,
+    pub authorizer_result_ttl_in_seconds: Option<i32>,
+    pub enable_simple_responses: Option<bool>,
+    /// `IdentitySource` is a REQUIRED member of `CreateAuthorizerRequest`, so the
+    /// record always carries the list — possibly empty, which a REQUEST authorizer
+    /// with caching disabled is allowed to be.
+    pub identity_source: Vec<String>,
+    pub identity_validation_expression: Option<String>,
+    pub jwt_configuration: Option<wire::JWTConfiguration>,
+}
+
+impl Authorizer {
+    /// Project the record onto the modelled `Authorizer` shape.
+    pub fn to_wire(&self) -> wire::Authorizer {
+        wire::Authorizer {
+            authorizer_credentials_arn: self.authorizer_credentials_arn.clone(),
+            authorizer_id: Some(self.authorizer_id.clone()),
+            authorizer_payload_format_version: self.authorizer_payload_format_version.clone(),
+            authorizer_result_ttl_in_seconds: self.authorizer_result_ttl_in_seconds,
+            authorizer_type: Some(self.authorizer_type.clone()),
+            authorizer_uri: self.authorizer_uri.clone(),
+            enable_simple_responses: self.enable_simple_responses,
+            // The list the record holds, reported whether or not it is empty: the
+            // member is required on the request, so the resource always has one.
+            identity_source: Some(self.identity_source.clone()),
+            identity_validation_expression: self.identity_validation_expression.clone(),
+            jwt_configuration: self.jwt_configuration.clone(),
+            name: self.name.clone(),
+        }
+    }
+}
+
+/// `Ok(())`, or the reason this configuration is not one its own `AuthorizerType`
+/// admits — the message for the caller's `BadRequestException`.
+///
+/// Every clause is a member's own documentation, which makes a member required for one
+/// authorizer type, or one api protocol, and undefined for another:
+///
+/// * `AuthorizerType` — "Specify JWT to use JSON Web Tokens (supported only for HTTP
+///   APIs)", so a WebSocket api takes only `REQUEST` authorizers.
+/// * `JwtConfiguration` — "Required for the JWT authorizer type", and its `Issuer` is
+///   "the base domain of the identity provider that issues JSON Web Tokens", so a JWT
+///   authorizer cannot validate a token without one.
+/// * `AuthorizerUri` — "For REQUEST authorizers, this must be a well-formed Lambda
+///   function URI": the Lambda to invoke, so that type cannot authorize without it.
+/// * `AuthorizerPayloadFormatVersion` — "Specifies the format of the payload sent to an
+///   HTTP API Lambda authorizer. Required for HTTP API Lambda authorizers. Supported
+///   values are 1.0 and 2.0."
+///
+/// `EnableSimpleResponses` is deliberately NOT cross-checked against the payload format
+/// version: a simple-response authorizer under payload format 1.0 is a configuration the
+/// service accepts and that fails when the authorizer is INVOKED, not when it is created.
+///
+/// Shared by every writer of an authorizer, so the requirement cannot differ between
+/// the create and a later update.
+pub fn validate_authorizer_config(
+    protocol_type: &str,
+    authorizer_type: &str,
+    authorizer_uri: Option<&str>,
+    payload_format_version: Option<&str>,
+    jwt_configuration: Option<&wire::JWTConfiguration>,
+) -> Result<(), String> {
+    let is_websocket = protocol_type == WEBSOCKET_PROTOCOL_TYPE;
+    if authorizer_type == AUTHORIZER_TYPE_JWT {
+        if is_websocket {
+            return Err(format!(
+                "AuthorizerType {AUTHORIZER_TYPE_JWT} is supported only for HTTP APIs, \
+                 and this API's ProtocolType is {protocol_type}"
+            ));
+        }
+        let issuer = jwt_configuration.and_then(|configuration| configuration.issuer.as_deref());
+        if issuer.is_none_or(str::is_empty) {
+            return Err(format!(
+                "JwtConfiguration with an Issuer is required for an authorizer of type \
+                 {AUTHORIZER_TYPE_JWT}"
+            ));
+        }
+    }
+    if authorizer_type == AUTHORIZER_TYPE_REQUEST {
+        if authorizer_uri.is_none_or(str::is_empty) {
+            return Err(format!(
+                "AuthorizerUri is required for an authorizer of type {AUTHORIZER_TYPE_REQUEST}"
+            ));
+        }
+        if !is_websocket && payload_format_version.is_none_or(str::is_empty) {
+            return Err(format!(
+                "AuthorizerPayloadFormatVersion is required for an authorizer of type \
+                 {AUTHORIZER_TYPE_REQUEST} on an API whose ProtocolType is {protocol_type}"
+            ));
+        }
+    }
+    if let Some(version) = payload_format_version {
+        if !AUTHORIZER_PAYLOAD_FORMAT_VERSIONS.contains(&version) {
+            return Err(format!(
+                "AuthorizerPayloadFormatVersion must be one of {}, got {version}",
+                AUTHORIZER_PAYLOAD_FORMAT_VERSIONS.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Is `name` a `Model$Name` the service accepts?
