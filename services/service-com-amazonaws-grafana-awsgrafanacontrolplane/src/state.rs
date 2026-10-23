@@ -125,6 +125,12 @@ pub const WORKSPACE_PAGE_LIMIT: i32 = 100;
 /// `@range(min: 1, max: 100)`.
 pub const VERSION_PAGE_LIMIT: i32 = 100;
 
+/// The largest page `ListWorkspaceServiceAccounts` serves, and the page size it
+/// uses when the request names no `maxResults`:
+/// `ListWorkspaceServiceAccountsRequest$maxResults` is modelled
+/// `@range(min: 1, max: 100)`.
+pub const SERVICE_ACCOUNT_PAGE_LIMIT: i32 = 100;
+
 /// The most tags one resource holds.
 ///
 /// `TagMap` is modelled `@length(max: 50)`, so a single request can carry 50 tag
@@ -543,6 +549,21 @@ pub fn is_workspace_id(value: &str) -> bool {
         return false;
     };
     hex.len() == 10 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The total order of a service-account id: the decimal counter value
+/// [`Workspace::mint_service_account_id`] renders.
+///
+/// `ServiceAccountSummary$id` is a plain string holding a decimal number, so the
+/// ids must be ordered as NUMBERS — byte order puts "10" before "2", which would
+/// resume a page before the account its token named. `None` for a value that is
+/// not such an id, which is what lets a paginated read refuse a `nextToken` this
+/// service never issued instead of silently serving the first page again.
+pub fn service_account_order(id: &str) -> Option<u64> {
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    id.parse().ok()
 }
 
 /// The sort key of a Grafana version: its dot-separated components as numbers.
