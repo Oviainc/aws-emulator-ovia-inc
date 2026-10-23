@@ -96,6 +96,9 @@
 //! * `InvalidParameterException` (HTTP 400) — A parameter is specified incorrectly.
 //! * `ResourceNotFoundException` (HTTP 400) — The specified resource does not exist.
 //! * `ServiceUnavailableException` (HTTP 500) — The service cannot complete the request.
+//! * `ValidationException` (HTTP 400) — widened in through `extra_errors` (see below): the
+//!   code this service answers when the `logGroupName` / `logGroupIdentifier` pair names
+//!   both selectors or neither (`crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -111,12 +114,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatchlogs-logs-201
 // here — hence the `DescribeLogStreamsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatchlogs#DescribeLogStreams")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatchlogs#DescribeLogStreams",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum DescribeLogStreamsErrorModeled {
     InvalidParameterException(InvalidParameterException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
+    // Widened in through `extra_errors`: the SERVICE models `ValidationException` and
+    // answers it for the cross-member log-group-selector check, which this operation's own
+    // `errors` list omits. See `crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`.
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -253,11 +263,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
+        // Naming both log-group selectors, or neither, is the cross-member check the
+        // service answers with `ValidationException` rather than with this operation's
+        // `InvalidParameterException` (see `crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`).
         let log_group_name = crate::state::resolve_log_group_target(
             input.log_group_name.as_deref(),
             input.log_group_identifier.as_deref(),
         )
-        .map_err(|message| invalid(&message))?;
+        .map_err(|message| {
+            DescribeLogStreamsError::from(DescribeLogStreamsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            ))
+        })?;
 
         let order_by = input
             .order_by

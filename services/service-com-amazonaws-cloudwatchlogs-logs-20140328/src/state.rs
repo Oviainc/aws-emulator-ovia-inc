@@ -875,9 +875,30 @@ pub fn log_group_name_from_identifier(identifier: &str) -> &str {
     }
 }
 
+/// The refusal for a request that names BOTH log-group selectors, and the one that names
+/// NEITHER ([`resolve_log_group_target`]).
+///
+/// This pair's refusal is the one CloudWatch Logs answers with `ValidationException`
+/// (HTTP 400) rather than with the operation's own `InvalidParameterException`: it is
+/// checked across two members, which no single member's constraint can express, and the
+/// recorded refusal for a request naming both selectors is `400 ValidationException:
+/// LogGroup name and LogGroup ARN are mutually exclusive parameters.` — which is why each
+/// caller widens that shape in through `extra_errors`. The sentences live here, beside the
+/// check that decides them, and name the two selectors the way the service names them: the
+/// log group's NAME and its ARN.
+pub const LOG_GROUP_SELECTORS_EXCLUSIVE: &str =
+    "LogGroup name and LogGroup ARN are mutually exclusive parameters.";
+
+/// The refusal for a request that names neither selector; see
+/// [`LOG_GROUP_SELECTORS_EXCLUSIVE`]. Both sentences are the service's own fixed wording
+/// for a request-independent refusal, and both name the selectors as the service names
+/// them rather than as the members spell them.
+pub const LOG_GROUP_SELECTOR_REQUIRED: &str = "Either LogGroupName or LogGroupArn must be provided.";
+
 /// Resolve the log group an operation's `logGroupName` / `logGroupIdentifier` pair
 /// names. The model documents them as mutually exclusive with one of them required, so
-/// neither-or-both is a client error; the `Err` carries the message to refuse with.
+/// neither-or-both is a client error; the `Err` carries the message to refuse with, and
+/// [`LOG_GROUP_SELECTORS_EXCLUSIVE`] records which error shape a caller refuses with.
 pub fn resolve_log_group_target(
     log_group_name: Option<&str>,
     log_group_identifier: Option<&str>,
@@ -885,13 +906,8 @@ pub fn resolve_log_group_target(
     match (log_group_name, log_group_identifier) {
         (Some(name), None) => Ok(name.to_string()),
         (None, Some(identifier)) => Ok(log_group_name_from_identifier(identifier).to_string()),
-        (Some(_), Some(_)) => Err(
-            "logGroupName and logGroupIdentifier are mutually exclusive; specify only one"
-                .to_string(),
-        ),
-        (None, None) => {
-            Err("either logGroupName or logGroupIdentifier must be specified".to_string())
-        }
+        (Some(_), Some(_)) => Err(LOG_GROUP_SELECTORS_EXCLUSIVE.to_string()),
+        (None, None) => Err(LOG_GROUP_SELECTOR_REQUIRED.to_string()),
     }
 }
 

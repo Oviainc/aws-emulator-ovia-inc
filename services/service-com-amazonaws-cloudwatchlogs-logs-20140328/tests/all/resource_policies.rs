@@ -797,14 +797,15 @@ async fn put_refuses_requests_it_cannot_store() {
     }
 
     // `policyScope` only takes the two values the model's `PolicyScope` enum declares,
-    // so the boundary validator refuses any other before a handler sees it.
+    // so the boundary validator refuses any other before a handler sees it — with this
+    // operation's own refusal error, `InvalidParameterException`.
     assert_eq!(
         logs.err(
             "DescribeResourcePolicies",
             &json!({"policyScope": "EVERYTHING"}),
         )
         .await,
-        "ValidationException",
+        "InvalidParameterException",
         "case policyScope EVERYTHING: the scope is ACCOUNT or RESOURCE"
     );
 }

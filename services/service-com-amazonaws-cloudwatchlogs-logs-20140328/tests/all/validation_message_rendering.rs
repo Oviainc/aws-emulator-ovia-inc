@@ -3,11 +3,16 @@
 //! End-to-end tests for how this service words a request the framework refused for
 //! failing a constraint the model declares.
 //!
-//! The rule: a CloudWatch Logs `ValidationException` names the INPUT POSITION that failed
+//! The rule: a CloudWatch Logs constraint refusal names the INPUT POSITION that failed
 //! and the modeled constraint it failed — `N validation error(s) detected: Value at
 //! '<member path>' failed to satisfy constraint: <the model's constraint>` — and never
-//! interpolates the value submitted there; a member the request did not carry at all is
-//! the one case reported with a value, the shape fact `Value null at '<member path>'`.
+//! interpolates the value submitted there, nor a `null` for a member the request did not
+//! carry at all (the recorded `PutStorageTierPolicy` refusal for an absent `storageTier`
+//! states `Value at 'storageTier' … Member must not be null`). An enum's value set is
+//! listed in ascending order of its values. The CODE such a refusal carries is the one the
+//! served operation declares, which `tests/all/refusal_error_codes.rs` is about: the
+//! delivery and S3-table-source operations below declare `ValidationException`, while
+//! `CreateLogGroup` and `DescribeLogGroups` declare `InvalidParameterException`.
 //!
 //! Every case drives the service the way a client does — `POST /` with
 //! `X-Amz-Target: Logs_20140328.<Operation>` through the router that mounts it — so the
@@ -35,9 +40,19 @@ struct Case {
     name: &'static str,
     operation: &'static str,
     body: Value,
+    /// The error code the SERVED OPERATION declares for a refusal.
+    code: &'static str,
     /// The complete `message` member of the 400 body.
     message: String,
 }
+
+/// The code the delivery and S3-table-source operations below declare — the only refusal
+/// shape in their modelled error set.
+const VALIDATION: &str = "ValidationException";
+
+/// The code `CreateLogGroup` and `DescribeLogGroups` declare: they list
+/// `InvalidParameterException` and no `ValidationException` at all.
+const INVALID_PARAMETER: &str = "InvalidParameterException";
 
 /// The clause `DeliveryId`'s `@pattern` states. Source: the model's `DeliveryId` shape
 /// (`@length` 1..64, `@pattern ^[0-9A-Za-z]+$`), reached by `GetDelivery.id`,
@@ -68,42 +83,45 @@ fn cases() -> Vec<Case> {
             name: "GetDelivery id with a dash",
             operation: "GetDelivery",
             body: json!({"id": "delivery-1"}),
+            code: VALIDATION,
             message: at("id", DELIVERY_ID_PATTERN),
         },
         Case {
             name: "DeleteDelivery id with a slash",
             operation: "DeleteDelivery",
             body: json!({"id": "abc/def"}),
+            code: VALIDATION,
             message: at("id", DELIVERY_ID_PATTERN),
         },
         Case {
             name: "UpdateDeliveryConfiguration id with a space",
             operation: "UpdateDeliveryConfiguration",
             body: json!({"id": "abc def"}),
+            code: VALIDATION,
             message: at("id", DELIVERY_ID_PATTERN),
         },
-        // `@required`: the one subject that names a value, because the request carried
-        // none at that position.
+        // `@required`: the subject is the same `Value at '<path>'`, because the refusal
+        // reports the POSITION rather than anything about what reached it.
         Case {
             name: "GetDelivery without the required id",
             operation: "GetDelivery",
             body: json!({}),
-            message: one("Value null at 'id' failed to satisfy constraint: Member must not be null"),
+            code: VALIDATION,
+            message: at("id", "Member must not be null"),
         },
         Case {
             name: "DisassociateSourceFromS3TableIntegration without the required identifier",
             operation: "DisassociateSourceFromS3TableIntegration",
             body: json!({}),
-            message: one(
-                "Value null at 'identifier' failed to satisfy constraint: \
-                 Member must not be null",
-            ),
+            code: VALIDATION,
+            message: at("identifier", "Member must not be null"),
         },
         // `@length` max. Source: `DeliveryId` 1..64.
         Case {
             name: "DeleteDelivery id one character past the maximum length",
             operation: "DeleteDelivery",
             body: json!({"id": "a".repeat(65)}),
+            code: VALIDATION,
             message: at("id", "Member must have length less than or equal to 64"),
         },
         // `@length` min, at the empty string. Source: `S3TableIntegrationSourceIdentifier`
@@ -112,6 +130,7 @@ fn cases() -> Vec<Case> {
             name: "DisassociateSourceFromS3TableIntegration empty identifier",
             operation: "DisassociateSourceFromS3TableIntegration",
             body: json!({"identifier": ""}),
+            code: VALIDATION,
             message: at(
                 "identifier",
                 "Member must have length greater than or equal to 1",
@@ -121,6 +140,7 @@ fn cases() -> Vec<Case> {
             name: "DisassociateSourceFromS3TableIntegration identifier past the maximum length",
             operation: "DisassociateSourceFromS3TableIntegration",
             body: json!({"identifier": "a".repeat(2049)}),
+            code: VALIDATION,
             message: at(
                 "identifier",
                 "Member must have length less than or equal to 2048",
@@ -137,6 +157,7 @@ fn cases() -> Vec<Case> {
                 "resourceArn": SOME_ARN,
                 "logType": "WAFLOGS",
             }),
+            code: VALIDATION,
             message: at(
                 "name",
                 "Member must satisfy regular expression pattern: ^[\\w-]*$",
@@ -150,6 +171,7 @@ fn cases() -> Vec<Case> {
                 "resourceArn": SOME_ARN,
                 "logType": "WAFLOGS",
             }),
+            code: VALIDATION,
             message: at("name", "Member must have length less than or equal to 60"),
         },
         Case {
@@ -160,6 +182,7 @@ fn cases() -> Vec<Case> {
                 "resourceArn": SOME_ARN,
                 "logType": "WAF-LOGS",
             }),
+            code: VALIDATION,
             message: at(
                 "logType",
                 "Member must satisfy regular expression pattern: ^[\\w]*$",
@@ -171,24 +194,28 @@ fn cases() -> Vec<Case> {
             name: "ListSourcesForS3TableIntegration maxResults one past the maximum",
             operation: "ListSourcesForS3TableIntegration",
             body: json!({"integrationArn": SOME_ARN, "maxResults": 101}),
+            code: VALIDATION,
             message: at("maxResults", "Member must have value less than or equal to 100"),
         },
         Case {
             name: "ListSourcesForS3TableIntegration maxResults one below the minimum",
             operation: "ListSourcesForS3TableIntegration",
             body: json!({"integrationArn": SOME_ARN, "maxResults": 0}),
+            code: VALIDATION,
             message: at(
                 "maxResults",
                 "Member must have value greater than or equal to 1",
             ),
         },
-        // A `@range` on another operation, with a different maximum. Source:
+        // A `@range` on another operation, with a different maximum — and one that
+        // declares `InvalidParameterException` rather than `ValidationException`. Source:
         // `DescribeLimit` 1..50, reached by `DescribeLogGroups.limit`: the rule is the
         // service's, not these six operations'.
         Case {
             name: "DescribeLogGroups limit one past the maximum",
             operation: "DescribeLogGroups",
             body: json!({"limit": 51}),
+            code: INVALID_PARAMETER,
             message: at("limit", "Member must have value less than or equal to 50"),
         },
         // A `@pattern` on an operation no report cites. Source: `LogGroupName` 1..512,
@@ -197,28 +224,30 @@ fn cases() -> Vec<Case> {
             name: "CreateLogGroup logGroupName with a space and a bang",
             operation: "CreateLogGroup",
             body: json!({"logGroupName": "bad name!"}),
+            code: INVALID_PARAMETER,
             message: at(
                 "logGroupName",
                 "Member must satisfy regular expression pattern: ^[\\.\\-_/#A-Za-z0-9]+$",
             ),
         },
-        // An enum value set. Source: the model's `LogGroupClass` enum — STANDARD,
-        // INFREQUENT_ACCESS, DELIVERY — in the order the model declares them.
+        // An enum value set. Source: the model's `LogGroupClass` enum — declared STANDARD,
+        // INFREQUENT_ACCESS, DELIVERY — listed in ascending order of its values.
         Case {
             name: "CreateLogGroup logGroupClass outside the enum",
             operation: "CreateLogGroup",
             body: json!({"logGroupName": "valid-name", "logGroupClass": "NOT_A_CLASS"}),
+            code: INVALID_PARAMETER,
             message: at(
                 "logGroupClass",
-                "Member must satisfy enum value set: [STANDARD, INFREQUENT_ACCESS, DELIVERY]",
+                "Member must satisfy enum value set: [DELIVERY, INFREQUENT_ACCESS, STANDARD]",
             ),
         },
     ]
 }
 
-/// Every refused request is answered 400 `ValidationException` with the message the rule
-/// requires — the member path and the modeled constraint, with the submitted value
-/// withheld.
+/// Every refused request is answered 400 with the code the served operation declares and
+/// the message the rule requires — the member path and the modeled constraint, with the
+/// submitted value withheld.
 #[tokio::test]
 async fn a_refused_request_states_the_position_and_the_constraint_only() {
     let logs = Logs::new();
@@ -227,6 +256,7 @@ async fn a_refused_request_states_the_position_and_the_constraint_only() {
             name,
             operation,
             body,
+            code,
             message: expected,
         } = case;
         let (status, parsed) = logs.call(operation, &body).await;
@@ -236,8 +266,8 @@ async fn a_refused_request_states_the_position_and_the_constraint_only() {
         );
         assert_eq!(
             error_code(&parsed),
-            "ValidationException",
-            "case {name:?}: expected error code ValidationException, got {parsed}"
+            code,
+            "case {name:?}: expected error code {code}, got {parsed}"
         );
         let actual = parsed
             .get("message")
