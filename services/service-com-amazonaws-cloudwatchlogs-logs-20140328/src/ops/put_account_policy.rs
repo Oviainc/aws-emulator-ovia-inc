@@ -12,13 +12,18 @@
 //! ([`crate::state::check_account_policy_document`]), and each type's documented quota is
 //! enforced ([`crate::state::max_account_policies`]).
 //!
-//! The GRAMMAR of `selectionCriteria` — `LogGroupName NOT IN [...]`,
-//! `LogGroupNamePrefix`, `DataSourceName` AND `DataSourceType` — and the "no two of them
-//! can use the same or overlapping log group name prefixes" rule between two policies of
-//! one type are NOT judged here: a criteria string is stored and reported verbatim. They
-//! are the subject of this operation's own issue,
-//! `issues/things-that-do-not-work/20261023T113357Z-logs-putaccountpolicy-stub.md`, whose
-//! recorded units cover them.
+//! A `selectionCriteria` string is held to the filters the member documents for the type
+//! it is put with — `LogGroupName NOT IN [...]`, `LogGroupNamePrefix`, `DataSourceName`
+//! AND `DataSourceType` ([`crate::state::check_selection_criteria`]) — and to the
+//! conflict rules between two policies of one type: "no two of them can use the same or
+//! overlapping log group name prefixes", the same data source name and type combination,
+//! and the overlap rules a metric extraction policy's `IN` / `NOT IN` criteria are held to
+//! ([`crate::state::check_account_policy_criteria_overlap`]). The string itself is still
+//! stored and reported verbatim.
+//!
+//! What a policy DOES to ingested log events — masking, transformation, suppressing EMF
+//! metric creation — is not this operation's: nothing here reads a policy back out at
+//! ingestion time yet.
 //!
 //! ## Shape of an operation
 //!
@@ -252,23 +257,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // policyType" — plus the metric extraction policies the operation's own
         // documentation scopes with it. A data protection policy is the one type that
         // applies to every log group, so a criteria string put with it selects nothing.
-        if let Some(selection_criteria) = input.selection_criteria.as_deref() {
-            if !crate::state::SELECTION_CRITERIA_POLICY_TYPES.contains(&input.policy_type.as_str())
-            {
-                return Err(invalid(format!(
-                    "selectionCriteria is valid only when policyType is one of: [{}]",
-                    crate::state::SELECTION_CRITERIA_POLICY_TYPES.join(", ")
-                )));
+        let criteria = match input.selection_criteria.as_deref() {
+            None => None,
+            Some(selection_criteria) => {
+                if !crate::state::SELECTION_CRITERIA_POLICY_TYPES
+                    .contains(&input.policy_type.as_str())
+                {
+                    return Err(invalid(format!(
+                        "selectionCriteria is valid only when policyType is one of: [{}]",
+                        crate::state::SELECTION_CRITERIA_POLICY_TYPES.join(", ")
+                    )));
+                }
+                // "The selectionCriteria string can be up to 25KB in length. The length is
+                // determined by using its UTF-8 bytes."
+                if selection_criteria.len() > crate::state::MAX_SELECTION_CRITERIA_BYTES {
+                    return Err(invalid(format!(
+                        "selectionCriteria can be up to {} bytes in length",
+                        crate::state::MAX_SELECTION_CRITERIA_BYTES
+                    )));
+                }
+                // Which filters the string may be written with is the member's own
+                // contract, stated per policy type.
+                Some(
+                    crate::state::check_selection_criteria(
+                        &input.policy_type,
+                        selection_criteria,
+                    )
+                    .map_err(invalid)?,
+                )
             }
-            // "The selectionCriteria string can be up to 25KB in length. The length is
-            // determined by using its UTF-8 bytes."
-            if selection_criteria.len() > crate::state::MAX_SELECTION_CRITERIA_BYTES {
-                return Err(invalid(format!(
-                    "selectionCriteria can be up to {} bytes in length",
-                    crate::state::MAX_SELECTION_CRITERIA_BYTES
-                )));
-            }
-        }
+        };
 
         // What the document must say is the contract of `policyDocument` for the type it
         // is put with; the checks, and the sentences they refuse with, live beside the
@@ -288,6 +306,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "the findings destination log group '{destination_name}' does not exist"
                 )));
             }
+        }
+
+        // "If you have multiple account-level transformer policies with selection
+        // criteria, no two of them can use the same or overlapping log group name
+        // prefixes", and the sentences the other scoped types state for their own criteria:
+        // what a put may not do is select log groups another policy of its type already
+        // selects.
+        if let Some(criteria) = &criteria {
+            crate::state::check_account_policy_criteria_overlap(
+                &store.account_policies,
+                &input.policy_type,
+                &input.policy_name,
+                criteria,
+            )
+            .map_err(invalid)?;
         }
 
         // A policy is identified by its type AND its name: "If you are updating an

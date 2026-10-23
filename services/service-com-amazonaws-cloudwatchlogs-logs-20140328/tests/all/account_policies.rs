@@ -68,7 +68,7 @@ const MAX_SCOPED_METRIC_EXTRACTION_POLICIES: usize = 5;
 /// A data protection policy document: the two blocks `PutAccountPolicy$policyDocument`
 /// documents, each listing the same `DataIdentifier` array, with the Audit action's
 /// `FindingsDestination` left empty (the "optionally" case).
-fn data_protection_document(identifier: &str) -> String {
+pub(crate) fn data_protection_document(identifier: &str) -> String {
     let identifiers = json!([format!(
         "arn:aws:dataprotection::aws:data-identifier/{identifier}"
     )]);
@@ -94,7 +94,10 @@ fn data_protection_document(identifier: &str) -> String {
 /// A subscription filter policy document: the attributes
 /// `PutAccountPolicy$policyDocument` lists for one (`DestinationArn`, `RoleArn`,
 /// `FilterPattern`, `Distribution`).
-fn subscription_filter_document(destination_arn: &str, role_arn: Option<&str>) -> String {
+pub(crate) fn subscription_filter_document(
+    destination_arn: &str,
+    role_arn: Option<&str>,
+) -> String {
     let mut document = json!({
         "DestinationArn": destination_arn,
         "FilterPattern": "",
@@ -108,7 +111,7 @@ fn subscription_filter_document(destination_arn: &str, role_arn: Option<&str>) -
 
 /// A field index policy document carrying a `Fields` array. Source:
 /// `PutAccountPolicy$policyDocument` — "Fields The array of field indexes to create".
-fn field_index_document(fields: &[&str]) -> String {
+pub(crate) fn field_index_document(fields: &[&str]) -> String {
     json!({"Fields": fields}).to_string()
 }
 
@@ -124,16 +127,17 @@ fn field_index_v2_document() -> String {
 
 /// A transformer policy document: "one JSON block with the array of processors and their
 /// configurations".
-fn transformer_document() -> String {
+pub(crate) fn transformer_document() -> String {
     json!([{"parseJSON": {}}, {"trimString": {"withKeys": ["message"]}}]).to_string()
 }
 
-/// A metric extraction policy document. The operation documents what such a policy DOES
-/// ("controls whether CloudWatch Metrics can be created through the Embedded Metrics
-/// Format (EMF)") without documenting the members of its document, so this is a policy in
-/// JSON and nothing more.
-fn metric_extraction_document() -> String {
-    json!({"EMFEnabled": false}).to_string()
+/// A metric extraction policy document: the one thing such a policy can say. Source:
+/// `PutAccountPolicy` — "You can use metric extraction policies to disable EMF metric
+/// creation for your entire account or specific log groups", which the document says
+/// through `EmbeddedMetricFormat.Status`, where the service accepts only the exact string
+/// `Disabled` (the subject of `tests/all/account_policy_selection_criteria.rs`).
+pub(crate) fn metric_extraction_document() -> String {
+    json!({"EmbeddedMetricFormat": {"Status": "Disabled"}}).to_string()
 }
 
 /// One row per policy type: a document that type admits, and the `selectionCriteria` it
@@ -174,7 +178,12 @@ fn policy_rows() -> Vec<(&'static str, String, Option<&'static str>)> {
 }
 
 /// A request body for one put.
-fn put_body(name: &str, policy_type: &str, document: &str, criteria: Option<&str>) -> Value {
+pub(crate) fn put_body(
+    name: &str,
+    policy_type: &str,
+    document: &str,
+    criteria: Option<&str>,
+) -> Value {
     let mut body = json!({
         "policyName": name,
         "policyType": policy_type,
@@ -187,7 +196,7 @@ fn put_body(name: &str, policy_type: &str, document: &str, criteria: Option<&str
 }
 
 /// One string member of a returned `AccountPolicy`.
-fn member(policy: &Value, key: &str) -> String {
+pub(crate) fn member(policy: &Value, key: &str) -> String {
     policy
         .get(key)
         .and_then(Value::as_str)
@@ -196,7 +205,7 @@ fn member(policy: &Value, key: &str) -> String {
 }
 
 /// The `accountPolicy` of a `PutAccountPolicy` response.
-fn put_policy(response: &Value) -> Value {
+pub(crate) fn put_policy(response: &Value) -> Value {
     response
         .get("accountPolicy")
         .cloned()
@@ -205,7 +214,7 @@ fn put_policy(response: &Value) -> Value {
 
 /// The policies one `DescribeAccountPolicies` request reports, asserting it reports them
 /// in one page (this operation mints no `nextToken`).
-async fn describe(logs: &Logs, body: &Value) -> Vec<Value> {
+pub(crate) async fn describe(logs: &Logs, body: &Value) -> Vec<Value> {
     let page = logs.ok("DescribeAccountPolicies", body).await;
     assert!(
         page.get("nextToken").is_none(),
@@ -220,7 +229,7 @@ async fn describe(logs: &Logs, body: &Value) -> Vec<Value> {
 }
 
 /// The `policyName`s one `DescribeAccountPolicies` request reports, in the order returned.
-async fn described_names(logs: &Logs, body: &Value) -> Vec<String> {
+pub(crate) async fn described_names(logs: &Logs, body: &Value) -> Vec<String> {
     describe(logs, body)
         .await
         .iter()
@@ -331,14 +340,13 @@ async fn describe_filters_by_type_name_and_account() {
     // reader must split them by type and report one type's policies by policy name.
     let index_document = field_index_document(&["requestId"]);
     for name in ["zz-index", "aa-index"] {
+        // A prefix per policy: no two policies of one type may select log groups by the
+        // same or overlapping prefixes, which
+        // `tests/all/account_policy_selection_criteria.rs` is about.
+        let criteria = format!(r#"LogGroupNamePrefix IN ["/aws/index/{name}"]"#);
         logs.ok(
             "PutAccountPolicy",
-            &put_body(
-                name,
-                "FIELD_INDEX_POLICY",
-                &index_document,
-                Some(r#"LogGroupNamePrefix IN ["/aws/index"]"#),
-            ),
+            &put_body(name, "FIELD_INDEX_POLICY", &index_document, Some(&criteria)),
         )
         .await;
     }
@@ -606,7 +614,7 @@ async fn put_enforces_the_documented_per_type_quotas() {
         )
         .await;
         for index in 1..=*limit {
-            let criteria = format!(r#"LogGroupNamePrefix IN ["/aws/mixed-{index}"]"#);
+            let criteria = scoped_criteria(policy_type, index);
             let body = put_body(
                 &format!("mixed-scoped-{index}"),
                 policy_type,
@@ -862,8 +870,10 @@ async fn documents_and_criteria_are_held_to_their_documented_bounds() {
         }
     }
 
-    // The `selectionCriteria` byte bound, measured in UTF-8 bytes: a multi-byte character
-    // counts as its bytes, so a string of half as many characters is still at the bound.
+    // The `selectionCriteria` byte bound, measured in UTF-8 bytes on the whole criteria
+    // string: a multi-byte character counts as its bytes, so a string of half as many
+    // characters is still at the bound. The padding goes inside the prefix value, so each
+    // case is a criteria string the member's grammar admits.
     let criteria_cases: &[(usize, char, bool)] = &[
         (MAX_SELECTION_CRITERIA_BYTES, 'a', true),
         (MAX_SELECTION_CRITERIA_BYTES + 1, 'a', false),
@@ -871,9 +881,14 @@ async fn documents_and_criteria_are_held_to_their_documented_bounds() {
         (MAX_SELECTION_CRITERIA_BYTES + 2, 'é', false),
     ];
     for (bytes, filler, accepted) in criteria_cases {
-        let count = bytes / filler.len_utf8();
-        let criteria = filler.to_string().repeat(count);
+        let criteria = prefix_criteria_of_bytes(*bytes, *filler);
         let case = format!("{bytes} bytes of {filler}");
+        assert_eq!(
+            criteria.len(),
+            *bytes,
+            "case {case}: the case must build a criteria of {bytes} bytes, got {}",
+            criteria.len()
+        );
         let body = put_body(
             "criteria-bound",
             "FIELD_INDEX_POLICY",
@@ -1057,4 +1072,29 @@ fn field_index_document_of_length(chars: usize) -> String {
         document.chars().count()
     );
     document
+}
+
+/// A `LogGroupNamePrefix IN [...]` criteria of exactly `bytes` UTF-8 bytes, padded with
+/// `filler` inside the prefix value so the string the bound is measured on is one the
+/// member's grammar admits.
+fn prefix_criteria_of_bytes(bytes: usize, filler: char) -> String {
+    let frame = r#"LogGroupNamePrefix IN [""]"#;
+    let padding = bytes.saturating_sub(frame.len()) / filler.len_utf8();
+    format!(
+        r#"LogGroupNamePrefix IN ["{}"]"#,
+        filler.to_string().repeat(padding)
+    )
+}
+
+/// A `selectionCriteria` string scoping one policy of `policy_type` to its own subset of
+/// log groups, in the filter form `PutAccountPolicy$selectionCriteria` documents for that
+/// type: `LogGroupName NOT IN [...]` for a subscription filter policy, a
+/// `LogGroupNamePrefix` filter for the others. Each `index` names a disjoint subset, so no
+/// two of them select the same log groups.
+fn scoped_criteria(policy_type: &str, index: usize) -> String {
+    if policy_type == "SUBSCRIPTION_FILTER_POLICY" {
+        format!(r#"LogGroupName NOT IN ["/aws/mixed-{index}"]"#)
+    } else {
+        format!(r#"LogGroupNamePrefix IN ["/aws/mixed-{index}"]"#)
+    }
 }

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    CapabilityReport, CapabilitySchemaItem, ConfigurationStatus, PushConfig,
+    CapabilityReport, CapabilitySchemaItem, ConfigurationStatus, EndpointConfig, PushConfig,
     ResourceNotFoundException, WiFiSimpleSetupConfiguration,
 };
 
@@ -18,13 +18,14 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// `ManagedThingArn` pattern (`^arn:aws:iotmanagedintegrations:…`) requires.
 pub const SERVICE_ARN_NAMESPACE: &str = "iotmanagedintegrations";
 
-/// The `Role`, `AuthMaterialType`, `HubNetworkMode`, `EncryptionType`, `LogLevel` and
+/// The `Role`, `AuthMaterialType`, `HubNetworkMode`, `EncryptionType`, `EndpointType`,
+/// `LogLevel` and
 /// `ConfigurationState` value lists the handlers validate against and report, re-exported
 /// from the MODEL-GENERATED constants in `crate::ops::types` so there is no second copy
 /// to drift from the model.
 pub use crate::ops::types::{
     AUTH_MATERIAL_TYPE_VALUES, CONFIGURATION_STATE_VALUES, ENCRYPTION_TYPE_VALUES,
-    HUB_NETWORK_MODE_VALUES, LOG_LEVEL_VALUES, ROLE_VALUES,
+    ENDPOINT_TYPE_VALUES, HUB_NETWORK_MODE_VALUES, LOG_LEVEL_VALUES, ROLE_VALUES,
 };
 
 /// The `ProvisioningStatus` a freshly created managed thing carries: it is not yet
@@ -85,6 +86,56 @@ pub struct ManagedThing {
     /// keeps resuming at the right place even when records are deleted in between.
     pub sequence: u64,
 }
+
+/// The `CloudConnectorType` every connector this service creates carries.
+///
+/// `CloudConnectorType` is `LISTED | UNLISTED`
+/// (`smithy_query(query="shape",shape="CloudConnectorType")`): a LISTED connector is one
+/// of the C2C connectors published for every account, which NO operation of this service
+/// creates, and an UNLISTED one is the connector an account creates for itself.
+/// `CreateCloudConnector` — "Creates a C2C (cloud-to-cloud) connector", and the only way a
+/// record enters [`ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState::cloud_connectors`]
+/// — is that call, so a stored connector reports this type.
+pub const CREATED_CLOUD_CONNECTOR_TYPE: &str = "UNLISTED";
+
+/// One stored C2C (cloud-to-cloud) cloud connector: the authoritative record
+/// `CreateCloudConnector` inserts and `GetCloudConnector` projects onto its output shape.
+///
+/// It holds no timestamp because no modelled cloud-connector shape reports one
+/// (`smithy_query(query="operation",operation="GetCloudConnector")`); the instant a
+/// create happened is kept on its idempotency record, where the TTL needs it.
+#[derive(Debug, Clone)]
+pub struct CloudConnector {
+    /// The generated `CloudConnectorId` this record is keyed by.
+    pub id: String,
+    /// The region the creating request was signed for. A cloud connector is a regional
+    /// resource: only that region's endpoint resolves it.
+    pub region: String,
+    /// `DisplayName` — the connector's display name.
+    pub name: String,
+    pub description: Option<String>,
+    /// The endpoint the connector reaches the third-party cloud through.
+    pub endpoint_config: EndpointConfig,
+    /// `EndpointType` enum value, absent when the create named none.
+    pub endpoint_type: Option<String>,
+    /// `CloudConnectorType` enum value — see [`CREATED_CLOUD_CONNECTOR_TYPE`].
+    pub connector_type: String,
+}
+
+/// The most cloud connectors one store holds. A create past it is refused rather than
+/// grown into, so a caller cannot make this emulator's memory grow without end. A bound
+/// CHOSEN for the emulator, not a published AWS quota, like [`MAX_MANAGED_THINGS`].
+pub const MAX_CLOUD_CONNECTORS: usize = 1_000;
+
+/// The `ResourceType` this service reports a cloud connector under — the Smithy resource
+/// name, which is also what `ResourceNotFoundException`'s `ResourceType` member carries
+/// and the kind an idempotency token is scoped to ([`IdempotencyKey`]).
+pub const CLOUD_CONNECTOR_RESOURCE_TYPE: &str = "CloudConnector";
+
+/// The cloud-connector resource as a READ's reason names it — the resource's name in
+/// words, which is what that sentence states instead of the identifier
+/// ([`resource_not_found_message`]).
+pub const CLOUD_CONNECTOR_RESOURCE_NAME: &str = "Cloud Connector";
 
 /// One stored over-the-air (OTA) task configuration: the authoritative record every
 /// OTA-task-configuration operation reads and writes. `CreateOtaTaskConfiguration`
@@ -288,6 +339,13 @@ pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// The authoritative OTA-task-configuration store, keyed by the generated
     /// `OtaTaskConfigurationId`.
     pub ota_task_configurations: HashMap<String, OtaTaskConfiguration>,
+    /// The authoritative cloud-connector store, keyed by the generated
+    /// `CloudConnectorId`. `CreateCloudConnector` inserts a record and
+    /// `GetCloudConnector` projects it onto its output shape.
+    pub cloud_connectors: HashMap<String, CloudConnector>,
+    /// Insertion order of cloud-connector ids, so every operation that reports several
+    /// of them reports them in the order they were created. An id is appended on create.
+    pub cloud_connector_order: Vec<String>,
     /// A resource kind plus a `ClientToken` (`@idempotencyToken`) -> what the first call
     /// created, so a replayed create returns the original record instead of a duplicate.
     /// The key carries the resource kind because a `ClientToken` is scoped to the
@@ -509,6 +567,14 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
         self.default_encryption
             .insert(region.to_string(), configuration);
         true
+    }
+
+    /// The cloud connector `region`'s endpoint holds under `id`, if any. A connector
+    /// created in another region is not visible here.
+    pub fn cloud_connector_in(&self, region: &str, id: &str) -> Option<&CloudConnector> {
+        self.cloud_connectors
+            .get(id)
+            .filter(|connector| connector.region == region)
     }
 
     /// The record `region`'s endpoint holds under `id`, if any. A configuration created in
@@ -1031,6 +1097,16 @@ fn resource_not_found(resource_type: &str, identifier: &str) -> ResourceNotFound
         message: None,
         resource_id: Some(identifier.to_string()),
         resource_type: Some(resource_type.to_string()),
+    }
+}
+
+/// The modelled `ResourceNotFoundException` a READ answers for a cloud connector the
+/// store does not hold under the identifier a request named, worded by the same read-path
+/// sentence every read of this service uses ([`resource_not_found_message`]).
+pub fn cloud_connector_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(resource_not_found_message(CLOUD_CONNECTOR_RESOURCE_NAME)),
+        ..resource_not_found(CLOUD_CONNECTOR_RESOURCE_TYPE, identifier)
     }
 }
 

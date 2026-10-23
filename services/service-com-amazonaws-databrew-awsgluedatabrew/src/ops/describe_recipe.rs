@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRecipe
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRecipe`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRecipe::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Serves the definition of one VERSION of a stored recipe from [`crate::state`]: the
+//! version the request names, or — when it names none — the latest published version,
+//! falling back to the recipe's working version while nothing has been published.
 //!
 //! ## Shape of an operation
 //!
@@ -98,9 +92,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-databrew-awsgluedatabre
 // here — hence the `DescribeRecipeError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.databrew#DescribeRecipe")]
+// `InternalServerException` (HTTP 500) is widened in: the service models it, this
+// operation does not list it, and it is the only honest answer for an engine that
+// holds no state — a mounting fault, never a client error.
+#[smithy_macros::operation_error(
+    "com.amazonaws.databrew#DescribeRecipe",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DescribeRecipeErrorModeled {
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
@@ -154,20 +155,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRecipe` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRecipeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRecipe"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeRecipeErrorModeled::InternalServerException(InternalServerException {
+                message: Some("DataBrew is mounted on an engine that holds no state".to_string()),
+            })
+        })?;
+
+        // The modelled length bounds are already enforced; the documented set of
+        // version identifiers is not, and an identifier outside it names no version
+        // DataBrew could ever hold.
+        if let Some(requested) = &input.recipe_version {
+            if let Err(message) =
+                crate::state::validate_recipe_version("RecipeVersion", requested)
+            {
+                return Err(DescribeRecipeErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let store = state.lock();
+        // Both a recipe this account does not hold and a version this recipe does not
+        // hold are "one or more resources can't be found": the request names a
+        // (recipe, version) pair, and only the pair resolves to a definition.
+        let not_found = || {
+            DescribeRecipeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+            })
+        };
+        let Some(recipe) = store.recipes.get(&input.name) else {
+            return Err(not_found().into());
+        };
+        let Some(version) = recipe.resolve_version(input.recipe_version.as_deref()) else {
+            return Err(not_found().into());
+        };
+
+        Ok(DescribeRecipeOutput {
+            created_by: Some(version.audit.created_by.clone()),
+            create_date: Some(crate::state::wire_date(version.audit.create_date)),
+            // Absent until a mutating operation has modified this version: the model
+            // makes both members optional, and an unmodified version has no
+            // modification to report.
+            last_modified_by: version.audit.wire_last_modified_by(),
+            last_modified_date: version.audit.wire_last_modified_date(),
+            project_name: recipe.project_name.clone(),
+            // Absent on a version no publish has frozen.
+            published_by: version.published_by.clone(),
+            published_date: version.published_date.map(crate::state::wire_date),
+            description: version.description.clone(),
+            name: recipe.name.clone(),
+            // The steps of the resolved VERSION, which is the definition this
+            // operation returns.
+            steps: Some(version.steps.clone()),
+            tags: crate::state::wire_tags(&recipe.tags),
+            resource_arn: Some(recipe.resource_arn.clone()),
+            // The version that was resolved, never the alias the request asked with.
+            recipe_version: Some(version.version.clone()),
+        })
     }
 }

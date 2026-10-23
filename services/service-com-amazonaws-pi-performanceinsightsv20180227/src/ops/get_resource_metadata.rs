@@ -11,11 +11,14 @@
 //! source this account may see at all (the modelled `NotAuthorizedException`, see
 //! [`crate::state::is_data_source_identifier`]).
 //!
-//! `Features` reports what the emulator OBSERVES on the data source. This emulator
-//! runs no DB engine and holds no per-feature state for a monitored resource, so it
-//! observes none and the map is empty — never a feature name under an invented
-//! status. (The separate issue `pi-getresourcemetadata-stub` records the SQL-digest
-//! feature a recorded unit expects; that feature catalogue is its own question.)
+//! `Features` reports what the emulator OBSERVES on the data source. A feature of a
+//! monitored DB resource is turned on by the service that OWNS the resource
+//! (`EnablePerformanceInsights` and `DatabaseInsightsMode` are members of the database
+//! control plane's create and modify requests, not of any Performance Insights
+//! request), so each feature's status is PROJECTED from the monitoring configuration
+//! that service persisted in the shared data-source directory — see
+//! [`crate::state::observed_features`] for the projection, which answers `UNKNOWN`
+//! where no configuration is on record rather than inventing a status.
 //!
 //! ## Shape of an operation
 //!
@@ -199,12 +202,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The data source is served, so its metadata is the identifier it is
-        // addressed by and the features observed on it. Nothing in this emulator
-        // writes per-feature state for a monitored resource, so the map is EMPTY
-        // rather than carrying a feature whose status nothing measured.
+        // addressed by and the features observed on it — each status read off the
+        // monitoring configuration the owning database service persisted for the
+        // resource, never measured here and never invented.
         Ok(GetResourceMetadataOutput {
             identifier: Some(input.identifier.clone()),
-            features: Some(::std::collections::HashMap::new()),
+            features: Some(crate::state::observed_features(
+                &*self.engine,
+                &input.service_type,
+                &input.identifier,
+            )),
         })
     }
 }

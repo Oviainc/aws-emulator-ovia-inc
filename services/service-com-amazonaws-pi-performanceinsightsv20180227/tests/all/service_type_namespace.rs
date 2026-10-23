@@ -284,8 +284,10 @@ async fn an_unrecorded_identifier_is_served_under_either_service_type() {
 }
 
 /// RULE: `GetResourceMetadata` answers the metadata of the data source it was asked
-/// about — the `Identifier` echoed back, and the features the emulator observes on it
-/// (none, so the map is empty) — and is subject to the same two gates as its peers.
+/// about — the `Identifier` echoed back, and the features the emulator observes on it,
+/// each status projected from the monitoring configuration the owning service recorded
+/// (none here, so every feature is `UNKNOWN`) — and is subject to the same two gates as
+/// its peers. The projection itself is `resource_features.rs`.
 #[tokio::test]
 async fn get_resource_metadata_reports_the_addressed_data_source() {
     let (emulator, engine) = emulator_with_engine();
@@ -312,13 +314,20 @@ async fn get_resource_metadata_reports_the_addressed_data_source() {
             "case {case}: expected the addressed identifier echoed, got {:?}",
             answer.body
         );
+        let features = answer.member("Features").as_object().cloned().unwrap_or_default();
         assert_eq!(
-            answer.member("Features").as_object().map(|map| map.len()),
-            Some(0),
-            "case {case}: the emulator observes no feature on a data source, so Features is \
-             an empty map, got {:?}",
+            features.len(),
+            state::REPORTED_FEATURES.len(),
+            "case {case}: expected one entry per reported feature, got {:?}",
             answer.body
         );
+        for feature in state::REPORTED_FEATURES {
+            assert!(
+                features.contains_key(feature),
+                "case {case}: expected the feature {feature} reported, got {:?}",
+                answer.body
+            );
+        }
     }
 
     // The authorization gate still decides a value that addresses no data source at

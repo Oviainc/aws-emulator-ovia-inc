@@ -15,8 +15,11 @@
 //! This is that record: ONE directory in the shared engine, written by the database
 //! services when they mint a resource id (and cleared when the resource is deleted),
 //! read by the services that monitor those resources. Nothing here names a wire shape:
-//! the directory holds the resource id, the monitoring `ServiceType` that serves it and
-//! the engine it runs, and a reader projects those onto the shapes ITS model declares.
+//! the directory holds the resource id, the monitoring `ServiceType` that serves it, the
+//! engine it runs and the MONITORING CONFIGURATION the owning service persisted for it
+//! ([`MonitoringConfiguration`] — whether Performance Insights is turned on, and which
+//! database-insights mode the resource runs under), and a reader projects those onto the
+//! shapes ITS model declares.
 //!
 //! The directory is a record of what this emulator MINTED, so it is partial by
 //! construction: an id it holds no record of may still be a resource id of the right
@@ -44,6 +47,41 @@ pub const SERVICE_TYPE_DOCDB: &str = "DOCDB";
 /// workflow just created is always still resolvable.
 pub const MAX_REGISTERED_DATA_SOURCES: usize = 10_000;
 
+/// The `DatabaseInsightsMode` value under which a resource runs the ADVANCED feature
+/// set, as the database control planes model it (`DatabaseInsightsMode`: `advanced` |
+/// `standard`).
+pub const DATABASE_INSIGHTS_MODE_ADVANCED: &str = "advanced";
+
+/// The monitoring configuration a database control plane persisted for one resource.
+///
+/// A monitoring service cannot measure whether a feature is turned on for a DB
+/// resource — the resource's OWNER is what the setting was given to, so the owner is
+/// what records it here, and the monitoring service projects it onto its own shapes.
+/// Nothing in this struct names a wire member of any monitoring model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MonitoringConfiguration {
+    /// Whether Performance Insights is turned on for the resource
+    /// (`EnablePerformanceInsights` on the create/modify request).
+    pub performance_insights_enabled: bool,
+    /// The `DatabaseInsightsMode` the resource runs under (`standard` | `advanced`), or
+    /// `None` when the owning service's model has no such setting at all — Amazon
+    /// DocumentDB, say, which persists only whether Performance Insights is on.
+    pub database_insights_mode: Option<String>,
+}
+
+impl MonitoringConfiguration {
+    /// Whether the resource runs the ADVANCED database-insights mode, the mode whose
+    /// feature set is wider than the standard one.
+    ///
+    /// Compared without regard to case: the mode is a modelled enum value, and the
+    /// control planes store it as the caller wrote it.
+    pub fn runs_advanced_insights_mode(&self) -> bool {
+        self.database_insights_mode
+            .as_deref()
+            .is_some_and(|mode| mode.eq_ignore_ascii_case(DATABASE_INSIGHTS_MODE_ADVANCED))
+    }
+}
+
 /// One database resource a database service minted, as the directory records it.
 #[derive(Debug, Clone)]
 pub struct DataSourceRecord {
@@ -56,6 +94,10 @@ pub struct DataSourceRecord {
     /// The database engine the resource runs (`mysql`, `postgres`, `docdb`, …), as the
     /// owning service persisted it.
     pub engine: String,
+    /// What the owning service persisted about this resource's monitoring
+    /// configuration, or `None` when it recorded none — which a reader must treat as
+    /// UNDECIDED (the configuration is unknown here), never as "everything off".
+    pub monitoring: Option<MonitoringConfiguration>,
 }
 
 /// The directory itself: resource id -> the service that owns it.
@@ -76,12 +118,15 @@ impl DataSourceDirectory {
     ///
     /// Re-registering an id REPLACES its record (an id is minted once, so this is the
     /// owning service correcting what it told the directory) and does not move its
-    /// place in the eviction order.
+    /// place in the eviction order. The replacement carries no monitoring
+    /// configuration, so an owner that records one calls [`Self::record_monitoring`]
+    /// after registering.
     pub fn register(&mut self, resource_id: &str, service_type: &str, engine: &str) {
         let record = DataSourceRecord {
             resource_id: resource_id.to_string(),
             service_type: service_type.to_string(),
             engine: engine.to_string(),
+            monitoring: None,
         };
         if self
             .sources
@@ -94,6 +139,21 @@ impl DataSourceDirectory {
                     self.sources.remove(&oldest);
                 }
             }
+        }
+    }
+
+    /// Record what the owning service persisted about `resource_id`'s monitoring
+    /// configuration — on the create that minted it, and again on every modification
+    /// that changes one of those settings, so a monitoring service reads the
+    /// configuration the resource is running under now rather than the one it was
+    /// created with.
+    ///
+    /// A no-op for an id the directory holds no record of: the owner registers the id
+    /// first, and nothing here invents a record for a resource the directory never saw
+    /// minted.
+    pub fn record_monitoring(&mut self, resource_id: &str, monitoring: MonitoringConfiguration) {
+        if let Some(record) = self.sources.get_mut(resource_id) {
+            record.monitoring = Some(monitoring);
         }
     }
 
@@ -199,6 +259,66 @@ mod tests {
                 .map(|record| record.engine.clone()),
             Some("postgres".to_string()),
             "case a re-registration: expected the newest record to stand"
+        );
+    }
+
+    #[test]
+    fn a_monitoring_configuration_is_recorded_against_the_registered_id_only() {
+        let mut directory = DataSourceDirectory::default();
+        directory.register("db-MONITORED00000001", SERVICE_TYPE_RDS, "mysql");
+
+        // A registered id with nothing recorded yet is UNDECIDED, not "everything off".
+        assert_eq!(
+            directory
+                .get("db-MONITORED00000001")
+                .map(|record| record.monitoring.clone()),
+            Some(None),
+            "case a fresh registration: expected no monitoring configuration on record"
+        );
+
+        // Each row is a configuration an owner persists, including the re-record a
+        // modification makes.
+        let rows: &[(&str, bool, Option<&str>, bool)] = &[
+            ("performance insights off", false, Some("standard"), false),
+            ("standard insights mode", true, Some("standard"), false),
+            ("advanced insights mode", true, Some("advanced"), true),
+            ("the mode as the caller wrote it", true, Some("ADVANCED"), true),
+            ("an owner with no mode at all", true, None, false),
+        ];
+        for (case, enabled, mode, advanced) in rows {
+            directory.record_monitoring(
+                "db-MONITORED00000001",
+                MonitoringConfiguration {
+                    performance_insights_enabled: *enabled,
+                    database_insights_mode: mode.map(str::to_string),
+                },
+            );
+            let recorded = directory
+                .get("db-MONITORED00000001")
+                .and_then(|record| record.monitoring.clone())
+                .unwrap_or_else(|| panic!("case {case}: expected a recorded configuration"));
+            assert_eq!(
+                (
+                    recorded.performance_insights_enabled,
+                    recorded.runs_advanced_insights_mode()
+                ),
+                (*enabled, *advanced),
+                "case {case}: expected ({enabled}, {advanced}), got {recorded:?}"
+            );
+        }
+
+        // An id the directory never saw minted gets no record invented for it.
+        directory.record_monitoring(
+            "db-NEVERREGISTERED1",
+            MonitoringConfiguration {
+                performance_insights_enabled: true,
+                database_insights_mode: Some("advanced".to_string()),
+            },
+        );
+        assert!(
+            directory.get("db-NEVERREGISTERED1").is_none() && directory.len() == 1,
+            "case an unregistered id: expected no record invented, got {} record(s)",
+            directory.len()
         );
     }
 

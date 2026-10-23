@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAnalysisTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAnalysisTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAnalysisTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a stored analysis template, unchanged. An analysis template is a
+//! sub-resource of the membership it was created under, so both path identifiers have
+//! to resolve: a template that exists under another membership is not found under this
+//! one.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +143,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAnalysisTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAnalysisTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAnalysisTemplate"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(GetAnalysisTemplateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("cleanrooms state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+
+        if !store.memberships.contains_key(&input.membership_identifier) {
+            return Err(GetAnalysisTemplateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("membership {} not found", input.membership_identifier),
+                    resource_id: input.membership_identifier,
+                    resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
+                },
+            )
+            .into());
+        }
+
+        match store.analysis_template_in(
+            &input.membership_identifier,
+            &input.analysis_template_identifier,
+        ) {
+            Some(analysis_template) => Ok(GetAnalysisTemplateOutput {
+                analysis_template: analysis_template.clone(),
+            }),
+            None => Err(GetAnalysisTemplateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "analysis template {} not found in membership {}",
+                        input.analysis_template_identifier, input.membership_identifier
+                    ),
+                    resource_id: input.analysis_template_identifier,
+                    resource_type: st::RESOURCE_TYPE_ANALYSIS_TEMPLATE.to_string(),
+                },
+            )
+            .into()),
+        }
     }
 }
+

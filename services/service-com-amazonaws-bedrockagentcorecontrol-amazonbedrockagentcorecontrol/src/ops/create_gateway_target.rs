@@ -221,7 +221,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // below: a lock is not held across an await, and the Lambda the target
         // names is resolved only for a request that would otherwise be written.
         let gateway_arn = {
-            let store = state.lock();
+            let mut store = state.lock();
+            // A gateway whose deletion the clock has already made due is gone
+            // before this call looks for it.
+            store.expire_deleted_gateways(now);
             if let Some((gateway_id, Some(target_id))) =
                 store.replayed_gateway_result(Self::NAME, input.client_token.as_deref())
             {

@@ -4,9 +4,9 @@
 //!
 //! The service's primary resource is the **monitor**: `CreateMonitor` stores one here and
 //! every other monitor operation (`GetMonitor`, `ListMonitors`, `UpdateMonitor`,
-//! `DeleteMonitor`, `TagResource`, `ListTagsForResource`) computes its answer from this
-//! one store, so a create is observable from a get/list and a delete is observable as an
-//! absence.
+//! `DeleteMonitor`, `TagResource`, `UntagResource`, `ListTagsForResource`) computes its
+//! answer from this one store, so a create is observable from a get/list and a delete is
+//! observable as an absence.
 //!
 //! The small helpers below (region, ARN, wire timestamp, page token) live beside the
 //! store rather than in one operation's file because several handlers need exactly the
@@ -120,7 +120,8 @@ pub struct MonitorRecord {
     /// is due; [`MonitorRecord::settle`] materialises it. `None` once the monitor has
     /// reached a state the clock owes nothing from.
     pub active_at: Option<SystemTime>,
-    /// `Tags`, shared by `GetMonitor`, `TagResource` and `ListTagsForResource`.
+    /// `Tags`, shared by `GetMonitor`, `TagResource`, `UntagResource` and
+    /// `ListTagsForResource`.
     pub tags: BTreeMap<String, String>,
     /// `MaxCityNetworksToMonitor`.
     pub max_city_networks_to_monitor: Option<i32>,

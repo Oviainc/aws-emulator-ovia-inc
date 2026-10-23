@@ -31,10 +31,10 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AgentRuntime, AgentRuntimeArtifact, AuthorizerConfiguration, CapacityProviderConfiguration,
     CertificateConfiguration, CreateGatewayOutput, CreateGatewayTargetOutput,
-    CredentialProviderConfiguration, FilesystemConfiguration, GatewayInterceptorConfiguration,
-    GatewayPolicyEngineConfiguration, GatewayProtocolConfiguration, GetGatewayOutput,
-    GetGatewayTargetOutput, Harness, HarnessAgentCoreRuntimeEnvironment, HttpTargetConfiguration,
-    InferenceTargetConfiguration,
+    CredentialProviderConfiguration, CustomTransformConfiguration, FilesystemConfiguration,
+    GatewayInterceptorConfiguration, GatewayPolicyEngineConfiguration,
+    GatewayProtocolConfiguration, GetGatewayOutput, GetGatewayTargetOutput, Harness,
+    HarnessAgentCoreRuntimeEnvironment, HttpTargetConfiguration, InferenceTargetConfiguration,
     HarnessAgentCoreRuntimeEnvironmentRequest, HarnessEnvironmentArtifact,
     HarnessEnvironmentProvider, HarnessEnvironmentProviderRequest, HarnessHook,
     HarnessMemoryConfiguration, HarnessModelConfiguration, HarnessSkill, HarnessSystemContentBlock,
@@ -42,7 +42,8 @@ use crate::ops::types::{
     McpTargetConfiguration, Memory, MemoryStrategy, MetadataConfiguration, NamespaceKeyEntry,
     NetworkConfiguration, PrivateEndpoint, ProtocolConfiguration, RequestHeaderConfiguration,
     RuntimeMetadataConfiguration, StreamDeliveryResources, TargetConfiguration, TargetSummary,
-    ValidationException, ValidationExceptionField, WorkloadIdentityDetails,
+    UpdateGatewayOutput, ValidationException, ValidationExceptionField, WafConfiguration,
+    WorkloadIdentityDetails,
 };
 
 /// The ARN namespace (and sigv4 signing name) this service stamps on its
@@ -92,6 +93,13 @@ pub const AUTHORIZER_TYPE_CUSTOM_JWT: &str = "CUSTOM_JWT";
 /// (`smithy_query shape=ValidationExceptionReason`).
 pub const VALIDATION_REASON_FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
 
+/// `ValidationExceptionReason` for a request the stored resource's own state
+/// refuses — an operation asked for while the resource is in a status that
+/// cannot serve it. Same enum as
+/// [`VALIDATION_REASON_FIELD_VALIDATION_FAILED`]: nothing is wrong with the
+/// request's members, so `FieldValidationFailed` would misreport it.
+pub const VALIDATION_REASON_RESOURCE_CONFLICT: &str = "ResourceConflict";
+
 /// The modelled validation error for ONE request member this service refuses:
 /// the member's name and why, in the `fieldList` the shape declares for exactly
 /// that, with `reason` saying a field failed validation.
@@ -106,6 +114,23 @@ pub fn field_validation_failed(member: &str, why: &str) -> ValidationException {
             name: member.to_string(),
             message: why.to_string(),
         }]),
+    }
+}
+
+/// The modelled validation error a gateway operation gets while the gateway is
+/// in a status that cannot serve it: the operation and the status it found,
+/// in the form this service's recorded refusals take ("Cannot perform operation
+/// CreateGatewayTarget when gateway is in CREATING status").
+///
+/// A gateway reaches `READY` on the clock, so every mutation of it is refused
+/// while it is still `CREATING`, `UPDATING` or on its way out in `DELETING`:
+/// nothing is wrong with the request's members, so `reason` is
+/// [`VALIDATION_REASON_RESOURCE_CONFLICT`] and there is no `fieldList`.
+pub fn gateway_status_conflict(operation: &str, status: &str) -> ValidationException {
+    ValidationException {
+        message: format!("Cannot perform operation {operation} when gateway is in {status} status"),
+        reason: VALIDATION_REASON_RESOURCE_CONFLICT.to_string(),
+        field_list: None,
     }
 }
 
@@ -338,6 +363,19 @@ pub struct GatewayRecord {
     pub interceptor_configurations: Option<Vec<GatewayInterceptorConfiguration>>,
     pub policy_engine_configuration: Option<GatewayPolicyEngineConfiguration>,
     pub exception_level: Option<String>,
+    /// The custom transformation configuration, which only `UpdateGateway`
+    /// carries (`CreateGatewayRequest` declares no such member), so a gateway
+    /// holds none until an update supplies one.
+    pub custom_transform_configuration: Option<CustomTransformConfiguration>,
+    /// The WAF configuration, carried by `UpdateGateway` only, for the same
+    /// reason as [`custom_transform_configuration`](Self::custom_transform_configuration).
+    pub waf_configuration: Option<WafConfiguration>,
+    /// The instant an accepted deletion removes this record, once `DeleteGateway`
+    /// has accepted one; `None` for a gateway nobody has deleted. Stored, never
+    /// slept on: the removal is the clock's, materialised by
+    /// [`ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::expire_deleted_gateways`]
+    /// on the next call that reads the store.
+    pub removal_due_at: Option<SystemTime>,
     pub tags: BTreeMap<String, String>,
     pub workload_identity_details: Option<WorkloadIdentityDetails>,
     /// Every target on this gateway, keyed by `targetId`. The key order is the
@@ -346,6 +384,12 @@ pub struct GatewayRecord {
 }
 
 impl GatewayRecord {
+    /// Whether a deletion has been accepted for this gateway: it reports
+    /// `DELETING` and the clock owes its removal.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
     /// The status this gateway reports at `now`: the transient one until the
     /// transition the clock owes comes due, the settled one afterwards.
     pub fn status_at(&self, now: SystemTime) -> &str {
@@ -381,15 +425,18 @@ impl GatewayRecord {
             authorizer_type: self.authorizer_type.clone(),
             authorizer_configuration: self.authorizer_configuration.clone(),
             kms_key_arn: self.kms_key_arn.clone(),
-            // No operation of this service sets a custom transform, a web ACL or
-            // a WAF configuration on a gateway, so a gateway carries none.
-            custom_transform_configuration: None,
+            // `UpdateGateway` is the only call of this service that carries a
+            // custom transform or a WAF configuration, so a gateway reports what
+            // the last update stored it with, and none until one does.
+            custom_transform_configuration: self.custom_transform_configuration.clone(),
             interceptor_configurations: self.interceptor_configurations.clone(),
             policy_engine_configuration: self.policy_engine_configuration.clone(),
             workload_identity_details: self.workload_identity_details.clone(),
             exception_level: self.exception_level.clone(),
+            // No member of any request this service models names a web ACL, so a
+            // gateway is associated with none.
             web_acl_arn: None,
-            waf_configuration: None,
+            waf_configuration: self.waf_configuration.clone(),
         }
     }
 
@@ -398,6 +445,37 @@ impl GatewayRecord {
     pub fn get_output(&self, now: SystemTime) -> GetGatewayOutput {
         let created = self.create_output(now);
         GetGatewayOutput {
+            gateway_arn: created.gateway_arn,
+            gateway_id: created.gateway_id,
+            gateway_url: created.gateway_url,
+            created_at: created.created_at,
+            updated_at: created.updated_at,
+            status: created.status,
+            status_reasons: created.status_reasons,
+            name: created.name,
+            description: created.description,
+            role_arn: created.role_arn,
+            protocol_type: created.protocol_type,
+            protocol_configuration: created.protocol_configuration,
+            authorizer_type: created.authorizer_type,
+            authorizer_configuration: created.authorizer_configuration,
+            kms_key_arn: created.kms_key_arn,
+            custom_transform_configuration: created.custom_transform_configuration,
+            interceptor_configurations: created.interceptor_configurations,
+            policy_engine_configuration: created.policy_engine_configuration,
+            workload_identity_details: created.workload_identity_details,
+            exception_level: created.exception_level,
+            web_acl_arn: created.web_acl_arn,
+            waf_configuration: created.waf_configuration,
+        }
+    }
+
+    /// This gateway as `UpdateGateway`'s response envelope — the same members
+    /// [`Self::create_output`] renders, so an update reports exactly the record it
+    /// just wrote and a later `GetGateway` cannot differ from it.
+    pub fn update_output(&self, now: SystemTime) -> UpdateGatewayOutput {
+        let created = self.create_output(now);
+        UpdateGatewayOutput {
             gateway_arn: created.gateway_arn,
             gateway_id: created.gateway_id,
             gateway_url: created.gateway_url,
@@ -1105,6 +1183,31 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
             .retain(|token| live.contains_key(token));
     }
 
+    /// Remove every gateway whose deletion the clock has already made due, with
+    /// the name it reserved, the targets on it and the idempotency records naming
+    /// it.
+    ///
+    /// `DeleteGateway` ACCEPTS the deletion (202) and reports the gateway
+    /// `DELETING`; the record itself goes when the span it owes passes, so a
+    /// caller polling the gateway sees `DELETING` and then the modelled 404. The
+    /// removal is owed by the CLOCK — it was due at this instant whether or not
+    /// anybody called — so every operation that reads the gateway store
+    /// materialises it first, and nothing ever sleeps for it.
+    pub fn expire_deleted_gateways(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .gateways
+            .iter()
+            .filter(|(_, record)| record.removal_due_at.is_some_and(|at| now >= at))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            if let Some(record) = self.gateways.remove(&id) {
+                self.gateway_names.remove(&record.name);
+                self.forget_gateway_client_tokens_for(&record.gateway_id);
+            }
+        }
+    }
+
     /// Mint a `harnessId` for `name` that no stored harness holds: the name + `-`
     /// + 10 alphanumerics, per `HarnessId`'s pattern
     /// `^[a-zA-Z][a-zA-Z0-9_]{0,39}-[a-zA-Z0-9]{10}$`.
@@ -1383,6 +1486,14 @@ pub fn gateway_url(region: &str, gateway_id: &str) -> String {
 ///
 /// AWS documents no duration for either transition, so the span is chosen: short
 /// enough to keep a client script quick, long enough that a caller acting
+/// straight after the call still observes the transient status.
+/// How long a freshly created or updated gateway stays in its transient status
+/// (`CREATING` / `UPDATING`) before the clock owes it `READY`, and how long a
+/// gateway whose deletion was accepted stays readable in `DELETING` before the
+/// clock owes its removal.
+///
+/// AWS documents no duration for any of these transitions, so the span is chosen:
+/// short enough to keep a client script quick, long enough that a caller acting
 /// straight after the call still observes the transient status.
 pub const GATEWAY_SETTLE_DELAY: Duration = Duration::from_millis(500);
 

@@ -21,6 +21,8 @@ mod clock_dependent_state;
 mod group_lifecycle;
 #[path = "all/group_membership.rs"]
 mod group_membership;
+#[path = "all/initiate_auth.rs"]
+mod initiate_auth;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/token_signing.rs"]

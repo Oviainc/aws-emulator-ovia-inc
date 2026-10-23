@@ -13,6 +13,9 @@
 //!   per request by [`CleanRoomsState::collaboration_view`].
 //! * the modelled [`Membership`] shape IS stored as-is: every one of its members is
 //!   absolute, so there is nothing to derive.
+//! * the modelled [`AnalysisTemplate`] shape is likewise stored as-is, under the
+//!   membership it was created for; `analysis_template_by_name` is the index that makes
+//!   a repeat create under one name a conflict rather than a second resource.
 //!
 //! * the modelled [`ConfiguredTable`] is likewise stored as-is: a configured table is an
 //!   account-level resource, so none of its members describes the caller. The analysis
@@ -24,8 +27,9 @@
 //!   collides with) is a lookup rather than a scan.
 //!
 //! Insertion order is kept in `collaboration_order` / `membership_order` /
-//! `configured_table_order` so the list operations page deterministically and a
-//! pagination token stays valid across calls.
+//! `analysis_template_order` / `protected_query_order` / `configured_table_order` so
+//! the list operations page deterministically and a pagination token stays valid across
+//! calls.
 //!
 //! The privacy budget template a collaboration holds is stored the same way the
 //! modelled [`Membership`] is — as the modelled `PrivacyBudgetTemplate`, because every
@@ -44,18 +48,19 @@
 //! [`change_request_status_from_approvals`], and [`change_request_is_terminal`] says
 //! which statuses admit no modification at all.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AccessBudgetsPrivacyTemplateParametersOutput, ApprovalStatusDetails, Change, ChangeSpecification,
-    Collaboration,
-    CollaborationChangeRequest, CollaborationSummary, ComputeConfiguration, ConfiguredTable,
-    ConfiguredTableAnalysisRule, ConfiguredTableAnalysisRulePolicy,
-    ConfiguredTableAnalysisRulePolicyV1,
-    DataEncryptionMetadata, DifferentialPrivacyTemplateParametersOutput, MLMemberAbilities,
+    AccessBudgetsPrivacyTemplateParametersOutput, AnalysisParameter, AnalysisSchema, AnalysisSource,
+    AnalysisTemplate, AnalysisTemplateSummary, ApprovalStatusDetails, Change, ChangeSpecification,
+    Collaboration, CollaborationChangeRequest, CollaborationSummary, ComputeConfiguration,
+    ConfiguredTable, ConfiguredTableAnalysisRule, ConfiguredTableAnalysisRulePolicy,
+    ConfiguredTableAnalysisRulePolicyV1, DataEncryptionMetadata,
+    DifferentialPrivacyTemplateParametersOutput, ErrorMessageConfiguration, MLMemberAbilities,
     MemberChangeSpecification, MemberSpecification, Membership, MembershipJobComputePaymentConfig,
     MembershipMLPaymentConfig, MembershipModelInferencePaymentConfig,
     MembershipModelTrainingPaymentConfig, MembershipPaymentConfiguration,
@@ -64,8 +69,8 @@ use crate::ops::types::{
     MembershipSummary, MembershipSyntheticDataGenerationPaymentConfig, PaymentConfiguration,
     PrivacyBudgetTemplate, PrivacyBudgetTemplateParametersInput,
     PrivacyBudgetTemplateParametersOutput, ProtectedQuery, ProtectedQueryError,
-    ProtectedQueryOutputConfiguration, ProtectedQueryResultConfiguration, TableReference,
-    WorkerComputeConfiguration,
+    ProtectedQueryOutputConfiguration, ProtectedQueryResultConfiguration, SyntheticDataParameters,
+    TableReference, WorkerComputeConfiguration,
 };
 
 /// The ARN service segment and the SigV4 signing name for Clean Rooms, from
@@ -291,6 +296,15 @@ pub const ANALYSIS_RULE_TYPE_CUSTOM: &str = "CUSTOM";
 /// declares.
 pub const MIN_SELECTED_ANALYSIS_METHODS: usize = 2;
 
+/// The resource type an analysis-template 404 reports.
+///
+/// `ResourceNotFoundException$resourceType` is REQUIRED, and the model's `ResourceType`
+/// catalog (CONFIGURED_TABLE | COLLABORATION | MEMBERSHIP |
+/// CONFIGURED_TABLE_ASSOCIATION) names no analysis template, so the member reports the
+/// type of the resource that was not found rather than one of the four that is not it.
+/// `ConflictException$resourceType`, which is optional, is left absent instead.
+pub const RESOURCE_TYPE_ANALYSIS_TEMPLATE: &str = "ANALYSIS_TEMPLATE";
+
 /// `ConflictExceptionReason` for a resource that already exists (model shape
 /// `ConflictExceptionReason`: ALREADY_EXISTS | SUBRESOURCES_EXIST | INVALID_STATE).
 pub const CONFLICT_REASON_ALREADY_EXISTS: &str = "ALREADY_EXISTS";
@@ -329,8 +343,9 @@ pub const ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS: &str = "INSUFFICIENT_PE
 /// `ValidationExceptionReason`).
 pub const VALIDATION_REASON_FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FAILED";
 
-/// `ValidationExceptionReason` for SQL parameters that name no query to run (model
-/// shape `ValidationExceptionReason`: FIELD_VALIDATION_FAILED | INVALID_CONFIGURATION |
+/// `ValidationExceptionReason` for a request that names no query the service can run —
+/// SQL parameters with no query, or an analysis whose text is not a query (model shape
+/// `ValidationExceptionReason`: FIELD_VALIDATION_FAILED | INVALID_CONFIGURATION |
 /// INVALID_QUERY | IAM_SYNCHRONIZATION_DELAY).
 pub const VALIDATION_REASON_INVALID_QUERY: &str = "INVALID_QUERY";
 
@@ -339,6 +354,12 @@ pub const VALIDATION_REASON_INVALID_QUERY: &str = "INVALID_QUERY";
 /// change request that is already settled, say (model shape
 /// `ValidationExceptionReason`).
 pub const VALIDATION_REASON_INVALID_CONFIGURATION: &str = "INVALID_CONFIGURATION";
+
+/// `AnalysisFormat` values this slice keys on (model shape `AnalysisFormat`: SQL |
+/// PYSPARK_1_0). Only a SQL analysis carries a query the service can read relations
+/// out of; a PySpark analysis is program text, so its referenced tables are the ones
+/// the caller declared.
+pub const ANALYSIS_FORMAT_SQL: &str = "SQL";
 
 /// The largest `members` list `CreateCollaboration` accepts.
 ///
@@ -367,6 +388,98 @@ pub const MAX_COLLABORATIONS: usize = 5_000;
 
 /// See [`MAX_COLLABORATIONS`].
 pub const MAX_MEMBERSHIPS: usize = 5_000;
+
+/// See [`MAX_COLLABORATIONS`] — the same bound, for the analysis templates one
+/// membership's creates add to the store.
+pub const MAX_ANALYSIS_TEMPLATES: usize = 5_000;
+
+/// The most relations this emulator reads out of ONE analysis.
+///
+/// The model declares `QueryTables` with no upper bound, and the relations are read out
+/// of caller-supplied text, so without a cap the number of names one request makes the
+/// service collect and store would be set by the request rather than by the service.
+/// This is an EMULATOR-ENFORCED resource bound, not a documented AWS quota: it is far
+/// above any realistic analysis (an AWS Clean Rooms collaboration's whole catalog is
+/// orders of magnitude smaller), so it refuses only an analysis that exists to make the
+/// service collect an unbounded relation set, through the
+/// `ServiceQuotaExceededException` (402) `CreateAnalysisTemplate` declares. A query
+/// over the cap is refused rather than reported with a truncated relation set, which
+/// would misstate what the analysis reads. It sits below what
+/// [`MAX_PARSED_ANALYSIS_TOKENS`] allows, so this is the bound a relation-heavy query
+/// meets, and it is the one reported.
+pub const MAX_REFERENCED_TABLES: usize = 200;
+
+/// The most analysis text this service reads a relation set out of.
+///
+/// The model's `AnalysisTemplateText` allows up to 500,000 characters, and the cost of
+/// parsing a query is a function of its length, so the length the SERVICE will parse is
+/// capped here: the work one request can ask for is bounded BEFORE it is scheduled,
+/// instead of only being waited on. A longer analysis is refused with the modelled
+/// `ValidationException` naming `source.text`, rather than stored with a relation set
+/// nothing read. The EMULATOR's own number, not an AWS one, and far above any
+/// hand-written analysis (100,000 characters of SQL).
+pub const MAX_PARSED_ANALYSIS_CHARS: usize = 100_000;
+
+/// The most TOKENS this service parses in ONE analysis.
+///
+/// This is the bound that dominates the recursion, and it is counted on a FLAT token
+/// pass before any tree exists. The length cap above bounds how much text the lexer
+/// reads; it does not bound the shape of the tree a parse of that text would build, and
+/// bracket nesting is not a bound on it either: a left-associative chain
+/// (`1 + 1 + 1 + …`, `a OR a OR …`) carries no brackets at all and still builds a tree
+/// one node deep per operator, which the parser itself builds in a LOOP rather than by
+/// recursing. Every node of that tree consumes at least one token, so a cap on the
+/// non-whitespace token count caps the tree's SIZE and therefore its DEPTH — the
+/// recursive parse, this module's recursive walk of the tree and the tree's own
+/// recursive drop all stay within this many frames, which is what keeps a deep analysis
+/// from exhausting the stack (a Rust stack overflow aborts the process, so no later
+/// check could contain it). An analysis over the cap is refused with the modelled
+/// `ValidationException` naming `source.text`. The EMULATOR's own number, not an AWS
+/// one, and far above any hand-written analysis (1,000 tokens is a query of a hundred
+/// lines or so).
+pub const MAX_PARSED_ANALYSIS_TOKENS: usize = 1_000;
+
+/// The parser's own recursion limit, an INDEPENDENT second bound on nesting the parser
+/// produces by recursing (a bracketed subquery or sub-expression).
+///
+/// [`MAX_PARSED_ANALYSIS_TOKENS`] already bounds the tree, so this is a backstop that
+/// stops a deeply bracketed analysis inside the parse instead of after it; exceeding it
+/// is a parse ERROR, reported as the same modelled refusal. The EMULATOR's own number,
+/// not an AWS one.
+pub const MAX_PARSER_RECURSION: usize = 200;
+
+/// The most analyses this service parses at once.
+///
+/// Each parse runs on its own thread with [`ANALYSIS_PARSE_STACK_BYTES`] of stack, so
+/// without a cap a burst of creates could start an unbounded number of them; a request
+/// that finds every slot taken waits for one within [`ANALYSIS_PARSE_TIME_BUDGET`] and
+/// is refused if none frees up. The EMULATOR's own number, not an AWS one.
+pub const MAX_CONCURRENT_ANALYSIS_PARSES: usize = 4;
+
+/// The stack one analysis parse is given.
+///
+/// Parsing an analysis, walking the tree for its relations and dropping that tree are
+/// all recursive, so they cost stack in proportion to the tree's depth — and a Rust
+/// stack overflow ABORTS the process instead of unwinding, so it cannot be caught after
+/// the fact. [`MAX_PARSED_ANALYSIS_TOKENS`] bounds the tree to that many nodes, hence
+/// that many frames, and this stack is sized with a wide margin over them (32 KiB of
+/// stack per possible frame) — which is why the work runs on a thread of this service's
+/// own making rather than on the runtime's blocking pool, whose stack size it does not
+/// choose. Virtual address space, committed by the page as it is used. The EMULATOR's
+/// own number, not an AWS one.
+pub const ANALYSIS_PARSE_STACK_BYTES: usize = 32 * 1024 * 1024;
+
+/// The wall-clock budget one analysis parse is given.
+///
+/// A BACKSTOP, not the bound: the work itself is bounded by
+/// [`MAX_PARSED_ANALYSIS_CHARS`] (how much text is lexed),
+/// [`MAX_PARSED_ANALYSIS_TOKENS`] (how big a tree the parse may build, and so how deep
+/// the parse, the walk and the drop recurse), [`MAX_REFERENCED_TABLES`] (how many
+/// relations are collected) and [`MAX_CONCURRENT_ANALYSIS_PARSES`] (how many parses run
+/// at once). The caller is held to this budget as well, so a request is never left
+/// waiting and the wait has an await point for a timeout or a shutdown to land on. The
+/// EMULATOR's own number, not an AWS one.
+pub const ANALYSIS_PARSE_TIME_BUDGET: Duration = Duration::from_secs(2);
 
 /// See [`MAX_COLLABORATIONS`]: the same EMULATOR-enforced bound on the configured-table
 /// store, reported through the `ServiceQuotaExceededException` (HTTP 402)
@@ -518,6 +631,14 @@ pub struct ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
     /// Tags by resource ARN, shared by collaboration and membership ARNs so a later
     /// TagResource/ListTagsForResource slice has one place to read and write.
     pub tags: HashMap<String, HashMap<String, String>>,
+    /// Analysis templates by `AnalysisTemplate.id`. The modelled shape is stored as-is:
+    /// every one of its members is absolute, so nothing is derived per caller.
+    pub analysis_templates: HashMap<String, AnalysisTemplate>,
+    /// Analysis template ids in creation order — the order a listing pages in.
+    pub analysis_template_order: Vec<String>,
+    /// `(membership id, analysis template name) -> analysis template id`: the index that
+    /// makes the duplicate-name conflict computable instead of guessed.
+    pub analysis_template_by_name: HashMap<(String, String), String>,
     /// Privacy budget templates by `PrivacyBudgetTemplate.id`. The modelled shape is
     /// stored as-is: every one of its members is absolute, so there is nothing to
     /// derive per request.
@@ -615,6 +736,34 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
         } else {
             MEMBER_STATUS_INVITED
         })
+    }
+
+    /// The analysis template `membership_id` already holds under `name`, if any.
+    ///
+    /// A template's name is unique within its membership, so this is what makes a
+    /// repeat create a conflict rather than a second resource.
+    pub fn analysis_template_named(
+        &self,
+        membership_id: &str,
+        name: &str,
+    ) -> Option<&AnalysisTemplate> {
+        let id = self
+            .analysis_template_by_name
+            .get(&(membership_id.to_string(), name.to_string()))?;
+        self.analysis_templates.get(id)
+    }
+
+    /// The stored analysis template `template_id`, but only when it belongs to
+    /// `membership_id`: an analysis template is a sub-resource of one membership, so a
+    /// template read under another membership is not found there.
+    pub fn analysis_template_in(
+        &self,
+        membership_id: &str,
+        template_id: &str,
+    ) -> Option<&AnalysisTemplate> {
+        self.analysis_templates
+            .get(template_id)
+            .filter(|template| template.membership_id == membership_id)
     }
 
     /// The modelled `Collaboration` as `account_id` sees it, or `None` when that
@@ -1137,6 +1286,27 @@ pub fn membership_summary(membership: &Membership) -> MembershipSummary {
     }
 }
 
+/// The modelled `AnalysisTemplateSummary` projection of a stored `AnalysisTemplate`.
+///
+/// `isSyntheticData` ("Indicates if this analysis template summary generated synthetic
+/// data") is derived from whether the template carries `syntheticDataParameters`, which
+/// is what makes an analysis generate synthetic data.
+pub fn analysis_template_summary(template: &AnalysisTemplate) -> AnalysisTemplateSummary {
+    AnalysisTemplateSummary {
+        arn: template.arn.clone(),
+        create_time: template.create_time,
+        id: template.id.clone(),
+        name: template.name.clone(),
+        update_time: template.update_time,
+        membership_arn: template.membership_arn.clone(),
+        membership_id: template.membership_id.clone(),
+        collaboration_arn: template.collaboration_arn.clone(),
+        collaboration_id: template.collaboration_id.clone(),
+        description: template.description.clone(),
+        is_synthetic_data: Some(template.synthetic_data_parameters.is_some()),
+    }
+}
+
 /// The account id every emulated caller presents, from the vendored runtime's single
 /// source of truth. Never a literal.
 pub fn caller_account_id() -> &'static str {
@@ -1214,6 +1384,18 @@ pub fn collaboration_arn(region: &str, id: &str) -> String {
 /// `MembershipArn` pattern declares.
 pub fn membership_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("membership/{id}"))
+}
+
+/// `arn:aws:cleanrooms:<region>:<account>:membership/<membership id>/analysistemplate/<id>`,
+/// the form the model's `AnalysisTemplateArn` pattern declares — an analysis template
+/// is a sub-resource of the membership it was created under, so its ARN is nested in
+/// that membership's.
+pub fn analysis_template_arn(region: &str, membership_id: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("membership/{membership_id}/analysistemplate/{id}"),
+    )
 }
 
 /// `arn:aws:cleanrooms:<region>:<account>:privacybudgettemplate/<id>`, the form the
@@ -1311,15 +1493,19 @@ pub fn configured_table_analysis_rule_policy_type(
 /// How many DISTINCT analysis methods a `selectedAnalysisMethods` list configures.
 ///
 /// The list is a set of enum values, so a method repeated in the request still
-/// configures one method — see [`MIN_SELECTED_ANALYSIS_METHODS`]. The count is taken
-/// through a hash set, so it is LINEAR in the list the request carries: a membership
-/// scan would make the per-request work quadratic in a list the model does not bound
-/// above.
+/// configures one method — see [`MIN_SELECTED_ANALYSIS_METHODS`].
+///
+/// The model puts no length constraint on `SelectedAnalysisMethods`, so the list one
+/// request may carry is bounded only by the transport body size: the count is taken
+/// through a hash set, never by scanning what has been seen already, so the pass stays
+/// LINEAR in the list's length however many repeats it carries (a scan would make the
+/// per-request work quadratic in a list the model does not bound above). The distinct
+/// count it answers is bounded by the model's `AnalysisMethod` catalog.
 pub fn distinct_selected_analysis_methods(methods: &[String]) -> usize {
     methods
         .iter()
         .map(String::as_str)
-        .collect::<std::collections::HashSet<&str>>()
+        .collect::<HashSet<&str>>()
         .len()
 }
 
@@ -1597,6 +1783,317 @@ impl NewMembership<'_> {
             is_metrics_enabled: Some(self.is_metrics_enabled),
         }
     }
+}
+
+/// Everything a new `AnalysisTemplate` is built from: the ids minted for it, the stored
+/// membership it is created under (which is where its collaboration identity comes
+/// from), and the analysis the request carried.
+pub struct NewAnalysisTemplate<'a> {
+    pub id: String,
+    pub arn: String,
+    pub membership: &'a Membership,
+    pub name: String,
+    pub description: Option<String>,
+    pub format: String,
+    pub source: AnalysisSource,
+    /// The relation set in force, from [`analysis_template_schema`].
+    pub schema: AnalysisSchema,
+    pub analysis_parameters: Option<Vec<AnalysisParameter>>,
+    pub error_message_configuration: Option<ErrorMessageConfiguration>,
+    pub synthetic_data_parameters: Option<SyntheticDataParameters>,
+    pub created_at: DateTime,
+}
+
+impl NewAnalysisTemplate<'_> {
+    /// The stored `AnalysisTemplate`. Every collaboration/membership-derived member is
+    /// copied FROM the stored membership, never from the request.
+    pub fn build(self) -> AnalysisTemplate {
+        AnalysisTemplate {
+            id: self.id,
+            arn: self.arn,
+            collaboration_id: self.membership.collaboration_id.clone(),
+            collaboration_arn: self.membership.collaboration_arn.clone(),
+            membership_id: self.membership.id.clone(),
+            membership_arn: self.membership.arn.clone(),
+            description: self.description,
+            name: self.name,
+            create_time: self.created_at,
+            update_time: self.created_at,
+            schema: self.schema,
+            format: self.format,
+            source: self.source,
+            // `sourceMetadata` reports hashes of the S3 artifacts an artifact-sourced
+            // analysis points at (`AnalysisTemplateArtifactMetadata$entryPointHash`).
+            // Nothing in this emulator reads those objects, so the member is left
+            // absent rather than filled with a hash of something that was never
+            // hashed.
+            source_metadata: None,
+            analysis_parameters: self.analysis_parameters,
+            // `validations` carries the DIFFERENTIAL_PRIVACY validation detail (model
+            // shape `AnalysisTemplateValidationType`), which only a differential-privacy
+            // analysis acquires; no validation has run here, so no status is claimed.
+            validations: None,
+            error_message_configuration: self.error_message_configuration,
+            synthetic_data_parameters: self.synthetic_data_parameters,
+        }
+    }
+}
+
+/// The `schema` a created analysis template reports — a REQUIRED member of
+/// `AnalysisTemplate`, so the service always has one.
+///
+/// Precedence: the schema the caller declared, else the relations the analysis itself
+/// reads. Only a `SQL`-format analysis carries a query the service can read those out
+/// of; for any other analysis (PySpark program text, or artifacts in S3 this emulator
+/// cannot open) no relation set is derived and `referencedTables` is left absent rather
+/// than asserted empty.
+///
+/// `Err` says why no relation set could be read out of the analysis.
+pub fn analysis_template_schema(
+    requested: Option<AnalysisSchema>,
+    format: &str,
+    source: &AnalysisSource,
+) -> Result<AnalysisSchema, SchemaError> {
+    if let Some(schema) = requested {
+        return Ok(schema);
+    }
+    let referenced_tables = match source {
+        AnalysisSource::Text(text) if format == ANALYSIS_FORMAT_SQL => {
+            Some(sql_referenced_tables(text)?)
+        }
+        _ => None,
+    };
+    Ok(AnalysisSchema { referenced_tables })
+}
+
+/// Whether reading this analysis's relation set means parsing a query at all.
+///
+/// Only a `SQL`-format analysis given as TEXT carries one, and only when the caller
+/// declared no schema of its own; every other case is answered without the parse
+/// machinery (no thread, no parse slot), because [`analysis_template_schema`] returns
+/// immediately for it.
+pub fn analysis_needs_parse(
+    requested: Option<&AnalysisSchema>,
+    format: &str,
+    source: &AnalysisSource,
+) -> bool {
+    requested.is_none()
+        && format == ANALYSIS_FORMAT_SQL
+        && matches!(source, AnalysisSource::Text(_))
+}
+
+/// Why an analysis has no relation set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaError {
+    /// The SQL analysis is more text than [`MAX_PARSED_ANALYSIS_CHARS`], so the service
+    /// does not read a relation set out of it; carries that cap.
+    TooMuchText(usize),
+    /// The SQL analysis carries more tokens than [`MAX_PARSED_ANALYSIS_TOKENS`], so the
+    /// tree a parse would build is not one this service walks; carries that cap.
+    TooComplex(usize),
+    /// The SQL analysis nests deeper than the parser's [`MAX_PARSER_RECURSION`]; carries
+    /// that cap.
+    TooDeep(usize),
+    /// The SQL analysis is not a query; carries the parser's complaint.
+    NotAQuery(String),
+    /// The query names more relations than [`MAX_REFERENCED_TABLES`].
+    TooManyRelations,
+    /// The query reads a relation whose name cannot appear in the model's `QueryTables`
+    /// member type (`TableAlias`), so the relation set could not be reported in full;
+    /// carries that name.
+    UnreportableRelation(String),
+}
+
+/// The relations a SQL analysis reads, in the order the query first names them.
+///
+/// Parsed with the `sqlparser` crate rather than scanned for keywords, so a subquery,
+/// a join or a qualified name is found where it really is. A name the query defines
+/// itself (a common table expression) is not a referenced table, and a name that cannot
+/// appear in the model's `QueryTables` member type (`TableAlias`) is left out so the
+/// response stays within the modelled constraints.
+///
+/// SYNCHRONOUS CPU WORK over caller-supplied text: callers run it on the blocking pool,
+/// under [`ANALYSIS_PARSE_TIME_BUDGET`] and never with the store locked. The work is
+/// bounded before it is scheduled, in size, in depth and in volume, each bound measured
+/// by a FLAT pass that recurses over nothing: at most [`MAX_PARSED_ANALYSIS_CHARS`] of
+/// text is lexed, at most [`MAX_PARSED_ANALYSIS_TOKENS`] tokens are parsed — which caps
+/// the tree's node count and so its depth, for the recursive parse, this module's
+/// recursive walk and the tree's own recursive drop alike — the parser additionally
+/// carries [`MAX_PARSER_RECURSION`], each relation is looked up in a set rather than
+/// scanned for in a list, and the number of relations collected stops at
+/// [`MAX_REFERENCED_TABLES`].
+fn sql_referenced_tables(sql: &str) -> Result<Vec<String>, SchemaError> {
+    // The INPUT is bounded before the parser runs, so the work one request can ask for
+    // is bounded BEFORE it is scheduled rather than only waited on: the parse cost is a
+    // function of this text, and a caller cannot make it longer than the cap.
+    if sql.chars().count() > MAX_PARSED_ANALYSIS_CHARS {
+        return Err(SchemaError::TooMuchText(MAX_PARSED_ANALYSIS_CHARS));
+    }
+    // The TREE is bounded the same way, from outside: lexing is a flat pass, every node
+    // of the tree a parse would build consumes at least one token, so a token count is
+    // an upper bound on the tree's size and therefore on its depth. Refusing here keeps
+    // the recursive parse, the recursive walk and the tree's recursive drop off a tree
+    // deeper than the cap — including the shapes no bracket count would catch, such as
+    // a left-associative `1 + 1 + …` chain, which the parser builds iteratively into a
+    // tree one node deep per operator.
+    if analysis_token_count(sql)? > MAX_PARSED_ANALYSIS_TOKENS {
+        return Err(SchemaError::TooComplex(MAX_PARSED_ANALYSIS_TOKENS));
+    }
+    let statements = ::sqlparser::parser::Parser::new(&::sqlparser::dialect::GenericDialect {})
+        .with_recursion_limit(MAX_PARSER_RECURSION)
+        .try_with_sql(sql)
+        .and_then(|mut parser| parser.parse_statements())
+        .map_err(|error| match error {
+            ::sqlparser::parser::ParserError::RecursionLimitExceeded => {
+                SchemaError::TooDeep(MAX_PARSER_RECURSION)
+            }
+            other => SchemaError::NotAQuery(other.to_string()),
+        })?;
+    let mut collector = RelationCollector::default();
+    // The only thing that breaks the walk is the relation cap, and a truncated relation
+    // set would misreport what the analysis reads.
+    if ::sqlparser::ast::Visit::visit(&statements, &mut collector).is_break() {
+        return Err(SchemaError::TooManyRelations);
+    }
+    collector.finish()
+}
+
+/// How many tokens, not counting whitespace and comments, the analysis carries.
+///
+/// Lexing is a FLAT pass — the tokenizer recurses over nothing — so this can be measured
+/// before anything recursive runs, which is what makes it usable as the bound in front
+/// of the parse. Whitespace and comments carry no node, so they are not counted. Text
+/// the tokenizer cannot lex at all (an unterminated string, say) is not a query, and is
+/// reported as such.
+fn analysis_token_count(sql: &str) -> Result<usize, SchemaError> {
+    use ::sqlparser::tokenizer::{Token, Tokenizer};
+
+    let tokens = Tokenizer::new(&::sqlparser::dialect::GenericDialect {}, sql)
+        .tokenize()
+        .map_err(|error| SchemaError::NotAQuery(error.to_string()))?;
+    Ok(tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .count())
+}
+
+/// The walk stopped because the query names more relations than
+/// [`MAX_REFERENCED_TABLES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TooManyRelations;
+
+/// Collects the relation names a parsed SQL statement reads, and the names it defines
+/// for itself.
+///
+/// `relations` keeps first-appearance order; `seen` is what makes the de-duplication a
+/// set lookup rather than a scan of `relations`, so the walk stays linear in the number
+/// of relations the caller's query names.
+#[derive(Debug, Default)]
+struct RelationCollector {
+    relations: Vec<String>,
+    seen: HashSet<String>,
+    defined_names: HashSet<String>,
+}
+
+impl RelationCollector {
+    /// The referenced tables: every relation the query reads that it did not define
+    /// itself.
+    ///
+    /// A name that cannot appear in the model's `QueryTables` member type (`TableAlias`)
+    /// is an ERROR rather than an omission: dropping it would report a relation set that
+    /// misstates what the analysis reads, with a 200.
+    fn finish(self) -> Result<Vec<String>, SchemaError> {
+        let defined = self.defined_names;
+        let mut referenced = Vec::with_capacity(self.relations.len());
+        for name in self.relations {
+            if defined.contains(&name) {
+                continue;
+            }
+            if !fits_table_alias(&name) {
+                return Err(SchemaError::UnreportableRelation(name));
+            }
+            referenced.push(name);
+        }
+        Ok(referenced)
+    }
+}
+
+impl ::sqlparser::ast::Visitor for RelationCollector {
+    type Break = TooManyRelations;
+
+    fn pre_visit_query(&mut self, query: &::sqlparser::ast::Query) -> ControlFlow<Self::Break> {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                self.defined_names.insert(cte.alias.name.value.clone());
+            }
+            if self.defined_names.len() > MAX_REFERENCED_TABLES {
+                return ControlFlow::Break(TooManyRelations);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_relation(
+        &mut self,
+        relation: &::sqlparser::ast::ObjectName,
+    ) -> ControlFlow<Self::Break> {
+        // The last segment of a possibly-qualified name (`db.schema.table`) is the
+        // relation itself; quoting is syntax, not part of the name.
+        let rendered = relation.to_string();
+        let name = rendered
+            .rsplit('.')
+            .next()
+            .unwrap_or(rendered.as_str())
+            .trim_matches(|c| matches!(c, '"' | '`' | '[' | ']'))
+            .to_string();
+        if name.is_empty() {
+            return ControlFlow::Continue(());
+        }
+        if self.seen.insert(name.clone()) {
+            if self.relations.len() >= MAX_REFERENCED_TABLES {
+                return ControlFlow::Break(TooManyRelations);
+            }
+            self.relations.push(name);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Whether `name` can appear in a `QueryTables` list, whose member is the model's
+/// `TableAlias`: `len ..128`, pattern
+/// `^[a-zA-Z0-9_](([a-zA-Z0-9_ ]+-)*([a-zA-Z0-9_ ]+))?$` — it starts with a letter,
+/// digit or underscore, carries only those characters plus space and `-`, and does not
+/// end in `-`.
+fn fits_table_alias(name: &str) -> bool {
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    // `len 0..128` is a CHARACTER bound, and the pattern's first group is narrower than
+    // the rest: no space and no hyphen may start the name.
+    if name.chars().count() > 128 || !(first.is_ascii_alphanumeric() || first == '_') {
+        return false;
+    }
+    // After the first character the pattern is `[a-zA-Z0-9_ ]+` segments joined by a
+    // SINGLE `-`, so a doubled or trailing hyphen does not match it.
+    if name.ends_with('-') {
+        return false;
+    }
+    let mut previous_was_hyphen = false;
+    for character in name.chars() {
+        if character == '-' {
+            if previous_was_hyphen {
+                return false;
+            }
+            previous_was_hyphen = true;
+            continue;
+        }
+        if !(character.is_ascii_alphanumeric() || matches!(character, '_' | ' ')) {
+            return false;
+        }
+        previous_was_hyphen = false;
+    }
+    true
 }
 
 /// Why a page request could not be served.

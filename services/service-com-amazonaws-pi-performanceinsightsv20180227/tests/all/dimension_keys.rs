@@ -2,27 +2,51 @@
 
 //! `DescribeDimensionKeys`, end to end over the wire.
 //!
-//! The rules under test are the ones the model and the member documentation
-//! state: `StartTime` must be earlier than `EndTime`, and a window that is not
-//! is refused with the modelled `InvalidArgumentException` (HTTP 400); a window
-//! that is gets the same granular alignment `GetResourceMetrics` reports
-//! (`AlignedStartTime` at or before the requested start, `AlignedEndTime` at or
-//! after the requested end, both on a boundary of the effective period); and the
-//! key list is what the window HOLDS — a dimension key is a group of DB
-//! sessions sampled on a running engine, and the data sources this emulator
-//! serves run none, so `Keys` is empty rather than a top-N list of invented
-//! sessions.
+//! The rules under test are the ones the model, the member documentation and the
+//! service's recorded behaviour state: `StartTime` must be earlier than
+//! `EndTime`, and a window that is not is refused with the modelled
+//! `InvalidArgumentException` (HTTP 400); a window that is gets the same granular
+//! alignment `GetResourceMetrics` reports (`AlignedStartTime` at or before the
+//! requested start, `AlignedEndTime` the latest period boundary the service
+//! holds — its own clock floored to the effective period — both on a boundary of
+//! that period); and the key list is what the window HOLDS — a dimension key is
+//! a group of DB sessions sampled on a running engine, and the data sources this
+//! emulator serves run none, so `Keys` is empty rather than a top-N list of
+//! invented sessions.
 
 use serde_json::{json, Value};
 
 use crate::pi_harness::{call, emulator};
 
-/// 2026-01-01T00:00:00Z. Windows below are stated relative to it.
-const T0: i64 = 1_767_225_600;
+/// One day in seconds — a multiple of every documented period.
+const ONE_DAY: i64 = 86_400;
 
 /// The granularities `PeriodInSeconds` documents: 1 (one second), 60 (one
 /// minute), 300 (five minutes), 3600 (one hour), 86400 (twenty-four hours).
 const DOCUMENTED_PERIODS: &[i64] = &[1, 60, 300, 3600, 86400];
+
+/// Epoch seconds, as the service reads its own clock.
+fn unix_now() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is at or after the Unix epoch")
+            .as_secs(),
+    )
+    .expect("the current time fits in an i64")
+}
+
+/// `seconds` floored to a `period` boundary measured from the Unix epoch.
+fn floor_to(seconds: i64, period: i64) -> i64 {
+    seconds - seconds.rem_euclid(period)
+}
+
+/// A window start that leaves a `span`-second window entirely in the past, two
+/// days clear of the service's clock, and on a boundary of every documented
+/// period.
+fn past_start(span: i64) -> i64 {
+    floor_to(unix_now() - span - 2 * ONE_DAY, ONE_DAY)
+}
 
 /// A monitored data source: an immutable DB resource id of the form the model
 /// documents on every `Identifier` member.
@@ -72,11 +96,12 @@ async fn a_window_whose_end_does_not_follow_its_start_is_refused() {
     // The rows differ along the ordering: an end before the start by a second,
     // by half an hour and by a day, and an end exactly at the start (which
     // describes no window either).
+    let t0 = past_start(86_400);
     for (start, end, label) in [
-        (T0, T0 - 1, "an end one second before the start"),
-        (T0 + 1_800, T0 - 1_800, "an end half an hour before the start"),
-        (T0, T0 - 86_400, "an end a day before the start"),
-        (T0, T0, "an end equal to the start"),
+        (t0, t0 - 1, "an end one second before the start"),
+        (t0 + 1_800, t0 - 1_800, "an end half an hour before the start"),
+        (t0, t0 - 86_400, "an end a day before the start"),
+        (t0, t0, "an end equal to the start"),
     ] {
         for group in GROUPS {
             let case = format!("{label} / {group}");
@@ -101,9 +126,10 @@ async fn a_window_whose_end_does_not_follow_its_start_is_refused() {
     }
 }
 
-/// RULE: a window whose end follows its start is answered with that window
-/// aligned to the effective period's nearest boundaries, in that order, and
-/// with the dimension keys it holds.
+/// RULE: a window whose end follows its start is answered with the aligned
+/// window — the requested start floored to the effective period, and the latest
+/// boundary the service holds (its clock floored to that period) — and with the
+/// dimension keys it holds.
 #[tokio::test]
 async fn a_well_ordered_window_is_answered_with_the_aligned_window_and_its_keys() {
     let emulator = emulator();
@@ -113,23 +139,27 @@ async fn a_well_ordered_window_is_answered_with_the_aligned_window_and_its_keys(
     // and the dimension group asked for.
     let mut cases: Vec<(i64, i64, Option<i64>, &str)> = Vec::new();
     for &period in DOCUMENTED_PERIODS {
+        let t0 = past_start(period * 2);
         for (start_offset, end_offset) in [(0, period), (1, period + 1), (period - 1, period * 2)] {
             for group in GROUPS {
-                cases.push((T0 + start_offset, T0 + end_offset, Some(period), group));
+                cases.push((t0 + start_offset, t0 + end_offset, Some(period), group));
             }
         }
     }
     // And one row with no `PeriodInSeconds` at all, where the service picks it.
-    cases.push((T0, T0 + 1_800, None, "db.sql"));
+    let t0 = past_start(1_800);
+    cases.push((t0, t0 + 1_800, None, "db.sql"));
 
     for (start, end, period, group) in cases {
         let case = format!("start={start} end={end} period={period:?} group={group}");
+        let before = unix_now();
         let answer = call(
             &emulator,
             "DescribeDimensionKeys",
             dimension_keys_input(IDENTIFIER, group, "db.load.avg", start, end, period),
         )
         .await;
+        let after = unix_now();
         assert_eq!(
             answer.status, 200,
             "case {case}: expected 200, got {} {:?}",
@@ -149,21 +179,26 @@ async fn a_well_ordered_window_is_answered_with_the_aligned_window_and_its_keys(
             "case {case}: expected AlignedStartTime < AlignedEndTime, got \
              {aligned_start}..{aligned_end}"
         );
-        assert!(
-            aligned_start <= start && aligned_end >= end,
-            "case {case}: expected the aligned window to cover {start}..{end}, got \
-             {aligned_start}..{aligned_end}"
-        );
         if let Some(period) = period {
             assert_eq!(
-                (aligned_start.rem_euclid(period), aligned_end.rem_euclid(period)),
-                (0, 0),
-                "case {case}: expected both ends on a {period}s boundary, got \
-                 {aligned_start}..{aligned_end}"
+                aligned_start,
+                floor_to(start, period),
+                "case {case}: expected the start floored to the {period}s boundary, got \
+                 {aligned_start}"
             );
+            // The end bound is the service's clock floored to the period — the
+            // latest boundary it holds — so the requested end does not drive it.
+            let candidates = [floor_to(before, period), floor_to(after, period)];
             assert!(
-                start - aligned_start < period && aligned_end - end < period,
-                "case {case}: expected the nearest boundaries, got {aligned_start}..{aligned_end}"
+                candidates.contains(&aligned_end),
+                "case {case}: expected AlignedEndTime at the current {period}s boundary \
+                 ({candidates:?}), got {aligned_end}"
+            );
+        } else {
+            assert!(
+                aligned_start <= start && aligned_end <= after,
+                "case {case}: expected a start at or before {start} and an end at or before \
+                 the clock, got {aligned_start}..{aligned_end}"
             );
         }
 
@@ -199,10 +234,11 @@ async fn a_well_ordered_window_is_answered_with_the_aligned_window_and_its_keys(
 async fn partition_keys_are_reported_exactly_when_partition_by_asks_for_them() {
     let emulator = emulator();
 
+    let t0 = past_start(3_600);
     for partition_by in [None, Some(json!({"Group": "db.user"})), Some(json!({"Group": "db.host", "Limit": 5}))] {
         let case = format!("PartitionBy={partition_by:?}");
         let mut input =
-            dimension_keys_input(IDENTIFIER, "db.sql", "db.load.avg", T0, T0 + 3_600, Some(60));
+            dimension_keys_input(IDENTIFIER, "db.sql", "db.load.avg", t0, t0 + 3_600, Some(60));
         if let Some(partition_by) = &partition_by {
             input["PartitionBy"] = partition_by.clone();
         }
@@ -231,12 +267,13 @@ async fn period_in_seconds_accepts_exactly_the_documented_granularities() {
     let emulator = emulator();
 
     for &period in DOCUMENTED_PERIODS {
+        let t0 = past_start(period);
         let answer = call(
             &emulator,
             "DescribeDimensionKeys",
             // A window of one period, so even the one-second granularity stays
             // small.
-            dimension_keys_input(IDENTIFIER, "db.sql", "db.load.avg", T0, T0 + period, Some(period)),
+            dimension_keys_input(IDENTIFIER, "db.sql", "db.load.avg", t0, t0 + period, Some(period)),
         )
         .await;
         assert_eq!(
@@ -248,6 +285,7 @@ async fn period_in_seconds_accepts_exactly_the_documented_granularities() {
 
     // Each row is one period off the documented set, including values just
     // below and just above every published one.
+    let t0 = past_start(3_600);
     for period in [0, 2, 30, 59, 61, 299, 301, 3_599, 3_601, 86_399, 86_401, 172_800] {
         let answer = call(
             &emulator,
@@ -256,8 +294,8 @@ async fn period_in_seconds_accepts_exactly_the_documented_granularities() {
                 IDENTIFIER,
                 "db.sql",
                 "db.load.avg",
-                T0,
-                T0 + 3_600,
+                t0,
+                t0 + 3_600,
                 Some(period),
             ),
         )
@@ -288,25 +326,31 @@ async fn a_window_wider_than_the_data_point_budget_is_still_answered() {
     // the data-point budget `GetResourceMetrics` is held to; this operation
     // answers it, because it reports no series over it.
     let week: i64 = 7 * 86_400;
+    let t0 = past_start(week);
+    let before = unix_now();
     let answer = call(
         &emulator,
         "DescribeDimensionKeys",
-        dimension_keys_input(IDENTIFIER, "db.sql", "db.load.avg", T0, T0 + week, Some(1)),
+        dimension_keys_input(IDENTIFIER, "db.sql", "db.load.avg", t0, t0 + week, Some(1)),
     )
     .await;
+    let after = unix_now();
     assert_eq!(
         answer.status, 200,
         "case a week at one-second granularity: expected 200, got {} {:?}",
         answer.status, answer.body
     );
+    let aligned_end = answer.member("AlignedEndTime").as_i64().unwrap_or(-1);
     assert_eq!(
-        (
-            answer.member("AlignedStartTime").as_i64(),
-            answer.member("AlignedEndTime").as_i64()
-        ),
-        (Some(T0), Some(T0 + week)),
-        "case a week at one-second granularity: expected the requested window back, got {:?}",
+        answer.member("AlignedStartTime").as_i64(),
+        Some(t0),
+        "case a week at one-second granularity: expected the requested start back, got {:?}",
         answer.body
+    );
+    assert!(
+        (before..=after).contains(&aligned_end),
+        "case a week at one-second granularity: expected the end bound at the current second \
+         ({before}..={after}), got {aligned_end}"
     );
     assert_eq!(
         answer.member("Keys").as_array().map(Vec::len),
@@ -324,8 +368,8 @@ async fn a_window_wider_than_the_data_point_budget_is_still_answered() {
             "ServiceType": "RDS",
             "Identifier": IDENTIFIER,
             "MetricQueries": [{"Metric": "db.load.avg"}],
-            "StartTime": T0,
-            "EndTime": T0 + week,
+            "StartTime": t0,
+            "EndTime": t0 + week,
             "PeriodInSeconds": 1,
         }),
     )
@@ -351,6 +395,7 @@ async fn an_unmonitored_data_source_is_refused_as_not_authorized() {
     // The rows span the forms an identifier can take without being a resource
     // id: a DB instance name, a bare word, a lowercase token, a token with no
     // kind prefix, an empty token.
+    let t0 = past_start(3_600);
     for identifier in [
         "my-production-database",
         "database",
@@ -362,7 +407,7 @@ async fn an_unmonitored_data_source_is_refused_as_not_authorized() {
         for service_type in ["RDS", "DOCDB"] {
             let case = format!("{identifier:?} / {service_type}");
             let mut input =
-                dimension_keys_input(identifier, "db.sql", "db.load.avg", T0, T0 + 3_600, Some(60));
+                dimension_keys_input(identifier, "db.sql", "db.load.avg", t0, t0 + 3_600, Some(60));
             input["ServiceType"] = json!(service_type);
             let answer = call(&emulator, "DescribeDimensionKeys", input).await;
             assert_eq!(
@@ -396,12 +441,13 @@ async fn a_cursor_this_operation_never_issued_is_refused() {
     // The rows differ in where the token came from: one this service issued for
     // a DIFFERENT operation's result set, and one that is merely inside the
     // modelled `NextToken` pattern.
+    let t0 = past_start(3_600);
     let mut paged = json!({
         "ServiceType": "RDS",
         "Identifier": IDENTIFIER,
         "MetricQueries": [{"Metric": "db.load.avg"}, {"Metric": "db.sampledload.avg"}],
-        "StartTime": T0,
-        "EndTime": T0 + 3_600,
+        "StartTime": t0,
+        "EndTime": t0 + 3_600,
         "PeriodInSeconds": 3_600,
     });
     paged["MaxResults"] = json!(1);
@@ -417,7 +463,7 @@ async fn a_cursor_this_operation_never_issued_is_refused() {
         ("a pattern-valid token nothing issued", "abc123_=-".to_string()),
     ] {
         let mut input =
-            dimension_keys_input(IDENTIFIER, "db.sql", "db.load.avg", T0, T0 + 3_600, Some(60));
+            dimension_keys_input(IDENTIFIER, "db.sql", "db.load.avg", t0, t0 + 3_600, Some(60));
         input["NextToken"] = json!(token);
         let answer = call(&emulator, "DescribeDimensionKeys", input).await;
         assert_eq!(
@@ -430,13 +476,15 @@ async fn a_cursor_this_operation_never_issued_is_refused() {
     }
 }
 
-/// RULE: the answer is computed from the request and nothing else, so repeating
-/// a call answers identically and reading dimension keys changes nothing a
-/// later caller sees.
+/// RULE: the key list is computed from the request and nothing else, so
+/// repeating a call answers the same keys and the same start bound, and reading
+/// dimension keys changes nothing a later caller sees. The END bound tracks the
+/// service's clock, so it is the one member a repeat may advance.
 #[tokio::test]
-async fn repeating_the_same_request_answers_identically() {
+async fn repeating_the_same_request_answers_the_same_keys() {
     let emulator = emulator();
-    let input = dimension_keys_input(IDENTIFIER, "db.sql", "db.load.avg", T0 + 17, T0 + 3_600, Some(60));
+    let t0 = past_start(3_600);
+    let input = dimension_keys_input(IDENTIFIER, "db.sql", "db.load.avg", t0 + 17, t0 + 3_600, Some(60));
 
     let first = call(&emulator, "DescribeDimensionKeys", input.clone()).await;
     let second = call(&emulator, "DescribeDimensionKeys", input).await;
@@ -445,10 +493,21 @@ async fn repeating_the_same_request_answers_identically() {
         "case the first call: expected 200, got {} {:?}",
         first.status, first.body
     );
-    assert_eq!(
-        first.body, second.body,
-        "case repeated call: expected an identical answer, got {:?} then {:?}",
-        first.body, second.body
+    for member in ["AlignedStartTime", "Keys", "PartitionKeys", "NextToken"] {
+        assert_eq!(
+            first.member(member),
+            second.member(member),
+            "case repeated call: expected the same {member}, got {:?} then {:?}",
+            first.member(member),
+            second.member(member)
+        );
+    }
+    assert!(
+        second.member("AlignedEndTime").as_i64() >= first.member("AlignedEndTime").as_i64(),
+        "case repeated call: expected the end bound to track the clock forward, got {:?} then \
+         {:?}",
+        first.member("AlignedEndTime"),
+        second.member("AlignedEndTime")
     );
 
     // And the report store the sibling operations own is untouched.
