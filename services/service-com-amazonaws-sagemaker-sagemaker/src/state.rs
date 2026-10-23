@@ -310,6 +310,11 @@ pub const DEFAULT_SORT_ORDER: &str = ORDER_DESCENDING;
 /// is the descending one.
 pub const ORDER_DESCENDING: &str = "Descending";
 
+/// `OrderKey`'s ascending member — the documented default of the listings whose own
+/// member doc says so (`ListClusters`, `ListCodeRepositories`), as opposed to
+/// [`DEFAULT_SORT_ORDER`].
+pub const ORDER_ASCENDING: &str = "Ascending";
+
 /// A page boundary as an opaque `NextToken`: the hex of the resource name the page
 /// stopped at.
 ///
@@ -3154,7 +3159,7 @@ pub const CLUSTER_SORT_BY_NAME: &str = "NAME";
 /// `SortOrder`'s documented default for `ListClusters` ("The sort order for results. The
 /// default value is `Ascending`.") — the opposite of [`DEFAULT_SORT_ORDER`], which is
 /// what `ListModels` documents. The descending token is [`ORDER_DESCENDING`].
-pub const CLUSTER_DEFAULT_SORT_ORDER: &str = "Ascending";
+pub const CLUSTER_DEFAULT_SORT_ORDER: &str = ORDER_ASCENDING;
 
 /// A SageMaker HyperPod cluster created by `CreateCluster`, as `ListClusters`
 /// summarises it and `DescribeCluster` replays it.

@@ -55,6 +55,8 @@ mod lineage_context_lifecycle;
 mod lineage_group_reporting;
 #[path = "all/list_artifacts.rs"]
 mod list_artifacts;
+#[path = "all/list_code_repositories.rs"]
+mod list_code_repositories;
 #[path = "all/list_endpoints.rs"]
 mod list_endpoints;
 #[path = "all/list_model_packages.rs"]

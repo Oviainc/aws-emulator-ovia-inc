@@ -292,6 +292,18 @@
 //! deliver, one that was cancelled, one whose payment is pending or failed — are stored, as
 //! [`CapacityBlockRecord::pinned_state`].
 //!
+//! ## Secondary subnets
+//!
+//! [`ComAmazonawsEc2Amazonec2State::secondary_subnets`] holds the account's secondary
+//! subnets — the subnets of a secondary network — as the modelled [`SecondarySubnet`]
+//! shape itself, keyed by `SecondarySubnetId` in a [`BTreeMap`], exactly the way
+//! [`ComAmazonawsEc2Amazonec2State::subnets`] holds ordinary subnets: a member a writer
+//! sets round-trips through `DescribeSecondarySubnets` without a field-by-field copy, and
+//! the id order is both the order the describe reports in and the position a pagination
+//! token names. [`ComAmazonawsEc2Amazonec2State::insert_secondary_subnet`] is the one
+//! place a record is built, so the id, the ARN, the owning account and the id of each
+//! IPv4 CIDR block association are decided once however many writers there are.
+//!
 //! ## A Capacity Block OFFERING is a search result, not a stored resource
 //!
 //! Nothing in the EC2 API creates or deletes a Capacity Block offering:
@@ -352,7 +364,8 @@ use crate::ops::types::{
     PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry,
     RequestLaunchTemplateData, RunInstancesOutput, SecondaryNetwork,
-    SecondaryNetworkIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
+    SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
+    SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
     SpotPlacementScore, StateReason,
     Subnet, SubnetAssociation, Tag,
     TagSpecification,
@@ -1150,6 +1163,10 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs. Ordered by endpoint id, which is the order
     /// `DescribeVpcEndpointConnections` reports and pages over.
     pub vpc_endpoint_connections: BTreeMap<String, VpcEndpointConnection>,
+    /// Every secondary subnet the account holds, by `SecondarySubnetId`, as the modelled
+    /// [`SecondarySubnet`] shape itself — see the module docs. Ordered by id, which is the
+    /// order `DescribeSecondarySubnets` reports and pages over.
+    pub secondary_subnets: BTreeMap<String, SecondarySubnet>,
     /// The state move an acceptance owes a VPC endpoint connection, by `VpcEndpointId` —
     /// the connection counterpart of [`Self::vpc_available_at`], beside the connection
     /// store rather than inside it because that store holds the modelled shape itself.
@@ -1248,6 +1265,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
+            secondary_subnets: BTreeMap::new(),
             vpc_endpoint_connection_moves: BTreeMap::new(),
             vpc_endpoint_services: BTreeMap::new(),
             vpc_endpoints: BTreeMap::new(),
@@ -9346,6 +9364,188 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 // ---------------------------------------------------------------------------
+// Secondary subnets
+// ---------------------------------------------------------------------------
+
+/// EC2's error code for a request that named a secondary subnet id no secondary subnet of
+/// the account has.
+///
+/// EC2 spells an id it cannot resolve `Invalid<Resource>ID.NotFound` —
+/// [`INVALID_SUBNET_ID_NOT_FOUND`], [`INVALID_VPC_ID_NOT_FOUND`],
+/// [`INVALID_TRANSIT_GATEWAY_ID_NOT_FOUND`] — so the secondary subnet's own code follows
+/// that form. EC2 models no error shapes at all, so it is answered through
+/// [`crate::scaffolded::Scaffolded::service_error`] like every other code here.
+pub const INVALID_SECONDARY_SUBNET_ID_NOT_FOUND: &str = "InvalidSecondarySubnetID.NotFound";
+
+/// Refuse a request that named a secondary subnet id no secondary subnet of the account
+/// has, the way [`invalid_subnet_id_not_found`] refuses an unknown subnet id: HTTP 400.
+pub fn invalid_secondary_subnet_id_not_found<E>(secondary_subnet_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_SECONDARY_SUBNET_ID_NOT_FOUND,
+        400,
+        format!("The secondary subnet ID '{secondary_subnet_id}' does not exist"),
+    )
+}
+
+/// The id prefix a secondary subnet carries.
+///
+/// CHOSEN: the model publishes no `@pattern` for `SecondarySubnetId`
+/// (`smithy_query(query="shape",shape="SecondarySubnetId")` reports a plain string), so the
+/// only form it has to satisfy is EC2's own `<prefix>-<hex>`, which
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] gives.
+pub const SECONDARY_SUBNET_ID_PREFIX: &str = "snet";
+
+/// The id prefix of one IPv4 CIDR block association of a secondary subnet, on the same
+/// terms as [`SECONDARY_SUBNET_ID_PREFIX`]: `SecondarySubnetCidrAssociationId` is a plain
+/// string in the model, and an ordinary subnet's CIDR associations are minted under
+/// `subnet-cidr-assoc`.
+pub const SECONDARY_SUBNET_CIDR_ASSOCIATION_ID_PREFIX: &str = "snet-cidr-assoc";
+
+/// The only secondary network type the model publishes: `SecondaryNetworkType`'s sole
+/// member — "The type of the secondary network (`rdma`)"
+/// (`DescribeSecondarySubnetsRequest$Filters`). The whole catalog is the generated
+/// [`crate::ops::types::SECONDARY_NETWORK_TYPE_VALUES`].
+pub const SECONDARY_NETWORK_TYPE_RDMA: &str = "rdma";
+
+/// A secondary subnet that has been created: `SecondarySubnetState`'s `create-complete`
+/// member, the state a usable secondary subnet sits in. The whole catalog is the generated
+/// [`crate::ops::types::SECONDARY_SUBNET_STATE_VALUES`]; the states a creation or a
+/// deletion passes through belong to the operations that perform them.
+pub const SECONDARY_SUBNET_STATE_CREATE_COMPLETE: &str = "create-complete";
+
+/// An IPv4 CIDR block that is associated with its secondary subnet:
+/// `SecondarySubnetCidrBlockAssociationState`'s `associated` member. The whole catalog is
+/// the generated [`crate::ops::types::SECONDARY_SUBNET_CIDR_BLOCK_ASSOCIATION_STATE_VALUES`].
+pub const SECONDARY_SUBNET_CIDR_STATE_ASSOCIATED: &str = "associated";
+
+/// One IPv4 CIDR block of a secondary subnet, as the writer of one asks for it.
+///
+/// The association id is NOT here: it is minted by
+/// [`ComAmazonawsEc2Amazonec2State::insert_secondary_subnet`], the way every other stored
+/// id is, so no writer can choose one.
+#[derive(Debug, Clone)]
+pub struct SecondarySubnetCidrSpec {
+    /// "The IPv4 CIDR block" (`SecondarySubnetIpv4CidrBlockAssociation$CidrBlock`).
+    pub cidr_block: String,
+    /// The state of the association, as the model's
+    /// `SecondarySubnetCidrBlockAssociationState` enum spells it — see
+    /// [`SECONDARY_SUBNET_CIDR_STATE_ASSOCIATED`].
+    pub state: String,
+    /// "The reason for the current state of the CIDR block association"
+    /// (`SecondarySubnetIpv4CidrBlockAssociation$StateReason`), or `None` for an
+    /// association that carries none.
+    pub state_reason: Option<String>,
+}
+
+/// What one stored secondary subnet is created with, beside the ids the store mints itself.
+///
+/// The spec of the resource, in the same shape [`SubnetSpec`] has for an ordinary subnet: a
+/// writer fills this in and [`ComAmazonawsEc2Amazonec2State::insert_secondary_subnet`]
+/// turns it into the modelled [`SecondarySubnet`] the describe reports, so the ids, the
+/// ARN, the owning account and the byte charge are decided in exactly one place.
+#[derive(Debug, Clone)]
+pub struct SecondarySubnetSpec {
+    /// "The ID of the secondary network" the subnet belongs to
+    /// (`SecondarySubnet$SecondaryNetworkId`).
+    pub secondary_network_id: String,
+    /// "The type of the secondary network" (`SecondarySubnet$SecondaryNetworkType`), as the
+    /// model's `SecondaryNetworkType` enum spells it — see
+    /// [`SECONDARY_NETWORK_TYPE_RDMA`].
+    pub secondary_network_type: String,
+    /// "The Availability Zone of the secondary subnet"
+    /// (`SecondarySubnet$AvailabilityZone`).
+    pub availability_zone: String,
+    /// "The ID of the Availability Zone of the secondary subnet"
+    /// (`SecondarySubnet$AvailabilityZoneId`).
+    pub availability_zone_id: String,
+    /// The Region the subnet's ARN names. Not a member of the shape: it is what
+    /// `engine::emulator_arn` needs to build `SecondarySubnetArn`.
+    pub region: String,
+    /// The IPv4 CIDR blocks associated with the subnet, in the order they are reported.
+    pub ipv4_cidr_blocks: Vec<SecondarySubnetCidrSpec>,
+    /// The subnet's state, as the model's `SecondarySubnetState` enum spells it — see
+    /// [`SECONDARY_SUBNET_STATE_CREATE_COMPLETE`].
+    pub state: String,
+    /// "The reason for the current state of the secondary subnet"
+    /// (`SecondarySubnet$StateReason`), or `None` for a subnet that carries none.
+    pub state_reason: Option<String>,
+    /// "The tags assigned to the secondary subnet" (`SecondarySubnet$Tags`).
+    pub tags: Vec<Tag>,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Store a secondary subnet, and answer the `SecondarySubnetId` it was given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the
+    /// caller — the subnet's id, the ARN built from it, the owning account, and the
+    /// association id of each IPv4 CIDR block — so two writers cannot report the same
+    /// secondary subnet differently. Like [`Self::insert_subnet`], the caller-chosen bytes
+    /// the record holds are charged against the store's byte budget here, so no writer can
+    /// store them uncharged.
+    pub fn insert_secondary_subnet(&mut self, spec: SecondarySubnetSpec) -> String {
+        let secondary_subnet_id = self.next_id(SECONDARY_SUBNET_ID_PREFIX);
+        let mut ipv4_cidr_block_associations = Vec::with_capacity(spec.ipv4_cidr_blocks.len());
+        for block in spec.ipv4_cidr_blocks {
+            let association_id = self.next_id(SECONDARY_SUBNET_CIDR_ASSOCIATION_ID_PREFIX);
+            ipv4_cidr_block_associations.push(SecondarySubnetIpv4CidrBlockAssociation {
+                association_id: Some(association_id),
+                cidr_block: Some(block.cidr_block),
+                state: Some(block.state),
+                state_reason: block.state_reason,
+            });
+        }
+        let secondary_subnet = SecondarySubnet {
+            secondary_subnet_id: Some(secondary_subnet_id.clone()),
+            secondary_subnet_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("secondary-subnet/{secondary_subnet_id}"),
+            )),
+            secondary_network_id: Some(spec.secondary_network_id),
+            secondary_network_type: Some(spec.secondary_network_type),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            availability_zone_id: Some(spec.availability_zone_id),
+            availability_zone: Some(spec.availability_zone),
+            ipv4_cidr_block_associations: Some(ipv4_cidr_block_associations),
+            state: Some(spec.state),
+            state_reason: spec.state_reason,
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(secondary_subnet_payload_bytes(&secondary_subnet));
+        self.secondary_subnets
+            .insert(secondary_subnet_id.clone(), secondary_subnet);
+        secondary_subnet_id
+    }
+}
+
+/// The caller-chosen bytes one stored secondary subnet holds: its tags, the CIDR block of
+/// each association, and the state reasons. The ids, the ARN, the owning account, the
+/// states and the network type are derived by this module or bounded by the model, so they
+/// are fixed-size.
+///
+/// The ONE definition of that charge, the way [`vpc_endpoint_connection_payload_bytes`] is
+/// for a VPC endpoint connection: a writer charges exactly it, and a removal path must give
+/// back the same number.
+pub fn secondary_subnet_payload_bytes(secondary_subnet: &SecondarySubnet) -> usize {
+    let association_bytes: usize = secondary_subnet
+        .ipv4_cidr_block_associations
+        .iter()
+        .flatten()
+        .map(|association| {
+            association.cidr_block.as_deref().unwrap_or_default().len()
+                + association.state_reason.as_deref().unwrap_or_default().len()
+        })
+        .sum();
+    tag_list_bytes(secondary_subnet.tags.as_deref().unwrap_or_default())
+        + association_bytes
+        + secondary_subnet
+            .state_reason
+            .as_deref()
+            .unwrap_or_default()
+            .len()
+}
+
+// ---------------------------------------------------------------------------
 // VPC Block Public Access exclusions
 // ---------------------------------------------------------------------------
 
@@ -9600,4 +9800,3 @@ impl ComAmazonawsEc2Amazonec2State {
         stored
     }
 }
-
