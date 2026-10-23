@@ -6,7 +6,7 @@
 //! any existence lookup, so an ARN naming an account other than the caller's own is
 //! refused with the modelled `ValidationException` (HTTP 400) and never looked up — while
 //! an ARN of the caller's own account is looked up, and answers either the resource's tags
-//! or the modelled `ResourceNotFoundException` (404). The two codes mean different things
+//! or the modelled `ResourceNotFoundException`. The two codes mean different things
 //! to a client: not-found invites a create-then-retry, a validation failure says the ARN
 //! itself is unusable. Deciding a foreign ARN without a lookup is also what keeps the
 //! answer from depending on what this account holds, which is the cross-tenant probe the
@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::RESOURCE_NOT_TAGGABLE_MESSAGE;
 
-use crate::export_lifecycle::{cases, error_code, Client};
+use crate::export_lifecycle::{cases, error_code, Client, NOT_FOUND_STATUS};
 
 /// The account every ARN this emulator mints names (`engine::emulator_account_id`).
 fn own_account() -> &'static str {
@@ -222,18 +222,19 @@ async fn a_tagging_arn_of_this_account_is_looked_up() {
             .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: an ARN of this account is looked up, so it must answer 404, got {status} with {body}"
+            (NOT_FOUND_STATUS, "ResourceNotFoundException"),
+            "case {label:?}: an ARN of this account is looked up, so it must answer the \
+             not-found refusal, got {status} with {body}"
         );
         assert_eq!(
             body["ResourceId"].as_str(),
             Some(candidate.as_str()),
-            "case {label:?}: the 404 must report the ARN it could not find, got {body}"
+            "case {label:?}: the refusal must report the ARN it could not find, got {body}"
         );
     }
 
-    // GetExport is unchanged by this rule: it answers a foreign ARN with the 404 its own
-    // lookup reaches, which is what the tagging path must NOT do.
+    // GetExport is unchanged by this rule: it answers a foreign ARN with the not-found
+    // refusal its own lookup reaches, which is what the tagging path must NOT do.
     let foreign = arn(
         "aws",
         "us-east-1",
@@ -245,7 +246,7 @@ async fn a_tagging_arn_of_this_account_is_looked_up() {
         .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "ResourceNotFoundException"),
-        "GetExport on a foreign ARN stays a 404, got {status} with {body}"
+        (NOT_FOUND_STATUS, "ResourceNotFoundException"),
+        "GetExport on a foreign ARN stays a not-found refusal, got {status} with {body}"
     );
 }

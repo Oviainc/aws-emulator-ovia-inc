@@ -4,9 +4,16 @@
 //!
 //! Lists the recorded executions OF ONE EXPORT: one `ExecutionReference` per execution
 //! the store holds for the `ExportArn`, in a stable execution-id order, honouring
-//! `MaxResults` and resuming exactly where a previous page ended. An `ExportArn` naming no
-//! export answers the modelled `ResourceNotFoundException`. A reporting operation
+//! `MaxResults` and resuming exactly where a previous page ended. A reporting operation
 //! (`@readonly` — smithy_query operation `ListExecutions`): it writes nothing.
+//!
+//! The `ExportArn` is NOT resolved against the export store first. RECORDED AWS behaviour
+//! is that this listing answers 200 with an EMPTY `Executions` list for an ARN that names
+//! no export — the recording for the export-not-found walk asserts exactly that, where
+//! every OTHER ARN-addressed operation of this service answers the modelled not-found
+//! refusal. The answer is therefore the executions recorded for that ARN and nothing else,
+//! and an unknown ARN has none. (`ResourceNotFoundException` stays in the operation's
+//! modelled error set, which the model declares; nothing here raises it.)
 //!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
 //! reaching this service's state and the modelled contract still apply.
@@ -170,16 +177,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let references: Vec<(String, ExecutionReference)> = {
             let store = state.lock();
-            // The export is resolved first: "Lists the historical executions for the
-            // export" (smithy_query operation `ListExecutions`), so an ARN naming no
-            // export has no execution sequence to page over and is the modelled 404 — not
-            // an empty page, which would report that an existing export has never run.
-            if !store.exports.contains_key(&input.export_arn) {
-                return Err(ListExecutionsErrorModeled::ResourceNotFoundException(
-                    crate::state::export_not_found(&input.export_arn),
-                )
-                .into());
-            }
+            // The ARN is NOT resolved against the export store: RECORDED AWS behaviour is
+            // that this listing answers 200 with an empty `Executions` list for an
+            // `ExportArn` that names no export (the recording for the export-not-found
+            // walk asserts exactly that, where every OTHER ARN-addressed operation of this
+            // service answers the not-found refusal). The answer is therefore computed from
+            // the store alone: the executions recorded for that ARN, of which an unknown
+            // ARN has none.
             store
                 .executions_of(&input.export_arn)
                 .map(|execution| {

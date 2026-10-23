@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateClusterSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateClusterSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateClusterSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts a new cluster subnet group into this service's store and reports it
+//! back: the folded name, the description as given, the VPC the group's subnets
+//! are in, each subnet with the Availability Zone it resolves to, and the tags
+//! the request carried. A second create under the same name is refused with
+//! `ClusterSubnetGroupAlreadyExistsFault`.
+//!
+//! The group is what `CreateCluster` and `RestoreFromClusterSnapshot` resolve a
+//! `ClusterSubnetGroupName` against, so a cluster can only be launched into a
+//! subnet group this operation created.
 //!
 //! ## Shape of an operation
 //!
@@ -107,7 +108,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `CreateClusterSubnetGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CreateClusterSubnetGroup")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CreateClusterSubnetGroup",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum CreateClusterSubnetGroupErrorModeled {
     ClusterSubnetGroupAlreadyExistsFault(ClusterSubnetGroupAlreadyExistsFault),
@@ -118,6 +125,7 @@ pub enum CreateClusterSubnetGroupErrorModeled {
     InvalidTagFault(InvalidTagFault),
     TagLimitExceededFault(TagLimitExceededFault),
     UnauthorizedOperation(UnauthorizedOperation),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -171,18 +179,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateClusterSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateClusterSubnetGroup"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateClusterSubnetGroupErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = st::request_region(ctx);
+
+        // The request's own values first: a name that cannot be a subnet group
+        // name, and a subnet list longer than one group may hold, are answered
+        // before the store is changed at all.
+        if let Err(message) = st::check_identifier(
+            st::SUBNET_GROUP_NAME_RULE,
+            "ClusterSubnetGroupName",
+            &input.cluster_subnet_group_name,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+        // "Amazon Redshift stores the value as a lowercase string", so the stored
+        // name — the one uniqueness is decided on and the one every read reports
+        // — is the folded form, not what the request spelled.
+        let name = st::normalized_subnet_group_name(&input.cluster_subnet_group_name);
+        if name == st::RESERVED_SUBNET_GROUP_NAME {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Invalid value for ClusterSubnetGroupName: '{}'. The name must not be \"Default\".",
+                input.cluster_subnet_group_name
+            )));
+        }
+        if input.subnet_ids.len() > st::SUBNETS_PER_SUBNET_GROUP_QUOTA {
+            return Err(
+                CreateClusterSubnetGroupErrorModeled::ClusterSubnetQuotaExceededFault(
+                    ClusterSubnetQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the allowed number of subnets in a cluster subnet group ({}).",
+                            st::SUBNETS_PER_SUBNET_GROUP_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "You must provide a list of one or more subnets": a group with no
+        // subnet covers no Availability Zone, so there is nothing to launch a
+        // cluster into.
+        if input.subnet_ids.is_empty() {
+            return Err(CreateClusterSubnetGroupErrorModeled::InvalidSubnet(
+                InvalidSubnet {
+                    message: Some(
+                        "SubnetIds must name at least one subnet of your VPC.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // Identity before capacity: a request that would create nothing keeps the
+        // more specific fault even when the account is at its quota.
+        if store.subnet_group(&name).is_some() {
+            return Err(
+                CreateClusterSubnetGroupErrorModeled::ClusterSubnetGroupAlreadyExistsFault(
+                    ClusterSubnetGroupAlreadyExistsFault {
+                        message: Some(format!(
+                            "Cluster subnet group '{name}' already exists."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.subnet_groups.len() >= st::SUBNET_GROUP_QUOTA {
+            return Err(
+                CreateClusterSubnetGroupErrorModeled::ClusterSubnetGroupQuotaExceededFault(
+                    ClusterSubnetGroupQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the allowed number of cluster subnet groups ({}).",
+                            st::SUBNET_GROUP_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record a later `DescribeClusterSubnetGroups` reports verbatim, and
+        // the one a cluster launched into this group reads its VPC from.
+        let group = ClusterSubnetGroup {
+            cluster_subnet_group_name: Some(name.clone()),
+            description: Some(input.description.clone()),
+            vpc_id: Some(st::derived_vpc_id(&name)),
+            subnet_group_status: Some(st::SUBNET_GROUP_STATUS_COMPLETE.to_string()),
+            subnets: Some(
+                input
+                    .subnet_ids
+                    .iter()
+                    .map(|subnet_id| st::subnet_record(subnet_id, &region))
+                    .collect(),
+            ),
+            tags: Some(input.tags.clone().unwrap_or_default()),
+            supported_cluster_ip_address_types: Some(
+                st::SUPPORTED_CLUSTER_IP_ADDRESS_TYPES
+                    .iter()
+                    .map(|kind| (*kind).to_string())
+                    .collect(),
+            ),
+        };
+        store.subnet_groups.push(group.clone());
+
+        Ok(CreateClusterSubnetGroupOutput {
+            cluster_subnet_group: Some(group),
+        })
     }
 }

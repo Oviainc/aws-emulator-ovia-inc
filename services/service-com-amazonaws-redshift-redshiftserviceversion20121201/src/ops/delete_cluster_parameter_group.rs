@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteClusterParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteClusterParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteClusterParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a cluster parameter group from this service's store, so a later
+//! `DescribeClusterParameterGroups` naming it answers
+//! `ClusterParameterGroupNotFoundFault` — deletion is observable, which is the
+//! whole of what this operation does. A group no cluster can lose is refused
+//! instead: a DEFAULT group ("Cannot delete a default cluster parameter group")
+//! and one a cluster is configured from ("You cannot delete a parameter group if
+//! it is associated with a cluster") both answer the modelled
+//! `InvalidClusterParameterGroupStateFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -99,11 +99,18 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteClusterParameterGr
 // here — hence the `DeleteClusterParameterGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DeleteClusterParameterGroup")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DeleteClusterParameterGroup",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteClusterParameterGroupErrorModeled {
     ClusterParameterGroupNotFoundFault(ClusterParameterGroupNotFoundFault),
     InvalidClusterParameterGroupStateFault(InvalidClusterParameterGroupStateFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -155,20 +162,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteClusterParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClusterParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteClusterParameterGroup"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DeleteClusterParameterGroupErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A group is stored under the documented lower-case form of its name, so
+        // the request's spelling is folded before it is resolved.
+        let name = st::normalized_parameter_group_name(&input.parameter_group_name);
+
+        let mut store = state.lock();
+
+        let Some(position) = store.parameter_group_position(&name) else {
+            return Err(
+                DeleteClusterParameterGroupErrorModeled::ClusterParameterGroupNotFoundFault(
+                    ClusterParameterGroupNotFoundFault {
+                        message: Some(format!(
+                            "Cluster parameter group not found: {}",
+                            input.parameter_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Cannot delete a default cluster parameter group": Redshift owns it,
+        // not the account, so it is not the account's to remove.
+        if store.parameter_groups[position].default_group {
+            return Err(
+                DeleteClusterParameterGroupErrorModeled::InvalidClusterParameterGroupStateFault(
+                    InvalidClusterParameterGroupStateFault {
+                        message: Some(format!(
+                            "Cluster parameter group {name} is a default parameter group and cannot be deleted."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You cannot delete a parameter group if it is associated with a
+        // cluster" — the clusters this store holds are the whole of what can be
+        // associated with it.
+        let in_use_by: Vec<String> = store
+            .clusters
+            .iter()
+            .filter(|stored| {
+                stored
+                    .cluster
+                    .cluster_parameter_groups
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|membership| membership.parameter_group_name.as_deref() == Some(&name))
+            })
+            .filter_map(|stored| stored.cluster.cluster_identifier.clone())
+            .collect();
+        if !in_use_by.is_empty() {
+            return Err(
+                DeleteClusterParameterGroupErrorModeled::InvalidClusterParameterGroupStateFault(
+                    InvalidClusterParameterGroupStateFault {
+                        message: Some(format!(
+                            "Cluster parameter group {name} is in use by cluster(s) {}.",
+                            in_use_by.join(", ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record leaves the store, which is what makes the deletion
+        // observable: every later read of this name reports it absent. `remove`
+        // keeps the insertion order the `Marker` cursor pages over.
+        store.parameter_groups.remove(position);
+
+        Ok(DeleteClusterParameterGroupOutput)
     }
 }

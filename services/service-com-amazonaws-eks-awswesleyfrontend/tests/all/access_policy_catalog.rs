@@ -23,9 +23,13 @@ use crate::wire::{call, emulator, Answer};
 /// source is the EKS "Access policy permissions" reference's table of Amazon EKS
 /// access policies: the policies whose permissions mirror the Kubernetes
 /// `cluster-admin`, `admin`, `edit` and `view` cluster roles that the model's own
-/// `AccessPolicy` documentation points at, the read-only mirror of `admin`, and
-/// the policies Amazon EKS publishes for the controllers and Amazon Web Services
-/// services that work on a cluster.
+/// `AccessPolicy` documentation points at, the read-only mirror of `admin`, the
+/// policies Amazon EKS publishes for the controllers and Amazon Web Services
+/// services that work on a cluster (each Auto Mode capability controller both
+/// namespace-scoped, `AmazonEKS<Capability>Policy`, and cluster-scoped,
+/// `AmazonEKS<Capability>ClusterPolicy`), and the policies for the cluster
+/// capabilities EKS manages (events, the Kube Resource Orchestrator, Pod Identity
+/// and secret admin/reader access).
 const EXPECTED_POLICIES: &[&str] = &[
     "AIDevOpsAgentAccessPolicy",
     "AWSBatchClusterPolicy",
@@ -39,12 +43,21 @@ const EXPECTED_POLICIES: &[&str] = &[
     "AmazonEKSArgoCDPolicy",
     "AmazonEKSAutoNodePolicy",
     "AmazonEKSBlockStorageClusterPolicy",
+    "AmazonEKSBlockStoragePolicy",
     "AmazonEKSClusterAdminPolicy",
     "AmazonEKSComputeClusterPolicy",
+    "AmazonEKSComputePolicy",
     "AmazonEKSEditPolicy",
+    "AmazonEKSEventPolicy",
     "AmazonEKSHybridPolicy",
+    "AmazonEKSKROPolicy",
     "AmazonEKSLoadBalancingClusterPolicy",
+    "AmazonEKSLoadBalancingPolicy",
     "AmazonEKSNetworkingClusterPolicy",
+    "AmazonEKSNetworkingPolicy",
+    "AmazonEKSPodIdentityPolicy",
+    "AmazonEKSSecretAdminPolicy",
+    "AmazonEKSSecretReaderPolicy",
     "AmazonEKSViewPolicy",
 ];
 

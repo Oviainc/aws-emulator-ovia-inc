@@ -19,3 +19,11 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 handler returns an error, so it never has to construct a value.
 
 // SKIPPED: DescribeStorage — unsupported shape construct: operation 'DescribeStorage' has a Unit/absent input, which the generator does not emit yet
+
+## Since hand-authored
+
+`DescribeStorage` is now hand-authored in `ops/describe_storage.rs` (with its
+shapes in `ops/types/describe_storage_types.rs`), so it is routed and served
+rather than answered by the framework's unroutable-operation path. The
+`SKIPPED:` line is left as the generator wrote it — it records what the
+generator did, not what the crate holds today.

@@ -29,7 +29,6 @@
 use serde_json::{json, Map, Value};
 
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::ops::types::EXECUTION_STATUS_CODE_VALUES;
-use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::EXPORT_NOT_FOUND_MESSAGE;
 
 use crate::execution_lookup::{client_and_engine, record_execution};
 use crate::export_lifecycle::{error_code, Client};
@@ -284,13 +283,18 @@ async fn a_listed_reference_reports_the_recorded_execution() {
     }
 }
 
-/// An `ExportArn` that names no export is the modelled `ResourceNotFoundException`, which
-/// reports the export it could not find — never an empty page, which would say the export
-/// exists and has never run.
+/// An `ExportArn` that names no export answers 200 with an EMPTY page.
+///
+/// RECORDED AWS behaviour for THIS listing, and the one place this service departs from
+/// its own not-found rule: the recording for the export-not-found walk
+/// (`bcm-data-exports-export-not-found-errors#task#5`, replayed by this issue's units)
+/// asserts HTTP 200 for `ListExecutions` on an ARN that resolves to nothing, where
+/// `GetExport`, `DeleteExport`, `UpdateExport` and the tagging operations all answer the
+/// modelled `ResourceNotFoundException`. The answer is the executions recorded for that
+/// ARN, and an unknown ARN has none.
 #[tokio::test]
-async fn an_export_arn_that_names_no_export_is_a_modelled_not_found() {
+async fn an_export_arn_that_names_no_export_lists_no_execution() {
     let (client, seeded) = seeded().await;
-    let known = seeded[0].0.clone();
 
     // Rows: an export never created, one in another region, one in another account, and a
     // resource segment that is not an export at all. All satisfy the modelled `Arn`
@@ -305,39 +309,50 @@ async fn an_export_arn_that_names_no_export_is_a_modelled_not_found() {
         ::engine::emulator_arn("bcm-data-exports", "us-east-1", "table/COST_AND_USAGE_REPORT"),
     ];
     for arn in absent {
-        let (status, body) = client
-            .call("ListExecutions", &json!({ "ExportArn": arn }))
+        let body = client
+            .ok("ListExecutions", &json!({ "ExportArn": arn }))
             .await;
         assert_eq!(
-            (
-                status,
-                error_code(&body).as_str(),
-                body["Message"].as_str(),
-                body["ResourceId"].as_str(),
-                body["ResourceType"].as_str(),
-            ),
-            (
-                404,
-                "ResourceNotFoundException",
-                Some(EXPORT_NOT_FOUND_MESSAGE),
-                Some(arn.as_str()),
-                Some("Export"),
-            ),
-            "case {arn:?}: expected the modelled 404 reporting the absent export, got {status} with {body}"
+            body["Executions"],
+            json!([]),
+            "case {arn:?}: an ARN that names no export lists no execution, got {body}"
+        );
+        assert!(
+            body.get("NextToken").is_none(),
+            "case {arn:?}: a last page must omit NextToken, got {body}"
         );
     }
 
-    // Deleting an export takes its listing with it: the ARN then names nothing.
-    client
-        .ok("DeleteExport", &json!({ "ExportArn": known }))
+    // Deleting an export takes its executions' listing with it: the ARN then names
+    // nothing, and the listing is empty rather than reporting the executions it had.
+    // Deleting an export takes its executions' listing with it: the ARN then names
+    // nothing, and the listing is empty rather than reporting the executions it had. The
+    // row picked here is one that HAS recorded executions, so the empty answer after the
+    // delete is about the delete.
+    let (with_executions, _) = seeded
+        .iter()
+        .find(|(_, ids)| !ids.is_empty())
+        .expect("a seeded row records executions")
+        .clone();
+    let before = client
+        .ok("ListExecutions", &json!({ "ExportArn": with_executions }))
         .await;
-    let (status, body) = client
-        .call("ListExecutions", &json!({ "ExportArn": known }))
+    assert!(
+        before["Executions"]
+            .as_array()
+            .is_some_and(|executions| !executions.is_empty()),
+        "case {with_executions:?}: the seeded export must list its executions first, got {before}"
+    );
+    client
+        .ok("DeleteExport", &json!({ "ExportArn": with_executions }))
+        .await;
+    let body = client
+        .ok("ListExecutions", &json!({ "ExportArn": with_executions }))
         .await;
     assert_eq!(
-        (status, error_code(&body).as_str()),
-        (404, "ResourceNotFoundException"),
-        "case {known:?}: a deleted export has no execution listing, got {status} with {body}"
+        body["Executions"],
+        json!([]),
+        "case {with_executions:?}: a deleted export's executions are gone with it, got {body}"
     );
 }
 

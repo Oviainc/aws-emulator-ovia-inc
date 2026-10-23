@@ -60,7 +60,35 @@ pub struct RefreshCadence {
     pub frequency: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bcmdataexports#ExecutionStatus")]
+// `ExecutionStatus` and `ExportStatus` are the two shapes in this module whose schemas are
+// written out by hand rather than produced by `#[smithy_macros::smithy(shape = ...)]`, and
+// the reason is a single trait the macro does not read: `@timestampFormat`.
+//
+// EVERY `Timestamp` member this service models carries `@timestampFormat("date-time")`:
+// `smithy_query(query="shape",shape="ExportStatus,ExecutionStatus")` reports
+// `"timestampFormat": "date-time"` on `ExportStatus$CreatedAt`, `$LastUpdatedAt`,
+// `$LastRefreshedAt` and on `ExecutionStatus$CreatedAt`, `$CompletedAt`, `$LastUpdatedAt` —
+// and those six are the whole of this service's timestamp surface. The vendored codegen
+// captures `@length`/`@range`/`@pattern`/`@enum`/`@uniqueItems` and never emits
+// `with_timestamp_format`, so a macro-built member schema reports NO format and the
+// awsJson1_1 codec falls back to its protocol default, epoch seconds
+// (`vendor/smithy-schema-server/src/json.rs::timestamp_format`) — a fractional NUMBER where
+// the model, and every AWS SDK's generated deserializer for a `date-time` member, requires
+// an ISO-8601 string. The hand-written member schemas below differ from the macro's output
+// in exactly that one chain call.
+//
+// Everything else mirrors the macro's output for a structure: one `M_<MEMBER>` member schema
+// per member (index = position in the member list), a `SCHEMA` naming them in order, the
+// `<SHAPE>_SCHEMA` alias, and the serialize/deserialize pair. Constraint traits are
+// deliberately absent: the validating walk runs on operation INPUTS only and both shapes are
+// output-only, so the macro's captured constraints would be inert here too.
+//
+// REMOVE THIS BLOCK when the vendored codegen learns `smithy.api#timestampFormat`: the fix
+// belongs there, not here, because every `@timestampFormat` member of every service has the
+// same defect and `vendor/` is outside what a fix may change. Once `vendor/smithy-macros`
+// emits `with_timestamp_format`, delete the hand-written schemas and the four impls and put
+// the `#[smithy_macros::smithy(shape = ...)]` attributes back on the two structs; the wire
+// form is pinned by `tests/all/status_timestamp_wire_form.rs`, which fails if it regresses.
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionStatus {
     pub status_code: Option<String>,
@@ -68,6 +96,109 @@ pub struct ExecutionStatus {
     pub created_at: Option<::aws_smithy_types::DateTime>,
     pub completed_at: Option<::aws_smithy_types::DateTime>,
     pub last_updated_at: Option<::aws_smithy_types::DateTime>,
+}
+
+/// One member schema of [`ExecutionStatus`], named and indexed as the struct orders it.
+macro_rules! execution_status_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.bcmdataexports#ExecutionStatus$", $name),
+                ExecutionStatus::NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+#[allow(non_upper_case_globals)]
+impl ExecutionStatus {
+    const SHAPE_ID: &'static str = "com.amazonaws.bcmdataexports#ExecutionStatus";
+    const NAMESPACE: &'static str = "com.amazonaws.bcmdataexports";
+
+    /// `ExecutionStatusCode`, an enum, so a string on the wire.
+    pub const M_STATUS_CODE: ::aws_smithy_schema::Schema =
+        execution_status_member!("StatusCode", String, 0);
+    /// `ExecutionStatusReason`, an enum, so a string on the wire.
+    pub const M_STATUS_REASON: ::aws_smithy_schema::Schema =
+        execution_status_member!("StatusReason", String, 1);
+    /// `@timestampFormat("date-time")` — the chain the macro cannot emit.
+    pub const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        execution_status_member!("CreatedAt", Timestamp, 2)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")`, as for `CreatedAt`.
+    pub const M_COMPLETED_AT: ::aws_smithy_schema::Schema =
+        execution_status_member!("CompletedAt", Timestamp, 3)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")`, as for `CreatedAt`.
+    pub const M_LAST_UPDATED_AT: ::aws_smithy_schema::Schema =
+        execution_status_member!("LastUpdatedAt", Timestamp, 4)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            Self::SHAPE_ID,
+            Self::NAMESPACE,
+            "ExecutionStatus",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_STATUS_CODE,
+            &Self::M_STATUS_REASON,
+            &Self::M_CREATED_AT,
+            &Self::M_COMPLETED_AT,
+            &Self::M_LAST_UPDATED_AT,
+        ],
+    );
+}
+
+pub static EXECUTION_STATUS_SCHEMA: &::aws_smithy_schema::Schema = &ExecutionStatus::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ExecutionStatus {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.status_code.as_ref() {
+            s.write_string(&Self::M_STATUS_CODE, v.as_str())?;
+        }
+        if let Some(v) = self.status_reason.as_ref() {
+            s.write_string(&Self::M_STATUS_REASON, v.as_str())?;
+        }
+        if let Some(v) = self.created_at.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_AT, v)?;
+        }
+        if let Some(v) = self.completed_at.as_ref() {
+            s.write_timestamp(&Self::M_COMPLETED_AT, v)?;
+        }
+        if let Some(v) = self.last_updated_at.as_ref() {
+            s.write_timestamp(&Self::M_LAST_UPDATED_AT, v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ExecutionStatus {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.status_code = Some(d.read_string(&Self::M_STATUS_CODE)?),
+                Some(1) => out.status_reason = Some(d.read_string(&Self::M_STATUS_REASON)?),
+                Some(2) => out.created_at = Some(d.read_timestamp(&Self::M_CREATED_AT)?),
+                Some(3) => out.completed_at = Some(d.read_timestamp(&Self::M_COMPLETED_AT)?),
+                Some(4) => out.last_updated_at = Some(d.read_timestamp(&Self::M_LAST_UPDATED_AT)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bcmdataexports#InternalServerException")]
@@ -120,7 +251,9 @@ pub struct AccessDeniedException {
     pub message: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bcmdataexports#ExportStatus")]
+/// Hand-written for the same reason as [`ExecutionStatus`]: `CreatedAt`, `LastUpdatedAt`
+/// and `LastRefreshedAt` all carry `@timestampFormat("date-time")`, which the vendored
+/// codegen drops. See the block comment above `ExecutionStatus`.
 #[derive(Debug, Clone, Default)]
 pub struct ExportStatus {
     pub status_code: Option<String>,
@@ -128,6 +261,107 @@ pub struct ExportStatus {
     pub created_at: Option<::aws_smithy_types::DateTime>,
     pub last_updated_at: Option<::aws_smithy_types::DateTime>,
     pub last_refreshed_at: Option<::aws_smithy_types::DateTime>,
+}
+
+/// One member schema of [`ExportStatus`], named and indexed as the struct orders it.
+macro_rules! export_status_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.bcmdataexports#ExportStatus$", $name),
+                ExportStatus::NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+#[allow(non_upper_case_globals)]
+impl ExportStatus {
+    const SHAPE_ID: &'static str = "com.amazonaws.bcmdataexports#ExportStatus";
+    const NAMESPACE: &'static str = "com.amazonaws.bcmdataexports";
+
+    /// `ExportStatusCode`, an enum, so a string on the wire.
+    pub const M_STATUS_CODE: ::aws_smithy_schema::Schema =
+        export_status_member!("StatusCode", String, 0);
+    /// `ExecutionStatusReason`, an enum, so a string on the wire.
+    pub const M_STATUS_REASON: ::aws_smithy_schema::Schema =
+        export_status_member!("StatusReason", String, 1);
+    /// `@timestampFormat("date-time")` — the chain the macro cannot emit.
+    pub const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        export_status_member!("CreatedAt", Timestamp, 2)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")`, as for `CreatedAt`.
+    pub const M_LAST_UPDATED_AT: ::aws_smithy_schema::Schema =
+        export_status_member!("LastUpdatedAt", Timestamp, 3)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")`, as for `CreatedAt`.
+    pub const M_LAST_REFRESHED_AT: ::aws_smithy_schema::Schema =
+        export_status_member!("LastRefreshedAt", Timestamp, 4)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(Self::SHAPE_ID, Self::NAMESPACE, "ExportStatus"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_STATUS_CODE,
+            &Self::M_STATUS_REASON,
+            &Self::M_CREATED_AT,
+            &Self::M_LAST_UPDATED_AT,
+            &Self::M_LAST_REFRESHED_AT,
+        ],
+    );
+}
+
+pub static EXPORT_STATUS_SCHEMA: &::aws_smithy_schema::Schema = &ExportStatus::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ExportStatus {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.status_code.as_ref() {
+            s.write_string(&Self::M_STATUS_CODE, v.as_str())?;
+        }
+        if let Some(v) = self.status_reason.as_ref() {
+            s.write_string(&Self::M_STATUS_REASON, v.as_str())?;
+        }
+        if let Some(v) = self.created_at.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_AT, v)?;
+        }
+        if let Some(v) = self.last_updated_at.as_ref() {
+            s.write_timestamp(&Self::M_LAST_UPDATED_AT, v)?;
+        }
+        if let Some(v) = self.last_refreshed_at.as_ref() {
+            s.write_timestamp(&Self::M_LAST_REFRESHED_AT, v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ExportStatus {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.status_code = Some(d.read_string(&Self::M_STATUS_CODE)?),
+                Some(1) => out.status_reason = Some(d.read_string(&Self::M_STATUS_REASON)?),
+                Some(2) => out.created_at = Some(d.read_timestamp(&Self::M_CREATED_AT)?),
+                Some(3) => out.last_updated_at = Some(d.read_timestamp(&Self::M_LAST_UPDATED_AT)?),
+                Some(4) => {
+                    out.last_refreshed_at = Some(d.read_timestamp(&Self::M_LAST_REFRESHED_AT)?)
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 /// The values `CompressionOption` accepts on the wire.

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeClusterSchedulerConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeClusterSchedulerConfig`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: replays the cluster policy `crate::state` holds under this id, and
+//! materialises the `Creating` -> `Created` transition the clock already owes. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeClusterSchedulerConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +160,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeClusterSchedulerConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeClusterSchedulerConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeClusterSchedulerConfig"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(config) = store
+            .cluster_policies
+            .configs
+            .get_mut(&input.cluster_scheduler_config_id)
+        else {
+            // Never a 200 with empty fields: a caller cannot tell that from a policy
+            // that exists and carries nothing. `ResourceNotFound` is what this
+            // operation models for an id it does not hold.
+            return Err(DescribeClusterSchedulerConfigErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(format!(
+                        "Could not find cluster policy \"{}\".",
+                        input.cluster_scheduler_config_id
+                    )),
+                },
+            )
+            .into());
+        };
+        // A version the policy was never at is as absent as an unknown id; omitting the
+        // member asks for the current version. Checked BEFORE the clock-owed transition
+        // is materialised, so a refused read leaves the store exactly as it found it and
+        // every transition this handler does materialise is also recorded below.
+        if let Some(wanted) = input.cluster_scheduler_config_version {
+            if wanted != config.version {
+                let (id, version) = (config.id.clone(), config.version);
+                return Err(DescribeClusterSchedulerConfigErrorModeled::ResourceNotFound(
+                    ResourceNotFound {
+                        message: Some(format!(
+                            "Could not find version {wanted} of cluster policy \"{id}\"; its \
+                             current version is {version}."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        // The one write a reporting call may make: the transition was due at
+        // `created_status_due` whether or not anybody described the policy. A read that
+        // does not materialise it leaves it owed, and the next reporting call at or
+        // after that instant makes it — so the result does not depend on who looked.
+        let settled = config.settle_status(now);
+
+        let output = DescribeClusterSchedulerConfigOutput {
+            cluster_scheduler_config_arn: config.arn.clone(),
+            cluster_scheduler_config_id: config.id.clone(),
+            name: config.name.clone(),
+            cluster_scheduler_config_version: config.version,
+            status: config.status.clone(),
+            // Nothing in this emulator fails a cluster policy, so there is no reason to
+            // report and no status detail to add; absent is what the real service
+            // returns for a policy that has not failed.
+            failure_reason: None,
+            status_details: None,
+            cluster_arn: Some(config.cluster_arn.clone()),
+            scheduler_config: Some(config.scheduler_config.clone()),
+            description: config.description.clone(),
+            creation_time: crate::state::timestamp(config.creation_time),
+            // SageMaker fills these from the Studio user context of the caller, which
+            // this emulator does not model; absent is what a non-Studio caller sees.
+            created_by: None,
+            last_modified_time: Some(crate::state::timestamp(config.last_modified_time)),
+            last_modified_by: None,
+        };
+        let arn = config.arn.clone();
+        drop(store);
+
+        if settled {
+            crate::state::record_state_change(Self::NAME, &arn, ctx);
+        }
+        Ok(output)
     }
 }

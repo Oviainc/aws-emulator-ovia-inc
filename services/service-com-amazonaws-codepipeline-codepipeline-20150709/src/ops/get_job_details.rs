@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetJobDetails
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetJobDetails`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetJobDetails::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation serves, and to whom
+//!
+//! `GetJobDetails` reads back one of the jobs `PollForJobs` hands out: "used for custom
+//! actions only", so the job it reports is a job queued for a CUSTOM action's worker,
+//! named by the id that worker was given. Two rules, and this handler is both:
+//!
+//! 1. **Reporting.** The answer is the stored job: its id, the account the pipeline
+//!    lives in, and the same `JobData` the poll reported — the action type, the action's
+//!    configuration, the pipeline context, and the artifact locations it reads and
+//!    writes. It is a READ: the job keeps its claim and its status, because what owns a
+//!    job is the `nonce` a poll granted and `AcknowledgeJob` confirms, not a call that
+//!    looked at it. `JobDetails` models no `nonce` for that reason.
+//! 2. **An id that names no job is refused** `JobNotFoundException` (HTTP 400), with the
+//!    wording the service states for a missing job
+//!    ([`crate::state::job_not_found_message`]) — a job that was never queued, one whose
+//!    action has finished, and one whose pipeline is gone are the same fact to a caller.
+//!
+//! The one thing this call writes is the drop of a job whose action is no longer waiting
+//! for a worker (abandoned by a stop, or finished): that release was already owed when
+//! the action moved, so materialising it here is the sanctioned "a read may write only
+//! to materialise a change the clock already made due" case, and it is the same sweep
+//! `PollForJobs` performs — the two cannot disagree about which jobs still exist.
+//!
+//! `JobData$artifactCredentials` stays ABSENT, for the reason
+//! [`crate::state::JobRecord::to_data`] records.
 //!
 //! ## Shape of an operation
 //!
@@ -140,20 +157,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetJobDetails` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetJobDetailsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetJobDetails"))
+        let state = crate::state::require_state(&*self.engine)?;
+        let mut state = state.lock();
+        // A job whose action is no longer waiting for a worker is not a job any more
+        // (the same sweep `PollForJobs` performs), so it is not reported either.
+        state.retire_finished_jobs();
+        let job = state.job(&input.job_id).ok_or_else(|| {
+            GetJobDetailsError::from(GetJobDetailsErrorModeled::JobNotFoundException(
+                JobNotFoundException {
+                    message: Some(crate::state::job_not_found_message(&input.job_id)),
+                },
+            ))
+        })?;
+        Ok(GetJobDetailsOutput {
+            job_details: Some(job.to_details()),
+        })
     }
 }

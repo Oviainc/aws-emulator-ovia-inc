@@ -65,3 +65,10 @@ mod describe_users;
 // Appended for the same reason: the `DescribeUpdateActions` suite.
 #[path = "all/describe_update_actions.rs"]
 mod describe_update_actions;
+
+// Appended for the same reason: the awsQuery error-envelope suite and the
+// `DeleteCacheParameterGroup` suite it shares a fix with.
+#[path = "all/query_error_envelope.rs"]
+mod query_error_envelope;
+#[path = "all/cache_parameter_group_delete.rs"]
+mod cache_parameter_group_delete;

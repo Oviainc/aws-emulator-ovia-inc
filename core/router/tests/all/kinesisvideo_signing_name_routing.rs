@@ -249,3 +249,292 @@ fn every_kinesisvideo_path_is_claimed_by_exactly_one_service() {
         .join()
         .expect("the routing check must pass");
 }
+
+/// Two more things a `kinesisvideo`-signed answer has to get right once the path
+/// conjunct above has routed it to the one service that owns the path.
+///
+/// 1. THE ENVELOPE. All five services declare `restJson1`, for which AWS answers
+///    `Content-Type: application/json` and names the modelled error in the
+///    `x-amzn-errortype` header. The router's own refusal for a request several
+///    services claim is rendered as `awsJson1.1`
+///    (`application/x-amz-json-1.1`, `__type` only), so while every Kinesis Video
+///    request was refused as `500 AmbiguousService` no caller ever saw the service's
+///    own envelope. Asserted over a success, a handler's modelled 4xx, a boundary
+///    refusal and a scaffolded operation's 501 — four different renderers, one
+///    envelope.
+/// 2. THE STORED RECORD. A route that reaches its owner has to answer from state, so
+///    the stream a `CreateStream` minted is read back BY THE `StreamARN` IT RETURNED,
+///    through `DescribeStream` and through `ListStreams`.
+///
+/// Both run against the production `build_router`, on the same sized thread and with
+/// the same credential scope as the suite above.
+mod stream_surface {
+    use super::{build_router, InMemoryEngine, AUTHORIZATION, BOOT_STACK_SIZE};
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    /// One answer from the assembled router.
+    struct Answer {
+        status: u16,
+        /// The `restJson1` error code of the body (`__type`), namespace stripped; empty
+        /// on a success, which carries none.
+        code: String,
+        content_type: String,
+        error_type: String,
+        body: Value,
+    }
+
+    async fn call(
+        router: &smithy_server_runtime::MultiServiceRouter,
+        path: &str,
+        body: &str,
+    ) -> Answer {
+        let host = "kinesisvideo.us-east-1.amazonaws.com";
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("https://{host}{path}"))
+            .header("host", host)
+            .header("authorization", AUTHORIZATION)
+            .header("content-type", "application/json")
+            .body(bytes::Bytes::from(body.to_owned()))
+            .expect("the request is well formed");
+        let response = router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let content_type = header("content-type");
+        let error_type = header("x-amzn-errortype");
+        let parsed: Value = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        let code = parsed
+            .get("__type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .rsplit('#')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        Answer {
+            status,
+            code,
+            content_type,
+            error_type,
+            body: parsed,
+        }
+    }
+
+    #[test]
+    fn kinesisvideo_answers_carry_the_restjson1_envelope() {
+        on_a_sized_thread("kinesisvideo-envelope", || {
+            Box::pin(async {
+                let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
+                let router = build_router(engine);
+                // (case, path, body, whether the answer is an error)
+                let rows: [(&str, &str, &str, bool); 4] = [
+                    (
+                        "a success",
+                        "/createStream",
+                        r#"{"StreamName":"envelope-probe"}"#,
+                        false,
+                    ),
+                    (
+                        "a modelled 404 from a handler",
+                        "/describeStream",
+                        r#"{"StreamName":"absent-stream"}"#,
+                        true,
+                    ),
+                    (
+                        "a boundary refusal",
+                        "/describeStream",
+                        r#"{"StreamARN":"not-an-arn"}"#,
+                        true,
+                    ),
+                    (
+                        "a scaffolded operation's 501",
+                        "/describeImageGenerationConfiguration",
+                        r#"{"StreamName":"envelope-probe"}"#,
+                        true,
+                    ),
+                ];
+
+                for (case, path, body, is_error) in rows {
+                    let answer = call(&router, path, body).await;
+                    assert_ne!(
+                        answer.code, "AmbiguousService",
+                        "case {case:?} ({path}): several services claimed the request, \
+                         got HTTP {} ({})",
+                        answer.status, answer.body
+                    );
+                    assert_eq!(
+                        answer.content_type, "application/json",
+                        "case {case:?} ({path}): a restJson1 service answers \
+                         `application/json`, got {:?} with HTTP {} ({})",
+                        answer.content_type, answer.status, answer.body
+                    );
+                    if is_error {
+                        assert!(
+                            !answer.error_type.is_empty()
+                                && answer.error_type == answer.code,
+                            "case {case:?} ({path}): a restJson1 error names its code in \
+                             `x-amzn-errortype`, got {:?} beside the body code {:?} ({})",
+                            answer.error_type,
+                            answer.code,
+                            answer.body
+                        );
+                    }
+                }
+            })
+        });
+    }
+
+    /// Run one async check on a thread sized like `boot_serve.rs`'s: assembling the
+    /// production router costs stack, for the same reason that suite gives.
+    fn on_a_sized_thread(
+        name: &str,
+        check: fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+    ) {
+        let name = name.to_string();
+        std::thread::Builder::new()
+            .name(name)
+            .stack_size(BOOT_STACK_SIZE)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("build a current-thread runtime");
+                runtime.block_on(check());
+            })
+            .expect("spawn the check thread")
+            .join()
+            .expect("the check must pass");
+    }
+
+    #[test]
+    fn a_stream_created_through_the_shared_endpoint_reads_back() {
+        on_a_sized_thread("kinesisvideo-round-trip", || {
+            Box::pin(async {
+                let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
+                let router = build_router(engine);
+                let created = call(
+                    &router,
+                    "/createStream",
+                    r#"{"StreamName":"kv-round-trip","DataRetentionInHours":2}"#,
+                )
+                .await;
+                assert_eq!(
+                    (created.status, created.code.as_str()),
+                    (200, ""),
+                    "case \"CreateStream\": expected HTTP 200, got {} {:?} ({})",
+                    created.status,
+                    created.code,
+                    created.body
+                );
+                let arn = created.body["StreamARN"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+
+                // The modelled `ResourceARN` form
+                // `arn:<partition>:kinesisvideo:<region>:<account>:<type>/<name>/<digits>`,
+                // read off the `@pattern` on `DescribeStreamInput$StreamARN`
+                // (`smithy_query(query="operation", operation="DescribeStream")`).
+                // Checked structurally here and then PROVED against the model by feeding
+                // it back in through that pattern-carrying member below: a value outside
+                // the pattern is refused at the boundary.
+                let fields: Vec<&str> = arn.split(':').collect();
+                assert_eq!(
+                    fields.len(),
+                    6,
+                    "case \"CreateStream\": a StreamARN has six `:`-separated fields, \
+                     got {arn:?}"
+                );
+                assert_eq!(
+                    (fields[0], fields[2], fields[3]),
+                    ("arn", "kinesisvideo", "us-east-1"),
+                    "case \"CreateStream\": expected an arn of the kinesisvideo namespace \
+                     in the request's region, got {arn:?}"
+                );
+                let resource: Vec<&str> = fields[5].split('/').collect();
+                assert_eq!(
+                    resource.len(),
+                    3,
+                    "case \"CreateStream\": a StreamARN resource is \
+                     `<type>/<name>/<digits>`, got {arn:?}"
+                );
+                assert_eq!(
+                    (resource[0], resource[1]),
+                    ("stream", "kv-round-trip"),
+                    "case \"CreateStream\": expected the created stream's own name in its \
+                     ARN, got {arn:?}"
+                );
+                assert!(
+                    !resource[2].is_empty()
+                        && resource[2].bytes().all(|byte| byte.is_ascii_digit()),
+                    "case \"CreateStream\": a StreamARN ends in a numeric segment, \
+                     got {arn:?}"
+                );
+
+                let fetched = call(
+                    &router,
+                    "/describeStream",
+                    &format!(r#"{{"StreamARN":"{arn}"}}"#),
+                )
+                .await;
+                assert_eq!(
+                    (fetched.status, fetched.code.as_str()),
+                    (200, ""),
+                    "case \"DescribeStream by the returned StreamARN\": expected HTTP 200, \
+                     got {} {:?} ({})",
+                    fetched.status,
+                    fetched.code,
+                    fetched.body
+                );
+                let info = &fetched.body["StreamInfo"];
+                assert_eq!(
+                    info["StreamARN"].as_str(),
+                    Some(arn.as_str()),
+                    "case \"DescribeStream by the returned StreamARN\": the stream read \
+                     back must be the stream created, got {info}"
+                );
+                assert_eq!(
+                    info["DataRetentionInHours"].as_i64(),
+                    Some(2),
+                    "case \"DescribeStream by the returned StreamARN\": the retention the \
+                     create asked for must read back, got {info}"
+                );
+
+                let listed = call(&router, "/listStreams", "{}").await;
+                assert_eq!(
+                    (listed.status, listed.code.as_str()),
+                    (200, ""),
+                    "case \"ListStreams\": expected HTTP 200, got {} {:?} ({})",
+                    listed.status,
+                    listed.code,
+                    listed.body
+                );
+                let arns: Vec<&str> = listed.body["StreamInfoList"]
+                    .as_array()
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|entry| entry["StreamARN"].as_str())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                assert_eq!(
+                    arns,
+                    vec![arn.as_str()],
+                    "case \"ListStreams\": expected exactly the created stream, got {}",
+                    listed.body
+                );
+            })
+        });
+    }
+}

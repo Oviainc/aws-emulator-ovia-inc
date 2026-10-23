@@ -48,7 +48,7 @@
 //! ## Input
 //!
 //! * `resourceArn` (SavingsPlanArn, pattern
-//!   ^arn:aws:[a-z]+:([a-z]{2}-[a-z]+-\d{1}|):(\d{12}):savingsplan\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{
+//!   ^arn:aws([-a-z]*)?:[a-z]+:([a-z]{2}-[a-z]+-\d{1}|):(\d{12}):savingsplan\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{
 //!   …) **required** — The Amazon Resource Name (ARN) of the resource.
 //! * `tags` (TagMap) **required** — One or more tags. For example, { "tags":
 //!   {"key1":"value1", "key2":"value2"} }.
@@ -156,10 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let plan = store.plan_by_arn_mut(&input.resource_arn).ok_or_else(|| {
             TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "no Savings Plan found with ARN '{}'",
-                    input.resource_arn
-                ),
+                message: crate::state::resource_not_found_message(&input.resource_arn),
             })
         })?;
         // All or nothing: a write that would take the plan past the service's

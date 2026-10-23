@@ -963,3 +963,134 @@ async fn an_arn_outside_the_modelled_constraints_is_a_validation_error() {
         "ResourceARNNotValidException",
     );
 }
+
+/// The published `@length` bounds of the policy document, from
+/// `smithy_query(query="shape", shape="ResourcePolicy")`: `ResourcePolicy` is a string
+/// of 1..8192 characters, and both `PutResourcePolicyRequest$ResourcePolicy` and the
+/// `ResourcePolicy` every read reports target that shape.
+const POLICY_MIN_LEN: usize = 1;
+/// See [`POLICY_MIN_LEN`].
+const POLICY_MAX_LEN: usize = 8192;
+
+/// A valid policy document carrying `padding` filler characters in its `Sid` — the
+/// free-form statement id — which is what lets a row sit on an exact length.
+fn policy_padded_with(padding: usize) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "A".repeat(padding),
+            "Effect": "Allow",
+            "Principal": {"AWS": format!("arn:aws:iam::{OTHER_ACCOUNT}:root")},
+            "Action": "cloudtrail:GetDashboard",
+        }],
+    })
+    .to_string()
+}
+
+/// A VALID policy document of exactly `len` characters, padded through its `Sid`, so a
+/// row can sit ON a published length bound without stopping being a policy.
+fn padded_policy(len: usize) -> String {
+    let unpadded = policy_padded_with(0).len();
+    assert!(
+        len >= unpadded,
+        "a document of {len} character(s) cannot state the elements a policy states \
+         ({unpadded} characters before any padding)"
+    );
+    let padded = policy_padded_with(len - unpadded);
+    assert_eq!(
+        padded.len(),
+        len,
+        "padding produced {} character(s), not {len}",
+        padded.len()
+    );
+    padded
+}
+
+/// RULE: the policy document is a modelled `ResourcePolicy` (`@length` 1..8192, see
+/// [`POLICY_MIN_LEN`]), so a document outside that bound is refused as a validation
+/// error before this service's own policy grammar ever reads it, while a document ON
+/// the published maximum is stored and reported back by `GetResourcePolicy` verbatim.
+///
+/// The rows walk each published bound and one value past it: a length bound is a rule
+/// about SIZE, so what varies between rows is the document's size alone.
+#[tokio::test]
+async fn a_policy_document_is_bounded_by_the_modelled_length() {
+    let emulator = Emulator::new();
+    let stored_on = settled_dashboard(&emulator, "policy-length-ok", HOME_REGION).await;
+    let refused_on = settled_dashboard(&emulator, "policy-length-bad", HOME_REGION).await;
+
+    // (case, the document as it is sent, expected error code) — every row is HTTP 400.
+    let refused: Vec<(&str, String, &str)> = vec![
+        (
+            "empty: one character below the minimum length",
+            String::new(),
+            "ValidationException",
+        ),
+        (
+            "one character past the maximum length",
+            padded_policy(POLICY_MAX_LEN + 1),
+            "ValidationException",
+        ),
+        (
+            "far past the maximum length",
+            padded_policy(POLICY_MAX_LEN * 2),
+            "ValidationException",
+        ),
+        (
+            // Inside the modelled bound, so the MODEL admits it and this service's own
+            // policy grammar is what refuses it — which is how a length row proves the
+            // bound and not the grammar.
+            "the shortest document the model admits, which is no policy",
+            "{".repeat(POLICY_MIN_LEN),
+            "ResourcePolicyNotValidException",
+        ),
+    ];
+
+    for (case, document, code) in &refused {
+        put(&emulator, &refused_on, document)
+            .await
+            .expect_error(case, 400, code);
+        // A refused put stores nothing, so the resource still carries no policy.
+        get(&emulator, &refused_on).await.expect_error(
+            &format!("{case}: nothing was stored"),
+            404,
+            "ResourcePolicyNotFoundException",
+        );
+    }
+
+    // (case, the document as it is sent) — accepted, and reported back character for
+    // character by the read.
+    let accepted: Vec<(&str, String)> = vec![
+        (
+            "the shortest document that is still a policy",
+            policy_padded_with(0),
+        ),
+        ("a document well inside the bound", padded_policy(1_024)),
+        (
+            "one character below the maximum length",
+            padded_policy(POLICY_MAX_LEN - 1),
+        ),
+        ("exactly the maximum length", padded_policy(POLICY_MAX_LEN)),
+    ];
+
+    for (case, document) in &accepted {
+        assert!(
+            (POLICY_MIN_LEN..=POLICY_MAX_LEN).contains(&document.len()),
+            "case {case:?}: a {}-character document is outside the modelled bound, so it \
+             is the wrong row for this rule",
+            document.len()
+        );
+        expect_policy(
+            case,
+            &put(&emulator, &stored_on, document).await,
+            &stored_on,
+            document,
+        );
+        expect_policy(
+            &format!("{case} (read back)"),
+            &get(&emulator, &stored_on).await,
+            &stored_on,
+            document,
+        );
+    }
+}

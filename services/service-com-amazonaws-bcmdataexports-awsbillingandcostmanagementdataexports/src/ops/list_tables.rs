@@ -215,7 +215,7 @@ fn listed_table(spec: &crate::state::TableSpec) -> Table {
                             .map(|value| (*value).to_string())
                             .collect(),
                     ),
-                    default_value: property.default_value.map(str::to_string),
+                    default_value: property.default_value().map(str::to_string),
                     description: Some(property.description.to_string()),
                 })
                 .collect(),

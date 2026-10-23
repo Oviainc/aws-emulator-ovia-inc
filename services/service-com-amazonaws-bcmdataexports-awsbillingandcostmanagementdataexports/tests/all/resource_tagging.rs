@@ -9,7 +9,8 @@
 //! request does not name keeps the value it had — so the call is additive, idempotent for
 //! a list already in effect, and observable by every later reader; it reports no payload
 //! ("Adds tags for an existing data export definition", `TagResourceResponse` has no
-//! members), refuses an ARN that names no export with the modelled 404, and refuses a
+//! members), refuses an ARN that names no export with the modelled
+//! `ResourceNotFoundException`, and refuses a
 //! request it cannot read as a tag set ("each key must be unique for the resource" —
 //! smithy_query shape `TagResourceRequest`, member `ResourceTags`) with the modelled 400.
 //!
@@ -25,10 +26,10 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::{
-    EXPORT_NOT_FOUND_MESSAGE, MAX_RESOURCE_TAGS,
+    MAX_RESOURCE_TAGS, RESOURCE_NOT_FOUND_MESSAGE,
 };
 
-use crate::export_lifecycle::{cases, error_code, Client};
+use crate::export_lifecycle::{cases, error_code, Client, NOT_FOUND_STATUS};
 
 /// `ResourceTagKey`: `@length 1..128` (smithy_query shape `ResourceTagKey`).
 const KEY_MIN_LEN: usize = 1;
@@ -359,13 +360,14 @@ async fn a_duplicated_tag_key_is_refused_and_persists_nothing() {
     }
 }
 
-/// An ARN of THIS ACCOUNT that names no export is refused with the modelled 404, whether
+/// An ARN of THIS ACCOUNT that names no export is refused with the modelled
+/// `ResourceNotFoundException`, whether
 /// it was never created or has since been deleted — and a deleted export's tags do not come
 /// back. An ARN of ANOTHER account is refused before any lookup, with the modelled 400:
 /// see `tests/all/tagging_arn_validation.rs` for that rule, which this test's foreign rows
 /// cross-check on `TagResource`.
 #[tokio::test]
-async fn tagging_an_arn_that_names_no_export_is_a_404() {
+async fn tagging_an_arn_that_names_no_export_is_not_found() {
     let client = Client::new();
     let own = ::engine::emulator_account_id();
     let live = create_export(&client, "live_export", &pairs(&[("env", "dev")])).await;
@@ -394,18 +396,18 @@ async fn tagging_an_arn_that_names_no_export_is_a_404() {
             .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: tagging an absent export must be a 404, got {status} with {body}"
+            (NOT_FOUND_STATUS, "ResourceNotFoundException"),
+            "case {label:?}: tagging an absent export must be the not-found refusal, got {status} with {body}"
         );
         assert_eq!(
             body["Message"],
-            json!(EXPORT_NOT_FOUND_MESSAGE),
+            json!(RESOURCE_NOT_FOUND_MESSAGE),
             "case {label:?}: expected this service's fixed not-found message, got {body}"
         );
         assert_eq!(
             body["ResourceId"],
             json!(arn),
-            "case {label:?}: the 404 must name the ARN it could not find, got {body}"
+            "case {label:?}: the refusal must name the ARN it could not find, got {body}"
         );
     }
 
@@ -415,7 +417,7 @@ async fn tagging_an_arn_that_names_no_export_is_a_404() {
         .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "ResourceNotFoundException"),
+        (NOT_FOUND_STATUS, "ResourceNotFoundException"),
         "a refused TagResource must not resurrect the export, got {status} with {body}"
     );
 }

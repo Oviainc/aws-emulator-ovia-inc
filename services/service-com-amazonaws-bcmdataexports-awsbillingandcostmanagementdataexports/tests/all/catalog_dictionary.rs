@@ -186,14 +186,32 @@ type PropertyRow = (
     Option<&'static str>,
 );
 
+/// The marker a [`PropertyRow`] names the ACCOUNT's primary billing view with.
+///
+/// `BILLING_VIEW_ARN` assumes the account's primary billing view
+/// (`arn:aws:billing::<account>:billingview/primary`) when a request does not name it, and
+/// that ARN carries the account id — so the rows below name the default through this
+/// marker and [`published_default`] resolves it from the emulator's account rather than
+/// pinning an account id in a literal.
+const PRIMARY_BILLING_VIEW: &str = "@the account's primary billing view";
+
+/// The value a [`PropertyRow`]'s default stands for: itself, or — for
+/// [`PRIMARY_BILLING_VIEW`] — the account's primary billing view ARN.
+fn published_default(row_default: Option<&'static str>) -> Option<String> {
+    if row_default == Some(PRIMARY_BILLING_VIEW) {
+        return Some(engine::emulator_arn("billing", "", "billingview/primary"));
+    }
+    row_default.map(str::to_string)
+}
+
 /// The table properties the dictionary publishes for a table, in the order it publishes
 /// them, with the values each accepts and the value it assumes when a request does not
 /// name it. An empty value list, or the wildcard `*`, is a free-form property.
 const PUBLISHED_PROPERTIES: &[(&str, &[PropertyRow])] = &[
-    ("CARBON_EMISSIONS", &[("BILLING_VIEW_ARN", &[], Some(""))]),
+    ("CARBON_EMISSIONS", &[("BILLING_VIEW_ARN", &[], Some(PRIMARY_BILLING_VIEW))]),
     (
         "COST_AND_USAGE_DASHBOARD",
-        &[("BILLING_VIEW_ARN", &[], Some(""))],
+        &[("BILLING_VIEW_ARN", &[], Some(PRIMARY_BILLING_VIEW))],
     ),
     (
         "COST_AND_USAGE_REPORT",
@@ -208,7 +226,7 @@ const PUBLISHED_PROPERTIES: &[(&str, &[PropertyRow])] = &[
                 &["TRUE", "FALSE"],
                 Some("FALSE"),
             ),
-            ("BILLING_VIEW_ARN", &[], Some("")),
+            ("BILLING_VIEW_ARN", &[], Some(PRIMARY_BILLING_VIEW)),
             (
                 "INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY",
                 &["TRUE", "FALSE"],
@@ -238,7 +256,10 @@ const PUBLISHED_PROPERTIES: &[(&str, &[PropertyRow])] = &[
             ("FILTER", &["*"], Some("{}")),
         ],
     ),
-    ("FOCUS_1_0_AWS", &[("BILLING_VIEW_ARN", &[], Some(""))]),
+    (
+        "FOCUS_1_0_AWS",
+        &[("BILLING_VIEW_ARN", &[], Some(PRIMARY_BILLING_VIEW))],
+    ),
     (
         "FOCUS_1_0_AWS_PREVIEW",
         // The one thing the dictionary publishes about a superseded preview table.
@@ -495,7 +516,7 @@ async fn every_table_property_is_reported_as_the_dictionary_publishes_it() {
             );
             assert_eq!(
                 property.get("DefaultValue").and_then(Value::as_str),
-                *default_value,
+                published_default(*default_value).as_deref(),
                 "case {case:?}: expected the published default, got {property}"
             );
             let description = property
@@ -529,7 +550,7 @@ async fn every_table_property_is_reported_as_the_dictionary_publishes_it() {
         let expected: BTreeMap<String, String> = properties
             .iter()
             .filter_map(|(name, _, default_value)| {
-                default_value.map(|default| ((*name).to_string(), default.to_string()))
+                published_default(*default_value).map(|default| ((*name).to_string(), default))
             })
             .collect();
         assert_eq!(

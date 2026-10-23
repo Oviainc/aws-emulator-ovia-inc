@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConfiguredTableAnalysisRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConfiguredTableAnalysisRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConfiguredTableAnalysisRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the analysis rule of a configured table from persisted state: "Configured
+//! table analysis rules are uniquely identified by their configured table identifier and
+//! analysis rule type", so the pair is what this read looks up, and a pair the store
+//! holds no rule for is a `ResourceNotFoundException`. Nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +144,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConfiguredTableAnalysisRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConfiguredTableAnalysisRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConfiguredTableAnalysisRule"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                GetConfiguredTableAnalysisRuleErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("cleanrooms state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let store = state.lock();
+        match store
+            .configured_table_analysis_rule(
+                &input.configured_table_identifier,
+                &input.analysis_rule_type,
+            )
+            .cloned()
+        {
+            Some(analysis_rule) => Ok(GetConfiguredTableAnalysisRuleOutput { analysis_rule }),
+            // A configured table the store does not hold and a configured table holding
+            // no rule of this type are one answer: the rule the pair names does not
+            // exist. The model's `ResourceType` catalog (COLLABORATION | CONFIGURED_TABLE
+            // | CONFIGURED_TABLE_ASSOCIATION | MEMBERSHIP) names no analysis rule, so the
+            // missing resource is reported as the configured table that would own it.
+            None => Err(
+                GetConfiguredTableAnalysisRuleErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "configured table {} has no {} analysis rule",
+                            input.configured_table_identifier, input.analysis_rule_type
+                        ),
+                        resource_id: input.configured_table_identifier,
+                        resource_type: st::RESOURCE_TYPE_CONFIGURED_TABLE.to_string(),
+                    },
+                )
+                .into(),
+            ),
+        }
     }
 }

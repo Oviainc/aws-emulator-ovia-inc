@@ -14,16 +14,17 @@
 //! request it is answering.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ActionConfigurationProperty, ActionDeclaration, ActionExecutionDetail, ActionExecutionInput,
-    ActionRevision, ActionType, ActionTypeId, ActionTypeSettings, ArtifactDetail,
-    ArtifactDetails, Condition, ConditionState, CurrentRevision, ExecutionDetails, ExecutionTrigger,
-    ListWebhookItem, PipelineDeclaration, PipelineExecution, PipelineExecutionSummary,
-    PipelineMetadata, PipelineSummary, PipelineVariable, ResolvedPipelineVariable, RuleState,
-    SourceRevision, StageConditionState, Tag, ThirdPartyJob, TransitionState,
-    WebhookDefinition,
+    ActionConfiguration, ActionConfigurationProperty, ActionContext, ActionDeclaration,
+    ActionExecutionDetail, ActionExecutionInput, ActionRevision, ActionType, ActionTypeId,
+    ActionTypeSettings, Artifact, ArtifactDetail, ArtifactDetails, ArtifactLocation, Condition,
+    ConditionState, CurrentRevision, EncryptionKey, ExecutionDetails, ExecutionTrigger, Job,
+    JobData, ListWebhookItem, PipelineContext, PipelineDeclaration, PipelineExecution,
+    PipelineExecutionSummary, PipelineMetadata, PipelineSummary, PipelineVariable,
+    ResolvedPipelineVariable, RuleState, S3ArtifactLocation, SourceRevision, StageConditionState,
+    StageContext, Tag, ThirdPartyJob, TransitionState, WebhookDefinition,
 };
 
 /// The execution plane's data model: what an execution's stages and actions are.
@@ -153,6 +154,38 @@ pub const JOB_STATUS_TIMED_OUT: &str = "TimedOut";
 /// still live (`Created`, `Queued`, `Dispatched`, `InProgress`).
 pub const TERMINAL_JOB_STATUSES: [&str; 3] =
     [JOB_STATUS_SUCCEEDED, JOB_STATUS_FAILED, JOB_STATUS_TIMED_OUT];
+
+/// How long one `PollForJobs` call withholds a job it reported from later polls.
+///
+/// `Job$nonce` is "a system-generated random number that CodePipeline uses to ensure
+/// that the job is being worked on by only one job worker", so a poll that reports a
+/// job hands it to that worker: until the worker's claim lapses, another poll is not
+/// reported the same job. The job becoming pollable again is a transition the CLOCK
+/// owes — nothing but the passage of time makes it due — and AWS publishes no figure
+/// for how long a polled, unacknowledged job stays held, so the span is this
+/// emulator's, chosen inside the 250-750 ms band this project fixes for a clock-owed
+/// transition: a worker that polls twice in a row still observes the job withheld,
+/// and a worker that abandons a job it polled does not strand it.
+pub const JOB_POLL_LEASE: Duration = Duration::from_millis(500);
+
+/// The most jobs this emulator keeps queued for custom-action job workers, across
+/// every action type.
+///
+/// A bound is required for the same reason every other store has one: a job is queued
+/// each time an execution reaches a `Custom` action, and the release paths (the
+/// action finishing, its execution being evicted, its pipeline being deleted) are not
+/// under the caller's control. Past the bound the OLDEST queued job is dropped, so
+/// the queue cannot grow without limit however many executions run. AWS publishes no
+/// such figure; it is this emulator's, sized like
+/// [`MAX_EXECUTION_HISTORY_PER_PIPELINE`].
+pub const MAX_QUEUED_JOBS: usize = 1000;
+
+/// The `ArtifactLocationType` an artifact of this service's artifact store carries:
+/// the model declares exactly one value
+/// (`crate::ops::types::ARTIFACT_LOCATION_TYPE_VALUES` -> `S3`), and an artifact
+/// store IS an S3 bucket (`ArtifactStore$location` is "the S3 bucket used for
+/// storing the artifacts").
+pub const ARTIFACT_LOCATION_TYPE_S3: &str = crate::ops::types::ARTIFACT_LOCATION_TYPE_VALUES[0];
 
 /// The `ExecutionType` of an execution that runs the pipeline forward, from the
 /// model's enum (`smithy_query query="shape" shape="ExecutionType"` -> `STANDARD`,
@@ -414,6 +447,16 @@ pub struct ComAmazonawsCodepipelineCodepipeline20150709State {
     /// operations — is still a scaffold with its own issue), so no request path
     /// writes this map and it needs no per-request bound.
     pub third_party_jobs: BTreeMap<ActionTypeKey, Vec<ThirdPartyJobRecord>>,
+    /// The jobs waiting for a CUSTOM action's job worker, per action type, oldest
+    /// first — what `PollForJobs` hands out.
+    ///
+    /// A `Custom` action type is run by the account's own job worker rather than by
+    /// CodePipeline, so when an execution reaches such an action the execution plane
+    /// queues a job here ([`driver`]) and the action stays `InProgress` until a worker
+    /// reports its result. Write it through [`Self::enqueue_job`] (or
+    /// [`enqueue_job_into`], the same path the driver takes while it holds only this
+    /// field), which is where the [`MAX_QUEUED_JOBS`] bound lives.
+    pub jobs: JobQueue,
 }
 
 impl ComAmazonawsCodepipelineCodepipeline20150709State {
@@ -527,6 +570,9 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
                 self.forget_action_executions(id);
             }
             self.idempotency.retain(|_, id| !evicted.contains(id));
+            // A job waits for the execution that queued it, so an execution no caller
+            // can read any more has no job waiting either.
+            self.forget_jobs_of_executions(&evicted);
         }
 
         if let Some(token) = client_request_token {
@@ -589,6 +635,107 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
             .take(limit)
             .map(ThirdPartyJobRecord::to_job)
             .collect()
+    }
+
+    /// Queue `job` as the newest job waiting for the custom action type `id`, and
+    /// answer whether it was queued.
+    ///
+    /// Only a `Custom` action type has jobs of this kind — an `AWS` action type is run
+    /// by AWS and a `ThirdParty` one by its partner (whose jobs are
+    /// [`Self::third_party_jobs`]) — so any other owner is refused HERE, once, rather
+    /// than by every reader. Bounded by [`MAX_QUEUED_JOBS`].
+    pub fn enqueue_job(&mut self, id: &ActionTypeId, job: JobRecord) -> bool {
+        enqueue_job_into(&mut self.jobs, id, job)
+    }
+
+    /// Hand at most `limit` of the custom action type `id`'s waiting jobs to the
+    /// worker that is polling, oldest first, and report them as they were handed out.
+    ///
+    /// Each job handed out is LEASED: a fresh `nonce` is minted for it and it is
+    /// withheld from later polls for [`JOB_POLL_LEASE`], which is what "only one job
+    /// worker" means for the nonce the model documents. A job whose lease has lapsed
+    /// is available again and is handed out with a NEW nonce, so the nonce a lapsed
+    /// lease published no longer reaches the job.
+    ///
+    /// `query` is the `queryParam` pair the poll carried, if any: a job is handed out
+    /// only when its action configuration maps that property to that value.
+    pub fn lease_jobs(
+        &mut self,
+        id: &ActionTypeId,
+        limit: usize,
+        query: Option<(&str, &str)>,
+        now: SystemTime,
+    ) -> Vec<JobRecord> {
+        let mut leased = Vec::new();
+        let Some(queue) = self.jobs.get_mut(&ActionTypeKey::from_id(id)) else {
+            return leased;
+        };
+        for job in queue.iter_mut() {
+            if leased.len() >= limit {
+                break;
+            }
+            if !job.is_available(now) || !job.matches_query(query) {
+                continue;
+            }
+            job.lease(now);
+            leased.push(job.clone());
+        }
+        leased
+    }
+
+    /// The job queued under `job_id`, whatever action type's queue it waits in.
+    ///
+    /// A worker's call names a job by id alone, so the search spans every action
+    /// type's queue: a job id identifies one job across the service, and which queue
+    /// it waits in is not something the caller knows or states.
+    pub fn job(&self, job_id: &str) -> Option<&JobRecord> {
+        self.jobs.values().flatten().find(|job| job.job_id == job_id)
+    }
+
+    /// Drop every queued job whose action is no longer waiting for a worker.
+    ///
+    /// A job is owed to a worker exactly while the action that queued it is still
+    /// `InProgress`: once the action has been abandoned by a stop, or has reached an
+    /// outcome, the job it was waiting on is not work any more and is forgotten. A job
+    /// whose execution record this store no longer holds is left alone — it is kept by
+    /// the paths that drop an execution ([`Self::forget_pipeline`] and the eviction in
+    /// [`Self::record_execution`]) and by [`MAX_QUEUED_JOBS`], not by this sweep.
+    pub fn retire_finished_jobs(&mut self) {
+        let Self { jobs, executions, .. } = self;
+        jobs.retain(|_, queue| {
+            queue.retain(|job| {
+                executions
+                    .get(&job.pipeline_execution_id)
+                    .and_then(|record| record.stages.get(job.stage))
+                    .and_then(|stage| stage.actions.get(job.action))
+                    .is_none_or(ActionRun::is_in_progress)
+            });
+            !queue.is_empty()
+        });
+    }
+
+    /// The names of the pipelines with an execution that can still move — the ones a
+    /// call materialises the clock's owed steps for when the request names no pipeline
+    /// of its own.
+    ///
+    /// Each name appears once, in name order: an execution in a terminal status is
+    /// owed nothing, so a pipeline with only those is not walked at all.
+    pub fn pipelines_with_live_executions(&self) -> Vec<String> {
+        self.executions
+            .values()
+            .filter(|record| !is_terminal_status(&record.status))
+            .map(|record| record.pipeline_name.clone())
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Drop every queued job of the pipeline executions named by `execution_ids`.
+    fn forget_jobs_of_executions(&mut self, execution_ids: &[String]) {
+        self.jobs.retain(|_, queue| {
+            queue.retain(|job| !execution_ids.contains(&job.pipeline_execution_id));
+            !queue.is_empty()
+        });
     }
 
     /// The action executions a freshly started `execution` begins with: one per
@@ -691,6 +838,12 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
             self.executions.remove(&id);
             self.forget_action_executions(&id);
         }
+        // The jobs those executions queued for a custom action's worker go with them:
+        // a deleted pipeline has no action left waiting for one.
+        self.jobs.retain(|_, queue| {
+            queue.retain(|job| job.pipeline_name != name);
+            !queue.is_empty()
+        });
         self.idempotency
             .retain(|(pipeline_name, _), _| pipeline_name != name);
         self.action_revisions
@@ -891,7 +1044,7 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
                 // The message AWS answers a missing job with, built from the
                 // request: the id the caller asked for, and nothing else about the
                 // store.
-                ThirdPartyJobProblem::NotFound(format!("Job with id '{job_id}' does not exist."))
+                ThirdPartyJobProblem::NotFound(job_not_found_message(job_id))
             })?;
         if job.client_token != client_token {
             return Err(ThirdPartyJobProblem::ClientToken(format!(
@@ -2154,6 +2307,301 @@ pub fn not_whitelisted_message(id: &ActionTypeId) -> String {
          ActionType.Provider='{}' ActionType.Version='{}'",
         id.category, id.owner, id.provider, id.version
     )
+}
+
+/// The jobs waiting for each custom action type's job worker, oldest first.
+pub type JobQueue = BTreeMap<ActionTypeKey, Vec<JobRecord>>;
+
+/// Queue `job` as the newest job waiting for the custom action type `id`, answering
+/// whether the queue took it.
+///
+/// The ONE write path into a [`JobQueue`], so the owner rule and the
+/// [`MAX_QUEUED_JOBS`] bound hold whatever queues a job: the state method
+/// ([`ComAmazonawsCodepipelineCodepipeline20150709State::enqueue_job`]) and the
+/// execution driver, which reaches only this field while it writes an execution's
+/// record, both come through here. Past the bound the OLDEST queued job across every
+/// action type is dropped, so a queue entry can never be added without one being
+/// releasable.
+pub fn enqueue_job_into(queue: &mut JobQueue, id: &ActionTypeId, job: JobRecord) -> bool {
+    if id.owner != ACTION_OWNER_CUSTOM {
+        return false;
+    }
+    queue
+        .entry(ActionTypeKey::from_id(id))
+        .or_default()
+        .push(job);
+    while queued_job_count(queue) > MAX_QUEUED_JOBS {
+        // The oldest job of each action type is its queue's first entry (the queues are
+        // kept oldest first), so the oldest job overall is the oldest of those.
+        let oldest = queue
+            .iter()
+            .filter_map(|(key, jobs)| jobs.first().map(|job| (job.queued_at, key.clone())))
+            .min();
+        let Some((_, key)) = oldest else { break };
+        if let Some(jobs) = queue.get_mut(&key) {
+            jobs.remove(0);
+            if jobs.is_empty() {
+                queue.remove(&key);
+            }
+        }
+    }
+    true
+}
+
+/// How many jobs a [`JobQueue`] is holding, across every action type.
+pub fn queued_job_count(queue: &JobQueue) -> usize {
+    queue.values().map(Vec::len).sum()
+}
+
+/// How many jobs a poll asks for: `maxBatchSize` when it carries a count, and every
+/// job waiting when the member is absent.
+///
+/// `MaxBatchSize` is modelled `range 1..` and the framework refuses anything below 1
+/// before a handler runs, so the conversion cannot actually fail. It is mapped to 0 —
+/// no jobs — rather than to "every job" deliberately: a cap that cannot be honoured
+/// must never WIDEN the answer. Shared by `PollForJobs` and
+/// `PollForThirdPartyJobs`, which model the same member.
+pub fn poll_limit(max_batch_size: Option<i32>) -> usize {
+    max_batch_size.map_or(usize::MAX, |size| usize::try_from(size).unwrap_or(0))
+}
+
+/// What `ActionTypeNotFoundException` states: the four identifying fields of the
+/// action type the REQUEST named, in the order `ActionTypeId` declares them.
+///
+/// Built from the request, so it is a template over the caller's own values rather
+/// than text naming one particular action type, and the caller can tell from it which
+/// of the four fields it has to correct.
+pub fn action_type_not_found_message(id: &ActionTypeId) -> String {
+    format!(
+        "ActionType (Category='{}', Owner='{}', Provider='{}', Version='{}') is not \
+         registered in account '{}'",
+        id.category,
+        id.owner,
+        id.provider,
+        id.version,
+        ::engine::emulator_account_id()
+    )
+}
+
+/// One job waiting for a CUSTOM action's job worker — what `PollForJobs` hands out.
+///
+/// `PollForJobs` "is valid only for action types with Custom in the owner field":
+/// CodePipeline does not run a custom action, the account's own job worker does. So
+/// when an execution reaches such an action the execution plane queues this record and
+/// the action stays `InProgress` until a worker reports its result; what the worker
+/// needs to do the work (the action's configuration, the artifacts it consumes and the
+/// ones it is to produce, the pipeline it belongs to) is captured here from the
+/// declaration the execution pinned, so the job a poll reports is computed from stored
+/// state rather than from the poll.
+#[derive(Debug, Clone)]
+pub struct JobRecord {
+    /// The job's id, matching `JobId`'s modelled pattern
+    /// (`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).
+    pub job_id: String,
+    /// The custom action type whose worker this job waits for.
+    pub action_type: ActionTypeId,
+    /// The pipeline the action belongs to.
+    pub pipeline_name: String,
+    /// That pipeline's ARN — `JobData$pipelineContext` documents that it "includes
+    /// pipelineArn and pipelineExecutionId for custom jobs".
+    pub pipeline_arn: String,
+    /// The execution that reached the action.
+    pub pipeline_execution_id: String,
+    /// The stage that contains the action.
+    pub stage_name: String,
+    /// The declared action's name.
+    pub action_name: String,
+    /// The id the action's execution is reported under.
+    pub action_execution_id: String,
+    /// Where the action sits in its execution's plan: the stage's index.
+    pub stage: usize,
+    /// Where the action sits in that stage: the action's index.
+    pub action: usize,
+    /// The action's `configuration`, with the execution's variables resolved — what
+    /// `JobData$actionConfiguration` reports, and what a `queryParam` poll selects on.
+    pub configuration: BTreeMap<String, String>,
+    /// The artifacts supplied to the job, at the artifact-store locations the earlier
+    /// actions produced them in.
+    pub input_artifacts: Vec<Artifact>,
+    /// The artifacts the job is to produce, at the artifact-store locations they are
+    /// to be written to.
+    pub output_artifacts: Vec<Artifact>,
+    /// The customer managed key the pipeline's artifact store declares, when it
+    /// declares one: the worker needs it to read and write those artifacts.
+    pub encryption_key: Option<EncryptionKey>,
+    /// A `JobStatus` value: where the job is between being queued and a worker
+    /// reporting its outcome.
+    pub status: String,
+    /// The `nonce` the newest poll published for this job, or `None` while no poll
+    /// has reported it. The worker presents it to `AcknowledgeJob`.
+    pub nonce: Option<String>,
+    /// When the claim the newest poll granted lapses, so the job may be reported to
+    /// another worker again (see [`JOB_POLL_LEASE`]).
+    pub leased_until: Option<SystemTime>,
+    /// The continuation token the last result supplied, identifying a custom action
+    /// still in progress.
+    pub continuation_token: Option<String>,
+    /// When the job was queued — the order the jobs of one action type are handed out
+    /// in, and which job the [`MAX_QUEUED_JOBS`] bound drops first.
+    pub queued_at: SystemTime,
+    /// When this job's status last changed.
+    pub last_status_change: SystemTime,
+}
+
+impl JobRecord {
+    /// A job of `action_type` queued at `now`, with nothing of a pipeline recorded
+    /// against it yet.
+    ///
+    /// The job starts at [`JOB_STATUS_QUEUED`] and unleased: it is waiting for a
+    /// worker, and no worker owns its outcome until one polls for it and
+    /// acknowledges it. The execution plane fills in the pipeline context it queues
+    /// the job with.
+    pub fn new(job_id: impl Into<String>, action_type: ActionTypeId, now: SystemTime) -> Self {
+        Self {
+            job_id: job_id.into(),
+            action_type,
+            pipeline_name: String::new(),
+            pipeline_arn: String::new(),
+            pipeline_execution_id: String::new(),
+            stage_name: String::new(),
+            action_name: String::new(),
+            action_execution_id: String::new(),
+            stage: 0,
+            action: 0,
+            configuration: BTreeMap::new(),
+            input_artifacts: Vec::new(),
+            output_artifacts: Vec::new(),
+            encryption_key: None,
+            status: JOB_STATUS_QUEUED.to_string(),
+            nonce: None,
+            leased_until: None,
+            continuation_token: None,
+            queued_at: now,
+            last_status_change: now,
+        }
+    }
+
+    /// This job as `PollForJobs` reports it to the worker it was just handed to.
+    pub fn to_job(&self) -> Job {
+        Job {
+            id: Some(self.job_id.clone()),
+            data: Some(self.to_data()),
+            nonce: self.nonce.clone(),
+            // "The ID of the Amazon Web Services account to use when performing the
+            // job": the account the pipeline lives in, which is the one account this
+            // emulator serves.
+            account_id: Some(::engine::emulator_account_id().to_string()),
+        }
+    }
+
+    /// This job as `GetJobDetails` reports it.
+    ///
+    /// The same job, read back: `JobDetails` carries everything `Job` does except the
+    /// `nonce`, which is the claim one poll granted rather than a property of the job.
+    pub fn to_details(&self) -> crate::ops::types::JobDetails {
+        crate::ops::types::JobDetails {
+            id: Some(self.job_id.clone()),
+            data: Some(self.to_data()),
+            account_id: Some(::engine::emulator_account_id().to_string()),
+        }
+    }
+
+    /// What a worker needs to perform this job, as `JobData` models it.
+    pub fn to_data(&self) -> JobData {
+        JobData {
+            action_type_id: Some(self.action_type.clone()),
+            action_configuration: Some(ActionConfiguration {
+                configuration: (!self.configuration.is_empty()).then(|| {
+                    self.configuration
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect()
+                }),
+            }),
+            pipeline_context: Some(PipelineContext {
+                pipeline_name: Some(self.pipeline_name.clone()),
+                stage: Some(StageContext {
+                    name: Some(self.stage_name.clone()),
+                }),
+                action: Some(ActionContext {
+                    name: Some(self.action_name.clone()),
+                    action_execution_id: Some(self.action_execution_id.clone()),
+                }),
+                pipeline_arn: Some(self.pipeline_arn.clone()),
+                pipeline_execution_id: Some(self.pipeline_execution_id.clone()),
+            }),
+            input_artifacts: optional_list(self.input_artifacts.clone()),
+            output_artifacts: optional_list(self.output_artifacts.clone()),
+            // `artifactCredentials` is an STS session SCOPED to the artifact bucket
+            // ("temporary credentials that are issued by Amazon Web Services Secure
+            // Token Service"). This emulator's credential store holds no policies, so
+            // a session it minted would carry no scope at all — it would authorize
+            // every request of every service, which is not what this member stands
+            // for — and nothing would revoke it either: a job is released by paths
+            // with no credential store in reach (its execution being evicted, its
+            // pipeline deleted, the queue bound dropping it). So no credential is
+            // invented here and the member is absent; a worker reaches the artifact
+            // locations above with the credential it already signs its calls with.
+            artifact_credentials: None,
+            continuation_token: self.continuation_token.clone(),
+            encryption_key: self.encryption_key.clone(),
+        }
+    }
+
+    /// Whether this job may be handed to a polling worker at `now`: it is still
+    /// waiting for one, and no claim on it is in force.
+    pub fn is_available(&self, now: SystemTime) -> bool {
+        self.status == JOB_STATUS_QUEUED
+            && self.leased_until.is_none_or(|until| until <= now)
+    }
+
+    /// Hand this job to the worker that is polling: mint the `nonce` that worker
+    /// presents to `AcknowledgeJob`, and hold the job for [`JOB_POLL_LEASE`].
+    ///
+    /// The nonce is minted per lease and is unpredictable, so the claim it grants
+    /// cannot be taken by a worker that was never handed the job, and the nonce of a
+    /// lease that lapsed no longer reaches it.
+    pub fn lease(&mut self, now: SystemTime) {
+        self.nonce = Some(random_uuid_v4());
+        self.leased_until = Some(now + JOB_POLL_LEASE);
+    }
+
+    /// Whether this job's action configuration satisfies a poll's `queryParam` pair.
+    ///
+    /// `PollForJobs` documents it: "only jobs whose action configuration matches the
+    /// mapped value are returned". A poll that supplied no pair selects every job.
+    pub fn matches_query(&self, query: Option<(&str, &str)>) -> bool {
+        query.is_none_or(|(name, value)| {
+            self.configuration.get(name).map(String::as_str) == Some(value)
+        })
+    }
+}
+
+/// What `JobNotFoundException` states, for every operation that raises it: the id the
+/// caller asked for, and nothing else about the store. One source, so the two job
+/// planes cannot drift on what a missing job is reported as.
+pub fn job_not_found_message(job_id: &str) -> String {
+    format!("Job with id '{job_id}' does not exist.")
+}
+
+/// One artifact of a job, named and placed where its bytes live — or, for an artifact
+/// the job is still to produce, where they are to be written.
+///
+/// `ArtifactLocation` is how `JobData` tells a worker where to read and write: the
+/// artifact store is an S3 bucket, so the location is the bucket and object key the
+/// execution plane assigned the artifact.
+pub fn job_artifact(name: &str, location: &ArtifactRef) -> Artifact {
+    Artifact {
+        name: Some(name.to_string()),
+        revision: location.revision.clone(),
+        location: Some(ArtifactLocation {
+            r#type: Some(ARTIFACT_LOCATION_TYPE_S3.to_string()),
+            s3_location: Some(S3ArtifactLocation {
+                bucket_name: location.bucket.clone(),
+                object_key: location.key.clone(),
+            }),
+        }),
+    }
 }
 
 /// One third-party job waiting for a partner's job worker.
