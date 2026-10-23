@@ -157,6 +157,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Phase 1: screen each entry, holding no lock.
         let mut outcomes: Vec<Outcome> = Vec::with_capacity(input.entries.len());
         for entry in input.entries {
+            // The `aws.` namespace belongs to Amazon Web Services' own
+            // services: an event whose `Source` is in it asserts an AWS service
+            // as its origin, and nothing a caller can be granted lets it
+            // publish one. It is a property of the entry alone, so the entry
+            // fails on its own row and the rest of the batch is still
+            // published.
+            if entry.source.as_deref().is_some_and(is_reserved_source) {
+                outcomes.push(Outcome::Refused(PutEventsResultEntry {
+                    event_id: None,
+                    error_code: Some(NOT_AUTHORIZED_FOR_SOURCE.to_string()),
+                    error_message: Some(NOT_AUTHORIZED_FOR_SOURCE_MESSAGE.to_string()),
+                }));
+                continue;
+            }
+
             // `Detail` is "a valid JSON string... The JSON string may contain
             // fields and nested subobjects": it is the event's own document, so
             // it has to be a JSON OBJECT for a pattern to be able to descend
@@ -352,4 +367,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 enum Outcome {
     Refused(PutEventsResultEntry),
     Accepted(crate::state::RecordedEvent),
+}
+
+/// The namespace Amazon Web Services reserves for the events its OWN services
+/// publish: `aws.<service>` for a service's events and `aws.partner/...` for a
+/// partner event source. A caller's event may not claim to come from it, so no
+/// client can forge an event that looks like an AWS-service one.
+///
+/// Matched as an exact, case-sensitive prefix: every other comparison this
+/// service makes on a `Source` is byte for byte (an `EventPattern`'s `source`
+/// clause included), so `awsome.example` and `com.aws.example` are the
+/// caller's own namespaces, not the reserved one.
+const RESERVED_SOURCE_PREFIX: &str = "aws.";
+
+/// The non-retryable per-entry code this API publishes for a `Source` the
+/// caller may not publish under: "You do not have permissions to publish
+/// events with this source onto this event bus"
+/// (`PutEventsResultEntry$ErrorCode` of the EventBridge model this legacy model
+/// is an alias of — `smithy_query(query="doc", shape="PutEventsResultEntry",
+/// member="ErrorCode",
+/// model_path="services/service-com-amazonaws-eventbridge-awsevents/smithy-model/com-amazonaws-eventbridge-awsevents.json")`).
+const NOT_AUTHORIZED_FOR_SOURCE: &str = "NotAuthorizedForSourceException";
+
+/// The message that accompanies [`NOT_AUTHORIZED_FOR_SOURCE`]. It is a CONSTANT
+/// of the condition — the verdict is on the namespace the source claims, not on
+/// anything else in the entry — so it carries none of the request's values.
+const NOT_AUTHORIZED_FOR_SOURCE_MESSAGE: &str = "Not authorized for the source.";
+
+/// Whether `source` lies in the reserved [`RESERVED_SOURCE_PREFIX`] namespace.
+fn is_reserved_source(source: &str) -> bool {
+    source.starts_with(RESERVED_SOURCE_PREFIX)
 }

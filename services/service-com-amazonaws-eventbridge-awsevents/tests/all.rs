@@ -19,6 +19,8 @@ mod event_bus_deletion;
 mod event_bus_lifecycle;
 #[path = "all/input_validation.rs"]
 mod input_validation;
+#[path = "all/reserved_event_source.rs"]
+mod reserved_event_source;
 #[path = "all/rule_lifecycle.rs"]
 mod rule_lifecycle;
 #[path = "all/state_roundtrip.rs"]
