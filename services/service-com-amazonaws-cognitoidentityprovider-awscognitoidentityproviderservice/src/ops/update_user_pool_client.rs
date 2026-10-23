@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateUserPoolClient
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateUserPoolClient`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateUserPoolClient::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the configuration of one app client of a user pool: every member this
+//! operation's input models is REPLACED (by the request's value, or by the service
+//! default when the request carries none), and the updated app client is rendered
+//! from what is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -324,18 +320,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateUserPoolClient` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateUserPoolClientErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        let client = pool
+            .clients
+            .get_mut(&input.client_id)
+            .ok_or_else(|| client_not_found(&input.client_id))?;
+
+        // "If you don't provide a value for an attribute, Amazon Cognito sets it to
+        // its default value" (this operation's documentation): every member this
+        // input models is REPLACED — by the request's value when it carries one, by
+        // the service default when it does not — so an update never merges with what
+        // the client held.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateUserPoolClient"))
+        // `ClientName` is the one exception: an app client must carry a name and the
+        // model documents no default for it, so an absent `ClientName` leaves the
+        // stored name alone.
+        if let Some(client_name) = input.client_name {
+            client.client_name = client_name;
+        }
+
+        // Members the model gives a default: `RefreshTokenValidity` defaults to `0`
+        // (which the client's `refresh_token_ttl` reads as the documented 30 days) and
+        // `AllowedOAuthFlowsUserPoolClient` defaults to `false`; the deserializer has
+        // already applied both, so the input's value IS the effective one.
+        client.refresh_token_validity = input.refresh_token_validity;
+        client.allowed_oauth_flows_user_pool_client = input.allowed_o_auth_flows_user_pool_client;
+
+        // Members with a documented default that `state.rs` owns, so a create and an
+        // update agree on what "unset" means.
+        client.prevent_user_existence_errors =
+            crate::state::effective_prevent_user_existence_errors(
+                input.prevent_user_existence_errors,
+            );
+        client.explicit_auth_flows = input.explicit_auth_flows.unwrap_or_else(|| {
+            crate::state::DEFAULT_EXPLICIT_AUTH_FLOWS
+                .iter()
+                .map(|flow| (*flow).to_string())
+                .collect()
+        });
+        // "If you don't include this parameter, token revocation is automatically
+        // activated" (`EnableTokenRevocation`), and additional user context data is
+        // off until a request asks for it.
+        client.enable_token_revocation = input.enable_token_revocation.unwrap_or(true);
+        client.enable_propagate_additional_user_context_data = input
+            .enable_propagate_additional_user_context_data
+            .unwrap_or(false);
+
+        // Everything else is optional with no default but "absent", so an omitted
+        // member clears what the client held.
+        client.access_token_validity = input.access_token_validity;
+        client.id_token_validity = input.id_token_validity;
+        client.token_validity_units = input.token_validity_units;
+        client.read_attributes = input.read_attributes;
+        client.write_attributes = input.write_attributes;
+        client.supported_identity_providers = input.supported_identity_providers;
+        client.callback_urls = input.callback_ur_ls;
+        client.logout_urls = input.logout_ur_ls;
+        client.default_redirect_uri = input.default_redirect_uri;
+        client.allowed_oauth_flows = input.allowed_o_auth_flows;
+        client.allowed_oauth_scopes = input.allowed_o_auth_scopes;
+        client.analytics_configuration = input.analytics_configuration;
+        client.auth_session_validity = input.auth_session_validity;
+        client.refresh_token_rotation = input.refresh_token_rotation;
+
+        // `ClientId`, `ClientSecret`, `UserPoolId` and `CreationDate` are not members
+        // of this operation's input — they are fixed when the app client is created —
+        // so they survive the update. The client changed, so its last-modified instant
+        // advances.
+        client.last_modified_date = now;
+
+        // Rendered from the STORED client, so the response is what a later
+        // `DescribeUserPoolClient` sees.
+        Ok(UpdateUserPoolClientOutput {
+            user_pool_client: Some(client.to_user_pool_client_type()),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> UpdateUserPoolClientError {
+    UpdateUserPoolClientErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for an absent app client.
+fn client_not_found(client_id: &str) -> UpdateUserPoolClientError {
+    UpdateUserPoolClientErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> UpdateUserPoolClientError {
+    UpdateUserPoolClientErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }
