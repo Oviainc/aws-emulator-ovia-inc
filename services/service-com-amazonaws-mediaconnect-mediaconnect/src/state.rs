@@ -18,8 +18,8 @@ use crate::ops::types::{
     EncodingParameters, Encryption, Entitlement, FailoverConfig, Flow, FlowTransitEncryption, Fmtp,
     Gateway, GatewayNetwork, GrantEntitlementRequest, Interface, ListedFlow, ListedGateway,
     Maintenance, MediaStream, MediaStreamAttributes, MediaStreamOutputConfiguration,
-    MediaStreamOutputConfigurationRequest, MonitoringConfig, NdiConfig, Output, Source, Transport,
-    VpcInterface, VpcInterfaceAttachment,
+    MediaStreamOutputConfigurationRequest, MonitoringConfig, NdiConfig, Output, SetSourceRequest,
+    Source, Transport, VpcInterface, VpcInterfaceAttachment,
 };
 
 /// The `Status` enum the model declares for a flow
@@ -280,6 +280,18 @@ pub const MAX_FLOW_ENTITLEMENTS: usize = 50;
 /// the request.
 pub const MAX_FLOW_MEDIA_STREAMS: usize = MAX_FLOW_COLLECTION_ENTRIES;
 
+/// The ceiling on how many sources ONE FLOW holds, however many calls fill it.
+///
+/// AWS publishes no count for a flow's sources, so the number is
+/// [`MAX_FLOW_COLLECTION_ENTRIES`] — the bound CreateFlow applies to one request's
+/// `Sources` — named once so the create side and the add side cannot drift apart. Like
+/// [`MAX_FLOW_MEDIA_STREAMS`] it is a different RULE from that per-request bound: this
+/// one bounds the STORED flow, so a sequence of adds cannot grow one past what a single
+/// create could store. AddFlowSources models no 420, so it refuses past this bound with
+/// `BadRequestException`, the error the model describes for "a semantic error" in the
+/// request.
+pub const MAX_FLOW_SOURCES: usize = MAX_FLOW_COLLECTION_ENTRIES;
+
 /// The first port handed to a source that did not ask for one. MediaConnect assigns an
 /// ingest port from its own pool when the request omits `IngestPort`; the emulator
 /// assigns from a WRAPPING pool that starts at this base, so a source's port is drawn
@@ -411,6 +423,74 @@ pub struct StoredSource {
 }
 
 impl StoredSource {
+    /// Materialise one `SetSourceRequest` into the source record a flow keeps, under the
+    /// name [`resolve_source_name`] gave it.
+    ///
+    /// Every operation that adds a source to a flow (CreateFlow's `Source` / `Sources`,
+    /// AddFlowSources) materialises it HERE, so one request shape always becomes the same
+    /// stored record: the service mints the `SourceArn`, assigns the ingest endpoint an
+    /// owned source listens on, and folds the request's transport members into
+    /// `Source.Transport`.
+    ///
+    /// `SetSourceRequest$SourceTags` is not stored: `Source` models no tag member, so no
+    /// implemented operation could report it — exactly as the output and media-stream tags
+    /// of a create request are not stored either.
+    pub fn from_set_request(
+        request: &SetSourceRequest,
+        name: String,
+        region: &str,
+        suffix: u64,
+    ) -> Self {
+        // A source reached through another account's entitlement is fed by that account's
+        // flow, so this service assigns it no ingest endpoint of its own; an owned source
+        // listens on the address and port the service assigns it.
+        let entitled = request.entitlement_arn.is_some();
+        StoredSource {
+            source_arn: ::engine::emulator_arn(
+                SERVICE_NAMESPACE,
+                region,
+                &source_resource_fragment(suffix, &name),
+            ),
+            name,
+            description: request.description.clone(),
+            ingest_ip: (!entitled).then(|| assigned_ingest_ip(suffix)),
+            ingest_port: (!entitled).then(|| {
+                request
+                    .ingest_port
+                    .unwrap_or_else(|| assigned_ingest_port(suffix))
+            }),
+            whitelist_cidr: request.whitelist_cidr.clone(),
+            entitlement_arn: request.entitlement_arn.clone(),
+            vpc_interface_name: request.vpc_interface_name.clone(),
+            sender_ip_address: request.sender_ip_address.clone(),
+            sender_control_port: request.sender_control_port,
+            decryption: request.decryption.clone(),
+            // What the request asked for; the state the source REPORTS is resolved by
+            // `reported_router_integration_state`, which gives a source whose request
+            // never mentioned router integration the disabled state.
+            router_integration_state: request.router_integration_state.clone(),
+            router_integration_transit_decryption: request
+                .router_integration_transit_decryption
+                .clone(),
+            // `Transport.Protocol` is required, so a source that names no protocol (an
+            // entitled one, say) carries no transport rather than an empty one.
+            transport: request.protocol.clone().map(|protocol| Transport {
+                max_bitrate: assigned_source_max_bitrate(&protocol, request.max_bitrate),
+                protocol,
+                max_latency: request.max_latency,
+                max_sync_buffer: request.max_sync_buffer,
+                min_latency: request.min_latency,
+                sender_control_port: request.sender_control_port,
+                sender_ip_address: request.sender_ip_address.clone(),
+                source_listener_address: request.source_listener_address.clone(),
+                source_listener_port: request.source_listener_port,
+                stream_id: request.stream_id.clone(),
+                ndi_source_settings: request.ndi_source_settings.clone(),
+                ..Transport::default()
+            }),
+        }
+    }
+
     /// The modelled `Source` for this record.
     pub fn to_source(&self) -> Source {
         Source {
@@ -800,6 +880,15 @@ impl StoredFlow {
             .collect()
     }
 
+    /// The names of the sources the flow already holds — what [`resolve_source_name`]
+    /// checks a generated source name against.
+    pub fn source_names(&self) -> BTreeSet<String> {
+        self.sources
+            .iter()
+            .map(|source| source.name.clone())
+            .collect()
+    }
+
     /// The names of the entitlements the flow already carries — what
     /// [`resolve_entitlement_name`] checks a new entitlement's name against.
     pub fn entitlement_names(&self) -> BTreeSet<String> {
@@ -1069,6 +1158,58 @@ pub fn resolve_output_name(requested: Option<&str>, taken: &BTreeSet<String>) ->
         None => (1..)
             .map(|position| format!("output-{position}"))
             .find(|candidate| !taken.contains(candidate)),
+    }
+}
+
+/// The resource fragment of a source ARN: `source:<source id>:<name>`.
+///
+/// The id is the ARN counter in zero-padded hex, like [`output_resource_fragment`]'s, so
+/// the fragment satisfies the pattern the model puts on every `SourceArn` label
+/// (`smithy_query(query="operation",operation="RemoveFlowSource")`:
+/// `^arn:.+:mediaconnect.+:source:.+$`) and is unique per source.
+pub fn source_resource_fragment(suffix: u64, name: &str) -> String {
+    format!("source:1-{suffix:08x}:{name}")
+}
+
+/// The name a `SetSourceRequest` takes on a flow named `flow_name` whose source names
+/// are `taken`, for a source landing at `position` in the flow's source list.
+///
+/// `SetSourceRequest$Name` is "the name of the source" and is OPTIONAL, while
+/// `Source$Name` is REQUIRED — so a source whose request named none is named by the
+/// service. The model states no uniqueness rule on a source's name (a source is addressed
+/// by its ARN, never by its name: RemoveFlowSource and UpdateFlowSource take `SourceArn`
+/// as the `@httpLabel`), so a name the REQUEST chose is kept as given, exactly like a flow
+/// name; but a name the SERVICE generates skips the ones the flow already holds, so no
+/// call mints a duplicate of a name already on the flow.
+///
+/// The generated sequence is the flow's own name for the flow's first source and
+/// `<flow name>-<n>` (n counting from 2) after it, the shape MediaConnect's own
+/// console-created flows carry. `taken` is every source name the flow already holds PLUS
+/// the names resolved for earlier sources of the same request, so one request cannot
+/// generate one name twice.
+///
+/// Every operation that adds a source to a flow (CreateFlow, AddFlowSources) names it
+/// HERE, so a flow's source names do not depend on which call wrote them.
+pub fn resolve_source_name(
+    requested: Option<&str>,
+    flow_name: &str,
+    position: usize,
+    taken: &BTreeSet<String>,
+) -> String {
+    if let Some(name) = requested.filter(|name| !name.is_empty()) {
+        return name.to_string();
+    }
+    let mut candidate_position = position;
+    loop {
+        let candidate = if candidate_position == 0 {
+            flow_name.to_string()
+        } else {
+            format!("{flow_name}-{}", candidate_position + 1)
+        };
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+        candidate_position += 1;
     }
 }
 
