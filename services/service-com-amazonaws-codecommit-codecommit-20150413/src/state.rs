@@ -235,9 +235,27 @@ pub fn repository_name_of_resource_arn(raw: &str) -> Result<&str, ResourceArnPro
 
 /// The message AWS returns with `RepositoryDoesNotExistException`: the requested
 /// repository name, then `" for "`, then the account the lookup ran in.
+///
+/// CodeCommit words each of its request-derived client errors with one fixed
+/// template per error code, so this crate builds each such message in exactly one
+/// place and every operation raising that code goes through it — two operations
+/// cannot word the same code differently, and a client that matches on the message
+/// reads the same text it reads against AWS.
 pub fn repository_does_not_exist_message(name: &str) -> String {
     format!("{name} for {}", ::engine::emulator_account_id())
 }
+
+/// `RepositoryNameExistsException`'s message: `Repository named <name> already
+/// exists`, built from the requested name.
+pub fn repository_name_exists_message(repository_name: &str) -> String {
+    format!("Repository named {repository_name} already exists")
+}
+
+/// `BranchDoesNotExistException`'s message. The template has no slot: CodeCommit
+/// returns this constant and names neither the branch nor the repository, because
+/// a reference that resolves to a tag rather than a branch answers the very same
+/// message — an ambiguity clients are written against.
+pub const BRANCH_DOES_NOT_EXIST_MESSAGE: &str = "The specified branch does not exist";
 
 /// The combined size of all the file content one commit may carry, in bytes.
 /// CodeCommit documents this on `FileContentSizeLimitExceededException`: "The

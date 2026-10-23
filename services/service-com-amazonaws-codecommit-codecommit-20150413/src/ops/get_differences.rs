@@ -319,9 +319,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let repository = store.repositories.get(&input.repository_name).ok_or_else(|| {
             GetDifferencesErrorModeled::RepositoryDoesNotExistException(
                 RepositoryDoesNotExistException {
-                    message: Some(format!(
-                        "the repository {} does not exist",
-                        input.repository_name
+                    message: Some(crate::state::repository_does_not_exist_message(
+                        &input.repository_name,
                     )),
                 },
             )

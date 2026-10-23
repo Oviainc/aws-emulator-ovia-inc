@@ -196,7 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.repositories.contains_key(&input.old_name) {
             return Err(UpdateRepositoryNameErrorModeled::RepositoryDoesNotExistException(
                 RepositoryDoesNotExistException {
-                    message: Some(format!("the repository {} does not exist", input.old_name)),
+                    message: Some(crate::state::repository_does_not_exist_message(
+                        &input.old_name,
+                    )),
                 },
             )
             .into());
@@ -209,9 +211,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.repositories.contains_key(&input.new_name) {
             return Err(UpdateRepositoryNameErrorModeled::RepositoryNameExistsException(
                 RepositoryNameExistsException {
-                    message: Some(format!(
-                        "the repository name {} already exists",
-                        input.new_name
+                    message: Some(crate::state::repository_name_exists_message(
+                        &input.new_name,
                     )),
                 },
             )

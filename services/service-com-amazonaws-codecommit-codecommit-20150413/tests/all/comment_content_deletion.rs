@@ -25,12 +25,13 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::comment_deleted_refusals::comment_deleted_message;
 use crate::comment_lifecycle::{fixture, Fixture, MAX_COMMENT_CHARACTERS, OTHER_ACCESS_KEY_ID, PATH};
 use crate::repository_lifecycle::{ok, string_at};
-use crate::wire::{ok_as, refusal_as, DEFAULT_ACCESS_KEY_ID};
+use crate::wire::ok_as;
 
-/// The code AND message of a refused call, as the shared `wire` harness parses
-/// them: every error this suite asserts is a modelled 400.
+/// The code AND message of a refused call: every error this suite asserts is a
+/// modelled 400, and the parse is the crate's single one
+/// ([`crate::harness::error_with_message`], over `crate::wire::refusal_as`).
 async fn refusal(router: &MultiServiceRouter, operation: &str, body: &Value) -> (String, String) {
-    refusal_as(router, DEFAULT_ACCESS_KEY_ID, operation, body, 400).await
+    crate::harness::error_with_message(router, operation, body, 400).await
 }
 
 /// One row of the deletion table.

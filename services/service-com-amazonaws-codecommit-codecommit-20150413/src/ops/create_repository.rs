@@ -271,9 +271,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.repositories.contains_key(&input.repository_name) {
             return Err(CreateRepositoryErrorModeled::RepositoryNameExistsException(
                 RepositoryNameExistsException {
-                    message: Some(format!(
-                        "the repository name {} already exists",
-                        input.repository_name
+                    message: Some(crate::state::repository_name_exists_message(
+                        &input.repository_name,
                     )),
                 },
             )

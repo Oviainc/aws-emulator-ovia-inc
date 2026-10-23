@@ -194,9 +194,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 UpdateDefaultBranchErrorModeled::RepositoryDoesNotExistException(
                     RepositoryDoesNotExistException {
-                        message: Some(format!(
-                            "the repository {} does not exist",
-                            input.repository_name
+                        message: Some(crate::state::repository_does_not_exist_message(
+                            &input.repository_name,
                         )),
                     },
                 )
@@ -207,10 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !repository.branches.contains_key(&input.default_branch_name) {
             return Err(UpdateDefaultBranchErrorModeled::BranchDoesNotExistException(
                 BranchDoesNotExistException {
-                    message: Some(format!(
-                        "the branch {} does not exist in the repository {}",
-                        input.default_branch_name, input.repository_name
-                    )),
+                    message: Some(crate::state::BRANCH_DOES_NOT_EXIST_MESSAGE.to_string()),
                 },
             )
             .into());

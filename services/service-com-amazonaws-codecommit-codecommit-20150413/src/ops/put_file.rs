@@ -323,9 +323,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 PutFileErrorModeled::RepositoryDoesNotExistException(
                     RepositoryDoesNotExistException {
-                        message: Some(format!(
-                            "the repository {} does not exist",
-                            input.repository_name
+                        message: Some(crate::state::repository_does_not_exist_message(
+                            &input.repository_name,
                         )),
                     },
                 )
@@ -392,10 +391,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !repository.branches.is_empty() {
                     return Err(PutFileErrorModeled::BranchDoesNotExistException(
                         BranchDoesNotExistException {
-                            message: Some(format!(
-                                "the branch {} does not exist in the repository {}",
-                                input.branch_name, input.repository_name
-                            )),
+                            message: Some(
+                                crate::state::BRANCH_DOES_NOT_EXIST_MESSAGE.to_string(),
+                            ),
                         },
                     )
                     .into());

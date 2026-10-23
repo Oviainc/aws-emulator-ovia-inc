@@ -189,15 +189,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let repository = store.repositories.get(&repository_name).ok_or_else(|| {
             GetBranchErrorModeled::RepositoryDoesNotExistException(
                 RepositoryDoesNotExistException {
-                    message: Some(format!("the repository {repository_name} does not exist")),
+                    message: Some(crate::state::repository_does_not_exist_message(
+                        &repository_name,
+                    )),
                 },
             )
         })?;
         let branch = repository.branches.get(&branch_name).ok_or_else(|| {
             GetBranchErrorModeled::BranchDoesNotExistException(BranchDoesNotExistException {
-                message: Some(format!(
-                    "the branch {branch_name} does not exist in the repository {repository_name}"
-                )),
+                message: Some(crate::state::BRANCH_DOES_NOT_EXIST_MESSAGE.to_string()),
             })
         })?;
 

@@ -23,6 +23,8 @@ mod blob_content;
 mod branch_create;
 #[path = "all/branch_creation.rs"]
 mod branch_creation;
+#[path = "all/client_error_messages.rs"]
+mod client_error_messages;
 #[path = "all/comment_content_deletion.rs"]
 mod comment_content_deletion;
 #[path = "all/comment_deleted_refusals.rs"]

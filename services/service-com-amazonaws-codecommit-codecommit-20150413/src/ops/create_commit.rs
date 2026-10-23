@@ -511,10 +511,7 @@ fn resolve_parent(
             if !repository.branches.is_empty() {
                 return Err(CreateCommitErrorModeled::BranchDoesNotExistException(
                     BranchDoesNotExistException {
-                        message: Some(format!(
-                            "the branch {branch_name} does not exist in the repository \
-                             {repository_name}"
-                        )),
+                        message: Some(crate::state::BRANCH_DOES_NOT_EXIST_MESSAGE.to_string()),
                     },
                 )
                 .into());
@@ -596,9 +593,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 CreateCommitErrorModeled::RepositoryDoesNotExistException(
                     RepositoryDoesNotExistException {
-                        message: Some(format!(
-                            "the repository {} does not exist",
-                            input.repository_name
+                        message: Some(crate::state::repository_does_not_exist_message(
+                            &input.repository_name,
                         )),
                     },
                 )
