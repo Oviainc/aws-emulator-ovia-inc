@@ -571,10 +571,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::normalized_auto_rollback_configuration(Some(configuration));
             }
             if let Some(strategy) = input.outdated_instances_strategy {
-                group.outdated_instances_strategy = Some(strategy);
+                group.outdated_instances_strategy =
+                    crate::state::effective_outdated_instances_strategy(Some(strategy));
             }
             if let Some(style) = input.deployment_style {
-                group.deployment_style = Some(style);
+                // Materialised exactly as at create time: a style naming only
+                // one of its two members gets the server-side default for the
+                // other, so a group never holds a half-stated style.
+                group.deployment_style = crate::state::effective_deployment_style(Some(style));
             }
             if let Some(configuration) = input.blue_green_deployment_configuration {
                 group.blue_green_deployment_configuration = Some(configuration);
