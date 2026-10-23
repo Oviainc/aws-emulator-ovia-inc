@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-managedblockchainquery-tietonchainqueryservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchainquery#ListTransactionEventsInput")]
+// Every constrained member carries `skip_validation`, so this operation's handler
+// answers a value outside their modelled constraints with the service's own
+// `ValidationException`. See the note on `TokenIdentifier` in `shared_types.rs` and
+// `crate::state::validation`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.managedblockchainquery#ListTransactionEventsInput",
+    skip_validation = ["transactionHash", "transactionId", "network", "nextToken", "maxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListTransactionEventsInput {
     pub transaction_hash: Option<String>,

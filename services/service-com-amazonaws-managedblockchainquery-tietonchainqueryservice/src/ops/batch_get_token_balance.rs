@@ -7,9 +7,13 @@
 //!
 //! A batch read answers the whole request with HTTP 200: an item the ledger holds a
 //! balance for goes to `tokenBalances`, and an item the single-item read would have
-//! refused goes to `errors` as a `BatchGetTokenBalanceErrorItem` carrying that
-//! failure's modelled `ErrorType`, the refused exception's code and its message. One
-//! item's failure therefore never costs the caller the balances of the others.
+//! refused — for a value outside a modelled constraint, for a `tokenIdentifier` that
+//! names no token, or for a holding the ledger does not know — goes to `errors` as a
+//! `BatchGetTokenBalanceErrorItem` carrying that failure's modelled `ErrorType`, its
+//! status and its message. One item's failure therefore never costs the caller the
+//! balances of the others. A top-level `ValidationException` is reserved for what is
+//! wrong with the REQUEST rather than with an item — the item list's own
+//! `@length(1, 10)`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,6 +165,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // What is wrong with the REQUEST is a top-level refusal: this service's own
+        // `ValidationException`, with its required `reason` and a `fieldList`. It runs
+        // before the store is reached, so caller-sized validation never holds the
+        // shared state's lock.
+        crate::state::validation::batch_get_token_balance_input(
+            input.get_token_balance_inputs.as_deref(),
+        )
+        .map_err(BatchGetTokenBalanceErrorModeled::ValidationException)?;
+
+        // `GetTokenBalanceInputList` is `@length(min: 1, max: 10)`, refused above — but
+        // the member itself is modelled optional, and a request that asks for no balance
+        // is answered by the two empty lists the output requires rather than by a
+        // refusal the model does not declare.
+        let requested = input.get_token_balance_inputs.unwrap_or_default();
+
+        // EVERY item is checked here, before the store is reached, so no caller-sized
+        // work ever holds the shared state's lock. What bounds that work: the item
+        // count is the modelled `@length(min: 1, max: 10)` refused just above; each
+        // string an item carries is checked against ONE modelled constraint through the
+        // framework's own constraint walk (`crate::state::validation`), whose schemas are
+        // built once into `LazyLock` statics rather than per request or per item;
+        // and the report a bad item produces is capped there at `MAX_VIOLATIONS`
+        // entries, with each echoed value elided by the framework's own walk.
+        //
+        // What is wrong with ONE ITEM is reported as that item's entry in `errors`, so
+        // every other item in the batch is still answered. The item is checked against
+        // the same modelled constraints the single read's input carries (its members
+        // carry `skip_validation`, so the framework cannot refuse the whole request for
+        // one item's value).
+        let checked: Vec<(&BatchGetTokenBalanceInputItem, Option<ValidationException>)> = requested
+            .iter()
+            .map(|item| {
+                let violations = crate::state::validation::batch_get_token_balance_item(item);
+                let refusal = (!violations.is_empty())
+                    .then(|| crate::state::validation::constraint_exception(&violations));
+                (item, refusal)
+            })
+            .collect();
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             BatchGetTokenBalanceErrorModeled::InternalServerException(
                 crate::state::store_unavailable(),
@@ -168,25 +211,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
-        // `GetTokenBalanceInputList` is `@length(min: 1, max: 10)`, so a present list is
-        // never empty by the time a handler runs — but the member itself is modelled
-        // optional, and a request that asks for no balance is answered by the two empty
-        // lists the output requires rather than by a refusal the model does not declare.
-        let requested = input.get_token_balance_inputs.unwrap_or_default();
-
         // Every item of one batch is read as of the same instant, so an item that named
         // no `atBlockchainInstant` is read — and reported — as of this one.
         let read_at = crate::state::now_secs();
 
-        let mut token_balances = Vec::with_capacity(requested.len());
+        let mut token_balances = Vec::with_capacity(checked.len());
         let mut errors = Vec::new();
 
-        for item in &requested {
-            match state.read_token_balance(
-                &item.token_identifier,
-                &item.owner_identifier,
-                item.at_blockchain_instant.as_ref(),
-            ) {
+        for (item, refusal) in checked {
+            // Under the lock only the read happens: a map lookup per item.
+            let read = match refusal {
+                Some(error) => Err(crate::state::BalanceFailure::Invalid(error)),
+                None => state.read_token_balance(
+                    &item.token_identifier,
+                    &item.owner_identifier,
+                    item.at_blockchain_instant.as_ref(),
+                ),
+            };
+            match read {
                 // `BatchGetTokenBalanceOutputItem` declares exactly the members of the
                 // `TokenBalance` the single-item read returns.
                 Ok(balance) => token_balances.push(BatchGetTokenBalanceOutputItem {
@@ -220,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // exception. So a batch item and the single read cannot disagree
                     // about the status, whatever the model says it is.
                     let raised: BatchGetTokenBalanceErrorModeled = match failure {
-                        crate::state::BalanceFailure::Unidentified(error) => {
+                        crate::state::BalanceFailure::Invalid(error) => {
                             BatchGetTokenBalanceErrorModeled::ValidationException(error)
                         }
                         crate::state::BalanceFailure::NotFound(error) => {

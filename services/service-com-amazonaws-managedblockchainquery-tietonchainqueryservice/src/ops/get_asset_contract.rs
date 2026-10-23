@@ -164,30 +164,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            GetAssetContractErrorModeled::InternalServerException(crate::state::store_unavailable())
-        })?;
-        let state = state.lock();
+        // Every modelled constraint on this input is checked HERE rather than at the
+        // framework boundary, so a refusal is this service's own `ValidationException`
+        // with its required `reason` and a `fieldList`. See `crate::state::validation`.
+        // It runs before the store is reached, so caller-sized validation never holds
+        // the shared state's lock.
+        crate::state::validation::get_asset_contract_input(&input)
+            .map_err(GetAssetContractErrorModeled::ValidationException)?;
 
         let requested = &input.contract_identifier;
 
         // This operation's own documentation: "The Bitcoin blockchain networks do not
         // support this operation". `QueryNetwork` is one enum for every network, so the
-        // boundary validator admits a Bitcoin network here and only the operation can
-        // refuse it.
+        // model cannot express the restriction and only the operation can refuse it —
+        // which it does the way this service states every rule of its own.
         if crate::state::is_bitcoin(&requested.network) {
             return Err(GetAssetContractErrorModeled::ValidationException(
-                crate::state::field_validation_exception(
-                    "contractIdentifier.network",
-                    format!(
-                        "the Bitcoin blockchain networks do not support GetAssetContract, \
-                         including {}",
-                        requested.network
-                    ),
-                ),
+                crate::state::contracts_unsupported_on_network("contractIdentifier.network"),
             )
             .into());
         }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAssetContractErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let state = state.lock();
 
         let contract = state
             .ledger(&requested.network)

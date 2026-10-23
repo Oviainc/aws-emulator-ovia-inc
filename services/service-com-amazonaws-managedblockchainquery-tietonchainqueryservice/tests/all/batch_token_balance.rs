@@ -18,7 +18,7 @@
 
 use serde_json::{json, Value};
 
-use crate::chain_query_slice::{error_code, token_json, Emulator, NetworkFixture};
+use crate::chain_query_slice::{error_code, refusal_explanation, token_json, Emulator, NetworkFixture};
 
 /// The largest batch the model admits: `GetTokenBalanceInputList` carries
 /// `@length(min: 1, max: 10)`, and `BatchGetTokenBalanceOutputList` /
@@ -108,19 +108,18 @@ async fn single_read(emulator: &Emulator, row: &Row) -> Expected {
                 .to_string(),
             last_updated_time: body["lastUpdatedTime"].clone(),
         },
-        400 | 404 => Expected::Failure {
-            status,
-            code: error_code(&body),
-            message: body["message"]
-                .as_str()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "case {}: a refusal carries a message, got {body:?}",
-                        row.label
-                    )
-                })
-                .to_string(),
-        },
+        status @ (400 | 404) => {
+            assert!(
+                body["message"].as_str().is_some(),
+                "case {}: a refusal carries a message, got {body:?}",
+                row.label
+            );
+            Expected::Failure {
+                status,
+                code: error_code(&body),
+                message: refusal_explanation(&body),
+            }
+        }
         other => panic!(
             "case {}: GetTokenBalance answered {other} with {body:?}",
             row.label

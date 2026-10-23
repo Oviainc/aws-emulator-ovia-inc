@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-managedblockchainquery-tietonchainqueryservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchainquery#ListFilteredTransactionEventsInput")]
+// Every constrained member carries `skip_validation`, so this operation answers a value
+// outside their modelled constraints with the service's own `ValidationException` rather
+// than with the framework's synthetic one. See the note on `TokenIdentifier` in
+// `shared_types.rs` and `crate::state::validation`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.managedblockchainquery#ListFilteredTransactionEventsInput",
+    skip_validation = ["nextToken", "maxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListFilteredTransactionEventsInput {
     pub network: String,
@@ -24,7 +31,10 @@ pub struct ListFilteredTransactionEventsInput {
     pub max_results: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchainquery#AddressIdentifierFilter")]
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.managedblockchainquery#AddressIdentifierFilter",
+    skip_validation = ["transactionEventToAddress"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct AddressIdentifierFilter {
     pub transaction_event_to_address: Vec<String>,
@@ -43,7 +53,10 @@ pub struct VoutFilter {
     pub vout_spent: bool,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchainquery#ListFilteredTransactionEventsSort")]
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.managedblockchainquery#ListFilteredTransactionEventsSort",
+    skip_validation = ["sortBy", "sortOrder"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListFilteredTransactionEventsSort {
     pub sort_by: Option<String>,

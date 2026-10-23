@@ -155,10 +155,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            GetTransactionErrorModeled::InternalServerException(crate::state::store_unavailable())
-        })?;
-        let state = state.lock();
+        // Every modelled constraint on this input is checked HERE rather than at the
+        // framework boundary, so a refusal is this service's own `ValidationException`
+        // with its required `reason` and a `fieldList`. See `crate::state::validation`.
+        // It runs before the store is reached, so caller-sized validation never holds
+        // the shared state's lock.
+        crate::state::validation::get_transaction_input(&input)
+            .map_err(GetTransactionErrorModeled::ValidationException)?;
 
         // Exactly one of `transactionHash`/`transactionId` names the transaction, and
         // `transactionId` only on the Bitcoin networks. Both members are modelled
@@ -169,6 +172,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.transaction_id.as_deref(),
         )
         .map_err(GetTransactionErrorModeled::ValidationException)?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTransactionErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let state = state.lock();
 
         let ledger = state.ledger(&input.network).ok_or_else(|| {
             GetTransactionErrorModeled::ResourceNotFoundException(crate::state::not_found(

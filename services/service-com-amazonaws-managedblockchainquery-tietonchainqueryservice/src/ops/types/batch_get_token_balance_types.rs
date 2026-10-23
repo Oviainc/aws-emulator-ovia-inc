@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-managedblockchainquery-tietonchainqueryservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchainquery#BatchGetTokenBalanceInput")]
+// `getTokenBalanceInputs` carries `skip_validation`: this operation reports a per-item
+// failure inside its 200 response, so the HANDLER has to see the items the framework
+// boundary would have refused. See the note on `TokenIdentifier` in `shared_types.rs`
+// and `crate::state::validation`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.managedblockchainquery#BatchGetTokenBalanceInput",
+    skip_validation = ["getTokenBalanceInputs"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct BatchGetTokenBalanceInput {
     pub get_token_balance_inputs: Option<Vec<BatchGetTokenBalanceInputItem>>,

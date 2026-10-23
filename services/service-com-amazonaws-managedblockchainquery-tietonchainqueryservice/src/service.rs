@@ -60,15 +60,20 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// escaped by a backslash is a literal dollar sign inside the expression, not the end
 /// anchor, so it stays.
 ///
-/// NOTE (the note `services/common/src/validation.rs` asks every new copy to leave):
-/// this helper, [`requirement`] and [`constraint_clause`] inline the three
-/// service-independent rules that module stages, as ~24 sibling service crates already
-/// do (`grep -rln 'fn unanchored' services/*/src`). They are inlined here rather than
-/// shared because that module is declared nowhere and so compiles nowhere; the fix that
-/// owns the migration declares it, moves these rules there and calls them from here.
-/// What is NOT service-independent — and so would stay in this file either way — is the
-/// envelope dialect and this service's choice to quote a submitted scalar value, which
-/// its recordings pin.
+/// NOTE, stated as `services/common/src/validation.rs` asks: this rule has LANDED in that
+/// shared module as `service_common::validation::unanchored`, which is the staged home for
+/// it; ~26 service crates — this one included — still carry the inlined copy below, and
+/// "nothing new should inline the rule again". This copy PRE-DATES this change and is not a
+/// new one: deleting it, together with the other crates', in favour of the shared function
+/// is that migration's own change, and the shared rendering is the stricter of the two (it
+/// drops a `^`/`$` pair only when the pair wraps the WHOLE expression), so swapping it in
+/// is a behavioural change to re-pin against this service's recordings rather than a
+/// no-op. The two rules this file also inlines — the requirement half in [`requirement`]
+/// and the subject half in [`constraint_clause`] — are the parts that module lists as
+/// still to come, so they stay here until it owns them. What is NOT service-independent,
+/// and so stays in this file either way, is the envelope dialect, which values an enum's
+/// value set lists and in which order, and this service's choice to quote a submitted
+/// scalar value — each pinned by this service's recordings and tests.
 fn unanchored(pattern: &str) -> &str {
     let body = pattern.strip_prefix('^').unwrap_or(pattern);
     match body.strip_suffix('$') {
@@ -146,7 +151,13 @@ fn is_collection_size(violation: &Violation) -> bool {
 
 /// Render one constraint violation the way AWS's validation framework states it: the
 /// submitted value, the member's dotted path, and the constraint it failed.
-fn constraint_clause(violation: &Violation) -> Option<String> {
+///
+/// `pub(crate)` because the two refusal paths share it: this file's
+/// [`Service::override_refusal`] for the refusals the framework still makes (an absent
+/// `@required` member), and `crate::state::validation` for the modelled constraints the
+/// handlers check themselves so the answer can carry the modelled `reason` and
+/// `fieldList`.
+pub(crate) fn constraint_clause(violation: &Violation) -> Option<String> {
     let requirement = requirement(&violation.kind)?;
     let path = &violation.path;
     if is_collection_size(violation) {
@@ -167,8 +178,9 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
 /// The `ValidationException` message for a refusal: the AWS envelope
 /// (`N validation error(s) detected: `) over one clause per violation.
 ///
-/// `None` declines the whole refusal — see [`constraint_clause`].
-fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+/// `None` declines the whole refusal — see [`constraint_clause`], which also says why
+/// this is `pub(crate)`.
+pub(crate) fn constraint_envelope(violations: &[Violation]) -> Option<String> {
     let clauses: Vec<String> = violations
         .iter()
         .map(constraint_clause)

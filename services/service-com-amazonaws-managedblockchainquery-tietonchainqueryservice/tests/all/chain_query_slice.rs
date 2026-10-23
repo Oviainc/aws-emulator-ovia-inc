@@ -44,6 +44,44 @@ const PAGINATED: [(&str, &str); 4] = [
 /// The route `ListFilteredTransactionEvents` is bound to (`@http(uri:)`).
 const FILTERED_EVENTS: &str = "/list-filtered-transaction-events";
 
+/// The top-level `message` this service's `ValidationException` carries for a request it
+/// refuses on a rule the MODEL cannot express (a combination of members, an ordering
+/// between two of them, a continuation token it never issued), with the per-rule detail
+/// in `fieldList` — which the model describes as "the container for the fieldList of the
+/// exception" (`smithy_query(query="shape",shape="ValidationException")`).
+///
+/// `pub(crate)` because every suite in this target that reads a refusal needs it.
+pub(crate) const GENERIC_VALIDATION_MESSAGE: &str = "One or more parameter values were invalid.";
+
+/// What a refusal SAID about the request, as the ONE sentence a place with no `fieldList`
+/// of its own can carry.
+///
+/// A `BatchGetTokenBalanceErrorItem` models one `errorMessage` and no field list, so a
+/// refusal whose top-level `message` is [`GENERIC_VALIDATION_MESSAGE`] is stated by its
+/// `fieldList` detail — otherwise the item would say nothing about what was wrong — while
+/// a refusal whose message is already the detail (a modelled-constraint report) keeps it.
+///
+/// Stated here once for the whole test target, rather than per suite.
+pub(crate) fn refusal_explanation(body: &Value) -> String {
+    let message = body["message"].as_str().unwrap_or_default();
+    if message != GENERIC_VALIDATION_MESSAGE {
+        return message.to_string();
+    }
+    let detail: Vec<&str> = body["fieldList"]
+        .as_array()
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|field| field["message"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    if detail.is_empty() {
+        return message.to_string();
+    }
+    detail.join(" ")
+}
+
 /// Whether `network` is one of the model's two Bitcoin networks —
 /// `ListFilteredTransactionEvents` "is only supported on the Bitcoin networks".
 ///
@@ -76,25 +114,13 @@ pub(crate) fn unseeded_bitcoin_address() -> String {
     format!("1{}", "z".repeat(32))
 }
 
-/// The operations this slice deliberately leaves scaffolded, with a request that
-/// satisfies every modelled constraint so the answer can only be the scaffold's own.
-///
-/// `BatchGetTokenBalance` is no longer among them: it is implemented and covered by
-/// `tests/all/batch_token_balance.rs`. Neither is `GetAssetContract`, covered by
-/// `tests/all/asset_contracts.rs`.
-fn scaffolded_operations(network: &str, address: &str) -> Vec<(&'static str, Value)> {
-    vec![
-        (
-            "/list-asset-contracts",
-            json!({"contractFilter": {
-                "network": network,
-                // `QueryTokenStandard`: ERC1155 | ERC20 | ERC721.
-                "tokenStandard": "ERC20",
-                "deployerAddress": address,
-            }}),
-        ),
-    ]
-}
+// Every operation of this service is implemented now: `ListFilteredTransactionEvents`,
+// `GetAssetContract` and `BatchGetTokenBalance` on mainline, and `ListAssetContracts` in
+// the change that answers the wire issue about this service's error responses. There is
+// therefore no scaffolded row left to assert a 501 for, and the census that listed them
+// is gone with the last stub; `error_response_shape.rs`, `error_contract.rs`,
+// `batch_token_balance.rs`, `response_fidelity.rs` and `asset_contracts.rs` cover what
+// those operations answer.
 
 /// A router with only this service mounted — one emulator "session" — plus the engine
 /// it was built on, so a test can read the ledger it serves.
@@ -1814,27 +1840,6 @@ async fn list_filtered_transaction_events_refuses_a_request_it_cannot_answer() {
 // What this slice deliberately leaves alone
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn the_operations_outside_this_slice_still_answer_501() {
-    let emulator = Emulator::new();
-    let network = emulator
-        .fixture()
-        .into_iter()
-        .next()
-        .expect("a seeded network");
-    let address = network.busiest_address();
+// Nothing: this service has no scaffolded operation left (see the note above
+// [`Emulator`]), so the 501 census this suite carried is gone with the last stub.
 
-    for (path, body) in scaffolded_operations(&network.network, &address) {
-        let (status, parsed) = emulator.post(path, &body).await;
-        assert_eq!(
-            status, 501,
-            "case {path}: an unimplemented operation answers 501, not an empty success; \
-             got {status} with {parsed:?}"
-        );
-        assert_eq!(
-            error_code(&parsed),
-            "NotImplemented",
-            "case {path}: expected NotImplemented, got {parsed:?}"
-        );
-    }
-}

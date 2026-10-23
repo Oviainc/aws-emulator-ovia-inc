@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssetContracts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssetContracts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssetContracts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the asset contracts of one network's ledger
+//! (`crate::state::NetworkLedger::contracts`) that match the request's `contractFilter`,
+//! one page at a time through `crate::state::page`. Every item is the STORED record
+//! projected onto the modelled `AssetContract`, so a listed contract is exactly the one
+//! `GetAssetContract` returns.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +157,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssetContracts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssetContractsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        // Every modelled constraint on this input is checked HERE rather than at the
+        // framework boundary, so a refusal is this service's own `ValidationException`
+        // with its required `reason` and a `fieldList`. See `crate::state::validation`.
+        // It runs before the store is reached, so caller-sized validation never holds
+        // the shared state's lock.
+        crate::state::validation::list_asset_contracts_input(&input)
+            .map_err(ListAssetContractsErrorModeled::ValidationException)?;
+
+        let filter = &input.contract_filter;
+        // "The Bitcoin blockchain networks do not support this operation."
+        if crate::state::is_bitcoin(&filter.network) {
+            return Err(ListAssetContractsErrorModeled::ValidationException(
+                crate::state::contracts_unsupported_on_network("contractFilter.network"),
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAssetContractsErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let state = state.lock();
+
+        // `ContractFilter` makes all three members required, so every one of them
+        // narrows the listing: the contracts of this network, of this token standard,
+        // deployed by this address. The ledger keys contracts by address, so iterating
+        // it is already in a stable order to page over.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssetContracts"))
+        // The deployer is matched the way every address lookup of this service matches
+        // one — on the spelling the LEDGER keys it by
+        // (`crate::state::derived::normalize_address`) — so the two spellings of one EVM
+        // account select the same contracts, as `GetAssetContract` resolves either
+        // spelling of a contract address to one contract.
+        let deployed_by = crate::state::derived::normalize_address(&filter.deployer_address);
+        let all: Vec<(String, AssetContract)> = state
+            .ledger(&filter.network)
+            .into_iter()
+            .flat_map(|ledger| ledger.contracts.values())
+            .filter(|contract| contract.token_standard == filter.token_standard)
+            .filter(|contract| contract.deployer_address() == deployed_by)
+            .map(|contract| (contract.contract_address.clone(), contract.asset_contract()))
+            .collect();
+
+        // `maxResults` carries `@range(min: 1, max: 250)`, refused above by
+        // `validation::list_asset_contracts_input`, and `state::page` clamps whatever
+        // reaches it to `state::MAX_PAGE_SIZE` (250) — the same number the output list's
+        // own `@length` carries — so one page is bounded by the model, never by the
+        // request.
+        let page = crate::state::page(all, input.max_results, input.next_token.as_deref())
+            .map_err(|_| {
+                ListAssetContractsErrorModeled::ValidationException(
+                    crate::state::invalid_page_token(),
+                )
+            })?;
+
+        Ok(ListAssetContractsOutput {
+            contracts: page.items,
+            next_token: page.next_token,
+        })
     }
 }

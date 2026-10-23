@@ -168,6 +168,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // Every modelled constraint on this input is checked HERE rather than at the
+        // framework boundary, so a refusal is this service's own `ValidationException`
+        // with its required `reason` and a `fieldList`. See `crate::state::validation`.
+        // It runs before the store is reached, so caller-sized validation never holds
+        // the shared state's lock.
+        crate::state::validation::list_transactions_input(&input)
+            .map_err(ListTransactionsErrorModeled::ValidationException)?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTransactionsErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
@@ -175,15 +183,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `fromBlockchainInstant`/`toBlockchainInstant` bound the window the listing
         // covers; a window that ends before it starts selects nothing a caller could
-        // have meant, so it is refused rather than answered with an empty page.
+        // have meant, so it is refused rather than answered with an empty page. The
+        // model cannot state an ordering between two members, so this is a rule of this
+        // service: the generic message, with the explanation in `fieldList` under the
+        // shape BOTH members target, which is the field the rule is about.
         let from = crate::state::instant_to_secs(input.from_blockchain_instant.as_ref());
         let to = crate::state::instant_to_secs(input.to_blockchain_instant.as_ref());
         if let (Some(earliest), Some(latest)) = (from, to) {
             if earliest > latest {
                 return Err(ListTransactionsErrorModeled::ValidationException(
                     crate::state::field_validation_exception(
-                        "fromBlockchainInstant",
-                        "fromBlockchainInstant must not be later than toBlockchainInstant",
+                        "BlockchainInstant",
+                        "The 'time' field in fromBlockchainInstant must be less than or equal \
+                         to the 'time' field in toBlockchainInstant.",
                     ),
                 )
                 .into());
@@ -239,10 +251,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
+        // `maxResults` carries `@range(min: 1, max: 250)`, refused above by
+        // `validation::list_transactions_input`, and `state::page` clamps whatever
+        // reaches it to `state::MAX_PAGE_SIZE` (250) — the same number the output list's
+        // own `@length` carries — so one page is bounded by the model, never by the
+        // request.
         let page = crate::state::page(all, input.max_results, input.next_token.as_deref())
-            .map_err(|error| {
+            .map_err(|_| {
                 ListTransactionsErrorModeled::ValidationException(
-                    crate::state::invalid_page_token(&error),
+                    crate::state::invalid_page_token(),
                 )
             })?;
 

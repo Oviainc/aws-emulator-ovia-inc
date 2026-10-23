@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-managedblockchainquery-tietonchainqueryservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchainquery#ListAssetContractsInput")]
+// `nextToken` and `maxResults` carry `skip_validation`, and so do `ContractFilter`'s
+// three members: this operation's handler answers a value outside their modelled
+// constraints with the service's own `ValidationException`. See the note on
+// `TokenIdentifier` in `shared_types.rs` and `crate::state::validation`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.managedblockchainquery#ListAssetContractsInput",
+    skip_validation = ["nextToken", "maxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListAssetContractsInput {
     pub contract_filter: ContractFilter,
@@ -19,7 +26,10 @@ pub struct ListAssetContractsInput {
     pub max_results: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchainquery#ContractFilter")]
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.managedblockchainquery#ContractFilter",
+    skip_validation = ["network", "tokenStandard", "deployerAddress"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ContractFilter {
     pub network: String,

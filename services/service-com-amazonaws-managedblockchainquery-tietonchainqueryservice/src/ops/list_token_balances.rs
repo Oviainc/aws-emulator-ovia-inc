@@ -168,6 +168,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // Every modelled constraint on this input is checked HERE rather than at the
+        // framework boundary, so a refusal is this service's own `ValidationException`
+        // with its required `reason` and a `fieldList`. See `crate::state::validation`.
+        // It runs before the store is reached, so caller-sized validation never holds
+        // the shared state's lock.
+        crate::state::validation::list_token_balances_input(&input)
+            .map_err(ListTokenBalancesErrorModeled::ValidationException)?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTokenBalancesErrorModeled::InternalServerException(
                 crate::state::store_unavailable(),
@@ -181,12 +189,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // balances owned by an address, the balances for all tokens created by a
         // contract, and the balances for a given token. Each one narrows the network by
         // an owner, a contract or a token, so a request that narrows it by none of the
-        // three asks for something the operation does not offer.
+        // three asks for something the operation does not offer. The model cannot state
+        // that, so it is a rule of this service.
         if owner.is_none() && filter.contract_address.is_none() && filter.token_id.is_none() {
             return Err(ListTokenBalancesErrorModeled::ValidationException(
                 crate::state::field_validation_exception(
                     "tokenFilter",
-                    "one of ownerFilter.address, tokenFilter.contractAddress or tokenFilter.tokenId must be specified",
+                    "The request must include one of ownerFilter.address, \
+                     tokenFilter.contractAddress or tokenFilter.tokenId.",
                 ),
             )
             .into());
@@ -224,10 +234,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
+        // `maxResults` carries `@range(min: 1, max: 250)`, refused above by
+        // `validation::list_token_balances_input`, and `state::page` clamps whatever
+        // reaches it to `state::MAX_PAGE_SIZE` (250), so one page is bounded by the
+        // model and never by the request.
         let page = crate::state::page(all, input.max_results, input.next_token.as_deref())
-            .map_err(|error| {
+            .map_err(|_| {
                 ListTokenBalancesErrorModeled::ValidationException(
-                    crate::state::invalid_page_token(&error),
+                    crate::state::invalid_page_token(),
                 )
             })?;
 

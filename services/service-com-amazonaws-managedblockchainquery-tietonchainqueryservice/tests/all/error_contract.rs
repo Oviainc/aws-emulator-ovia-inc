@@ -196,14 +196,13 @@ fn pattern_cases() -> Vec<Clause> {
             "bad!",
             CHAIN_ADDRESS_PATTERN,
         ),
-        // A member of a structure inside a list: the deepest path this service has.
-        pattern_case(
-            "/batch-get-token-balance",
-            json!({"getTokenBalanceInputs": [batch_item("ETHEREUM_MAINNET", "bad!")]}),
-            "getTokenBalanceInputs.1.member.ownerIdentifier.address",
-            "bad!",
-            CHAIN_ADDRESS_PATTERN,
-        ),
+        // NOTE: the deepest path this service has — a member of a structure inside a
+        // list — belongs to `BatchGetTokenBalance`, and it is deliberately NOT a row
+        // here: that operation's output models `errors` as a `@required` list beside
+        // `tokenBalances`, so one item's refused value is reported as an entry of that
+        // list inside the HTTP 200 and not as a top-level refusal (the recorded wire
+        // behaviour, and cause 1 of the "error responses are not AWS-shaped" issue).
+        // `tests/all/error_response_shape.rs` asserts that per-item clause there.
     ]
 }
 

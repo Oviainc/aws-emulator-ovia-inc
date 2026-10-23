@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-managedblockchainquery-tietonchainqueryservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchainquery#ListTokenBalancesInput")]
+// `nextToken` and `maxResults` carry `skip_validation`, and so do the two filters'
+// address and token members: this operation's handler answers a value outside their
+// modelled constraints with the service's own `ValidationException`. See the note on
+// `TokenIdentifier` in `shared_types.rs` and `crate::state::validation`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.managedblockchainquery#ListTokenBalancesInput",
+    skip_validation = ["nextToken", "maxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListTokenBalancesInput {
     pub owner_filter: Option<OwnerFilter>,
@@ -20,13 +27,19 @@ pub struct ListTokenBalancesInput {
     pub max_results: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchainquery#OwnerFilter")]
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.managedblockchainquery#OwnerFilter",
+    skip_validation = ["address"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct OwnerFilter {
     pub address: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchainquery#TokenFilter")]
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.managedblockchainquery#TokenFilter",
+    skip_validation = ["network", "contractAddress", "tokenId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct TokenFilter {
     pub network: String,

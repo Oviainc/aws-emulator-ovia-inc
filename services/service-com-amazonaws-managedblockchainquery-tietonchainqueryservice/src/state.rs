@@ -56,10 +56,17 @@ use sha2::{Digest, Sha256};
 pub mod chain;
 
 use crate::ops::types::{
-    BlockchainInstant, ContractIdentifier, ContractMetadata, InternalServerException,
-    OwnerIdentifier, TokenBalance, TokenIdentifier, Transaction, TransactionEvent,
-    TransactionOutputItem, ValidationException, ValidationExceptionField, QUERY_NETWORK_VALUES,
+    AssetContract, BlockchainInstant, ContractIdentifier, ContractMetadata,
+    InternalServerException, OwnerIdentifier, ResourceNotFoundException, TokenBalance,
+    TokenIdentifier, Transaction, TransactionEvent, TransactionOutputItem, ValidationException,
+    ValidationExceptionField, QUERY_NETWORK_VALUES,
 };
+
+/// The handler-side check of every constraint this service's model declares, and the
+/// `ValidationException` it answers one with. The refusals the service words itself
+/// ([`validation_exception`] below) and the ones a modelled constraint produces are
+/// built in the two halves of this module pair, and share one renderer.
+pub mod validation;
 
 // ---------------------------------------------------------------------------
 // Modelled vocabulary
@@ -518,7 +525,7 @@ impl StoredHolding {
 }
 
 /// A stored asset contract: the state `GetAssetContract` answers from, and the state the
-/// modelled `AssetContract` is projected from.
+/// modelled `AssetContract` `ListAssetContracts` lists is projected from.
 #[derive(Debug, Clone)]
 pub struct StoredContract {
     pub network: String,
@@ -551,6 +558,18 @@ impl StoredContract {
     /// [`StoredContract::identifier`].
     pub fn deployer_address(&self) -> String {
         derived::normalize_address(&self.deployer_address)
+    }
+
+    /// Project the stored contract onto the modelled `AssetContract`, the summary
+    /// `ListAssetContracts` returns. It carries no metadata: the model gives
+    /// `AssetContract` only the identifier, the standard and the deployer — each in the
+    /// spelling the ledger holds, as [`StoredContract::identifier`] explains.
+    pub fn asset_contract(&self) -> AssetContract {
+        AssetContract {
+            contract_identifier: self.identifier(),
+            token_standard: self.token_standard.clone(),
+            deployer_address: self.deployer_address(),
+        }
     }
 }
 
@@ -698,9 +717,9 @@ impl Default for ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState 
 impl ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState {
     /// The ledger for `network`, or `None` for a network this emulator holds none for.
     ///
-    /// The boundary validator has already refused any value the `QueryNetwork` enum
-    /// does not declare by the time a handler runs, so in practice every network
-    /// resolves.
+    /// Every value the `QueryNetwork` enum declares has a ledger, so a `None` here means
+    /// the request named a value outside that set — which the handler's own validation
+    /// has already refused.
     pub fn ledger(&self, network: &str) -> Option<&NetworkLedger> {
         self.networks.get(network)
     }
@@ -726,11 +745,11 @@ impl ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState {
         // `TokenIdentifier` is "the container for the identifier for the token including
         // the unique token ID and its blockchain network": a network on its own names no
         // token, so one of `contractAddress`/`tokenId` has to be there. Both are
-        // modelled optional, so the validator cannot say this.
+        // modelled optional, so this is a rule of this service rather than of the model.
         if token.contract_address.is_none() && token.token_id.is_none() {
-            return Err(BalanceFailure::Unidentified(field_validation_exception(
+            return Err(BalanceFailure::Invalid(field_validation_exception(
                 "tokenIdentifier",
-                "tokenIdentifier must specify one of contractAddress or tokenId",
+                "The tokenIdentifier must include one of contractAddress or tokenId.",
             )));
         }
 
@@ -767,27 +786,32 @@ impl ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState {
 /// from here, so there is one source for the status of a failed read.
 #[derive(Debug)]
 pub enum BalanceFailure {
-    /// The `tokenIdentifier` names a network but no token.
-    Unidentified(ValidationException),
+    /// The item earns a `ValidationException`: a value outside a constraint the model
+    /// declares, or the service's own rule that a `tokenIdentifier` names a token.
+    Invalid(ValidationException),
     /// The ledger knows no balance for that (token, owner) at the requested instant.
-    NotFound(crate::ops::types::ResourceNotFoundException),
+    NotFound(ResourceNotFoundException),
 }
 
 impl BalanceFailure {
     /// The modelled `ErrorType` of this failure.
     pub fn error_type(&self) -> &'static str {
         match self {
-            Self::Unidentified(_) => ERROR_TYPE_VALIDATION_EXCEPTION,
+            Self::Invalid(_) => ERROR_TYPE_VALIDATION_EXCEPTION,
             Self::NotFound(_) => ERROR_TYPE_RESOURCE_NOT_FOUND_EXCEPTION,
         }
     }
 
-    /// The exception's own message, so a batch error item says exactly what the
-    /// single-item read's error would have said.
-    pub fn message(&self) -> &str {
+    /// What the exception says about the item, so an error item states exactly what the
+    /// single-item read's error would have.
+    ///
+    /// An error item models ONE message and no field list, so a `ValidationException`
+    /// whose detail lives in `fieldList` is rendered through
+    /// [`validation::explanation`].
+    pub fn message(&self) -> String {
         match self {
-            Self::Unidentified(error) => &error.message,
-            Self::NotFound(error) => &error.message,
+            Self::Invalid(error) => validation::explanation(error),
+            Self::NotFound(error) => error.message.clone(),
         }
     }
 }
@@ -885,7 +909,7 @@ impl TransactionSelector {
     /// Which transaction a request's `transactionHash`/`transactionId` name, refusing
     /// the combinations this service does not accept.
     ///
-    /// Both members are modelled OPTIONAL, so the boundary validator lets through a
+    /// Both members are modelled OPTIONAL, so nothing the model says refuses a
     /// request naming NEITHER or BOTH, while a transaction-scoped read needs exactly
     /// one. And `transactionId` is a Bitcoin identifier — the member's own
     /// documentation: "transactionId is only supported on the Bitcoin networks" — so it
@@ -988,8 +1012,9 @@ pub fn page<T>(
                 .ok_or_else(|| InvalidPageToken(token.to_string()))?
         }
     };
-    // `maxResults` carries `@range(min: 1, max: 250)`, so the boundary validator has
-    // already refused anything outside it; absent, the page is the modelled maximum.
+    // `maxResults` carries `@range(min: 1, max: 250)`, which this service's own
+    // validation has already refused anything outside of
+    // (`validation::max_results`); absent, the page is the modelled maximum.
     let limit = max_results.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE) as usize;
 
     let mut rest = all.into_iter().skip(start);
@@ -1031,7 +1056,8 @@ pub const INVALID_PARAMETER_VALUES_MESSAGE: &str = "One or more parameter values
 ///
 /// `ValidationExceptionField$name` carries `@required` in the model, so every entry
 /// names a member — the member the rule is stated about when the rule spans a pair of
-/// them (`transactionHash`/`transactionId`).
+/// them (`transactionHash`/`transactionId`), or the shape both members target when the
+/// rule is about the pair itself (`fromBlockchainInstant`/`toBlockchainInstant`).
 pub fn validation_field(name: &str, message: impl Into<String>) -> ValidationExceptionField {
     ValidationExceptionField {
         name: name.to_string(),
@@ -1058,13 +1084,29 @@ pub fn field_validation_exception(name: &str, message: impl Into<String>) -> Val
 
 /// Render a refused `nextToken` as this service's modelled `ValidationException`.
 ///
-/// The token appears in the `fieldList` entry, never in the top-level message: the entry
-/// is the per-member detail a client reads to fix the request, which is exactly where
-/// request-derived text belongs.
-pub fn invalid_page_token(error: &InvalidPageToken) -> ValidationException {
+/// `NextToken` declares only a `@length`, so a token this service never issued breaks no
+/// modelled constraint: which values are tokens is a rule of this service, and it is
+/// refused the way its other rules are. The refused value is not echoed, and so is not
+/// taken: the member it belongs to is what identifies it, and the caller sent it.
+pub fn invalid_page_token() -> ValidationException {
     field_validation_exception(
         "nextToken",
-        format!("'{}' is not a valid pagination token", error.0),
+        "The nextToken must be a pagination token issued by this operation.",
+    )
+}
+
+/// Refuse an asset-contract operation because the request named a Bitcoin network.
+///
+/// Both `GetAssetContract` and `ListAssetContracts` are documented "The Bitcoin
+/// blockchain networks do not support this operation"
+/// (`smithy_query(query="doc",shape="GetAssetContract")`), and the model cannot say so —
+/// its `QueryNetwork` enum admits the Bitcoin values on every operation — so this is a
+/// rule of the service, reported like its others. `network` is the path of the member
+/// that carried the value, which differs between the two operations.
+pub fn contracts_unsupported_on_network(network: &str) -> ValidationException {
+    field_validation_exception(
+        network,
+        "Asset contracts are only supported on the Ethereum networks.",
     )
 }
 
@@ -1081,8 +1123,8 @@ pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource was not fou
 ///
 /// `resourceType` is [`RESOURCE_TYPE`] because that is the only value the model's
 /// `ResourceType` enum declares.
-pub fn not_found(resource_id: impl Into<String>) -> crate::ops::types::ResourceNotFoundException {
-    crate::ops::types::ResourceNotFoundException {
+pub fn not_found(resource_id: impl Into<String>) -> ResourceNotFoundException {
+    ResourceNotFoundException {
         message: RESOURCE_NOT_FOUND_MESSAGE.to_string(),
         resource_id: resource_id.into(),
         resource_type: RESOURCE_TYPE.to_string(),
