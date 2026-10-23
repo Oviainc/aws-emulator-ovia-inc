@@ -4,9 +4,12 @@
 //!
 //! Reads one stored dashboard back by ARN. Every output member comes from the stored
 //! record; nothing is echoed from the request but the ARN that identified it. An ARN no
-//! dashboard is stored under answers `ResourceNotFoundException` (404); an ARN that does
-//! not satisfy `DashboardArn`'s pattern is refused as a `ValidationException` (400) by the
-//! boundary validator before this handler runs.
+//! dashboard is stored under answers the service's not-found refusal — HTTP 400 with the
+//! error code `ResourceNotFoundException` and a `resourceId` member carrying the requested
+//! ARN, as `crate::scaffolded::Scaffolded::resource_not_found` renders it (the model's
+//! `@httpError` for that shape is 404, which is not what the recorded service answers); an
+//! ARN that does not satisfy `DashboardArn`'s pattern is refused as a `ValidationException`
+//! (400) by the boundary validator before this handler runs.
 //!
 //! ## Shape of an operation
 //!
@@ -171,9 +174,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: it resolves the record and projects it, and writes nothing.
         let state = state.lock();
         let dashboard = state.dashboards.get(&input.arn).ok_or_else(|| {
-            GetDashboardErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("No dashboard found for arn {}", input.arn),
-            })
+            // The request-derived template the recorded service words this refusal with,
+            // per operation; the ARN is the one the request carried.
+            crate::scaffolded::Scaffolded::resource_not_found(
+                &input.arn,
+                format!("Resource {} does not exist.", input.arn),
+            )
         })?;
 
         Ok(GetDashboardOutput {

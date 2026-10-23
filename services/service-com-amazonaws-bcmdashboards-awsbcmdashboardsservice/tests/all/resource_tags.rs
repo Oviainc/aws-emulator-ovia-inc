@@ -5,7 +5,8 @@
 //! The rule under test is that `ListTagsForResource` reports exactly the tags stored on
 //! the resource its `resourceArn` names — for every tag set the model admits and for
 //! either resource type that ARN can name (a dashboard or a scheduled report) — answers
-//! `ResourceNotFoundException` (404) when this service holds no resource under that ARN,
+//! `ResourceNotFoundException` (HTTP 400, as `tests/all/resource_not_found.rs` pins) when
+//! this service holds no resource under that ARN,
 //! and changes nothing a later caller can observe. The tag sets below are a TABLE
 //! spanning that class: they differ in count (none, one, several, the list maximum), in
 //! key and value length (each modelled bound), in the characters the values carry, and
@@ -356,8 +357,8 @@ async fn an_arn_naming_no_resource_is_not_found() {
     for (label, arn) in &cases {
         let (status, body) = call(&router, "ListTagsForResource", &json!({"resourceArn": arn})).await;
         assert_eq!(
-            status, 404,
-            "case {label}: {arn} names no resource, expected 404, got {status}: {body}"
+            status, 400,
+            "case {label}: {arn} names no resource, expected 400, got {status}: {body}"
         );
         assert!(
             error_code(&body).contains("ResourceNotFoundException"),

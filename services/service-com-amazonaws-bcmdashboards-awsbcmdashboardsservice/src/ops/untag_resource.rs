@@ -5,7 +5,10 @@
 //! Removes the named tag keys from the resource a `ResourceArn` identifies, and
 //! nothing else: a key the resource does not carry is a no-op (so the call is
 //! idempotent), every key not named keeps its value, and an ARN that names no
-//! stored resource is refused with the modelled `ResourceNotFoundException`.
+//! stored resource is refused with the service's not-found answer — HTTP 400 with the
+//! error code `ResourceNotFoundException` and a `resourceId` member carrying the requested
+//! ARN, as `crate::scaffolded::Scaffolded::resource_not_found` renders it (the model's
+//! `@httpError` for that shape is 404, which is not what the recorded service answers).
 //!
 //! ## Shape of an operation
 //!
@@ -157,12 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.resource_arn,
                 "ResourceNotFoundException",
             );
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("No resource found for arn {}", input.resource_arn),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::resource_not_found(
+                &input.resource_arn,
+                crate::state::TAGGING_RESOURCE_NOT_FOUND_MESSAGE,
+            ));
         };
 
         // Remove exactly the named keys. The requested keys go into a set first, so the

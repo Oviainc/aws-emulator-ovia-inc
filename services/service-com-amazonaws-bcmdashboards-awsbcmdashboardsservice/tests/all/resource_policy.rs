@@ -6,7 +6,8 @@
 //! The rule under test is that `GetResourcePolicy` reports the policy document stored on
 //! the dashboard its `resourceArn` names — the empty document while no policy is
 //! attached, since `policyDocument`'s modelled length starts at 0 — echoes that ARN,
-//! answers `ResourceNotFoundException` (404) when this service holds no dashboard under
+//! answers `ResourceNotFoundException` (HTTP 400, as `tests/all/resource_not_found.rs`
+//! pins) when this service holds no dashboard under
 //! the ARN, and (being `@readonly`) changes nothing a later caller can observe.
 //!
 //! This service's model declares no operation that ATTACHES a policy (its 15 operations
@@ -365,8 +366,8 @@ async fn an_arn_naming_no_dashboard_is_not_found() {
     for (label, arn) in &cases {
         let (status, body) = call(&router, "GetResourcePolicy", &json!({"resourceArn": arn})).await;
         assert_eq!(
-            status, 404,
-            "case {label}: {arn} names no dashboard, expected 404, got {status}: {body}"
+            status, 400,
+            "case {label}: {arn} names no dashboard, expected 400, got {status}: {body}"
         );
         assert!(
             error_code(&body).contains("ResourceNotFoundException"),
