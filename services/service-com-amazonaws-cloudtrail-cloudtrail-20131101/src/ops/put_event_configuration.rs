@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutEventConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutEventConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutEventConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the event configuration of ONE resource: the maximum event size and the
+//! context key selectors of an event data store, or the aggregation configuration
+//! of a trail. `TrailName` and `EventDataStore` are both optional in the model and
+//! name resources of different kinds, so exactly one of them addresses the call
+//! ([`crate::state::event_configuration_target`]), and only the members that
+//! belong to the addressed kind may come with it.
+//!
+//! The configuration is persisted on the addressed record, so
+//! `GetEventConfiguration` — and every later read of the resource — reports what
+//! this call wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -230,18 +232,296 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutEventConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutEventConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutEventConfiguration"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // Which resource this call configures. Read BEFORE the registry is
+        // reached: a request that addresses no single resource is refused whatever
+        // the registry holds.
+        let target = crate::state::event_configuration_target(
+            input.trail_name.as_deref(),
+            input.event_data_store.as_deref(),
+        )
+        .map_err(refuse_target)?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutEventConfigurationErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "PutEventConfiguration needs the CloudTrail trail and event data \
+                         store registries, which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        match target {
+            crate::state::EventConfigurationTarget::EventDataStore(identifier) => {
+                configure_event_data_store(&mut store, &input, &identifier, &region, now)
+            }
+            crate::state::EventConfigurationTarget::Trail(identifier) => {
+                configure_trail(&mut store, &input, &identifier, &region)
+            }
+        }
     }
+}
+
+/// The HTTP status this service answers an event data store not-found refusal
+/// with.
+///
+/// The model annotates `EventDataStoreNotFoundException` `@httpError(404)` and
+/// CloudTrail answers 400 for it on the wire, which is what the recorded response
+/// for `GetEventDataStore` shows; `get_event_data_store` states the same status
+/// for the same reason. Only the status is stated here — the error code and the
+/// body stay the model's.
+const EVENT_DATA_STORE_NOT_FOUND_STATUS: u16 = 400;
+
+/// The HTTP status this service answers a trail not-found refusal with.
+///
+/// The model annotates `TrailNotFoundException` `@httpError(404)`; the recorded
+/// CloudTrail response for an awsJson1_1 trail operation on an absent trail is
+/// HTTP 400 with `__type` `TrailNotFoundException` (issue
+/// `20261022T230533Z-cloudtrail-trail-validation-and-not-found-rejections-answer.md`,
+/// cause 6: "the recorded 400 plus the error code is the wire requirement").
+const TRAIL_NOT_FOUND_STATUS: u16 = 400;
+
+/// Refuse a request that does not address exactly one resource.
+///
+/// Naming both resources, and naming neither, are both combinations of
+/// parameters that cannot hold together, which is the modelled
+/// `InvalidParameterCombinationException`.
+fn refuse_target(
+    rejection: crate::state::EventConfigurationTargetRejection,
+) -> PutEventConfigurationError {
+    PutEventConfigurationErrorModeled::InvalidParameterCombinationException(
+        InvalidParameterCombinationException {
+            message: Some(rejection.message()),
+        },
+    )
+    .into()
+}
+
+/// Write the event configuration of the event data store `identifier` names.
+///
+/// "This operation supports updating the maximum event size, adding or modifying
+/// context key selectors for event data store": both members state that
+/// configuration, so a call that addresses a store states both of them and no
+/// trail-level member.
+fn configure_event_data_store(
+    store: &mut crate::state::ComAmazonawsCloudtrailCloudtrail20131101State,
+    input: &PutEventConfigurationInput,
+    identifier: &str,
+    region: &str,
+    now: ::std::time::SystemTime,
+) -> Result<PutEventConfigurationOutput, PutEventConfigurationError> {
+    let (Some(max_event_size), Some(context_key_selectors)) = (
+        input.max_event_size.as_deref(),
+        input.context_key_selectors.as_deref(),
+    ) else {
+        return Err(crate::scaffolded::Scaffolded::validation(
+            crate::state::MISSING_EVENT_DATA_STORE_CONFIGURATION_MESSAGE,
+        ));
+    };
+    // `AggregationConfigurations` configures a trail ("the aggregation
+    // configurations that you want to configure for the trail"), so it cannot
+    // come with an event data store.
+    if input.aggregation_configurations.is_some() {
+        return Err(
+            PutEventConfigurationErrorModeled::InvalidParameterCombinationException(
+                InvalidParameterCombinationException {
+                    message: Some(
+                        "AggregationConfigurations configures a trail, so it cannot be set \
+                         with EventDataStore."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into(),
+        );
+    }
+    let Some(max_event_size) = crate::state::MaxEventSizeSetting::from_wire(max_event_size) else {
+        return Err(crate::scaffolded::Scaffolded::validation(format!(
+            "MaxEventSize must be one of {:?}, got '{max_event_size}'.",
+            MAX_EVENT_SIZE_VALUES
+        )));
+    };
+    // "If you are using context key selectors, MaxEventSize must be set to
+    // Large" — model doc for `PutEventConfigurationRequest$MaxEventSize`.
+    if !context_key_selectors.is_empty()
+        && max_event_size != crate::state::MaxEventSizeSetting::Large
+    {
+        return Err(
+            PutEventConfigurationErrorModeled::InvalidParameterCombinationException(
+                InvalidParameterCombinationException {
+                    message: Some(format!(
+                        "MaxEventSize must be {} when ContextKeySelectors are set, got {}.",
+                        crate::state::MaxEventSizeSetting::Large.as_wire(),
+                        max_event_size.as_wire()
+                    )),
+                },
+            )
+            .into(),
+        );
+    }
+
+    let parsed =
+        crate::state::parse_event_data_store_identifier(identifier).map_err(|rejection| {
+            PutEventConfigurationErrorModeled::EventDataStoreARNInvalidException(
+                EventDataStoreARNInvalidException {
+                    message: Some(rejection.message(region)),
+                },
+            )
+        })?;
+    let addressed_arn = parsed.arn(region);
+    let Some(record) = store.addressed_event_data_store_mut(&parsed, region) else {
+        return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+            PutEventConfigurationErrorModeled::EventDataStoreNotFoundException(
+                EventDataStoreNotFoundException {
+                    message: Some(crate::state::event_data_store_not_found_message(
+                        &addressed_arn,
+                    )),
+                },
+            ),
+            EVENT_DATA_STORE_NOT_FOUND_STATUS,
+        ));
+    };
+    // A store awaiting deletion holds no configuration to change, which is what
+    // the modelled `InactiveEventDataStoreException` ("The event data store is
+    // inactive") reports.
+    if record.status == crate::state::EventDataStoreState::PendingDeletion {
+        return Err(
+            PutEventConfigurationErrorModeled::InactiveEventDataStoreException(
+                InactiveEventDataStoreException {
+                    message: Some(format!(
+                        "The event data store {addressed_arn} is {} and its event \
+                         configuration cannot be changed.",
+                        record.status.as_wire()
+                    )),
+                },
+            )
+            .into(),
+        );
+    }
+
+    record.max_event_size = max_event_size;
+    record.context_key_selectors = context_key_selectors.to_vec();
+    record.updated_at = Some(now);
+
+    // Report the STORED configuration, so this answer and every later read of the
+    // store are the same values.
+    Ok(PutEventConfigurationOutput {
+        event_data_store_arn: Some(record.arn()),
+        max_event_size: Some(record.max_event_size.as_wire().to_string()),
+        context_key_selectors: (!record.context_key_selectors.is_empty())
+            .then(|| record.context_key_selectors.clone()),
+        trail_arn: None,
+        aggregation_configurations: None,
+    })
+}
+
+/// Write the event configuration of the trail `identifier` names.
+///
+/// "configuring aggregation settings for the trail": `AggregationConfigurations`
+/// is the trail's whole share of this operation, so a call that addresses a trail
+/// states it and no store-level member.
+fn configure_trail(
+    store: &mut crate::state::ComAmazonawsCloudtrailCloudtrail20131101State,
+    input: &PutEventConfigurationInput,
+    identifier: &str,
+    region: &str,
+) -> Result<PutEventConfigurationOutput, PutEventConfigurationError> {
+    let Some(aggregation_configurations) = input.aggregation_configurations.as_deref() else {
+        return Err(crate::scaffolded::Scaffolded::validation(
+            crate::state::MISSING_TRAIL_CONFIGURATION_MESSAGE,
+        ));
+    };
+    // `MaxEventSize` and `ContextKeySelectors` configure an event data store, so
+    // neither can come with a trail.
+    if input.max_event_size.is_some() || input.context_key_selectors.is_some() {
+        return Err(
+            PutEventConfigurationErrorModeled::InvalidParameterCombinationException(
+                InvalidParameterCombinationException {
+                    message: Some(
+                        "MaxEventSize and ContextKeySelectors configure an event data store, \
+                         so neither can be set with TrailName."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into(),
+        );
+    }
+
+    // Configuration is written in the trail's own Region, as every other change
+    // to a trail is: a trail of this name in another Region, or one addressed by
+    // an ARN from another Region, exists but cannot be driven from here. A
+    // malformed identifier is refused as the form it was written in, the way
+    // every other trail operation refuses it.
+    let located = store
+        .resolve_for_mutation(identifier, region)
+        .map_err(|rejection| match rejection {
+            crate::state::IdentifierRejection::InvalidArn(message) => {
+                PutEventConfigurationErrorModeled::CloudTrailARNInvalidException(
+                    CloudTrailARNInvalidException {
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::IdentifierRejection::InvalidName(message) => {
+                PutEventConfigurationErrorModeled::InvalidTrailNameException(
+                    InvalidTrailNameException {
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+    let record = match located {
+        crate::state::TrailForMutation::Found(record) => record,
+        crate::state::TrailForMutation::AddressedInAnotherRegion { name, addressed } => {
+            return Err(PutEventConfigurationErrorModeled::InvalidHomeRegionException(
+                InvalidHomeRegionException {
+                    message: Some(format!(
+                        "Trail {name} was addressed in {addressed}, but this request was made \
+                         in {region}: event configuration is written in the Region the trail \
+                         was created in"
+                    )),
+                },
+            )
+            .into())
+        }
+        crate::state::TrailForMutation::HomedInAnotherRegion { name, home_region } => {
+            return Err(PutEventConfigurationErrorModeled::InvalidHomeRegionException(
+                InvalidHomeRegionException {
+                    message: Some(format!(
+                        "Trail {name} was created in {home_region}, not in {region}: event \
+                         configuration is written in the Region the trail was created in"
+                    )),
+                },
+            )
+            .into())
+        }
+        crate::state::TrailForMutation::Absent => {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                PutEventConfigurationErrorModeled::TrailNotFoundException(TrailNotFoundException {
+                    message: Some(crate::state::unknown_trail_message(identifier)),
+                }),
+                TRAIL_NOT_FOUND_STATUS,
+            ))
+        }
+    };
+
+    record.aggregation_configurations = aggregation_configurations.to_vec();
+
+    // Report the STORED configuration, so this answer and every later read of the
+    // trail are the same values.
+    Ok(PutEventConfigurationOutput {
+        trail_arn: Some(record.trail_arn.clone()),
+        aggregation_configurations: (!record.aggregation_configurations.is_empty())
+            .then(|| record.aggregation_configurations.clone()),
+        event_data_store_arn: None,
+        max_event_size: None,
+        context_key_selectors: None,
+    })
 }
