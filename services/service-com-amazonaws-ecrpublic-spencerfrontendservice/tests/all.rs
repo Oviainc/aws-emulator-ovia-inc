@@ -15,6 +15,8 @@
 mod client_error_message_templates;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/image_tag_details.rs"]
+mod image_tag_details;
 #[path = "all/invalid_parameter_messages.rs"]
 mod invalid_parameter_messages;
 #[path = "all/invalid_parameter_template.rs"]

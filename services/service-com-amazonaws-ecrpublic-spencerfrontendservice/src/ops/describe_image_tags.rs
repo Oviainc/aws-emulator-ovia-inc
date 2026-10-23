@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeImageTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeImageTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeImageTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the image TAGS a repository currently carries, one `ImageTagDetail` per tag in
+//! tag order, each naming the manifest that tag points at; it writes nothing, so it is
+//! purely a reporting operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +161,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeImageTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeImageTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeImageTags"))
+        // ECR Public serves its API from ONE Region, so a call signed for any other is
+        // refused with the service-common `UnsupportedCommandException` before this
+        // handler reads anything — see `crate::state::unsupported_in_region`.
+        if let Some(unsupported) = crate::state::unsupported_in_region(ctx.parts(), Self::NAME) {
+            return Err(
+                DescribeImageTagsErrorModeled::UnsupportedCommandException(unsupported).into(),
+            );
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeImageTagsErrorModeled::ServerException(ServerException {
+                message: Some(
+                    "The ECR Public emulator could not reach its state store.".to_string(),
+                ),
+            })
+            .into());
+        };
+
+        // The token and the page size are this service's one pagination contract, shared
+        // with every other paginated reader (`crate::state::page`): a token names the
+        // last key of the page it was returned with, and a token this service did not
+        // mint is an invalid parameter rather than an empty page.
+        let resume_after = match crate::state::decode_page_token(input.next_token.as_deref()) {
+            Ok(resume_after) => resume_after,
+            Err(message) => return Err(invalid_parameter(message)),
+        };
+        let page_size = crate::state::page_size(input.max_results);
+
+        let store = state.lock();
+        // "If you do not specify a registry, the default public registry is assumed" —
+        // this emulator has exactly one, so a request naming another account's registry
+        // names a registry this service cannot describe.
+        if let Some(registry_id) = input.registry_id.as_deref() {
+            if !store.is_this_registry(registry_id) {
+                return Err(invalid_parameter(format!(
+                    "Invalid parameter at 'registryId' failed to satisfy constraint: 'Member \
+                     must name the public registry of this account ({})'",
+                    store.registry_id
+                )));
+            }
+        }
+        let Some(repository) = store.repositories.get(&input.repository_name) else {
+            return Err(DescribeImageTagsErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException {
+                    message: Some(store.repository_not_found_message(&input.repository_name)),
+                },
+            )
+            .into());
+        };
+        // One entry per TAG the repository holds, in tag order: the walk is over the tag
+        // set, so a manifest carrying several tags appears once per tag and an untagged
+        // manifest does not appear at all.
+        let details = repository.image_tag_details();
+        drop(store);
+
+        let page = crate::state::page(details, resume_after.as_deref(), page_size);
+        Ok(DescribeImageTagsOutput {
+            image_tag_details: Some(page.items),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// Refuse a parameter this operation cannot serve, with the one client-input error every
+/// ECR Public operation declares.
+fn invalid_parameter(message: String) -> DescribeImageTagsError {
+    DescribeImageTagsErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
 }

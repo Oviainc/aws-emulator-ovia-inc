@@ -20,7 +20,7 @@
 //! * what a manifest references ([`manifest_content`]), which is what an image's
 //!   reported size is computed over ([`StoredRepository::refresh_image_sizes`]);
 //! * the opaque pagination token ([`encode_page_token`] / [`decode_page_token`]) that
-//!   `DescribeRepositories` and `DescribeImages` must agree on.
+//!   `DescribeRepositories`, `DescribeImages` and `DescribeImageTags` must agree on.
 //!
 //! Every collection is a `BTreeMap`/`BTreeSet`, so each listing walks one stable,
 //! key-ordered sequence and a pagination token naming the last key of a page resumes
@@ -32,8 +32,9 @@ use std::time::SystemTime;
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ImageDetail, ImageIdentifier, RegistryCatalogData, Repository, RepositoryCatalogData,
-    RepositoryCatalogDataInput, Tag, UnsupportedCommandException,
+    ImageDetail, ImageIdentifier, ImageTagDetail, ReferencedImageDetail, RegistryCatalogData,
+    Repository, RepositoryCatalogData, RepositoryCatalogDataInput, Tag,
+    UnsupportedCommandException,
 };
 
 /// The `ecr-public` ARN namespace, as the Smithy model's `awsService` trait declares it
@@ -293,6 +294,26 @@ pub struct StoredImage {
     pub tags: BTreeSet<String>,
 }
 
+/// One image tag of a repository: the manifest it points at, and when the push that
+/// put it there created it.
+///
+/// A tag is mutable — "a tag is mutable, so it moves onto this digest" is what
+/// `PutImage` does with a tag already in the repository — so the digest is the tag's
+/// CURRENT target rather than the first one it ever had.
+#[derive(Debug, Clone)]
+pub struct StoredTag {
+    /// The `imageDigest` this tag currently names.
+    pub digest: String,
+    /// `ImageTagDetail$createdAt`: "the time stamp that indicates when the image tag was
+    /// created" — the instant of the `PutImage` call that made this tag name
+    /// [`Self::digest`]. A tag enters a repository only by being pushed and leaves it
+    /// only by being deleted, so this is set once, when the tag is written, and is never
+    /// touched by a read: two reads of one tag report the same stamp. Re-pushing a tag
+    /// onto a DIFFERENT manifest writes the tag again, so the stamp then describes that
+    /// push rather than the superseded one.
+    pub created_at: SystemTime,
+}
+
 /// One public repository: what `CreateRepository` inserted.
 #[derive(Debug, Clone)]
 pub struct StoredRepository {
@@ -313,9 +334,11 @@ pub struct StoredRepository {
     pub policy_text: Option<String>,
     /// Images keyed by `imageDigest`, so `DescribeImages` pages in digest order.
     pub images: BTreeMap<String, StoredImage>,
-    /// `imageTag` -> `imageDigest`, so a tag-keyed `ImageIdentifier` resolves to a
+    /// `imageTag` -> the tag's entry, so a tag-keyed `ImageIdentifier` resolves to a
     /// stored image in one probe and re-pushing a tag moves it between digests.
-    pub tag_index: BTreeMap<String, String>,
+    ///
+    /// Keyed by tag, so `DescribeImageTags` walks one stable, tag-ordered sequence.
+    pub tag_index: BTreeMap<String, StoredTag>,
     /// The image layers this repository holds, keyed by the `sha256:<hex>` digest
     /// `CompleteLayerUpload` finalised, each carrying the size in bytes of the layer the
     /// upload's parts made up.
@@ -351,13 +374,14 @@ impl StoredRepository {
             (None, Some(tag)) => self
                 .tag_index
                 .get(tag)
-                .and_then(|digest| self.images.get(digest))
+                .and_then(|tagged| self.images.get(&tagged.digest))
                 .ok_or(IdentifierProblem::ImageNotFound),
             (Some(digest), Some(tag)) => {
-                let tagged = self
+                let tagged = &self
                     .tag_index
                     .get(tag)
-                    .ok_or(IdentifierProblem::ImageNotFound)?;
+                    .ok_or(IdentifierProblem::ImageNotFound)?
+                    .digest;
                 if tagged != digest {
                     return Err(IdentifierProblem::ImageTagDoesNotMatchDigest);
                 }
@@ -380,6 +404,52 @@ impl StoredRepository {
             image_manifest_media_type: image.manifest_media_type.clone(),
             artifact_media_type: image.artifact_media_type.clone(),
         }
+    }
+
+    /// The image a tag points at, as the modelled `ReferencedImageDetail` shape.
+    ///
+    /// `ReferencedImageDetail` is the `ImageDetail` members that describe the MANIFEST
+    /// rather than its place in the registry: the same stored values
+    /// [`Self::image_detail`] reports for `imageDigest`, `imageSizeInBytes`,
+    /// `imagePushedAt`, `imageManifestMediaType` and `artifactMediaType`, so the two
+    /// readers never disagree about one image. The shape carries no `imageTags` member —
+    /// the tag is the entry it hangs off — and no registry or repository member, both of
+    /// which the request already named.
+    pub fn referenced_image_detail(&self, image: &StoredImage) -> ReferencedImageDetail {
+        ReferencedImageDetail {
+            image_digest: Some(image.digest.clone()),
+            image_size_in_bytes: image.size_in_bytes,
+            image_pushed_at: Some(as_timestamp(image.pushed_at)),
+            image_manifest_media_type: image.manifest_media_type.clone(),
+            artifact_media_type: image.artifact_media_type.clone(),
+        }
+    }
+
+    /// Every image TAG this repository currently carries, in tag order, each paired with
+    /// the tag it is keyed by so a page token naming the last tag of a page resumes
+    /// exactly after it.
+    ///
+    /// One entry per tag, never per image: a manifest carrying three tags is reported
+    /// three times (once per tag, each naming the same `imageDetail`) and an untagged
+    /// manifest is not reported at all, because there is no tag for it to be the detail
+    /// of. A tag whose digest nothing stored holds is skipped rather than reported with
+    /// an absent image — [`Self::tag_index`] and [`Self::images`] are maintained
+    /// together, so that cannot arise from this service's own writes.
+    pub fn image_tag_details(&self) -> Vec<(String, ImageTagDetail)> {
+        self.tag_index
+            .iter()
+            .filter_map(|(tag, tagged)| {
+                let image = self.images.get(&tagged.digest)?;
+                Some((
+                    tag.clone(),
+                    ImageTagDetail {
+                        image_tag: Some(tag.clone()),
+                        created_at: Some(as_timestamp(tagged.created_at)),
+                        image_detail: Some(self.referenced_image_detail(image)),
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// Recompute the `imageSizeInBytes` every image in this repository reports.

@@ -346,11 +346,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A tag names exactly one digest, so pushing a tag that currently points at
-        // another manifest moves it; the manifest it left keeps its remaining tags.
+        // another manifest moves it; the manifest it left keeps its remaining tags. The
+        // tag's `createdAt` is the instant of the push that wrote it — this one — and a
+        // push only reaches here when it introduces the tag or moves it, since
+        // re-pushing a tag already on this digest was refused above as a duplicate.
         if let Some(tag) = image_tag {
-            if let Some(previous) = repository.tag_index.insert(tag.to_string(), digest.clone()) {
-                if previous != digest {
-                    if let Some(image) = repository.images.get_mut(&previous) {
+            let tagged = crate::state::StoredTag {
+                digest: digest.clone(),
+                created_at: pushed_at,
+            };
+            if let Some(previous) = repository.tag_index.insert(tag.to_string(), tagged) {
+                if previous.digest != digest {
+                    if let Some(image) = repository.images.get_mut(&previous.digest) {
                         image.tags.remove(tag);
                     }
                 }
