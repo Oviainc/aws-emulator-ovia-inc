@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ListRoute53HealthChecksInRegionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("No plan found for arn {}", input.arn),
+                        message: crate::state::plan_not_found_message(&input.arn),
                     },
                 )
                 .into(),

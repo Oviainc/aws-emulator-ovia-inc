@@ -7,6 +7,11 @@
 //! (`crate::state::plan_arn`), and the server-owned `owner`, `version` and `updatedAt`
 //! come from the record — nothing in the response is echoed straight from the request.
 //!
+//! A plan's two Regions have to be two DIFFERENT Regions (the model constrains only their
+//! count), so a request naming one Region twice is refused with a 400
+//! `ValidationException` and nothing is stored — see
+//! [`crate::state::region_pair_violation`], the one reading of that rule.
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request. Reach
@@ -166,6 +171,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // The two Regions of a plan name one switch between them, so they have to be two
+        // different Regions. The model constrains the COUNT (`regions` is
+        // `@length(2, 2)`, already refused at the boundary) but not their distinctness,
+        // so nothing before this handler refuses a pair that names one Region twice —
+        // and such a plan describes no switch at all. Refused as a 400
+        // `ValidationException`, with nothing stored.
+        if let Some(violation) = crate::state::region_pair_violation(&input.regions) {
+            return Err(crate::scaffolded::Scaffolded::validation(violation));
         }
 
         // The ARN suffix comes from the store's monotonic seed, so two plans that share a
