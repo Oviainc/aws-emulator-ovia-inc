@@ -237,11 +237,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `ShowCacheClustersNotInReplicationGroups` keeps only the clusters that
-        // belong to no replication group. `CreateCacheCluster` refuses a
-        // `ReplicationGroupId` while every replication-group operation is a
-        // scaffolded 501, so no stored cluster belongs to one and the flag
-        // cannot exclude anything — it is honoured against the stored value all
-        // the same, so it keeps working when that slice lands.
+        // belong to no replication group, which is read off each stored
+        // cluster's `ReplicationGroupId`: `CreateReplicationGroup` sets it on
+        // the member clusters it mints, and a standalone cluster carries none.
         let only_standalone = input
             .show_cache_clusters_not_in_replication_groups
             .unwrap_or(false);

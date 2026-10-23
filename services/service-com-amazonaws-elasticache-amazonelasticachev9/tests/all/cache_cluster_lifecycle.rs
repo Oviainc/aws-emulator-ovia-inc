@@ -29,7 +29,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every test signs with unless it is exercising the region rule
 /// itself.
-const REGION: &str = "us-east-1";
+///
+/// `pub(crate)` here and below: the sibling suites in `tests/all/` share this
+/// one wire harness rather than carrying copies of it.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The API version an `awsQuery` client sends beside `Action`, from the model's
 /// service version (`smithy_query(query="service_info")`: `version 2015-02-02`).
