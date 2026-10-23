@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteQueuedSavingsPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteQueuedSavingsPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteQueuedSavingsPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels a purchase whose term has not begun: the stored plan leaves `queued`
+//! for `queued-deleted`, which a later `DescribeSavingsPlans` reports. A plan in
+//! any other state has no queued purchase to delete, so the call is refused
+//! rather than quietly succeeding.
 //!
 //! ## Shape of an operation
 //!
@@ -134,20 +130,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteQueuedSavingsPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteQueuedSavingsPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteQueuedSavingsPlan"))
+        use crate::state::{STATE_QUEUED, STATE_QUEUED_DELETED};
+
+        let now = crate::state::now_millis();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteQueuedSavingsPlanErrorModeled::InternalServerException(InternalServerException {
+                message: "the savingsplans store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // A queued purchase falls due at its purchase time whether or not anybody
+        // called, so the clock's owed transitions are materialised before this
+        // call decides: a purchase whose term has begun is no longer queued and
+        // can no longer be cancelled.
+        store.materialize_due(now);
+
+        let plan = store.plan_mut(&input.savings_plan_id).ok_or_else(|| {
+            DeleteQueuedSavingsPlanErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no Savings Plan with id '{}'", input.savings_plan_id),
+                },
+            )
+        })?;
+
+        // Only a plan whose term has not begun HAS a queued purchase to delete.
+        // Every other state — one already cancelled, one being paid for, one
+        // active, retired or returned — is refused, naming the state it refused,
+        // so the one sentence covers every state a deletion is not accepted from.
+        if plan.state != STATE_QUEUED {
+            return Err(validation(format!(
+                "Savings Plans in {} state cannot be deleted.",
+                plan.state
+            )));
+        }
+        plan.state = STATE_QUEUED_DELETED.to_string();
+
+        Ok(DeleteQueuedSavingsPlanOutput {})
     }
+}
+
+/// A 400 `ValidationException` carrying `message`.
+fn validation(message: String) -> DeleteQueuedSavingsPlanError {
+    DeleteQueuedSavingsPlanErrorModeled::ValidationException(ValidationException { message }).into()
 }

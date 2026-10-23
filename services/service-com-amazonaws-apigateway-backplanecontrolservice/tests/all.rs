@@ -49,6 +49,8 @@ mod rest_api_identifier_refusals;
 mod rest_api_import;
 #[path = "all/rest_api_lifecycle.rs"]
 mod rest_api_lifecycle;
+#[path = "all/sdk_types.rs"]
+mod sdk_types;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/stage_lifecycle.rs"]

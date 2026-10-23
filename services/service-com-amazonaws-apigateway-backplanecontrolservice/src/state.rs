@@ -13,12 +13,20 @@
 //! (`EndpointConfiguration`, `Method`'s responses and integration) rather than as a
 //! second hand-written mirror of the same members: the model already declares them, and
 //! two copies of one shape is how two operations end up reading two different records.
+//!
+//! Two collections of this surface are the SERVICE's own rather than an account's — the
+//! gateway responses API Gateway generates and the `SdkType`s it can generate a client
+//! SDK for. Neither is created, updated or deleted by any operation of this service, so
+//! each is a catalog here ([`default_gateway_response`], [`sdk_type`]) that every
+//! handler reading it answers from, instead of a per-account record a caller could never
+//! have written.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
     CanarySettings, DocumentationPartLocation, EndpointConfiguration, GetGatewayResponseOutput,
-    GetIntegrationOutput, GetMethodResponseOutput, MethodSetting, MethodSnapshot,
+    GetIntegrationOutput, GetMethodResponseOutput, GetSdkTypeOutput, MethodSetting, MethodSnapshot,
+    SdkConfigurationProperty,
 };
 
 /// Per-service state for com-amazonaws-apigateway-backplanecontrolservice. A handler reaches it through [`service_state`].
@@ -497,6 +505,191 @@ pub fn default_gateway_response(response_type: &str) -> GetGatewayResponseOutput
         response_templates: None,
         default_response: true,
     }
+}
+
+// ---------------------------------------------------------------------------
+// SDK types
+//
+// The `SdkType` collection is the SERVICE's published catalog of the languages API
+// Gateway can generate a client SDK in for a deployed stage. It is the same collection
+// for every account, no operation of this service creates, updates or deletes an entry
+// of it, and an `SdkType` id is exactly what `GetSdk`'s `sdkType` label names. So the
+// catalog below IS the collection: `GetSdkTypes` pages it and `GetSdkType` resolves one
+// id out of it, the same way an uncustomized gateway response is derived from the
+// catalog above rather than from a stored record.
+// ---------------------------------------------------------------------------
+
+/// One configuration property of an SDK type, as the catalog spells it:
+/// `(name, friendlyName, description, required)`. `name` is the key a `GetSdk`
+/// `parameters` entry carries for that property.
+type SdkPropertyRow = (&'static str, &'static str, &'static str, bool);
+
+/// One SDK type of the catalog:
+/// `(id, friendlyName, description, configurationProperties)`.
+type SdkTypeRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [SdkPropertyRow],
+);
+
+/// The SDK types API Gateway can generate a client SDK for.
+///
+/// Hand-written because this service's model declares no shape enumerating them. The ids
+/// and their order are `GetSdkRequest$sdkType`'s own documentation
+/// (`smithy_query(query="doc", shape="GetSdkRequest", member="sdkType")`: "The language
+/// for the generated SDK. Currently `java`, `javascript`, `android`, `objectivec` (for
+/// iOS), `swift` (for iOS), and `ruby` are supported"), and each type's REQUIRED
+/// configuration properties are `GetSdkRequest$parameters`' ("For `sdkType` of
+/// `objectivec` or `swift`, a parameter named `classPrefix` is required. For `sdkType` of
+/// `android`, parameters named `groupId`, `artifactId`, `artifactVersion`, and
+/// `invokerPackage` are required. For `sdkType` of `java`, parameters named `serviceName`
+/// and `javaPackageName` are required."), in the order that sentence lists them. A type
+/// that documentation names no parameter for therefore carries NO configuration
+/// property, rather than one this emulator invented.
+///
+/// The `friendlyName` and `description` prose below is NOT documented anywhere this
+/// emulator can read: the model states no sentence for either member, so each one is
+/// this emulator's own wording for the type or property the model DOES name, and a
+/// client that keys off it rather than off the id is reading prose the real service
+/// words differently. Nothing but the ids, their order and the configuration property
+/// names and `required` flags is claimed to match AWS.
+const SDK_TYPES: &[SdkTypeRow] = &[
+    (
+        "java",
+        "Java SDK",
+        "Generates a Java client SDK for a deployed stage of a REST API.",
+        &[
+            (
+                "serviceName",
+                "Service name",
+                "The name of the service the generated Java client calls.",
+                true,
+            ),
+            (
+                "javaPackageName",
+                "Java package name",
+                "The package the generated Java client classes are declared in.",
+                true,
+            ),
+        ],
+    ),
+    (
+        "javascript",
+        "JavaScript SDK",
+        "Generates a JavaScript client SDK for a deployed stage of a REST API.",
+        &[],
+    ),
+    (
+        "android",
+        "Android SDK",
+        "Generates an Android client SDK for a deployed stage of a REST API.",
+        &[
+            (
+                "groupId",
+                "Group ID",
+                "The group id of the generated Android SDK's build artifact.",
+                true,
+            ),
+            (
+                "artifactId",
+                "Artifact ID",
+                "The artifact id of the generated Android SDK's build artifact.",
+                true,
+            ),
+            (
+                "artifactVersion",
+                "Artifact version",
+                "The version of the generated Android SDK's build artifact.",
+                true,
+            ),
+            (
+                "invokerPackage",
+                "Invoker package",
+                "The package the generated Android client classes are declared in.",
+                true,
+            ),
+        ],
+    ),
+    (
+        "objectivec",
+        "iOS (Objective-C) SDK",
+        "Generates an Objective-C client SDK for a deployed stage of a REST API, for iOS.",
+        &[(
+            "classPrefix",
+            "Class prefix",
+            "The prefix the generated Objective-C client classes are named with.",
+            true,
+        )],
+    ),
+    (
+        "swift",
+        "iOS (Swift) SDK",
+        "Generates a Swift client SDK for a deployed stage of a REST API, for iOS.",
+        &[(
+            "classPrefix",
+            "Class prefix",
+            "The prefix the generated Swift client classes are named with.",
+            true,
+        )],
+    ),
+    (
+        "ruby",
+        "Ruby SDK",
+        "Generates a Ruby client SDK for a deployed stage of a REST API.",
+        &[],
+    ),
+];
+
+/// Every SDK type's id, in the catalog's order: the stable sequence `GetSdkTypes` pages
+/// and a `position` cursor walks, which [`page_of`] cuts a page out of.
+pub fn sdk_type_ids() -> Vec<String> {
+    SDK_TYPES.iter().map(|(id, ..)| (*id).to_string()).collect()
+}
+
+/// The SDK type `id` names, or `None` when the catalog holds no type under that id.
+///
+/// Shared by `GetSdkType` and `GetSdkTypes`, so one entry of the listed collection and a
+/// direct read of the same id are the same record member for member.
+pub fn sdk_type(id: &str) -> Option<GetSdkTypeOutput> {
+    SDK_TYPES
+        .iter()
+        .find(|(type_id, ..)| *type_id == id)
+        .map(|(type_id, friendly_name, description, properties)| GetSdkTypeOutput {
+            id: Some((*type_id).to_string()),
+            friendly_name: Some((*friendly_name).to_string()),
+            description: Some((*description).to_string()),
+            // Always reported, and empty for a type the documentation names no
+            // parameter for: the member says which properties `GetSdk` takes, and "none"
+            // is an answer a client can read.
+            configuration_properties: Some(
+                properties
+                    .iter()
+                    .map(
+                        |(name, property_friendly_name, property_description, required)| {
+                            SdkConfigurationProperty {
+                                name: Some((*name).to_string()),
+                                friendly_name: Some((*property_friendly_name).to_string()),
+                                description: Some((*property_description).to_string()),
+                                required: *required,
+                                // The catalog documents no default for any of these
+                                // properties, so none is reported.
+                                default_value: None,
+                            }
+                        },
+                    )
+                    .collect(),
+            ),
+        })
+}
+
+/// The `NotFoundException` message for an `id` that names no SDK type of the catalog.
+///
+/// API Gateway states no fixed sentence here, so the message is BUILT FROM THE REQUEST:
+/// it names the identifier that could not be resolved, as this service's other
+/// identifier refusals do (see [`no_such_rest_api`]).
+pub fn no_such_sdk_type(id: &str) -> String {
+    format!("Invalid SDK type identifier specified: {id}")
 }
 
 /// The characters an API Gateway id is built from: lowercase alphanumerics.

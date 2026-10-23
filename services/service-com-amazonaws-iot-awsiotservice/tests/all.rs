@@ -21,6 +21,8 @@ mod indexing_configuration;
 mod job_execution_read;
 #[path = "all/job_targeting.rs"]
 mod job_targeting;
+#[path = "all/policy_registry.rs"]
+mod policy_registry;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/thing_group_hierarchy.rs"]
