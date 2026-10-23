@@ -533,9 +533,19 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
     /// Pair it with [`profiling_group_name_from_arn`], which separates "not a
     /// profiling-group ARN at all" (a bad request) from "no such profiling group"
     /// (a 404).
-    pub fn group_by_arn_mut(&mut self, arn: &str) -> Option<&mut ProfilingGroup> {
-        let group = self.groups.get_mut(profiling_group_name_from_arn(arn)?)?;
+    pub fn group_by_arn(&self, arn: &str) -> Option<&ProfilingGroup> {
+        let group = self.groups.get(profiling_group_name_from_arn(arn)?)?;
         (group.arn == arn).then_some(group)
+    }
+
+    /// The same resolution as [`group_by_arn`](Self::group_by_arn), for an operation
+    /// that WRITES the resource it resolved. The rule lives in `group_by_arn` alone and
+    /// is applied here through it, so the two cannot drift; only the borrow differs,
+    /// which is why a reporting operation takes the shared one and physically cannot
+    /// write.
+    pub fn group_by_arn_mut(&mut self, arn: &str) -> Option<&mut ProfilingGroup> {
+        let name = self.group_by_arn(arn)?.name.clone();
+        self.groups.get_mut(&name)
     }
 
     /// Store a posted agent profile, honouring `profile_token` as an idempotency token
@@ -719,7 +729,11 @@ pub fn instant_key(at: DateTime) -> (i64, u32) {
 /// The ARN of a profiling group:
 /// `arn:aws:codeguru-profiler:<region>:<account>:profilingGroup/<name>`.
 pub fn profiling_group_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("profilingGroup/{name}"))
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{PROFILING_GROUP_RESOURCE_PREFIX}{name}"),
+    )
 }
 
 /// The region this request was signed for, defaulting to [`DEFAULT_REGION`] when the

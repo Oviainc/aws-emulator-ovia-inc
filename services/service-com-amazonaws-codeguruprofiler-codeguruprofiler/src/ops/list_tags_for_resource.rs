@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags currently stored on the profiling group the `resourceArn` names.
+//! A pure read: it answers from `state.groups[<name from the ARN>].tags` and writes
+//! nothing, so a later caller sees exactly what the last tag write left.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +137,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the profiling-group store is unavailable".to_string(),
+            })
+        })?;
+
+        // `ProfilingGroupArn` carries no modelled length or pattern constraint, so the
+        // boundary validator passed any string: a `resourceArn` that is not one of this
+        // service's profiling-group ARNs names no resource of any kind, which is a bad
+        // request rather than a missing resource. (Same split as `UntagResource`.)
+        if crate::state::profiling_group_name_from_arn(&input.resource_arn).is_none() {
+            return Err(ListTagsForResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "resourceArn must be an {}:{}<name> ARN, got {}",
+                        crate::state::ARN_NAMESPACE,
+                        crate::state::PROFILING_GROUP_RESOURCE_PREFIX,
+                        input.resource_arn
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let guard = state.lock();
+        let group = guard.group_by_arn(&input.resource_arn).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("no resource with the arn {}", input.resource_arn),
+            })
+        })?;
+
+        // The stored tag set, whatever it holds — an empty map for a resource carrying
+        // no tags, which is a map with no entries rather than an absent member.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(group.tags.clone()),
+        })
     }
 }
