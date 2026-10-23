@@ -399,10 +399,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 )
             }
-            Err(crate::state::TagRefusal::MissingKey) => {
+            Err(crate::state::TagRefusal::InvalidTag(message)) => {
                 return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
-                        message: Some("Invalid value for Tags: a tag's Key may not be null.".to_string()),
+                        message: Some(message),
                     },
                 )
                 .into())

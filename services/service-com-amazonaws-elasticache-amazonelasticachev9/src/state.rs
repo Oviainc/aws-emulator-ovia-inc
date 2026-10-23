@@ -32,6 +32,14 @@
 //! about and because a status change the CLOCK materialises
 //! ([`CacheClusterRecord::settle`]) has to record one too.
 //!
+//! A resource's TAGS, by contrast, live ON its record
+//! ([`CacheClusterRecord::tags`] and its siblings), because a tag belongs to one
+//! resource and goes when it goes. That is the one copy a create's `Tags` member
+//! writes, `ListTagsForResource` reports and `AddTagsToResource` /
+//! `RemoveTagsFromResource` change; the three of them resolve an ARN to it
+//! through [`ComAmazonawsElasticacheAmazonelasticachev9State::resource_tags`], so
+//! they cannot disagree about which resource an ARN names.
+//!
 //! Beside those customer-created resources sit the catalogs this service
 //! publishes rather than mints: the service updates AWS releases for its cache
 //! engines, the cache engines and versions themselves, and the ENGINE DEFAULT
@@ -400,17 +408,79 @@ pub fn is_valid_subnet_group_name(value: &str) -> bool {
         && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
+/// The longest tag key a caller may use: "Maximum key length — 128 Unicode
+/// characters in UTF-8", from the tag restrictions ElastiCache publishes
+/// ("Tagging your ElastiCache resources", the same restrictions AWS states for
+/// tags generally). `Tag$Key` carries no modelled `@length` or `@pattern`, so
+/// the boundary validator passes any string and the bound is enforced here.
+pub const MAX_TAG_KEY_LEN: usize = 128;
+
+/// The longest tag value a caller may use: "Maximum value length — 256 Unicode
+/// characters in UTF-8"; see [`MAX_TAG_KEY_LEN`]. A value of length ZERO is
+/// permitted — `Tag$Value` is "the tag's value. May be null".
+pub const MAX_TAG_VALUE_LEN: usize = 256;
+
+/// The tag-key prefix AWS reserves for itself: "Do not use the `aws:` prefix in
+/// your tag names or values because it is reserved for AWS use. You can't edit
+/// or delete tag names or values with this prefix." So a CALLER's tag key may
+/// not carry it, in any letter case, wherever a request names tag keys — a
+/// create's `Tags`, `AddTagsToResource`'s `Tags`, and
+/// `RemoveTagsFromResource`'s `TagKeys`.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
 /// Why a request's `Tags` cannot be stored.
 #[derive(Debug, Clone)]
 pub enum TagRefusal {
-    /// A tag carried no `Key`. `Tag$Key` is "the key for the tag. May not be
-    /// null" — only the VALUE may be.
-    MissingKey,
+    /// A tag a caller may not write, with the rule it breaks: a `Key` the
+    /// request omitted or left empty (`Tag$Key` is "the key for the tag. May not
+    /// be null" — only the VALUE may be), a key or value past its length bound,
+    /// or a key under the reserved [`RESERVED_TAG_KEY_PREFIX`].
+    InvalidTag(String),
     /// More tags than [`MAX_TAGS_PER_RESOURCE`].
     TooMany(usize),
 }
 
-/// The tags a create was given as stored pairs, or why they are refused.
+/// What is wrong with a caller-supplied tag KEY, or `None` when the caller may
+/// use it — the one statement of the rule, so a create's `Tags`,
+/// `AddTagsToResource` and `RemoveTagsFromResource` cannot disagree about which
+/// keys a caller owns.
+pub fn tag_key_rejection(key: &str) -> Option<String> {
+    if key.is_empty() {
+        return Some("Invalid value for Tags: a tag's Key may not be null.".to_string());
+    }
+    if key.chars().count() > MAX_TAG_KEY_LEN {
+        return Some(format!(
+            "Invalid value {key} for Tags: a tag's Key may contain no more than \
+             {MAX_TAG_KEY_LEN} characters."
+        ));
+    }
+    // Sliced with `get`, which answers `None` rather than panicking when the
+    // key's first bytes are the middle of a multi-byte character.
+    if key
+        .get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+    {
+        return Some(format!(
+            "Invalid value {key} for Tags: a tag's Key may not start with the reserved prefix \
+             {RESERVED_TAG_KEY_PREFIX}."
+        ));
+    }
+    None
+}
+
+/// What is wrong with a caller-supplied tag VALUE, or `None` when the caller may
+/// use it; see [`tag_key_rejection`]. Only the length is bounded: the empty
+/// value is permitted, and the model puts no character class on `Tag$Value`.
+pub fn tag_value_rejection(value: &str) -> Option<String> {
+    (value.chars().count() > MAX_TAG_VALUE_LEN).then(|| {
+        format!(
+            "Invalid value for Tags: a tag's Value may contain no more than \
+             {MAX_TAG_VALUE_LEN} characters."
+        )
+    })
+}
+
+/// The tags a request was given as stored pairs, or why they are refused.
 ///
 /// Order is preserved and duplicate keys are kept as sent, so a later
 /// `ListTagsForResource` reports what the caller supplied rather than a set the
@@ -421,11 +491,43 @@ pub fn tag_pairs(tags: Option<Vec<Tag>>) -> Result<Vec<(String, String)>, TagRef
         return Err(TagRefusal::TooMany(tags.len()));
     }
     tags.into_iter()
-        .map(|tag| match tag.key {
-            Some(key) => Ok((key, tag.value.unwrap_or_default())),
-            None => Err(TagRefusal::MissingKey),
+        .map(|tag| {
+            // A tag with no `Value` carries the EMPTY value once stored, so
+            // every tag this service reports has one.
+            let key = tag.key.unwrap_or_default();
+            let value = tag.value.unwrap_or_default();
+            match tag_key_rejection(&key).or_else(|| tag_value_rejection(&value)) {
+                Some(message) => Err(TagRefusal::InvalidTag(message)),
+                None => Ok((key, value)),
+            }
         })
         .collect()
+}
+
+/// The stored pairs as the modelled `TagList` every tagging operation answers
+/// with ("a list of tags as key-value pairs"), in the order the store holds
+/// them.
+pub fn tag_list(tags: &[(String, String)]) -> Vec<Tag> {
+    tags.iter()
+        .map(|(key, value)| Tag {
+            key: Some(key.clone()),
+            value: Some(value.clone()),
+        })
+        .collect()
+}
+
+/// Merge `requested` into `stored`, which is what `AddTagsToResource` does to a
+/// resource's tags: a key the resource does not carry is APPENDED, and a key it
+/// does carry takes the new value in place, so re-tagging a key adds no tag and
+/// leaves the resource's tag order alone. A key the request does not name is
+/// untouched.
+pub fn merge_tags(stored: &mut Vec<(String, String)>, requested: Vec<(String, String)>) {
+    for (key, value) in requested {
+        match stored.iter_mut().find(|(held, _)| *held == key) {
+            Some(slot) => slot.1 = value,
+            None => stored.push((key, value)),
+        }
+    }
 }
 
 /// `CacheClusterStatus` / `CacheNodeStatus` values this slice uses, from
@@ -1977,6 +2079,164 @@ pub fn snapshot_arn(region: &str, snapshot_name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("snapshot:{snapshot_name}"))
 }
 
+/// The kind of resource an ElastiCache ARN names, which is what decides WHICH
+/// not-found fault a tagging call answers with for an ARN this store holds no
+/// resource for: each of `AddTagsToResource`, `ListTagsForResource` and
+/// `RemoveTagsFromResource` models one per kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedResourceKind {
+    CacheCluster,
+    CacheParameterGroup,
+    CacheSecurityGroup,
+    CacheSubnetGroup,
+    GlobalReplicationGroup,
+    ReplicationGroup,
+    ReservedCacheNode,
+    ServerlessCache,
+    ServerlessCacheSnapshot,
+    Snapshot,
+    User,
+    UserGroup,
+}
+
+impl TaggedResourceKind {
+    /// How this kind is named in the message of the fault it answers with.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CacheCluster => "Cache cluster",
+            Self::CacheParameterGroup => "Cache parameter group",
+            Self::CacheSecurityGroup => "Cache security group",
+            Self::CacheSubnetGroup => "Cache subnet group",
+            Self::GlobalReplicationGroup => "Global datastore",
+            Self::ReplicationGroup => "Replication group",
+            Self::ReservedCacheNode => "Reserved cache node",
+            Self::ServerlessCache => "Serverless cache",
+            Self::ServerlessCacheSnapshot => "Serverless cache snapshot",
+            Self::Snapshot => "Snapshot",
+            Self::User => "User",
+            Self::UserGroup => "User group",
+        }
+    }
+}
+
+/// The resource-type segment an ElastiCache ARN carries for each kind.
+///
+/// Every segment this service's ARN helpers mint ([`cluster_arn`],
+/// [`subnet_group_arn`], [`parameter_group_arn`], [`snapshot_arn`],
+/// [`replication_group_arn`], [`reservation_arn`], [`serverless_cache_arn`],
+/// [`user_arn`], [`user_group_arn`], [`global_replication_group_arn`]), plus the
+/// two kinds this emulator mints no resource of yet — the EC2-Classic cache
+/// security group and the serverless cache snapshot. A segment in neither list
+/// names no ElastiCache resource at all, which is what [`parse_resource_arn`]
+/// answers `None` for.
+const RESOURCE_TYPE_SEGMENTS: &[(&str, TaggedResourceKind)] = &[
+    ("cluster", TaggedResourceKind::CacheCluster),
+    ("parametergroup", TaggedResourceKind::CacheParameterGroup),
+    ("securitygroup", TaggedResourceKind::CacheSecurityGroup),
+    ("subnetgroup", TaggedResourceKind::CacheSubnetGroup),
+    (
+        "globalreplicationgroup",
+        TaggedResourceKind::GlobalReplicationGroup,
+    ),
+    ("replicationgroup", TaggedResourceKind::ReplicationGroup),
+    ("reserved-instance", TaggedResourceKind::ReservedCacheNode),
+    ("serverlesscache", TaggedResourceKind::ServerlessCache),
+    (
+        "serverlesscachesnapshot",
+        TaggedResourceKind::ServerlessCacheSnapshot,
+    ),
+    ("snapshot", TaggedResourceKind::Snapshot),
+    ("user", TaggedResourceKind::User),
+    ("usergroup", TaggedResourceKind::UserGroup),
+];
+
+/// What an ElastiCache resource ARN carries: the Region it names the resource
+/// in, the kind of resource, and the resource's own name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceArnParts<'a> {
+    pub region: &'a str,
+    pub kind: TaggedResourceKind,
+    pub name: &'a str,
+}
+
+impl ResourceArnParts<'_> {
+    /// The rejection an ARN of this kind that names no stored resource is
+    /// answered with: the kind decides which modelled not-found fault the
+    /// calling operation lifts it into.
+    pub fn not_found(&self) -> TagTargetRejection {
+        TagTargetRejection::NotFound(
+            self.kind,
+            format!("{} {} not found.", self.kind.label(), self.name),
+        )
+    }
+}
+
+/// The parts of an ElastiCache resource ARN, or `None` when `resource_arn` is
+/// not one.
+///
+/// The shape is the one every ARN this service mints has (see [`cluster_arn`]):
+/// `arn:<partition>:elasticache:<region>:<account>:<type>:<name>`, with a
+/// non-empty partition, Region and account, a resource type from
+/// [`RESOURCE_TYPE_SEGMENTS`] and a non-empty resource name. The service field
+/// must be this service's ([`ARN_NAMESPACE`]): another service's ARN names no
+/// ElastiCache resource.
+pub fn parse_resource_arn(resource_arn: &str) -> Option<ResourceArnParts<'_>> {
+    let mut fields = resource_arn.splitn(6, ':');
+    let prefix = fields.next()?;
+    let partition = fields.next()?;
+    let service = fields.next()?;
+    let region = fields.next()?;
+    let account = fields.next()?;
+    let resource = fields.next()?;
+    if prefix != "arn"
+        || partition.is_empty()
+        || service != ARN_NAMESPACE
+        || region.is_empty()
+        || account.is_empty()
+    {
+        return None;
+    }
+    let (resource_type, name) = resource.split_once(':')?;
+    if name.is_empty() {
+        return None;
+    }
+    let (_, kind) = RESOURCE_TYPE_SEGMENTS
+        .iter()
+        .find(|(segment, _)| *segment == resource_type)?;
+    Some(ResourceArnParts {
+        region,
+        kind: *kind,
+        name,
+    })
+}
+
+/// Why a tagging call's `ResourceName` names no resource of this service (see
+/// [`ComAmazonawsElasticacheAmazonelasticachev9State::resource_tags`]).
+///
+/// Carries the MESSAGE and, for a well-formed ARN, the kind — not a modelled
+/// error: each of the three tagging operations declares its own error enum, so
+/// each lifts this into its own `InvalidARNFault` / per-kind not-found variant.
+#[derive(Debug, Clone)]
+pub enum TagTargetRejection {
+    /// The value is not an ElastiCache resource ARN at all: the 400
+    /// `InvalidARNFault`, "the requested Amazon Resource Name (ARN) does not
+    /// refer to an existing resource".
+    InvalidArn(String),
+    /// A well-formed ARN naming no resource in this store: that kind's own
+    /// not-found fault.
+    NotFound(TaggedResourceKind, String),
+}
+
+/// `resource_arn` parsed, or the `InvalidArn` rejection for a value that is not
+/// an ElastiCache resource ARN.
+fn tag_target_parts(resource_arn: &str) -> Result<ResourceArnParts<'_>, TagTargetRejection> {
+    parse_resource_arn(resource_arn).ok_or_else(|| {
+        TagTargetRejection::InvalidArn(format!(
+            "{resource_arn} is not a valid ElastiCache resource ARN."
+        ))
+    })
+}
+
 /// The region of the request being served: the third field of its SigV4
 /// credential scope, falling back to [`DEFAULT_REGION`] for a request that is
 /// not signed.
@@ -2688,9 +2948,10 @@ pub struct NewReservation {
     pub cache_node_count: i32,
     /// The Region of the request that bought it, which its ARN names.
     pub region: String,
-    /// The tags the purchase was given. `AddTagsToResource` /
-    /// `ListTagsForResource` are scaffolded 501s and own their issues; the tags
-    /// are persisted here so implementing them does not have to move them.
+    /// The tags the purchase was given. The ONE copy of this reservation's tags:
+    /// `ListTagsForResource` reports it and `AddTagsToResource` /
+    /// `RemoveTagsFromResource` change it, through
+    /// [`ComAmazonawsElasticacheAmazonelasticachev9State::resource_tags`].
     pub tags: Vec<(String, String)>,
     pub now: SystemTime,
 }
@@ -3054,9 +3315,10 @@ pub struct CacheClusterRecord {
     pub log_delivery_configurations: Vec<LogDeliveryRecord>,
     pub nodes: Vec<CacheNodeRecord>,
     pub pending_modified_values: PendingValues,
-    /// The tags `CreateCacheCluster` was given. `AddTagsToResource` /
-    /// `ListTagsForResource` are scaffolded 501s and own their issues; the tags
-    /// are persisted here so implementing them does not have to move them.
+    /// The tags `CreateCacheCluster` was given. The ONE copy of this cluster's
+    /// tags: `ListTagsForResource` reports it and `AddTagsToResource` /
+    /// `RemoveTagsFromResource` change it, through
+    /// [`ComAmazonawsElasticacheAmazonelasticachev9State::resource_tags`].
     pub tags: Vec<(String, String)>,
 }
 
@@ -4749,9 +5011,10 @@ pub struct SnapshotRecord {
     pub kms_key_id: Option<String>,
     pub arn: String,
     pub node_snapshots: Vec<NodeSnapshotRecord>,
-    /// The tags `CreateSnapshot` was given. `AddTagsToResource` /
-    /// `ListTagsForResource` are scaffolded 501s and own their issues; the tags
-    /// are persisted here so implementing them does not have to move them.
+    /// The tags `CreateSnapshot` was given. The ONE copy of this snapshot's tags:
+    /// `ListTagsForResource` reports it and `AddTagsToResource` /
+    /// `RemoveTagsFromResource` change it, through
+    /// [`ComAmazonawsElasticacheAmazonelasticachev9State::resource_tags`].
     pub tags: Vec<(String, String)>,
 }
 
@@ -6312,8 +6575,8 @@ pub struct UserRecord {
     /// A `User$Status` token — see [`USER_STATUS_ACTIVE`].
     pub status: String,
     pub arn: String,
-    /// The tags the create was given, for `ListTagsForResource` (still a
-    /// scaffolded 501 with its own issue) to report.
+    /// The tags the create was given, for `ListTagsForResource` to report and the
+    /// two tag mutations to change; see [`CacheClusterRecord::tags`].
     pub tags: Vec<(String, String)>,
     /// When the clock owes this user's removal from the store: the instant
     /// [`USER_DELETION_TRANSITION`] after the `DeleteUser` that moved it to
@@ -7690,6 +7953,154 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                 .get(id)?
                 .to_modeled(&self.cache_clusters),
         )
+    }
+
+    /// The tags the resource `resource_arn` names carries, or why that ARN names
+    /// no resource of this service.
+    ///
+    /// The ONE resolution `AddTagsToResource`, `ListTagsForResource` and
+    /// `RemoveTagsFromResource` share, so they cannot disagree about which
+    /// resource an ARN is about, nor report different tags for one resource:
+    /// tags live on the resource's own record (`CacheClusterRecord::tags` and
+    /// its siblings), which is also what a create's `Tags` member writes.
+    ///
+    /// A resource is matched on the ARN this service MINTED for it and stored on
+    /// its record, so an ARN naming an existing name in another Region, account
+    /// or partition resolves to nothing rather than to this store's copy of that
+    /// name. A cache parameter group is the one kind whose record carries no
+    /// Region of its own — a group's ARN is built from the Region of the request
+    /// reporting it ([`parameter_group_arn`]) — so for that kind the ARN is
+    /// matched against the one built from its own Region field.
+    ///
+    /// The kinds this emulator mints no resource of yet (the EC2-Classic cache
+    /// security group, the serverless cache snapshot) can match nothing, which
+    /// is exactly what their not-found faults say.
+    pub fn resource_tags(
+        &self,
+        resource_arn: &str,
+    ) -> Result<&Vec<(String, String)>, TagTargetRejection> {
+        let parts = tag_target_parts(resource_arn)?;
+        let found = match parts.kind {
+            TaggedResourceKind::CacheCluster => self
+                .cache_clusters
+                .values()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &record.tags),
+            TaggedResourceKind::CacheParameterGroup => self
+                .cache_parameter_groups
+                .values()
+                .find(|record| parameter_group_arn(parts.region, &record.name) == resource_arn)
+                .map(|record| &record.tags),
+            TaggedResourceKind::CacheSubnetGroup => self
+                .cache_subnet_groups
+                .values()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &record.tags),
+            TaggedResourceKind::GlobalReplicationGroup => self
+                .global_replication_groups
+                .values()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &record.tags),
+            TaggedResourceKind::ReplicationGroup => self
+                .replication_groups
+                .values()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &record.tags),
+            TaggedResourceKind::ReservedCacheNode => self
+                .reserved_cache_nodes
+                .values()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &record.tags),
+            TaggedResourceKind::ServerlessCache => self
+                .serverless_caches
+                .values()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &record.tags),
+            TaggedResourceKind::Snapshot => self
+                .snapshots
+                .values()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &record.tags),
+            TaggedResourceKind::User => self
+                .users
+                .values()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &record.tags),
+            TaggedResourceKind::UserGroup => self
+                .user_groups
+                .values()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &record.tags),
+            TaggedResourceKind::CacheSecurityGroup
+            | TaggedResourceKind::ServerlessCacheSnapshot => None,
+        };
+        found.ok_or_else(|| parts.not_found())
+    }
+
+    /// [`Self::resource_tags`] with the write capability, for the two tagging
+    /// operations that CHANGE a resource's tags. The resolution is the same one,
+    /// arm for arm: a caller that can read a resource's tags through an ARN is
+    /// the caller that can write them through it.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Result<&mut Vec<(String, String)>, TagTargetRejection> {
+        let parts = tag_target_parts(resource_arn)?;
+        let found = match parts.kind {
+            TaggedResourceKind::CacheCluster => self
+                .cache_clusters
+                .values_mut()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &mut record.tags),
+            TaggedResourceKind::CacheParameterGroup => self
+                .cache_parameter_groups
+                .values_mut()
+                .find(|record| parameter_group_arn(parts.region, &record.name) == resource_arn)
+                .map(|record| &mut record.tags),
+            TaggedResourceKind::CacheSubnetGroup => self
+                .cache_subnet_groups
+                .values_mut()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &mut record.tags),
+            TaggedResourceKind::GlobalReplicationGroup => self
+                .global_replication_groups
+                .values_mut()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &mut record.tags),
+            TaggedResourceKind::ReplicationGroup => self
+                .replication_groups
+                .values_mut()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &mut record.tags),
+            TaggedResourceKind::ReservedCacheNode => self
+                .reserved_cache_nodes
+                .values_mut()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &mut record.tags),
+            TaggedResourceKind::ServerlessCache => self
+                .serverless_caches
+                .values_mut()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &mut record.tags),
+            TaggedResourceKind::Snapshot => self
+                .snapshots
+                .values_mut()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &mut record.tags),
+            TaggedResourceKind::User => self
+                .users
+                .values_mut()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &mut record.tags),
+            TaggedResourceKind::UserGroup => self
+                .user_groups
+                .values_mut()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &mut record.tags),
+            TaggedResourceKind::CacheSecurityGroup
+            | TaggedResourceKind::ServerlessCacheSnapshot => None,
+        };
+        found.ok_or_else(|| parts.not_found())
     }
 }
 

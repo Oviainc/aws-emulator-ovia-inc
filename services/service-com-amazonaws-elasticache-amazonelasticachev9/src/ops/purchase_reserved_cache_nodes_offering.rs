@@ -224,10 +224,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 )
             }
-            Err(crate::state::TagRefusal::MissingKey) => {
-                return Err(invalid_parameter_value(
-                    "Invalid value for Tags: a tag's Key may not be null.".to_string(),
-                ))
+            Err(crate::state::TagRefusal::InvalidTag(message)) => {
+                return Err(invalid_parameter_value(message))
             }
         };
 

@@ -84,6 +84,11 @@ mod cache_parameter_group_delete;
 #[path = "all/describe_cache_parameters.rs"]
 mod describe_cache_parameters;
 
+// Appended for the same reason: the tagging suite (`AddTagsToResource`,
+// `ListTagsForResource`, `RemoveTagsFromResource`).
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
+
 // Appended for the same reason: the `DeleteServerlessCache` suite.
 #[path = "all/serverless_cache_delete.rs"]
 mod serverless_cache_delete;

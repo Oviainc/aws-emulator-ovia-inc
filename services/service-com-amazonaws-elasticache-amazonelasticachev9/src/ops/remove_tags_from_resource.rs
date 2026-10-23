@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveTagsFromResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveTagsFromResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveTagsFromResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the tags its `TagKeys` names from the resource its `ResourceName` names,
+//! and answers with the tag set that resource is left with. This is the ONLY file to
+//! touch for this operation.
+//!
+//! The ARN is resolved through the one resolution this operation shares with
+//! `AddTagsToResource` and `ListTagsForResource`
+//! (`crate::state::ComAmazonawsElasticacheAmazonelasticachev9State::resource_tags_mut`):
+//! a value that is not an ElastiCache resource ARN is the modelled 400
+//! `InvalidARNFault`, and a well-formed ARN naming no stored resource is that resource
+//! kind's own not-found fault.
+//!
+//! The write is ATOMIC: every key `TagKeys` names has to be ON the resource — one that
+//! is not is the modelled 404 `TagNotFoundFault`, "the requested tag was not found on
+//! this resource" — and a refused request removes NOTHING, so the next
+//! `ListTagsForResource` still reports the tags the resource had.
 //!
 //! ## Shape of an operation
 //!
@@ -157,6 +164,89 @@ impl From<RemoveTagsFromResourceErrorModeled> for RemoveTagsFromResourceError {
     }
 }
 
+/// This operation's answer to a `ResourceName` that names no resource of this service.
+///
+/// The classification is
+/// [`crate::state::ComAmazonawsElasticacheAmazonelasticachev9State::resource_tags_mut`]'s,
+/// shared with `AddTagsToResource` and `ListTagsForResource`; only the lift into THIS
+/// operation's error enum lives here, because each tagging operation declares its own.
+fn reject(rejection: crate::state::TagTargetRejection) -> RemoveTagsFromResourceError {
+    use crate::state::{TagTargetRejection, TaggedResourceKind};
+    match rejection {
+        TagTargetRejection::InvalidArn(message) => {
+            RemoveTagsFromResourceErrorModeled::InvalidARNFault(InvalidARNFault {
+                message: Some(message),
+            })
+        }
+        TagTargetRejection::NotFound(kind, text) => {
+            let message = Some(text);
+            match kind {
+                TaggedResourceKind::CacheCluster => {
+                    RemoveTagsFromResourceErrorModeled::CacheClusterNotFoundFault(
+                        CacheClusterNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::CacheParameterGroup => {
+                    RemoveTagsFromResourceErrorModeled::CacheParameterGroupNotFoundFault(
+                        CacheParameterGroupNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::CacheSecurityGroup => {
+                    RemoveTagsFromResourceErrorModeled::CacheSecurityGroupNotFoundFault(
+                        CacheSecurityGroupNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::CacheSubnetGroup => {
+                    RemoveTagsFromResourceErrorModeled::CacheSubnetGroupNotFoundFault(
+                        CacheSubnetGroupNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::GlobalReplicationGroup => {
+                    RemoveTagsFromResourceErrorModeled::GlobalReplicationGroupNotFoundFault(
+                        GlobalReplicationGroupNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::ReplicationGroup => {
+                    RemoveTagsFromResourceErrorModeled::ReplicationGroupNotFoundFault(
+                        ReplicationGroupNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::ReservedCacheNode => {
+                    RemoveTagsFromResourceErrorModeled::ReservedCacheNodeNotFoundFault(
+                        ReservedCacheNodeNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::ServerlessCache => {
+                    RemoveTagsFromResourceErrorModeled::ServerlessCacheNotFoundFault(
+                        ServerlessCacheNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::ServerlessCacheSnapshot => {
+                    RemoveTagsFromResourceErrorModeled::ServerlessCacheSnapshotNotFoundFault(
+                        ServerlessCacheSnapshotNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::Snapshot => {
+                    RemoveTagsFromResourceErrorModeled::SnapshotNotFoundFault(
+                        SnapshotNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::User => {
+                    RemoveTagsFromResourceErrorModeled::UserNotFoundFault(UserNotFoundFault {
+                        message,
+                    })
+                }
+                TaggedResourceKind::UserGroup => {
+                    RemoveTagsFromResourceErrorModeled::UserGroupNotFoundFault(
+                        UserGroupNotFoundFault { message },
+                    )
+                }
+            }
+        }
+    }
+    .into()
+}
+
 /// The `RemoveTagsFromResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -193,18 +283,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveTagsFromResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveTagsFromResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveTagsFromResource"))
+        // This operation MUTATES: it takes tags off a stored resource's own record.
+        // The ARN carries the Region the resource lives in, so nothing here reads the
+        // request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The keys are checked BEFORE anything is resolved or removed: a key a caller
+        // may not write is a key a caller may not remove either, so the same rule
+        // `AddTagsToResource` and every create applies holds here — which is what
+        // keeps AWS's reserved `aws:` tags out of a caller's reach.
+        for key in &input.tag_keys {
+            if let Some(message) = crate::state::tag_key_rejection(key) {
+                return Err(
+                    RemoveTagsFromResourceErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let mut store = state.lock();
+        let stored = store
+            .resource_tags_mut(&input.resource_name)
+            .map_err(reject)?;
+        // Every named key has to be one the resource carries. The check runs over the
+        // WHOLE key list before the first removal, so a request naming one tag the
+        // resource does not have removes none of the others either.
+        if let Some(missing) = input
+            .tag_keys
+            .iter()
+            .find(|key| !stored.iter().any(|(held, _)| held == *key))
+        {
+            return Err(RemoveTagsFromResourceErrorModeled::TagNotFoundFault(
+                TagNotFoundFault {
+                    message: Some(format!(
+                        "The tag {missing} was not found on resource {}.",
+                        input.resource_name
+                    )),
+                },
+            )
+            .into());
+        }
+        stored.retain(|(held, _)| !input.tag_keys.iter().any(|key| key == held));
+        // `TagListMessage$TagList` is "a list of tags as key-value pairs": the tag set
+        // the resource is LEFT with, read back out of the record this call just wrote.
+        Ok(RemoveTagsFromResourceOutput {
+            tag_list: Some(crate::state::tag_list(stored)),
+        })
     }
 }

@@ -83,7 +83,11 @@ impl Reply {
 }
 
 /// Resolve the five predefined XML entities in an element's text.
-fn unescape_xml(text: &str) -> String {
+///
+/// `pub(crate)` for the same reason as the rest of this harness: a suite that reads an
+/// element out of the RAW body (because the scanner below drops an element whose text
+/// is empty) resolves its entities the one way rather than carrying a second copy.
+pub(crate) fn unescape_xml(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
