@@ -4,7 +4,10 @@
 //!
 //! Creates or replaces the resource-based policy attached to a workspace, under the
 //! optimistic lock `revisionId` carries: every accepted put mints a fresh revision and
-//! the policy becomes `ACTIVE` once the clock owes that transition.
+//! the policy becomes `ACTIVE` once the clock owes that transition. A `revisionId` that
+//! does not name the current revision is the caller's value to fix, so it is refused
+//! with the modelled `ValidationException` (400), not the 409 a transient status
+//! answers.
 //!
 //! ## Shape of an operation
 //!
@@ -236,16 +239,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The optimistic lock: a `revisionId` that does not name the policy's current
         // revision is a stale writer, and applying it would lose the revision in
-        // between — ConflictException (409).
+        // between. The value the caller SENT is what is wrong, and no retry of the same
+        // request can fix it — so this is the modelled ValidationException (400) naming
+        // `revisionId`, not the 409 a transient resource status answers
+        // (`crate::state::stale_revision_rejection`). Nothing is written: the stored
+        // document and revision are left exactly as they were.
         if !crate::state::revision_matches(existing.as_ref(), input.revision_id.as_deref()) {
-            return Err(PutResourcePolicyErrorModeled::ConflictException(
-                ConflictException {
-                    message: "The revisionId does not name the current revision of the \
-                              resource-based policy"
-                        .to_string(),
-                    resource_id: input.workspace_id.clone(),
-                    resource_type: crate::state::POLICY_RESOURCE_TYPE.to_string(),
-                },
+            return Err(PutResourcePolicyErrorModeled::ValidationException(
+                crate::state::stale_revision_rejection(),
             )
             .into());
         }

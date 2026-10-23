@@ -157,7 +157,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
 
         let mut store = state.lock();
+        // The service-managed keyspaces are part of the account before any call.
+        store.ensure_service_managed_catalog(&region);
         store.settle(::std::time::SystemTime::now());
+
+        // A service-managed keyspace is not a resource a client owns: Cassandra refuses
+        // DDL against one as an invalid query ("system keyspace is not user-modifiable"),
+        // which is this operation's `ValidationException` — "The operation failed due to
+        // an invalid or malformed request". It exists, so a 404 would be wrong, and it
+        // must still be there for the next caller, so a delete would be worse.
+        if crate::state::is_service_managed_keyspace(&input.keyspace_name) {
+            return Err(DeleteKeyspaceErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::service_managed_rejection(&input.keyspace_name)),
+            })
+            .into());
+        }
 
         // "The DeleteKeyspace operation deletes a keyspace and all of its tables." The
         // tables are held INSIDE the keyspace record, so removing it removes them with

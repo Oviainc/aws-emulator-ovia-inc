@@ -46,7 +46,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, ViolationKind,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -59,6 +59,86 @@ use std::sync::Arc;
 /// in `tests/all/target_prefix_dispatch.rs`.
 #[cfg(test)]
 mod rpc_target;
+
+/// The error code this service answers an input-constraint violation with. It is also
+/// the code the framework would have chosen, restated here because `override_refusal`
+/// replaces the code and the message together.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// Render one violation the way CloudTrail states it.
+///
+/// A violated `@pattern` names the member path and the pattern it failed — the pattern
+/// as the MODEL writes it, anchors included — and NOTHING of the value that was
+/// rejected. The recorded answer to a `ResourceArn` outside its pattern, quoted in this
+/// fix's issue report and replayed by its corpus unit, is `1 validation error detected:
+/// Value at 'resourceArn' failed to satisfy constraint: Member must satisfy regular
+/// expression pattern: ^[a-zA-Z0-9._/\-:]+$`. Every other class keeps the framework's
+/// own sentence ([`Violation::message`], value and all): the pattern class is the one
+/// this service has recorded wording for, and a class with no recorded wording is
+/// better left as the framework states it than reworded on a guess.
+///
+/// Why neither shared seam serves this service, which is what the duplication below
+/// costs and what would retire it:
+///
+/// * `service_common::validation_message::aws_validation_refusal` is the shared
+///   `override_refusal` body, but it states a pattern requirement UNANCHORED
+///   (`service_common::validation::unanchored`) and KEEPS the rejected value — the two
+///   things CloudTrail's recorded answer does not do, and the exact `$.message`
+///   divergence this fix removed. A service whose recorded answer differs on both
+///   counts cannot call it.
+/// * `aws_smithy_schema_server::constraints::envelope` IS public, so the envelope could
+///   come from there — but it renders every clause through [`Violation::message`], whose
+///   only value-free form is `Value null at '<path>'` (an ABSENT member), not the
+///   recorded `Value at '<path>'`. There is no public seam for "this value, unquoted",
+///   because `Violation::requirement` is private and `vendor/` is read-only here.
+///
+/// MIGRATION NOTE (the one `services/common/src/validation.rs` asks every new inliner
+/// to leave): the same value-free clause rendering is inlined in
+/// `services/service-com-amazonaws-b2bi-b2bi/src/service.rs`,
+/// `services/service-com-amazonaws-emrserverless-awstoledowebservice/src/service.rs`
+/// and `services/service-com-amazonaws-personalizeruntime-amazonpersonalizeruntime/src/service.rs`,
+/// over the same `N validation error(s) detected: …` envelope. The fix that owns the
+/// migration adds the one missing seam — a public `Violation::message_without_value()`,
+/// or a `services/common` clause renderer taking the requirement from the framework —
+/// and replaces every copy, this one included, with a call to it.
+fn clause(violation: &Violation) -> String {
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => format!(
+            "Value at '{}' failed to satisfy constraint: Member must satisfy regular \
+             expression pattern: {pattern}",
+            violation.path
+        ),
+        _ => violation.message(),
+    }
+}
+
+/// Whether `violation` is the class this service rewords: a violated `@pattern`.
+fn is_pattern(violation: &Violation) -> bool {
+    matches!(violation.kind, ViolationKind::Pattern(_))
+}
+
+/// The `ValidationException` message for a refused request: the AWS validation envelope
+/// (`N validation error(s) detected: `) over one clause per violation.
+///
+/// `None` declines the refusal, leaving the framework's wording, for a request with no
+/// pattern violation at all — there is nothing to reword there. A request that mixes a
+/// pattern violation with another class IS reworded, so the pattern clause drops its
+/// value while every other clause reads exactly as the framework would have stated it.
+fn pattern_envelope(violations: &[Violation]) -> Option<String> {
+    if !violations.iter().any(is_pattern) {
+        return None;
+    }
+    let clauses: Vec<String> = violations.iter().map(clause).collect();
+    match clauses.as_slice() {
+        [] => None,
+        [only] => Some(format!("1 validation error detected: {only}")),
+        many => Some(format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        )),
+    }
+}
 
 /// The part of a tag a constraint-violation path names — `key` or `value` — or `None`
 /// for a path that does not walk into a tag at all.
@@ -78,6 +158,30 @@ fn tag_member(path: &str) -> Option<&'static str> {
         "value" => Some("value"),
         _ => None,
     }
+}
+
+/// The refusal a tag outside its modelled `@length` is answered with, if `violations`
+/// carries one.
+///
+/// CloudTrail does not answer a tag outside the modelled `TagKey` / `TagValue` length
+/// with the framework's generic `ValidationException`: a tag key or value outside its
+/// bound is `InvalidTagParameterException`, the shape the model declares for "the
+/// specified tag key or values are not valid", worded from the bound the value broke.
+/// The recorded corpus pins it — `AddTags` with an over-long tag value answers HTTP 400
+/// `InvalidTagParameterException` "Tag value length cannot be more than 256
+/// characters." — and the rule holds for every operation that takes a tag, not only the
+/// tagging pair.
+fn invalid_tag_parameter(violations: &[Violation]) -> Option<Refused> {
+    violations.iter().find_map(|violation| {
+        let ViolationKind::MaxLength(max) = violation.kind else {
+            return None;
+        };
+        let part = tag_member(&violation.path)?;
+        Some(Refused {
+            code: "InvalidTagParameterException".to_string(),
+            message: format!("Tag {part} length cannot be more than {max} characters."),
+        })
+    })
 }
 
 /// The `com-amazonaws-cloudtrail-cloudtrail-20131101` emulated service: the generated [`ServiceDefinition`] plus
@@ -161,31 +265,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // CloudTrail does not answer a tag outside the modelled `TagKey` / `TagValue`
-        // length with the framework's generic `ValidationException`: a tag key or
-        // value outside its bound is `InvalidTagParameterException`, the shape the
-        // model declares for "the specified tag key or values are not valid", worded
-        // from the bound the value broke. The recorded corpus pins it — `AddTags` with
-        // an over-long tag value answers HTTP 400 `InvalidTagParameterException`
-        // "Tag value length cannot be more than 256 characters." — and the rule holds
-        // for every operation that takes a tag, not only the tagging pair.
+        // The centralized walk calls this on a framework-level refusal (an absent
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. Two classes are reworded, each from a recorded answer, and in
+        // this order because a request can break both:
         //
-        // Every OTHER refusal keeps the framework's wording, which is what this
-        // service was recorded answering elsewhere (a `resourceArn` outside its
-        // pattern reads "1 validation error detected: Value at 'resourceArn' failed to
-        // satisfy constraint: …").
+        // * a tag key or value outside its modelled length is
+        //   `InvalidTagParameterException`, not a `ValidationException`
+        //   ([`invalid_tag_parameter`]);
+        // * a violated `@pattern` is a `ValidationException` whose clause names the
+        //   member and the pattern WITHOUT the value that broke it
+        //   ([`pattern_envelope`]). The code stays the one the framework would have
+        //   answered — a client branches on the code, so only the wording changes.
+        //
+        // Every other refusal, authentication included, keeps the framework's wording
+        // because both readers decline it.
         let Refusal::Invalid(violations) = refusal else {
             return None;
         };
-        violations.iter().find_map(|violation| {
-            let ViolationKind::MaxLength(max) = violation.kind else {
-                return None;
-            };
-            let part = tag_member(&violation.path)?;
-            Some(Refused {
-                code: "InvalidTagParameterException".to_string(),
-                message: format!("Tag {part} length cannot be more than {max} characters."),
-            })
+        if let Some(refused) = invalid_tag_parameter(violations) {
+            return Some(refused);
+        }
+        Some(Refused {
+            code: VALIDATION_EXCEPTION.to_string(),
+            message: pattern_envelope(violations)?,
         })
     }
 

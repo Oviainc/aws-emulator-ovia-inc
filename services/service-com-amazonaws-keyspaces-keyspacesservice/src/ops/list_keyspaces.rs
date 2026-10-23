@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListKeyspacesErrorModeled::InternalServerException(InternalServerException {
@@ -194,6 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
+        let region = crate::state::request_region(ctx);
 
         // `maxResults` is modelled `1..1000`, so the boundary validator has already
         // refused a page size outside that range; an absent one means "no limit the
@@ -214,6 +215,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // The service-managed keyspaces are part of the account before any call, so an
+        // account that created nothing still enumerates them.
+        store.ensure_service_managed_catalog(&region);
         // Reporting, not mutating: settling only materialises the status transitions the
         // clock already owed at this instant, which a later caller would have seen anyway.
         store.settle(::std::time::SystemTime::now());

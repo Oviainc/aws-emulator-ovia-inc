@@ -319,7 +319,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // The service-managed keyspaces and their system tables are part of the account
+        // before any call, so one of them resolves here instead of 404-ing — and is then
+        // refused below.
+        store.ensure_service_managed_catalog(&region);
         store.settle(now);
+
+        // A system table of a service-managed keyspace carries no setting a caller chose
+        // and takes none: Cassandra refuses DDL against a system keyspace as an invalid
+        // query ("system keyspace is not user-modifiable"), which is this operation's
+        // `ValidationException`.
+        if crate::state::is_service_managed_keyspace(&input.keyspace_name) {
+            return Err(invalid(crate::state::service_managed_rejection(
+                &input.keyspace_name,
+            )));
+        }
 
         let Some(keyspace) = store.keyspaces.get_mut(&input.keyspace_name) else {
             return Err(UpdateTableErrorModeled::ResourceNotFoundException(
@@ -353,6 +367,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if let Some(added) = input.add_columns {
+            // Every table reachable here carries the schema its `CreateTable` stored: the
+            // only schema-less tables are the service-managed ones, refused above.
+            let schema = match table.schema_definition.as_mut() {
+                Some(schema) => schema,
+                None => {
+                    return Err(invalid(crate::state::service_managed_rejection(
+                        &input.keyspace_name,
+                    )))
+                }
+            };
             // The schema is the one part of a stored table that GROWS, and it never
             // shrinks: `addColumns` is modelled `len 1..` with no maximum, and every
             // accepted update appends again. So the column count is capped the way this
@@ -360,9 +384,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // cap with the quota error this operation models — checked BEFORE anything is
             // stored, so neither one oversized list nor a run of updates can grow the
             // schema without bound, and the scan below stays bounded too.
-            if table.schema_definition.all_columns.len() + added.len()
-                > crate::state::MAX_COLUMNS_PER_TABLE
-            {
+            if schema.all_columns.len() + added.len() > crate::state::MAX_COLUMNS_PER_TABLE {
                 return Err(UpdateTableErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
                         message: Some(format!(
@@ -372,7 +394,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             input.keyspace_name,
                             input.table_name,
                             crate::state::MAX_COLUMNS_PER_TABLE,
-                            table.schema_definition.all_columns.len()
+                            schema.all_columns.len()
                         )),
                     },
                 )
@@ -384,8 +406,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // already has, or one this request repeats, is refused naming the member the
             // caller has to fix — the alternative would be a schema with two columns of
             // one name.
-            let mut declared: ::std::collections::BTreeSet<&str> = table
-                .schema_definition
+            let mut declared: ::std::collections::BTreeSet<&str> = schema
                 .all_columns
                 .iter()
                 .map(|column| column.name.as_str())
@@ -400,7 +421,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // The added columns are regular columns of the table, so they join
             // `allColumns` and take no key or static role.
-            table.schema_definition.all_columns.extend(added);
+            schema.all_columns.extend(added);
         }
         if let Some(capacity) = capacity_specification {
             // "The timestamp of the last operation that changed the provisioned
@@ -408,18 +429,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `PAY_PER_REQUEST`, so it is stamped only when this update is that move. An
             // update that re-sets the mode a table is ALREADY in changed no throughput
             // capacity, so it deliberately leaves the existing stamp where it is.
-            if capacity.throughput_mode != table.capacity_specification.throughput_mode
+            let was_pay_per_request = table
+                .capacity_specification
+                .as_ref()
+                .is_some_and(|existing| {
+                    existing.throughput_mode == crate::state::PAY_PER_REQUEST_THROUGHPUT_MODE
+                });
+            if !was_pay_per_request
                 && capacity.throughput_mode == crate::state::PAY_PER_REQUEST_THROUGHPUT_MODE
             {
                 table.last_update_to_pay_per_request = Some(now);
             }
-            table.capacity_specification = capacity;
+            table.capacity_specification = Some(capacity);
         }
         if let Some(encryption) = encryption_specification {
-            table.encryption_specification = encryption;
+            table.encryption_specification = Some(encryption);
         }
         if let Some(point_in_time_recovery) = input.point_in_time_recovery {
-            table.point_in_time_recovery = point_in_time_recovery;
+            table.point_in_time_recovery = Some(point_in_time_recovery);
         }
         // `TimeToLiveStatus` and `ClientSideTimestampsStatus` each model exactly one
         // value, `ENABLED` (`crate::ops::types::TIME_TO_LIVE_STATUS_VALUES`,

@@ -21,6 +21,8 @@ mod keyspace_table_lifecycle;
 mod list_keyspaces;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/service_managed_catalog.rs"]
+mod service_managed_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/type_lifecycle.rs"]
