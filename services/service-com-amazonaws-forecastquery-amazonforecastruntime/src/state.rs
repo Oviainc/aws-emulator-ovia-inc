@@ -103,33 +103,35 @@ pub const ARN_NAMESPACE: &str = "forecast";
 /// exist under this ARN — is what separates the 404 from a 200.
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceKind {
-    /// The request member the ARN arrives in, named in the rejection message.
+    /// The request member the ARN arrives in, as the model spells it. Lower-camelled by
+    /// [`ResourceKind::member_path`] to match a boundary refusal's dotted path.
     pub member: &'static str,
     /// The ARN's resource type: the segment before the first `/` of its resource field.
+    /// Also how the rejection message names the kind of resource that was asked for.
     pub resource_type: &'static str,
     /// How many non-empty `/`-separated name segments follow that type.
     pub name_segments: usize,
-    /// The whole ARN form, quoted back in the rejection message so a caller can see what
-    /// the member expects.
-    pub form: &'static str,
 }
 
-/// The resource `QueryForecast`'s `ForecastArn` must name.
+/// The resource `QueryForecast`'s `ForecastArn` must name:
+/// `arn:<partition>:forecast:<region>:<account>:forecast/<forecastName>`.
 pub const FORECAST: ResourceKind = ResourceKind {
     member: "ForecastArn",
     resource_type: "forecast",
     name_segments: 1,
-    form: "arn:<partition>:forecast:<region>:<account>:forecast/<forecastName>",
 };
 
-/// The resource `QueryWhatIfForecast`'s `WhatIfForecastArn` must name.
+/// The resource `QueryWhatIfForecast`'s `WhatIfForecastArn` must name:
+/// `arn:<partition>:forecast:<region>:<account>:what-if-forecast/<whatIfAnalysisName>/<whatIfForecastName>`.
 pub const WHAT_IF_FORECAST: ResourceKind = ResourceKind {
     member: "WhatIfForecastArn",
     resource_type: "what-if-forecast",
     name_segments: 2,
-    form: "arn:<partition>:forecast:<region>:<account>:\
-           what-if-forecast/<whatIfAnalysisName>/<whatIfForecastName>",
 };
+
+/// Every resource kind one of this service's operations resolves an ARN member by — the
+/// table a refusal consults to word an ARN it could not read (`crate::service`).
+pub const RESOURCE_KINDS: [ResourceKind; 2] = [FORECAST, WHAT_IF_FORECAST];
 
 impl ResourceKind {
     /// Whether `arn` NAMES a resource of this kind: the Forecast ARN namespace, this
@@ -158,13 +160,27 @@ impl ResourceKind {
         names.len() == self.name_segments && names.iter().all(|name| !name.is_empty())
     }
 
-    /// The `Message` for an ARN that names no resource of this kind, built from the
-    /// request so a caller can fix it.
-    pub fn rejection_message(&self, arn: &str) -> String {
-        format!(
-            "The value is invalid: {} '{}' does not name a {}. A {} ARN has the form {}.",
-            self.member, arn, self.resource_type, self.resource_type, self.form
-        )
+    /// The `Message` an ARN this service cannot read as one of this kind is refused with:
+    /// `Invalid ARN for <resource type>: <the value supplied>`.
+    ///
+    /// ONE rule for every way the value fails — outside the member's modelled `@pattern`
+    /// or `@length`, naming another kind of resource, or carrying the wrong number of name
+    /// segments — because nothing in the answer distinguishes them: Amazon Forecast
+    /// reports an ARN it cannot resolve to a resource of the queried kind by quoting the
+    /// value back after the kind that was expected, and says nothing about the ARN's
+    /// internal form. It is composed from the request, so a caller sees exactly what it
+    /// sent.
+    pub fn invalid_arn_message(&self, arn: &str) -> String {
+        format!("Invalid ARN for {}: {}", self.resource_type, arn)
+    }
+
+    /// The dotted member path a boundary refusal names this ARN member under.
+    ///
+    /// Spelled by the framework's OWN path writer (lowerCamel), so this service's table
+    /// and the validating walk that produced the violation cannot drift into two
+    /// spellings of one position.
+    pub fn member_path(&self) -> String {
+        aws_smithy_schema_server::constraints::path::member(self.member)
     }
 }
 

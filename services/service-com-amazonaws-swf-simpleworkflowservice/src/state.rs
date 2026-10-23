@@ -34,6 +34,11 @@ pub const ARN_NAMESPACE: &str = "swf";
 /// [`crate::ops::types::REGISTRATION_STATUS_VALUES`].
 pub const STATUS_REGISTERED: &str = "REGISTERED";
 
+/// `RegistrationStatus` of a domain or type that has been deprecated. One of
+/// [`crate::ops::types::REGISTRATION_STATUS_VALUES`]; `RegistrationStatus`'s own doc
+/// calls it "DEPRECATED – The type was deprecated".
+pub const STATUS_DEPRECATED: &str = "DEPRECATED";
+
 /// `ExecutionStatus` of a running execution. One of
 /// [`crate::ops::types::EXECUTION_STATUS_VALUES`].
 pub const EXECUTION_STATUS_OPEN: &str = "OPEN";
@@ -526,6 +531,33 @@ impl Domain {
     pub fn configuration(&self) -> DomainConfiguration {
         DomainConfiguration {
             workflow_execution_retention_period_in_days: self.retention_period_in_days.clone(),
+        }
+    }
+
+    /// Whether this domain is deprecated, i.e. whether its stored
+    /// `RegistrationStatus` is [`STATUS_DEPRECATED`].
+    pub fn is_deprecated(&self) -> bool {
+        self.status == STATUS_DEPRECATED
+    }
+
+    /// Deprecate this domain as of `at`, cascading to every type registered in it.
+    /// `DeprecateDomain`'s doc: "Deprecating a domain also deprecates all activity and
+    /// workflow types registered in the domain." A type that was already deprecated
+    /// keeps the `deprecationDate` its own deprecation gave it, so the cascade cannot
+    /// rewrite an instant that already happened.
+    pub fn deprecate(&mut self, at: DateTime) {
+        self.status = STATUS_DEPRECATED.to_string();
+        for workflow_type in self.workflow_types.values_mut() {
+            if workflow_type.status != STATUS_DEPRECATED {
+                workflow_type.status = STATUS_DEPRECATED.to_string();
+                workflow_type.deprecation_date = Some(at);
+            }
+        }
+        for activity_type in self.activity_types.values_mut() {
+            if activity_type.status != STATUS_DEPRECATED {
+                activity_type.status = STATUS_DEPRECATED.to_string();
+                activity_type.deprecation_date = Some(at);
+            }
         }
     }
 
