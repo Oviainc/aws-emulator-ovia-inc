@@ -249,18 +249,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // Quick create (`Target`/`RouteKey`) and `CorsConfiguration` are each documented
-        // "Supported only for HTTP APIs", and `RouteKey` only names the route quick
-        // create mints, so it means nothing without a `Target`.
-        if !is_http {
-            if input.target.is_some() {
-                return Err(bad_request("Target is supported only for HTTP APIs."));
-            }
-            if input.cors_configuration.is_some() {
-                return Err(bad_request(
-                    "CorsConfiguration is supported only for HTTP APIs.",
-                ));
-            }
+        // Quick create (`Target`/`RouteKey`) and `CorsConfiguration` and the quick-create
+        // `CredentialsArn` are each documented "Supported only for HTTP APIs", so each
+        // names a setting an api of another protocol could never apply. The protocol this
+        // request asks for is its OWN `ProtocolType`, there being no parent api.
+        // `RouteKey` only names the route quick create mints, so it means nothing without
+        // a `Target`.
+        //
+        // `ApiKeySelectionExpression` and `DisableSchemaValidation` carry the same clause
+        // but are deliberately NOT gated: the modelled `Api` shape reports both members
+        // for an api of EITHER protocol (and this service, like API Gateway, answers an
+        // HTTP api's CreateApi with the default `ApiKeySelectionExpression`), so a value
+        // a caller supplies for one is a value the resource reports back whatever its
+        // protocol — there is nothing the api could not apply.
+        let restricted = [
+            crate::state::ProtocolRestrictedMember::http_only("Target", input.target.is_some()),
+            crate::state::ProtocolRestrictedMember::http_only(
+                "RouteKey",
+                input.route_key.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::http_only(
+                "CorsConfiguration",
+                input.cors_configuration.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::http_only(
+                "CredentialsArn",
+                input.credentials_arn.is_some(),
+            ),
+        ];
+        if let Err(message) =
+            crate::state::validate_protocol_restricted_members(&input.protocol_type, &restricted)
+        {
+            return Err(bad_request(&message));
         }
         if input.route_key.is_some() && input.target.is_none() {
             return Err(bad_request(

@@ -178,11 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A route response belongs to the WebSocket two-way communication model:
         // `RouteResponse$ModelSelectionExpression` is "Supported only for WebSocket
         // APIs", and an HTTP api has no route-response resource to create.
-        if api.protocol_type != crate::state::WEBSOCKET_PROTOCOL_TYPE {
-            return Err(bad_request(&format!(
-                "Route responses are not supported for {} APIs.",
-                api.protocol_type
-            )));
+        if let Err(message) = crate::state::validate_protocol_restricted_resource(
+            &api.protocol_type,
+            "Route responses",
+            crate::state::WEBSOCKET_PROTOCOL_TYPE,
+        ) {
+            return Err(bad_request(&message));
         }
 
         let Some(route) = api.routes.get_mut(&input.route_id) else {

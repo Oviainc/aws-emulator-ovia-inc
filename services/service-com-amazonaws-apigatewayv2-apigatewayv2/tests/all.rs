@@ -27,6 +27,8 @@ mod integration_lifecycle;
 mod integration_pagination;
 #[path = "all/model_lifecycle.rs"]
 mod model_lifecycle;
+#[path = "all/protocol_type_gating.rs"]
+mod protocol_type_gating;
 #[path = "all/route_request_parameter.rs"]
 mod route_request_parameter;
 #[path = "all/route_response_lifecycle.rs"]

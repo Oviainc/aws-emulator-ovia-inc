@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIntegration
-//! IMPLEMENTED: mints an `IntegrationId` and persists a [`crate::state::Integration`]
-//! record under its parent api, resolving the connection type and the timeout the
+//! IMPLEMENTED: refuses the request's `ProtocolType`-restricted members and integration
+//! types on a parent api of another protocol, then mints an `IntegrationId` and persists
+//! a [`crate::state::Integration`] record under its parent api, resolving the members the
 //! request left to their documented defaults. This is the ONLY file to touch for this
 //! operation.
 //!
@@ -348,6 +349,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let is_http = api.protocol_type == crate::state::HTTP_PROTOCOL_TYPE;
+
+        // Each of these members, and three of the five `IntegrationType` values, is
+        // documented as supported only for APIs of ONE protocol, so an integration of an
+        // api of the other protocol cannot carry it. Checked BEFORE anything is written,
+        // so a refused create leaves the api's integrations exactly as they were. A map
+        // the request sent empty configures nothing.
+        let mut restricted = vec![
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "ContentHandlingStrategy",
+                input.content_handling_strategy.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "PassthroughBehavior",
+                input.passthrough_behavior.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "RequestTemplates",
+                input
+                    .request_templates
+                    .as_ref()
+                    .is_some_and(|templates| !templates.is_empty()),
+            ),
+            // "The template selection expression for the integration. Supported only
+            // for WebSocket APIs" (`Integration$TemplateSelectionExpression`, the shape
+            // every reader of the integration reports).
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "TemplateSelectionExpression",
+                input.template_selection_expression.is_some(),
+            ),
+            // "The ID of the VPC link for a private integration. Supported only for
+            // HTTP APIs" (`CreateIntegration$ConnectionId`).
+            crate::state::ProtocolRestrictedMember::http_only(
+                "ConnectionId",
+                input.connection_id.is_some(),
+            ),
+            // "Supported only for HTTP API AWS_PROXY integrations"
+            // (`CreateIntegration$IntegrationSubtype`).
+            crate::state::ProtocolRestrictedMember::http_only(
+                "IntegrationSubtype",
+                input.integration_subtype.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::http_only(
+                "ResponseParameters",
+                input
+                    .response_parameters
+                    .as_ref()
+                    .is_some_and(|parameters| !parameters.is_empty()),
+            ),
+            // "The TLS configuration for a private integration … Supported only for
+            // HTTP APIs" (`CreateIntegration$TlsConfig`).
+            crate::state::ProtocolRestrictedMember::http_only(
+                "TlsConfig",
+                input.tls_config.is_some(),
+            ),
+        ];
+        // The restricted VALUES of a member the model documents value by value: the
+        // member itself is accepted by either protocol, so what is gated is the value
+        // this request selected (see `WEBSOCKET_ONLY_INTEGRATION_TYPES`). The refusal
+        // names the member AND the value, which is what the caller has to change.
+        let integration_type_member = format!("IntegrationType {}", input.integration_type);
+        if crate::state::WEBSOCKET_ONLY_INTEGRATION_TYPES.contains(&input.integration_type.as_str())
+        {
+            restricted.insert(
+                0,
+                crate::state::ProtocolRestrictedMember::websocket_only(
+                    &integration_type_member,
+                    true,
+                ),
+            );
+        }
+        if let Err(message) =
+            crate::state::validate_protocol_restricted_members(&api.protocol_type, &restricted)
+        {
+            return Err(bad_request(&message));
+        }
 
         // "For a Lambda integration, specify the URI of a Lambda function. For an HTTP
         // integration, specify a fully-qualified URL" (`CreateIntegration$IntegrationUri`):

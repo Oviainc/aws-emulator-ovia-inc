@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateModel
-//! IMPLEMENTED: validates the request's `Name` and `Schema`, mints a `ModelId` and
-//! persists a [`crate::state::Model`] record under its parent api. This is the ONLY
-//! file to touch for this operation.
+//! IMPLEMENTED: refuses a parent api whose `ProtocolType` does not support models,
+//! validates the request's `Name` and `Schema`, mints a `ModelId` and persists a
+//! [`crate::state::Model`] record under its parent api. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -170,6 +171,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+
+        // A Model is a WebSocket-only resource: everything in this service that
+        // REFERENCES a model is documented "Supported only for WebSocket APIs"
+        // (`Route$RequestModels` and `Route$ModelSelectionExpression`,
+        // `RouteResponse$ResponseModels`, and `CreateApi$DisableSchemaValidation` —
+        // "Avoid validating models when creating a deployment"), so an api of any other
+        // protocol has nothing that could ever select one. Refused BEFORE anything is
+        // written, so a later GetModels on such an api reports none.
+        if let Err(message) = crate::state::validate_protocol_restricted_resource(
+            &api.protocol_type,
+            "Models",
+            crate::state::WEBSOCKET_PROTOCOL_TYPE,
+        ) {
+            return Err(bad_request(&message));
+        }
 
         // "The name of the model. Must be alphanumeric" (`CreateModel$Name`).
         if !crate::state::model_name_is_alphanumeric(&input.name) {

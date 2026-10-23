@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetModels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetModels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetModels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports one page of the parent api's stored [`crate::state::Model`]
+//! records in `ModelId` order, resuming from `NextToken`. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +141,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetModels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetModelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetModels"))
+        let _ = ctx;
+        // `MaxResults` is a query string on this operation, so the numeric rule is the
+        // handler's: the same one every paginated reader of this service applies.
+        let max_results = crate::state::parse_max_results(input.max_results.as_deref())
+            .map_err(|message| -> Self::Error {
+                GetModelsErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+                .into()
+            })?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("GetModels"));
+        };
+        // A reporting operation: it reads the store and writes nothing.
+        let store = state.lock();
+        let Some(api) = store.apis.get(&input.api_id) else {
+            return Err(GetModelsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "Invalid API identifier specified {}:{}",
+                    ::engine::emulator_account_id(),
+                    input.api_id
+                )),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        };
+
+        let (page, next_token) =
+            crate::state::page(&api.models, input.next_token.as_deref(), max_results);
+
+        Ok(GetModelsOutput {
+            // The list the api holds, reported whether or not it is empty: an api with
+            // no models reports none rather than nothing.
+            items: Some(page.into_iter().map(crate::state::Model::to_wire).collect()),
+            next_token,
+        })
     }
 }

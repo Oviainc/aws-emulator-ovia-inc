@@ -219,18 +219,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "Supported only for WebSocket APIs" (`CreateStage$ClientCertificateId`), so a
-        // client certificate on a stage of any other protocol names a setting the stage
-        // could never apply.
-        if input.client_certificate_id.is_some()
-            && api.protocol_type != crate::state::WEBSOCKET_PROTOCOL_TYPE
-        {
-            return Err(bad_request(format!(
-                "ClientCertificateId is supported only for WebSocket APIs, and the \
-                 ProtocolType of this API is {}.",
-                api.protocol_type
-            )));
-        }
+        // Each of these is documented as supported only for APIs of ONE protocol, so a
+        // stage of an api of the other protocol cannot carry it: "Supported only for
+        // WebSocket APIs" on `CreateStage$ClientCertificateId`, and on
+        // `RouteSettings$DataTraceEnabled` and `RouteSettings$LoggingLevel` — the shape
+        // both `DefaultRouteSettings` and every entry of `RouteSettings` carries, so one
+        // gate covers both. Checked before anything is written.
+        let route_settings_blocks: Vec<&RouteSettings> = input
+            .default_route_settings
+            .iter()
+            .chain(
+                input
+                    .route_settings
+                    .iter()
+                    .flatten()
+                    .map(|(_, settings)| settings),
+            )
+            .collect();
+        let restricted = [
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "ClientCertificateId",
+                input.client_certificate_id.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "RouteSettings DataTraceEnabled",
+                route_settings_blocks
+                    .iter()
+                    .any(|settings| settings.data_trace_enabled == Some(true)),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "RouteSettings LoggingLevel",
+                route_settings_blocks
+                    .iter()
+                    .any(|settings| settings.logging_level.is_some()),
+            ),
+        ];
+        crate::state::validate_protocol_restricted_members(&api.protocol_type, &restricted)
+            .map_err(bad_request)?;
 
         // A stage is identified by its name within its api, so one api cannot carry two
         // stages with the same name.

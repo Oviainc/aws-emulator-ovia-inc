@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRoute
-//! IMPLEMENTED: mints a `RouteId` and persists a [`crate::state::Route`] record under
-//! its parent api. This is the ONLY file to touch for this operation.
+//! IMPLEMENTED: refuses the request's `ProtocolType`-restricted members on a parent api
+//! of another protocol, then mints a `RouteId` and persists a [`crate::state::Route`]
+//! record under its parent api. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -211,6 +212,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Each of these members is documented "Supported only for WebSocket APIs" on
+        // `CreateRoute`, so a route of an api of any other protocol cannot carry one.
+        // Checked BEFORE anything is written, so a refused create leaves the api's
+        // routes exactly as they were. A map the request sent empty, and an
+        // `ApiKeyRequired` the request sent `false`, configure nothing: `false` is the
+        // value a route carries either way (`Route$ApiKeyRequired`).
+        let restricted = [
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "ApiKeyRequired",
+                input.api_key_required == Some(true),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "ModelSelectionExpression",
+                input.model_selection_expression.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "RequestModels",
+                input
+                    .request_models
+                    .as_ref()
+                    .is_some_and(|models| !models.is_empty()),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "RequestParameters",
+                input
+                    .request_parameters
+                    .as_ref()
+                    .is_some_and(|parameters| !parameters.is_empty()),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "RouteResponseSelectionExpression",
+                input.route_response_selection_expression.is_some(),
+            ),
+        ];
+        if let Err(message) =
+            crate::state::validate_protocol_restricted_members(&api.protocol_type, &restricted)
+        {
+            return Err(bad_request(&message));
+        }
+
         // A route key identifies the route within its api, so one api cannot carry two
         // routes with the same key.
         if api
@@ -296,4 +337,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             target: stored.target,
         })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint. Takes
+/// the same `&str` the sibling helper in `create_integration` does.
+fn bad_request(message: &str) -> CreateRouteError {
+    CreateRouteErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

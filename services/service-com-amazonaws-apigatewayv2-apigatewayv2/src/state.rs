@@ -156,6 +156,20 @@ pub const HTTP_PROTOCOL_TYPE: &str = "HTTP";
 /// routable internet … The default value is INTERNET."
 pub const DEFAULT_CONNECTION_TYPE: &str = "INTERNET";
 
+/// The `IntegrationType` values only a WebSocket api supports, drawn from the member's
+/// own documentation rather than from a hand-written allowlist.
+///
+/// `CreateIntegration$IntegrationType` documents each value of
+/// `INTEGRATION_TYPE_VALUES` (`AWS | AWS_PROXY | HTTP | HTTP_PROXY | MOCK`) and marks
+/// exactly three "Supported only for WebSocket APIs": "AWS: for integrating the route
+/// or method request with an AWS service action … Supported only for WebSocket APIs",
+/// "HTTP: for integrating the route or method request with an HTTP endpoint … Supported
+/// only for WebSocket APIs" and "MOCK: for integrating the route or method request with
+/// API Gateway as a 'loopback' endpoint without invoking any backend. Supported only for
+/// WebSocket APIs". The two proxy values carry no such clause, so they are what is left
+/// for an HTTP api.
+pub const WEBSOCKET_ONLY_INTEGRATION_TYPES: &[&str] = &["AWS", "HTTP", "MOCK"];
+
 /// The `TimeoutInMillis` an integration of an HTTP API gets when the request names
 /// none: "The default timeout is … 30 seconds for HTTP APIs"
 /// (`CreateIntegration$TimeoutInMillis`).
@@ -646,6 +660,99 @@ pub fn validate_authorizer_config(
         }
     }
     Ok(())
+}
+
+/// One request member the model restricts to APIs of a single `ProtocolType`.
+///
+/// API Gateway v2 serves two protocols from one control plane, and a member's own
+/// documentation is what says which of them supports it ("Supported only for WebSocket
+/// APIs", "Supported only for HTTP APIs"). A request that configures such a member on an
+/// api of the OTHER protocol asks for a resource that protocol has no behaviour for, so
+/// the service refuses it rather than storing a setting nothing could ever apply.
+#[derive(Debug, Clone, Copy)]
+pub struct ProtocolRestrictedMember<'a> {
+    /// The member's name as a request spells it, for the refusal message.
+    pub member: &'a str,
+    /// The one `ProtocolType` whose APIs support the member, from
+    /// `PROTOCOL_TYPE_VALUES`.
+    pub supported_by: &'a str,
+    /// Does THIS request configure the member? A member the request left out asks for
+    /// nothing, and neither does one set to the value it would carry anyway — an empty
+    /// map or list, or a `false` flag whose documented default is `false` — so a caller
+    /// may send those to an api of either protocol.
+    pub configured: bool,
+}
+
+impl<'a> ProtocolRestrictedMember<'a> {
+    /// A member whose documentation reads "Supported only for WebSocket APIs".
+    pub fn websocket_only(member: &'a str, configured: bool) -> Self {
+        Self {
+            member,
+            supported_by: WEBSOCKET_PROTOCOL_TYPE,
+            configured,
+        }
+    }
+
+    /// A member whose documentation reads "Supported only for HTTP APIs".
+    pub fn http_only(member: &'a str, configured: bool) -> Self {
+        Self {
+            member,
+            supported_by: HTTP_PROTOCOL_TYPE,
+            configured,
+        }
+    }
+}
+
+/// Refuse a request that configures a [`ProtocolRestrictedMember`] on an api of another
+/// protocol.
+///
+/// Every writer of a protocol-restricted member routes through here, so the gate cannot
+/// differ between the operations that share a member, and an api of the supporting
+/// protocol is never refused. The FIRST offending member is the one reported — a request
+/// fixing it is checked again.
+///
+/// `Ok(())` or the message for the operation's `BadRequestException`, built from the
+/// request in the sentence API Gateway answers a protocol-restricted request with
+/// ("Currently, Models are not permitted for APIs with a protocol type of HTTP"): the
+/// member the request carried, and the protocol type of the api it was aimed at.
+pub fn validate_protocol_restricted_members(
+    protocol_type: &str,
+    members: &[ProtocolRestrictedMember<'_>],
+) -> Result<(), String> {
+    for restricted in members {
+        if restricted.configured && protocol_type != restricted.supported_by {
+            return Err(format!(
+                "Currently, {} is not permitted for APIs with a protocol type of \
+                 {protocol_type}",
+                restricted.member
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a child resource one protocol's APIs have no behaviour for, on an api of
+/// another protocol — the whole-resource form of
+/// [`validate_protocol_restricted_members`], for a create whose every member is moot
+/// once the parent's protocol is wrong.
+///
+/// `resource_plural` names the resource as the service's own messages do (`Models`,
+/// `Route responses`), and the message is the sentence API Gateway answers such a
+/// request with, built from the parent api's protocol type: "Currently, Models are not
+/// permitted for APIs with a protocol type of HTTP". `Ok(())` or the message for the
+/// operation's `BadRequestException`.
+pub fn validate_protocol_restricted_resource(
+    protocol_type: &str,
+    resource_plural: &str,
+    supported_by: &str,
+) -> Result<(), String> {
+    if protocol_type == supported_by {
+        return Ok(());
+    }
+    Err(format!(
+        "Currently, {resource_plural} are not permitted for APIs with a protocol type \
+         of {protocol_type}"
+    ))
 }
 
 /// Is `name` a `Model$Name` the service accepts?
