@@ -19,6 +19,8 @@ mod application_provider_describe;
 mod instance_create;
 #[path = "all/instance_describe.rs"]
 mod instance_describe;
+#[path = "all/instance_update.rs"]
+mod instance_update;
 #[path = "all/ssoadmin_permission_sets.rs"]
 mod ssoadmin_permission_sets;
 #[path = "all/state_roundtrip.rs"]

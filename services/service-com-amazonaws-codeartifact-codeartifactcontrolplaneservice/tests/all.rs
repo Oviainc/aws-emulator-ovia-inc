@@ -17,6 +17,10 @@ mod domain_permissions_policy;
 mod domain_repository_lifecycle;
 #[path = "all/external_connection.rs"]
 mod external_connection;
+#[path = "all/harness.rs"]
+mod harness;
+#[path = "all/package_group_association.rs"]
+mod package_group_association;
 #[path = "all/package_group_hierarchy.rs"]
 mod package_group_hierarchy;
 #[path = "all/package_listing.rs"]

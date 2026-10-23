@@ -209,6 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // removed, a later `DescribeRuleGroup` for either the name or the ARN takes
         // its not-found path.
         state.rule_group_arn_index.remove(&record.rule_group_arn);
+        // A resource policy belongs TO the resource it is attached to, and
+        // `DescribeResourcePolicy` can only be asked for it by that resource's
+        // ARN, so the attachment goes with the resource.
+        state.detach_resource_policy(&record.rule_group_arn);
 
         // The record is gone from state; the response reports the terminal status of
         // the rule group this call just removed, as `DeleteFirewall` and

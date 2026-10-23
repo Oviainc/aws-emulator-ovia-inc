@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: disassociates the member accounts named by `AccountIds` from the
+//! administrator account that owns `DetectorId`, moving each member's
+//! `RelationshipStatus` to `Removed` and RETAINING its record — "the member account
+//! details obtained from the CreateMembers API, including the associated email
+//! addresses, are retained ... To remove the details associated with a member
+//! account, the delegated administrator must invoke the DeleteMembers API" (the
+//! modelled contract below).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An account id the administrator is not associated with — one it holds no member
+//! record for, and one a disassociation already moved — is reported in
+//! `UnprocessedAccounts` with the reason it was not processed, which is what that
+//! member is for; the call still succeeds with HTTP 200. A value that cannot be an
+//! account id at all, or a `DetectorId` this account/Region does not own, is a
+//! request the service does not understand and is refused with HTTP 400 under the
+//! `InvalidInputException` class.
+//!
+//! The contract below also refuses a disassociation "with autoEnableOrganizationMembers
+//! configuration for your organization set to ALL ... before removing them from your
+//! organization". That configuration is not modelled yet —
+//! `UpdateOrganizationConfiguration` and `DescribeOrganizationConfiguration` are still
+//! scaffolds — so no request can set it and no call can be refused for it; when they
+//! are implemented, that refusal belongs here.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +174,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateMembers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DisassociateMembersErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // Parameter failures first, before anything is looked up: a value that
+        // cannot be a value of its member at all is refused whatever the store
+        // holds. `UnprocessedAccounts` reports accounts that were not PROCESSED,
+        // never a request that was not understood, so a malformed account id
+        // refuses the whole call rather than landing in that list.
+        if !crate::state::is_detector_id(&input.detector_id) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::DETECTOR_ID_MEMBER),
+            ));
+        }
+        if input
+            .account_ids
+            .iter()
+            .any(|account_id| !crate::state::is_account_id(account_id))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::ACCOUNT_ID_MEMBER),
+            ));
+        }
+
+        let mut state = state.lock();
+        // Only the Region's endpoint that serves the detector administers its
+        // members, and only the account that owns it can disassociate them.
+        if state.detector_in(&region, &input.detector_id).is_none() {
+            return Err(not_owned(&input.detector_id));
+        }
+        // The relationship changes now, so the clock advances once for the whole
+        // call: every member this call moves carries the same `UpdatedAt`.
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // Unreachable: the detector was resolved above and the lock has not been
+            // released since. Answered rather than panicked, because a handler owes
+            // the caller a modelled response on every path.
+            return Err(not_owned(&input.detector_id));
+        };
+
+        let mut unprocessed = Vec::new();
+        let mut seen = ::std::collections::BTreeSet::new();
+        for account_id in &input.account_ids {
+            // `AccountIds` names a SET of accounts: a repeated id is processed once,
+            // so it cannot be reported twice either.
+            if !seen.insert(account_id.as_str()) {
+                continue;
+            }
+            match detector.members.get_mut(account_id) {
+                Some(member) if member.is_associated() => {
+                    // The record is RETAINED: only the relationship moves, so a
+                    // later `GetMembers` still reports the account and its email.
+                    member.relationship_status = crate::state::RELATIONSHIP_REMOVED.to_string();
+                    member.updated_at_millis = now;
+                }
+                // Only an account ASSOCIATED with this administrator can be
+                // disassociated from it: an account it never recorded, and one a
+                // disassociation already moved, are both reported rather than
+                // refused — and neither changes any stored member.
+                _ => unprocessed.push(UnprocessedAccount {
+                    account_id: account_id.clone(),
+                    result: crate::state::NOT_ASSOCIATED_MESSAGE.to_string(),
+                }),
+            }
+        }
+
+        Ok(DisassociateMembersOutput {
+            unprocessed_accounts: unprocessed,
+        })
     }
+}
+
+/// Refuse a well-formed `DetectorId` this account/Region does not own.
+///
+/// GuardDuty does not distinguish "never existed" from "belongs to someone else",
+/// which is also what keeps one account from probing another's detector ids.
+fn not_owned(detector_id: &str) -> DisassociateMembersError {
+    crate::scaffolded::Scaffolded::invalid_input(crate::state::detector_id_rejection(detector_id))
 }

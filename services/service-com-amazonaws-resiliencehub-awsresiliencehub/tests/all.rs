@@ -15,6 +15,8 @@
 mod app_version_app_components;
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
+#[path = "all/publish_app_version.rs"]
+mod publish_app_version;
 #[path = "all/resiliency_policy_deletion.rs"]
 mod resiliency_policy_deletion;
 #[path = "all/state_roundtrip.rs"]

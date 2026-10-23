@@ -2,20 +2,21 @@
 
 //! Engine state for the com-amazonaws-networkmanager-networkmanager service.
 //!
-//! The global-network / site lifecycle is the core resource tree of Network Manager:
-//! a global network owns sites (and, in a later slice, devices and links). Everything
+//! The global-network / site / link lifecycle is the core resource tree of Network
+//! Manager: a global network owns sites, a site owns links (and, in a later slice,
+//! devices). Everything
 //! the implemented operations answer is computed from the records below — no handler
 //! echoes its input back without storing it.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{GlobalNetwork, Location, Site, Tag};
+use crate::ops::types::{Bandwidth, GlobalNetwork, Link, Location, Site, Tag};
 
-/// Members of `GlobalNetworkState` / `SiteState` this slice uses. Both enums carry the
-/// same four values (`smithy_query shape=GlobalNetworkState,SiteState`:
+/// Members of `GlobalNetworkState` / `SiteState` / `LinkState` this slice uses. All three
+/// enums carry the same four values (`smithy_query shape=GlobalNetworkState,SiteState,LinkState`:
 /// AVAILABLE, DELETING, PENDING, UPDATING), mirrored in
-/// `ops::types::GLOBAL_NETWORK_STATE_VALUES` / `SITE_STATE_VALUES`.
+/// `ops::types::GLOBAL_NETWORK_STATE_VALUES` / `SITE_STATE_VALUES` / `LINK_STATE_VALUES`.
 pub const STATE_PENDING: &str = "PENDING";
 /// See [`STATE_PENDING`].
 pub const STATE_AVAILABLE: &str = "AVAILABLE";
@@ -26,10 +27,13 @@ pub const STATE_DELETING: &str = "DELETING";
 const ARN_NAMESPACE: &str = "networkmanager";
 
 /// The resource kinds this slice mints: both the id prefix (`global-network-<hex>`,
-/// `site-<hex>`) and the ARN resource type (`global-network/<id>`, `site/<id>`).
+/// `site-<hex>`, `link-<hex>`) and the ARN resource type (`global-network/<id>`,
+/// `site/<id>`, `link/<id>`).
 pub const GLOBAL_NETWORK_KIND: &str = "global-network";
 /// See [`GLOBAL_NETWORK_KIND`].
 pub const SITE_KIND: &str = "site";
+/// See [`GLOBAL_NETWORK_KIND`].
+pub const LINK_KIND: &str = "link";
 
 /// Network Manager is a global (partition-scoped) service, so its ARNs carry an empty
 /// region segment: `arn:aws:networkmanager::<account>:global-network/<id>`.
@@ -45,6 +49,8 @@ pub const SERVICE_CODE: &str = ARN_NAMESPACE;
 pub const LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT: &str = "global-networks-per-account";
 /// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`].
 pub const LIMIT_SITES_PER_GLOBAL_NETWORK: &str = "sites-per-global-network";
+/// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`].
+pub const LIMIT_LINKS_PER_SITE: &str = "links-per-site";
 
 /// How many global networks one account may hold here, and how many sites one global
 /// network may hold.
@@ -57,6 +63,10 @@ pub const LIMIT_SITES_PER_GLOBAL_NETWORK: &str = "sites-per-global-network";
 pub const MAX_GLOBAL_NETWORKS: usize = 100;
 /// See [`MAX_GLOBAL_NETWORKS`].
 pub const MAX_SITES_PER_GLOBAL_NETWORK: usize = 100;
+/// How many links one site may hold. CHOSEN for the same reason as
+/// [`MAX_SITES_PER_GLOBAL_NETWORK`]: the model carries no number and the published quota
+/// is per-account adjustable, so this one only bounds the store.
+pub const MAX_LINKS_PER_SITE: usize = 100;
 
 /// How long after the creating call a `PENDING` resource settles to `AVAILABLE`.
 ///
@@ -152,6 +162,60 @@ impl SiteRecord {
     }
 }
 
+/// A stored link, back-referencing the site (and through it the global network) it
+/// belongs to. Like the records above, `state` is a function of the clock.
+#[derive(Debug, Clone)]
+pub struct LinkRecord {
+    pub id: String,
+    pub arn: String,
+    pub global_network_id: String,
+    pub site_id: String,
+    pub description: Option<String>,
+    /// The link's `Type`, a free-form string the model does not enumerate.
+    pub link_type: Option<String>,
+    /// The upload/download speeds in Mbps, as the request supplied them.
+    pub bandwidth: Bandwidth,
+    pub provider: Option<String>,
+    pub created_at: SystemTime,
+    /// The instant the `PENDING` -> `AVAILABLE` transition the clock owes becomes due.
+    pub available_at: SystemTime,
+    pub tags: Vec<Tag>,
+}
+
+impl LinkRecord {
+    /// This link's lifecycle state as of `now`.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.available_at {
+            STATE_AVAILABLE
+        } else {
+            STATE_PENDING
+        }
+    }
+
+    /// The modelled `Link` for this record, as of `now`.
+    pub fn to_shape(&self, now: SystemTime) -> Link {
+        self.to_shape_with_state(self.state_at(now))
+    }
+
+    /// The modelled `Link` for this record, forcing `state` — used by `DeleteLink`, which
+    /// reports the record it just removed as `DELETING`.
+    pub fn to_shape_with_state(&self, state: &str) -> Link {
+        Link {
+            link_id: Some(self.id.clone()),
+            link_arn: Some(self.arn.clone()),
+            global_network_id: Some(self.global_network_id.clone()),
+            site_id: Some(self.site_id.clone()),
+            description: self.description.clone(),
+            r#type: self.link_type.clone(),
+            bandwidth: Some(self.bandwidth.clone()),
+            provider: self.provider.clone(),
+            created_at: Some(epoch_seconds(self.created_at)),
+            state: Some(state.to_string()),
+            tags: Some(self.tags.clone()),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-networkmanager-networkmanager. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
@@ -160,6 +224,8 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     pub global_networks: BTreeMap<String, GlobalNetworkRecord>,
     /// Sites by `SiteId`, each carrying its owning `GlobalNetworkId`.
     pub sites: BTreeMap<String, SiteRecord>,
+    /// Links by `LinkId`, each carrying the `SiteId` and `GlobalNetworkId` it belongs to.
+    pub links: BTreeMap<String, LinkRecord>,
     /// Monotonic source for generated resource-id suffixes, so ids are unique within a
     /// run and deterministic across runs.
     pub id_counter: u64,
@@ -195,6 +261,23 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .values()
             .filter(|site| site.global_network_id == global_network_id)
             .map(|site| site.id.clone())
+            .collect()
+    }
+
+    /// How many links `site_id` holds, for the per-site quota.
+    pub fn link_count_of_site(&self, site_id: &str) -> usize {
+        self.links
+            .values()
+            .filter(|link| link.site_id == site_id)
+            .count()
+    }
+
+    /// The ids of the links attached to `site_id`, in `LinkId` order.
+    pub fn link_ids_of_site(&self, site_id: &str) -> Vec<String> {
+        self.links
+            .values()
+            .filter(|link| link.site_id == site_id)
+            .map(|link| link.id.clone())
             .collect()
     }
 }

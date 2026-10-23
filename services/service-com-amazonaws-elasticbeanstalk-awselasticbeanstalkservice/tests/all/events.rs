@@ -109,13 +109,10 @@ async fn events_of(emulator: &Emulator, case: &str, filters: &[(&str, &str)]) ->
     reported(&answer)
 }
 
-/// An `EventDate` as epoch seconds.
+/// An `EventDate` as epoch seconds: the shared timestamp reader
+/// ([`crate::lifecycle::instant`]), which orders two renderings as instants.
 fn at_secs(event_date: &str, case: &str) -> f64 {
-    DateTime::from_str(event_date, Format::DateTime)
-        .unwrap_or_else(|error| {
-            panic!("case {case:?}: EventDate {event_date:?} is not an ISO-8601 timestamp: {error}")
-        })
-        .as_secs_f64()
+    crate::harness::instant(event_date, case)
 }
 
 /// `secs` as the ISO-8601 timestamp the query protocol reads a timestamp from.

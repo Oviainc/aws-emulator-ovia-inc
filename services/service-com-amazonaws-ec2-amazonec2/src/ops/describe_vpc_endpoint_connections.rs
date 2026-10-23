@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVpcEndpointConnections
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVpcEndpointConnections`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVpcEndpointConnections::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the connections to the account's own VPC endpoint services that
+//! [`crate::state`] holds, narrowed by the documented filters and paged by
+//! `MaxResults`/`NextToken`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +141,279 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVpcEndpointConnections` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVpcEndpointConnectionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_PAGE_SIZE, MatchBudget, decode_page_token, encode_page_token,
+            invalid_pagination_token, request_region, require_service_state,
+        };
+
+        // "This value can be between 5 and 1,000"
+        // (`DescribeVpcEndpointConnectionsRequest$MaxResults`). The model declares no
+        // `@range` on the member — it targets a plain `Integer` — so the handler is the
+        // only place that bound is enforced. The upper end is NOT an error: "if MaxResults
+        // is given a value larger than 1,000, only 1,000 results are returned", so a
+        // larger page size is clamped below rather than refused here.
+        if input
+            .max_results
+            .is_some_and(|max_results| max_results < MIN_PAGE_SIZE)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for MaxResults. It must be between {MIN_PAGE_SIZE} and \
+                 {MAX_PAGE_SIZE}",
+                input.max_results.unwrap_or_default()
+            )));
+        }
+
+        // Matching cost is filters x values x held values x stored connections and the
+        // model bounds none of them, so the request-controlled factors are capped here,
+        // before any work proportional to them is done — and their PRODUCT is charged to
+        // one [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // connection would have matched it, so an unsupported filter can never read as "no
+        // results". "Filter names are case-sensitive" (`Filter$Name`), so the comparison
+        // is exact.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !VPC_ENDPOINT_CONNECTION_FILTERS.contains(&name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token to retrieve the next page of results" — anything else is refused
+        // rather than read as an id, and it is refused before any other member is looked
+        // at, so whether a bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        // DryRun sits AFTER every parameter has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused
+        // with that reason instead. Nothing in the store has to be resolved first — this
+        // operation names no resource.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The Region the request was signed for is the Region this service answers as, so
+        // it is what the `vpc-endpoint-region` filter's `cross-region` value is measured
+        // against: an endpoint in another Region is one of "endpoints for other Regions".
+        let service_region = request_region(ctx.parts());
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // A pure read: a connection stays `PendingAcceptance` until the service owner
+        // accepts or rejects it, which is an action and not an instant, so there is no
+        // clock-owed transition to materialise here and nothing this call writes.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVpcEndpointConnections"))
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored connections,
+        // filters, values, held values and value length is bounded however the caller
+        // combines them — which is also what bounds how long this holds the state lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<VpcEndpointConnection> = Vec::new();
+        for connection in store.vpc_endpoint_connections.values() {
+            if budget.exhausted() {
+                break;
+            }
+            if matches_every_filter(connection, &service_region, &selectors, &mut budget) {
+                selected.push(connection.clone());
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `VpcEndpointId` order, which the cursor below names a position in. The
+        // store is an ordered map keyed by that id, so its iteration order already
+        // satisfies this sort; doing it here establishes the invariant the cursor depends
+        // on at the point of use.
+        selected.sort_by(|left, right| left.vpc_endpoint_id.cmp(&right.vpc_endpoint_id));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|connection| {
+                connection.vpc_endpoint_id.as_deref().unwrap_or_default() < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this service serves, and
+        // one that asks for more than that gets that same largest page: "if MaxResults is
+        // given a value larger than 1,000, only 1,000 results are returned".
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // A token only when a connection follows this page: "This value is null when there
+        // are no more results to return" (`DescribeVpcEndpointConnectionsResult$NextToken`).
+        let next_token = page
+            .get(limit)
+            .and_then(|connection| connection.vpc_endpoint_id.as_deref())
+            .map(encode_page_token);
+
+        Ok(DescribeVpcEndpointConnectionsOutput {
+            vpc_endpoint_connections: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
     }
+}
+
+/// The smallest page size this operation serves: "This value can be between 5 and 1,000"
+/// (`DescribeVpcEndpointConnectionsRequest$MaxResults`). The largest is
+/// [`crate::state::MAX_PAGE_SIZE`], the same 1,000 that sentence names.
+const MIN_PAGE_SIZE: i32 = 5;
+
+/// The filter names this operation documents, from
+/// `DescribeVpcEndpointConnectionsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeVpcEndpointConnectionsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// This operation documents no `tag:<key>` family — unlike `DescribeVolumes` — so a tag
+/// filter is as undocumented here as any other name. Every entry must be answered by
+/// [`filter_values`].
+const VPC_ENDPOINT_CONNECTION_FILTERS: [&str; 6] = [
+    "ip-address-type",
+    "service-id",
+    "vpc-endpoint-id",
+    "vpc-endpoint-owner",
+    "vpc-endpoint-region",
+    "vpc-endpoint-state",
+];
+
+/// The `vpc-endpoint-region` value that selects an endpoint in another Region: "the Region
+/// of the endpoint or `cross-region` to find endpoints for other Regions"
+/// (`DescribeVpcEndpointConnectionsRequest$Filters`).
+const CROSS_REGION_FILTER_VALUE: &str = "cross-region";
+
+/// The values the EC2 filter `name` compares against this connection, where
+/// `service_region` is the Region the service is being asked in.
+///
+/// A filter naming an attribute this connection does not carry compares against NO values,
+/// so it selects nothing — which is the answer for `ip-address-type` on an endpoint whose
+/// type has none. `name` is one of [`VPC_ENDPOINT_CONNECTION_FILTERS`].
+fn filter_values<'a>(
+    connection: &'a VpcEndpointConnection,
+    service_region: &str,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "ip-address-type" => text(connection.ip_address_type.as_deref()),
+        "service-id" => text(connection.service_id.as_deref()),
+        "vpc-endpoint-id" => text(connection.vpc_endpoint_id.as_deref()),
+        "vpc-endpoint-owner" => text(connection.vpc_endpoint_owner.as_deref()),
+        // The endpoint's own Region, and — for an endpoint outside the Region the service
+        // is hosted in — the `cross-region` term that names exactly those endpoints.
+        "vpc-endpoint-region" => {
+            let region = connection.vpc_endpoint_region.as_deref();
+            let mut values = text(region);
+            if region.is_some_and(|region| region != service_region) {
+                values.push(Cow::Borrowed(CROSS_REGION_FILTER_VALUE));
+            }
+            values
+        }
+        // The state is stored as the model's `State` enum spells it, while the filter
+        // documents its own spelling of the same state, so BOTH spellings are what the
+        // filter compares against — see [`crate::state::VPC_ENDPOINT_STATE_FILTER_VALUES`].
+        "vpc-endpoint-state" => {
+            let state = connection.vpc_endpoint_state.as_deref();
+            let mut values = text(state);
+            if let Some(documented) = state.and_then(documented_state_value) {
+                values.push(Cow::Borrowed(documented));
+            }
+            values
+        }
+        // Unreachable: the handler has already refused every other name. An undefined name
+        // compares against nothing, so it could never widen a result even if that check
+        // were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// How the `vpc-endpoint-state` filter spells the modelled state `state`, when that
+/// spelling differs from the modelled one; `None` for a state the filter documents no
+/// value for (the `State` enum's `Expired` and `Partial`, which name states of other
+/// resources).
+fn documented_state_value(state: &str) -> Option<&'static str> {
+    crate::state::VPC_ENDPOINT_STATE_FILTER_VALUES
+        .iter()
+        .find(|(documented, modelled)| *modelled == state && *documented != state)
+        .map(|(documented, _)| *documented)
+}
+
+/// Does `connection` satisfy every filter?
+///
+/// "If you specify multiple filters, the filters are joined with an AND" (`Filter`), and
+/// within one filter "if you specify multiple values for a filter, the values are joined
+/// with an OR" (`Filter$Values`) — each value matched case-sensitively, with EC2's own
+/// `*`/`?` wildcards, by the pattern the value was compiled into. So a filter carrying no
+/// value at all matches nothing, there being no value for the attribute to match.
+///
+/// Every comparison is charged to `budget`, so one request's filtering cannot cost more
+/// than the ceiling however it combines filters, values and value length; once the budget
+/// is gone every further comparison answers "no match" and the caller is told the answer
+/// is incomplete.
+fn matches_every_filter(
+    connection: &VpcEndpointConnection,
+    service_region: &str,
+    selectors: &[crate::state::CompiledFilter],
+    budget: &mut crate::state::MatchBudget,
+) -> bool {
+    selectors.iter().all(|filter| {
+        let held = filter_values(connection, service_region, &filter.name);
+        filter
+            .patterns
+            .iter()
+            .any(|pattern| held.iter().any(|value| pattern.matches_within(value, budget)))
+    })
 }

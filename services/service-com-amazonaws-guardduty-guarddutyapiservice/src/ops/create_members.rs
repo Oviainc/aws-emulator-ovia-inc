@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: records each `AccountDetails` entry as a member account of the
+//! administrator that owns `DetectorId`, so the account becomes one the
+//! members operations can act on. A re-created account keeps its record and takes
+//! the account details the request carries: "you can create an association with
+//! these member accounts again only by calling the CreateMembers API" (the modelled
+//! contract below), which is how a disassociated member becomes associated again.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The administrator's own account id cannot be one of its members, so it is
+//! reported in `UnprocessedAccounts` with that reason while the call succeeds with
+//! HTTP 200 — and so is an account past GuardDuty's quota of
+//! [`crate::state::MAX_MEMBERS_PER_DETECTOR`] member accounts per administrator,
+//! which is what bounds the store. A value that cannot be an account id, an email
+//! address that breaks one of the rules `AccountDetail.Email` documents, or a
+//! `DetectorId` this account/Region does not own is refused with HTTP 400 under the
+//! `InvalidInputException` class.
+//!
+//! What this does NOT model yet, each belonging to its own operation: enabling
+//! GuardDuty in the member account (the member account's own detector is not a
+//! resource this emulator holds), the organization auto-enable settings
+//! (`UpdateOrganizationConfiguration` is still a scaffold) and the invitation flow
+//! (`InviteMembers` is still a scaffold), so a recorded member's
+//! `RelationshipStatus` is `Created` until an invitation is modelled.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +177,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMembers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateMembersErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let administrator = crate::state::administrator_account_id();
+
+        // Parameter failures first, before anything is looked up or written: a
+        // request carrying a value that cannot be a value of its member is refused
+        // whole, so a rejected create leaves no member behind.
+        if !crate::state::is_detector_id(&input.detector_id) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::DETECTOR_ID_MEMBER),
+            ));
+        }
+        for detail in &input.account_details {
+            if !crate::state::is_account_id(&detail.account_id) {
+                return Err(crate::scaffolded::Scaffolded::invalid_input(
+                    crate::state::invalid_parameter_message(crate::state::ACCOUNT_ID_MEMBER),
+                ));
+            }
+            if !crate::state::is_member_email(&detail.email) {
+                return Err(crate::scaffolded::Scaffolded::invalid_input(
+                    crate::state::invalid_parameter_message(crate::state::EMAIL_MEMBER),
+                ));
+            }
+        }
+
+        let mut state = state.lock();
+        // Members hang off the detector, so only the account/Region that owns it can
+        // add them.
+        if state.detector_in(&region, &input.detector_id).is_none() {
+            return Err(not_owned(&input.detector_id));
+        }
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // Unreachable: the detector was resolved above and the lock has not been
+            // released since. Answered rather than panicked, because a handler owes
+            // the caller a modelled response on every path.
+            return Err(not_owned(&input.detector_id));
+        };
+
+        let mut unprocessed = Vec::new();
+        let mut seen = ::std::collections::BTreeSet::new();
+        for detail in &input.account_details {
+            // One account is one member: a second entry for an account already
+            // recorded by this call would otherwise overwrite the first silently.
+            if !seen.insert(detail.account_id.as_str()) {
+                continue;
+            }
+            // The current account is the administrator in this relationship, so it
+            // is not one of its own members — a per-account failure, reported.
+            if detail.account_id == administrator {
+                unprocessed.push(UnprocessedAccount {
+                    account_id: detail.account_id.clone(),
+                    result: crate::state::SELF_AS_MEMBER_MESSAGE.to_string(),
+                });
+                continue;
+            }
+            match detector.members.get_mut(&detail.account_id) {
+                Some(existing) => {
+                    // Re-creating an account records its details again and
+                    // re-associates it if it was disassociated; a member that is
+                    // still associated keeps the relationship it has. `UpdatedAt`
+                    // moves only when something about the member actually changed.
+                    let mut changed = false;
+                    if existing.email != detail.email {
+                        existing.email = detail.email.clone();
+                        changed = true;
+                    }
+                    if !existing.is_associated() {
+                        existing.relationship_status =
+                            crate::state::RELATIONSHIP_CREATED.to_string();
+                        changed = true;
+                    }
+                    if changed {
+                        existing.updated_at_millis = now;
+                    }
+                }
+                None => {
+                    // The quota bounds the store: an account past it is reported
+                    // rather than recorded, so a caller repeating this call with
+                    // fresh account ids cannot grow the store without limit. The
+                    // records of the members already recorded are retained, so
+                    // there is nothing to evict in their place.
+                    if detector.members.len() >= crate::state::MAX_MEMBERS_PER_DETECTOR {
+                        unprocessed.push(UnprocessedAccount {
+                            account_id: detail.account_id.clone(),
+                            result: crate::state::member_quota_message(),
+                        });
+                        continue;
+                    }
+                    detector.members.insert(
+                        detail.account_id.clone(),
+                        crate::state::MemberRecord {
+                            account_id: detail.account_id.clone(),
+                            email: detail.email.clone(),
+                            // No invitation has been sent yet: `InviteMembers` is
+                            // what moves the relationship on from here.
+                            relationship_status: crate::state::RELATIONSHIP_CREATED.to_string(),
+                            updated_at_millis: now,
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(CreateMembersOutput {
+            unprocessed_accounts: unprocessed,
+        })
     }
+}
+
+/// Refuse a well-formed `DetectorId` this account/Region does not own.
+///
+/// GuardDuty does not distinguish "never existed" from "belongs to someone else",
+/// which is also what keeps one account from probing another's detector ids.
+fn not_owned(detector_id: &str) -> CreateMembersError {
+    crate::scaffolded::Scaffolded::invalid_input(crate::state::detector_id_rejection(detector_id))
 }

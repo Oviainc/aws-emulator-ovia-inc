@@ -185,9 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        let consumed = state.consumed_policy_capacity(&record.policy);
         Ok(DescribeFirewallPolicyOutput {
             update_token: record.update_token.clone(),
-            firewall_policy_response: record.to_response(),
+            firewall_policy_response: record.to_response(consumed),
             firewall_policy: Some(record.policy.clone()),
         })
     }

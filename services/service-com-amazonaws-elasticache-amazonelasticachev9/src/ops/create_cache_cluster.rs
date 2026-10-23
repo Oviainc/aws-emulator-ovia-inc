@@ -391,18 +391,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // A cluster joins a replication group only if that group exists, and no
-        // replication group can: every replication-group operation in this
-        // service is still a scaffolded 501, so there is nothing to join.
-        if let Some(group) = input.replication_group_id.as_deref() {
-            return Err(CreateCacheClusterErrorModeled::ReplicationGroupNotFoundFault(
-                ReplicationGroupNotFoundFault {
-                    message: Some(format!("Replication group {group} not found.")),
-                },
-            )
-            .into());
-        }
-
         // Same for cache security groups — the EC2-Classic mechanism whose
         // `CreateCacheSecurityGroup` is a scaffolded 501.
         if let Some(name) = input
@@ -567,6 +555,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A cluster joins a replication group only if that group exists, so the
+        // name is resolved against the stored groups. Adding a cluster to a
+        // group that DOES exist (a read replica of a cluster mode disabled
+        // group) is behaviour nobody has written yet — it belongs with
+        // `IncreaseReplicaCount`, a scaffolded 501 that owns its own issue — so
+        // it answers the scaffold's 501 rather than a success that persists a
+        // cluster the group does not know about. It is answered AFTER every
+        // modelled refusal above, so a request that is also wrong in a way the
+        // model words still gets the modelled error.
+        if let Some(group) = input.replication_group_id.as_deref() {
+            if !store
+                .replication_groups
+                .contains_key(&group.to_ascii_lowercase())
+            {
+                return Err(CreateCacheClusterErrorModeled::ReplicationGroupNotFoundFault(
+                    ReplicationGroupNotFoundFault {
+                        message: Some(format!("Replication group {group} not found.")),
+                    },
+                )
+                .into());
+            }
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateCacheCluster into an existing replication group",
+            ));
+        }
+
         // The store is bounded: past its quota a create is refused rather than
         // adding another record. `ClusterQuotaForCustomerExceededFault` is the
         // modelled refusal for exactly this.
@@ -719,6 +733,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // one was set, which is all the model reports.
             auth_token_enabled: input.auth_token.is_some(),
             transit_encryption_enabled: input.transit_encryption_enabled,
+            // `CreateCacheCluster` has no member for the in-transit encryption
+            // mode or for at-rest encryption; a replication group's member
+            // cluster carries the group's settings.
+            transit_encryption_mode: None,
+            at_rest_encryption_enabled: None,
             network_type: input.network_type,
             ip_discovery: input.ip_discovery,
             log_delivery_configurations: {
@@ -731,6 +750,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
             tags,
             now,
+            // A standalone cluster: the member clusters of a replication group
+            // are minted by `CreateReplicationGroup`, which joins them to the
+            // group it created.
+            replication_group_id: None,
+            replication_group_log_delivery_enabled: None,
         };
 
         // A created cluster is NOT ready: it answers `creating`, and the clock

@@ -35,13 +35,11 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_codeartifact_codeartifactcontrolplaneservice::ops::types::ResourcePolicy;
 use service_com_amazonaws_codeartifact_codeartifactcontrolplaneservice::ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState as CodeArtifactState;
 
-// The `Answer`/`call`/`create_domain` harness and the account/region constants are the
-// `pub(crate)` ones `domain_repository_lifecycle.rs` exposes; this suite adds only the
-// policy-shaped helpers. `emulator_with_engine` is that harness's `emulator`, handing back
-// the shared engine too, which is what lets the cases below check the STORED record.
-use crate::domain_repository_lifecycle::{
-    call, create_domain, emulator_with_engine, Answer, ACCOUNT, REGION,
-};
+// The `Answer`/`call`/`create_domain` harness and the account/region constants come from
+// the crate's shared `harness` module; this suite adds only the policy-shaped helpers.
+// `emulator_with_engine` is that harness's `emulator`, handing back the shared engine too,
+// which is what lets the cases below check the STORED record.
+use crate::harness::{call, create_domain, emulator_with_engine, Answer, ACCOUNT, REGION};
 
 /// An account that is NOT the emulator's, used to pin `domainOwner` to the wrong owner.
 /// Asserted distinct from [`ACCOUNT`] where it is used.

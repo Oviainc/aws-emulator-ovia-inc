@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReplicationGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReplicationGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeReplicationGroups::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -154,18 +150,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReplicationGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReplicationGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReplicationGroups"))
+        // This is a reporting operation: it reads the stored replication
+        // groups. The one write it makes is materialising the status change the
+        // clock already owed each group and cluster — owed at this instant
+        // whether or not anybody called — through `settle_all`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // "Default: 100. Constraints: minimum 20; maximum 100."
+        let page_size = match crate::state::page_size(input.max_records) {
+            Ok(size) => size,
+            Err(message) => {
+                return Err(
+                    DescribeReplicationGroupsErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+        // A `Marker` only ever travels back unchanged, so one this service did
+        // not mint is a bad parameter value rather than an empty page.
+        let resume_from = match input.marker.as_deref() {
+            Some(marker) => match crate::state::decode_marker(marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(
+                        DescribeReplicationGroupsErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(format!("Invalid value {marker} for Marker.")),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // With `ReplicationGroupId` the answer is that one group, or the
+        // modelled not-found; pagination does not apply to a single-resource
+        // lookup. "This parameter is not case sensitive."
+        if let Some(id) = input.replication_group_id.as_deref() {
+            let key = id.to_ascii_lowercase();
+            let Some(group) = store.modeled_replication_group(&key) else {
+                return Err(
+                    DescribeReplicationGroupsErrorModeled::ReplicationGroupNotFoundFault(
+                        ReplicationGroupNotFoundFault {
+                            message: Some(format!("Replication group {id} not found.")),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            return Ok(DescribeReplicationGroupsOutput {
+                marker: None,
+                replication_groups: Some(vec![group]),
+            });
+        }
+
+        let mut page: Vec<ReplicationGroup> = Vec::new();
+        let mut marker = None;
+        for (key, group) in store
+            .replication_groups
+            .iter()
+            .filter(|(key, _)| resume_from.as_ref().is_none_or(|from| *key >= from))
+        {
+            if page.len() == page_size {
+                // More records exist than `MaxRecords`, so the response carries
+                // the marker the next call resumes from — the key of the first
+                // record this page did not return.
+                marker = Some(crate::state::encode_marker(key));
+                break;
+            }
+            page.push(group.to_modeled(&store.cache_clusters));
+        }
+
+        Ok(DescribeReplicationGroupsOutput {
+            marker,
+            replication_groups: Some(page),
+        })
     }
 }

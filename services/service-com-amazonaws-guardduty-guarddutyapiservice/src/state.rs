@@ -287,6 +287,16 @@ pub const DETECTOR_ID_MEMBER: &str = "detectorId";
 /// (`smithy_query(operation="ListDetectors")`), for the same reason.
 pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
 
+/// The wire name of the account-id member every members operation carries:
+/// `AccountIds`' entries target `AccountId`
+/// (`smithy_query(operation="DisassociateMembers")`), and `AccountDetail.AccountId`
+/// renders as `accountId` (`smithy_query(shape="AccountDetail")`).
+pub const ACCOUNT_ID_MEMBER: &str = "accountId";
+
+/// The wire name of `AccountDetail`'s email member
+/// (`smithy_query(shape="AccountDetail")` renders `Email` as `email`).
+pub const EMAIL_MEMBER: &str = "email";
+
 /// The length of a GuardDuty detector id: the 32 hexadecimal characters
 /// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::mint_id`] mints, which is the
 /// form every id this service hands out has. The model's own constraint
@@ -325,6 +335,145 @@ pub fn not_owned_message(member: &str) -> String {
 /// request was signed for, so the rejection does not name it.
 pub const DETECTOR_ALREADY_EXISTS_MESSAGE: &str =
     "The request is rejected because a detector already exists for the current account.";
+
+/// The length of an AWS account id: the 12 characters `AccountId` is constrained
+/// to (`len 12..12` — `smithy_query(shape="AccountId")`). The model constrains the
+/// LENGTH only, so a 12-character value that is not an account id at all reaches
+/// the handler instead of being refused at the boundary.
+pub const ACCOUNT_ID_LEN: usize = 12;
+
+/// Is `id` a syntactically well-formed account id — exactly [`ACCOUNT_ID_LEN`]
+/// decimal digits?
+///
+/// Form only: a well-formed id need not name an account this administrator has a
+/// member record for, which is a different question and a different answer (see
+/// [`not_a_member_message`]).
+pub fn is_account_id(id: &str) -> bool {
+    id.len() == ACCOUNT_ID_LEN && id.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The administrator account the members of this emulator's detectors belong to:
+/// the single account this emulator serves, which is the account every request it
+/// answers is signed for.
+///
+/// It is NOT read from the request, so it is not caller input: a member's
+/// `MasterId` / `AdministratorId` is the account that owns the detector the member
+/// hangs off.
+pub fn administrator_account_id() -> String {
+    ::engine::emulator_account_id().to_string()
+}
+
+/// `UnprocessedAccount.Result` — "a reason why the account hasn't been processed"
+/// (`smithy_query(shape="UnprocessedAccount")`) — for an account id the
+/// administrator's detector holds no member record for.
+///
+/// A per-account failure is reported here rather than refusing the whole request:
+/// the operations that take an `AccountIds` list answer 200 and report the accounts
+/// they could not process, which is what `UnprocessedAccounts` is for.
+pub fn not_a_member_message(administrator_account_id: &str) -> String {
+    format!(
+        "The request is rejected because the given account ID is not an associated member of account {administrator_account_id}."
+    )
+}
+
+/// `UnprocessedAccount.Result` for an account `DisassociateMembers` was asked to
+/// disassociate that is not ASSOCIATED with the administrator — one it holds no
+/// member record for, and one whose relationship a disassociation already moved.
+///
+/// The condition is the association, not the record: the message states it ("the
+/// latter is not yet associated to it"), and a disassociated member keeps its
+/// record (see [`MemberRecord`]) while no longer being associated.
+pub const NOT_ASSOCIATED_MESSAGE: &str = "The request is rejected because the current account cannot disassociate the given member account ID since the latter is not yet associated to it.";
+
+/// `UnprocessedAccount.Result` for the administrator's OWN account id.
+///
+/// `CreateMembers` "creates member accounts of the current Amazon Web Services
+/// account by specifying a list of Amazon Web Services account IDs"
+/// (`smithy_query(query="doc",shape="CreateMembers")`): the current account is the
+/// administrator in that relationship, so it cannot also be one of its own members.
+pub const SELF_AS_MEMBER_MESSAGE: &str =
+    "The request is rejected because the current account cannot be used as a member account.";
+
+/// How many member accounts one administrator's detector holds.
+///
+/// GuardDuty's own quota is 5,000 member accounts per administrator account per
+/// Region, and the store is bounded by it rather than by nothing: a member record
+/// is keyed by a REQUEST-chosen account id, so without a bound a caller repeating
+/// `CreateMembers` with fresh ids could grow the store without limit. Dropping a
+/// member is not an option the way evicting an old finding is — the records are
+/// retained on purpose (see [`MemberRecord`]) — so the quota is enforced by
+/// REFUSING the accounts past it, which is what the real quota does.
+pub const MAX_MEMBERS_PER_DETECTOR: usize = 5_000;
+
+/// `UnprocessedAccount.Result` for an account that would take the administrator
+/// past [`MAX_MEMBERS_PER_DETECTOR`] member accounts.
+pub fn member_quota_message() -> String {
+    format!(
+        "The request is rejected because the current account cannot have more than {MAX_MEMBERS_PER_DETECTOR} member accounts."
+    )
+}
+
+/// The lower bound on an `AccountDetail.Email`: "the email address must be a
+/// minimum of 6 and a maximum of 64 characters long"
+/// (`smithy_query(query="doc",shape="AccountDetail",member="Email")`). The model
+/// carries `len 1..64`, so only the maximum is refused at the boundary.
+pub const EMAIL_MIN_LEN: usize = 6;
+
+/// The characters the local name of an email address cannot contain, as the member
+/// documents them: "whitespace, \" ' ( ) < > [ ] : ' , \\ | % &"
+/// (`smithy_query(query="doc",shape="AccountDetail",member="Email")`). Whitespace
+/// is checked separately, since it is a class rather than a character.
+pub const EMAIL_LOCAL_FORBIDDEN: [char; 14] = [
+    '"', '\'', '(', ')', '<', '>', '[', ']', ':', ',', '\\', '|', '%', '&',
+];
+
+/// Is `email` a valid `AccountDetail.Email`?
+///
+/// Every rule is one the member itself documents
+/// (`smithy_query(query="doc",shape="AccountDetail",member="Email")`), in the order
+/// it lists them: 6..64 characters, 7-bit ASCII only, exactly one `@` separating
+/// the local name from the domain name, no [`EMAIL_LOCAL_FORBIDDEN`] character or
+/// whitespace and no leading dot in the local name, and a domain name of
+/// `[a-zA-Z0-9]`, hyphen and dot only that neither begins nor ends with a dot or a
+/// hyphen and contains at least one dot.
+pub fn is_member_email(email: &str) -> bool {
+    if email.len() < EMAIL_MIN_LEN || !email.is_ascii() {
+        return false;
+    }
+    let mut parts = email.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let local_ok = !local.is_empty()
+        && !local.starts_with('.')
+        && !local
+            .chars()
+            .any(|c| c.is_whitespace() || EMAIL_LOCAL_FORBIDDEN.contains(&c));
+    let domain_ok = !domain.is_empty()
+        && domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        && !domain.starts_with(['.', '-'])
+        && !domain.ends_with(['.', '-'])
+        && domain.contains('.');
+    local_ok && domain_ok
+}
+
+/// `Member.RelationshipStatus` for an account `CreateMembers` has recorded and no
+/// invitation has been sent to yet.
+///
+/// The member targets a plain `String` — "the status of the relationship between
+/// the member and the administrator"
+/// (`smithy_query(query="doc",shape="Member",member="RelationshipStatus")`) — so
+/// the values are GuardDuty's documented relationship statuses, which are
+/// mixed-case words rather than the SCREAMING_CASE of this service's modelled
+/// enums.
+pub const RELATIONSHIP_CREATED: &str = "Created";
+
+/// `Member.RelationshipStatus` for a member the administrator disassociated with
+/// `DisassociateMembers`. See [`RELATIONSHIP_CREATED`] for where the values come
+/// from.
+pub const RELATIONSHIP_REMOVED: &str = "Removed";
 
 /// The message a request is DENIED with when the account is not authorized on the
 /// resource `member` names.
@@ -543,6 +692,48 @@ pub struct Detector {
     /// detector like its findings and filters, so `DeleteDetector` drops them with
     /// it.
     pub investigations: BTreeMap<String, InvestigationRecord>,
+    /// The member accounts this detector's account administers, keyed by account
+    /// id. `DeleteDetector` drops them with the detector, like the findings and
+    /// filters above.
+    pub members: BTreeMap<String, MemberRecord>,
+}
+
+/// A member account of the administrator that owns the detector this record hangs
+/// off.
+///
+/// The record outlives the ASSOCIATION: when a member is disassociated "the member
+/// account details obtained from the CreateMembers API, including the associated
+/// email addresses, are retained. This is done so that the delegated administrator
+/// can invoke the InviteMembers API without the need to invoke the CreateMembers
+/// API again. To remove the details associated with a member account, the delegated
+/// administrator must invoke the DeleteMembers API"
+/// (`smithy_query(query="doc",shape="DisassociateMembers")`). So disassociating
+/// moves [`Self::relationship_status`] and nothing else, and only `DeleteMembers`
+/// drops the record.
+#[derive(Debug, Clone)]
+pub struct MemberRecord {
+    pub account_id: String,
+    /// The member account's email address, as the request that recorded the account
+    /// gave it.
+    pub email: String,
+    /// `Member.RelationshipStatus`: [`RELATIONSHIP_CREATED`] or
+    /// [`RELATIONSHIP_REMOVED`].
+    pub relationship_status: String,
+    /// When the relationship last changed, in epoch milliseconds — the member's
+    /// `UpdatedAt`.
+    pub updated_at_millis: i64,
+}
+
+impl MemberRecord {
+    /// Is this member currently ASSOCIATED with the administrator?
+    ///
+    /// "Is a member account of this administrator" and "is associated with it" are
+    /// two different questions, because the record is retained across a
+    /// disassociation (see the type's documentation): `GetMembers` answers the
+    /// first, `DisassociateMembers` acts on the second.
+    pub fn is_associated(&self) -> bool {
+        self.relationship_status != RELATIONSHIP_REMOVED
+    }
 }
 
 impl Detector {

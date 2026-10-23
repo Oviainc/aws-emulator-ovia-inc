@@ -6,6 +6,9 @@
 //! production router runs — so the restJson1 routes, the query/label bindings and the
 //! error envelopes are exercised exactly as a client would hit them. Nothing reaches
 //! into `crate::state`: a resource is only ever read back through an operation.
+//!
+//! The harness below (`Emulator` and the helpers under it) is shared with the other
+//! suites in this target, which reach it as `crate::global_network_lifecycle::*`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,15 +22,15 @@ const HOST: &str = "networkmanager.us-west-2.amazonaws.com";
 
 /// The settle span `crate::state::SETTLE_DELAY` fixes, plus slack, so a test that waits
 /// for the `PENDING` -> `AVAILABLE` transition the clock owes is not racing it.
-const PAST_SETTLE: Duration = Duration::from_millis(900);
+pub(crate) const PAST_SETTLE: Duration = Duration::from_millis(900);
 
 /// The emulator under test: one shared engine, this service, the production dispatch.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These tests exercise operation behaviour, not SigV4; signing is covered by the
@@ -39,7 +42,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {
         let payload = body.map_or_else(Vec::new, |value| {
             serde_json::to_vec(&value).expect("the request body must serialize")
         });
@@ -63,24 +66,24 @@ impl Emulator {
         (status, parsed)
     }
 
-    async fn get(&self, uri: &str) -> (u16, Value) {
+    pub(crate) async fn get(&self, uri: &str) -> (u16, Value) {
         self.call("GET", uri, None).await
     }
 
-    async fn post(&self, uri: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn post(&self, uri: &str, body: Value) -> (u16, Value) {
         self.call("POST", uri, Some(body)).await
     }
 
-    async fn patch(&self, uri: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn patch(&self, uri: &str, body: Value) -> (u16, Value) {
         self.call("PATCH", uri, Some(body)).await
     }
 
-    async fn delete(&self, uri: &str) -> (u16, Value) {
+    pub(crate) async fn delete(&self, uri: &str) -> (u16, Value) {
         self.call("DELETE", uri, None).await
     }
 
     /// Create a global network and return its minted id.
-    async fn create_global_network(&self, description: &str) -> String {
+    pub(crate) async fn create_global_network(&self, description: &str) -> String {
         let (status, body) = self
             .post("/global-networks", json!({ "Description": description }))
             .await;
@@ -95,7 +98,7 @@ impl Emulator {
     }
 
     /// Create a site in `global_network_id` and return its minted id.
-    async fn create_site(&self, global_network_id: &str, description: &str) -> String {
+    pub(crate) async fn create_site(&self, global_network_id: &str, description: &str) -> String {
         let (status, body) = self
             .post(
                 &format!("/global-networks/{global_network_id}/sites"),
@@ -116,7 +119,7 @@ impl Emulator {
 /// The id shape Network Manager mints: `<kind>-<17 lowercase hex digits>`. The model's
 /// own id patterns for the kinds it constrains read `^core-network-([0-9a-f]{8,17})$`
 /// (`smithy_query shape=CoreNetworkId`), which is where the alphabet and width come from.
-fn is_minted_id(id: &str, kind: &str) -> bool {
+pub(crate) fn is_minted_id(id: &str, kind: &str) -> bool {
     match id.strip_prefix(&format!("{kind}-")) {
         Some(suffix) => {
             suffix.len() == 17
@@ -130,7 +133,7 @@ fn is_minted_id(id: &str, kind: &str) -> bool {
 
 /// The ARN of a resource of this global (region-less) service, built the way the
 /// emulator's one account/ARN source does.
-fn expected_arn(kind: &str, id: &str) -> String {
+pub(crate) fn expected_arn(kind: &str, id: &str) -> String {
     format!(
         "arn:aws:networkmanager::{}:{kind}/{id}",
         engine::emulator_account_id()
@@ -138,12 +141,13 @@ fn expected_arn(kind: &str, id: &str) -> String {
 }
 
 /// The wire error code of a failed response (restJson1 carries it as `__type`).
-fn error_code(body: &Value) -> &str {
+pub(crate) fn error_code(body: &Value) -> &str {
     body["__type"].as_str().unwrap_or("<no __type>")
 }
 
-/// The ids in a `DescribeGlobalNetworks` / `GetSites` page, in the order returned.
-fn ids_of(body: &Value, list: &str, id_member: &str) -> Vec<String> {
+/// The ids in a `DescribeGlobalNetworks` / `GetSites` / `GetLinks` page, in the order
+/// returned.
+pub(crate) fn ids_of(body: &Value, list: &str, id_member: &str) -> Vec<String> {
     body[list]
         .as_array()
         .unwrap_or_else(|| panic!("expected a {list} array in {body}"))

@@ -56,6 +56,8 @@ mod state_roundtrip;
 mod volume_lifecycle;
 #[path = "all/vpc_attributes.rs"]
 mod vpc_attributes;
+#[path = "all/vpc_endpoint_connections.rs"]
+mod vpc_endpoint_connections;
 #[path = "all/vpc_lifecycle.rs"]
 mod vpc_lifecycle;
 #[path = "all/vpc_network_lifecycle.rs"]

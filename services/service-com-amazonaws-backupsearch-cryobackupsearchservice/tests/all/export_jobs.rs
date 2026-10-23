@@ -10,6 +10,11 @@
 //! (destination bucket, destination prefix, role ARN, tag count, signing region, and how
 //! the search job reached a status export permits), never over one request alone.
 //!
+//! Every `RoleArn` a row expects to be ACCEPTED names a role in the account this
+//! emulator attributes its callers to (`engine::emulator_account_id()`), because a role
+//! in another account cannot be passed to the service — the refusal that rule produces
+//! has its own table in `export_listing.rs`.
+//!
 //! The HTTP harness (`emulator`, `emulator_with_engine`, `call`, `Answer`) and the two
 //! transition-span constants are the search-job suite's: both suites drive the same
 //! emulator the same way, so there is one harness, not two.
@@ -25,6 +30,16 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 use crate::search_jobs::{
     call, emulator, emulator_with_engine, Answer, PAST_THE_DUE_INSTANT, WITHIN_THE_DUE_INSTANT,
 };
+
+/// A `RoleArn` the service can be passed: a role in the account this emulator attributes
+/// every caller to. Satisfies `IamRoleArn`'s modelled `@pattern`
+/// (`^arn:(?:aws|aws-cn|aws-us-gov):iam::[a-z0-9-]+:role/(.+)$`).
+fn passable_role(partition: &str, name: &str) -> String {
+    format!(
+        "arn:{partition}:iam::{}:role/{name}",
+        engine::emulator_account_id()
+    )
+}
 
 /// How a search job reaches a status an export may be started from. Both of the statuses
 /// in `state::EXPORTABLE_SEARCH_JOB_STATES` are reachable, and each row of the table
@@ -55,7 +70,7 @@ struct ExportCase {
     region: &'static str,
     settled: Settled,
     specification: Value,
-    role_arn: Option<&'static str>,
+    role_arn: Option<String>,
     tags: Option<Value>,
 }
 
@@ -66,9 +81,7 @@ fn export_cases() -> Vec<ExportCase> {
             region: "us-west-2",
             settled: Settled::Completed,
             specification: json!({"s3ExportSpecification": {"DestinationBucket": "search-exports"}}),
-            // Satisfies IamRoleArn's modelled @pattern
-            // (^arn:(?:aws|aws-cn|aws-us-gov):iam::[a-z0-9-]+:role/(.+)$).
-            role_arn: Some("arn:aws:iam::123456789012:role/backup-search-export"),
+            role_arn: Some(passable_role("aws", "backup-search-export")),
             tags: None,
         },
         ExportCase {
@@ -94,7 +107,7 @@ fn export_cases() -> Vec<ExportCase> {
                     "DestinationPrefix": "a/b/c/"
                 }
             }),
-            role_arn: Some("arn:aws-us-gov:iam::210987654321:role/service-role/export"),
+            role_arn: Some(passable_role("aws-us-gov", "service-role/export")),
             tags: Some(json!({"owner": "backup", "env": "test"})),
         },
     ]
@@ -106,7 +119,7 @@ fn export_body(case: &ExportCase, search_job_identifier: &str) -> Value {
         "SearchJobIdentifier": search_job_identifier,
         "ExportSpecification": case.specification.clone(),
     });
-    if let Some(role_arn) = case.role_arn {
+    if let Some(role_arn) = case.role_arn.clone() {
         body["RoleArn"] = json!(role_arn);
     }
     if let Some(tags) = case.tags.clone() {
@@ -191,8 +204,7 @@ async fn get_export_job(
 }
 
 /// How many export jobs the shared store holds — the check that a refused start wrote
-/// nothing, which no modelled read can make while `ListSearchResultExportJobs` is still a
-/// scaffold stub.
+/// nothing, read off the store itself so it does not depend on a listing's own filters.
 fn stored_export_jobs(engine: &engine::InMemoryEngine) -> usize {
     engine
         .state::<state::ComAmazonawsBackupsearchCryobackupsearchserviceState>()
@@ -554,7 +566,7 @@ async fn a_client_token_is_idempotent_for_the_same_body_and_conflicts_for_a_diff
         "ExportSpecification": {
             "s3ExportSpecification": {"DestinationBucket": "bucket", "DestinationPrefix": "p"}
         },
-        "RoleArn": "arn:aws:iam::123456789012:role/export",
+        "RoleArn": passable_role("aws", "export"),
         "Tags": {"team": "data"}
     });
 
@@ -573,7 +585,7 @@ async fn a_client_token_is_idempotent_for_the_same_body_and_conflicts_for_a_diff
             "s3ExportSpecification": {"DestinationPrefix": "p", "DestinationBucket": "bucket"}
         },
         "Tags": {"team": "data"},
-        "RoleArn": "arn:aws:iam::123456789012:role/export",
+        "RoleArn": passable_role("aws", "export"),
         "SearchJobIdentifier": first_job,
         "ClientToken": token
     });
@@ -605,7 +617,7 @@ async fn a_client_token_is_idempotent_for_the_same_body_and_conflicts_for_a_diff
     dropped_prefix["ExportSpecification"] =
         json!({"s3ExportSpecification": {"DestinationBucket": "bucket"}});
     let mut other_role = body.clone();
-    other_role["RoleArn"] = json!("arn:aws:iam::123456789012:role/other");
+    other_role["RoleArn"] = json!(passable_role("aws", "other"));
     let mut other_tags = body.clone();
     other_tags["Tags"] = json!({"team": "ops"});
     let mut other_job = body.clone();

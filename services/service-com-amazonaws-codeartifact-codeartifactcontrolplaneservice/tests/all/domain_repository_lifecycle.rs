@@ -22,154 +22,20 @@
 //! 5. A domain's `repositoryCount` is the number of repositories it holds, at every point
 //!    in the lifecycle.
 //!
-//! The `Answer`/`emulator`/`call` harness below is `pub(crate)`, so a sibling suite
-//! (`repository_endpoint.rs`) drives the same front door rather than rebuilding one.
-
-use std::sync::Arc;
+//! The `Answer`/`emulator`/`call` plumbing lives in the shared `harness` module, so every
+//! suite in this crate drives the same front door; the `create_repository` /
+//! `describe_repository` helpers below are `pub(crate)` for the sibling suites that
+//! address a repository (`repository_endpoint.rs`).
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A SigV4 `Authorization` header for `region`, in the shape the router's routing key
-/// reader parses: its credential scope is what names the target service AND the region
-/// every minted ARN carries. The signature itself is never checked here (the harness
-/// turns request authentication off), so it is a placeholder.
-pub(crate) fn auth_for(region: &str) -> String {
-    format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/codeartifact/aws4_request, \
-         SignedHeaders=host, Signature=0"
-    )
-}
-
-/// The account id every generated emulator presents, and therefore the `owner`,
-/// `domainOwner` and `administratorAccount` of every resource here.
-pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
-
-/// The region every request below is signed for; every ARN here is regional on it.
-pub(crate) const REGION: &str = "us-east-1";
-
-/// One HTTP answer, reduced to what a client branches on.
-///
-/// This harness (the type, [`emulator`], [`call`] and the per-operation senders below) is
-/// `pub(crate)` so the crate's other suites in `tests/all/` drive the emulator exactly the
-/// same way instead of standing up a second copy of it.
-#[derive(Debug)]
-pub(crate) struct Answer {
-    pub(crate) status: u16,
-    /// `x-amzn-errortype`, which is how restJson1 names the error shape.
-    pub(crate) error_type: Option<String>,
-    pub(crate) body: Value,
-}
-
-impl Answer {
-    /// The `__type`/`x-amzn-errortype` error code, or `""` on a success.
-    pub(crate) fn code(&self) -> String {
-        self.error_type.clone().unwrap_or_default()
-    }
-
-    /// The `message` of an error body, or `""` when the body carries none.
-    pub(crate) fn message(&self) -> String {
-        self.body
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    }
-}
-
-/// The emulator under test: the production router with this one service mounted on a
-/// single shared engine, exactly as `core/router` assembles it.
-pub(crate) fn emulator() -> MultiServiceRouter {
-    emulator_with_engine().0
-}
-
-/// [`emulator`], handing back the shared engine as well — for a suite that reads the
-/// stored record directly, to catch a call that mutated state its answer looked right
-/// about.
-pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Deterministic regardless of the ambient `--auth` setting: these requests carry an
-    // unsigned placeholder credential, and signature verification is the emulator's job,
-    // not this service's.
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_codeartifact_codeartifactcontrolplaneservice::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    (router, engine)
-}
-
-/// Send one request signed for [`REGION`] and reduce the response to an [`Answer`].
-pub(crate) async fn call(
-    router: &MultiServiceRouter,
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-) -> Answer {
-    call_in_region(router, REGION, method, uri, body).await
-}
-
-/// [`call`], signed for (and addressed to) an arbitrary `region`.
-pub(crate) async fn call_in_region(
-    router: &MultiServiceRouter,
-    region: &str,
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-) -> Answer {
-    let payload = match &body {
-        Some(value) => bytes::Bytes::from(serde_json::to_vec(value).expect("serialize body")),
-        None => bytes::Bytes::new(),
-    };
-    let request = http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("host", format!("codeartifact.{region}.amazonaws.com"))
-        .header("authorization", auth_for(region))
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("build request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let raw = response.into_body();
-    let body = if raw.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&raw)
-            .unwrap_or_else(|_| json!({ "unparsed": String::from_utf8_lossy(&raw) }))
-    };
-    Answer {
-        status,
-        error_type,
-        body,
-    }
-}
-
-pub(crate) async fn create_domain(
-    router: &MultiServiceRouter,
-    domain: &str,
-    key: Option<&str>,
-) -> Answer {
-    let body = match key {
-        Some(key) => json!({ "encryptionKey": key }),
-        None => json!({}),
-    };
-    call(
-        router,
-        "POST",
-        &format!("/v1/domain?domain={domain}"),
-        Some(body),
-    )
-    .await
-}
+// Used here AND re-exported `pub(crate)`: several of the crate's suites import this
+// plumbing from this module (`external_connection_disassociation.rs` and
+// `error_message_composition.rs` do), so the re-export is what lets either path —
+// `crate::harness::call` or `crate::domain_repository_lifecycle::call` — name the one
+// shared harness in `tests/all/harness.rs`.
+pub(crate) use crate::harness::{call, create_domain, emulator, Answer, ACCOUNT, REGION};
 
 async fn describe_domain(router: &MultiServiceRouter, domain: &str) -> Answer {
     call(router, "GET", &format!("/v1/domain?domain={domain}"), None).await

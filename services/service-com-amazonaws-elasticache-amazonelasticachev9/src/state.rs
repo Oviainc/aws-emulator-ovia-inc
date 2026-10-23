@@ -41,16 +41,22 @@
 //! `DescribeUsers` reports it, over the one [`UserRecord`] map below, which also
 //! holds the built-in `default` user every account already has.
 //!
-//! Everything else in this service (replication groups, user groups, parameter
-//! groups, migrations, update actions) is still a scaffolded 501 and owns its
-//! own gap issue; where a member of an implemented operation belongs to one of
-//! those resources, the comment beside it says so.
+//! Everything else in this service (user groups, parameter groups, migrations,
+//! update actions) is still a scaffolded 501 and owns its own gap issue; where a
+//! member of an implemented operation belongs to one of those resources, the
+//! comment beside it says so.
 //!
 //! The serverless cache is another customer-created resource this store holds:
 //! `CreateServerlessCache` mints one and `DescribeServerlessCaches` reports it.
 //! `ModifyServerlessCache` / `DeleteServerlessCache` and the serverless
 //! snapshot operations are still scaffolded 501s with their own gap issues, and
 //! they read and write the SAME record rather than a copy beside it.
+//!
+//! A replication group is the other resource this state holds:
+//! `CreateReplicationGroup` mints one together with the member cache clusters it
+//! is made of, and `DescribeReplicationGroups` reports it. Those member clusters
+//! are ordinary [`CacheClusterRecord`]s in the same map as the standalone ones,
+//! so there is one copy of a cluster however it was created.
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -60,10 +66,10 @@ use crate::ops::types::{
     Authentication, AuthenticationMode, AvailabilityZone, CacheCluster, CacheEngineVersion,
     CacheNode, CacheParameterGroup, CacheParameterGroupStatus, CacheSubnetGroup, CacheUsageLimits,
     CreateUserOutput, DestinationDetails, Endpoint, LogDeliveryConfiguration,
-    LogDeliveryConfigurationRequest, NodeGroupConfiguration, NodeSnapshot,
-    NotificationConfiguration, PendingModifiedValues, RecurringCharge, ReservedCacheNode,
-    ReservedCacheNodesOffering, ScaleConfig, SecurityGroupMembership, ServerlessCache,
-    ServiceUpdate, Snapshot, Subnet, Tag,
+    LogDeliveryConfigurationRequest, NodeGroup, NodeGroupConfiguration, NodeGroupMember,
+    NodeSnapshot, NotificationConfiguration, PendingModifiedValues, RecurringCharge,
+    ReplicationGroup, ReservedCacheNode, ReservedCacheNodesOffering, ScaleConfig,
+    SecurityGroupMembership, ServerlessCache, ServiceUpdate, Snapshot, Subnet, Tag,
 };
 
 /// The region a request is treated as having been made in when its SigV4
@@ -94,12 +100,16 @@ pub const STORE_UNAVAILABLE: &str =
 /// choice; `redis` is also what the AWS CLI sends when the flag is omitted.
 pub const DEFAULT_ENGINE: &str = "redis";
 
+/// The Valkey engine, named wherever behaviour differs by engine (the version
+/// catalogue, a replication group's at-rest encryption default).
+pub const ENGINE_VALKEY: &str = "valkey";
+
 /// The cache engines a cluster may run.
 ///
 /// From the model's own `CreateCacheCluster` documentation: "All nodes in the
 /// cluster run the same protocol-compliant cache engine software, either
 /// Memcached, Valkey or Redis OSS."
-pub const ENGINES: [&str; 3] = ["memcached", "redis", "valkey"];
+pub const ENGINES: [&str; 3] = ["memcached", DEFAULT_ENGINE, ENGINE_VALKEY];
 
 /// The `MaxRecords` of every paginated describe in this service, as each of
 /// those members documents it: "Default: 100. Constraints: minimum 20; maximum
@@ -192,19 +202,40 @@ pub const SUBNETS_PER_GROUP: usize = 20;
 /// documents it: "The maximum number of tags permitted on a resource is 50."
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
-/// True when `value` satisfies `CacheClusterId`'s documented constraints: "A
-/// name must contain from 1 to 50 alphanumeric characters or hyphens. The first
-/// character must be a letter. A name cannot end with a hyphen or contain two
-/// consecutive hyphens."
+/// The longest `CacheClusterId`: "A name must contain from 1 to 50 alphanumeric
+/// characters or hyphens."
+pub const CLUSTER_ID_MAX_LEN: usize = 50;
+
+/// The longest `ReplicationGroupId`: "A name must contain from 1 to 40
+/// alphanumeric characters or hyphens."
+pub const REPLICATION_GROUP_ID_MAX_LEN: usize = 40;
+
+/// True when `value` satisfies the name rule ElastiCache documents for every one
+/// of its identifiers — "A name must contain from 1 to `max_len` alphanumeric
+/// characters or hyphens. The first character must be a letter. A name cannot
+/// end with a hyphen or contain two consecutive hyphens." — the only thing that
+/// differs between them being the length bound.
 ///
-/// The member carries no modelled `@length` or `@pattern`, so the boundary
+/// These members carry no modelled `@length` or `@pattern`, so the boundary
 /// validator passes any string and the rule is enforced here.
-pub fn is_valid_cluster_id(value: &str) -> bool {
-    (1..=50).contains(&value.len())
+pub fn is_valid_identifier(value: &str, max_len: usize) -> bool {
+    (1..=max_len).contains(&value.len())
         && value.starts_with(|first: char| first.is_ascii_alphabetic())
         && !value.ends_with('-')
         && !value.contains("--")
         && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// True when `value` satisfies `CacheClusterId`'s documented constraints; see
+/// [`is_valid_identifier`].
+pub fn is_valid_cluster_id(value: &str) -> bool {
+    is_valid_identifier(value, CLUSTER_ID_MAX_LEN)
+}
+
+/// True when `value` satisfies `ReplicationGroupId`'s documented constraints;
+/// see [`is_valid_identifier`].
+pub fn is_valid_replication_group_id(value: &str) -> bool {
+    is_valid_identifier(value, REPLICATION_GROUP_ID_MAX_LEN)
 }
 
 /// True when `value` can name a snapshot: 1 to 255 alphanumeric characters or
@@ -1384,9 +1415,12 @@ impl CacheNodeRecord {
                 port: Some(self.endpoint_port),
             }),
             parameter_group_status: Some(self.parameter_group_status.clone()),
-            // The primary a read replica syncs from: a replica belongs to a
-            // replication group, and every replication-group operation is a
-            // scaffolded 501, so a cluster of this slice has no primary.
+            // The primary a read replica syncs from, as a cache NODE id within
+            // the reporting cluster. A standalone cluster has no primary, and a
+            // replication group's member cluster holds a single node whose
+            // primary is a node of a DIFFERENT cluster, which this member cannot
+            // name — the group's `NodeGroupMembers`/`CurrentRole` is where that
+            // relationship is reported.
             source_cache_node_id: None,
             customer_availability_zone: self.availability_zone.clone(),
             // Outposts are not modelled by this slice.
@@ -1489,13 +1523,16 @@ pub struct CacheClusterRecord {
     pub az_mode: Option<String>,
     pub preferred_maintenance_window: String,
     pub cache_subnet_group_name: Option<String>,
-    /// The replication group this cluster belongs to. Always absent in this
-    /// slice: `CreateCacheCluster` refuses a `ReplicationGroupId` while every
-    /// replication-group operation is a scaffolded 501, so there is no group to
-    /// join. The field is what
+    /// The replication group this cluster belongs to: set on the member
+    /// clusters `CreateReplicationGroup` mints, absent on a standalone cluster.
+    /// The field is what
     /// `DescribeCacheClusters$ShowCacheClustersNotInReplicationGroups` filters
     /// on, so that filter reads stored state rather than a constant.
     pub replication_group_id: Option<String>,
+    /// `CacheCluster$ReplicationGroupLogDeliveryEnabled` — whether log delivery
+    /// is enabled for the replication group this cluster belongs to. `None` on a
+    /// standalone cluster, which belongs to no group.
+    pub replication_group_log_delivery_enabled: Option<bool>,
     pub cache_parameter_group_name: String,
     pub snapshot_retention_limit: Option<i32>,
     pub snapshot_window: Option<String>,
@@ -1511,6 +1548,13 @@ pub struct CacheClusterRecord {
     /// `AuthTokenLastModifiedDate`.
     pub auth_token_last_modified: Option<SystemTime>,
     pub transit_encryption_enabled: Option<bool>,
+    /// The in-transit encryption MODE, which only a replication group sets, so
+    /// it is absent on a standalone cluster.
+    pub transit_encryption_mode: Option<String>,
+    /// Whether data is encrypted at rest. `CreateCacheCluster` has no member for
+    /// it, so it is absent on a standalone cluster and carries the group's
+    /// setting on a member cluster.
+    pub at_rest_encryption_enabled: Option<bool>,
     pub network_type: Option<String>,
     pub ip_discovery: Option<String>,
     pub log_delivery_configurations: Vec<LogDeliveryRecord>,
@@ -1629,6 +1673,8 @@ impl CacheClusterRecord {
         // is clamped instead of allocated.
         let target = target.clamp(1, MEMCACHED_MAX_NODES);
         let target_len = usize::try_from(target).unwrap_or(1);
+        self.nodes
+            .reserve(target_len.saturating_sub(self.nodes.len()));
         while self.nodes.len() > target_len {
             self.nodes.pop();
         }
@@ -1640,7 +1686,10 @@ impl CacheClusterRecord {
             .unwrap_or(0);
         let mut added = 0usize;
         while self.nodes.len() < target_len {
-            highest += 1;
+            // `saturating_add`: the ordinal is bounded by the clamp above, so
+            // this cannot wrap, and it must not panic in a debug build if a
+            // future caller ever brings it close.
+            highest = highest.saturating_add(1);
             let zone = if new_zones.is_empty() {
                 self.zone_for(usize::try_from(highest).unwrap_or(1).saturating_sub(1))
             } else {
@@ -1762,9 +1811,9 @@ impl CacheClusterRecord {
                     })
                     .collect()
             }),
-            // A cluster of this slice belongs to no replication group: every
-            // replication-group operation is a scaffolded 501, so
-            // `CreateCacheCluster` refuses a `ReplicationGroupId`.
+            // The group this cluster is a member of, set when
+            // `CreateReplicationGroup` minted it as one of the group's member
+            // clusters.
             replication_group_id: self.replication_group_id.clone(),
             snapshot_retention_limit: self.snapshot_retention_limit,
             snapshot_window: self.snapshot_window.clone(),
@@ -1774,13 +1823,15 @@ impl CacheClusterRecord {
                 .map(::aws_smithy_types::DateTime::from),
             transit_encryption_enabled: self.transit_encryption_enabled,
             // At-rest encryption "cannot be modified after the cluster is
-            // created" and `CreateCacheCluster` has no member to set it, so no
-            // cluster of this API can carry it.
-            at_rest_encryption_enabled: None,
+            // created" and `CreateCacheCluster` has no member to set it, so a
+            // standalone cluster carries none; a replication group's member
+            // cluster carries the group's setting.
+            at_rest_encryption_enabled: self.at_rest_encryption_enabled,
             arn: Some(self.arn.clone()),
-            // Log delivery "for the replication group": a cluster of this slice
-            // belongs to none.
-            replication_group_log_delivery_enabled: None,
+            // Log delivery "for the replication group": absent on a standalone
+            // cluster, and on a member cluster whatever its group was created
+            // with.
+            replication_group_log_delivery_enabled: self.replication_group_log_delivery_enabled,
             log_delivery_configurations: (!self.log_delivery_configurations.is_empty()).then(|| {
                 self.log_delivery_configurations
                     .iter()
@@ -1789,11 +1840,585 @@ impl CacheClusterRecord {
             }),
             network_type: self.network_type.clone(),
             ip_discovery: self.ip_discovery.clone(),
-            // The in-transit encryption MODE is set by
-            // `ModifyReplicationGroup`, a scaffolded 501.
-            transit_encryption_mode: None,
+            // The in-transit encryption MODE is set when a replication group is
+            // created; `CreateCacheCluster` has no member for it, so a
+            // standalone cluster carries none.
+            transit_encryption_mode: self.transit_encryption_mode.clone(),
         }
     }
+}
+
+/// The cache engines a replication group may run, from
+/// `CreateReplicationGroup$Engine`: "The value must be set to valkey or redis",
+/// and the operation itself "is valid for Valkey and Redis OSS only".
+pub const REPLICATION_GROUP_ENGINES: [&str; 2] = [DEFAULT_ENGINE, ENGINE_VALKEY];
+
+/// The largest `NumCacheClusters`, as the member documents it: "The maximum
+/// permitted value for NumCacheClusters is 6 (1 primary plus 5 replicas)."
+pub const MAX_CACHE_CLUSTERS_PER_GROUP: i32 = 6;
+
+/// The largest `ReplicasPerNodeGroup` / `NodeGroupConfiguration$ReplicaCount`,
+/// as `ReplicasPerNodeGroup` documents it: "Valid values are 0 to 5."
+pub const MAX_REPLICAS_PER_NODE_GROUP: i32 = 5;
+
+/// The largest `NumNodeGroups`, from
+/// `NodeGroupsPerReplicationGroupQuotaExceededFault`: "The request cannot be
+/// processed because it would exceed the maximum allowed number of node groups
+/// (shards) in a single replication group. The default maximum is 90".
+pub const MAX_NODE_GROUPS: i32 = 90;
+
+/// How many hash slots a Valkey / Redis OSS keyspace holds, from
+/// `NodeGroupConfiguration$Slots`: "Keyspaces range from 0 to 16,383."
+pub const KEYSPACE_SLOTS: i32 = 16_384;
+
+/// `AuthToken`'s documented length bounds: "Must be at least 16 characters and
+/// no more than 128 characters in length."
+pub const AUTH_TOKEN_MIN_LEN: usize = 16;
+/// See [`AUTH_TOKEN_MIN_LEN`].
+pub const AUTH_TOKEN_MAX_LEN: usize = 128;
+
+/// The printable special characters an `AuthToken` may carry: "The only
+/// permitted printable special characters are !, &, #, $, ^, <, >, and -. Other
+/// printable special characters cannot be used in the AUTH token."
+pub const AUTH_TOKEN_SPECIAL_CHARACTERS: [char; 8] = ['!', '&', '#', '$', '^', '<', '>', '-'];
+
+/// The node-type family data tiering requires, from `DataTieringEnabled`: "Data
+/// tiering is only supported for replication groups using the r6gd node type.
+/// This parameter must be set to true when using r6gd nodes."
+pub const DATA_TIERING_NODE_TYPE: &str = "r6gd";
+
+/// The `enabled` / `disabled` of `AutomaticFailoverStatus`, `MultiAZStatus` and
+/// `DataTieringStatus` (`smithy_query(query="shape", shape="MultiAZStatus")`).
+pub const SETTING_ENABLED: &str = "enabled";
+/// See [`SETTING_ENABLED`].
+pub const SETTING_DISABLED: &str = "disabled";
+
+/// `NodeGroupMember$CurrentRole`'s values: "The role that is currently assigned
+/// to the node - primary or replica."
+pub const ROLE_PRIMARY: &str = "primary";
+/// See [`ROLE_PRIMARY`].
+pub const ROLE_REPLICA: &str = "replica";
+
+/// `StorageEncryptionType`'s values (`smithy_query(query="shape",
+/// shape="StorageEncryptionType")`: `none | sse-elasticache | sse-kms`), which
+/// `ReplicationGroup$StorageEncryptionType` documents as "none if at-rest
+/// encryption is not enabled, sse-elasticache if an ElastiCache service-managed
+/// key is used, or sse-kms if a customer-managed KMS key is used". The two
+/// key-bearing values are declared with the serverless-cache slice, which
+/// documents them the same way.
+pub const STORAGE_ENCRYPTION_NONE: &str = "none";
+
+/// `Durability`'s `default`: "When set to default, the service determines the
+/// effective durability based on the engine version, cluster mode, and other
+/// parameters. The resolved setting is reflected in the EffectiveDurability
+/// property."
+pub const DURABILITY_DEFAULT: &str = "default";
+
+/// What [`DURABILITY_DEFAULT`] resolves to here, and the only value
+/// `EffectiveDurability` can take for a group this operation creates:
+/// `CreateReplicationGroup`'s own documentation states the replication this
+/// service performs — "Writes to the primary are asynchronously propagated to
+/// the replicas" — and `async` is that setting's name in `EffectiveDurability`
+/// (`async | sync | disabled`).
+pub const EFFECTIVE_DURABILITY_ASYNC: &str = "async";
+
+/// The id of the one cache node a Valkey / Redis OSS member cluster holds; node
+/// ids are "a numeric identifier (0001, 0002, etc.)" and
+/// [`REDIS_NUM_CACHE_NODES`] is 1, so a member cluster's node is always this one.
+pub const FIRST_CACHE_NODE_ID: &str = "0001";
+
+/// The ARN of a replication group:
+/// `arn:aws:elasticache:<region>:<account>:replicationgroup:<id>`.
+pub fn replication_group_arn(region: &str, replication_group_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("replicationgroup:{replication_group_id}"),
+    )
+}
+
+/// `engine` lowercased when it names an engine a replication group may run,
+/// else the reason it is refused. See [`REPLICATION_GROUP_ENGINES`].
+pub fn normalize_replication_group_engine(engine: &str) -> Result<String, String> {
+    let lowered = engine.to_ascii_lowercase();
+    if REPLICATION_GROUP_ENGINES.contains(&lowered.as_str()) {
+        Ok(lowered)
+    } else {
+        Err(format!(
+            "Invalid value {engine} for Engine: a replication group must run one of {}.",
+            REPLICATION_GROUP_ENGINES.join(" | ")
+        ))
+    }
+}
+
+/// `None` when `token` satisfies every documented `AuthToken` constraint, else
+/// the reason it does not: "Must be only printable ASCII characters. Must be at
+/// least 16 characters and no more than 128 characters in length. The only
+/// permitted printable special characters are !, &, #, $, ^, <, >, and -."
+pub fn auth_token_refusal(token: &str) -> Option<String> {
+    if !(AUTH_TOKEN_MIN_LEN..=AUTH_TOKEN_MAX_LEN).contains(&token.chars().count()) {
+        return Some(format!(
+            "Invalid value for AuthToken: the password must be at least {AUTH_TOKEN_MIN_LEN} and \
+             no more than {AUTH_TOKEN_MAX_LEN} characters in length."
+        ));
+    }
+    if !token.chars().all(|character| {
+        character.is_ascii_alphanumeric() || AUTH_TOKEN_SPECIAL_CHARACTERS.contains(&character)
+    }) {
+        return Some(format!(
+            "Invalid value for AuthToken: the password must be printable ASCII characters, and \
+             the only permitted printable special characters are {}.",
+            AUTH_TOKEN_SPECIAL_CHARACTERS
+                .iter()
+                .map(char::to_string)
+                .collect::<Vec<String>>()
+                .join(", ")
+        ));
+    }
+    None
+}
+
+/// The inclusive slot range a `Slots` string names, or the reason it names none.
+///
+/// "A string that specifies the keyspace for a particular node group. Keyspaces
+/// range from 0 to 16,383. The string is in the format `startkey-endkey`.
+/// Example: `"0-3999"`."
+pub fn slot_range(slots: &str) -> Result<(i32, i32), String> {
+    let refusal = || {
+        format!(
+            "Invalid value {slots} for Slots: a keyspace is written startkey-endkey, with both \
+             keys between 0 and {}.",
+            KEYSPACE_SLOTS - 1
+        )
+    };
+    let (start, end) = slots.split_once('-').ok_or_else(refusal)?;
+    let start: i32 = start.trim().parse().map_err(|_| refusal())?;
+    let end: i32 = end.trim().parse().map_err(|_| refusal())?;
+    if start < 0 || end < start || end >= KEYSPACE_SLOTS {
+        return Err(refusal());
+    }
+    Ok((start, end))
+}
+
+/// The keyspace of shard `index` of `num_node_groups` when the request named
+/// none: the 16,384 slots split as evenly as they divide, in order, the first
+/// shards taking the remainder, so the shards together cover the whole keyspace
+/// exactly once.
+pub fn default_slots(num_node_groups: i32, index: i32) -> String {
+    let total = i64::from(KEYSPACE_SLOTS);
+    let shards = i64::from(num_node_groups.max(1));
+    let index = i64::from(index);
+    let size = total / shards;
+    let remainder = total % shards;
+    // Each shard before this one took `size` slots, plus one more while the
+    // remainder lasted.
+    let start = index * size + index.min(remainder);
+    let end = start + size + i64::from(index < remainder) - 1;
+    format!("{start}-{end}")
+}
+
+/// The id ElastiCache gives the `member_ordinal`-th member cluster (1-based) of
+/// the node group (shard) `node_group_id` names.
+///
+/// A Valkey or Redis OSS (cluster mode disabled) group numbers its member
+/// clusters `<group>-001`, `<group>-002`, …; a cluster mode enabled group names
+/// the shard too, `<group>-0001-001`. Both are derived from the group id and the
+/// shard's own id, so a member cluster is always resolvable from the group and
+/// the shard a caller knows.
+pub fn member_cluster_id(
+    replication_group_id: &str,
+    node_group_id: &str,
+    member_ordinal: usize,
+    cluster_enabled: bool,
+) -> String {
+    if cluster_enabled {
+        format!("{replication_group_id}-{node_group_id}-{member_ordinal:03}")
+    } else {
+        format!("{replication_group_id}-{member_ordinal:03}")
+    }
+}
+
+/// One member of a node group (shard), as this emulator persists it: which
+/// cluster and node it is, where it sits and which role it plays.
+#[derive(Debug, Clone)]
+pub struct NodeGroupMemberRecord {
+    pub cache_cluster_id: String,
+    pub cache_node_id: String,
+    pub availability_zone: Option<String>,
+    /// [`ROLE_PRIMARY`] or [`ROLE_REPLICA`].
+    pub current_role: String,
+}
+
+impl NodeGroupMemberRecord {
+    /// This member as the modelled `NodeGroupMember`.
+    ///
+    /// `ReadEndpoint` and `CurrentRole` are reported only for a cluster mode
+    /// DISABLED group: the model says of each that it "is only applicable for
+    /// Valkey or Redis OSS (cluster mode disabled)" groups, which are reached
+    /// per node rather than through a configuration endpoint.
+    pub fn to_modeled(
+        &self,
+        cluster_enabled: bool,
+        clusters: &BTreeMap<String, CacheClusterRecord>,
+    ) -> NodeGroupMember {
+        NodeGroupMember {
+            cache_cluster_id: Some(self.cache_cluster_id.clone()),
+            cache_node_id: Some(self.cache_node_id.clone()),
+            read_endpoint: if cluster_enabled {
+                None
+            } else {
+                self.read_endpoint(clusters)
+            },
+            preferred_availability_zone: self.availability_zone.clone(),
+            // Outposts are not modelled by this service; see
+            // `CacheClusterRecord::to_modeled`.
+            preferred_outpost_arn: None,
+            current_role: (!cluster_enabled).then(|| self.current_role.clone()),
+        }
+    }
+
+    /// The endpoint a client reads this member through: the endpoint of the one
+    /// cache node of its member cluster, read out of that cluster's record so
+    /// there is a single copy of it. It appears once the node is provisioned,
+    /// exactly as `DescribeCacheClusters` reports the node itself.
+    fn read_endpoint(&self, clusters: &BTreeMap<String, CacheClusterRecord>) -> Option<Endpoint> {
+        clusters
+            .get(&self.cache_cluster_id)?
+            .nodes
+            .iter()
+            .find(|node| node.cache_node_id == self.cache_node_id)?
+            .to_modeled()
+            .endpoint
+    }
+}
+
+/// One node group (shard) of a replication group, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct NodeGroupRecord {
+    /// "The identifier for the node group (shard). A Valkey or Redis OSS
+    /// (cluster mode disabled) replication group contains only 1 node group;
+    /// therefore, the node group ID is 0001."
+    pub node_group_id: String,
+    /// One of `NodeGroup$Status`'s values ("creating, available, modifying,
+    /// deleting").
+    pub status: String,
+    /// "The keyspace for this node group (shard)", reported for a cluster mode
+    /// enabled group, where the keyspace is partitioned across shards.
+    pub slots: Option<String>,
+    /// This shard's members, the primary first.
+    pub members: Vec<NodeGroupMemberRecord>,
+}
+
+impl NodeGroupRecord {
+    /// This shard as the modelled `NodeGroup`.
+    ///
+    /// `PrimaryEndpoint` / `ReaderEndpoint` are the cluster mode DISABLED
+    /// group's endpoints: a cluster mode enabled group is reached through the
+    /// group's `ConfigurationEndpoint` instead. The reader endpoint exists only
+    /// where there is a replica to read from.
+    pub fn to_modeled(
+        &self,
+        group: &ReplicationGroupRecord,
+        clusters: &BTreeMap<String, CacheClusterRecord>,
+    ) -> NodeGroup {
+        let per_node_endpoints = !group.cluster_enabled;
+        let has_replica = self.members.len() > 1;
+        NodeGroup {
+            node_group_id: Some(self.node_group_id.clone()),
+            status: Some(self.status.clone()),
+            primary_endpoint: per_node_endpoints.then(|| Endpoint {
+                address: Some(group.primary_endpoint_address()),
+                port: Some(group.port),
+            }),
+            reader_endpoint: (per_node_endpoints && has_replica).then(|| Endpoint {
+                address: Some(group.reader_endpoint_address()),
+                port: Some(group.port),
+            }),
+            slots: self.slots.clone(),
+            node_group_members: Some(
+                self.members
+                    .iter()
+                    .map(|member| member.to_modeled(group.cluster_enabled, clusters))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// One replication group, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct ReplicationGroupRecord {
+    pub replication_group_id: String,
+    pub description: String,
+    pub region: String,
+    pub arn: String,
+    pub engine: String,
+    pub engine_version: String,
+    pub cache_node_type: Option<String>,
+    /// One of `ReplicationGroup$Status`'s values ("creating, available,
+    /// modifying, deleting, create-failed, snapshotting").
+    pub status: String,
+    /// The status change the clock owes this group, if any.
+    pub pending_status: Option<PendingTransition>,
+    pub created_at: SystemTime,
+    /// The DNS label every endpoint of this group carries, minted once and
+    /// stored, so an endpoint is stable across reads.
+    pub dns_token: String,
+    pub port: i32,
+    /// `ClusterEnabled` — "whether its data can be partitioned across multiple
+    /// shards (API/CLI: node groups)".
+    pub cluster_enabled: bool,
+    /// One of `ClusterMode`'s values (`enabled | disabled | compatible`).
+    pub cluster_mode: String,
+    /// [`SETTING_ENABLED`] or [`SETTING_DISABLED`].
+    pub automatic_failover: String,
+    /// See [`ReplicationGroupRecord::automatic_failover`].
+    pub multi_az: String,
+    pub node_groups: Vec<NodeGroupRecord>,
+    pub preferred_maintenance_window: String,
+    pub cache_subnet_group_name: Option<String>,
+    pub cache_parameter_group_name: String,
+    pub snapshot_retention_limit: Option<i32>,
+    pub snapshot_window: Option<String>,
+    /// Whether an `AuthToken` was set; the token itself is a SECRET and is NOT
+    /// stored. See [`CacheClusterRecord::auth_token_enabled`].
+    pub auth_token_enabled: bool,
+    pub auth_token_last_modified: Option<SystemTime>,
+    pub transit_encryption_enabled: bool,
+    pub transit_encryption_mode: Option<String>,
+    pub at_rest_encryption_enabled: bool,
+    pub kms_key_id: Option<String>,
+    /// [`SETTING_ENABLED`] or [`SETTING_DISABLED`].
+    pub data_tiering: String,
+    pub auto_minor_version_upgrade: Option<bool>,
+    pub network_type: Option<String>,
+    pub ip_discovery: Option<String>,
+    pub user_group_ids: Vec<String>,
+    pub log_delivery_configurations: Vec<LogDeliveryRecord>,
+    /// One of `Durability`'s values (`default | async | sync | disabled`), as
+    /// the request set it.
+    pub durability: String,
+    /// One of `EffectiveDurability`'s values (`async | sync | disabled`): what
+    /// [`ReplicationGroupRecord::durability`] resolves to.
+    pub effective_durability: String,
+    /// The tags `CreateReplicationGroup` was given; see
+    /// [`CacheClusterRecord::tags`].
+    pub tags: Vec<(String, String)>,
+}
+
+impl ReplicationGroupRecord {
+    /// The primary endpoint address of a cluster mode disabled group: the
+    /// `master.` name a writer connects to.
+    fn primary_endpoint_address(&self) -> String {
+        format!(
+            "master.{}.{}.{}.cache.amazonaws.com",
+            self.replication_group_id, self.dns_token, self.region
+        )
+    }
+
+    /// The reader endpoint address of a cluster mode disabled group: the
+    /// `replica.` name a reader connects to.
+    fn reader_endpoint_address(&self) -> String {
+        format!(
+            "replica.{}.{}.{}.cache.amazonaws.com",
+            self.replication_group_id, self.dns_token, self.region
+        )
+    }
+
+    /// The configuration endpoint address of a cluster mode enabled group.
+    ///
+    /// `CacheCluster$ConfigurationEndpoint` documents the shape of the name —
+    /// "The configuration endpoint will always have `.cfg` in it" — which the
+    /// `clustercfg` label a sharded group's endpoint carries satisfies.
+    fn configuration_endpoint_address(&self) -> String {
+        format!(
+            "{}.{}.clustercfg.{}.cache.amazonaws.com",
+            self.replication_group_id, self.dns_token, self.region
+        )
+    }
+
+    /// What `StorageEncryptionType` reports: the kind of key the group's
+    /// at-rest encryption uses, derived from whether it is enabled at all and
+    /// whether the request named a KMS key.
+    pub fn storage_encryption_type(&self) -> &'static str {
+        if !self.at_rest_encryption_enabled {
+            STORAGE_ENCRYPTION_NONE
+        } else if self.kms_key_id.is_some() {
+            STORAGE_ENCRYPTION_SSE_KMS
+        } else {
+            STORAGE_ENCRYPTION_SSE_ELASTICACHE
+        }
+    }
+
+    /// "The names of all the cache clusters that are part of this replication
+    /// group", derived from the shards rather than held a second time.
+    pub fn member_clusters(&self) -> Vec<String> {
+        let mut members: Vec<String> = self
+            .node_groups
+            .iter()
+            .flat_map(|shard| shard.members.iter())
+            .map(|member| member.cache_cluster_id.clone())
+            .collect();
+        members.sort();
+        members.dedup();
+        members
+    }
+
+    /// Materialise the status change the clock owes this group, if `now` is
+    /// past its due instant. See [`CacheClusterRecord::settle`]: this is the one
+    /// write a reporting operation may make.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(pending) = self.pending_status.as_ref() else {
+            return;
+        };
+        if now < pending.due {
+            return;
+        }
+        self.status = pending.status.clone();
+        self.pending_status = None;
+        for shard in &mut self.node_groups {
+            shard.status = self.status.clone();
+        }
+    }
+
+    /// This record as the modelled `ReplicationGroup`.
+    ///
+    /// `clusters` is the store's cluster map, which the members' read endpoints
+    /// are read out of: a member cluster's endpoint is held once, on the cluster.
+    pub fn to_modeled(
+        &self,
+        clusters: &BTreeMap<String, CacheClusterRecord>,
+    ) -> ReplicationGroup {
+        ReplicationGroup {
+            replication_group_id: Some(self.replication_group_id.clone()),
+            description: Some(self.description.clone()),
+            // A Global datastore cannot exist here: every
+            // global-replication-group operation is a scaffolded 501, so
+            // `CreateReplicationGroup` refuses a `GlobalReplicationGroupId`
+            // with the modelled not-found.
+            global_replication_group_info: None,
+            status: Some(self.status.clone()),
+            // Nothing can be pending on a group this operation created:
+            // `ModifyReplicationGroup` and the resharding and replica-count
+            // operations are scaffolded 501s, and each owns its own issue.
+            pending_modified_values: None,
+            member_clusters: Some(self.member_clusters()),
+            node_groups: Some(
+                self.node_groups
+                    .iter()
+                    .map(|shard| shard.to_modeled(self, clusters))
+                    .collect(),
+            ),
+            // The daily snapshot source: `CreateSnapshot` is a scaffolded 501,
+            // so no member is snapshotting.
+            snapshotting_cluster_id: None,
+            automatic_failover: Some(self.automatic_failover.clone()),
+            multi_az: Some(self.multi_az.clone()),
+            // "Use the configuration endpoint to connect to this replication
+            // group": the sharded group's one endpoint. A cluster mode disabled
+            // group is reached through its shard's primary and reader
+            // endpoints instead.
+            configuration_endpoint: self.cluster_enabled.then(|| Endpoint {
+                address: Some(self.configuration_endpoint_address()),
+                port: Some(self.port),
+            }),
+            snapshot_retention_limit: self.snapshot_retention_limit,
+            snapshot_window: self.snapshot_window.clone(),
+            cluster_enabled: Some(self.cluster_enabled),
+            cache_node_type: self.cache_node_type.clone(),
+            auth_token_enabled: Some(self.auth_token_enabled),
+            auth_token_last_modified_date: self
+                .auth_token_last_modified
+                .map(::aws_smithy_types::DateTime::from),
+            transit_encryption_enabled: Some(self.transit_encryption_enabled),
+            at_rest_encryption_enabled: Some(self.at_rest_encryption_enabled),
+            // Outposts are not modelled by this service.
+            member_clusters_outpost_arns: None,
+            kms_key_id: self.kms_key_id.clone(),
+            storage_encryption_type: Some(self.storage_encryption_type().to_string()),
+            arn: Some(self.arn.clone()),
+            user_group_ids: (!self.user_group_ids.is_empty())
+                .then(|| self.user_group_ids.clone()),
+            log_delivery_configurations: (!self.log_delivery_configurations.is_empty()).then(|| {
+                self.log_delivery_configurations
+                    .iter()
+                    .map(LogDeliveryRecord::to_modeled)
+                    .collect()
+            }),
+            replication_group_create_time: Some(::aws_smithy_types::DateTime::from(
+                self.created_at,
+            )),
+            data_tiering: Some(self.data_tiering.clone()),
+            auto_minor_version_upgrade: self.auto_minor_version_upgrade,
+            network_type: self.network_type.clone(),
+            ip_discovery: self.ip_discovery.clone(),
+            transit_encryption_mode: self.transit_encryption_mode.clone(),
+            cluster_mode: Some(self.cluster_mode.clone()),
+            engine: Some(self.engine.clone()),
+            durability: Some(self.durability.clone()),
+            effective_durability: Some(self.effective_durability.clone()),
+        }
+    }
+}
+
+/// One member cluster a new replication group is to have: the cluster id, the
+/// zone it is placed in, and whether it is an EXISTING cluster being adopted as
+/// the group's primary (the `PrimaryClusterId` path) rather than minted.
+#[derive(Debug, Clone)]
+pub struct NewMember {
+    pub cache_cluster_id: String,
+    pub availability_zone: Option<String>,
+    pub adopt: bool,
+}
+
+/// One node group (shard) a new replication group is to have.
+#[derive(Debug, Clone)]
+pub struct NewShard {
+    pub node_group_id: String,
+    pub slots: Option<String>,
+    /// The shard's members, the primary first.
+    pub members: Vec<NewMember>,
+}
+
+/// The validated values a new replication group is built from — one argument so
+/// [`ComAmazonawsElasticacheAmazonelasticachev9State::insert_replication_group`]
+/// does not take three dozen positional ones.
+#[derive(Debug, Clone)]
+pub struct NewReplicationGroup {
+    pub replication_group_id: String,
+    pub description: String,
+    pub region: String,
+    pub engine: String,
+    pub engine_version: String,
+    pub cache_node_type: Option<String>,
+    pub port: i32,
+    pub cluster_enabled: bool,
+    pub cluster_mode: String,
+    pub automatic_failover: bool,
+    pub multi_az: bool,
+    pub shards: Vec<NewShard>,
+    pub preferred_maintenance_window: String,
+    pub cache_subnet_group_name: Option<String>,
+    pub cache_parameter_group_name: String,
+    pub snapshot_retention_limit: Option<i32>,
+    pub snapshot_window: Option<String>,
+    pub auth_token_enabled: bool,
+    pub transit_encryption_enabled: bool,
+    pub transit_encryption_mode: Option<String>,
+    pub at_rest_encryption_enabled: bool,
+    pub kms_key_id: Option<String>,
+    pub data_tiering: bool,
+    pub auto_minor_version_upgrade: Option<bool>,
+    pub security_group_ids: Vec<String>,
+    pub notification_topic_arn: Option<String>,
+    pub network_type: Option<String>,
+    pub ip_discovery: Option<String>,
+    pub user_group_ids: Vec<String>,
+    pub log_delivery_configurations: Vec<LogDeliveryRecord>,
+    pub durability: String,
+    pub effective_durability: String,
+    pub tags: Vec<(String, String)>,
+    pub now: SystemTime,
 }
 
 /// One subnet of a cache subnet group, as this emulator persists it.
@@ -3430,6 +4055,13 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// Every stored subnet group, keyed by its (lowercased) name, ordered for
     /// the same reason.
     pub cache_subnet_groups: BTreeMap<String, CacheSubnetGroupRecord>,
+    /// Every stored replication group, keyed by its (lowercased)
+    /// `ReplicationGroupId`, ordered for the same reason: it is what gives
+    /// `DescribeReplicationGroups` the stable total order its `Marker` indexes
+    /// into. A group's member clusters live in
+    /// [`Self::cache_clusters`] beside the standalone ones, so there is one copy
+    /// of each cluster however it was created.
+    pub replication_groups: BTreeMap<String, ReplicationGroupRecord>,
     /// Every cache parameter group, keyed by its (lowercased) name, ordered for
     /// the same reason. Unlike the maps above this one is SEEDED when the store
     /// is created, with the default group of every published family (see
@@ -3495,6 +4127,7 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
         Self {
             cache_clusters: BTreeMap::new(),
             cache_subnet_groups: BTreeMap::new(),
+            replication_groups: BTreeMap::new(),
             serverless_caches: BTreeMap::new(),
             cache_parameter_groups: default_parameter_groups(),
             snapshots: BTreeMap::new(),
@@ -3634,7 +4267,8 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             az_mode: new.az_mode,
             preferred_maintenance_window: new.preferred_maintenance_window,
             cache_subnet_group_name: new.cache_subnet_group_name,
-            replication_group_id: None,
+            replication_group_id: new.replication_group_id,
+            replication_group_log_delivery_enabled: new.replication_group_log_delivery_enabled,
             cache_parameter_group_name: new.cache_parameter_group_name,
             snapshot_retention_limit: new.snapshot_retention_limit,
             snapshot_window: new.snapshot_window,
@@ -3644,6 +4278,8 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             auth_token_enabled: new.auth_token_enabled,
             auth_token_last_modified: new.auth_token_enabled.then_some(new.now),
             transit_encryption_enabled: new.transit_encryption_enabled,
+            transit_encryption_mode: new.transit_encryption_mode,
+            at_rest_encryption_enabled: new.at_rest_encryption_enabled,
             network_type: new.network_type,
             ip_discovery: new.ip_discovery,
             log_delivery_configurations: new.log_delivery_configurations,
@@ -3750,6 +4386,9 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         for cluster in self.cache_clusters.values_mut() {
             cluster.settle(now);
         }
+        for group in self.replication_groups.values_mut() {
+            group.settle(now);
+        }
         for cache in self.serverless_caches.values_mut() {
             cache.settle(now);
         }
@@ -3759,6 +4398,158 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         for reservation in self.reserved_cache_nodes.values_mut() {
             reservation.settle(now);
         }
+    }
+
+    /// Build and store a replication group and the member clusters it is made
+    /// of; the caller reads it back with [`Self::modeled_replication_group`].
+    ///
+    /// Every member cluster is a real cluster record in [`Self::cache_clusters`]
+    /// — minted here, or, for the `PrimaryClusterId` path, the existing cluster
+    /// joined to the group — so `DescribeCacheClusters` reports exactly the
+    /// clusters the group is made of.
+    pub fn insert_replication_group(&mut self, new: NewReplicationGroup) {
+        let dns_token = self.mint_dns_token();
+        let log_delivery_enabled = !new.log_delivery_configurations.is_empty();
+        let mut node_groups = Vec::with_capacity(new.shards.len());
+        for shard in &new.shards {
+            let mut members = Vec::with_capacity(shard.members.len());
+            for (index, member) in shard.members.iter().enumerate() {
+                if member.adopt {
+                    // The cluster the request named as the group's primary: it
+                    // keeps its own configuration and joins the group.
+                    if let Some(cluster) = self.cache_clusters.get_mut(&member.cache_cluster_id) {
+                        cluster.replication_group_id = Some(new.replication_group_id.clone());
+                        cluster.replication_group_log_delivery_enabled =
+                            Some(log_delivery_enabled);
+                    }
+                } else {
+                    let _ = self.insert_cluster(NewCluster {
+                        cache_cluster_id: member.cache_cluster_id.clone(),
+                        region: new.region.clone(),
+                        engine: new.engine.clone(),
+                        engine_version: new.engine_version.clone(),
+                        cache_node_type: new.cache_node_type.clone(),
+                        // A Valkey / Redis OSS cluster holds exactly one node;
+                        // a shard's replicas are further member CLUSTERS, not
+                        // further nodes of one.
+                        num_cache_nodes: REDIS_NUM_CACHE_NODES,
+                        port: new.port,
+                        availability_zones: member
+                            .availability_zone
+                            .clone()
+                            .into_iter()
+                            .collect(),
+                        az_mode: None,
+                        preferred_maintenance_window: new.preferred_maintenance_window.clone(),
+                        cache_subnet_group_name: new.cache_subnet_group_name.clone(),
+                        cache_parameter_group_name: new.cache_parameter_group_name.clone(),
+                        snapshot_retention_limit: new.snapshot_retention_limit,
+                        snapshot_window: new.snapshot_window.clone(),
+                        auto_minor_version_upgrade: new.auto_minor_version_upgrade,
+                        security_group_ids: new.security_group_ids.clone(),
+                        notification_topic_arn: new.notification_topic_arn.clone(),
+                        auth_token_enabled: new.auth_token_enabled,
+                        transit_encryption_enabled: Some(new.transit_encryption_enabled),
+                        transit_encryption_mode: new.transit_encryption_mode.clone(),
+                        at_rest_encryption_enabled: Some(new.at_rest_encryption_enabled),
+                        network_type: new.network_type.clone(),
+                        ip_discovery: new.ip_discovery.clone(),
+                        log_delivery_configurations: new.log_delivery_configurations.clone(),
+                        // ElastiCache tags a replication group's member
+                        // clusters with the group's tags, so a later
+                        // `ListTagsForResource` on a member answers them.
+                        tags: new.tags.clone(),
+                        now: new.now,
+                        replication_group_id: Some(new.replication_group_id.clone()),
+                        replication_group_log_delivery_enabled: Some(log_delivery_enabled),
+                    });
+                }
+                members.push(NodeGroupMemberRecord {
+                    cache_cluster_id: member.cache_cluster_id.clone(),
+                    cache_node_id: FIRST_CACHE_NODE_ID.to_string(),
+                    availability_zone: member.availability_zone.clone(),
+                    current_role: if index == 0 { ROLE_PRIMARY } else { ROLE_REPLICA }.to_string(),
+                });
+            }
+            node_groups.push(NodeGroupRecord {
+                node_group_id: shard.node_group_id.clone(),
+                status: STATUS_CREATING.to_string(),
+                slots: shard.slots.clone(),
+                members,
+            });
+        }
+
+        let record = ReplicationGroupRecord {
+            arn: replication_group_arn(&new.region, &new.replication_group_id),
+            replication_group_id: new.replication_group_id.clone(),
+            description: new.description,
+            region: new.region,
+            engine: new.engine,
+            engine_version: new.engine_version,
+            cache_node_type: new.cache_node_type,
+            // A created group is NOT ready: it answers `creating`, and the
+            // clock owes it `available` once the transition span has passed.
+            status: STATUS_CREATING.to_string(),
+            pending_status: Some(PendingTransition {
+                due: new.now + CLUSTER_TRANSITION,
+                status: STATUS_AVAILABLE.to_string(),
+            }),
+            created_at: new.now,
+            dns_token,
+            port: new.port,
+            cluster_enabled: new.cluster_enabled,
+            cluster_mode: new.cluster_mode,
+            automatic_failover: if new.automatic_failover {
+                SETTING_ENABLED
+            } else {
+                SETTING_DISABLED
+            }
+            .to_string(),
+            multi_az: if new.multi_az {
+                SETTING_ENABLED
+            } else {
+                SETTING_DISABLED
+            }
+            .to_string(),
+            node_groups,
+            preferred_maintenance_window: new.preferred_maintenance_window,
+            cache_subnet_group_name: new.cache_subnet_group_name,
+            cache_parameter_group_name: new.cache_parameter_group_name,
+            snapshot_retention_limit: new.snapshot_retention_limit,
+            snapshot_window: new.snapshot_window,
+            auth_token_enabled: new.auth_token_enabled,
+            auth_token_last_modified: new.auth_token_enabled.then_some(new.now),
+            transit_encryption_enabled: new.transit_encryption_enabled,
+            transit_encryption_mode: new.transit_encryption_mode,
+            at_rest_encryption_enabled: new.at_rest_encryption_enabled,
+            kms_key_id: new.kms_key_id,
+            data_tiering: if new.data_tiering {
+                SETTING_ENABLED
+            } else {
+                SETTING_DISABLED
+            }
+            .to_string(),
+            auto_minor_version_upgrade: new.auto_minor_version_upgrade,
+            network_type: new.network_type,
+            ip_discovery: new.ip_discovery,
+            user_group_ids: new.user_group_ids,
+            log_delivery_configurations: new.log_delivery_configurations,
+            durability: new.durability,
+            effective_durability: new.effective_durability,
+            tags: new.tags,
+        };
+        self.replication_groups
+            .insert(new.replication_group_id.clone(), record);
+    }
+
+    /// The stored replication group `id` names, as the modelled shape — built
+    /// from what the store holds rather than from a copy beside it.
+    pub fn modeled_replication_group(&self, id: &str) -> Option<ReplicationGroup> {
+        Some(
+            self.replication_groups
+                .get(id)?
+                .to_modeled(&self.cache_clusters),
+        )
     }
 }
 
@@ -3786,11 +4577,20 @@ pub struct NewCluster {
     pub notification_topic_arn: Option<String>,
     pub auth_token_enabled: bool,
     pub transit_encryption_enabled: Option<bool>,
+    /// See [`CacheClusterRecord::transit_encryption_mode`].
+    pub transit_encryption_mode: Option<String>,
+    /// See [`CacheClusterRecord::at_rest_encryption_enabled`].
+    pub at_rest_encryption_enabled: Option<bool>,
     pub network_type: Option<String>,
     pub ip_discovery: Option<String>,
     pub log_delivery_configurations: Vec<LogDeliveryRecord>,
     pub tags: Vec<(String, String)>,
     pub now: SystemTime,
+    /// The replication group this cluster is a member of, if any; see
+    /// [`CacheClusterRecord::replication_group_id`].
+    pub replication_group_id: Option<String>,
+    /// See [`CacheClusterRecord::replication_group_log_delivery_enabled`].
+    pub replication_group_log_delivery_enabled: Option<bool>,
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

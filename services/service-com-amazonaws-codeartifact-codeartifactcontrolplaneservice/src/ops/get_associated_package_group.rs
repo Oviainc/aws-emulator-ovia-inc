@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAssociatedPackageGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAssociatedPackageGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAssociatedPackageGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves the package group most closely associated with a package, WITHOUT requiring
+//! the package to exist anywhere in the domain: the package's
+//! `/<format>[/<namespace>]/<name>` path is matched against the domain's package group
+//! patterns and the most specific match is reported. A pure read — nothing is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -170,20 +166,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAssociatedPackageGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAssociatedPackageGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAssociatedPackageGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetAssociatedPackageGroupErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the CodeArtifact store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let store = state.lock();
+        let Some(domain) = store.domain(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(
+                GetAssociatedPackageGroupErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Domain not found. Domain '{}' owned by account '{}' does not exist.",
+                            input.domain,
+                            input
+                                .domain_owner
+                                .as_deref()
+                                .unwrap_or(::engine::emulator_account_id())
+                        ),
+                        resource_id: Some(input.domain.clone()),
+                        resource_type: Some("domain".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A package of a format whose versions carry a namespace component cannot be
+        // addressed without one, so the request is refused as the bad request it is.
+        // Checked AFTER the domain is resolved, so an unresolvable resource dominates a
+        // bad member the way the sibling handlers order the two.
+        if crate::state::NAMESPACE_REQUIRED_FORMATS.contains(&input.format.as_str())
+            && input.namespace.is_none()
+        {
+            return Err(GetAssociatedPackageGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "namespace is required for packages of format {}.",
+                        input.format
+                    ),
+                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The package itself need not exist in any repository: what is resolved is the
+        // PATH the package would have, against the patterns the domain holds.
+        let path = crate::state::package_path(
+            &input.format,
+            input.namespace.as_deref(),
+            &input.package,
+        );
+        // Unreachable while the domain holds its root group `/*`, whose pattern matches
+        // every package path — which is how a domain is created. Kept as the modelled
+        // error rather than an unwrap, so a change that lets a domain exist without its
+        // root group answers a client with "nothing to report" instead of panicking.
+        let Some(group_pattern) = domain
+            .associated_package_group(&path)
+            .map(|group| group.pattern.clone())
+        else {
+            return Err(
+                GetAssociatedPackageGroupErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "No package group in domain '{}' is associated with '{path}'.",
+                            domain.name
+                        ),
+                        resource_id: Some(path.clone()),
+                        resource_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // STRONG is the exact match and WEAK the relative one: the association is exact
+        // where the matched pattern names this package's own format, namespace and name,
+        // and relative where it matched only part of one of those components.
+        let association_type = if crate::state::match_is_exact(&group_pattern, &path) {
+            crate::state::ASSOCIATION_TYPE_STRONG
+        } else {
+            crate::state::ASSOCIATION_TYPE_WEAK
+        };
+
+        // Projected through the same reader `DescribePackageGroup` uses, so the group
+        // this answer reports — its parent and its effective origin restrictions — is
+        // resolved against the hierarchy the domain holds at this call.
+        let Some(description) = domain.package_group_description(&group_pattern) else {
+            return Err(
+                GetAssociatedPackageGroupErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!(
+                            "package group '{group_pattern}' matched '{path}' but cannot be read back"
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetAssociatedPackageGroupOutput {
+            package_group: Some(description),
+            association_type: Some(association_type.to_string()),
+        })
     }
 }

@@ -30,9 +30,8 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::domain_repository_lifecycle::{
-    call, create_domain, create_repository, emulator, Answer, ACCOUNT, REGION,
-};
+use crate::domain_repository_lifecycle::create_repository;
+use crate::harness::{call, create_domain, emulator, Answer, ACCOUNT, REGION};
 
 /// `PolicyDocument` is modelled `len 1..7168, pattern ^[\P{C}\s]+$`
 /// (`smithy_query(query="operation", operation="PutRepositoryPermissionsPolicy")`), so a

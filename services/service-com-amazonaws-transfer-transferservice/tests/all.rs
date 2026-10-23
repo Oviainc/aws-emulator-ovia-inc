@@ -81,3 +81,10 @@ mod web_app_listing;
 mod workflow_execution_listing;
 #[path = "all/workflow_lifecycle.rs"]
 mod workflow_lifecycle;
+// `connector_deletion` is declared HERE rather than in its alphabetical place beside the
+// other `connector_*` suites, for the reason the `workflow_step_contract` note above
+// records: the sorted list is where every concurrent change inserts, so those are the
+// lines a concurrent change also edits, and this declaration kept colliding with a
+// neighbouring insertion. Fold it into the list once the churn settles.
+#[path = "all/connector_deletion.rs"]
+mod connector_deletion;

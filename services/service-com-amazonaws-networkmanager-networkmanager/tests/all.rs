@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/global_network_lifecycle.rs"]
 mod global_network_lifecycle;
+#[path = "all/link_lifecycle.rs"]
+mod link_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

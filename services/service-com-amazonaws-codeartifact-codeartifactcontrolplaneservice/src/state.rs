@@ -106,6 +106,14 @@ pub const MAX_REPOSITORIES_PER_DOMAIN: usize = 1_000;
 /// boundary validator cannot cap it and `CreateRepository` must.
 pub const MAX_UPSTREAMS_PER_REPOSITORY: usize = 10;
 
+/// The `associationType` of a package whose associated group's pattern names the
+/// package's own path components (an "exact" match).
+pub const ASSOCIATION_TYPE_STRONG: &str = "STRONG";
+
+/// The `associationType` of a package that matched part of a component of its group's
+/// pattern (a "relative" match) rather than whole components of it.
+pub const ASSOCIATION_TYPE_WEAK: &str = "WEAK";
+
 /// Maximum packages one repository holds.
 ///
 /// Unlike the three bounds above this one is NOT a published CodeArtifact quota — AWS
@@ -349,6 +357,25 @@ impl Domain {
     /// that overflowed it would otherwise report a negative number of repositories.
     fn repository_count(&self) -> i32 {
         i32::try_from(self.repositories.len()).unwrap_or(i32::MAX)
+    }
+
+    /// The package group most closely associated with the package `path`
+    /// ([`package_path`]): of the groups whose pattern matches that path, the MOST
+    /// SPECIFIC one — the one matching on the longest literal, with an exact pattern
+    /// beating a relative pattern that matches the same literal.
+    ///
+    /// This is the ASSOCIATION question (`GetAssociatedPackageGroup`), which compares a
+    /// pattern against a package path character by character, so a pattern naming part
+    /// of a component still matches; [`Domain::package_group_parent`] answers the
+    /// HIERARCHY question between two patterns, which compares whole components.
+    ///
+    /// Never `None` for a domain that holds its root group, whose pattern matches every
+    /// package.
+    pub fn associated_package_group(&self, path: &str) -> Option<&PackageGroup> {
+        self.package_groups
+            .values()
+            .filter(|group| pattern_matches(&group.pattern, path))
+            .max_by_key(|group| pattern_specificity(&group.pattern))
     }
 
     /// `assetSizeBytes`: the total size of every asset the domain's repositories hold.
@@ -611,6 +638,94 @@ fn covers_strictly(pattern: &str, path: &[&str]) -> bool {
     let ancestor = covered_path(pattern);
     ancestor.len() < path.len() && path.starts_with(&ancestor)
 }
+
+/// Split a package group pattern into the literal it matches a PACKAGE PATH on, and
+/// whether that match is EXACT.
+///
+/// This is the association reading of a pattern (`GetAssociatedPackageGroup`), beside
+/// [`covered_path`]'s hierarchy reading of the same string: a package path is matched
+/// character by character, so a pattern naming part of a component still matches it.
+///
+/// A pattern ends in the terminator that decides how it matches (see "Package group
+/// definition syntax and matching behavior" in the CodeArtifact User Guide): `$` matches
+/// that one package path and nothing under it — an exact match — while `*` and `~` match
+/// every package path beginning with the literal before them. A pattern carrying no
+/// terminator names a single path, so it is read as exact.
+fn pattern_body(pattern: &str) -> (&str, bool) {
+    if let Some(body) = pattern.strip_suffix('$') {
+        (body, true)
+    } else if let Some(body) = pattern
+        .strip_suffix('*')
+        .or_else(|| pattern.strip_suffix('~'))
+    {
+        (body, false)
+    } else {
+        (pattern, true)
+    }
+}
+
+/// Does `pattern` match the package `path` ([`package_path`])?
+fn pattern_matches(pattern: &str, path: &str) -> bool {
+    let (body, exact) = pattern_body(pattern);
+    if exact {
+        path == body
+    } else {
+        path.starts_with(body)
+    }
+}
+
+/// Is `pattern`'s match of `path` an EXACT match — the one reported as
+/// [`ASSOCIATION_TYPE_STRONG`] — rather than a RELATIVE one
+/// ([`ASSOCIATION_TYPE_WEAK`])?
+///
+/// A package path is a sequence of `/`-separated components (the format, the optional
+/// namespace, the name). The match is exact when the pattern's literal covers whole
+/// components of the path — it is the entire path, or it stops where a component ends —
+/// because the group then names the package's own format, namespace and name. It is
+/// relative when the literal stops INSIDE a component, which is a prefix match on a
+/// namespace or a name (what a `~`-terminated pattern does for a sub-namespace): the
+/// group names something the package is only relative to.
+pub fn match_is_exact(pattern: &str, path: &str) -> bool {
+    let (body, exact) = pattern_body(pattern);
+    if exact {
+        return path == body;
+    }
+    match path.strip_prefix(body) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/') || body.ends_with('/'),
+        None => false,
+    }
+}
+
+/// How specific `pattern` is, for picking the most closely associated group: the length
+/// of the literal it matches on, and — between two patterns matching the same literal —
+/// the exact one, which matches strictly fewer packages.
+///
+/// Two patterns can still tie: `/npm/*` and `/npm/~` match the same literal the same
+/// way, so they are EQUIVALENT as matchers and which one is reported is decided by the
+/// group map's key order, not by a rule of the service. Nothing below depends on which
+/// of two equivalent patterns wins; a caller that wants one to win creates the more
+/// specific pattern.
+fn pattern_specificity(pattern: &str) -> (usize, bool) {
+    let (body, exact) = pattern_body(pattern);
+    (body.len(), exact)
+}
+
+/// The path a package is matched against a package group pattern on:
+/// `/<format>/<namespace>/<name>`, with the namespace segment omitted for a package that
+/// has none (the formats whose versions carry no namespace component).
+pub fn package_path(format: &str, namespace: Option<&str>, package: &str) -> String {
+    match namespace {
+        Some(namespace) => format!("/{format}/{namespace}/{package}"),
+        None => format!("/{format}/{package}"),
+    }
+}
+
+/// The package formats whose packages are addressed WITH a namespace, so an operation
+/// that resolves a package by format must be given one: a Maven package's namespace is
+/// its `groupId`, a Swift package's is its scope, and a generic package's is its
+/// namespace (`GetAssociatedPackageGroup`'s own `namespace` doc). The remaining formats'
+/// versions carry no corresponding component.
+pub const NAMESPACE_REQUIRED_FORMATS: &[&str] = &["generic", "maven", "swift"];
 
 /// A stored repository inside a domain.
 ///

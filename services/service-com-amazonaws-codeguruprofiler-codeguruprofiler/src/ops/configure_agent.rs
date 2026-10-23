@@ -209,7 +209,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.profiling_group_name)
             .ok_or_else(|| {
                 ConfigureAgentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: crate::state::group_not_found_message(&input.profiling_group_name),
+                    // The agent plane words a missing group its own way: account-qualified,
+                    // unlike every other operation's text.
+                    message: crate::state::agent_group_not_found_message(
+                        &input.profiling_group_name,
+                    ),
                 })
             })?;
 

@@ -15,6 +15,8 @@
 mod dashboard_lifecycle;
 #[path = "all/emulator.rs"]
 mod emulator;
+#[path = "all/event_data_store_reads.rs"]
+mod event_data_store_reads;
 #[path = "all/lake_queries.rs"]
 mod lake_queries;
 #[path = "all/state_roundtrip.rs"]

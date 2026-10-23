@@ -30,9 +30,8 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::domain_repository_lifecycle::{
-    call, create_domain, create_repository, emulator, Answer,
-};
+use crate::domain_repository_lifecycle::create_repository;
+use crate::harness::{call, create_domain, emulator, Answer};
 
 /// One package to put into a repository: the triple that identifies it plus the origin
 /// restrictions to set on it.

@@ -514,9 +514,54 @@ pub struct ComAmazonawsSwfSimpleworkflowserviceState {
     pub domains: HashMap<String, Domain>,
 }
 
+impl ComAmazonawsSwfSimpleworkflowserviceState {
+    /// The domain a `resourceArn` addresses: the stored domain whose own ARN is
+    /// exactly this one.
+    ///
+    /// Comparing the WHOLE ARN, not just the name parsed out of it, is what scopes the
+    /// lookup to the resource's region and account — `UnknownResourceFault` is
+    /// documented as "Returned when the named resource cannot be found with in the
+    /// scope of this operation (region or domain)" — so one region's ARN never
+    /// resolves to a same-named domain registered in another.
+    pub fn domain_by_arn(&self, arn: &str) -> Option<&Domain> {
+        let name = domain_name_from_arn(arn)?;
+        self.domains.get(name).filter(|domain| domain.arn == arn)
+    }
+}
+
+/// The resource portion of a domain ARN, before the domain's own name. SWF's domain
+/// ARNs are the slash-prefixed form the service's own `domainInfo.arn` carries.
+pub const DOMAIN_RESOURCE_PREFIX: &str = "/domain/";
+
 /// The ARN of a domain: `arn:aws:swf:<region>:<account>:/domain/<name>`.
 pub fn domain_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("/domain/{name}"))
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{DOMAIN_RESOURCE_PREFIX}{name}"),
+    )
+}
+
+/// The domain name a `resourceArn` addresses, or `None` when the string is not a
+/// domain ARN of this service.
+///
+/// The inverse of [`domain_arn`]: the tagging operations take an ARN where every other
+/// operation takes a domain name, so they resolve the name back out of it. A domain
+/// name can contain neither `:` nor `/` ([`validate_name`]), so the segment after the
+/// resource prefix is the whole name.
+pub fn domain_name_from_arn(arn: &str) -> Option<&str> {
+    let mut segments = arn.splitn(6, ':');
+    let prefix = segments.next()?;
+    let _partition = segments.next()?;
+    let service = segments.next()?;
+    let _region = segments.next()?;
+    let _account = segments.next()?;
+    let resource = segments.next()?;
+    if prefix != "arn" || service != ARN_NAMESPACE {
+        return None;
+    }
+    let name = resource.strip_prefix(DOMAIN_RESOURCE_PREFIX)?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// The region this request was signed for, defaulting to [`DEFAULT_REGION`] when the

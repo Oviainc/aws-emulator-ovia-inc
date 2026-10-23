@@ -111,6 +111,24 @@
 //! caller name either. An Elastic IP address AWS hands back is usable at once — it has no
 //! non-terminal status — so no entry beside it records a clock-owed transition.
 //!
+//! ## VPC endpoint connections
+//!
+//! [`ComAmazonawsEc2Amazonec2State::vpc_endpoint_connections`] holds the connections to
+//! the account's OWN VPC endpoint services — "the VPC endpoint connections to your VPC
+//! endpoint services" (`DescribeVpcEndpointConnections`) — as the modelled
+//! [`VpcEndpointConnection`] shape itself, keyed by `VpcEndpointId` in a [`BTreeMap`], for
+//! the same reasons the VPC store holds [`Vpc`]s: one endpoint connects to exactly one
+//! service, so the endpoint id identifies the connection, every member a writer sets
+//! round-trips through the describe without a field-by-field copy, and the map's order is
+//! the one order the describe reports and pages over. A fresh account has created no
+//! endpoint service, so it has no connection either and the store starts empty.
+//! [`ComAmazonawsEc2Amazonec2State::insert_vpc_endpoint_connection`] is the one way a
+//! connection is stored, so the id it carries and the bytes it charges cannot be minted two
+//! ways. A connection sits in `PendingAcceptance` until the SERVICE OWNER accepts or
+//! rejects it (`AcceptVpcEndpointConnections` / `RejectVpcEndpointConnections`), which is
+//! an action rather than an instant, so — unlike a `pending` VPC — nothing beside it
+//! records a clock-owed transition.
+//!
 //! ## AMIs: the published catalog, plus whatever a writer stores
 //!
 //! [`ComAmazonawsEc2Amazonec2State::images`] holds the AMIs the account can see as the
@@ -158,9 +176,10 @@ use crate::ops::types::{
     EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, INSTANCE_TYPE_VALUES, Image, Instance,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
     LaunchTemplate, Monitoring, OperatorResponse, Placement, PrivateDnsNameOptionsOnLaunch,
+    DnsEntry, PayerResponsibilityEntry,
     RequestLaunchTemplateData, RunInstancesOutput, SecurityGroup, StateReason, Subnet, Tag,
     TagSpecification,
-    UserIdGroupPair, Vpc, VpcCidrBlockAssociation, VpcCidrBlockState,
+    UserIdGroupPair, Vpc, VpcCidrBlockAssociation, VpcCidrBlockState, VpcEndpointConnection,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -832,6 +851,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Monotonic source of the Elastic IP addresses [`Self::mint_elastic_ip`] hands out,
     /// so one allocation can never be given an address another still holds.
     next_elastic_ip: u64,
+    /// Every connection to one of the account's own VPC endpoint services, by
+    /// `VpcEndpointId`, as the modelled [`VpcEndpointConnection`] shape itself — see the
+    /// module docs. Ordered by endpoint id, which is the order
+    /// `DescribeVpcEndpointConnections` reports and pages over.
+    pub vpc_endpoint_connections: BTreeMap<String, VpcEndpointConnection>,
 }
 
 /// A fresh account's EC2 state: the ambient network AWS gives it — the default VPC, that
@@ -864,6 +888,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             fast_launch_images: BTreeMap::new(),
             addresses: BTreeMap::new(),
             next_elastic_ip: 0,
+            vpc_endpoint_connections: BTreeMap::new(),
         };
         let default_vpc = state.insert_vpc(
             DEFAULT_VPC_CIDR_BLOCK,
@@ -4917,5 +4942,147 @@ pub fn address_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
 /// one border group.
 pub fn network_border_group_of_region(region: &str) -> String {
     region.to_string()
+}
+
+// =============================================================================
+// VPC endpoint connections
+// =============================================================================
+
+/// The id prefix a stored VPC endpoint connection is minted with.
+///
+/// The model publishes no pattern for `VpcEndpointConnection$VpcEndpointConnectionId` (it
+/// is a plain `String` — `smithy_query(query="shape",shape="VpcEndpointConnection")`), so
+/// the id takes EC2's own `<prefix>-<hex>` form through [`ComAmazonawsEc2Amazonec2State::next_id`],
+/// with a prefix naming the resource. It is minted by the store and never taken from a
+/// request.
+pub const VPC_ENDPOINT_CONNECTION_ID_PREFIX: &str = "vpce-conn";
+
+/// Every state a VPC endpoint connection can be in, as the `vpc-endpoint-state` FILTER
+/// spells it paired with the member of the model's `State` enum that names the same state.
+///
+/// Two sources spell one state two ways, and both are part of the contract: the filter
+/// documents "`vpc-endpoint-state` - The state of the endpoint (`pendingAcceptance` |
+/// `pending` | `available` | `deleting` | `deleted` | `rejected` | `failed`)"
+/// (`DescribeVpcEndpointConnectionsRequest$Filters`), while `VpcEndpointConnection$VpcEndpointState`
+/// targets the `State` enum, whose values are `PendingAcceptance`, `Pending`, `Available`,
+/// `Deleting`, `Deleted`, `Rejected`, `Failed`, `Expired` and `Partial`
+/// (`crate::ops::types::STATE_VALUES`). A stored connection therefore carries the MODELLED
+/// value, and this table is what lets the documented filter value select it. `Expired` and
+/// `Partial` are states of other resources the enum also serves — the filter documents no
+/// value for either — so they are not here.
+pub const VPC_ENDPOINT_STATE_FILTER_VALUES: [(&str, &str); 7] = [
+    ("pendingAcceptance", "PendingAcceptance"),
+    ("pending", "Pending"),
+    ("available", "Available"),
+    ("deleting", "Deleting"),
+    ("deleted", "Deleted"),
+    ("rejected", "Rejected"),
+    ("failed", "Failed"),
+];
+
+/// A connection whose endpoint is waiting for the service owner to accept it: the `State`
+/// enum's `PendingAcceptance` member, which is the state an endpoint to a service with
+/// `AcceptanceRequired` enters.
+pub const VPC_ENDPOINT_STATE_PENDING_ACCEPTANCE: &str = "PendingAcceptance";
+
+/// A connection whose endpoint is in service: the `State` enum's `Available` member.
+pub const VPC_ENDPOINT_STATE_AVAILABLE: &str = "Available";
+
+/// What one stored VPC endpoint connection is created with, beside the connection id the
+/// store mints itself.
+///
+/// The spec of the resource, in the same shape [`SubnetSpec`] has for a subnet: an
+/// operation that creates an endpoint to one of the account's services fills this in and
+/// [`ComAmazonawsEc2Amazonec2State::insert_vpc_endpoint_connection`] turns it into the
+/// modelled [`VpcEndpointConnection`] the describe reports, so the id, the stored key and
+/// the byte charge are decided in exactly one place.
+#[derive(Debug, Clone)]
+pub struct VpcEndpointConnectionSpec {
+    /// The service the endpoint is connected to (`VpcEndpointConnection$ServiceId`).
+    pub service_id: String,
+    /// The endpoint itself, which is also the key the connection is stored under.
+    pub vpc_endpoint_id: String,
+    /// The account that owns the endpoint (`VpcEndpointConnection$VpcEndpointOwner`).
+    pub vpc_endpoint_owner: String,
+    /// The endpoint's state, as the model's `State` enum spells it — see
+    /// [`VPC_ENDPOINT_STATE_FILTER_VALUES`].
+    pub vpc_endpoint_state: String,
+    /// When the endpoint was created.
+    pub creation_timestamp: SystemTime,
+    /// "The Region of the endpoint" (`VpcEndpointConnection$VpcEndpointRegion`).
+    pub vpc_endpoint_region: String,
+    /// "The IP address type for the endpoint" (`VpcEndpointConnection$IpAddressType`), or
+    /// `None` for an endpoint whose type carries none.
+    pub ip_address_type: Option<String>,
+    /// The DNS entries for the endpoint.
+    pub dns_entries: Vec<DnsEntry>,
+    /// The Network Load Balancers behind the service.
+    pub network_load_balancer_arns: Vec<String>,
+    /// The Gateway Load Balancers behind the service.
+    pub gateway_load_balancer_arns: Vec<String>,
+    /// The payer responsibility settings for the endpoint.
+    pub payer_responsibilities: Vec<PayerResponsibilityEntry>,
+    /// The tags on the endpoint.
+    pub tags: Vec<Tag>,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Store a connection to one of the account's own VPC endpoint services, and answer
+    /// the `VpcEndpointConnectionId` it was given.
+    ///
+    /// The connection id is minted here rather than taken from `spec`, the way
+    /// [`Self::insert_subnet`] mints a `SubnetId`, and the record is keyed by its
+    /// `VpcEndpointId` because one endpoint connects to exactly one service. The
+    /// caller-chosen bytes it holds are charged against the store's byte budget here, so no
+    /// path can store them uncharged.
+    pub fn insert_vpc_endpoint_connection(&mut self, spec: VpcEndpointConnectionSpec) -> String {
+        let vpc_endpoint_connection_id = self.next_id(VPC_ENDPOINT_CONNECTION_ID_PREFIX);
+        let connection = VpcEndpointConnection {
+            service_id: Some(spec.service_id),
+            vpc_endpoint_id: Some(spec.vpc_endpoint_id),
+            vpc_endpoint_owner: Some(spec.vpc_endpoint_owner),
+            vpc_endpoint_state: Some(spec.vpc_endpoint_state),
+            creation_timestamp: Some(system_time_to_date_time(spec.creation_timestamp)),
+            dns_entries: Some(spec.dns_entries),
+            network_load_balancer_arns: Some(spec.network_load_balancer_arns),
+            gateway_load_balancer_arns: Some(spec.gateway_load_balancer_arns),
+            ip_address_type: spec.ip_address_type,
+            vpc_endpoint_connection_id: Some(vpc_endpoint_connection_id.clone()),
+            tags: Some(spec.tags),
+            vpc_endpoint_region: Some(spec.vpc_endpoint_region),
+            payer_responsibilities: Some(spec.payer_responsibilities),
+        };
+        let vpc_endpoint_id = connection.vpc_endpoint_id.clone().unwrap_or_default();
+        self.add_stored_bytes(vpc_endpoint_connection_payload_bytes(&connection));
+        self.vpc_endpoint_connections
+            .insert(vpc_endpoint_id, connection);
+        vpc_endpoint_connection_id
+    }
+}
+
+/// The caller-chosen bytes one stored VPC endpoint connection holds: its tags, the load
+/// balancer ARNs of the service it connects to, and its DNS entries. The ids, the state,
+/// the timestamp and the Region are derived by this module or bounded by the model, so they
+/// are fixed-size.
+///
+/// The ONE definition of that charge, the way [`address_payload_bytes`] is for an address:
+/// a writer charges exactly it, and a removal path must give back the same number.
+pub fn vpc_endpoint_connection_payload_bytes(connection: &VpcEndpointConnection) -> usize {
+    let arn_bytes = |arns: Option<&Vec<String>>| -> usize {
+        arns.into_iter().flatten().map(String::len).sum()
+    };
+    let dns_bytes: usize = connection
+        .dns_entries
+        .iter()
+        .flatten()
+        .map(|entry| {
+            entry.dns_name.as_deref().unwrap_or_default().len()
+                + entry.hosted_zone_id.as_deref().unwrap_or_default().len()
+        })
+        .sum();
+    tag_list_bytes(connection.tags.as_deref().unwrap_or_default())
+        + arn_bytes(connection.network_load_balancer_arns.as_ref())
+        + arn_bytes(connection.gateway_load_balancer_arns.as_ref())
+        + dns_bytes
 }
 

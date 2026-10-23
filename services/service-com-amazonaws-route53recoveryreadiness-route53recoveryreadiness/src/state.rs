@@ -623,12 +623,16 @@ pub fn store_full_message(store: &str) -> String {
 ///
 /// The model constrains `CrossAccountAuthorization` with neither `@length` nor
 /// `@pattern` (`smithy_query(query="shape", shape="CrossAccountAuthorization")`), so
-/// the boundary validator accepts any string and this is the only rule applied: the
-/// value is the resource's identity and `DeleteCrossAccountAuthorization` binds it to
-/// an `@httpLabel` (`DELETE /crossaccountauthorizations/{CrossAccountAuthorization}`),
+/// the boundary validator accepts any string and this is the only rule applied where
+/// the value arrives as a path label: `DeleteCrossAccountAuthorization` binds it to an
+/// `@httpLabel` (`DELETE /crossaccountauthorizations/{CrossAccountAuthorization}`),
 /// which Smithy forbids from being empty — an empty value would name a resource no
 /// later call could delete.
-pub fn validate_cross_account_authorization(value: &str) -> Result<(), String> {
+///
+/// The CREATE path applies the stronger grant rule instead — see
+/// [`validate_cross_account_authorization`] — because a create is the only call that
+/// admits a value into the store.
+pub fn validate_cross_account_authorization_label(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(validation_message(
             "crossAccountAuthorization",
@@ -637,6 +641,107 @@ pub fn validate_cross_account_authorization(value: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The partition segment an IAM ARN may name, as the ARN patterns other AWS models in
+/// this tree publish it: `^arn:(aws|aws-cn|aws-iso|aws-iso-[a-z]{1}|aws-us-gov):…` —
+/// the standard partition, China, GovCloud US and the isolated partitions. THIS
+/// service's Smithy model carries no partition list (ARN syntax is not modelled
+/// anywhere in it), so the rule is named here once and
+/// [`is_account_root_arn`] is its only reader.
+///
+/// These are the partitions the pattern names literally; the `aws-iso-<letter>` family
+/// it also admits is [`ARN_ISO_PARTITION_PREFIX`] below, so the check and the pattern it
+/// quotes cannot disagree.
+pub const ARN_PARTITIONS: &[&str] = &["aws", "aws-cn", "aws-us-gov", "aws-iso"];
+
+/// The prefix of the isolated-partition family the same pattern admits — `aws-iso-`
+/// followed by exactly one lowercase ASCII letter.
+pub const ARN_ISO_PARTITION_PREFIX: &str = "aws-iso-";
+
+/// True when `value` is one of the partitions [`ARN_PARTITIONS`] names, or a member of
+/// the `aws-iso-<letter>` family [`ARN_ISO_PARTITION_PREFIX`] describes.
+pub fn is_arn_partition(value: &str) -> bool {
+    if ARN_PARTITIONS.contains(&value) {
+        return true;
+    }
+    match value.strip_prefix(ARN_ISO_PARTITION_PREFIX) {
+        Some(suffix) => matches!(suffix.as_bytes(), [b'a'..=b'z']),
+        None => false,
+    }
+}
+
+/// The number of decimal digits an AWS account id carries, as every account-scoped ARN
+/// in this service's own output shapes does (`mock_account_id()` mints one of the same
+/// width).
+pub const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// The sentence a cross-account authorization grant is refused with when the submitted
+/// value is not an account-root ARN. Constant and resource-agnostic, like this
+/// service's other refusals: the rejected bytes are NOT echoed back.
+pub const INVALID_CROSS_ACCOUNT_AUTHORIZATION_MESSAGE: &str = "Invalid cross account authorization";
+
+/// True when `value`'s LITERAL bytes are an IAM account-root ARN —
+/// `arn:<partition>:iam::<12 digits>:root`, with an empty region segment as IAM ARNs
+/// carry, the partition one [`is_arn_partition`] admits and the account id exactly
+/// [`ACCOUNT_ID_DIGITS`] ASCII digits.
+///
+/// Nothing is trimmed, lower-cased or otherwise normalised: a value that differs from a
+/// well-formed one by so much as a surrounding or embedded space is a different value,
+/// and therefore not an account-root ARN.
+pub fn is_account_root_arn(value: &str) -> bool {
+    // Seven reads of a six-segment value: the seventh must be absent, so a value
+    // carrying an extra `:` segment is refused rather than truncated.
+    let mut segments = value.split(':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some("iam"),
+        Some(""),
+        Some(account),
+        Some("root"),
+        None,
+    ) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    is_arn_partition(partition)
+        && account.len() == ACCOUNT_ID_DIGITS
+        && account.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Refuse a cross-account readiness grant whose value is not an account-root ARN.
+///
+/// The grant names the ACCOUNT being authorized, so the only value the service can
+/// honour is that account's root principal ARN; anything else — a bare account id, a
+/// role or user ARN, an ARN of another service, an account id of the wrong width, or a
+/// well-formed ARN carrying stray whitespace — names no account this service could ever
+/// evaluate readiness for, and is refused before anything is persisted.
+///
+/// WHERE THE RULE COMES FROM: the model is silent — `CrossAccountAuthorization` is a
+/// plain string with neither `@length` nor `@pattern`
+/// (`smithy_query(query="shape", shape="CrossAccountAuthorization")`) and the operation
+/// merely declares that a 400 validation path exists. The root-only rule is RECORDED
+/// behaviour: the corpus check
+/// `route53-recovery-readiness.cross-account-authorization-lifecycle` records real ARC
+/// refusing a value that is not a well-formed `arn:aws:iam::<12 digits>:root` — there,
+/// one differing from a well-formed value only by a trailing space — with HTTP 400 and
+/// the error code `Validation`, and records nothing persisted by the refused call. The
+/// partition is the one free part the recording does not pin, so [`is_arn_partition`]
+/// takes it from the partition alternation the ARN patterns in this tree publish rather
+/// than from the one recorded value.
+pub fn validate_cross_account_authorization(value: &str) -> Result<(), String> {
+    if is_account_root_arn(value) {
+        return Ok(());
+    }
+    Err(INVALID_CROSS_ACCOUNT_AUTHORIZATION_MESSAGE.to_string())
 }
 
 /// Refuse a resource list that is longer than this emulator stores, or one whose entry

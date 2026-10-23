@@ -138,14 +138,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        crate::state::validate_cross_account_authorization(&input.cross_account_authorization)
-            .map_err(|message| {
-                DeleteCrossAccountAuthorizationErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(message),
-                    },
-                )
-            })?;
+        // The value arrives as a path label here, so the only rule is the one Smithy
+        // puts on a label: it cannot be empty. The grant rule itself is enforced on the
+        // create, the only call that admits a value into the store, and this operation
+        // models no not-found error — so a value the store does not hold (a malformed one
+        // among them) is the same empty 200 as one it did.
+        crate::state::validate_cross_account_authorization_label(
+            &input.cross_account_authorization,
+        )
+        .map_err(|message| {
+            DeleteCrossAccountAuthorizationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+        })?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteCrossAccountAuthorizationErrorModeled::InternalServerException(

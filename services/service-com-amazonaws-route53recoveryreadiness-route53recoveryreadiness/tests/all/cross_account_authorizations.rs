@@ -15,9 +15,12 @@
 //! exactly the values held (in value order, paged), and a delete removes the named value
 //! and answers the same empty HTTP 200 whether or not it was held — the model declares no
 //! `ResourceNotFoundException` for the delete. The rows differ along what that rule
-//! generalises over: the value's form and length, how many values are stored, which one
-//! is addressed, and the page size asked for. The "delete a value that was never
-//! created" case the issue recorded is one row.
+//! generalises over: the authorization's partition and account id, how many values are
+//! stored, which one is addressed, and the page size asked for. The "delete a value that
+//! was never created" case the issue recorded is one row.
+//!
+//! Which VALUES a create accepts at all is the neighbouring suite
+//! `cross_account_authorization_validation.rs`, which reuses the harness below.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -37,22 +40,20 @@ const MAX_RESULTS_MAX: i64 = 1000;
 
 /// Authorization values this table ranges over.
 ///
-/// `CrossAccountAuthorization` is a plain string with neither `@length` nor `@pattern`
-/// (model: `smithy_query(query="shape", shape="CrossAccountAuthorization")`), so the
-/// rows vary form freely: a bare account id, the account-root and role ARNs AWS's
-/// cross-account documentation uses (the role ARN carries a `/`, which the delete's
-/// `@httpLabel` has to survive percent-encoded), a single character, a value far longer
-/// than any name this service mints, and a non-ASCII value. The issue's recorded case —
-/// deleting a value that was never created — is exercised against every one of these in
-/// [`deleting_an_authorization_the_store_does_not_hold_succeeds_idempotently`].
+/// A grant names the account being authorized, so the values a create accepts are
+/// account-root ARNs (`arn:<partition>:iam::<12 digits>:root`); the rows vary what that
+/// form leaves free — the partition and the account id's digits, including the all-zero
+/// and all-nine ends of the 12-digit range. Which values are REFUSED, and that a refused
+/// create persists nothing, is the table in
+/// `cross_account_authorization_validation.rs`.
 fn authorization_cases() -> Vec<String> {
     vec![
-        "111122223333".to_string(),
         "arn:aws:iam::111122223333:root".to_string(),
-        "arn:aws:iam::444455556666:role/ReadinessReader".to_string(),
-        "0".to_string(),
-        format!("arn:aws:iam::777788889999:role/{}", "deep_path/".repeat(20)),
-        "авторизация".to_string(),
+        "arn:aws:iam::444455556666:root".to_string(),
+        "arn:aws:iam::000000000000:root".to_string(),
+        "arn:aws:iam::999999999999:root".to_string(),
+        "arn:aws-us-gov:iam::777788889999:root".to_string(),
+        "arn:aws-cn:iam::123456789012:root".to_string(),
     ]
 }
 
@@ -63,7 +64,7 @@ fn authorization_cases() -> Vec<String> {
 pub(crate) struct Reply {
     pub(crate) status: u16,
     error_type: String,
-    body: Value,
+    pub(crate) body: Value,
 }
 
 impl Reply {
@@ -77,7 +78,7 @@ impl Reply {
 
     /// The error shape this answer names, from the `x-amzn-errortype` header, falling
     /// back to the body's `__type`.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         let raw = if self.error_type.is_empty() {
             self.string("__type").unwrap_or_default()
         } else {
@@ -169,7 +170,7 @@ impl Emulator {
         .await
     }
 
-    async fn delete(&self, authorization: &str) -> Reply {
+    pub(crate) async fn delete(&self, authorization: &str) -> Reply {
         self.send(
             "DELETE",
             &format!(
@@ -461,7 +462,7 @@ async fn pagination_reports_every_stored_authorization_exactly_once() {
 #[tokio::test]
 async fn a_max_results_outside_the_modelled_range_is_refused() {
     let emulator = Emulator::new();
-    emulator.create("111122223333").await;
+    emulator.create("arn:aws:iam::111122223333:root").await;
 
     // One past each published bound of `MaxResults` (range 1..1000).
     for max in [MAX_RESULTS_MIN - 1, MAX_RESULTS_MAX + 1] {
@@ -484,7 +485,10 @@ async fn a_max_results_outside_the_modelled_range_is_refused() {
 #[tokio::test]
 async fn a_next_token_this_service_did_not_mint_is_refused() {
     let emulator = Emulator::new();
-    for value in ["111122223333", "444455556666"] {
+    for value in [
+        "arn:aws:iam::111122223333:root",
+        "arn:aws:iam::444455556666:root",
+    ] {
         emulator.create(value).await;
     }
 
@@ -509,6 +513,9 @@ async fn a_next_token_this_service_did_not_mint_is_refused() {
 
 #[tokio::test]
 async fn an_empty_authorization_is_refused_and_stores_nothing() {
+    // Refused by the grant rule like any other value that is not an account-root ARN,
+    // so it carries the create's recorded `Validation` code rather than the modelled
+    // `ValidationException` the delete's empty-label refusal and the store ceiling use.
     let emulator = Emulator::new();
     let refused = emulator.create("").await;
     assert_eq!(
@@ -518,8 +525,8 @@ async fn an_empty_authorization_is_refused_and_stores_nothing() {
     );
     assert_eq!(
         refused.error_code(),
-        "ValidationException",
-        "case empty: expected ValidationException, got {:?} / {}",
+        "Validation",
+        "case empty: expected the Validation refusal, got {:?} / {}",
         refused.error_code(),
         refused.body
     );
@@ -563,7 +570,7 @@ async fn a_store_at_its_ceiling_refuses_another_authorization() {
         );
     }
 
-    let refused = emulator.create("one:too:many").await;
+    let refused = emulator.create("arn:aws:iam::999999999999:root").await;
     assert_eq!(
         refused.status, 400,
         "a store at {MAX_RECORDS_PER_STORE} records must refuse another, got {} / {}",
@@ -598,7 +605,7 @@ async fn a_store_at_its_ceiling_refuses_another_authorization() {
         "expected the delete to answer HTTP 200"
     );
     assert_eq!(
-        emulator.create("one:too:many").await.status,
+        emulator.create("arn:aws:iam::999999999999:root").await.status,
         200,
         "expected room for one more authorization after a delete"
     );

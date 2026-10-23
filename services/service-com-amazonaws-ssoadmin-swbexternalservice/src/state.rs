@@ -20,8 +20,9 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AccountAssignment, AccountAssignmentOperationStatus, DisplayData, InstanceMetadata,
-    PermissionSet, RegionMetadata, Tag, TrustedTokenIssuerConfiguration,
+    AccountAssignment, AccountAssignmentOperationStatus, DisplayData,
+    EncryptionConfigurationDetails, InstanceMetadata, PermissionSet, RegionMetadata, Tag,
+    TrustedTokenIssuerConfiguration,
 };
 
 /// The identity-store instance every `InstanceArn`-taking operation resolves against.
@@ -133,6 +134,34 @@ pub const CLIENT_TOKEN_MISMATCH_MESSAGE: &str =
     "The ClientToken was already used for a CreateInstance request with different \
      parameters.";
 
+/// `KmsKeyType::AWS_OWNED_KMS_KEY` — the instance is encrypted with an Amazon Web
+/// Services owned key, so no `KmsKeyArn` names it ("Cannot be specified when KeyType is
+/// AWS_OWNED_KMS_KEY", `EncryptionConfiguration$KmsKeyArn`).
+pub const KEY_TYPE_AWS_OWNED: &str = "AWS_OWNED_KMS_KEY";
+
+/// `KmsKeyType::CUSTOMER_MANAGED_KEY` — the instance is encrypted with the caller's own
+/// KMS key, which `KmsKeyArn` must name ("Required when KeyType is
+/// CUSTOMER_MANAGED_KEY").
+pub const KEY_TYPE_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED_KEY";
+
+/// `KmsKeyStatus::UPDATING` — an encryption-configuration change that has not taken
+/// effect yet.
+pub const KMS_KEY_STATUS_UPDATING: &str = "UPDATING";
+
+/// `KmsKeyStatus::ENABLED` — the encryption configuration an instance is actually
+/// encrypted under.
+pub const KMS_KEY_STATUS_ENABLED: &str = "ENABLED";
+
+/// How long after the `UpdateInstance` that sets an encryption configuration the
+/// instance reports that configuration as `ENABLED` rather than `UPDATING`.
+///
+/// The key change is asynchronous — the model carries `KmsKeyStatus::UPDATING` and an
+/// `EncryptionStatusReason` for the failure case precisely because the caller can observe
+/// the change in flight — and AWS publishes no duration for it, so this span is the
+/// emulator's OWN choice: non-zero, so a caller that reads straight after the update still
+/// sees `UPDATING`, and short enough that a test can wait it out.
+pub const ENCRYPTION_UPDATE_DELAY: Duration = Duration::from_millis(500);
+
 /// `StatusValues::SUCCEEDED` — the terminal status of an assignment operation this
 /// emulator has already applied in full.
 pub const STATUS_SUCCEEDED: &str = "SUCCEEDED";
@@ -164,6 +193,60 @@ pub fn quota_exceeded_message(store: &str) -> String {
         "The principal has crossed the permitted number of resources that can be \
          created: this emulator holds at most {MAX_RECORDS_PER_STORE} {store}"
     )
+}
+
+/// The encryption configuration of an instance, as the last `UpdateInstance` that
+/// carried one set it.
+///
+/// `EncryptionStatus` is DERIVED from [`effective_at`](Self::effective_at) rather than
+/// stored, so a read never has to write to move the status on: the instant the change
+/// becomes effective is fixed when the update is accepted, and every later read computes
+/// the status the clock implies at the moment it is asked.
+#[derive(Debug, Clone)]
+pub struct EncryptionConfigurationRecord {
+    /// `KmsKeyType`: [`KEY_TYPE_AWS_OWNED`] or [`KEY_TYPE_CUSTOMER_MANAGED`].
+    pub key_type: String,
+    /// The customer managed key this instance is encrypted under; `None` for an Amazon
+    /// Web Services owned key, which no ARN names.
+    pub kms_key_arn: Option<String>,
+    /// When the configuration stops being `UPDATING` and becomes `ENABLED`:
+    /// [`ENCRYPTION_UPDATE_DELAY`] after the update that set it was accepted.
+    pub effective_at: SystemTime,
+}
+
+impl EncryptionConfigurationRecord {
+    /// The configuration an `UpdateInstance` accepted at `accepted_at` writes.
+    pub fn new(key_type: String, kms_key_arn: Option<String>, accepted_at: SystemTime) -> Self {
+        Self {
+            key_type,
+            kms_key_arn,
+            effective_at: accepted_at + ENCRYPTION_UPDATE_DELAY,
+        }
+    }
+
+    /// `KmsKeyStatus` as of `now`: `UPDATING` until the change is due, `ENABLED` after.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.effective_at {
+            KMS_KEY_STATUS_UPDATING
+        } else {
+            KMS_KEY_STATUS_ENABLED
+        }
+    }
+
+    /// This configuration as the modeled `EncryptionConfigurationDetails` shape, as of
+    /// `now`.
+    ///
+    /// `EncryptionStatusReason` is left absent: the model documents it as context for a
+    /// FAILED update ("particularly useful when the encryption status is UPDATE_FAILED"),
+    /// and nothing here fails a key change.
+    pub fn to_shape(&self, now: SystemTime) -> EncryptionConfigurationDetails {
+        EncryptionConfigurationDetails {
+            key_type: Some(self.key_type.clone()),
+            kms_key_arn: self.kms_key_arn.clone(),
+            encryption_status: Some(self.status(now).to_string()),
+            encryption_status_reason: None,
+        }
+    }
 }
 
 /// One enabled Region of an IAM Identity Center instance.
@@ -201,10 +284,25 @@ pub struct Instance {
     pub status: String,
     pub primary_region: String,
     pub regions: Vec<Region>,
-    /// Account instance or organization instance: what decides whether the
-    /// permission-set / account-assignment surface is served on this instance, and
-    /// what `DescribeInstance$PermissionSetsEnabled` reports.
+    /// Account instance or organization instance: what the instance's INITIAL
+    /// permission-set enablement comes from (see
+    /// [`InstanceType::permission_sets_enabled`]).
     pub instance_type: InstanceType,
+    /// `DescribeInstance$PermissionSetsEnabled` — "Indicates whether permission sets are
+    /// enabled for this Identity Center instance", and what
+    /// [`ComAmazonawsSsoadminSwbexternalserviceState::permission_set_surface_withdrawn`]
+    /// asks. It starts at what [`InstanceType::permission_sets_enabled`] gives this kind
+    /// of instance and `UpdateInstance` can turn it ON — "Enables permission sets for
+    /// this Identity Center instance. The only accepted value is true. After permission
+    /// sets are enabled, they cannot be disabled" — so it is held per instance rather
+    /// than decided per read. `InstanceMetadata` (what `ListInstances` projects) carries
+    /// no such member, so only `DescribeInstance` reports it.
+    pub permission_sets_enabled: bool,
+    /// The instance's encryption configuration, or `None` while nothing has configured
+    /// one: `UpdateInstance` is the only operation that writes it and
+    /// `DescribeInstance$EncryptionConfigurationDetails` the only one that reports it, so
+    /// an instance no caller has configured reports no details rather than invented ones.
+    pub encryption: Option<EncryptionConfigurationRecord>,
     /// The `ClientToken` of the `CreateInstance` call that minted this instance, when
     /// it sent one. The model marks that member `@idempotencyToken`, so a retry of the
     /// same call must answer with this instance rather than refusing it as a duplicate.
@@ -244,6 +342,13 @@ impl Instance {
                 is_primary_region: true,
             }],
             instance_type,
+            // What this KIND of instance starts with; `UpdateInstance` can enable
+            // permission sets on an instance that starts without them.
+            permission_sets_enabled: instance_type.permission_sets_enabled(),
+            // Nothing configures encryption at creation: `CreateInstance` takes no
+            // encryption configuration, so there is none to report until an
+            // `UpdateInstance` writes one.
+            encryption: None,
             client_token: None,
             tags: Vec::new(),
             active_due: None,
@@ -272,13 +377,6 @@ impl Instance {
         }
         instance.active_due = Some(now + INSTANCE_ACTIVATION_SPAN);
         instance
-    }
-
-    /// Whether the permission-set / account-assignment surface is served on this
-    /// instance. `false` for an account instance, whose refusal is
-    /// [`ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE`].
-    pub fn permission_sets_enabled(&self) -> bool {
-        self.instance_type.permission_sets_enabled()
     }
 
     /// Apply what the CLOCK already owes this instance: an instance whose activation
@@ -508,6 +606,11 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         self.instances.get(instance_arn)
     }
 
+    /// The instance `instance_arn` names, for a handler that updates it.
+    pub fn instance_mut(&mut self, instance_arn: &str) -> Option<&mut Instance> {
+        self.instances.get_mut(instance_arn)
+    }
+
     /// Apply every transition the CLOCK already owes: see [`Instance::materialize_due`].
     pub fn materialize_due(&mut self, now: SystemTime) {
         for instance in self.instances.values_mut() {
@@ -527,7 +630,7 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// can.
     pub fn permission_set_surface_withdrawn(&self, instance_arn: &str) -> bool {
         self.instance(instance_arn)
-            .is_some_and(|instance| !instance.permission_sets_enabled())
+            .is_some_and(|instance| !instance.permission_sets_enabled)
     }
 
     /// The instance a previous `CreateInstance` minted under `client_token`, if that

@@ -32,10 +32,10 @@ const TARGET_PREFIX: &str = "SimpleWorkflowService";
 
 /// The region the `Authorization` credential scope below signs for; every ARN this
 /// service mints for these requests carries it.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account segment every emulated ARN carries.
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// One emulator: a fresh engine behind a router that claims `swf` requests.
 ///
@@ -118,7 +118,7 @@ impl Emulator {
 }
 
 /// The `__type` discriminator of an awsJson error body, reduced to the shape name.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -141,7 +141,7 @@ fn i64_at(body: &Value, pointer: &str) -> i64 {
         .unwrap_or_else(|| panic!("expected an integer at {pointer} of {body:?}"))
 }
 
-fn register_domain_body(name: &str, retention: &str) -> Value {
+pub(crate) fn register_domain_body(name: &str, retention: &str) -> Value {
     json!({ "name": name, "workflowExecutionRetentionPeriodInDays": retention })
 }
 

@@ -20,18 +20,10 @@
 //! 4. An unresolvable domain or repository (including a `domainOwner` that does not own
 //!    the domain) is `ResourceNotFoundException` (404).
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A SigV4 `Authorization` header in the shape the router's routing key reader parses:
-/// its credential scope is what names the target service AND the region every minted ARN
-/// carries. The signature itself is never checked here (the harness turns request
-/// authentication off), so it is a placeholder.
-const AUTH: &str =
-    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/codeartifact/aws4_request, \
-     SignedHeaders=host, Signature=0";
+use crate::harness::{call, create_domain, emulator, Answer};
 
 /// Every external connection CodeArtifact supports, paired with the `packageFormat` its
 /// packages carry.
@@ -62,85 +54,12 @@ const SUPPORTED_CONNECTIONS: &[(&str, &str)] = &[
 /// The only value `ExternalConnectionStatus` models.
 const AVAILABLE: &str = "Available";
 
-/// One HTTP answer, reduced to what a client branches on.
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    /// `x-amzn-errortype`, which is how restJson1 names the error shape.
-    error_type: Option<String>,
-    body: Value,
-}
-
+/// One HTTP answer's `repository` member.
 impl Answer {
-    /// The `x-amzn-errortype` error code, or `""` on a success.
-    fn code(&self) -> String {
-        self.error_type.clone().unwrap_or_default()
-    }
-
     /// The `repository` member of a success body.
     fn repository(&self) -> &Value {
         &self.body["repository"]
     }
-}
-
-/// The emulator under test: the production router with this one service mounted on a
-/// single shared engine, exactly as `core/router` assembles it.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_codeartifact_codeartifactcontrolplaneservice::EmulatedService::new(
-            engine,
-        ),
-    );
-    router
-}
-
-/// Send one request and reduce the response to an [`Answer`].
-async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option<Value>) -> Answer {
-    let payload = match &body {
-        Some(value) => bytes::Bytes::from(serde_json::to_vec(value).expect("serialize body")),
-        None => bytes::Bytes::new(),
-    };
-    let request = http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("host", "codeartifact.us-east-1.amazonaws.com")
-        .header("authorization", AUTH)
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("build request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let raw = response.into_body();
-    let body = if raw.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&raw)
-            .unwrap_or_else(|_| json!({ "unparsed": String::from_utf8_lossy(&raw) }))
-    };
-    Answer {
-        status,
-        error_type,
-        body,
-    }
-}
-
-async fn create_domain(router: &MultiServiceRouter, domain: &str) -> Answer {
-    call(
-        router,
-        "POST",
-        &format!("/v1/domain?domain={domain}"),
-        Some(json!({})),
-    )
-    .await
 }
 
 async fn create_repository(router: &MultiServiceRouter, domain: &str, repository: &str) -> Answer {
@@ -209,7 +128,7 @@ async fn each_supported_connection_is_stored_with_its_package_format() {
     let router = emulator();
     let domain = "ec-formats-domain";
     assert_eq!(
-        create_domain(&router, domain).await.status,
+        create_domain(&router, domain, None).await.status,
         200,
         "domain setup must succeed"
     );
@@ -276,7 +195,7 @@ async fn each_supported_connection_is_stored_with_its_package_format() {
 async fn a_repository_holds_at_most_one_external_connection() {
     let router = emulator();
     let domain = "ec-limit-domain";
-    assert_eq!(create_domain(&router, domain).await.status, 200);
+    assert_eq!(create_domain(&router, domain, None).await.status, 200);
 
     // Rows differ in WHICH registry is held first and which second, so the rule is not
     // asserted on one pair: a format-sharing pair (two Maven registries), a
@@ -347,7 +266,7 @@ async fn a_repository_holds_at_most_one_external_connection() {
 async fn an_unsupported_connection_name_is_refused() {
     let router = emulator();
     let domain = "ec-invalid-domain";
-    assert_eq!(create_domain(&router, domain).await.status, 200);
+    assert_eq!(create_domain(&router, domain, None).await.status, 200);
 
     // Each row is a name that satisfies `ExternalConnectionName`'s modelled length and
     // pattern — so the boundary validator admits it — but names no supported registry:
@@ -396,7 +315,7 @@ async fn an_unsupported_connection_name_is_refused() {
 async fn an_unresolvable_target_is_not_found() {
     let router = emulator();
     let domain = "ec-missing-domain";
-    assert_eq!(create_domain(&router, domain).await.status, 200);
+    assert_eq!(create_domain(&router, domain, None).await.status, 200);
     assert_eq!(
         create_repository(&router, domain, "ec-present").await.status,
         200

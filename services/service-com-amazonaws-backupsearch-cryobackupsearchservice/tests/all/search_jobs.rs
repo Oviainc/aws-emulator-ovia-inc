@@ -1224,6 +1224,7 @@ async fn starting_a_job_past_the_store_cap_is_refused_with_the_quota_error() {
                 search_scope_summary: types::SearchScopeSummary::default(),
                 current_search_progress: types::CurrentSearchProgress::default(),
                 results: Vec::new(),
+                backups: Vec::new(),
                 tags: std::collections::HashMap::new(),
                 client_token: None,
                 request_fingerprint: identifier,

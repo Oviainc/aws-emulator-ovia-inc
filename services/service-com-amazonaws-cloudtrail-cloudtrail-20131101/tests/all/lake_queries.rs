@@ -112,6 +112,9 @@ fn seed_store_with(
             status,
             owner_account_id: owner_account_id.map(str::to_string),
             created_at: Some(at(1_700_000_000)),
+            // The members only a read of the store itself reports (see
+            // `event_data_store_reads.rs`) are not what these cases vary.
+            ..EventDataStoreRecord::default()
         },
     );
 }

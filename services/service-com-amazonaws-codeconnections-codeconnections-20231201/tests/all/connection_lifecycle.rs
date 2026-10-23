@@ -79,14 +79,37 @@ async fn call_signed_for(
     operation: &str,
     body: serde_json::Value,
 ) -> (u16, serde_json::Value) {
+    call_signed_with_target(
+        router,
+        scope_region,
+        &format!("CodeConnections_20231201.{operation}"),
+        body,
+    )
+    .await
+}
+
+/// Call with a literal `X-Amz-Target` header value, so a test can pin which target
+/// forms this service routes. The one place this suite builds a request: every other
+/// helper here delegates to it, so the SigV4 and header boilerplate exists once.
+pub(crate) async fn call_with_target(
+    router: &MultiServiceRouter,
+    target: &str,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    call_signed_with_target(router, REGION, target, body).await
+}
+
+async fn call_signed_with_target(
+    router: &MultiServiceRouter,
+    scope_region: &str,
+    target: &str,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
         .header("content-type", "application/x-amz-json-1.0")
-        .header(
-            "x-amz-target",
-            format!("CodeConnections_20231201.{operation}"),
-        )
+        .header("x-amz-target", target)
         .header(
             "authorization",
             format!(
@@ -107,7 +130,7 @@ async fn call_signed_for(
     } else {
         serde_json::from_slice(&bytes).unwrap_or_else(|e| {
             panic!(
-                "operation {operation}: body is not JSON ({e}): {}",
+                "target {target}: body is not JSON ({e}): {}",
                 String::from_utf8_lossy(&bytes)
             )
         })

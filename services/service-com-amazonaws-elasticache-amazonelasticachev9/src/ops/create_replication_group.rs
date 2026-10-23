@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReplicationGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReplicationGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateReplicationGroup::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -351,18 +347,886 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReplicationGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReplicationGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Every member of this request is either persisted and reported, or the
+        // request is refused with a modelled error: a 200 must never claim a
+        // configuration the store does not hold.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReplicationGroup"))
+        // `ReplicationGroupId` "is stored as a lowercase string", so the
+        // identity a later Describe resolves is the lowercased one, and the
+        // member carries no modelled `@pattern`, so the documented name rule is
+        // enforced here.
+        let replication_group_id = input.replication_group_id.to_ascii_lowercase();
+        if !crate::state::is_valid_replication_group_id(&replication_group_id) {
+            return Err(invalid_value(format!(
+                "Invalid value {} for ReplicationGroupId: a name must contain from 1 to {} \
+                 alphanumeric characters or hyphens, must begin with a letter, and must not end \
+                 with a hyphen or contain two consecutive hyphens.",
+                input.replication_group_id,
+                crate::state::REPLICATION_GROUP_ID_MAX_LEN
+            )));
+        }
+
+        // The engine the request named, refused here when it is not one a
+        // replication group can run. Omitted, it is resolved below from the
+        // primary cluster, or from the service default.
+        let requested_engine = match input.engine.as_deref() {
+            Some(engine) => match crate::state::normalize_replication_group_engine(engine) {
+                Ok(engine) => Some(engine),
+                Err(message) => return Err(invalid_value(message)),
+            },
+            None => None,
+        };
+
+        // A Global datastore the group would join has to exist, and none can:
+        // every global-replication-group operation is a scaffolded 501 that owns
+        // its own issue, so there is nothing to join.
+        if let Some(global) = input.global_replication_group_id.as_deref() {
+            return Err(
+                CreateReplicationGroupErrorModeled::GlobalReplicationGroupNotFoundFault(
+                    GlobalReplicationGroupNotFoundFault {
+                        message: Some(format!("Global datastore {global} not found.")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Cache security groups are the pre-VPC, EC2-Classic mechanism whose
+        // `CreateCacheSecurityGroup` is a scaffolded 501, so none exists.
+        if let Some(name) = input
+            .cache_security_group_names
+            .as_deref()
+            .unwrap_or_default()
+            .first()
+        {
+            return Err(
+                CreateReplicationGroupErrorModeled::CacheSecurityGroupNotFoundFault(
+                    CacheSecurityGroupNotFoundFault {
+                        message: Some(format!("Cache security group {name} not found.")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Same for user groups: `CreateUserGroup` is a scaffolded 501.
+        if let Some(id) = input.user_group_ids.as_deref().unwrap_or_default().first() {
+            return Err(CreateReplicationGroupErrorModeled::UserGroupNotFoundFault(
+                UserGroupNotFoundFault {
+                    message: Some(format!("User group {id} not found.")),
+                },
+            )
+            .into());
+        }
+
+        // A serverless cache snapshot cannot exist: every serverless-cache
+        // operation is a scaffolded 501 that owns its own issue. A `SnapshotArns`
+        // entry would have to be read out of Amazon S3, which this emulator does
+        // not reach. (`SnapshotName` names a snapshot this service CAN hold, so
+        // it is resolved against the store below.)
+        for (member, value) in [
+            (
+                "ServerlessCacheSnapshotName",
+                input.serverless_cache_snapshot_name.as_deref(),
+            ),
+            (
+                "SnapshotArns",
+                input
+                    .snapshot_arns
+                    .as_deref()
+                    .unwrap_or_default()
+                    .first()
+                    .map(String::as_str),
+            ),
+        ] {
+            if let Some(value) = value {
+                return Err(invalid_value(format!(
+                    "Invalid value {value} for {member}: no such snapshot exists in this emulator."
+                )));
+            }
+        }
+
+        // A port is a TCP port: the member is an `IntegerOptional` with no
+        // modelled range, so the bound is enforced here.
+        if let Some(port) = input.port {
+            if !(1..=65535).contains(&port) {
+                return Err(invalid_value(format!(
+                    "Invalid value {port} for Port: must be between 1 and 65535."
+                )));
+            }
+        }
+
+        let tags = match crate::state::tag_pairs(input.tags) {
+            Ok(tags) => tags,
+            Err(crate::state::TagRefusal::TooMany(count)) => {
+                return Err(
+                    CreateReplicationGroupErrorModeled::TagQuotaPerResourceExceeded(
+                        TagQuotaPerResourceExceeded {
+                            message: Some(format!(
+                                "{count} tags were supplied; the maximum number of tags permitted \
+                                 on a resource is {}.",
+                                crate::state::MAX_TAGS_PER_RESOURCE
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Err(crate::state::TagRefusal::MissingKey) => {
+                return Err(invalid_value(
+                    "Invalid value for Tags: a tag's Key may not be null.".to_string(),
+                ))
+            }
+        };
+
+        // "AuthToken can be specified only on replication groups where
+        // TransitEncryptionEnabled is true." The token itself is a secret and is
+        // never stored; only the fact that one was set, which is all the model
+        // reports.
+        let transit_encryption_enabled = input.transit_encryption_enabled.unwrap_or(false);
+        if let Some(token) = input.auth_token.as_deref() {
+            if !transit_encryption_enabled {
+                return Err(invalid_combination(
+                    "AuthToken can be specified only on a replication group where \
+                     TransitEncryptionEnabled is true."
+                        .to_string(),
+                ));
+            }
+            if let Some(message) = crate::state::auth_token_refusal(token) {
+                return Err(invalid_value(message));
+            }
+        }
+
+        // How the group is partitioned. "For Valkey or Redis OSS (cluster mode
+        // disabled) either omit this parameter or set it to 1. Default: 1", and
+        // a request that configures the shards individually has one entry per
+        // shard.
+        let shard_configs = input.node_group_configuration.unwrap_or_default();
+        let num_node_groups = match input.num_node_groups {
+            Some(count) => count,
+            None => i32::try_from(shard_configs.len()).unwrap_or(1).max(1),
+        };
+        if num_node_groups < 1 {
+            return Err(invalid_value(format!(
+                "Invalid value {num_node_groups} for NumNodeGroups: a replication group has at \
+                 least one node group (shard)."
+            )));
+        }
+        if num_node_groups > crate::state::MAX_NODE_GROUPS {
+            return Err(
+                CreateReplicationGroupErrorModeled::NodeGroupsPerReplicationGroupQuotaExceededFault(
+                    NodeGroupsPerReplicationGroupQuotaExceededFault {
+                        message: Some(format!(
+                            "{num_node_groups} node groups (shards) were requested; a single \
+                             replication group holds at most {}.",
+                            crate::state::MAX_NODE_GROUPS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if !shard_configs.is_empty() && shard_configs.len() != num_node_groups as usize {
+            return Err(invalid_combination(format!(
+                "NodeGroupConfiguration configures {} node groups (shards), which must equal \
+                 NumNodeGroups ({num_node_groups}).",
+                shard_configs.len()
+            )));
+        }
+
+        // A group whose data is partitioned across more than one shard is
+        // cluster mode enabled; `ClusterMode` may also ask for it with a single
+        // shard, and cannot contradict the partitioning the request asks for.
+        let requested_cluster_mode = input.cluster_mode.as_deref();
+        if num_node_groups > 1 && requested_cluster_mode == Some(crate::state::SETTING_DISABLED) {
+            return Err(invalid_combination(format!(
+                "ClusterMode disabled cannot be combined with NumNodeGroups ({num_node_groups}): \
+                 a replication group whose keyspace is partitioned across shards is cluster mode \
+                 enabled."
+            )));
+        }
+        let cluster_enabled =
+            num_node_groups > 1 || requested_cluster_mode == Some(crate::state::SETTING_ENABLED);
+        let cluster_mode = requested_cluster_mode
+            .unwrap_or(if cluster_enabled {
+                crate::state::SETTING_ENABLED
+            } else {
+                crate::state::SETTING_DISABLED
+            })
+            .to_string();
+
+        // How many clusters each shard has. `NumCacheClusters` counts the
+        // clusters of the one shard a cluster mode disabled group has — it "is
+        // not used if there is more than one node group (shard). You should use
+        // ReplicasPerNodeGroup instead" — so the two members set the same count
+        // and cannot both be given.
+        if input.num_cache_clusters.is_some() && num_node_groups > 1 {
+            return Err(invalid_combination(format!(
+                "NumCacheClusters cannot be combined with NumNodeGroups ({num_node_groups}); use \
+                 ReplicasPerNodeGroup instead."
+            )));
+        }
+        if input.num_cache_clusters.is_some() && input.replicas_per_node_group.is_some() {
+            return Err(invalid_combination(
+                "NumCacheClusters and ReplicasPerNodeGroup both set the number of clusters in a \
+                 node group (shard) and cannot both be specified."
+                    .to_string(),
+            ));
+        }
+        let replicas_per_node_group =
+            match (input.num_cache_clusters, input.replicas_per_node_group) {
+                (Some(clusters), _) => {
+                    if !(1..=crate::state::MAX_CACHE_CLUSTERS_PER_GROUP).contains(&clusters) {
+                        return Err(invalid_value(format!(
+                            "Invalid value {clusters} for NumCacheClusters: a replication group \
+                             has between 1 and {} clusters (1 primary plus up to {} replicas).",
+                            crate::state::MAX_CACHE_CLUSTERS_PER_GROUP,
+                            crate::state::MAX_REPLICAS_PER_NODE_GROUP
+                        )));
+                    }
+                    clusters - 1
+                }
+                (None, Some(replicas)) => replicas,
+                // "If AutomaticFailoverEnabled is false you can omit this
+                // parameter (it will default to 1)": one cluster, the primary.
+                (None, None) => 0,
+            };
+
+        // Per shard: how many replicas it has.
+        let mut shard_replicas: Vec<i32> = Vec::with_capacity(num_node_groups as usize);
+        for index in 0..num_node_groups as usize {
+            let config = shard_configs.get(index);
+            let replicas = config
+                .and_then(|config| config.replica_count)
+                .unwrap_or(replicas_per_node_group);
+            if !(0..=crate::state::MAX_REPLICAS_PER_NODE_GROUP).contains(&replicas) {
+                return Err(invalid_value(format!(
+                    "Invalid value {replicas} for the number of replica nodes in a node group \
+                     (shard): valid values are 0 to {}.",
+                    crate::state::MAX_REPLICAS_PER_NODE_GROUP
+                )));
+            }
+            // "The number of Availability Zones in this list must match the
+            // value of ReplicaCount or ReplicasPerNodeGroup if not specified."
+            if let Some(zones) = config.and_then(|config| config.replica_availability_zones.as_ref())
+            {
+                if zones.len() != replicas as usize {
+                    return Err(invalid_combination(format!(
+                        "ReplicaAvailabilityZones lists {} zones, which must match the {replicas} \
+                         replicas of the node group (shard).",
+                        zones.len()
+                    )));
+                }
+            }
+            shard_replicas.push(replicas);
+        }
+
+        // The keyspaces the request named, if it named any: a shard's `Slots`
+        // partitions the keyspace, so either every shard is given one or none
+        // is, and together they must cover the keyspace exactly once.
+        let configured_slots: Vec<&String> = shard_configs
+            .iter()
+            .filter_map(|config| config.slots.as_ref())
+            .collect();
+        if !configured_slots.is_empty() {
+            if configured_slots.len() != num_node_groups as usize {
+                return Err(invalid_combination(format!(
+                    "Slots was given for {} of the {num_node_groups} node groups (shards): a \
+                     keyspace partition names the slots of every shard or of none.",
+                    configured_slots.len()
+                )));
+            }
+            if !cluster_enabled {
+                return Err(invalid_combination(
+                    "Slots partitions the keyspace across shards, which a cluster mode disabled \
+                     replication group does not do."
+                        .to_string(),
+                ));
+            }
+            let mut ranges = Vec::with_capacity(configured_slots.len());
+            for slots in &configured_slots {
+                match crate::state::slot_range(slots) {
+                    Ok(range) => ranges.push(range),
+                    Err(message) => return Err(invalid_value(message)),
+                }
+            }
+            ranges.sort_unstable();
+            let covers_keyspace = ranges.first().is_some_and(|(start, _)| *start == 0)
+                && ranges
+                    .last()
+                    .is_some_and(|(_, end)| *end == crate::state::KEYSPACE_SLOTS - 1)
+                && ranges.windows(2).all(|pair| pair[1].0 == pair[0].1 + 1);
+            if !covers_keyspace {
+                return Err(invalid_combination(format!(
+                    "Slots must partition the keyspace 0-{} across the node groups (shards) \
+                     exactly once, with no gap and no overlap.",
+                    crate::state::KEYSPACE_SLOTS - 1
+                )));
+            }
+        }
+
+        // Automatic failover promotes a replica, so it needs one: "If
+        // AutomaticFailoverEnabled is true, the value of [NumCacheClusters] must
+        // be at least 2." And it "must be enabled for Valkey or Redis OSS
+        // (cluster mode enabled) replication groups", which is why a sharded
+        // group that has replicas cannot turn it off.
+        let every_shard_has_replica = shard_replicas.iter().all(|replicas| *replicas >= 1);
+        let automatic_failover = match input.automatic_failover_enabled {
+            Some(true) if !every_shard_has_replica => {
+                return Err(invalid_combination(
+                    "AutomaticFailoverEnabled requires at least one replica in every node group \
+                     (shard) to promote."
+                        .to_string(),
+                ))
+            }
+            Some(false) if cluster_enabled && every_shard_has_replica => {
+                return Err(invalid_combination(
+                    "AutomaticFailoverEnabled must be enabled for a cluster mode enabled \
+                     replication group."
+                        .to_string(),
+                ))
+            }
+            Some(enabled) => enabled,
+            // "Default: false" for a cluster mode disabled group; a cluster mode
+            // enabled group with a replica in every shard has it enabled.
+            None => cluster_enabled && every_shard_has_replica,
+        };
+        // Multi-AZ enhances fault tolerance by failing the primary over to a
+        // replica in another zone, which is the automatic failover above.
+        let multi_az = input.multi_az_enabled.unwrap_or(false);
+        if multi_az && !automatic_failover {
+            return Err(invalid_combination(
+                "MultiAZEnabled requires AutomaticFailoverEnabled: Multi-AZ fault tolerance is \
+                 the promotion of a replica in another Availability Zone."
+                    .to_string(),
+            ));
+        }
+
+        // Where the clusters of a cluster mode disabled group go: "The order of
+        // the Availability Zones in the list is the order in which clusters are
+        // allocated. The primary cluster is created in the first AZ in the list
+        // … The number of Availability Zones listed must equal the value of
+        // NumCacheClusters." It "is not used if there is more than one node
+        // group (shard). You should use NodeGroupConfiguration instead."
+        if let Some(zones) = input.preferred_cache_cluster_a_zs.as_deref() {
+            if num_node_groups > 1 {
+                return Err(invalid_combination(format!(
+                    "PreferredCacheClusterAZs cannot be combined with NumNodeGroups \
+                     ({num_node_groups}); use NodeGroupConfiguration instead."
+                )));
+            }
+            if !shard_configs.is_empty() {
+                return Err(invalid_combination(
+                    "PreferredCacheClusterAZs and NodeGroupConfiguration both place the clusters \
+                     of a node group (shard) and cannot both be specified."
+                        .to_string(),
+                ));
+            }
+            let clusters = shard_replicas.first().copied().unwrap_or(0) + 1;
+            if zones.len() != clusters as usize {
+                return Err(invalid_combination(format!(
+                    "PreferredCacheClusterAZs lists {} zones, which must equal the {clusters} \
+                     clusters of the replication group.",
+                    zones.len()
+                )));
+            }
+        }
+
+        // "PrimaryClusterId … This parameter is not required if NumCacheClusters,
+        // NumNodeGroups, or ReplicasPerNodeGroup is specified": a named primary
+        // cluster is the first member of the group's single shard, so a
+        // partitioned group has nowhere to put it.
+        if input.primary_cluster_id.is_some() && cluster_enabled {
+            return Err(invalid_combination(
+                "PrimaryClusterId cannot be combined with a cluster mode enabled replication \
+                 group: a named primary cluster is the first member of the group's single shard."
+                    .to_string(),
+            ));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Whether the primary cluster below is `available` depends on the status
+        // change the clock may already owe it, so that is materialised first.
+        store.settle_all(now);
+
+        if store.replication_groups.contains_key(&replication_group_id) {
+            return Err(
+                CreateReplicationGroupErrorModeled::ReplicationGroupAlreadyExistsFault(
+                    ReplicationGroupAlreadyExistsFault {
+                        message: Some(format!(
+                            "Replication group {replication_group_id} already exists."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The parameter group the group's clusters join has to be one this
+        // account holds, so the name is resolved against the stored groups — the
+        // default group of every published family, plus whatever
+        // `CreateCacheParameterGroup` added. The STORED name is what the group
+        // carries, so it reports the group's own identity rather than the casing
+        // the request used.
+        let requested_parameter_group = match input.cache_parameter_group_name.as_deref() {
+            Some(name) => match store.parameter_group(name) {
+                Some(group) => Some(group.name.clone()),
+                None => {
+                    return Err(
+                        CreateReplicationGroupErrorModeled::CacheParameterGroupNotFoundFault(
+                            CacheParameterGroupNotFoundFault {
+                                message: Some(format!("CacheParameterGroup {name} not found.")),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        // Seeding the group from a stored snapshot ("The name of a snapshot from
+        // which to restore data into the new replication group"): a name this
+        // account never took is the modelled bad value, and a snapshot that DOES
+        // exist is a restore nobody has written yet, so it answers the scaffold's
+        // 501 rather than a group whose data was never loaded.
+        if let Some(name) = input.snapshot_name.as_deref() {
+            if !store.snapshots.contains_key(&name.to_ascii_lowercase()) {
+                return Err(invalid_value(format!(
+                    "Invalid value {name} for SnapshotName: no such snapshot exists."
+                )));
+            }
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateReplicationGroup seeded from a snapshot",
+            ));
+        }
+
+        // The cluster the request named as the group's primary: it "must already
+        // exist and have a status of available", and it becomes the group's
+        // first member, so the group takes its configuration wherever the
+        // request named none.
+        let primary = match input.primary_cluster_id.as_deref() {
+            Some(id) => {
+                let key = id.to_ascii_lowercase();
+                let Some(cluster) = store.cache_clusters.get(&key) else {
+                    return Err(CreateReplicationGroupErrorModeled::CacheClusterNotFoundFault(
+                        CacheClusterNotFoundFault {
+                            message: Some(format!("Cache cluster {id} not found.")),
+                        },
+                    )
+                    .into());
+                };
+                if cluster.status != crate::state::STATUS_AVAILABLE {
+                    return Err(
+                        CreateReplicationGroupErrorModeled::InvalidCacheClusterStateFault(
+                            InvalidCacheClusterStateFault {
+                                message: Some(format!(
+                                    "Cache cluster {key} is in the {} state, not available.",
+                                    cluster.status
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                if let Some(group) = cluster.replication_group_id.as_deref() {
+                    return Err(invalid_value(format!(
+                        "Invalid value {id} for PrimaryClusterId: that cluster is already a \
+                         member of replication group {group}."
+                    )));
+                }
+                Some(cluster.clone())
+            }
+            None => None,
+        };
+
+        // The group's engine: what the request named, else the primary
+        // cluster's, else the service default. A Memcached cluster cannot be a
+        // primary — this operation "is valid for Valkey and Redis OSS only".
+        let engine = match requested_engine {
+            Some(engine) => engine,
+            None => {
+                let inherited = primary
+                    .as_ref()
+                    .map(|cluster| cluster.engine.clone())
+                    .unwrap_or_else(|| crate::state::DEFAULT_ENGINE.to_string());
+                match crate::state::normalize_replication_group_engine(&inherited) {
+                    Ok(engine) => engine,
+                    Err(message) => return Err(invalid_value(message)),
+                }
+            }
+        };
+        let engine_version = input
+            .engine_version
+            .or_else(|| {
+                primary
+                    .as_ref()
+                    .map(|cluster| cluster.engine_version.clone())
+            })
+            .unwrap_or_else(|| crate::state::default_engine_version(&engine).to_string());
+        let cache_node_type = input.cache_node_type.or_else(|| {
+            primary
+                .as_ref()
+                .and_then(|cluster| cluster.cache_node_type.clone())
+        });
+
+        // "Data tiering is only supported for replication groups using the r6gd
+        // node type. This parameter must be set to true when using r6gd nodes."
+        let r6gd = cache_node_type
+            .as_deref()
+            .is_some_and(|node_type| node_type.contains(crate::state::DATA_TIERING_NODE_TYPE));
+        let data_tiering = input.data_tiering_enabled.unwrap_or(r6gd);
+        if data_tiering != r6gd {
+            return Err(invalid_combination(format!(
+                "DataTieringEnabled is {data_tiering} and the node type is {}: data tiering is \
+                 supported only on the {} node type, and must be enabled on it.",
+                cache_node_type.as_deref().unwrap_or("unset"),
+                crate::state::DATA_TIERING_NODE_TYPE
+            )));
+        }
+
+        // The subnet group the group's clusters are placed in has to be one this
+        // account created.
+        let cache_subnet_group_name = match input.cache_subnet_group_name.as_deref() {
+            Some(name) => {
+                let key = name.to_ascii_lowercase();
+                match store.cache_subnet_groups.get(&key) {
+                    Some(group) => Some(group.name.clone()),
+                    None => {
+                        return Err(
+                            CreateReplicationGroupErrorModeled::CacheSubnetGroupNotFoundFault(
+                                CacheSubnetGroupNotFoundFault {
+                                    message: Some(format!("Cache subnet group {name} not found.")),
+                                },
+                            )
+                            .into(),
+                        )
+                    }
+                }
+            }
+            None => primary
+                .as_ref()
+                .and_then(|cluster| cluster.cache_subnet_group_name.clone()),
+        };
+
+        // The shards and their members as they will be stored: the cluster ids
+        // ElastiCache derives from the group id, and the zone each member sits
+        // in.
+        let mut shards = Vec::with_capacity(shard_replicas.len());
+        for (index, replicas) in shard_replicas.iter().enumerate() {
+            let config = shard_configs.get(index);
+            let node_group_id = match config.and_then(|config| config.node_group_id.as_deref()) {
+                // "Either the ElastiCache supplied 4-digit id or a user supplied
+                // id": `AllowedNodeGroupId`'s modelled `@pattern` is `^\d+$` and
+                // its `@length` is 1..4, so a value that reaches here parses, and
+                // the stored id is the 4-digit form. One that does not is refused
+                // rather than silently stored as some other shard's id.
+                Some(id) => match id.parse::<u32>() {
+                    Ok(parsed) => format!("{parsed:04}"),
+                    Err(_) => {
+                        return Err(invalid_value(format!(
+                            "Invalid value {id} for NodeGroupId: a node group (shard) id is up to \
+                             4 digits."
+                        )))
+                    }
+                },
+                None => format!("{:04}", index + 1),
+            };
+            // Two shards of one group cannot carry the same id: it is what every
+            // later call names a shard by.
+            if shards
+                .iter()
+                .any(|shard: &crate::state::NewShard| shard.node_group_id == node_group_id)
+            {
+                return Err(invalid_combination(format!(
+                    "Node group (shard) {node_group_id} is named more than once; each shard of a \
+                     replication group has its own id."
+                )));
+            }
+            let slots = cluster_enabled.then(|| {
+                config
+                    .and_then(|config| config.slots.clone())
+                    .unwrap_or_else(|| {
+                        crate::state::default_slots(
+                            num_node_groups,
+                            i32::try_from(index).unwrap_or_default(),
+                        )
+                    })
+            });
+            let mut members = Vec::with_capacity(*replicas as usize + 1);
+            for member_index in 0..=*replicas as usize {
+                let availability_zone = member_zone(
+                    &region,
+                    input.preferred_cache_cluster_a_zs.as_deref(),
+                    config,
+                    member_index,
+                );
+                let adopt = member_index == 0 && primary.is_some();
+                let cache_cluster_id = match primary.as_ref().filter(|_| adopt) {
+                    // The named primary keeps its own id; the group's other
+                    // members are numbered after it.
+                    Some(cluster) => cluster.cache_cluster_id.clone(),
+                    None => crate::state::member_cluster_id(
+                        &replication_group_id,
+                        &node_group_id,
+                        member_index + 1,
+                        cluster_enabled,
+                    ),
+                };
+                if !crate::state::is_valid_cluster_id(&cache_cluster_id) {
+                    return Err(invalid_value(format!(
+                        "Invalid value {} for ReplicationGroupId: it yields the member cluster id \
+                         {cache_cluster_id}, which is not a valid cluster id.",
+                        input.replication_group_id
+                    )));
+                }
+                if !adopt && store.cache_clusters.contains_key(&cache_cluster_id) {
+                    return Err(invalid_value(format!(
+                        "Invalid value {} for ReplicationGroupId: its member cluster \
+                         {cache_cluster_id} already exists.",
+                        input.replication_group_id
+                    )));
+                }
+                members.push(crate::state::NewMember {
+                    cache_cluster_id,
+                    availability_zone,
+                    adopt,
+                });
+            }
+            shards.push(crate::state::NewShard {
+                node_group_id,
+                slots,
+                members,
+            });
+        }
+
+        // The store is bounded: a group's members are cache clusters, and past
+        // the quota the create is refused rather than adding more records.
+        let minted = shards
+            .iter()
+            .flat_map(|shard| shard.members.iter())
+            .filter(|member| !member.adopt)
+            .count();
+        if store.cache_clusters.len() + minted > crate::state::CLUSTER_QUOTA {
+            return Err(
+                CreateReplicationGroupErrorModeled::ClusterQuotaForCustomerExceededFault(
+                    ClusterQuotaForCustomerExceededFault {
+                        message: Some(format!(
+                            "The replication group's {minted} clusters would exceed the maximum \
+                             of {} cache clusters for this account.",
+                            crate::state::CLUSTER_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // At-rest encryption "cannot be modified after the replication group is
+        // created", and its default is the engine's: "true when using Valkey,
+        // false when using Redis OSS".
+        let at_rest_encryption_enabled = input
+            .at_rest_encryption_enabled
+            .unwrap_or(engine == crate::state::ENGINE_VALKEY);
+        // `Durability` reports the setting the request asked for, and
+        // `EffectiveDurability` what it resolves to; see
+        // `crate::state::EFFECTIVE_DURABILITY_ASYNC`.
+        let durability = input
+            .durability
+            .unwrap_or_else(|| crate::state::DURABILITY_DEFAULT.to_string());
+        let effective_durability = if durability == crate::state::DURABILITY_DEFAULT {
+            crate::state::EFFECTIVE_DURABILITY_ASYNC.to_string()
+        } else {
+            durability.clone()
+        };
+
+        // "Default: the default cache parameter group for the specified engine":
+        // the derived default is resolved through the SAME stored map as a named
+        // group, so the group this replication group reports is always one this
+        // account holds. A version no published family covers has no default
+        // group to join, so the version itself is refused.
+        let cache_parameter_group_name = match requested_parameter_group {
+            Some(name) => name,
+            None => {
+                let derived = crate::state::default_parameter_group_name(&engine, &engine_version)
+                    .and_then(|derived| {
+                        store
+                            .parameter_group(&derived)
+                            .map(|group| group.name.clone())
+                    });
+                match derived {
+                    Some(name) => name,
+                    None => {
+                        return Err(invalid_value(format!(
+                            "Invalid value {engine_version} for EngineVersion: no cache parameter \
+                             group family supports it."
+                        )))
+                    }
+                }
+            }
+        };
+
+        let new = crate::state::NewReplicationGroup {
+            port: input
+                .port
+                .or_else(|| primary.as_ref().map(|cluster| cluster.endpoint_port))
+                .unwrap_or_else(|| crate::state::default_port(&engine)),
+            cache_parameter_group_name,
+            preferred_maintenance_window: input
+                .preferred_maintenance_window
+                .or_else(|| {
+                    primary
+                        .as_ref()
+                        .map(|cluster| cluster.preferred_maintenance_window.clone())
+                })
+                .unwrap_or_else(|| crate::state::DEFAULT_MAINTENANCE_WINDOW.to_string()),
+            // A replication group runs Valkey or Redis OSS, which support
+            // backups, so it always carries a retention limit: "Default: 0
+            // (i.e., automatic backups are disabled)".
+            snapshot_retention_limit: Some(
+                input
+                    .snapshot_retention_limit
+                    .or_else(|| {
+                        primary
+                            .as_ref()
+                            .and_then(|cluster| cluster.snapshot_retention_limit)
+                    })
+                    .unwrap_or(crate::state::DEFAULT_SNAPSHOT_RETENTION_LIMIT),
+            ),
+            snapshot_window: input.snapshot_window.or_else(|| {
+                primary
+                    .as_ref()
+                    .and_then(|cluster| cluster.snapshot_window.clone())
+            }),
+            auto_minor_version_upgrade: input.auto_minor_version_upgrade.or_else(|| {
+                primary
+                    .as_ref()
+                    .and_then(|cluster| cluster.auto_minor_version_upgrade)
+            }),
+            security_group_ids: input
+                .security_group_ids
+                .or_else(|| {
+                    primary
+                        .as_ref()
+                        .map(|cluster| cluster.security_group_ids.clone())
+                })
+                .unwrap_or_default(),
+            notification_topic_arn: input.notification_topic_arn.or_else(|| {
+                primary
+                    .as_ref()
+                    .and_then(|cluster| cluster.notification_topic_arn.clone())
+            }),
+            replication_group_id: replication_group_id.clone(),
+            description: input.replication_group_description,
+            region,
+            engine,
+            engine_version,
+            cache_node_type,
+            cluster_enabled,
+            cluster_mode,
+            automatic_failover,
+            multi_az,
+            shards,
+            cache_subnet_group_name,
+            auth_token_enabled: input.auth_token.is_some(),
+            transit_encryption_enabled,
+            transit_encryption_mode: input.transit_encryption_mode,
+            at_rest_encryption_enabled,
+            kms_key_id: input.kms_key_id,
+            data_tiering,
+            network_type: input.network_type,
+            ip_discovery: input.ip_discovery,
+            // No user group can exist to associate; the request is refused
+            // above when it names one.
+            user_group_ids: Vec::new(),
+            log_delivery_configurations: {
+                let mut stored = Vec::new();
+                crate::state::apply_log_delivery(
+                    &mut stored,
+                    input.log_delivery_configurations.unwrap_or_default(),
+                );
+                stored
+            },
+            durability,
+            effective_durability,
+            tags,
+            now,
+        };
+
+        // A created group is NOT ready: it answers `creating`, and the clock
+        // owes it `available` once the transition span has passed. The response
+        // is read back out of the store, so it reports what was persisted.
+        store.insert_replication_group(new);
+        let Some(replication_group) = store.modeled_replication_group(&replication_group_id) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        Ok(CreateReplicationGroupOutput {
+            replication_group: Some(replication_group),
+        })
     }
+}
+
+/// The modelled refusal for a member whose VALUE this service does not accept:
+/// "The value for a parameter is invalid."
+fn invalid_value(message: String) -> CreateReplicationGroupError {
+    CreateReplicationGroupErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled refusal for members that cannot hold together: "Two or more
+/// incompatible parameters were specified."
+fn invalid_combination(message: String) -> CreateReplicationGroupError {
+    CreateReplicationGroupErrorModeled::InvalidParameterCombinationException(
+        InvalidParameterCombinationException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// Where the `member_index`-th cluster (the primary first) of a node group
+/// (shard) is placed: the zone the request named for it, else a system chosen
+/// one, spread over the Region's zones so a shard's primary and its replicas do
+/// not all sit in the same zone.
+///
+/// `PreferredCacheClusterAZs` is the cluster mode disabled group's list, in
+/// allocation order; `NodeGroupConfiguration` names a shard's
+/// `PrimaryAvailabilityZone` and its `ReplicaAvailabilityZones`.
+fn member_zone(
+    region: &str,
+    preferred: Option<&[String]>,
+    config: Option<&NodeGroupConfiguration>,
+    member_index: usize,
+) -> Option<String> {
+    if let Some(zone) = preferred.and_then(|zones| zones.get(member_index)) {
+        return Some(zone.clone());
+    }
+    if let Some(config) = config {
+        if member_index == 0 {
+            if let Some(zone) = config.primary_availability_zone.clone() {
+                return Some(zone);
+            }
+        } else if let Some(zone) = config
+            .replica_availability_zones
+            .as_ref()
+            .and_then(|zones| zones.get(member_index - 1))
+        {
+            return Some(zone.clone());
+        }
+    }
+    Some(crate::state::availability_zone(region, member_index))
 }

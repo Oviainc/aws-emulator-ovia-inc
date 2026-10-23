@@ -26,28 +26,13 @@
 //!    `ResourceNotFoundException` (404), and a domain the caller does not hold is 404
 //!    for both operations.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A SigV4 `Authorization` header in the shape the router's routing key reader parses:
-/// its credential scope is what names the target service AND the region every minted ARN
-/// carries. The signature itself is never checked here (the harness turns request
-/// authentication off), so it is a placeholder.
-const AUTH: &str =
-    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/codeartifact/aws4_request, \
-     SignedHeaders=host, Signature=0";
-
-/// The account id every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`), and
-/// therefore the `domainOwner` of every group here.
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
-
-/// The region in [`AUTH`]'s credential scope; every ARN below is regional on it.
-const REGION: &str = "us-east-1";
+use crate::harness::{call, create_domain, emulator, Answer, ACCOUNT, REGION};
 
 /// The pattern of the root package group, which every domain holds from creation.
-const ROOT: &str = "/*";
+pub(crate) const ROOT: &str = "/*";
 
 /// Every `PackageGroupOriginRestrictionType` the model declares — a group's
 /// `originConfiguration.restrictions` must carry one entry per type.
@@ -56,104 +41,9 @@ const ROOT: &str = "/*";
 /// values `["EXTERNAL_UPSTREAM", "INTERNAL_UPSTREAM", "PUBLISH"]`.
 const RESTRICTION_TYPES: [&str; 3] = ["EXTERNAL_UPSTREAM", "INTERNAL_UPSTREAM", "PUBLISH"];
 
-/// One HTTP answer, reduced to what a client branches on.
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    /// `x-amzn-errortype`, which is how restJson1 names the error shape.
-    error_type: Option<String>,
-    body: Value,
-}
-
-impl Answer {
-    /// The `x-amzn-errortype` error code, or `""` on a success.
-    fn code(&self) -> String {
-        self.error_type.clone().unwrap_or_default()
-    }
-
-    /// The `packageGroup` object of a successful answer.
-    fn group(&self) -> &Value {
-        self.body
-            .get("packageGroup")
-            .unwrap_or_else(|| panic!("no packageGroup in {:?}", self.body))
-    }
-
-    /// The `message` of an error answer.
-    fn message(&self) -> String {
-        self.body
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    }
-}
-
-/// The emulator under test: the production router with this one service mounted on a
-/// single shared engine, exactly as `core/router` assembles it.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Deterministic regardless of the ambient `--auth` setting: these requests carry an
-    // unsigned placeholder credential, and signature verification is the emulator's job,
-    // not this service's.
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_codeartifact_codeartifactcontrolplaneservice::EmulatedService::new(
-            engine,
-        ),
-    );
-    router
-}
-
-/// Send one request and reduce the response to an [`Answer`].
-async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option<Value>) -> Answer {
-    let payload = match &body {
-        Some(value) => bytes::Bytes::from(serde_json::to_vec(value).expect("serialize body")),
-        None => bytes::Bytes::new(),
-    };
-    let request = http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("host", "codeartifact.us-east-1.amazonaws.com")
-        .header("authorization", AUTH)
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("build request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let raw = response.into_body();
-    let body = if raw.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&raw)
-            .unwrap_or_else(|_| json!({ "unparsed": String::from_utf8_lossy(&raw) }))
-    };
-    Answer {
-        status,
-        error_type,
-        body,
-    }
-}
-
-async fn create_domain(router: &MultiServiceRouter, domain: &str) -> Answer {
-    call(
-        router,
-        "POST",
-        &format!("/v1/domain?domain={domain}"),
-        Some(json!({})),
-    )
-    .await
-}
-
 /// `CreatePackageGroup`: the pattern travels in the BODY (`packageGroup` carries no
 /// `httpQuery` binding), the domain in the query string.
-async fn create_package_group(
+pub(crate) async fn create_package_group(
     router: &MultiServiceRouter,
     domain: &str,
     pattern: &str,
@@ -177,7 +67,11 @@ async fn create_package_group(
 }
 
 /// `DescribePackageGroup`: both the domain and the pattern are `httpQuery`-bound.
-async fn describe_package_group(router: &MultiServiceRouter, domain: &str, pattern: &str) -> Answer {
+pub(crate) async fn describe_package_group(
+    router: &MultiServiceRouter,
+    domain: &str,
+    pattern: &str,
+) -> Answer {
     call(
         router,
         "GET",
@@ -341,7 +235,7 @@ fn hierarchy_cases() -> Vec<GroupCase> {
 async fn created_package_groups_round_trip_and_report_their_place_in_the_hierarchy() {
     let router = emulator();
     let domain = "pg-hierarchy";
-    let created_domain = create_domain(&router, domain).await;
+    let created_domain = create_domain(&router, domain, None).await;
     assert_eq!(
         created_domain.status, 200,
         "domain setup: expected 200, got {created_domain:?}"
@@ -472,7 +366,7 @@ struct ReparentCase {
 async fn inserting_a_group_above_a_leaf_reparents_it() {
     let router = emulator();
     let domain = "pg-reparent";
-    create_domain(&router, domain).await;
+    create_domain(&router, domain, None).await;
 
     // Rows differ along the leaf's terminator, how many levels the insertion adds, and
     // the ORDER of the insertions — shallow-then-deep against deep-then-shallow.
@@ -555,7 +449,7 @@ async fn every_domain_holds_a_root_package_group_that_allows_everything() {
     ];
 
     for domain in domains {
-        let created = create_domain(&router, &domain).await;
+        let created = create_domain(&router, &domain, None).await;
         assert_eq!(
             created.status, 200,
             "case {domain:?}: domain setup expected 200, got {created:?}"
@@ -608,7 +502,7 @@ async fn every_domain_holds_a_root_package_group_that_allows_everything() {
 async fn package_group_identity_refusals() {
     let router = emulator();
     let domain = "pg-refusals";
-    create_domain(&router, domain).await;
+    create_domain(&router, domain, None).await;
     let held = "/npm/*";
     assert_eq!(
         create_package_group(&router, domain, held, None, None)
@@ -733,7 +627,7 @@ async fn package_groups_are_bounded_by_the_per_domain_ceiling() {
 
     let router = emulator();
     let domain = "pg-quota";
-    create_domain(&router, domain).await;
+    create_domain(&router, domain, None).await;
 
     // The root group already occupies one slot, so this fills the domain exactly.
     for index in 1..CEILING {
@@ -761,7 +655,7 @@ async fn package_groups_are_bounded_by_the_per_domain_ceiling() {
 
     // Another domain has its own ceiling: the bound is per domain, not per account.
     let other = "pg-quota-two";
-    create_domain(&router, other).await;
+    create_domain(&router, other, None).await;
     let elsewhere = create_package_group(&router, other, &over, None, None).await;
     assert_eq!(
         elsewhere.status, 200,

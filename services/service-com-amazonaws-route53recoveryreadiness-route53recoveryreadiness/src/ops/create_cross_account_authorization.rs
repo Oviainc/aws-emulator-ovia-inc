@@ -8,6 +8,15 @@
 //! the store is a set and re-authorizing a value already held reports that same value
 //! back rather than storing a second copy.
 //!
+//! The value names the ACCOUNT being authorized, so the only one this service accepts is
+//! that account's root principal ARN (`arn:<partition>:iam::<12 digits>:root`), judged on
+//! the bytes as submitted; anything else is refused with HTTP 400 and the code
+//! `Validation` (see [`crate::state::validate_cross_account_authorization`]) and nothing
+//! is persisted. That grant refusal is the one answer of this operation that does NOT
+//! carry the modelled shape name: the store-ceiling refusal below is the emulator's own
+//! memory bound and keeps the modelled `ValidationException`, while the grant rule
+//! answers the code this service's refusal is recorded with.
+//!
 //! Implemented alongside `DeleteCrossAccountAuthorization`: a delete needs an
 //! authorization to remove for its effect to be observable at all.
 //!
@@ -150,14 +159,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The grant names the account being authorized, so only that account's root
+        // principal ARN can be honoured. The submitted bytes are judged as sent — no
+        // trimming or other normalisation — and a value that is not an account-root ARN
+        // is refused before the store is touched, with the code this refusal is recorded
+        // with (`Validation`, 400) rather than the modelled shape name.
         crate::state::validate_cross_account_authorization(&input.cross_account_authorization)
-            .map_err(|message| {
-                CreateCrossAccountAuthorizationErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(message),
-                    },
-                )
-            })?;
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateCrossAccountAuthorizationErrorModeled::InternalServerException(

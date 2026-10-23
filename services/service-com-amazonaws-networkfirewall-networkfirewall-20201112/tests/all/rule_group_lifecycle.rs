@@ -4,7 +4,7 @@
 //! `DescribeRuleGroup` read that proves what it persisted.
 //!
 //! Every test drives the service the way a client does, through the shared
-//! [`Harness`] in `firewall_lifecycle`: an awsJson1_0 `POST /` with
+//! [`Harness`] in `crate::harness`: an awsJson1_0 `POST /` with
 //! `X-Amz-Target: NetworkFirewall_20201112.<OperationName>`, so what is asserted
 //! is the WIRE behaviour and not a handler's return value.
 //!
@@ -13,7 +13,7 @@
 
 use serde_json::{json, Value};
 
-use crate::firewall_lifecycle::{error_code, is_uuid_form, string_at, Harness, ACCOUNT, REGION};
+use crate::harness::{error_code, is_uuid_form, string_at, Harness, ACCOUNT, REGION};
 
 /// A stateless rule group document with a single rule that matches anything.
 pub(crate) fn stateless_any() -> Value {
