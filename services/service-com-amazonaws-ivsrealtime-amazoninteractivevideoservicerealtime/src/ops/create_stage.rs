@@ -75,6 +75,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The resource a stage quota refusal names, as `crate::state::quota_exceeded_message`
+/// states it.
+const STAGE_QUOTA_RESOURCE: &str = "stage";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -154,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            CreateStageErrorModeled::InternalServerException(crate::state::state_unavailable())
+            crate::state::store_unavailable(CreateStageErrorModeled::InternalServerException)
         })?;
 
         let configurations = input.participant_token_configurations.unwrap_or_default();
@@ -166,17 +170,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .map_or(0, crate::state::attributes_size);
             if size > crate::state::MAX_TOKEN_ATTRIBUTES_BYTES {
-                return Err(CreateStageErrorModeled::ValidationException(
-                    ValidationException {
-                        exception_message: Some(format!(
-                            "participantTokenConfigurations[{index}].attributes must be at most \
-                             {} bytes in total, but is {size}",
-                            crate::state::MAX_TOKEN_ATTRIBUTES_BYTES,
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .into());
+                return Err(crate::state::validation_failed(
+                    CreateStageErrorModeled::ValidationException,
+                    // Worded in the construction this service states every constraint
+                    // refusal with (`crate::state::violation_clause`): the operation, the
+                    // dotted member path and the bound, with what the request sent. The
+                    // path names the list position the way the framework's own walk does.
+                    format!(
+                        "{}.participantTokenConfigurations.{}.member.attributes is required to \
+                         have a maximum size of {} bytes, found {size}",
+                        Self::NAME,
+                        index + 1,
+                        crate::state::MAX_TOKEN_ATTRIBUTES_BYTES,
+                    ),
+                ));
             }
         }
 
@@ -188,17 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at most the 12 token records the model allows in one request, which is far
         // under `MAX_PARTICIPANT_TOKENS_PER_STAGE`, so only the stage count needs it.
         if store.stages.len() >= crate::state::MAX_STAGES {
-            return Err(CreateStageErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    exception_message: Some(format!(
-                        "this emulator holds the maximum of {} stages; delete one before \
-                         creating another",
-                        crate::state::MAX_STAGES,
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
+            return Err(crate::state::quota_exceeded(
+                CreateStageErrorModeled::ServiceQuotaExceededException,
+                STAGE_QUOTA_RESOURCE,
+                crate::state::MAX_STAGES,
+            ));
         }
 
         // A fresh id per creation, re-minted on the (vanishingly unlikely) chance the
@@ -234,8 +235,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .ok_or_else(|| {
-                CreateStageErrorModeled::InternalServerException(
-                    crate::state::token_minting_failed(),
+                crate::state::token_minting_failed(
+                    CreateStageErrorModeled::InternalServerException,
                 )
             })?;
             records.push(record);

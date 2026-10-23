@@ -82,6 +82,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The resource a participant-token quota refusal names, as
+/// `crate::state::quota_exceeded_message` states it.
+const PARTICIPANT_TOKEN_QUOTA_RESOURCE: &str = "participant-token";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,8 +166,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            CreateParticipantTokenErrorModeled::InternalServerException(
-                crate::state::state_unavailable(),
+            crate::state::store_unavailable(
+                CreateParticipantTokenErrorModeled::InternalServerException,
             )
         })?;
 
@@ -178,30 +182,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // malformed whether or not its target exists.
         let size = crate::state::attributes_size(&attributes);
         if size > crate::state::MAX_TOKEN_ATTRIBUTES_BYTES {
-            return Err(CreateParticipantTokenErrorModeled::ValidationException(
-                ValidationException {
-                    exception_message: Some(format!(
-                        "attributes must be at most {} bytes in total, but is {size}",
-                        crate::state::MAX_TOKEN_ATTRIBUTES_BYTES,
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
+            return Err(crate::state::validation_failed(
+                CreateParticipantTokenErrorModeled::ValidationException,
+                // Worded in the construction this service states every constraint refusal
+                // with (`crate::state::violation_clause`): the operation, the member and
+                // the bound it violated, with what the request actually sent.
+                format!(
+                    "{}.attributes is required to have a maximum size of {} bytes, found {size}",
+                    Self::NAME,
+                    crate::state::MAX_TOKEN_ATTRIBUTES_BYTES,
+                ),
+            ));
         }
 
         let mut store = state.lock();
         if !store.stages.contains_key(&input.stage_arn) {
-            return Err(CreateParticipantTokenErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    exception_message: Some(format!(
-                        "stage {} does not exist",
-                        input.stage_arn
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
+            return Err(crate::state::resource_not_found(
+                CreateParticipantTokenErrorModeled::ResourceNotFoundException,
+                &input.stage_arn,
+            ));
         }
 
         // Bound the one store this operation grows, before anything is minted: the
@@ -212,20 +211,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.stage_arn)
             .map_or(0, Vec::len);
         if issued >= crate::state::MAX_PARTICIPANT_TOKENS_PER_STAGE {
-            return Err(
-                CreateParticipantTokenErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        exception_message: Some(format!(
-                            "stage {} already holds the maximum of {} participant tokens \
-                             this emulator keeps for one stage",
-                            input.stage_arn,
-                            crate::state::MAX_PARTICIPANT_TOKENS_PER_STAGE,
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .into(),
-            );
+            return Err(crate::state::quota_exceeded(
+                CreateParticipantTokenErrorModeled::ServiceQuotaExceededException,
+                PARTICIPANT_TOKEN_QUOTA_RESOURCE,
+                crate::state::MAX_PARTICIPANT_TOKENS_PER_STAGE,
+            ));
         }
 
         // Minted the single way `crate::state` mints a token record, so this operation
@@ -246,8 +236,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         )
         .ok_or_else(|| {
-            CreateParticipantTokenErrorModeled::InternalServerException(
-                crate::state::token_minting_failed(),
+            crate::state::token_minting_failed(
+                CreateParticipantTokenErrorModeled::InternalServerException,
             )
         })?;
 

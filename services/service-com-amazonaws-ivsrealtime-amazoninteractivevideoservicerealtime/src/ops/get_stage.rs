@@ -145,14 +145,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // written, so a later caller sees what this one saw.
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            GetStageErrorModeled::InternalServerException(crate::state::state_unavailable())
+            crate::state::store_unavailable(GetStageErrorModeled::InternalServerException)
         })?;
         let store = state.lock();
         let record = store.stages.get(&input.arn).ok_or_else(|| {
-            GetStageErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                exception_message: Some(format!("stage {} does not exist", input.arn)),
-                ..Default::default()
-            })
+            crate::state::resource_not_found(
+                GetStageErrorModeled::ResourceNotFoundException,
+                &input.arn,
+            )
         })?;
         Ok(GetStageOutput {
             stage: Some(record.to_stage()),

@@ -156,14 +156,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            UpdateStageErrorModeled::InternalServerException(crate::state::state_unavailable())
+            crate::state::store_unavailable(UpdateStageErrorModeled::InternalServerException)
         })?;
         let mut store = state.lock();
         let record = store.stages.get_mut(&input.arn).ok_or_else(|| {
-            UpdateStageErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                exception_message: Some(format!("stage {} does not exist", input.arn)),
-                ..Default::default()
-            })
+            crate::state::resource_not_found(
+                UpdateStageErrorModeled::ResourceNotFoundException,
+                &input.arn,
+            )
         })?;
 
         // Only the members the request supplied are changed; an absent member leaves

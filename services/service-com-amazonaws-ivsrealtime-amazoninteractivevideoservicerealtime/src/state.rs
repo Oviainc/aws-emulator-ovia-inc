@@ -11,10 +11,14 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use smithy_server_runtime::{Violation, ViolationKind};
+
 use crate::ops::types::{
-    AutoParticipantRecordingConfiguration, InternalServerException, ParticipantToken, Stage,
-    StageEndpoints, StageSummary,
+    AutoParticipantRecordingConfiguration, InternalServerException, ParticipantToken,
+    ResourceNotFoundException, ServiceQuotaExceededException, Stage, StageEndpoints, StageSummary,
+    ValidationException,
 };
+use crate::scaffolded::Scaffolded;
 
 /// Lifetime a participant token gets when the request omits `duration`.
 ///
@@ -222,27 +226,44 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// this service's store. Unreachable in this emulator (the router builds one
 /// `InMemoryEngine` and hands it to every operation), but a handler must answer
 /// rather than panic.
-pub fn state_unavailable() -> InternalServerException {
-    InternalServerException {
-        exception_message: Some(
-            "the IVS RealTime store is not reachable from the engine serving this request"
-                .to_string(),
-        ),
-        ..Default::default()
-    }
+///
+/// `variant` is the calling operation's OWN modelled error constructor, so the compiler
+/// still refuses a failure the operation does not model and the code and status stay
+/// model-derived; only the BODY is this service's rendering (see
+/// [`crate::scaffolded::Scaffolded::stated`]).
+pub fn store_unavailable<E>(variant: fn(InternalServerException) -> E) -> Scaffolded<E> {
+    let message = STORE_UNAVAILABLE_MESSAGE.to_string();
+    Scaffolded::stated(
+        variant(InternalServerException {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
 }
+
+/// The text [`store_unavailable`] states. AWS documents no message for this (it is an
+/// emulator fault, not a service behaviour), so it says plainly what failed.
+pub const STORE_UNAVAILABLE_MESSAGE: &str =
+    "the IVS RealTime store is not reachable from the engine serving this request";
 
 /// The modelled 500 a handler answers with when the emulator's credential store minted
 /// no secret for a participant token, so no token is issued rather than one this service
 /// made up itself.
-pub fn token_minting_failed() -> InternalServerException {
-    InternalServerException {
-        exception_message: Some(
-            "the participant token could not be minted, so no token was issued".to_string(),
-        ),
-        ..Default::default()
-    }
+pub fn token_minting_failed<E>(variant: fn(InternalServerException) -> E) -> Scaffolded<E> {
+    let message = TOKEN_MINTING_FAILED_MESSAGE.to_string();
+    Scaffolded::stated(
+        variant(InternalServerException {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
 }
+
+/// The text [`token_minting_failed`] states.
+pub const TOKEN_MINTING_FAILED_MESSAGE: &str =
+    "the participant token could not be minted, so no token was issued";
 
 /// Characters in a minted stage id. The model's `StageArn` pattern allows
 /// `[a-zA-Z0-9-]+` after `stage/`, and caps the whole ARN at 128 characters.
@@ -428,3 +449,298 @@ pub fn decode_page_token(token: &str) -> Option<u64> {
     let decoded = String::from_utf8(::aws_smithy_types::base64::decode(token).ok()?).ok()?;
     decoded.strip_prefix(PAGE_TOKEN_PREFIX)?.parse().ok()
 }
+
+// =============================================================================
+// How this service WORDS the failures it answers
+// =============================================================================
+//
+// Every message below is built from the REQUEST (the resource it named, the member it
+// sent, the quota it met) by one rule, stated once here and used by every handler that
+// answers that failure, so two operations cannot word the same refusal two ways. The
+// error CODE and the HTTP status are NOT here: they stay model-derived, on the modelled
+// error shape the operation declares (see `crate::scaffolded::Scaffolded::stated`).
+
+/// How this service states a request that named a resource it does not hold: the
+/// identifier the request named, under a fixed template.
+///
+/// One rule for every operation that takes an identifier. It is the same sentence the
+/// sibling IVS endpoints were recorded answering (`Resource: <arn> not found` for the
+/// low-latency `ivs` service's `GetChannel` / `UpdateChannel` / `CreateStreamKey`, and for
+/// `ivschat`), and the recorded IVS RealTime `CreateParticipantToken` not-found carries it
+/// too, which is what makes it a rule of the family rather than wording of one operation.
+pub fn resource_not_found_message(identifier: &str) -> String {
+    format!("Resource: {identifier} not found")
+}
+
+/// How this service states a quota refusal (`ServiceQuotaExceededException`, HTTP 402):
+/// it names the resource the quota is on and the limit that was reached.
+pub fn quota_exceeded_message(resource: &str, limit: usize) -> String {
+    format!("Resource: {resource} quota exceeded limit: {limit}")
+}
+
+/// The `ResourceNotFoundException` (HTTP 404) a handler answers when a request names a
+/// resource this service does not hold. See [`resource_not_found_message`].
+///
+/// `variant` is the calling operation's OWN modelled error constructor —
+/// `GetStageErrorModeled::ResourceNotFoundException`, say — so the compiler still refuses
+/// a failure the operation's model does not declare, and the error code and HTTP status
+/// stay derived from that modelled shape. Only the BODY is this service's own rendering:
+/// AWS puts the text under the key `message`, which the modelled `exceptionMessage` member
+/// is not (see `crate::scaffolded::STATED_ERROR_SCHEMA`). The modelled struct is filled in
+/// with the same text, so the error is complete as a Rust value too.
+pub fn resource_not_found<E>(
+    variant: fn(ResourceNotFoundException) -> E,
+    identifier: &str,
+) -> Scaffolded<E> {
+    let message = resource_not_found_message(identifier);
+    Scaffolded::stated(
+        variant(ResourceNotFoundException {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
+}
+
+/// The `ValidationException` (HTTP 400) a handler answers for a request it refuses for a
+/// reason the model cannot express. The caller supplies the sentence, built from the
+/// request by one of the rules above this line or by [`stated_violations`].
+pub fn validation_failed<E>(
+    variant: fn(ValidationException) -> E,
+    message: impl Into<String>,
+) -> Scaffolded<E> {
+    let message = message.into();
+    Scaffolded::stated(
+        variant(ValidationException {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
+}
+
+/// The `ServiceQuotaExceededException` (HTTP 402) a handler answers when a create would
+/// exceed a quota. See [`quota_exceeded_message`].
+pub fn quota_exceeded<E>(
+    variant: fn(ServiceQuotaExceededException) -> E,
+    resource: &str,
+    limit: usize,
+) -> Scaffolded<E> {
+    let message = quota_exceeded_message(resource, limit);
+    Scaffolded::stated(
+        variant(ServiceQuotaExceededException {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
+}
+
+// =============================================================================
+// How this service states a CONSTRAINT refusal
+// =============================================================================
+//
+// The framework's constraint walk runs between deserialize and `handle` and words a
+// violation the same way for every service ("1 validation error detected: Value '…' at
+// '…' failed to satisfy constraint: …"). IVS RealTime words it from the OPERATION and the
+// member path instead ("CreateParticipantToken.duration is required to have a maximum
+// value of 20160.0, found 20161.0" — recorded), and the operation is not reachable at the
+// framework's refusal seam: `Service::override_refusal` is handed the violations alone.
+// `crate::service`'s per-operation wrapper collects the framework's OWN violations and
+// brings the operation with it; the sentences are here, beside the message rules above,
+// and not one modelled constraint is restated — every bound and pattern a clause prints
+// comes off the `Violation` the walk produced.
+
+/// A numeric bound or submitted value as this service's validation layer renders it: the
+/// decimal form, so an integral value carries a `.0` (`20160` reads as `20160.0`).
+///
+/// The bound arrives as the text the constraint trait displays with and the submitted
+/// value as the text the request carried, so a value that already shows a fraction is
+/// left exactly as it is.
+fn as_decimal(value: &str) -> String {
+    if value.contains('.') {
+        value.to_string()
+    } else {
+        format!("{value}.0")
+    }
+}
+
+/// One violation as this service states it: the operation, the dotted member path and
+/// the constraint the request violated.
+///
+/// The `@range` form is the recorded one. The remaining kinds are derived from it by the
+/// same construction — the operation and member path, then the requirement — because
+/// AWS's exact wording for those is not recorded; the ERROR CODE and status they travel
+/// with are the modelled ones either way.
+pub fn violation_clause(operation: &str, violation: &Violation) -> String {
+    let path = violation.path.as_str();
+    let found = violation.value.as_deref().unwrap_or_default();
+    match &violation.kind {
+        ViolationKind::MinValue(minimum) => format!(
+            "{operation}.{path} is required to have a minimum value of {}, found {}",
+            as_decimal(minimum),
+            as_decimal(found),
+        ),
+        ViolationKind::MaxValue(maximum) => format!(
+            "{operation}.{path} is required to have a maximum value of {}, found {}",
+            as_decimal(maximum),
+            as_decimal(found),
+        ),
+        ViolationKind::Pattern(pattern) => {
+            format!("{operation}.{path} does not match the required pattern {pattern}")
+        }
+        ViolationKind::MinLength(minimum) => format!(
+            "{operation}.{path} is required to have a minimum length of {minimum}, found {}",
+            found_length(violation),
+        ),
+        ViolationKind::MaxLength(maximum) => format!(
+            "{operation}.{path} is required to have a maximum length of {maximum}, found {}",
+            found_length(violation),
+        ),
+        ViolationKind::MissingRequiredMember => format!("{operation}.{path} is required"),
+        ViolationKind::EnumValue(allowed) => format!(
+            "{operation}.{path} is required to be one of [{}]",
+            allowed.join(", ")
+        ),
+        ViolationKind::UniqueItems => {
+            format!("{operation}.{path} is required to have unique values")
+        }
+        // `ViolationKind` is `#[non_exhaustive]`: a constraint class the framework gains
+        // later is stated in the same construction rather than silently unworded.
+        _ => format!("{operation}.{path} does not satisfy the constraint the model declares"),
+    }
+}
+
+/// `violations` as this service states them for `operation`, or `None` when there is
+/// nothing to refuse.
+///
+/// The recorded refusal carries ONE violation and states its sentence alone — no count
+/// prefix, unlike the framework's envelope — so one violation is its clause; several are
+/// joined, in the order the walk collected them.
+pub fn stated_violations(operation: &str, violations: &[Violation]) -> Option<String> {
+    match violations {
+        [] => None,
+        [only] => Some(violation_clause(operation, only)),
+        many => Some(
+            many.iter()
+                .map(|violation| violation_clause(operation, violation))
+                .collect::<Vec<String>>()
+                .join("; "),
+        ),
+    }
+}
+
+/// The length the request actually sent, for a `@length` violation.
+///
+/// A `Violation` carries WHAT was sent, not its size, so the size is read off that
+/// rendering: the framework renders a collection as `"<n> items"` and a string as the
+/// string itself. A string longer than the framework's echo cap arrives elided, which is
+/// the one case this count is short — it affects the number in the message and nothing
+/// about the refusal.
+fn found_length(violation: &Violation) -> usize {
+    let Some(value) = violation.value.as_deref() else {
+        return 0;
+    };
+    value
+        .strip_suffix(" items")
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| value.chars().count())
+}
+
+/// The violation for a `@required` member the request did not send.
+///
+/// Absence is found while READING the request, so it arrives as a codec error rather
+/// than from the constraint walk; this is the same `Violation` the framework's own
+/// `refusal_of` builds for it, so one refusal is not stated two ways.
+pub fn missing_member_violation(member_name: String) -> Violation {
+    Violation {
+        path: member_name,
+        kind: ViolationKind::MissingRequiredMember,
+        value: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bound and a submitted value reach the recorded decimal rendering, and a value
+    /// that already carries a fraction is not given a second one.
+    #[test]
+    fn a_numeric_bound_is_stated_in_decimal_form() {
+        let cases = [
+            ("an integral bound", "20160", "20160.0"),
+            ("one", "1", "1.0"),
+            ("zero", "0", "0.0"),
+            ("a negative value", "-3", "-3.0"),
+            ("an already-fractional value", "2.5", "2.5"),
+        ];
+        for (case, value, expected) in cases {
+            let actual = as_decimal(value);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// Every violation class states the operation, the member path and the requirement.
+    #[test]
+    fn a_violation_clause_names_the_operation_and_the_member() {
+        let cases = [
+            (
+                "a range maximum",
+                Violation {
+                    path: "duration".to_string(),
+                    kind: ViolationKind::MaxValue("20160".to_string()),
+                    value: Some("20161".to_string()),
+                },
+                "CreateParticipantToken.duration is required to have a maximum value of \
+                 20160.0, found 20161.0",
+            ),
+            (
+                "a range minimum",
+                Violation {
+                    path: "duration".to_string(),
+                    kind: ViolationKind::MinValue("1".to_string()),
+                    value: Some("0".to_string()),
+                },
+                "CreateParticipantToken.duration is required to have a minimum value of 1.0, \
+                 found 0.0",
+            ),
+            (
+                "a pattern",
+                Violation {
+                    path: "stageArn".to_string(),
+                    kind: ViolationKind::Pattern("^arn:aws:ivs:".to_string()),
+                    value: Some("nope".to_string()),
+                },
+                "CreateParticipantToken.stageArn does not match the required pattern \
+                 ^arn:aws:ivs:",
+            ),
+            (
+                "a minimum length",
+                Violation {
+                    path: "stageArn".to_string(),
+                    kind: ViolationKind::MinLength(1),
+                    value: Some(String::new()),
+                },
+                "CreateParticipantToken.stageArn is required to have a minimum length of 1, \
+                 found 0",
+            ),
+            (
+                "a required member",
+                missing_member_violation("stageArn".to_string()),
+                "CreateParticipantToken.stageArn is required",
+            ),
+        ];
+        for (case, violation, expected) in cases {
+            let actual = violation_clause("CreateParticipantToken", &violation);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+}
+
