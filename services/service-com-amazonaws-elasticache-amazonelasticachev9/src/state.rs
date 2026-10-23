@@ -40,6 +40,14 @@
 //! resource: `PurchaseReservedCacheNodesOffering` mints one and
 //! `DescribeReservedCacheNodes` reports it.
 //!
+//! A cache parameter group is a supporting resource:
+//! `CreateCacheParameterGroup` mints a custom one and
+//! `DescribeCacheParameterGroups` reports it beside the family defaults the
+//! service publishes. The parameter VALUES inside a group are not held here —
+//! `DescribeCacheParameters`, `ModifyCacheParameterGroup` and
+//! `ResetCacheParameterGroup` are still scaffolded 501s and own their own gap
+//! issues.
+//!
 //! Beside the cache resources sits the RBAC user: `CreateUser` mints one and
 //! `DescribeUsers` reports it, over the one [`UserRecord`] map below, which also
 //! holds the built-in `default` user every account already has.
@@ -206,6 +214,10 @@ pub const SNAPSHOT_TRANSITION: Duration = Duration::from_millis(500);
 pub const CLUSTER_QUOTA: usize = 300;
 /// See [`CLUSTER_QUOTA`].
 pub const SUBNET_GROUP_QUOTA: usize = 150;
+/// See [`CLUSTER_QUOTA`]; this one bounds the CUSTOM cache parameter groups the
+/// store holds, the family defaults of [`default_parameter_groups`] being
+/// published by the service rather than created by an account.
+pub const PARAMETER_GROUP_QUOTA: usize = 150;
 /// See [`CLUSTER_QUOTA`]; this is what `SnapshotQuotaExceededFault` refuses
 /// past.
 pub const SNAPSHOT_QUOTA: usize = 300;
@@ -479,12 +491,6 @@ pub fn default_parameter_group_name(engine: &str, engine_version: &str) -> Optio
         .map(|family| format!("{DEFAULT_PARAMETER_GROUP_PREFIX}{family}"))
 }
 
-/// The ARN of a cache parameter group:
-/// `arn:aws:elasticache:<region>:<account>:parametergroup:<name>`.
-pub fn parameter_group_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("parametergroup:{name}"))
-}
-
 /// The default parameter groups an account holds the moment ElastiCache becomes
 /// available in it: one per published family, which is why
 /// `DescribeCacheParameterGroups` answers with groups before anything has been
@@ -502,18 +508,26 @@ pub fn default_parameter_groups() -> BTreeMap<String, CacheParameterGroupRecord>
                 family: (*family).to_string(),
                 // The description AWS gives a family's own default group.
                 description: format!("Default parameter group for {family}"),
+                // Nothing tags a group the service itself provides.
+                tags: Vec::new(),
             };
             (record.name.clone(), record)
         })
         .collect()
 }
 
-/// One cache parameter group, as this emulator persists it.
+/// One cache parameter group, as this emulator persists it: a family default
+/// the store comes up holding, or a custom one `CreateCacheParameterGroup`
+/// created.
 ///
-/// Every group this store holds is one AWS provides in EVERY Region (a custom
-/// group needs `CreateCacheParameterGroup`, still a scaffolded 501 with its own
-/// issue), so the ARN a read reports names the Region of the request reading it
-/// — see [`CacheParameterGroupRecord::to_modeled`].
+/// Every group is one an account holds in the Region it is read from — a family
+/// default is provided in every Region, and a custom one is created in the
+/// Region of the create — so the ARN a read reports names the Region of the
+/// request reading it; see [`CacheParameterGroupRecord::to_modeled`].
+///
+/// The parameter VALUES inside a group are not here: `DescribeCacheParameters`,
+/// `ModifyCacheParameterGroup` and `ResetCacheParameterGroup` are scaffolded
+/// 501s with their own issues.
 #[derive(Debug, Clone)]
 pub struct CacheParameterGroupRecord {
     /// The group's identity, which "is stored as a lowercase string"
@@ -523,6 +537,9 @@ pub struct CacheParameterGroupRecord {
     pub family: String,
     /// `CacheParameterGroup$Description`.
     pub description: String,
+    /// The tags `CreateCacheParameterGroup` was given; see
+    /// [`CacheClusterRecord::tags`].
+    pub tags: Vec<(String, String)>,
 }
 
 impl CacheParameterGroupRecord {
@@ -1505,6 +1522,12 @@ pub fn subnet_group_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("subnetgroup:{name}"))
 }
 
+/// The ARN of a cache parameter group:
+/// `arn:aws:elasticache:<region>:<account>:parametergroup:<name>`.
+pub fn parameter_group_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("parametergroup:{name}"))
+}
+
 /// The ARN of a snapshot: `arn:aws:elasticache:<region>:<account>:snapshot:<name>`.
 pub fn snapshot_arn(region: &str, snapshot_name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("snapshot:{snapshot_name}"))
@@ -1554,9 +1577,9 @@ pub fn page_size_within(max_records: Option<i32>, default: i32, max: i32) -> Res
     Ok(usize::try_from(requested).unwrap_or(MAX_RECORDS_MIN as usize))
 }
 
-/// The page size `DescribeCacheClusters` / `DescribeCacheSubnetGroups` serve,
-/// whose `MaxRecords` documents "Default: 100. Constraints: minimum 20; maximum
-/// 100".
+/// The page size `DescribeCacheClusters` / `DescribeCacheSubnetGroups` /
+/// `DescribeCacheParameterGroups` serve, whose `MaxRecords` documents "Default:
+/// 100. Constraints: minimum 20; maximum 100".
 pub fn page_size(max_records: Option<i32>) -> Result<usize, String> {
     page_size_within(max_records, MAX_RECORDS_DEFAULT, MAX_RECORDS_MAX)
 }
@@ -5013,6 +5036,8 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// [`default_parameter_groups`]): those groups exist in an account before
     /// anything has been created, and seeding them HERE rather than from a
     /// handler is what keeps `DescribeCacheParameterGroups` a pure read.
+    /// `CreateCacheParameterGroup` adds the account's own custom groups beside
+    /// them.
     pub cache_parameter_groups: BTreeMap<String, CacheParameterGroupRecord>,
     /// Every stored snapshot, keyed by its (lowercased) `SnapshotName` — the
     /// resource's identity in this API, which `CreateSnapshot$SnapshotName`
@@ -5360,6 +5385,17 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         for reservation in self.reserved_cache_nodes.values_mut() {
             reservation.settle(now);
         }
+    }
+
+    /// How many CUSTOM cache parameter groups this account holds — the count
+    /// [`PARAMETER_GROUP_QUOTA`] is taken against. The family defaults the store
+    /// is seeded with are the service's own, so they do not count against an
+    /// account's quota.
+    pub fn custom_parameter_group_count(&self) -> usize {
+        self.cache_parameter_groups
+            .keys()
+            .filter(|name| !name.starts_with(DEFAULT_PARAMETER_GROUP_PREFIX))
+            .count()
     }
 
     /// Build and store a replication group and the member clusters it is made
