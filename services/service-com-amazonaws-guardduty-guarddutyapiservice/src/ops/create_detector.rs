@@ -244,6 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at_millis: now,
             findings: std::collections::BTreeMap::new(),
             filters: std::collections::BTreeMap::new(),
+            investigations: std::collections::BTreeMap::new(),
         };
         // The deprecated `DataSources` view is applied first so an explicit
         // `Features` entry for the same switch wins.
