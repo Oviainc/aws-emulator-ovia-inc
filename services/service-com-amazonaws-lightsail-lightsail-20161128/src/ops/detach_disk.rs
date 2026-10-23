@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachDisk
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachDisk`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Releases the attachment the block storage disk the request names holds, and
+//! answers the operation-log entry the detach appended. A disk attached to
+//! nothing, and a disk attached to an instance that is not stopped, are refused
+//! with the modelled `OperationFailureException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachDisk::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +162,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachDisk` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachDiskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachDisk"))
+        let _ = ctx;
+
+        let name = input.disk_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // READ what the request addresses first, so a refused detach writes
+            // nothing: the disk must exist, it must currently be attached, and
+            // the instance holding it must be stopped.
+            let (location, instance_name, already_due) = {
+                let Some(disk) = store.disk(&name) else {
+                    return Err(not_found(&name));
+                };
+                let Some(instance_name) = disk.attached_to.clone() else {
+                    // Nothing holds this disk, so there is no attachment for
+                    // this call to release and the operation cannot execute.
+                    return Err(not_detachable(disk.state));
+                };
+                (
+                    disk.location.clone(),
+                    instance_name,
+                    // A detach this same disk is already in flight on: an
+                    // ATTACHED, `in-use` disk the clock owes `available`, which
+                    // is the one transition that releases an attachment. The
+                    // `in-use` part is what tells it apart from the
+                    // `pending` -> `available` settle a newly created disk
+                    // carries, so a disk attached while it was still being
+                    // provisioned is never mistaken for one being detached.
+                    disk.due
+                        .filter(|due| {
+                            disk.state == crate::state::DISK_STATE_IN_USE
+                                && due.state == crate::state::DISK_STATE_AVAILABLE
+                        })
+                        .map(|due| due.at_ms),
+                )
+            };
+
+            // "Detaches a stopped block storage disk from a Lightsail instance.
+            // Make sure to unmount any file systems on the device within your
+            // operating system before stopping the instance and detaching the
+            // disk." — the modelled `DetachDisk` documentation: the instance
+            // this disk is attached to has to be stopped before the disk comes
+            // off it, so a detach from an instance in any other state is the
+            // service's operation-failure rejection. An instance record that is
+            // gone no longer holds anything, so it does not stand in the way.
+            //
+            // The precondition is evaluated ONCE, at the instant the detach is
+            // started: a disk whose detach the clock already owes is on its way
+            // off the instance, and what that instance does afterwards cannot
+            // put it back on, so a second call while the first is in flight does
+            // not re-check the instance's state.
+            if already_due.is_none() {
+                if let Some(instance) = store.instance(&instance_name) {
+                    if instance.state != crate::state::STOPPED {
+                        return Err(instance_not_stopped(
+                            &instance_name,
+                            instance.state.name,
+                        ));
+                    }
+                }
+            }
+
+            // The detachment the clock owes the disk. A detach already in
+            // flight keeps the instant it was already owed rather than pushing
+            // it further out, so repeating the call cannot hold a disk attached
+            // for longer; the disk stays `in-use` and attached until that
+            // instant, exactly as a read straight after this call reports
+            // against AWS.
+            let settles_at_ms = match already_due {
+                Some(at_ms) => at_ms,
+                None => {
+                    let due = crate::state::DueNamedState::after(
+                        now,
+                        crate::state::DISK_STATE_AVAILABLE,
+                    );
+                    let disk = store
+                        .disk_mut(&name)
+                        .expect("the disk was resolved from this same store above");
+                    disk.due = Some(due);
+                    due.at_ms
+                }
+            };
+
+            // `operations` is a list because other Lightsail calls act on
+            // several resources at once; `DetachDisk` acts on exactly one disk,
+            // so it answers exactly one entry, left non-terminal until the
+            // detachment the clock owes the disk is due.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DETACH_DISK,
+                crate::state::RESOURCE_TYPE_DISK,
+                &name,
+                &location,
+                Some(settles_at_ms),
+            );
+            Ok(DetachDiskOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// The disk the request names is attached to nothing, so this detach has no
+/// attachment to release: the modelled `OperationFailureException` — HTTP 400,
+/// "Lightsail throws this exception when an operation fails to execute" — whose
+/// message is built from the disk's own current `DiskState` value, the state
+/// that makes it undetachable.
+fn not_detachable(state: &str) -> DetachDiskError {
+    DetachDiskErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(format!(
+            "You can't detach this disk right now. The state of this disk is: {state}."
+        )),
+        // `code`, `docs` and `tip` are members this service fills from its own
+        // catalogue of failures, and no recorded response shows what it puts
+        // there for this one — so they are left absent rather than invented.
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The disk is attached to an instance that is not stopped, so it cannot come
+/// off it yet: the same modelled `OperationFailureException`, with a message
+/// built from the request — the instance holding the disk and the state it is
+/// in.
+fn instance_not_stopped(instance_name: &str, state: &str) -> DetachDiskError {
+    DetachDiskErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(format!(
+            "You can't detach this disk right now. The instance it is attached to must be \
+             stopped first; the state of instance {instance_name} is: {state}."
+        )),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No disk of that name is stored: Lightsail's `DoesNotExist` rejection — HTTP
+/// 400, wire error `NotFoundException`, body `code` `DoesNotExist` and a message
+/// naming the resource type and the requested name.
+fn not_found(name: &str) -> DetachDiskError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(crate::state::RESOURCE_TYPE_DISK, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DetachDiskError {
+    DetachDiskErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail disk store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

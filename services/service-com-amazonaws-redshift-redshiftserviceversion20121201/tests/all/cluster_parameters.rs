@@ -24,29 +24,32 @@ use crate::cluster_lifecycle::{all_text, Emulator};
 
 /// The parameter group family of the engine version this service publishes,
 /// read off the same catalog the handlers do rather than spelled out here.
-fn default_family() -> String {
+///
+/// `pub(crate)` so a sibling suite under `tests/all/` names the family the same
+/// way instead of spelling it out.
+pub(crate) fn default_family() -> String {
     state::parameter_group_family(state::DEFAULT_CLUSTER_VERSION)
 }
 
 /// The name of that engine version's DEFAULT parameter group, which a fresh
 /// account already has.
-fn default_group_name() -> String {
+pub(crate) fn default_group_name() -> String {
     state::default_parameter_group(state::DEFAULT_CLUSTER_VERSION)
 }
 
 /// One `<Parameter>` of a `DescribeClusterParameters` body, reduced to the
 /// members the assertions read.
 #[derive(Debug)]
-struct Reported {
-    name: Option<String>,
-    value: Option<String>,
-    description: Option<String>,
-    source: Option<String>,
-    data_type: Option<String>,
-    allowed_values: Option<String>,
-    apply_type: Option<String>,
-    is_modifiable: Option<String>,
-    minimum_engine_version: Option<String>,
+pub(crate) struct Reported {
+    pub(crate) name: Option<String>,
+    pub(crate) value: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) source: Option<String>,
+    pub(crate) data_type: Option<String>,
+    pub(crate) allowed_values: Option<String>,
+    pub(crate) apply_type: Option<String>,
+    pub(crate) is_modifiable: Option<String>,
+    pub(crate) minimum_engine_version: Option<String>,
 }
 
 /// The first `<tag>` inside one parameter's XML, or `None` when the member is
@@ -90,7 +93,9 @@ fn parameter_blocks(xml: &str) -> Vec<&str> {
 /// time, because a member the service publishes no value for (`AllowedValues`
 /// of a free-text parameter) is simply absent, so per-member lists would not
 /// line up.
-fn reported_parameters(xml: &str) -> Vec<Reported> {
+///
+/// `pub(crate)` so a sibling suite reads one body the same way.
+pub(crate) fn reported_parameters(xml: &str) -> Vec<Reported> {
     parameter_blocks(xml)
         .into_iter()
         .map(|block| Reported {
@@ -128,7 +133,10 @@ fn catalog_names() -> Vec<&'static str> {
 }
 
 /// Create one parameter group of the published family.
-async fn create_group(emulator: &Emulator, name: &str) {
+///
+/// `pub(crate)` so a sibling suite that needs a group of the account's own
+/// drives the same create path.
+pub(crate) async fn create_group(emulator: &Emulator, name: &str) {
     let answer = emulator
         .call(
             "CreateClusterParameterGroup",
@@ -149,9 +157,11 @@ async fn create_group(emulator: &Emulator, name: &str) {
 /// Persist values a caller holds on one group, straight into the same shared
 /// store the handler reads.
 ///
-/// `ModifyClusterParameterGroup` is still a scaffold stub, so a stored override
-/// is the only way to make the `user` `Source` observable at all; the request
-/// path under test is unchanged, exactly as
+/// This suite is about what a READ reports, so it seeds the held values rather
+/// than driving `ModifyClusterParameterGroup` for them: the `user` `Source` is
+/// then observable without the read's assertions depending on the write path,
+/// which has its own suite in
+/// [`crate::modify_cluster_parameter_group`]. Exactly as
 /// `cluster_lifecycle`'s automated-snapshot seeding does for snapshots.
 fn seed_held_values(emulator: &Emulator, group_name: &str, held: &[(&str, &str)]) {
     let store = state::service_state(&*emulator.engine).expect("the Redshift store");

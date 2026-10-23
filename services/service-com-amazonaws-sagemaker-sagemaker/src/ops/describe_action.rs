@@ -167,12 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(action) = store.actions.get(&key) else {
             // Never a 200 with empty fields: a caller cannot tell that from an action
-            // that exists and carries nothing. The message quotes the identifier the
-            // CALLER passed, never an ARN this service synthesised for it.
+            // that exists and carries nothing. The lineage readers report the identifier
+            // RESOLVED to its ARN, which `key` already is.
             return Err(DescribeActionErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Could not find action \"{}\".",
-                    input.action_name
+                message: Some(crate::state::does_not_exist(
+                    crate::state::ACTION_ENTITY,
+                    &key,
                 )),
             })
             .into());

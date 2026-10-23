@@ -23,7 +23,7 @@
 use serde_json::{json, Value};
 
 use super::inference_deployment_lifecycle::{
-    error_code, message, one_variant_config, primary_container, str_field, Emulator, ACCOUNT,
+    error_code, message, one_variant_config, primary_container, str_field, Emulator,
 };
 
 /// The model every configuration below hosts. `CreateEndpointConfig` refuses a variant
@@ -142,7 +142,8 @@ async fn delete_endpoint_config_removes_exactly_the_named_configuration() {
             "case {name:?}: the modelled output has no members, got {deleted:?}"
         );
 
-        // The configuration is gone: its reader refuses the name, naming the ARN.
+        // The configuration is gone: its reader refuses the name, quoting the name the
+        // request carried.
         let (read_status, read_body) = emulator
             .call_in(
                 region,
@@ -160,10 +161,11 @@ async fn delete_endpoint_config_removes_exactly_the_named_configuration() {
             "ValidationException",
             "case {name:?}: error code after the delete, got {read_body:?}"
         );
-        assert!(
-            message(&read_body).contains(&format!("{ACCOUNT}:endpoint-config/{name}")),
-            "case {name:?}: the refusal must name the configuration it could not find, \
-             got {read_body:?}"
+        assert_eq!(
+            message(&read_body),
+            format!("Could not find endpoint configuration \"{name}\"."),
+            "case {name:?}: the refusal must quote the configuration name the request \
+             carried, got {read_body:?}"
         );
 
         // A second delete is refused the same way: the entry really went.
@@ -183,10 +185,11 @@ async fn delete_endpoint_config_removes_exactly_the_named_configuration() {
             "ValidationException",
             "case {name:?}: error code for the second delete, got {repeat_body:?}"
         );
-        assert!(
-            message(&repeat_body).contains(&format!("{ACCOUNT}:endpoint-config/{name}")),
-            "case {name:?}: the second delete must name the configuration it could not \
-             find, got {repeat_body:?}"
+        assert_eq!(
+            message(&repeat_body),
+            format!("Could not find endpoint configuration \"{name}\"."),
+            "case {name:?}: the second delete must quote the configuration name the \
+             request carried, got {repeat_body:?}"
         );
 
         // Only that entry went: the sibling configuration and the model are untouched.
@@ -342,10 +345,11 @@ async fn deleting_a_configuration_leaves_the_endpoints_created_from_it() {
             "ValidationException",
             "case {config}: error code for the dangling reference, got {parsed:?}"
         );
-        assert!(
-            message(&parsed).contains(&format!("{ACCOUNT}:endpoint-config/{config}")),
-            "case {config}: the refusal must name the configuration it could not find, \
-             got {parsed:?}"
+        assert_eq!(
+            message(&parsed),
+            format!("Could not find endpoint configuration \"{config}\"."),
+            "case {config}: the refusal must quote the configuration name the request \
+             carried, got {parsed:?}"
         );
 
         // Once the configuration exists again, the endpoint create succeeds.

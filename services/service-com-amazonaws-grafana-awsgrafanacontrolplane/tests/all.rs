@@ -26,6 +26,9 @@ mod service_accounts;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
+
 #[path = "all/workspace_api_keys.rs"]
 mod workspace_api_keys;
 

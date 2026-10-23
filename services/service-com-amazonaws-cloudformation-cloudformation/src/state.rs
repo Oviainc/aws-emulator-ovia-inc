@@ -75,6 +75,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
+/// Creating the resources a stack's template declares in the services that own them, and
+/// deleting them when the stack is deleted.
+pub mod provisioning;
 /// Reading a stack's template body, and evaluating the resources and outputs it
 /// declares.
 pub mod template;
@@ -181,10 +184,13 @@ pub fn validate_template_body(template_body: &str) -> Result<(), String> {
 pub mod status {
     pub const CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
     pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+    pub const CREATE_FAILED: &str = "CREATE_FAILED";
     pub const UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
     pub const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
+    pub const UPDATE_FAILED: &str = "UPDATE_FAILED";
     pub const DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
     pub const DELETE_COMPLETE: &str = "DELETE_COMPLETE";
+    pub const DELETE_FAILED: &str = "DELETE_FAILED";
     /// The status of a stack a `CREATE` change set brought into existence and nothing has
     /// executed yet (`CreateChangeSetInput$ChangeSetType`: "If you create a change set for
     /// a new stack, CloudFormation creates a stack with a unique stack ID, but no template
@@ -307,6 +313,16 @@ pub struct StoredResource {
     pub physical_resource_id: String,
     /// The attributes `Fn::GetAtt` reads off this resource, keyed by attribute name.
     pub attributes: BTreeMap<String, String>,
+    /// The resource's declared `Properties` with every intrinsic function EVALUATED — the
+    /// request the owning service's create API takes
+    /// ([`provisioning`](crate::state::provisioning)). `Null` for a resource that declared
+    /// none.
+    pub properties: ::serde_json::Value,
+    /// Whether the resource was CREATED in the service that owns it, so the stack's
+    /// deletion has to delete it there. `false` for a resource type this emulator has no
+    /// provisioner for: nothing was created for it anywhere (see
+    /// [`provisioning`](crate::state::provisioning)).
+    pub materialised: bool,
 }
 
 /// One resource a stack has DEPLOYED: what the template declared it as, plus the
@@ -591,19 +607,47 @@ impl StoredStack {
             mappings: &declared.mappings,
             conditions: &declared.conditions,
         };
-        let resources = template::provision(&declared, &scope, &mut budget);
+        let mut resources = template::provision(&declared, &scope, &mut budget);
         let by_logical_id: BTreeMap<String, StoredResource> = resources
             .iter()
             .map(|resource| (resource.logical_id.clone(), resource.clone()))
             .collect();
-        let outputs = template::evaluate_outputs(
-            &declared,
-            &template::Scope {
-                resources: &by_logical_id,
-                ..scope
-            },
-            &mut budget,
-        );
+        // Everything resolved against the whole set, now that every resource's identity
+        // is known.
+        let resolved = template::Scope {
+            resources: &by_logical_id,
+            ..scope
+        };
+        // A second pass: each resource's properties are evaluated against the whole set,
+        // so a property naming another resource (a stream's `RoleARN` from an
+        // `Fn::GetAtt`) carries that resource's value. This is the request the service
+        // that owns the resource is asked to create it with.
+        template::resolve_properties(&declared, &mut resources, &resolved, &mut budget);
+        // A resource this stack ALREADY created in the service that owns it, and that this
+        // template declares again unchanged, is still that same created resource: the
+        // record carries forward both the fact that it exists there and what that service
+        // reported about it, so a later deletion still deletes it. Creating what is new
+        // and deleting what this deployment replaced is
+        // [`provisioning::reconcile`](provisioning::reconcile), which the deploying
+        // operation calls with these records.
+        let already_created = self.current_resources();
+        for resource in &mut resources {
+            if let Some(existing) = already_created.iter().find(|existing| {
+                existing.materialised && provisioning::is_same_resource(existing, resource)
+            }) {
+                // Deliberately NOT `provisioning::carry_forward`: that one also carries
+                // the properties the resource was created with, and this record's
+                // properties are what `reconcile` compares against them to see whether
+                // the deployment asks for a DIFFERENT configuration of a resource that
+                // already exists. Only the fact that it exists, and what the owning
+                // service reported about it, carry forward here.
+                resource.materialised = true;
+                for (name, value) in &existing.attributes {
+                    resource.attributes.insert(name.clone(), value.clone());
+                }
+            }
+        }
+        let outputs = template::evaluate_outputs(&declared, &resolved, &mut budget);
         self.pending_deployment = Some(PendingDeployment { resources, outputs });
     }
 
@@ -742,6 +786,73 @@ impl StoredStack {
             operation_id,
             client_request_token,
         });
+    }
+
+    /// The resources the stack has RIGHT NOW: the ones the operation in flight is about to
+    /// install while it is still in flight, else the ones its last completed operation
+    /// left. This is the set a stack's deletion has to delete.
+    pub fn current_resources(&self) -> Vec<StoredResource> {
+        match &self.pending_deployment {
+            Some(deployment) => deployment.resources.clone(),
+            None => self
+                .resources
+                .iter()
+                .map(|deployed| deployed.resource.clone())
+                .collect(),
+        }
+    }
+
+    /// Replace the resources of [`Self::current_resources`] with what the services that
+    /// own them answered — the attributes they reported, and whether each one was really
+    /// created there.
+    ///
+    /// For an operation still in flight that is the pending deployment, which
+    /// [`Self::settle`] installs when the operation completes. For one that has already
+    /// settled (a deletion acting on a stack whose create completed), the installed
+    /// records are rewritten in place, each keeping the resource STATUS and timestamp its
+    /// deployment gave it: nothing about a resource's status changed because its
+    /// provisioning record did.
+    pub fn record_materialised_resources(&mut self, resources: Vec<StoredResource>) {
+        if let Some(deployment) = &mut self.pending_deployment {
+            deployment.resources = resources;
+            return;
+        }
+        for resource in resources {
+            match self
+                .resources
+                .iter_mut()
+                .find(|deployed| deployed.resource.logical_id == resource.logical_id)
+            {
+                Some(deployed) => deployed.resource = resource,
+                // A resource the stack did not have installed under that logical id: it
+                // takes the status of the operation that recorded it.
+                None => self.resources.push(DeployedResource {
+                    resource,
+                    status: resource_status::CREATE_COMPLETE.to_string(),
+                    status_timestamp: SystemTime::now(),
+                }),
+            }
+        }
+    }
+
+    /// Record that the operation in flight could not be carried out: the stack takes the
+    /// failed status with the reason, the clock is owed nothing more, and the event log
+    /// carries the failure.
+    ///
+    /// This is how CloudFormation reports a stack whose resources an owning service
+    /// refused to create or delete (`CREATE_FAILED` / `DELETE_FAILED`) — the operation
+    /// does not stay pending and no terminal status it never reached is reported.
+    pub fn fail_transition(&mut self, now: SystemTime, failed_status: &str, reason: String) {
+        let pending = self.pending.take();
+        self.status = failed_status.to_string();
+        self.status_reason = Some(reason.clone());
+        self.record_event(
+            now,
+            failed_status,
+            Some(reason),
+            pending.as_ref().and_then(|p| p.operation_id.clone()),
+            pending.and_then(|p| p.client_request_token),
+        );
     }
 }
 

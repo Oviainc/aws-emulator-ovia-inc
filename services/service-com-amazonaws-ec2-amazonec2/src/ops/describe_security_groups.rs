@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
             Some(token) => Some(
                 crate::state::decode_page_token(token)
-                    .ok_or_else(crate::state::invalid_pagination_token)?,
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
             ),
         };
 

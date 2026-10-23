@@ -468,20 +468,23 @@ async fn describe_endpoint_config_replays_exactly_what_create_stored() {
 }
 
 /// RULE: a reader or a delete naming a resource that is not in state is refused with
-/// HTTP 400 `ValidationException` — never a 200 with empty members, and never a 501.
+/// HTTP 400 `ValidationException`, quoting the IDENTIFIER THE REQUEST CARRIED — never a
+/// 200 with empty members, never a 501, and never an ARN the service synthesised for a
+/// name the caller never sent.
 #[tokio::test]
 async fn an_absent_resource_is_refused_with_a_400_validation_exception() {
     let emulator = Emulator::new();
 
     // Rows: every implemented operation that resolves a name, each with a name nothing
-    // created, so the rule is asserted over the whole class rather than one reader.
+    // created, so the rule is asserted over the whole class rather than one reader. The
+    // third column is the kind label the service words that resource by.
     let cases: Vec<(&str, Value, &str)> = vec![
         ("DescribeModel", json!({ "ModelName": "absent" }), "model"),
         ("DeleteModel", json!({ "ModelName": "absent" }), "model"),
         (
             "DescribeEndpointConfig",
             json!({ "EndpointConfigName": "absent" }),
-            "endpoint-config",
+            "endpoint configuration",
         ),
         (
             "DescribeEndpoint",
@@ -496,12 +499,12 @@ async fn an_absent_resource_is_refused_with_a_400_validation_exception() {
         (
             "DeleteEndpointConfig",
             json!({ "EndpointConfigName": "absent" }),
-            "endpoint-config",
+            "endpoint configuration",
         ),
         (
             "CreateEndpoint",
             json!({ "EndpointName": "fresh", "EndpointConfigName": "absent" }),
-            "endpoint-config",
+            "endpoint configuration",
         ),
         (
             "CreateEndpointConfig",
@@ -521,9 +524,11 @@ async fn an_absent_resource_is_refused_with_a_400_validation_exception() {
             "ValidationException",
             "case {target}: error code, got {parsed:?}"
         );
-        assert!(
-            message(&parsed).contains(&format!("{ACCOUNT}:{kind}/absent")),
-            "case {target}: the refusal must name the {kind} it could not find, got {parsed:?}"
+        assert_eq!(
+            message(&parsed),
+            format!("Could not find {kind} \"absent\"."),
+            "case {target}: the refusal must quote the {kind} identifier the request \
+             carried, got {parsed:?}"
         );
     }
 }

@@ -9,6 +9,32 @@ Issue-Commit: bd3308b0c8d992d57414e8fe0564c68280e702c4
 
 # Lightsail: DetachDisk answers 501 NotImplemented, and a managed relational database announces an unreachable rds.lightsail.local master endpoint with no MySQL data plane
 
+> _Resolution note (issue fixer): Cause 1 is FIXED — `DetachDisk` is implemented
+> (`src/ops/detach_disk.rs`, scaffold marker deleted): it releases the attachment
+> the named disk holds, answering one non-terminal `DetachDisk` operation-log
+> entry and letting the clock settle the disk into `available` with no
+> `attachedTo`/`path`; a disk no instance holds is refused with HTTP 400
+> `OperationFailureException` ("You can't detach this disk right now. The state of
+> this disk is: <state>."), a disk held by an instance that is not `stopped` is
+> refused the same way (the modelled "Detaches a stopped block storage disk"
+> precondition), and a name this account holds no disk under keeps the service's
+> `DoesNotExist` envelope. Covered by `tests/all/disk_detach.rs`._
+>
+> _Cause 2 is DECLINED as a core (vendor) blocker, not a fix this emulator can
+> make: the only socket seam a service may use is `engine.listeners().tcp`, and it
+> is TLS-from-the-first-byte (`vendor/server/src/listeners.rs` — "TLS-only ... a
+> plaintext/HTTP preface also fails the handshake here and never reaches the
+> handler"), while MySQL sends its Initial Handshake Packet in the clear and
+> upgrades in-band on the client's SSL-request packet (PostgreSQL likewise, via
+> SSLRequest). Every real database driver therefore fails the core's TLS handshake
+> before a handler sees the connection, and a service may not bind a socket of its
+> own — so no address this service could announce would answer the MySQL protocol.
+> The core change this needs is a listener seam that hands a connection over
+> WITHOUT terminating TLS first. The announced `masterEndpoint.address` stays on
+> the emulator-owned `.local` suffix, which (RFC 6762 §3) can never address a host
+> off this machine, so it never sends a client out of the emulator; the reason is
+> recorded on `RELATIONAL_DATABASE_ENDPOINT_SUFFIX` in `src/state.rs`._
+
 > _Note: this issue was identified against the code base at commit `bd3308b0c8d992d57414e8fe0564c68280e702c4`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

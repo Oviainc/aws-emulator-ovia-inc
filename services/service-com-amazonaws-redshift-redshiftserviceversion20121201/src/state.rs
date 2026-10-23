@@ -180,6 +180,55 @@ pub const PARAMETER_SOURCE_USER: &str = "user";
 /// member="Source")` — "Valid Values: user | engine-default".
 pub const PARAMETER_SOURCES: [&str; 2] = [PARAMETER_SOURCE_USER, PARAMETER_SOURCE_ENGINE_DEFAULT];
 
+/// `ClusterParameterGroupStatus$ParameterApplyStatus` /
+/// `ClusterParameterStatus$ParameterApplyStatus` for a value the database
+/// already carries.
+///
+/// Source: `smithy_query(query="doc", shape="ClusterParameterStatus",
+/// member="ParameterApplyStatus")` — "`in-sync`: The parameter value is in sync
+/// with the database."
+pub const PARAMETER_APPLY_STATUS_IN_SYNC: &str = "in-sync";
+
+/// The same member for a value an associated cluster only picks up when it is
+/// next rebooted.
+///
+/// Source: the same doc sentence as [`PARAMETER_APPLY_STATUS_IN_SYNC`] —
+/// "`pending-reboot`: The parameter value will be applied after the cluster
+/// reboots."
+pub const PARAMETER_APPLY_STATUS_PENDING_REBOOT: &str = "pending-reboot";
+
+/// What `ModifyClusterParameterGroup` reports as the group's
+/// `ParameterGroupStatus`.
+///
+/// Source: `smithy_query(query="doc", shape="ClusterParameterGroupNameMessage",
+/// member="ParameterGroupStatus")` — "if you made a change to a parameter group
+/// name-value pair, then the change could be pending a reboot of an associated
+/// cluster" — and the sentence the Amazon Redshift API/CLI reference prints for
+/// `modify-cluster-parameter-group`, which is this one verbatim.
+pub const PARAMETER_GROUP_STATUS_PENDING_REBOOT: &str =
+    "Your parameter group has been updated but changes won't get applied until you reboot the associated Clusters.";
+
+/// How many parameters one `ModifyClusterParameterGroup` request may carry.
+///
+/// Source: `smithy_query(query="doc", shape="ModifyClusterParameterGroupMessage",
+/// member="Parameters")` — "A maximum of 20 parameters can be modified in a
+/// single request."
+pub const MAX_MODIFIABLE_PARAMETERS: usize = 20;
+
+/// The parameter the workload management (WLM) configuration is held in.
+pub const WLM_JSON_CONFIGURATION: &str = "wlm_json_configuration";
+
+/// The documented maximum length of one parameter's value, in characters, for
+/// the parameters Redshift publishes one for — and `None` for every other, whose
+/// value is bounded only by the modelled `length 0..` of `Parameter$ParameterValue`.
+///
+/// Source: `smithy_query(query="doc", shape="Parameter",
+/// member="ParameterValue")` — "If ParameterName is wlm_json_configuration, then
+/// the maximum size of ParameterValue is 8000 characters."
+pub fn parameter_value_max_len(name: &str) -> Option<usize> {
+    (name == WLM_JSON_CONFIGURATION).then_some(8_000)
+}
+
 /// `Parameter$ApplyType` for a parameter an associated cluster picks up without
 /// being rebooted.
 ///
@@ -265,6 +314,48 @@ impl EngineParameter {
             minimum_engine_version: minimum_engine_version.map(str::to_string),
         }
     }
+
+    /// Whether the published `AllowedValues` set admits `value`.
+    ///
+    /// Source: `smithy_query(query="doc", shape="Parameter",
+    /// member="AllowedValues")` — "The valid range of values for the parameter".
+    /// Redshift publishes that set as a comma-separated list whose items are
+    /// either a literal value (`true,false`) or, for a numeric parameter, an
+    /// INCLUSIVE range written `low-high` with a possibly negative low (`-15-2`,
+    /// `0-10`, `0,100-2147483647`). A parameter that publishes no set admits
+    /// every value the engine itself parses, so it admits whatever it is given.
+    pub fn admits(&self, value: &str) -> bool {
+        let Some(allowed) = self.allowed_values else {
+            return true;
+        };
+        let numeric = self.data_type == DATA_TYPE_INTEGER;
+        allowed.split(',').map(str::trim).any(|item| {
+            if item == value {
+                return true;
+            }
+            if !numeric {
+                return false;
+            }
+            let Some((low, high)) = allowed_range(item) else {
+                return false;
+            };
+            value
+                .parse::<i64>()
+                .is_ok_and(|wanted| (low..=high).contains(&wanted))
+        })
+    }
+}
+
+/// One `AllowedValues` item read as an inclusive numeric range, or `None` when
+/// the item is not one.
+///
+/// The separator is the first `-` AFTER the first character, because the low
+/// bound itself may be negative (`-15-2` is -15 through 2).
+fn allowed_range(item: &str) -> Option<(i64, i64)> {
+    let separator = item.char_indices().skip(1).find(|&(_, c)| c == '-')?.0;
+    let low = item[..separator].parse::<i64>().ok()?;
+    let high = item[separator + 1..].parse::<i64>().ok()?;
+    Some((low, high))
 }
 
 /// The engine default parameters a cluster parameter group of a published family
@@ -610,6 +701,15 @@ impl StoredParameterGroup {
             })
             .collect()
     }
+
+    /// The catalog entry for the parameter `name` of this group's family, or
+    /// `None` when the family publishes no such parameter — which is what makes
+    /// a request naming one a request naming nothing this group holds.
+    pub fn family_parameter(&self, name: &str) -> Option<&'static EngineParameter> {
+        family_parameters(self.group.parameter_group_family.as_deref().unwrap_or_default())
+            .iter()
+            .find(|parameter| parameter.name == name)
+    }
 }
 
 /// A snapshot as this service stores it.
@@ -716,6 +816,15 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.parameter_groups
             .iter()
             .find(|g| g.group.parameter_group_name.as_deref() == Some(name))
+    }
+
+    /// The position of the cluster parameter group with this name, if any.
+    ///
+    /// The name is compared exactly as [`Self::parameter_group`] compares it.
+    pub fn parameter_group_position(&self, name: &str) -> Option<usize> {
+        self.parameter_groups
+            .iter()
+            .position(|g| g.group.parameter_group_name.as_deref() == Some(name))
     }
 
     /// The `ParameterGroupFamily` values a request may name.

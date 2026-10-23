@@ -189,11 +189,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reads a 200 for a card it did not create and the card it did create is gone.
         // The whole check-and-insert runs under the one store lock, so when two callers
         // race on one name exactly one creates it and the other reads this conflict.
-        if store.model_cards.contains_key(&input.model_card_name) {
+        //
+        // A model card is a VERSIONED resource, and the conflict AWS reports is about the
+        // card AND the version that collided: the message names the card by its ARN and
+        // the version the stored card is at, so a client can tell which version it
+        // collided with rather than only which name.
+        if let Some(existing) = store.model_cards.get(&input.model_card_name) {
+            let version = existing
+                .latest_version()
+                .map_or(crate::state::FIRST_MODEL_CARD_VERSION, |latest| {
+                    latest.version
+                });
             return Err(CreateModelCardErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
-                    "Model Card with name {} already exists. Choose a different name.",
-                    input.model_card_name
+                    "Modelcard {} with version {version} already exists",
+                    existing.arn
                 )),
             })
             .into());

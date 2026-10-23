@@ -648,6 +648,11 @@ pub const INVALID_SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetID.NotFound";
 /// EC2's error code for a request that named a security group no group of the account has.
 pub const INVALID_GROUP_NOT_FOUND: &str = "InvalidGroup.NotFound";
 
+/// EC2's error code for a request that named an address-pool id no pool of the account
+/// has — the code the customer-owned-IP surface answers with (`InvalidPoolID.NotFound`,
+/// as recorded for a `CoipPoolId` that names no pool).
+pub const INVALID_POOL_ID_NOT_FOUND: &str = "InvalidPoolID.NotFound";
+
 /// EC2's error code for a pagination token this service did not issue.
 pub const INVALID_PAGINATION_TOKEN: &str = "InvalidPaginationToken";
 
@@ -941,6 +946,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateVolume` `ClientToken` and the volume id it minted, so a repeat of the
     /// same request answers with that volume instead of creating a second one.
     pub volume_client_tokens: HashMap<String, String>,
+    /// Every customer-owned IP (CoIP) address pool the account holds, by `PoolId`, as the
+    /// modelled `CoipPool` shape itself — so every member a writer sets round-trips through
+    /// `DescribeCoipPools` without a field-by-field copy. Ordered by id in a [`BTreeMap`],
+    /// the same arrangement the VPC and subnet stores use: that id order is the one stable
+    /// order the describe reports and pages over, so a pagination token can name the id the
+    /// next page starts at.
+    ///
+    /// Starts EMPTY: a CoIP pool exists only on an Outpost local gateway, so a fresh
+    /// account has none until something creates one through [`Self::insert_coip_pool`].
+    pub coip_pools: BTreeMap<String, crate::ops::types::CoipPool>,
     /// Every Capacity Block the account holds, by `CapacityBlockId` — see the module docs.
     /// Ordered by id, which is the order `DescribeCapacityBlocks` reports and pages over.
     pub capacity_blocks: BTreeMap<String, CapacityBlockRecord>,
@@ -1035,6 +1050,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             id_counter: 0,
             volumes: BTreeMap::new(),
             volume_client_tokens: HashMap::new(),
+            coip_pools: BTreeMap::new(),
             capacity_blocks: BTreeMap::new(),
             application_status: BTreeMap::new(),
             fast_launch_images: BTreeMap::new(),
@@ -1248,6 +1264,43 @@ impl ComAmazonawsEc2Amazonec2State {
         self.add_stored_bytes(tag_list_bytes(subnet.tags.as_deref().unwrap_or_default()));
         self.subnets.insert(subnet_id.clone(), subnet);
         subnet_id
+    }
+
+    /// Insert a customer-owned IP (CoIP) address pool, and answer the `PoolId` it was
+    /// given.
+    ///
+    /// The writer seam for the CoIP store, ahead of the operation that will call it:
+    /// `CreateCoipPool` is still a scaffold stub with its own open issue, so for now this
+    /// is reached only from this crate's tests, which seed pools the way that create will.
+    /// It lives here rather than in a test so the create lands on this one record instead
+    /// of a second copy of a pool beside it.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the
+    /// caller — the id and the `PoolArn` built from it — so two writers cannot report the
+    /// same pool differently, exactly as [`Self::insert_subnet`] does for a subnet. The
+    /// caller-chosen bytes of the pool's CIDRs and tags are charged against the store's
+    /// byte budget here, so a writer cannot store them uncharged.
+    pub fn insert_coip_pool(&mut self, spec: CoipPoolSpec) -> String {
+        // [`COIP_POOL_ID_PREFIX`] carries its own separator, the way
+        // [`coip_pool_id_is_well_formed`] reads one, while [`Self::next_id`] adds one.
+        let pool_id = self.next_id(COIP_POOL_ID_PREFIX.trim_end_matches('-'));
+        let pool = crate::ops::types::CoipPool {
+            pool_id: Some(pool_id.clone()),
+            pool_cidrs: Some(spec.pool_cidrs),
+            local_gateway_route_table_id: Some(spec.local_gateway_route_table_id),
+            tags: Some(spec.tags),
+            pool_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("coip-pool/{pool_id}"),
+            )),
+        };
+        let cidr_bytes: usize = pool.pool_cidrs.iter().flatten().map(String::len).sum();
+        self.add_stored_bytes(
+            cidr_bytes + tag_list_bytes(pool.tags.as_deref().unwrap_or_default()),
+        );
+        self.coip_pools.insert(pool_id.clone(), pool);
+        pool_id
     }
 
     /// Give `vpc_id` the default subnet AWS creates in each Availability Zone of
@@ -1779,6 +1832,22 @@ pub struct SubnetSpec {
     /// Whether instances launched here receive a public IPv4 address.
     pub map_public_ip_on_launch: bool,
     /// The tags the subnet carries.
+    pub tags: Vec<Tag>,
+}
+
+/// One customer-owned IP address pool as a writer asks for it: the members a creator
+/// chooses. Everything the service derives — the pool id and the `PoolArn` built from it —
+/// is minted by [`ComAmazonawsEc2Amazonec2State::insert_coip_pool`].
+#[derive(Debug, Clone)]
+pub struct CoipPoolSpec {
+    /// "The ID of the local gateway route table" (`CoipPool$LocalGatewayRouteTableId`) the
+    /// pool belongs to.
+    pub local_gateway_route_table_id: String,
+    /// The Region the pool's ARN names.
+    pub region: String,
+    /// "The address ranges of the address pool" (`CoipPool$PoolCidrs`).
+    pub pool_cidrs: Vec<String>,
+    /// The tags the pool carries (`CoipPool$Tags`).
     pub tags: Vec<Tag>,
 }
 
@@ -2910,8 +2979,47 @@ pub fn invalid_group_not_found<E>(group: &str) -> crate::scaffolded::Scaffolded<
     )
 }
 
-/// Refuse a `NextToken` this service did not issue: HTTP 400 `InvalidPaginationToken`.
-/// The token itself is not echoed — it carried nothing the caller can act on.
+/// Refuse a request that named an address-pool id no pool of the account has, the way
+/// EC2's customer-owned-IP surface does: HTTP 400 `InvalidPoolID.NotFound`.
+pub fn invalid_pool_id_not_found<E>(pool_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_POOL_ID_NOT_FOUND,
+        400,
+        format!("The pool ID '{pool_id}' does not exist"),
+    )
+}
+
+/// The most characters of a refused `NextToken` its message repeats back.
+///
+/// The message names the token so a caller holding several can tell which one was refused;
+/// it does not need the whole of an arbitrarily long one, and a bounded echo keeps a
+/// request's own bytes from being reflected in full. Far above any token this service mints
+/// ([`encode_page_token`]), so a real token is always named in full.
+pub const MAX_ECHOED_PAGE_TOKEN_CHARS: usize = 256;
+
+/// Refuse a `NextToken` this service did not issue: HTTP 400 `InvalidPaginationToken`,
+/// with EC2's own message for it — `Next token '<token>' is invalid`, which names the
+/// token the request sent, so the message is built from the request rather than fixed.
+/// Only the first [`MAX_ECHOED_PAGE_TOKEN_CHARS`] characters of the token are named.
+///
+/// This is the form to call: a handler always has the token it is refusing, and EC2's
+/// message for this refusal is a function of it. [`invalid_pagination_token`] is the
+/// token-less form kept beside it, for the call sites that have not moved yet.
+pub fn invalid_pagination_token_for<E>(token: &str) -> crate::scaffolded::Scaffolded<E> {
+    let echoed: String = token.chars().take(MAX_ECHOED_PAGE_TOKEN_CHARS).collect();
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_PAGINATION_TOKEN,
+        400,
+        format!("Next token '{echoed}' is invalid"),
+    )
+}
+
+/// Refuse a `NextToken` this service did not issue without naming it: HTTP 400
+/// `InvalidPaginationToken`.
+///
+/// Kept so a handler landing on this helper keeps compiling;
+/// [`invalid_pagination_token_for`] is what a handler should call, because the message EC2
+/// answers with names the token.
 pub fn invalid_pagination_token<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         INVALID_PAGINATION_TOKEN,

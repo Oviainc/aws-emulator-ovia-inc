@@ -770,7 +770,66 @@ impl ComAmazonawsSyntheticsSyntheticsState {
             group.resources.remove(resource_arn);
         }
     }
+
+    /// The group a `ResourceArn` names, if this store holds it.
+    ///
+    /// ARN-only, unlike [`Self::group_by_identifier`]: the tag operations address a
+    /// resource by `ResourceArn` and never by name or bare id, so a group whose NAME
+    /// happens to spell an ARN is not reachable through this lookup. Keyed off the stored
+    /// record's own ARN, so an ARN naming another Region or another account matches
+    /// nothing.
+    pub fn group_by_arn(&self, arn: &str) -> Option<&StoredGroup> {
+        self.groups.values().find(|group| group.arn() == arn)
+    }
+
+    /// The tags of the canary or group a `ResourceArn` names, or `None` when this store
+    /// holds no such resource.
+    ///
+    /// `ResourceArn`'s pattern pins the resource segment to `canary:…` or `group:…`
+    /// (`smithy_query(query="shape",shape="ResourceArn")`), so the ARN itself says which
+    /// collection it resolves against, and the whole ARN — partition, Region and account
+    /// included — has to be that record's own: tags hang off a resource's identity, not
+    /// off its name. One lookup, so every tag operation addresses the same record as
+    /// every other.
+    pub fn tags_of_resource(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        match arn_resource_kind(resource_arn)? {
+            TaggedResourceKind::Canary => {
+                self.canary_by_arn(resource_arn).map(|canary| &canary.tags)
+            }
+            TaggedResourceKind::Group => self.group_by_arn(resource_arn).map(|group| &group.tags),
+        }
+    }
 }
+
+/// Which kind of resource a `ResourceArn` names. Its pattern admits exactly these two
+/// (`…:\d{12}:(canary|group):[0-9a-z_\-]+$`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedResourceKind {
+    Canary,
+    Group,
+}
+
+/// The kind of resource `arn` names, or `None` when its resource segment names neither.
+///
+/// An ARN's sixth colon-separated field is the resource type
+/// (`arn:partition:service:region:account-id:resource-type:resource-id`), which for this
+/// service's `ResourceArn` is `canary` or `group`.
+pub fn arn_resource_kind(arn: &str) -> Option<TaggedResourceKind> {
+    match arn.split(':').nth(5)? {
+        "canary" => Some(TaggedResourceKind::Canary),
+        "group" => Some(TaggedResourceKind::Group),
+        _ => None,
+    }
+}
+
+/// `NotFoundException$Message` for a `ResourceArn` a tag operation cannot resolve.
+///
+/// One sentence for both resource kinds, and it names neither the kind nor the ARN: the
+/// recorded service answers a `ListTagsForResource` whose `ResourceArn` it cannot resolve
+/// with exactly this, where the readers addressed by name or `GroupIdentifier` word the
+/// same miss per resource kind ([`CANARY_NOT_FOUND`], [`GROUP_NOT_FOUND`]). It carries
+/// nothing from the request, so the ARN the caller supplied is never echoed back.
+pub const TAGGED_RESOURCE_NOT_FOUND: &str = "Resource was not found";
 
 /// Every ARN starts with this, which is what tells an ARN-form identifier apart from a
 /// group name or a group id.

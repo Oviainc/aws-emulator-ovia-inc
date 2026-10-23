@@ -233,11 +233,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(config) = store.endpoint_configs.get(&input.endpoint_config_name) else {
-            let config_arn =
-                crate::state::resource_arn(&region, "endpoint-config", &input.endpoint_config_name);
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Could not find endpoint configuration \"{config_arn}\"."
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::could_not_find(
+                    crate::state::ENDPOINT_CONFIG_KIND_LABEL,
+                    &input.endpoint_config_name,
+                ),
+            ));
         };
 
         // The endpoint snapshots the configuration it was created from, the way the real

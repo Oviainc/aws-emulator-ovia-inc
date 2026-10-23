@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccessGrantsInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccessGrantsInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccessGrantsInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the one S3 Access Grants instance the account the request names has
+//! in the Region the request was signed for, and records it for
+//! `GetAccessGrantsInstance` to report. Answers
+//! `AccessGrantsInstanceAlreadyExistsError` when that account already has an
+//! instance in that Region, because an account has at most one per Region.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +173,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccessGrantsInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccessGrantsInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccessGrantsInstance"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        // One instance per Region per account, as this operation documents: the
+        // Region the request was signed for is half the resource's identity, so
+        // the same account creating an instance in another Region creates
+        // another resource rather than conflicting with this one.
+        let region = crate::state::signing_region(ctx.parts());
+        let key = (input.account_id.clone(), region.clone());
+        let mut store = state.lock();
+        if store.access_grants_instances.contains_key(&key) {
+            return Err(crate::state::access_grants_instance_already_exists(
+                &input.account_id,
+                &region,
+            ));
+        }
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record, so a caller cannot grow this process's state
+        // without end by varying the account id or the signing Region.
+        if store.access_grants_instances.len() >= crate::state::ACCESS_GRANTS_INSTANCE_QUOTA {
+            return Err(crate::state::access_grants_instance_store_full());
+        }
+
+        // S3 Access Grants creates the Identity Center application itself, and
+        // only for an instance a request associated an Identity Center instance
+        // with: an instance created without `IdentityCenterArn` reports neither
+        // ARN.
+        let identity_center_application_arn =
+            input.identity_center_arn.as_deref().map(|instance_arn| {
+                crate::state::identity_center_application_arn(
+                    instance_arn,
+                    &input.account_id,
+                    &region,
+                )
+            });
+        let record = crate::state::AccessGrantsInstanceRecord {
+            account_id: input.account_id.clone(),
+            region: region.clone(),
+            id: crate::state::ACCESS_GRANTS_INSTANCE_ID.to_string(),
+            arn: crate::state::access_grants_instance_arn(
+                &region,
+                crate::state::ACCESS_GRANTS_INSTANCE_ID,
+            ),
+            created_at: ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+            identity_center_instance_arn: input.identity_center_arn.clone(),
+            identity_center_application_arn,
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+
+        let output = CreateAccessGrantsInstanceOutput {
+            created_at: Some(record.created_at),
+            access_grants_instance_id: Some(record.id.clone()),
+            access_grants_instance_arn: Some(record.arn.clone()),
+            // The deprecated `IdentityCenterArn` carries the Identity Center
+            // INSTANCE ARN: its pattern is
+            // `^arn:[^:]+:sso::(\d{12}){0,1}:instance/.*$`, which no application
+            // ARN matches, and the member it was replaced by
+            // (`IdentityCenterInstanceArn`) targets the same shape.
+            identity_center_arn: record.identity_center_instance_arn.clone(),
+            identity_center_instance_arn: record.identity_center_instance_arn.clone(),
+            identity_center_application_arn: record.identity_center_application_arn.clone(),
+        };
+        store.access_grants_instances.insert(key, record);
+        Ok(output)
     }
 }
