@@ -2,11 +2,11 @@
 
 //! @op StartPipelineExecution
 //! IMPLEMENTED: resolves the pipeline the request names (by name or by ARN) in
-//! `crate::state`, refuses a run the stored pipeline cannot support — an unknown
-//! pipeline or version, a pipeline whose delete is in flight, a parameter its definition
-//! does not declare, a selected step or reference execution that does not resolve — then
-//! records one `PipelineExecution` under a minted `PipelineExecutionArn` and stamps the
-//! pipeline's `LastRunTime`. This is the ONLY file to touch for this operation.
+//! `crate::state`, refuses a run the stored pipeline cannot support — an unknown or
+//! deleted pipeline, an unknown version, a parameter its definition does not declare, a
+//! selected step or reference execution that does not resolve — then records one
+//! `PipelineExecution` under a minted `PipelineExecutionArn` and stamps the pipeline's
+//! `LastRunTime`. This is the ONLY file to touch for this operation.
 //!
 //! The run itself is NOT performed: a pipeline step's work (training, processing,
 //! transform, Lambda, callback) needs a runtime this emulator does not have, so the
@@ -220,35 +220,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        // A pipeline whose removal the clock already owes is gone before this call reads
-        // the store, so nothing can be run on it.
-        store.settle_pipeline_deletions(now);
 
         let Some(pipeline) = store.pipelines.get(&name) else {
             // Never a 200 carrying an ARN nothing resolves: an execution of a pipeline
-            // that does not exist is refused, and nothing is persisted.
+            // that does not exist is refused, and nothing is persisted. A deleted
+            // pipeline is exactly as unresolvable as one nobody created — `DeletePipeline`
+            // removes the record outright.
             return Err(StartPipelineExecutionErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Pipeline {} does not exist.",
-                    crate::state::resource_arn(&region, "pipeline", &name)
+                message: Some(crate::state::does_not_exist(
+                    crate::state::PIPELINE_ENTITY,
+                    &crate::state::resource_arn(&region, "pipeline", &name),
                 )),
             })
             .into());
         };
-        // A pipeline whose deletion is in flight (`PipelineStatus` `Deleting`, the other
-        // member of the modelled enum) is no longer runnable: starting a run on it
-        // conflicts with the delete already under way.
-        if pipeline.status != crate::state::PIPELINE_STATUS_ACTIVE {
-            return Err(StartPipelineExecutionErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "Pipeline {} is {} and cannot start an execution.",
-                        pipeline.arn, pipeline.status
-                    )),
-                },
-            )
-            .into());
-        }
         // A pipeline here carries exactly one version, the one creating it minted, so no
         // other version id names anything this account holds — the same resolution
         // `DescribePipeline` makes of the same member.
