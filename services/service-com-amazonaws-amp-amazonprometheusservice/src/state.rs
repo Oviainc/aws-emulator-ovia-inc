@@ -1476,6 +1476,161 @@ fn unanchored(pattern: &str) -> &str {
 }
 
 // =============================================================================
+// Rule groups namespaces
+// =============================================================================
+
+/// The bound BOTH operations that carry a rules file state in their own documentation:
+/// "The combined length of a rule group namespace and a rule group name cannot exceed
+/// 721 UTF-8 bytes."
+///
+/// It is an `<important>` callout on `CreateRuleGroupsNamespace` and on
+/// `PutRuleGroupsNamespace` alike
+/// (`smithy_query(query="doc",shape="CreateRuleGroupsNamespace")`), so it is a
+/// constraint of the REQUEST those two carry a rules file in — the namespace name is one
+/// member and the rule group names live in the `data` blob — and a request past it is
+/// refused rather than stored.
+pub const RULE_GROUP_NAME_COMBINED_MAX_UTF8_BYTES: usize = 721;
+
+/// The mapping key a Prometheus rules file carries its rule groups under, and the key
+/// each group carries its name under: the file is
+/// `groups:\n  - name: <group>\n    rules: [...]`, the structure
+/// `RuleGroupsNamespaceData` links to as "the rule groups namespace structure".
+const RULE_GROUPS_KEY: &str = "groups";
+/// See [`RULE_GROUPS_KEY`].
+const RULE_GROUP_NAME_KEY: &str = "name";
+
+/// How many parse events of a caller-supplied rules file are read while looking for its
+/// rule group names. The reader is driven event by event off an iterative state machine,
+/// so this bounds the WORK one request can ask of it (nothing recurses over the
+/// document): a file longer than this is read as far as this bound and no further.
+const MAX_RULES_FILE_EVENTS: usize = 1 << 20;
+
+/// How deeply the reader follows a caller-supplied rules file. A rule group name sits
+/// exactly three collections deep (`groups` -> item -> `name`), so a document that nests
+/// further carries nothing this reader has to track.
+const MAX_RULES_FILE_DEPTH: usize = 32;
+
+/// Whether `data` declares a rule group whose name, combined with `namespace_name`,
+/// exceeds [`RULE_GROUP_NAME_COMBINED_MAX_UTF8_BYTES`].
+///
+/// Both lengths are counted in UTF-8 BYTES, as the published bound states — a multibyte
+/// name reaches it in fewer characters.
+pub fn rule_group_name_bound_exceeded(namespace_name: &str, data: &[u8]) -> bool {
+    rule_group_names(data).iter().any(|group| {
+        namespace_name.len() + group.len() > RULE_GROUP_NAME_COMBINED_MAX_UTF8_BYTES
+    })
+}
+
+/// The requirement a request past that bound failed, worded as the service documents the
+/// bound itself — carrying nothing from the request, like every other aps refusal.
+pub fn rule_group_name_bound_requirement() -> String {
+    format!(
+        "The combined length of a rule group namespace and a rule group name cannot \
+         exceed {RULE_GROUP_NAME_COMBINED_MAX_UTF8_BYTES} UTF-8 bytes"
+    )
+}
+
+/// One open collection of the rules file being read.
+struct RulesFrame {
+    /// A sequence keys its children by position, a mapping by name.
+    sequence: bool,
+    /// The mapping key this collection is the value of, if any.
+    key: Option<String>,
+    /// For a mapping, the key read but not yet matched with its value.
+    pending_key: Option<String>,
+}
+
+/// The rule group names a rules file declares: the `name` of each item of the top-level
+/// `groups` sequence of its FIRST YAML document, which is where a Prometheus rule groups
+/// file carries them.
+///
+/// Read with `yaml-rust2` — the YAML 1.2 implementation the sibling apigateway,
+/// cloudformation and greengrassv2 crates already read caller-supplied documents with —
+/// driven EVENT BY EVENT rather than loaded into a tree, so nothing recurses over a
+/// caller-supplied document and an alias (the one way a YAML body amplifies itself) is
+/// not expanded.
+///
+/// A blob that is not UTF-8, not YAML, or carries no top-level `groups` sequence declares
+/// no rule group name here: `RuleGroupsNamespaceData` is a blob, stored byte for byte
+/// whatever it holds, so the bound is measured against the names this reader can actually
+/// SEE and nothing else about the file is judged.
+fn rule_group_names(data: &[u8]) -> Vec<String> {
+    use ::yaml_rust2::parser::Event;
+
+    let Ok(text) = ::std::str::from_utf8(data) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    let mut frames: Vec<RulesFrame> = Vec::new();
+    let mut parser = ::yaml_rust2::parser::Parser::new_from_str(text);
+
+    for _ in 0..MAX_RULES_FILE_EVENTS {
+        // Not a YAML document (or no longer one): there is nothing further to measure.
+        let Ok((event, _marker)) = parser.next_token() else {
+            break;
+        };
+        match event {
+            Event::Scalar(value, ..) => {
+                // The first scalar of a mapping pair is the KEY, not a value.
+                if let Some(frame) = frames.last_mut() {
+                    if !frame.sequence && frame.pending_key.is_none() {
+                        frame.pending_key = Some(value);
+                        continue;
+                    }
+                }
+                let key = take_pending_key(&mut frames);
+                if key.as_deref() == Some(RULE_GROUP_NAME_KEY) && is_rule_group_item(&frames) {
+                    names.push(value);
+                }
+            }
+            Event::SequenceStart(..) | Event::MappingStart(..) => {
+                let sequence = matches!(event, Event::SequenceStart(..));
+                let key = take_pending_key(&mut frames);
+                if frames.len() >= MAX_RULES_FILE_DEPTH {
+                    break;
+                }
+                frames.push(RulesFrame {
+                    sequence,
+                    key,
+                    pending_key: None,
+                });
+            }
+            Event::SequenceEnd | Event::MappingEnd => {
+                frames.pop();
+            }
+            // An alias copies an anchored node, which is how a YAML body amplifies
+            // itself. Nothing here expands one, so the document is read no further.
+            Event::Alias(_) => break,
+            // A rules file is ONE document; a second one in the same body is not it.
+            Event::DocumentEnd | Event::StreamEnd => break,
+            _ => {}
+        }
+    }
+    names
+}
+
+/// The mapping key the node about to be read is the value of, consumed so it speaks for
+/// that node only: a sequence item and the document's root node have none.
+fn take_pending_key(frames: &mut [RulesFrame]) -> Option<String> {
+    frames.last_mut().and_then(|frame| frame.pending_key.take())
+}
+
+/// Whether the open collections are exactly `groups` -> one item: the mapping at the
+/// document's root, the sequence its `groups` key carries, and one mapping item of that
+/// sequence. A `name` scalar THERE is a rule group's name.
+fn is_rule_group_item(frames: &[RulesFrame]) -> bool {
+    let [root, groups, item] = frames else {
+        return false;
+    };
+    !root.sequence
+        && root.key.is_none()
+        && groups.sequence
+        && groups.key.as_deref() == Some(RULE_GROUPS_KEY)
+        && !item.sequence
+        && item.key.is_none()
+}
+
+// =============================================================================
 // Scrapers
 // =============================================================================
 
