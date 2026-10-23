@@ -3633,6 +3633,17 @@ pub const MAX_NODE_GROUPS: i32 = 90;
 /// `NodeGroupConfiguration$Slots`: "Keyspaces range from 0 to 16,383."
 pub const KEYSPACE_SLOTS: i32 = 16_384;
 
+/// How many shards an account may test automatic failover on in one rolling
+/// window, as `TestFailover` documents it: "A customer can use this operation to
+/// test automatic failover on up to 15 shards (called node groups in the
+/// ElastiCache API and Amazon CLI) in any rolling 24-hour period." Past it the
+/// call is refused with the modelled `APICallRateForCustomerExceededFault`.
+pub const MAX_TEST_FAILOVERS_PER_WINDOW: usize = 15;
+
+/// The window [`MAX_TEST_FAILOVERS_PER_WINDOW`] is counted over, from the same
+/// sentence: "any rolling 24-hour period".
+pub const TEST_FAILOVER_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// `AuthToken`'s documented length bounds: "Must be at least 16 characters and
 /// no more than 128 characters in length."
 pub const AUTH_TOKEN_MIN_LEN: usize = 16;
@@ -3868,10 +3879,43 @@ pub struct NodeGroupRecord {
     /// enabled group, where the keyspace is partitioned across shards.
     pub slots: Option<String>,
     /// This shard's members, the primary first.
+    ///
+    /// The ORDER is this emulator's own: `NodeGroupMembers` carries no modelled
+    /// ordering, so a client must read a member's role from `CurrentRole`
+    /// rather than from its position. Holding the primary first is what lets
+    /// [`ComAmazonawsElasticacheAmazonelasticachev9State::set_shard_replica_count`]
+    /// drop the newest replicas from the end while keeping the primary, and
+    /// [`NodeGroupRecord::fail_over`] maintains it.
     pub members: Vec<NodeGroupMemberRecord>,
 }
 
 impl NodeGroupRecord {
+    /// Fail this shard over: the first replica takes the primary role and the
+    /// primary it had becomes a replica, which is what an automatic failover
+    /// does to a shard. Hands back `(demoted cluster, promoted cluster)`, or
+    /// `None` when the shard has no primary or no replica to promote.
+    ///
+    /// The promoted member is moved to the front, because this record holds its
+    /// members "the primary first" and [`ReplicationGroupRecord`]'s replica
+    /// scaling relies on that order.
+    pub fn fail_over(&mut self) -> Option<(String, String)> {
+        let primary = self
+            .members
+            .iter()
+            .position(|member| member.current_role == ROLE_PRIMARY)?;
+        let replica = self
+            .members
+            .iter()
+            .position(|member| member.current_role != ROLE_PRIMARY)?;
+        self.members[primary].current_role = ROLE_REPLICA.to_string();
+        self.members[replica].current_role = ROLE_PRIMARY.to_string();
+        let demoted = self.members[primary].cache_cluster_id.clone();
+        let promoted = self.members[replica].cache_cluster_id.clone();
+        let promoted_member = self.members.remove(replica);
+        self.members.insert(0, promoted_member);
+        Some((demoted, promoted))
+    }
+
     /// This shard as the modelled `NodeGroup`.
     ///
     /// `PrimaryEndpoint` / `ReaderEndpoint` are the cluster mode DISABLED
@@ -6769,6 +6813,14 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// was given. A `BTreeMap` is what gives `DescribeReservedCacheNodes` the
     /// stable total order its `Marker` indexes into.
     pub reserved_cache_nodes: BTreeMap<String, ReservedCacheNodeRecord>,
+    /// When each shard this account has tested automatic failover on was tested.
+    ///
+    /// Not a resource but a RATE: `TestFailover` is bounded at
+    /// [`MAX_TEST_FAILOVERS_PER_WINDOW`] shards per [`TEST_FAILOVER_WINDOW`], so
+    /// the instants of the accepted calls are what that bound is counted over,
+    /// and the ones that have left the window are dropped (see
+    /// [`Self::test_failovers_in_window`]).
+    pub test_failovers: Vec<SystemTime>,
 }
 
 impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
@@ -6809,6 +6861,7 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
             reserved_cache_nodes_offerings: offering_catalog(),
             engine_default_parameters: published_engine_default_parameters(),
             reserved_cache_nodes: BTreeMap::new(),
+            test_failovers: Vec::new(),
         }
     }
 }
@@ -7410,6 +7463,14 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                 drop_clusters.push(member.cache_cluster_id.clone());
             }
         }
+        // How many members the shard ends up with, HELD TO THE PUBLISHED BOUND
+        // before anything is allocated: `ReplicasPerNodeGroup` /
+        // `NewReplicaCount` is documented "Valid values are 0 to 5"
+        // ([`MAX_REPLICAS_PER_NODE_GROUP`]), so a request's count is clamped to
+        // that range here as well as refused by the handlers that call this —
+        // no request can drive the minting loop below past the bound, whatever
+        // a caller forgets to check.
+        let replicas = replicas.clamp(0, MAX_REPLICAS_PER_NODE_GROUP);
         let target = usize::try_from(replicas.saturating_add(1)).unwrap_or(1);
         while keep.len() > target {
             if let Some(member) = keep.pop() {
@@ -7943,6 +8004,26 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         };
         self.replication_groups
             .insert(new.replication_group_id.clone(), record);
+    }
+
+    /// How many shards this account has tested automatic failover on inside the
+    /// rolling [`TEST_FAILOVER_WINDOW`] that ends at `now` — the count
+    /// [`MAX_TEST_FAILOVERS_PER_WINDOW`] bounds.
+    ///
+    /// Counting drops the calls that have left the window, which is a write the
+    /// CLOCK owes: a call leaves a rolling window at a fixed instant whether or
+    /// not anybody calls again.
+    pub fn test_failovers_in_window(&mut self, now: SystemTime) -> usize {
+        if let Some(cutoff) = now.checked_sub(TEST_FAILOVER_WINDOW) {
+            self.test_failovers.retain(|at| *at >= cutoff);
+        }
+        self.test_failovers.len()
+    }
+
+    /// Record that automatic failover was tested on one shard at `at`; see
+    /// [`Self::test_failovers_in_window`].
+    pub fn record_test_failover(&mut self, at: SystemTime) {
+        self.test_failovers.push(at);
     }
 
     /// The stored replication group `id` names, as the modelled shape — built

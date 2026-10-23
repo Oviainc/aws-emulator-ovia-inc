@@ -76,3 +76,5 @@ mod delete_service_linked_recorder;
 mod config_rules_on_demand_evaluation;
 #[path = "all/config_delete_configuration_aggregator.rs"]
 mod config_delete_configuration_aggregator;
+#[path = "all/list_stored_queries.rs"]
+mod list_stored_queries;

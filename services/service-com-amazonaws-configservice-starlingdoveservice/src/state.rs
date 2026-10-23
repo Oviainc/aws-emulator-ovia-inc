@@ -37,6 +37,10 @@ use crate::ops::types::ScopeConfiguration;
 // resource's current configuration as.
 use crate::ops::types::BaseConfigurationItem;
 
+// `StoredQueryMetadata` is named separately for the same reason: it is what a listing
+// of stored queries reports each one as.
+use crate::ops::types::StoredQueryMetadata;
+
 /// The ARN namespace of this service (`awsService.arnNamespace` in the model), used
 /// for every ARN this emulator mints.
 pub const ARN_SERVICE: &str = "config";
@@ -449,6 +453,14 @@ pub const DESCRIBE_CONFIG_RULES_PAGE_SIZE: usize = 25;
 /// with `ValidationException`, which is the error the model lists for "You are trying
 /// to create more than 300 queries".
 pub const STORED_QUERIES_QUOTA: usize = 300;
+
+/// How many stored queries one `ListStoredQueries` page carries when the request asks
+/// for no page size (`ListStoredQueries`: "Lists the stored queries for a single
+/// Amazon Web Services account and a single Amazon Web Services Region. The default is
+/// 100", and `MaxResults` defaults to 0, which is "no page size asked for" rather than
+/// "no results"). It is also `Limit`'s own published maximum (range 0..100), so it is
+/// the largest page the model lets this operation report.
+pub const LIST_STORED_QUERIES_PAGE_SIZE: usize = 100;
 
 /// The timeout an evaluation runs under when the request asks for none
 /// (`StartResourceEvaluationRequest$EvaluationTimeout`: "The timeout for an
@@ -2021,6 +2033,18 @@ impl StoredQueryEntry {
             expression: Some(self.expression.clone()),
         }
     }
+
+    /// The modelled `StoredQueryMetadata`, read back out of state: the query's
+    /// identity and its description, which is every member that shape declares —
+    /// metadata carries no `Expression`.
+    pub fn to_metadata(&self) -> StoredQueryMetadata {
+        StoredQueryMetadata {
+            query_id: self.id.clone(),
+            query_arn: self.arn.clone(),
+            query_name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
 }
 
 /// Per-service state for com-amazonaws-configservice-starlingdoveservice. A handler reaches it through [`service_state`].
@@ -2426,6 +2450,21 @@ pub fn stored_query_arn(region: &str, name: &str, id: &str) -> String {
 pub fn mint_stored_query_id(seq: u64) -> String {
     base36(splitmix64(seq), 16)
 }
+
+/// Whether `name` is a `QueryName` the model allows: 1..64 characters of
+/// `^[a-zA-Z0-9-_]+$` (`StoredQuery$QueryName`). A listing resumes at a query NAME, so
+/// this is what tells a `NextToken` this operation issued from a value it did not.
+pub fn is_stored_query_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= STORED_QUERY_NAME_MAX_LENGTH
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+}
+
+/// The published maximum length of a `QueryName` (`StoredQuery$QueryName`, length
+/// 1..64).
+pub const STORED_QUERY_NAME_MAX_LENGTH: usize = 64;
 
 /// How Config words `ResourceNotFoundException` for a request that named a stored
 /// query this account does not hold.
