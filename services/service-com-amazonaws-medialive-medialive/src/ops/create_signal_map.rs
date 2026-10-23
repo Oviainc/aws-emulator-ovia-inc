@@ -282,13 +282,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Name` is documented as unique "within the scope of a resource type in
         // a specific region", so a second signal map cannot take a name one
-        // already holds.
-        if let Some(existing) = state.signal_map_named(&input.name) {
+        // already holds — the same name-collision class, with the same fixed
+        // message, as every other monitor resource.
+        if state.signal_map_named(&input.name).is_some() {
             return Err(CreateSignalMapErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "A signal map named {} already exists with id {}",
-                    input.name, existing
-                )),
+                message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
             })
             .into());
         }
