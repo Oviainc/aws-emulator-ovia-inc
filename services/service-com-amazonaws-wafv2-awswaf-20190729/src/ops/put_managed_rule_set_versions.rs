@@ -5,6 +5,15 @@
 //! asserts NOTHING about `PutManagedRuleSetVersions`'s real behaviour. Implement it here — this is
 //! the ONLY file to touch for this operation.
 //!
+//! It does, however, REFUSE a request WAF would refuse, before reaching that 501:
+//! the resource references `VersionsToPublish` names are resolved, and only then is
+//! the optimistic-lock token's own modelled constraint checked. That ordering is
+//! WAF's, and it is why `LockToken` carries `skip_validation` on the input struct
+//! (see `super::types::put_managed_rule_set_versions_types`): the request boundary
+//! runs every modelled constraint BEFORE any handler, so a token left there is
+//! reported instead of the unresolvable reference. A refusal is not an
+//! implementation, so the marker above stays until the operation itself is written.
+//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`PutManagedRuleSetVersions::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -199,18 +208,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutManagedRuleSetVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutManagedRuleSetVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutManagedRuleSetVersions"))
+        // A validation-only pass: nothing here writes to the store, and `ctx`
+        // carries only request metadata, which this pass does not need.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutManagedRuleSetVersionsErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // WAF resolves what the request REFERENCES first. Each entry of
+        // `VersionsToPublish` names "the Amazon Resource Name (ARN) of the vendor's
+        // rule group that's used in the published managed rule group version"
+        // (`VersionToPublish$AssociatedRuleGroupArn`), and an ARN WAF will not accept
+        // for that parameter is the modelled `WAFInvalidParameterException` — "Your
+        // request references an ARN that is malformed, or corresponds to a resource
+        // with which [it] can't be [used]", from that error's own doc — carrying
+        // `Field` RESOURCE_ARN, the rejected ARN as `Parameter`, and why as `Reason`.
+        if let Some(arn) = unresolvable_rule_group_reference(&state.lock(), &input) {
+            return Err(
+                PutManagedRuleSetVersionsErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_arn_exception(&arn),
+                )
+                .into(),
+            );
+        }
+
+        // Only then the optimistic-lock token's own modelled constraints, which this
+        // operation took over from the boundary so they run AFTER the resolution
+        // above (`skip_validation` on `PutManagedRuleSetVersionsInput`).
+        let violations = crate::state::validate_members(&[(
+            &crate::state::M_LOCK_TOKEN,
+            crate::state::ConstrainedValue::Text(&input.lock_token),
+        )]);
+        if !violations.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::constraint_envelope(&violations),
+            ));
+        }
+
+        // A well-formed request still reaches the 501: publishing a managed rule set
+        // version is not implemented yet, which is why the SCAFFOLDED marker at the
+        // top of this file stays. Refusing a bad request is not implementing the
+        // operation — and answering 501 for one would claim "nobody has written this
+        // yet" about a request that can never succeed.
+        Err(crate::scaffolded::Scaffolded::not_implemented(
+            "PutManagedRuleSetVersions",
+        ))
     }
+}
+
+/// The `AssociatedRuleGroupArn` of the first `VersionsToPublish` entry WAF cannot
+/// resolve to a rule group, if any.
+///
+/// Resolution is
+/// [`crate::state::ComAmazonawsWafv2Awswaf20190729State::holds_rule_group`]: the
+/// ARN must be a well-formed wafv2 `rulegroup` ARN that this service holds. The
+/// entries are visited in key order so a request naming several unresolvable
+/// references is refused with the same one on every call — the map comes off the
+/// wire unordered, and a refusal that named a different parameter each time could
+/// not be acted on.
+fn unresolvable_rule_group_reference(
+    state: &crate::state::ComAmazonawsWafv2Awswaf20190729State,
+    input: &PutManagedRuleSetVersionsInput,
+) -> Option<String> {
+    let versions = input.versions_to_publish.as_ref()?;
+    let mut keys: Vec<&String> = versions.keys().collect();
+    keys.sort();
+    keys.into_iter().find_map(|key| {
+        let arn = versions.get(key)?.associated_rule_group_arn.as_deref()?;
+        (!state.holds_rule_group(arn)).then(|| arn.to_string())
+    })
 }

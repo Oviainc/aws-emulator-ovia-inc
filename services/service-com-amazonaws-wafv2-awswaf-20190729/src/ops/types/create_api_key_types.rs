@@ -11,7 +11,18 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-wafv2-awswaf-20190729.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.wafv2#CreateAPIKeyRequest")]
+// `skip_validation` names `TokenDomains`: WAF reports an ELEMENT that fails
+// `TokenDomain`'s own constraints against the LIST member's path, with the value
+// rendered as the whole list and every constraint of the element shape in one
+// bracketed set. The boundary walk words the same failure per offending element, at
+// that element's indexed path (`tokenDomains.1.member`) and with only the one
+// constraint it tripped, so the handler takes the member over and words it the way
+// WAF does, against the same constraints re-declared in
+// `crate::state::M_TOKEN_DOMAINS`. `Scope` keeps its boundary check.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.wafv2#CreateAPIKeyRequest",
+    skip_validation = ["TokenDomains"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct CreateAPIKeyInput {
     pub scope: String,
