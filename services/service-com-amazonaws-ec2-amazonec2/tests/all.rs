@@ -17,6 +17,8 @@ mod application_status;
 mod availability_zones;
 #[path = "all/byoip_cidr_lifecycle.rs"]
 mod byoip_cidr_lifecycle;
+#[path = "all/capacity_block_offerings.rs"]
+mod capacity_block_offerings;
 #[path = "all/capacity_blocks.rs"]
 mod capacity_blocks;
 #[path = "all/coip_pools.rs"]

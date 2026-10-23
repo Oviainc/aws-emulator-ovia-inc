@@ -270,6 +270,24 @@
 //! deliver, one that was cancelled, one whose payment is pending or failed — are stored, as
 //! [`CapacityBlockRecord::pinned_state`].
 //!
+//! ## A Capacity Block OFFERING is a search result, not a stored resource
+//!
+//! Nothing in the EC2 API creates or deletes a Capacity Block offering:
+//! `DescribeCapacityBlockOfferings` "Describes Capacity Block offerings available for
+//! purchase in the Amazon Web Services Region that you're currently using", and the search
+//! it answers is the reservation duration, instance count and date range the request names.
+//! So an offering is derived — from the Region's [`availability_zones_in_region`], the
+//! modelled instance-type catalog [`offered_instance_types`] and the wall clock — and
+//! NOTHING about one is stored: two searches with the same terms in the same hour report the
+//! same offerings, and the search writes nothing a later caller could see.
+//!
+//! The terms an offering was reported with therefore travel inside its id
+//! ([`CapacityBlockOfferingTerms`], [`encode_capacity_block_offering_id`]) rather than in a
+//! map keyed by it, which is what lets a purchase resolve the id a caller hands back —
+//! window, zone and counts — without the describe having had to write a row for every
+//! offering it merely reported. [`capacity_block_upfront_fee`] is the one definition of what
+//! such a window costs.
+//!
 //! ## Application status is DERIVED, never stored
 //!
 //! [`ComAmazonawsEc2Amazonec2State::application_status`] holds, per `InstanceId`, the
@@ -3560,6 +3578,28 @@ pub fn dry_run_operation<E>() -> crate::scaffolded::Scaffolded<E> {
 /// thing that says which resource an id names.
 pub const LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION_ID_PREFIX: &str = "lgw-vif-grp-assoc";
 
+/// How many local gateway route table / virtual interface group associations this emulator
+/// stores before a write must refuse.
+///
+/// CHOSEN, like [`MAX_STORED_VOLUMES`] and for the same reason: nothing in this emulator
+/// reclaims a stored association, so the store needs a ceiling that is not the process's
+/// memory. A count ceiling is no bound on the caller-chosen bytes each record holds, so
+/// those are charged against [`MAX_STORED_BYTES`] too
+/// ([`local_gateway_vif_group_association_payload_bytes`]).
+pub const MAX_LOCAL_GATEWAY_VIF_GROUP_ASSOCIATIONS: usize = 4096;
+
+/// The code EC2 answers when a request would take the account past the associations it may
+/// hold, in the `<Resource>LimitExceeded` family this service's other quotas are refused
+/// with ([`SECONDARY_NETWORK_LIMIT_EXCEEDED`]).
+///
+/// No operation of this emulator writes this store yet — the operation that associates a
+/// virtual interface group with a local gateway route table is still a scaffold — so this
+/// code has no call site: it is the refusal the first writer must answer when
+/// [`ComAmazonawsEc2Amazonec2State::insert_local_gateway_route_table_virtual_interface_group_association`]
+/// hands it `None`.
+pub const LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION_LIMIT_EXCEEDED: &str =
+    "LocalGatewayRouteTableVirtualInterfaceGroupAssociationLimitExceeded";
+
 /// The ARN resource path of a local gateway route table:
 /// `arn:aws:ec2:<region>:<account>:local-gateway-route-table/<id>`, the form
 /// `LocalGatewayRouteTableVirtualInterfaceGroupAssociation$LocalGatewayRouteTableArn`
@@ -3601,16 +3641,63 @@ pub struct LocalGatewayRouteTableVirtualInterfaceGroupAssociationSpec {
     pub tags: Vec<Tag>,
 }
 
+/// The caller-chosen bytes one stored association holds: its tags, the state a writer pinned
+/// on it (`$State`, which the model leaves an unconstrained string) and the ids of the
+/// resources it joins. Everything else on the record — the association id, the route table
+/// ARN, the owning account — is derived by this module, so it is fixed-size.
+///
+/// The ONE definition of that charge, the way [`capacity_block_payload_bytes`] and
+/// [`host_payload_bytes`] are for their own stores:
+/// [`ComAmazonawsEc2Amazonec2State::insert_local_gateway_route_table_virtual_interface_group_association`]
+/// charges exactly it, and a removal path must give back the same number.
+pub fn local_gateway_vif_group_association_payload_bytes(
+    spec: &LocalGatewayRouteTableVirtualInterfaceGroupAssociationSpec,
+) -> usize {
+    tag_list_bytes(&spec.tags)
+        .saturating_add(spec.state.len())
+        .saturating_add(spec.local_gateway_route_table_id.len())
+        .saturating_add(spec.local_gateway_virtual_interface_group_id.len())
+        .saturating_add(spec.local_gateway_id.len())
+}
+
 impl ComAmazonawsEc2Amazonec2State {
-    /// Store one association between a local gateway route table and a virtual interface
-    /// group, and answer the id it was given.
+    /// Whether another `count` local gateway route table / virtual interface group
+    /// associations fit inside the store's ceiling
+    /// ([`MAX_LOCAL_GATEWAY_VIF_GROUP_ASSOCIATIONS`]).
     ///
-    /// Like [`Self::insert_vpc`], the caller-chosen bytes of `spec.tags` are charged
-    /// against the store's byte budget here, so no writer can store them uncharged.
+    /// A writer may ask this before inserting, the way [`Self::has_vpc_capacity`] and
+    /// [`Self::has_dedicated_host_capacity`] gate their own stores, so it can refuse with
+    /// [`LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION_LIMIT_EXCEEDED`] rather than discover the
+    /// refusal from an absent id. The insert itself asks it too, so no path can get past it.
+    pub fn has_local_gateway_vif_group_association_capacity(&self, count: usize) -> bool {
+        self.local_gateway_route_table_virtual_interface_group_associations
+            .len()
+            .saturating_add(count)
+            <= MAX_LOCAL_GATEWAY_VIF_GROUP_ASSOCIATIONS
+    }
+
+    /// Store one association between a local gateway route table and a virtual interface
+    /// group, and answer the id it was given — or `None` when the store cannot take it.
+    ///
+    /// Both of the store's bounds are enforced HERE, before an id is minted or a byte
+    /// charged: the count ceiling
+    /// ([`Self::has_local_gateway_vif_group_association_capacity`]) and the byte budget
+    /// ([`Self::would_exceed_stored_bytes`] over
+    /// [`local_gateway_vif_group_association_payload_bytes`]). Nothing in this emulator
+    /// reclaims a stored association, so a write that is not bounded at the seam it is
+    /// written through would grow the process's heap for as long as a caller keeps asking.
+    /// A caller that gets `None` must refuse the request with
+    /// [`LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION_LIMIT_EXCEEDED`].
     pub fn insert_local_gateway_route_table_virtual_interface_group_association(
         &mut self,
         spec: LocalGatewayRouteTableVirtualInterfaceGroupAssociationSpec,
-    ) -> String {
+    ) -> Option<String> {
+        let payload_bytes = local_gateway_vif_group_association_payload_bytes(&spec);
+        if !self.has_local_gateway_vif_group_association_capacity(1)
+            || self.would_exceed_stored_bytes(payload_bytes)
+        {
+            return None;
+        }
         let association_id = self.next_id(LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION_ID_PREFIX);
         let association =
             crate::ops::types::LocalGatewayRouteTableVirtualInterfaceGroupAssociation {
@@ -3630,12 +3717,10 @@ impl ComAmazonawsEc2Amazonec2State {
                 state: Some(spec.state),
                 tags: Some(spec.tags),
             };
-        self.add_stored_bytes(tag_list_bytes(
-            association.tags.as_deref().unwrap_or_default(),
-        ));
+        self.add_stored_bytes(payload_bytes);
         self.local_gateway_route_table_virtual_interface_group_associations
             .insert(association_id.clone(), association);
-        association_id
+        Some(association_id)
     }
 }
 
@@ -6807,6 +6892,197 @@ pub fn require_known_capacity_block<E>(
         return Ok(());
     }
     Err(invalid_capacity_block_id_not_found(capacity_block_id))
+}
+
+// =============================================================================
+// Capacity Block offerings
+// =============================================================================
+
+/// The currency a Capacity Block offering is priced in: the only member of the modelled
+/// `CurrencyCodeValues` enum (`smithy_query(query="shape",shape="CurrencyCodeValues")`), so
+/// it is the one value `CapacityBlockOffering$CurrencyCode` can carry.
+pub const CAPACITY_BLOCK_OFFERING_CURRENCY_CODE: &str = "USD";
+
+/// "The tenancy of the Capacity Block" (`CapacityBlockOffering$Tenancy`): the `default`
+/// member of the modelled `CapacityReservationTenancy` enum
+/// (`smithy_query(query="shape",shape="CapacityReservationTenancy")`). The other member,
+/// `dedicated`, is single-tenant hardware a caller asks for when it creates a Capacity
+/// Reservation, and nothing in a Capacity Block offering search asks for it.
+pub const CAPACITY_BLOCK_OFFERING_TENANCY: &str = "default";
+
+/// The id prefix a Capacity Block offering id carries, in the `<prefix>-<payload>` form
+/// every EC2 resource id takes; `cbo` is the prefix AWS gives an offering id of this
+/// operation, beside [`CAPACITY_BLOCK_ID_PREFIX`] for the block a purchase mints.
+pub const CAPACITY_BLOCK_OFFERING_ID_PREFIX: &str = "cbo";
+
+/// The marker an offering id carries ahead of its checksum and terms, so an id a caller
+/// assembled is detectable rather than read as terms — the same arrangement
+/// [`PAGE_TOKEN_VERSION`] gives a pagination token.
+const CAPACITY_BLOCK_OFFERING_ID_VERSION: &str = "ec2-cbo-1";
+
+/// What one reserved unit of a Capacity Block — one instance, or one EC2 UltraServer —
+/// costs for one hour, in cents, as [`capacity_block_upfront_fee`] prices an offering.
+///
+/// CHOSEN, like [`MAX_INSTANCES_PER_RUN`]: "The total price to be paid up front"
+/// (`CapacityBlockOffering$UpfrontFee`) is a function of AWS's price list, which neither the
+/// model nor a request carries, so this emulator prices every reserved unit the same rather
+/// than inventing a per-instance-type price list. What a caller can rely on is the RULE —
+/// the fee is the reserved units times the reserved hours times one rate — not the rate.
+pub const CAPACITY_BLOCK_FEE_CENTS_PER_UNIT_HOUR: u64 = 1_000;
+
+/// "The total price to be paid up front" for `reserved_units` units held for
+/// `duration_hours` hours, as `CapacityBlockOffering$UpfrontFee` carries it: a decimal
+/// amount in [`CAPACITY_BLOCK_OFFERING_CURRENCY_CODE`], with the two fractional digits a
+/// currency amount is written with.
+///
+/// The ONE definition of that charge, so every operation that reports an offering prices
+/// one window the same way.
+pub fn capacity_block_upfront_fee(reserved_units: u64, duration_hours: u64) -> String {
+    let cents = reserved_units
+        .saturating_mul(duration_hours)
+        .saturating_mul(CAPACITY_BLOCK_FEE_CENTS_PER_UNIT_HOUR);
+    format!("{}.{:02}", cents / 100, cents % 100)
+}
+
+/// What one Capacity Block offering reserves: the terms a purchase of it would turn into a
+/// stored Capacity Block.
+///
+/// An offering is not a stored resource — see the module docs — so the terms travel INSIDE
+/// the offering id ([`encode_capacity_block_offering_id`]) rather than in a map keyed by it.
+/// That is what lets `DescribeCapacityBlockOfferings` report offerings without writing
+/// anything, while a purchase can still resolve the id a caller hands back to the window,
+/// zone and counts the offering was reported with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityBlockOfferingTerms {
+    /// "The instance type of the Capacity Block offering"
+    /// (`CapacityBlockOffering$InstanceType`), or `None` for an offering of EC2
+    /// UltraServers, which names an UltraServer type instead.
+    pub instance_type: Option<String>,
+    /// "The number of instances in the Capacity Block offering"
+    /// (`CapacityBlockOffering$InstanceCount`).
+    pub instance_count: Option<i32>,
+    /// "The EC2 UltraServer type of the Capacity Block offering"
+    /// (`CapacityBlockOffering$UltraserverType`), or `None` for an offering of plain
+    /// instances.
+    pub ultraserver_type: Option<String>,
+    /// "The number of EC2 UltraServers in the offering"
+    /// (`CapacityBlockOffering$UltraserverCount`).
+    pub ultraserver_count: Option<i32>,
+    /// The Availability Zone the reserved capacity sits in.
+    pub availability_zone: String,
+    /// That zone's id. The modelled `CapacityBlockOffering` carries no member for it, but
+    /// the [`CapacityBlock`] a purchase mints does, so the offering's terms keep it.
+    pub availability_zone_id: String,
+    /// When the reserved window opens, in seconds since the Unix epoch.
+    pub start_date_secs: i64,
+    /// When it closes, in seconds since the Unix epoch.
+    pub end_date_secs: i64,
+}
+
+/// The `CapacityBlockOfferingId` for `terms`: `cbo-<hex>` over the terms, this service's
+/// offering-id marker and a checksum.
+///
+/// Deriving the id FROM the terms is what makes it stable — two searches that find the same
+/// window in the same zone for the same counts report the same id, so a read changes nothing
+/// a later caller sees — and resolvable, since [`decode_capacity_block_offering_id`] reads
+/// the terms back out without a store. The checksum is the same non-secret one a pagination
+/// token carries ([`page_token_checksum`]), for the same reason: it tells an id this service
+/// minted from one a caller assembled, nothing more.
+pub fn encode_capacity_block_offering_id(terms: &CapacityBlockOfferingTerms) -> String {
+    let payload = capacity_block_offering_payload(terms);
+    let checksum = page_token_checksum(&payload);
+    let body = format!("{CAPACITY_BLOCK_OFFERING_ID_VERSION}:{checksum:016x}:{payload}");
+    format!(
+        "{CAPACITY_BLOCK_OFFERING_ID_PREFIX}-{}",
+        ::hex::encode(body.as_bytes())
+    )
+}
+
+/// The terms an id minted by [`encode_capacity_block_offering_id`] carries; `None` for
+/// anything else — an id that does not carry this service's prefix or marker, is not hex,
+/// whose checksum does not match its terms, or whose terms are not the fields an offering
+/// has.
+pub fn decode_capacity_block_offering_id(offering_id: &str) -> Option<CapacityBlockOfferingTerms> {
+    let hexed = offering_id
+        .strip_prefix(CAPACITY_BLOCK_OFFERING_ID_PREFIX)
+        .and_then(|rest| rest.strip_prefix('-'))?;
+    let decoded = String::from_utf8(::hex::decode(hexed).ok()?).ok()?;
+    let marked = decoded
+        .strip_prefix(CAPACITY_BLOCK_OFFERING_ID_VERSION)
+        .and_then(|rest| rest.strip_prefix(':'))?;
+    let (checksum, payload) = marked.split_once(':')?;
+    if checksum != format!("{:016x}", page_token_checksum(payload)) {
+        return None;
+    }
+    // Every text field is itself hex, so no byte a request chose can carry the separator and
+    // shift the fields the service derived; the field count is therefore exact.
+    let fields: Vec<&str> = payload
+        .split(CAPACITY_BLOCK_OFFERING_FIELD_SEPARATOR)
+        .collect();
+    if fields.len() != CAPACITY_BLOCK_OFFERING_FIELDS {
+        return None;
+    }
+    let terms = CapacityBlockOfferingTerms {
+        start_date_secs: fields[0].parse().ok()?,
+        end_date_secs: fields[1].parse().ok()?,
+        instance_count: optional_count_field(fields[2])?,
+        ultraserver_count: optional_count_field(fields[3])?,
+        availability_zone: hex_field(fields[4])?,
+        availability_zone_id: hex_field(fields[5])?,
+        instance_type: optional_hex_field(fields[6])?,
+        ultraserver_type: optional_hex_field(fields[7])?,
+    };
+    Some(terms)
+}
+
+/// How many fields an offering id's payload carries.
+const CAPACITY_BLOCK_OFFERING_FIELDS: usize = 8;
+
+/// What separates them. Every text field is hex-encoded inside the payload, so no field can
+/// carry the separator whatever text it holds — see [`decode_capacity_block_offering_id`].
+const CAPACITY_BLOCK_OFFERING_FIELD_SEPARATOR: char = '|';
+
+/// The terms of one offering as the text its id carries them as: the instants and counts as
+/// decimal, every text field as hex, so a field is always separator-free.
+fn capacity_block_offering_payload(terms: &CapacityBlockOfferingTerms) -> String {
+    let separator = CAPACITY_BLOCK_OFFERING_FIELD_SEPARATOR;
+    let count = |value: Option<i32>| value.map(|count| count.to_string()).unwrap_or_default();
+    let text = |value: Option<&str>| ::hex::encode(value.unwrap_or_default().as_bytes());
+    format!(
+        "{}{separator}{}{separator}{}{separator}{}{separator}{}{separator}{}{separator}{}{separator}{}",
+        terms.start_date_secs,
+        terms.end_date_secs,
+        count(terms.instance_count),
+        count(terms.ultraserver_count),
+        text(Some(terms.availability_zone.as_str())),
+        text(Some(terms.availability_zone_id.as_str())),
+        text(terms.instance_type.as_deref()),
+        text(terms.ultraserver_type.as_deref()),
+    )
+}
+
+/// One count field of an offering id: an empty field is a member the offering does not
+/// carry, anything that is not a number at all makes the whole id unreadable.
+fn optional_count_field(field: &str) -> Option<Option<i32>> {
+    if field.is_empty() {
+        return Some(None);
+    }
+    field.parse().ok().map(Some)
+}
+
+/// One text field of an offering id: the text its hex carries. A field that is not hex, or
+/// not UTF-8 under it, makes the whole id unreadable.
+fn hex_field(field: &str) -> Option<String> {
+    String::from_utf8(::hex::decode(field).ok()?).ok()
+}
+
+/// One optional text field of an offering id: an empty field is a member the offering does
+/// not carry. The outer `None` is an unreadable field, the inner one an absent member.
+fn optional_hex_field(field: &str) -> Option<Option<String>> {
+    if field.is_empty() {
+        return Some(None);
+    }
+    hex_field(field).map(Some)
 }
 
 // =============================================================================

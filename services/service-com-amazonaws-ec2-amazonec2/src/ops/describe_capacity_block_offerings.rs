@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCapacityBlockOfferings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCapacityBlockOfferings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCapacityBlockOfferings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: answers the Capacity Block offerings that fit the search — the reservation
+//! duration, the counts and the date range the request names — in each Availability Zone of
+//! the Region the request was signed for, paged by `MaxResults`/`NextToken`. An offering is
+//! derived rather than stored (see [`crate::state`]) and its terms travel inside its id, so
+//! this search writes nothing. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +156,415 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCapacityBlockOfferings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCapacityBlockOfferingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            availability_zones_in_region, capacity_block_upfront_fee,
+            decode_page_token, encode_capacity_block_offering_id, encode_page_token,
+            instance_type_is_modelled, invalid_pagination_token_for, offered_instance_types,
+            request_region, CapacityBlockOfferingTerms, CAPACITY_BLOCK_OFFERING_CURRENCY_CODE,
+            CAPACITY_BLOCK_OFFERING_TENANCY, MAX_PAGE_SIZE,
+        };
+
+        // An offering is not a stored resource — it is what the Region offers for the search
+        // this request describes (`crate::state`, "A Capacity Block OFFERING is a search
+        // result, not a stored resource") — so this operation reads and writes no state and
+        // never reaches the engine on `self`.
+        let _ = &self.engine;
+
+        // "The token to use to retrieve the next page of results" — anything else is refused
+        // rather than read as a cursor, and it is refused before any member that selects what
+        // to report is looked at, so whether a bogus token is caught never depends on the
+        // rest of the request. The token also carries the fingerprint of the search it was
+        // minted for ([`search_fingerprint`]), so one presented back against a DIFFERENT
+        // search is refused rather than resuming inside a set it never described.
+        let fingerprint = search_fingerprint(&input);
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let cursor =
+                    decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?;
+                let (carried, position) = cursor
+                    .split_once(CURSOR_SEPARATOR)
+                    .ok_or_else(|| invalid_pagination_token_for(token))?;
+                if carried != fingerprint {
+                    return Err(invalid_pagination_token_for(token));
+                }
+                Some(position.to_string())
+            }
+        };
+
+        // "You must specify the duration in 1-day increments up 14 days, and in 7-day
+        // increments up to 182 days" (`DescribeCapacityBlockOfferingsRequest$CapacityDurationHours`):
+        // a duration outside those increments names no window Capacity Blocks are sold in.
+        let duration_hours = input.capacity_duration_hours;
+        if !duration_is_offered(duration_hours) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "CapacityDurationHours must be a multiple of {HOURS_PER_DAY} up to \
+                 {MAX_DAILY_INCREMENT_HOURS} hours ({MAX_DAILY_INCREMENT_DAYS} days), or a \
+                 multiple of {HOURS_PER_WEEK} up to {MAX_DURATION_HOURS} hours \
+                 ({MAX_DURATION_DAYS} days); got {duration_hours}"
+            )));
+        }
+
+        // "The type of instance for which the Capacity Block offering reserves capacity": a
+        // value the model's `InstanceType` enum does not declare is not an instance type at
+        // all, so it is refused rather than reported as an offering of it. Which instance
+        // types a Region offers Capacity Blocks for is not in the model and not in the
+        // request, so — exactly as `crate::state::offered_instance_types` documents for
+        // `DescribeInstanceTypeOfferings` — every type the model declares is treated as
+        // offered rather than a subset being invented here.
+        if let Some(instance_type) = input.instance_type.as_deref() {
+            if !instance_type_is_modelled(instance_type) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{instance_type}' for InstanceType"
+                )));
+            }
+        }
+
+        // "Each Capacity Block can have up to 64 instances"
+        // (`DescribeCapacityBlockOfferingsRequest$InstanceCount`), and a reservation of no
+        // instances reserves nothing.
+        if let Some(instance_count) = input.instance_count {
+            if !(1..=MAX_INSTANCES_PER_CAPACITY_BLOCK).contains(&instance_count) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "InstanceCount must be between 1 and {MAX_INSTANCES_PER_CAPACITY_BLOCK}; \
+                     got {instance_count}"
+                )));
+            }
+        }
+
+        // "The number of EC2 UltraServers in the offerings": the model publishes no bound for
+        // it, so only a count that reserves nothing is refused.
+        if let Some(ultraserver_count) = input.ultraserver_count {
+            if ultraserver_count < 1 {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "UltraserverCount must be at least 1; got {ultraserver_count}"
+                )));
+            }
+        }
+
+        // `UltraserverType` is a plain string in the model
+        // (`smithy_query(query="operation",operation="DescribeCapacityBlockOfferings")`), so
+        // what an EC2 UltraServer type looks like is checked here: a bounded name in the
+        // lowercase, digit, `-` and `.` alphabet every instance and UltraServer type AWS
+        // publishes is written in (`u-p6e-gb200x72`). The value is reported back on every
+        // offering of the page and carried in each offering's id, so anything else is
+        // refused rather than echoed.
+        if let Some(ultraserver_type) = input.ultraserver_type.as_deref() {
+            if !is_ultraserver_type_shaped(ultraserver_type) {
+                let echoed: String = ultraserver_type
+                    .chars()
+                    .take(MAX_ULTRASERVER_TYPE_BYTES)
+                    .collect();
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{echoed}' for UltraserverType: expected between 1 and \
+                     {MAX_ULTRASERVER_TYPE_BYTES} characters of [a-z0-9.-]"
+                )));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused with
+        // that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The reserved window. "To search for an available Capacity Block offering, you
+        // specify a reservation duration and instance count", and `StartDateRange` is "The
+        // earliest start date for the Capacity Block offering", so the offering reported is
+        // the soonest window that both fits the duration and starts no earlier than the
+        // caller asked — never in the past, since capacity is reserved ahead.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCapacityBlockOfferings"))
+        // Every step is CHECKED arithmetic: a bound so far out that the window could not be
+        // represented at all is a search nothing on sale fits, which is an empty answer
+        // rather than a window at a saturated instant no offering could ever have.
+        let now_secs = unix_seconds_now();
+        let window = input
+            .start_date_range
+            .map_or(Some(now_secs), ceiling_seconds)
+            .map(|earliest| earliest.max(now_secs))
+            .and_then(next_whole_hour_at_or_after)
+            .and_then(|start_date_secs| {
+                let span = i64::from(duration_hours).checked_mul(SECONDS_PER_HOUR)?;
+                let end_date_secs = start_date_secs.checked_add(span)?;
+                // A window the wire cannot carry is no offering at all: the modelled
+                // `MillisecondDateTime` is rendered as an RFC 3339 timestamp, which reaches
+                // only to [`MAX_REPRESENTABLE_EPOCH_SECONDS`].
+                if end_date_secs > MAX_REPRESENTABLE_EPOCH_SECONDS {
+                    return None;
+                }
+                // `EndDateRange` is "The latest end date for the Capacity Block offering": a
+                // duration that cannot close inside it is offered in no zone, which is an
+                // empty result rather than a refusal — the search was well formed, nothing
+                // on sale fits it.
+                input
+                    .end_date_range
+                    .is_none_or(|end_date_range| end_date_secs <= end_date_range.secs())
+                    .then_some((start_date_secs, end_date_secs))
+            });
+        let (start_date_secs, end_date_secs) = window.unwrap_or((now_secs, now_secs));
+
+        // What the offering reserves. An offering must say what it holds, and the smallest
+        // Capacity Block a search can be answered with is one unit, so a search that names no
+        // count is answered with one instance — or one UltraServer, when it is UltraServers
+        // the search is for.
+        let (instance_count, ultraserver_count) = match input.ultraserver_type.as_deref() {
+            Some(_) => (
+                input.instance_count,
+                Some(input.ultraserver_count.unwrap_or(1)),
+            ),
+            None => (Some(input.instance_count.unwrap_or(1)), None),
+        };
+        // The fee is charged on the units the block reserves: its instances, or its
+        // UltraServers when it is UltraServers that are reserved.
+        let reserved_units = ultraserver_count
+            .or(instance_count)
+            .unwrap_or(1)
+            .unsigned_abs();
+        let upfront_fee = capacity_block_upfront_fee(
+            u64::from(reserved_units),
+            u64::from(duration_hours.unsigned_abs()),
+        );
+
+        // The instance types the search covers: the one it names, none at all for a search
+        // for UltraServers, and otherwise every type the model declares.
+        let instance_types: Vec<Option<&str>> = match input.instance_type.as_deref() {
+            Some(instance_type) => vec![Some(instance_type)],
+            None if input.ultraserver_type.is_some() => vec![None],
+            None => offered_instance_types().iter().copied().map(Some).collect(),
+        };
+
+        // "Include all Availability Zones and Local Zones, regardless of your opt-in status.
+        // If you do not use this parameter, the results include available offerings from all
+        // Availability Zones in the Amazon Web Services Region and Local Zones you are opted
+        // into." Every zone this emulator serves is a standard Availability Zone and so is
+        // `opt-in-not-required` (`crate::state::availability_zones_in_region`), and there are
+        // no Local Zones to opt into, so the flag selects the same zones either way — it is
+        // read, and changes nothing, rather than being refused.
+        let _ = input.all_availability_zones;
+        let region = request_region(ctx.parts());
+        let zones = availability_zones_in_region(&region);
+
+        // One offering per zone and instance type: "The recommended Capacity Block offering
+        // for the dates specified". Each candidate carries the cursor that names it, built
+        // once, and the candidates are kept in cursor order — the order a `NextToken` walk
+        // resumes in — so neither the sort nor the resumption below rebuilds one.
+        let mut candidates: Vec<(String, usize, Option<&str>)> = Vec::new();
+        if window.is_some() {
+            for (zone_index, zone) in zones.iter().enumerate() {
+                for instance_type in &instance_types {
+                    candidates.push((
+                        offering_page_cursor(&zone.zone_name, *instance_type),
+                        zone_index,
+                        *instance_type,
+                    ));
+                }
+            }
+        }
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => {
+                candidates.partition_point(|(candidate, _, _)| candidate.as_str() < cursor)
+            }
+        };
+        let page = candidates.get(from..).unwrap_or_default();
+
+        // `MaxResults` carries the modelled `range 1..1000`
+        // (`smithy_query(query="shape",shape="DescribeCapacityBlockOfferingsMaxResults")`),
+        // so the boundary validator has already refused anything outside it, and a request
+        // that names no page size gets the largest page this service serves.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // "This value is null when there are no more results to return"
+        // (`DescribeCapacityBlockOfferingsResult$NextToken`): a token only when an offering
+        // follows this page.
+        let next_token = page.get(limit).map(|(cursor, _, _)| {
+            encode_page_token(&format!("{fingerprint}{CURSOR_SEPARATOR}{cursor}"))
+        });
+
+        let capacity_block_offerings = page
+            .iter()
+            .take(limit)
+            .map(|(_, zone_index, instance_type)| {
+                let zone = &zones[*zone_index];
+                let terms = CapacityBlockOfferingTerms {
+                    instance_type: instance_type.map(str::to_string),
+                    instance_count,
+                    ultraserver_type: input.ultraserver_type.clone(),
+                    ultraserver_count,
+                    availability_zone: zone.zone_name.clone(),
+                    availability_zone_id: zone.zone_id.clone(),
+                    start_date_secs,
+                    end_date_secs,
+                };
+                CapacityBlockOffering {
+                    // Derived from the terms, so the same window in the same zone for the
+                    // same counts always carries the same id, and a purchase can read the
+                    // terms back out of it.
+                    capacity_block_offering_id: Some(encode_capacity_block_offering_id(&terms)),
+                    instance_type: terms.instance_type.clone(),
+                    availability_zone: Some(zone.zone_name.clone()),
+                    instance_count,
+                    start_date: Some(::aws_smithy_types::DateTime::from_secs(start_date_secs)),
+                    end_date: Some(::aws_smithy_types::DateTime::from_secs(end_date_secs)),
+                    // "The number of hours (in addition to capacityBlockDurationMinutes) for
+                    // the duration of the Capacity Block reservation": the window is a whole
+                    // number of hours, so the minutes part of it is zero.
+                    capacity_block_duration_hours: Some(duration_hours),
+                    capacity_block_duration_minutes: Some(0),
+                    upfront_fee: Some(upfront_fee.clone()),
+                    currency_code: Some(CAPACITY_BLOCK_OFFERING_CURRENCY_CODE.to_string()),
+                    tenancy: Some(CAPACITY_BLOCK_OFFERING_TENANCY.to_string()),
+                    ultraserver_type: terms.ultraserver_type.clone(),
+                    ultraserver_count,
+                    // "The type of zone where the Capacity Block offering is available",
+                    // read off the zone the offering is in.
+                    zone_type: Some(zone.zone_type.to_string()),
+                }
+            })
+            .collect();
+
+        Ok(DescribeCapacityBlockOfferingsOutput {
+            capacity_block_offerings: Some(capacity_block_offerings),
+            next_token,
+        })
     }
+}
+
+/// The hours in one day, the smaller of the two increments a Capacity Block's duration is
+/// sold in.
+const HOURS_PER_DAY: i32 = 24;
+
+/// The hours in one week, the larger increment.
+const HOURS_PER_WEEK: i32 = 7 * HOURS_PER_DAY;
+
+/// The longest reservation sold in whole-day increments, in days: "You must specify the
+/// duration in 1-day increments up 14 days"
+/// (`DescribeCapacityBlockOfferingsRequest$CapacityDurationHours`).
+const MAX_DAILY_INCREMENT_DAYS: i32 = 14;
+
+/// That bound in hours, the unit the request gives a duration in.
+const MAX_DAILY_INCREMENT_HOURS: i32 = HOURS_PER_DAY * MAX_DAILY_INCREMENT_DAYS;
+
+/// The longest reservation sold at all, in days: "and in 7-day increments up to 182 days"
+/// (same member).
+const MAX_DURATION_DAYS: i32 = 182;
+
+/// That bound in hours.
+const MAX_DURATION_HOURS: i32 = HOURS_PER_DAY * MAX_DURATION_DAYS;
+
+/// "Each Capacity Block can have up to 64 instances"
+/// (`DescribeCapacityBlockOfferingsRequest$InstanceCount`).
+const MAX_INSTANCES_PER_CAPACITY_BLOCK: i32 = 64;
+
+/// The most bytes an `UltraserverType` may carry. CHOSEN: the model types the member as a
+/// plain string with no `@length`, and the value is reported back on every offering of a
+/// page and carried in each offering's id, so its size is bounded here. It is well above
+/// every UltraServer type name AWS publishes (`u-p6e-gb200x72`).
+const MAX_ULTRASERVER_TYPE_BYTES: usize = 64;
+
+/// Whether `ultraserver_type` is shaped like an EC2 UltraServer type at all: a bounded,
+/// non-empty name of lowercase letters, digits, `-` and `.`, the alphabet every instance and
+/// UltraServer type AWS publishes is written in.
+fn is_ultraserver_type_shaped(ultraserver_type: &str) -> bool {
+    !ultraserver_type.is_empty()
+        && ultraserver_type.len() <= MAX_ULTRASERVER_TYPE_BYTES
+        && ultraserver_type.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.'
+        })
+}
+
+/// The seconds in one hour, the unit a Capacity Block's duration is given in.
+const SECONDS_PER_HOUR: i64 = 3_600;
+
+/// The last instant a modelled timestamp can carry: `9999-12-31T23:59:59Z`, the end of the
+/// range the RFC 3339 rendering of a `MillisecondDateTime` supports ("RFC-3339 timestamps
+/// support dates between 0001-01-01T00:00:00.000Z and 9999-12-31T23:59:59.999Z", from the
+/// serializer that writes this operation's `StartDate`/`EndDate`). A window that would close
+/// after it is a window no offering can be reported with, so none is.
+const MAX_REPRESENTABLE_EPOCH_SECONDS: i64 = 253_402_300_799;
+
+/// Whether a reservation of `duration_hours` is a duration Capacity Blocks are sold for:
+/// "You must specify the duration in 1-day increments up 14 days, and in 7-day increments up
+/// to 182 days" (`DescribeCapacityBlockOfferingsRequest$CapacityDurationHours`).
+fn duration_is_offered(duration_hours: i32) -> bool {
+    if duration_hours <= 0 {
+        return false;
+    }
+    let daily = duration_hours % HOURS_PER_DAY == 0 && duration_hours <= MAX_DAILY_INCREMENT_HOURS;
+    let weekly = duration_hours % HOURS_PER_WEEK == 0 && duration_hours <= MAX_DURATION_HOURS;
+    daily || weekly
+}
+
+/// Now, in seconds since the Unix epoch.
+fn unix_seconds_now() -> i64 {
+    let since_epoch = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX)
+}
+
+/// A modelled instant as the first whole second at or after it, so a sub-second bound the
+/// request carries cannot be satisfied by an instant just before it. `None` for an instant
+/// so far out that the next whole second is not representable.
+fn ceiling_seconds(at: ::aws_smithy_types::DateTime) -> Option<i64> {
+    at.secs().checked_add(i64::from(at.subsec_nanos() > 0))
+}
+
+/// The first whole hour at or after `at`, or `None` when that instant is not representable.
+///
+/// CHOSEN alignment: AWS publishes no rule for when a Capacity Block offering's window
+/// opens — `CapacityBlockOffering$CapacityBlockDurationHours`'s own example is a block
+/// running from 04:55 to 11:30 — so the offerings this emulator reports start on the hour,
+/// which keeps a window's duration a whole number of hours and keeps the offering (and so
+/// its id) stable for every search made in the same hour.
+fn next_whole_hour_at_or_after(at: i64) -> Option<i64> {
+    let past_the_hour = at.rem_euclid(SECONDS_PER_HOUR);
+    if past_the_hour == 0 {
+        return Some(at);
+    }
+    at.checked_add(SECONDS_PER_HOUR - past_the_hour)
+}
+
+/// What separates the search's fingerprint from the position inside it in one page cursor.
+/// Neither part can carry it: the fingerprint is hex, and the position is a zone name and an
+/// instance type.
+const CURSOR_SEPARATOR: char = '#';
+
+/// The fingerprint of the search `input` describes: the members that SELECT what is
+/// reported, as the request gives them.
+///
+/// A `NextToken` carries it so a token minted by one search is refused when it is presented
+/// back against another — the way the real service refuses a pagination token whose request
+/// parameters changed — instead of resuming at a position inside a set it never described.
+/// The derived window is deliberately NOT part of it: it moves with the clock, and a token
+/// must not stop working because an hour turned.
+fn search_fingerprint(input: &DescribeCapacityBlockOfferingsInput) -> String {
+    use ::std::hash::{Hash, Hasher};
+
+    let instant = |at: Option<::aws_smithy_types::DateTime>| {
+        at.map(|at| (at.secs(), at.subsec_nanos()))
+    };
+    let mut hasher = ::std::hash::DefaultHasher::new();
+    input.capacity_duration_hours.hash(&mut hasher);
+    input.instance_type.hash(&mut hasher);
+    input.instance_count.hash(&mut hasher);
+    input.ultraserver_type.hash(&mut hasher);
+    input.ultraserver_count.hash(&mut hasher);
+    instant(input.start_date_range).hash(&mut hasher);
+    instant(input.end_date_range).hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// The cursor one offering of a page is named by: its zone and its instance type, which
+/// together identify one offering of a single search, in the order `NextToken` walks them.
+fn offering_page_cursor(zone_name: &str, instance_type: Option<&str>) -> String {
+    format!("{zone_name}|{}", instance_type.unwrap_or_default())
 }
