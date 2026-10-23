@@ -197,7 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let (resource_tags, next_token) = crate::state::page(
-            crate::state::PageTokenKind::ResourceTags,
+            // The token is bound to the tag keys of THIS export: a position in another
+            // export's tags is a position in a sequence this call never walked.
+            crate::state::PageTokenKind::ResourceTags {
+                resource_arn: &input.resource_arn,
+            },
             &tags,
             input.max_results,
             input.next_token.as_deref(),
