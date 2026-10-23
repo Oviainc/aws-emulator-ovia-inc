@@ -80,6 +80,45 @@ impl Logs {
         );
         error_code(&parsed)
     }
+
+    /// The one log group the service reports under `identifier` (a name or either ARN
+    /// form), or `None` once it is gone. Every suite that reads a log group's state back
+    /// goes through this, so what it asserts is what a client can observe.
+    pub async fn describe_group(&self, identifier: &str) -> Option<Value> {
+        let page = self
+            .ok(
+                "DescribeLogGroups",
+                &serde_json::json!({"logGroupIdentifiers": [identifier]}),
+            )
+            .await;
+        let groups = page
+            .get("logGroups")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("DescribeLogGroups must return logGroups, got {page}"))
+            .clone();
+        assert!(
+            groups.len() <= 1,
+            "case {identifier}: at most one log group is reported under one identifier, got {groups:?}"
+        );
+        groups.into_iter().next()
+    }
+
+    /// Both ARN forms a log group carries: `arn` (with the trailing `:*`) and
+    /// `logGroupArn` (without it).
+    pub async fn group_arns(&self, name: &str) -> (String, String) {
+        let group = self
+            .describe_group(name)
+            .await
+            .unwrap_or_else(|| panic!("case {name}: the log group must exist"));
+        let member = |key: &str| {
+            group
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("case {name}: a log group carries {key}, got {group}"))
+                .to_string()
+        };
+        (member("arn"), member("logGroupArn"))
+    }
 }
 
 /// The wire error code of an awsJson error body (`__type`, which may carry a namespace).

@@ -231,6 +231,29 @@ pub const DISCOVERED_RESOURCES_MAX_RESOURCE_IDS: usize = 20;
 /// `DescribeConfigRules` does, so it serves them at the same page size.
 pub const DESCRIBE_COMPLIANCE_BY_CONFIG_RULE_PAGE_SIZE: usize = DESCRIBE_CONFIG_RULES_PAGE_SIZE;
 
+/// The most tags one Config resource can carry, after which `TagResource` refuses
+/// the request with `TooManyTagsException` ("You have reached the limit of the number
+/// of tags you can use"). 50 is the tags-per-resource limit, which the model
+/// corroborates: every `Tags` member it declares, and `TagResource$Tags` itself, has a
+/// `TagList` length maximum of 50, so no resource can be given more than 50 tags in
+/// one request either.
+pub const TAGS_PER_RESOURCE_QUOTA: usize = 50;
+
+/// The largest `Limit` `ListTagsForResource` accepts
+/// (`ListTagsForResourceRequest$Limit`: "The limit maximum is 50. You cannot specify a
+/// number greater than 50"), past which it answers `InvalidLimitException`. The
+/// MODELLED range of `Limit` is 0..100, so a value in 51..=100 clears boundary
+/// validation and this limit is what refuses it.
+pub const LIST_TAGS_MAX_LIMIT: i32 = 50;
+
+/// How many tags one `ListTagsForResource` page carries when the request leaves
+/// `Limit` at its modelled default of 0 (`ListTagsForResourceRequest$Limit`: "If you
+/// specify 0, Config uses the default").
+///
+/// The default itself is not published, so it is this emulator's: the limit maximum
+/// the same member documents, [`LIST_TAGS_MAX_LIMIT`].
+pub const LIST_TAGS_DEFAULT_LIMIT: i32 = LIST_TAGS_MAX_LIMIT;
+
 /// The most retention configurations this account and Region can hold
 /// (`DescribeRetentionConfigurations` and `PutRetentionConfiguration`: "Currently,
 /// Config supports only one retention configuration per region in your account").
@@ -257,6 +280,73 @@ pub const DESCRIBE_PENDING_AGGREGATION_REQUESTS_MAX_LIMIT: usize = 20;
 pub const STATE_UNAVAILABLE: &str =
     "the Config emulator could not reach its state store for this request";
 
+/// The tags on ONE resource, keyed by tag key.
+///
+/// A map, not the modelled `TagList`, because a resource carries each tag key at most
+/// once: re-tagging a key updates its value (`TagResource`: "If existing tags are
+/// specified, however, then their values will be updated"). The key ordering is also
+/// the stable ordering `ListTagsForResource` pages over, so a page token survives a
+/// later tag or untag.
+pub type TagSet = BTreeMap<String, String>;
+
+/// The tag set a request's `TagList` describes: the key is taken VERBATIM (so the key
+/// a write stores is the key an untag or a read names), the last value wins for a key
+/// the list repeats, and an entry carrying no key is dropped (the model leaves
+/// `Tag$Key` optional).
+pub fn tag_set(tags: &[Tag]) -> TagSet {
+    tags.iter()
+        .filter_map(|tag| {
+            let key = tag.key.as_deref()?;
+            Some((key.to_string(), tag.value.clone().unwrap_or_default()))
+        })
+        .collect()
+}
+
+/// A tag set as the modelled `TagList` reports it, in tag-key order.
+pub fn tag_list<'a>(tags: impl IntoIterator<Item = (&'a String, &'a String)>) -> Vec<Tag> {
+    tags.into_iter()
+        .map(|(key, value)| Tag {
+            key: Some(key.clone()),
+            value: Some(value.clone()),
+        })
+        .collect()
+}
+
+/// Whether `arn` is a well-formed Amazon Resource Name: the `arn` prefix and six
+/// colon-separated fields (`arn:<partition>:<service>:<region>:<account>:<resource>`),
+/// with a partition, a service and a resource. Region and account are empty in the
+/// ARNs of some services, so neither is required here.
+pub fn is_amazon_resource_name(arn: &str) -> bool {
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    fields.len() == 6
+        && fields[0] == "arn"
+        && !fields[1].is_empty()
+        && !fields[2].is_empty()
+        && !fields[5].is_empty()
+}
+
+/// How Config words `ValidationException` for a tagging request whose `ResourceArn` is
+/// not an ARN at all.
+///
+/// BUILT FROM THE REQUEST — it quotes the value the caller sent and names the member
+/// to fix — so every operation that refuses a malformed `ResourceArn` words it the
+/// same way.
+pub fn malformed_resource_arn_message(arn: &str) -> String {
+    format!(
+        "The ResourceArn '{arn}' provided in the request is invalid. Please check the \
+         resource ARN."
+    )
+}
+
+/// How Config words `ResourceNotFoundException` for a tagging request whose
+/// `ResourceArn` names a resource this account does not hold in this Region.
+///
+/// BUILT FROM THE REQUEST, for the same reason as
+/// [`malformed_resource_arn_message`].
+pub fn resource_not_found_message(arn: &str) -> String {
+    format!("The resource '{arn}' provided in the request does not exist.")
+}
+
 /// One persisted customer managed configuration recorder.
 #[derive(Debug, Clone, Default)]
 pub struct RecorderEntry {
@@ -277,10 +367,11 @@ pub struct RecorderEntry {
     /// recorder this account creates itself. Only
     /// `PutThirdPartyServiceLinkedConfigurationRecorder` sets it.
     pub provider: Option<String>,
-    /// Tags are taken at creation and not updated afterwards
-    /// (`PutConfigurationRecorder`: "Tags are added at creation and cannot be
-    /// updated").
-    pub tags: Vec<Tag>,
+    /// The recorder's tags. `PutConfigurationRecorder` takes them at creation and
+    /// does not update them afterwards ("Tags are added at creation and cannot be
+    /// updated"); `TagResource` and `UntagResource` are what change them after that
+    /// ("Use TagResource and UntagResource to update tags after creation").
+    pub tags: TagSet,
 }
 
 impl RecorderEntry {
@@ -504,7 +595,10 @@ pub struct ConfigRuleEntry {
     pub evaluation_modes: Vec<EvaluationModeConfiguration>,
     pub rule_evaluation_visibility: Option<String>,
     pub created_at: SystemTime,
-    pub tags: Vec<Tag>,
+    /// The rule's tags, taken at creation by `PutConfigRule` and changed after that
+    /// by `TagResource` and `UntagResource` (`PutConfigRule`: "Use TagResource and
+    /// UntagResource to update tags after creation").
+    pub tags: TagSet,
     /// The `ComplianceType` of the last evaluation result recorded for each resource
     /// this rule evaluated, keyed by `<ComplianceResourceType>/<ComplianceResourceId>`.
     ///
@@ -720,8 +814,9 @@ pub struct ConfigurationAggregatorEntry {
     /// Tags are taken at creation and not updated afterwards
     /// (`PutConfigurationAggregator`: "Tags are added at creation and cannot be
     /// updated with this operation ... tags will not be updated, even if they are
-    /// different. Use TagResource and UntagResource to update tags after creation").
-    pub tags: Vec<Tag>,
+    /// different. Use TagResource and UntagResource to update tags after creation"),
+    /// which is what changes them from then on.
+    pub tags: TagSet,
 }
 
 impl ConfigurationAggregatorEntry {
@@ -798,6 +893,55 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Source of the next configuration aggregator id, so every aggregator gets a
     /// distinct one.
     pub next_aggregator_seq: u64,
+}
+
+impl ComAmazonawsConfigserviceStarlingdoveserviceState {
+    /// The tags of the resource `arn` identifies, or `None` when this store holds no
+    /// resource with that ARN.
+    ///
+    /// This is the ONE place an ARN is resolved to a tag set, so the tagging
+    /// operations agree with each other and with the resource's own read path: the
+    /// tags live ON the resource, which is also why deleting the resource deletes its
+    /// tags (`TagResource`: "When a resource is deleted, the tags associated with that
+    /// resource are deleted as well"). Every taggable resource this emulator persists
+    /// is reached here; a resource type whose write operation is still scaffolded
+    /// cannot be in the store at all, so its ARN resolves to `None` exactly as an
+    /// ARN of a deleted resource does.
+    pub fn tags_of(&self, arn: &str) -> Option<&TagSet> {
+        if let Some(recorder) = self.recorders.values().find(|entry| entry.arn == arn) {
+            return Some(&recorder.tags);
+        }
+        if let Some(rule) = self.config_rules.values().find(|entry| entry.arn == arn) {
+            return Some(&rule.tags);
+        }
+        if let Some(aggregator) = self
+            .configuration_aggregators
+            .values()
+            .find(|entry| entry.arn == arn)
+        {
+            return Some(&aggregator.tags);
+        }
+        None
+    }
+
+    /// The tags of the resource `arn` identifies, for a request that changes them.
+    /// See [`Self::tags_of`].
+    pub fn tags_of_mut(&mut self, arn: &str) -> Option<&mut TagSet> {
+        if let Some(recorder) = self.recorders.values_mut().find(|entry| entry.arn == arn) {
+            return Some(&mut recorder.tags);
+        }
+        if let Some(rule) = self.config_rules.values_mut().find(|entry| entry.arn == arn) {
+            return Some(&mut rule.tags);
+        }
+        if let Some(aggregator) = self
+            .configuration_aggregators
+            .values_mut()
+            .find(|entry| entry.arn == arn)
+        {
+            return Some(&mut aggregator.tags);
+        }
+        None
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -1166,7 +1310,7 @@ mod tests {
             evaluation_modes: default_evaluation_modes(),
             rule_evaluation_visibility: Some(RULE_EVALUATION_VISIBILITY_EXTERNAL.to_string()),
             created_at: SystemTime::UNIX_EPOCH,
-            tags: Vec::new(),
+            tags: TagSet::new(),
             resource_compliance: compliance_types
                 .iter()
                 .enumerate()

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRegionOptStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRegionOptStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRegionOptStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the opt status of one Region for the resolved account: a Region the
+//! catalog marks enabled by default is `ENABLED_BY_DEFAULT`, and an opt-in
+//! Region reports whatever `EnableRegion` / `DisableRegion` last stored against
+//! that account (`DISABLED` when it has never been opted into). A REPORT only —
+//! it creates and changes nothing: a stored `ENABLING` / `DISABLING` whose due
+//! instant has passed reads as `ENABLED` / `DISABLED` from the clock
+//! (`crate::state::RegionOptState::settled`), so the answer never depends on a
+//! write.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +157,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRegionOptStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRegionOptStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRegionOptStatus"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRegionOptStatusErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                    error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // `RegionName`'s modelled `@length(min: 1, max: 50)` and `AccountId`'s
+        // `^\d{12}$` were already enforced at the boundary. WHICH strings name a
+        // Region is not modelled, so that is refused here.
+        let Some(kind) = crate::state::region_kind(&input.region_name) else {
+            return Err(GetRegionOptStatusErrorModeled::ValidationException(
+                crate::state::unknown_region(&input.region_name),
+            )
+            .into());
+        };
+
+        let account_id = crate::state::resolve_account_id(input.account_id.as_deref());
+        let now = ::std::time::SystemTime::now();
+        // A REPORTING operation: the store is read, never written, so no record
+        // is created here and a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(account) = store.account(&account_id) else {
+            return Err(GetRegionOptStatusErrorModeled::AccessDeniedException(
+                crate::state::account_not_accessible(&account_id),
+            )
+            .into());
+        };
+        // The status as of now: a transition the CLOCK already owes reads as
+        // its terminal status, whether or not anybody wrote it back.
+        let status = account.region_opt_state(&input.region_name, kind, now);
+
+        Ok(GetRegionOptStatusOutput {
+            // "The Region code that was passed in."
+            region_name: Some(input.region_name),
+            region_opt_status: Some(status.as_wire().to_string()),
+        })
     }
 }
+
