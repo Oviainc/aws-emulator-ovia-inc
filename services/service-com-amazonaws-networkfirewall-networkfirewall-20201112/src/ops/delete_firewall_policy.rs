@@ -196,14 +196,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         state.firewall_policy_arn_index.remove(&record.policy_arn);
+        // A resource policy belongs TO the resource it is attached to, and
+        // `DescribeResourcePolicy` can only be asked for it by that resource's
+        // ARN, so the attachment goes with the resource.
+        state.detach_resource_policy(&record.policy_arn);
 
         // The policy is gone from state; the response reports the terminal status
         // of the resource this call just removed.
         record.status = crate::state::RESOURCE_DELETING.to_string();
         record.last_modified_time = ::std::time::SystemTime::now();
+        let consumed = state.consumed_policy_capacity(&record.policy);
 
         Ok(DeleteFirewallPolicyOutput {
-            firewall_policy_response: record.to_response(),
+            firewall_policy_response: record.to_response(consumed),
         })
     }
 }

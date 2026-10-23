@@ -5,7 +5,7 @@
 //! makes to rule groups.
 //!
 //! Every test drives the service the way a client does, through the shared
-//! [`Harness`] in `firewall_lifecycle`: an awsJson1_0 `POST /` with
+//! [`Harness`] in `crate::harness`: an awsJson1_0 `POST /` with
 //! `X-Amz-Target: NetworkFirewall_20201112.<OperationName>`, so what is asserted
 //! is the WIRE behaviour and not a handler's return value.
 //!
@@ -14,7 +14,9 @@
 
 use serde_json::{json, Value};
 
-use crate::firewall_lifecycle::{error_code, is_uuid_form, minimal_policy, string_at, Harness};
+use crate::harness::{
+    error_code, is_uuid_form, minimal_policy_document as minimal_policy, string_at, Harness,
+};
 use crate::rule_group_lifecycle::{
     create_request, expected_arn, stateful_one_rule, stateless_any, stateless_group, stateless_rule,
 };

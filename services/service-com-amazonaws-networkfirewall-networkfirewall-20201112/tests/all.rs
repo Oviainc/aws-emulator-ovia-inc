@@ -13,6 +13,12 @@
 // points it into `tests/all/`.
 #[path = "all/firewall_lifecycle.rs"]
 mod firewall_lifecycle;
+#[path = "all/harness.rs"]
+mod harness;
+#[path = "all/resource_policies.rs"]
+mod resource_policies;
+#[path = "all/rule_group_capacity_and_resource_policy.rs"]
+mod rule_group_capacity_and_resource_policy;
 #[path = "all/rule_group_lifecycle.rs"]
 mod rule_group_lifecycle;
 #[path = "all/rule_group_mutations.rs"]

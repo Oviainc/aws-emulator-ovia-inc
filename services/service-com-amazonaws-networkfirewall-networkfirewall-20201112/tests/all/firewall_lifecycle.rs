@@ -10,137 +10,18 @@
 //! The tests are tables: each row is one input in the class the rule covers, and
 //! every assertion names its row and the actual value.
 //!
-//! The harness and helpers below are `pub(crate)` so the other suites in this test
-//! crate drive the service through the same wire path rather than rebuilding one.
+//! The harness, the fixtures and the response readers live in `crate::harness`,
+//! which every suite in this test crate drives the service through.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_networkfirewall_networkfirewall_20201112::state;
-use service_com_amazonaws_networkfirewall_networkfirewall_20201112::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every request in these tests is signed for. ARNs must carry it,
-/// which is how a region other than the emulator default proves the ARN is built
-/// from the request rather than from a constant.
-pub(crate) const REGION: &str = "eu-west-1";
-
-/// The account segment every emulator ARN carries, sourced from the vendored
-/// constant so an ARN assertion cannot drift from it.
-pub(crate) const ACCOUNT: &str = emulator_server::EMULATOR_ACCOUNT_ID;
-
-/// A minimal valid `FirewallPolicy`: the two members the model marks required
-/// (`StatelessDefaultActions`, `StatelessFragmentDefaultActions`).
-pub(crate) fn minimal_policy() -> Value {
-    json!({
-        "StatelessDefaultActions": ["aws:forward_to_sfe"],
-        "StatelessFragmentDefaultActions": ["aws:forward_to_sfe"],
-    })
-}
-
-/// One emulator: a single shared engine behind the router every test calls.
-pub(crate) struct Harness {
-    router: MultiServiceRouter,
-}
-
-impl Harness {
-    pub(crate) fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
-    }
-
-    /// Send one operation and return its HTTP status and parsed JSON body.
-    pub(crate) async fn call(&self, target: &str, body: &Value) -> (u16, Value) {
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("https://network-firewall.eu-west-1.amazonaws.com/")
-            .header("content-type", "application/x-amz-json-1.0")
-            .header(
-                "x-amz-target",
-                format!("NetworkFirewall_20201112.{target}"),
-            )
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/network-firewall/\
-                     aws4_request, SignedHeaders=host, Signature=abc"
-                ),
-            )
-            .body(bytes::Bytes::from(
-                serde_json::to_vec(body).expect("serialize the request body"),
-            ))
-            .expect("build the request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let parsed = if response.body().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-        };
-        (status, parsed)
-    }
-
-    /// Send one operation that must succeed, and return its body.
-    pub(crate) async fn ok(&self, target: &str, body: &Value) -> Value {
-        let (status, parsed) = self.call(target, body).await;
-        assert_eq!(
-            status, 200,
-            "case {target}: expected HTTP 200, got {status} with body {parsed:?}"
-        );
-        parsed
-    }
-
-    /// Create a firewall policy with the minimal valid document.
-    async fn create_policy(&self, name: &str) -> Value {
-        self.ok(
-            "CreateFirewallPolicy",
-            &json!({ "FirewallPolicyName": name, "FirewallPolicy": minimal_policy() }),
-        )
-        .await
-    }
-}
-
-/// The awsJson error code (`__type`) of an error body.
-pub(crate) fn error_code(body: &Value) -> String {
-    body.get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or("<no __type>")
-        .to_string()
-}
-
-/// Whether `value` satisfies the `ResourceId` / `UpdateToken` pattern
-/// `^([0-9a-f]{8})-([0-9a-f]{4}-){3}([0-9a-f]{12})$` (length 36).
-pub(crate) fn is_uuid_form(value: &str) -> bool {
-    let groups: Vec<&str> = value.split('-').collect();
-    let widths = [8usize, 4, 4, 4, 12];
-    groups.len() == widths.len()
-        && groups
-            .iter()
-            .zip(widths)
-            .all(|(group, width)| {
-                group.len() == width
-                    && group
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
-}
-
-/// Read a required string out of a response body, naming the path on failure.
-pub(crate) fn string_at<'a>(body: &'a Value, path: &[&str]) -> &'a str {
-    let mut cursor = body;
-    for step in path {
-        cursor = cursor
-            .get(step)
-            .unwrap_or_else(|| panic!("expected {path:?} in {body:?}"));
-    }
-    cursor
-        .as_str()
-        .unwrap_or_else(|| panic!("expected {path:?} to be a string in {body:?}"))
-}
+use crate::harness::{
+    error_code, is_uuid_form, minimal_policy_document as minimal_policy, string_at, Harness,
+    ACCOUNT, REGION,
+};
 
 /// One row of the create -> describe round-trip table.
 #[derive(Debug)]

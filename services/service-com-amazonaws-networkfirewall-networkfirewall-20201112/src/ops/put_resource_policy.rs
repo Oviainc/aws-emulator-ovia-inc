@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: validates the policy document against the fixed action set the
+//! shared resource's type admits, then attaches it to that resource in
+//! `crate::state` for `DescribeResourcePolicy` to report.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +165,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        let _ = ctx;
+        // Network Firewall shares rule groups and firewall policies through a
+        // resource policy; any other resource kind an `^arn:aws` value can name
+        // "corresponds to a resource that isn't valid in the context of the
+        // request", which is what `InvalidRequestException` documents.
+        let Some(kind) = crate::state::shared_resource_kind(&input.resource_arn) else {
+            return Err(PutResourcePolicyErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "{} does not name a rule group or a firewall policy, so it cannot carry a \
+                         resource policy.",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The policy statement is validated BEFORE anything is attached, so a
+        // refused document leaves the resource exactly as it was.
+        if let Some(breach) = crate::state::resource_policy_breach(&input.policy, kind) {
+            return Err(
+                PutResourcePolicyErrorModeled::InvalidResourcePolicyException(
+                    InvalidResourcePolicyException {
+                        message: Some(breach),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutResourcePolicyErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the resource policy store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        let exists = match kind {
+            crate::state::SharedResource::RuleGroup => {
+                state.rule_group_arn_index.contains_key(&input.resource_arn)
+            }
+            crate::state::SharedResource::FirewallPolicy => state
+                .firewall_policy_arn_index
+                .contains_key(&input.resource_arn),
+        };
+        if !exists {
+            return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No object with the provided name or resource identifier was found: {}",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A policy may only be attached to a resource that exists, and deleting
+        // that resource detaches it, so the store cannot hold more entries than
+        // there are resources able to carry one. The ceiling is checked anyway,
+        // before the insert, so a caller can never grow the store past it. The
+        // envelope is `InvalidRequestException` because the model does NOT
+        // declare `LimitExceededException` for this operation
+        // (`smithy_query(query="operation",operation="PutResourcePolicy")`: only
+        // InternalServerError, InvalidRequestException,
+        // InvalidResourcePolicyException, ResourceNotFoundException and
+        // ThrottlingException), and the message says it is an emulator limit so a
+        // caller does not read it as a defect in the document.
+        if state.resource_policies.len() >= crate::state::MAX_STORED_RESOURCE_POLICIES
+            && !state.resource_policies.contains_key(&input.resource_arn)
+        {
+            return Err(PutResourcePolicyErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "Emulator limit, not a defect in this request: this emulator retains at \
+                         most {} resource policies; delete one before attaching another.",
+                        crate::state::MAX_STORED_RESOURCE_POLICIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        state
+            .resource_policies
+            .insert(input.resource_arn, input.policy);
+
+        Ok(PutResourcePolicyOutput {})
     }
 }

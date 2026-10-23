@@ -136,9 +136,11 @@ pub const MAX_RULE_GROUP_CAPACITY: i32 = 30_000;
 /// rule-group reference, default-action or custom-action lists, so one request
 /// could otherwise make a single retained record arbitrarily large. AWS bounds
 /// the same thing by rule CAPACITY (the `Consumed*RuleCapacity` members), which
-/// a policy cannot total until it resolves its rule-group references; this entry
-/// count stands in for it and is far above any real policy. A request past it is
-/// refused with the modelled `LimitExceededException`.
+/// this emulator totals from the rule groups a policy references (see
+/// [`ComAmazonawsNetworkfirewallNetworkfirewall20201112State::consumed_policy_capacity`]);
+/// this entry count bounds the lists that carry no capacity of their own and is
+/// far above any real policy. A request past it is refused with the modelled
+/// `LimitExceededException`.
 pub const MAX_POLICY_LIST_ENTRIES: usize = 64;
 
 /// The first list in `policy` that exceeds [`MAX_POLICY_LIST_ENTRIES`], named
@@ -186,6 +188,16 @@ pub fn policy_document_breach(policy: &FirewallPolicy) -> Option<String> {
             )
         })
 }
+
+/// How many resource policies this emulator keeps.
+///
+/// A resource policy exists only for a resource that is still stored — the
+/// attach path refuses an ARN that names none, and deleting a resource detaches
+/// its policy — so this is exactly the number of resources that can carry one. A
+/// request past it is refused rather than retained, so no sequence of calls can
+/// grow the store beyond it even if that invariant is ever broken.
+pub const MAX_STORED_RESOURCE_POLICIES: usize =
+    MAX_STORED_FIREWALL_POLICIES + MAX_STORED_RULE_GROUPS;
 
 /// The `RulesSource` member `group`'s rules were given in, for an error message
 /// that names the offending part of the request. `rule_group_document_breach`
@@ -252,6 +264,143 @@ pub fn rule_group_document_breach(group_type: &str, group: &RuleGroup) -> Option
         );
     }
     None
+}
+
+/// The actions a resource policy on a shared RULE GROUP may grant, from the AWS
+/// `PutResourcePolicy` documentation's list of operations that may appear in the
+/// statement for a rule group resource.
+pub const RULE_GROUP_POLICY_ACTIONS: [&str; 3] = [
+    "network-firewall:ListRuleGroups",
+    "network-firewall:CreateFirewallPolicy",
+    "network-firewall:UpdateFirewallPolicy",
+];
+
+/// The actions a resource policy on a shared FIREWALL POLICY may grant. See
+/// [`RULE_GROUP_POLICY_ACTIONS`].
+pub const FIREWALL_POLICY_POLICY_ACTIONS: [&str; 2] = [
+    "network-firewall:AssociateFirewallPolicy",
+    "network-firewall:ListFirewallPolicies",
+];
+
+/// The two resource kinds Network Firewall can share through a resource policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedResource {
+    /// A rule group, named by a `*-rulegroup/<name>` ARN.
+    RuleGroup,
+    /// A firewall policy, named by a `firewall-policy/<name>` ARN.
+    FirewallPolicy,
+}
+
+impl SharedResource {
+    /// The fixed action set a policy on this kind of resource may grant.
+    pub fn permitted_actions(self) -> &'static [&'static str] {
+        match self {
+            Self::RuleGroup => &RULE_GROUP_POLICY_ACTIONS,
+            Self::FirewallPolicy => &FIREWALL_POLICY_POLICY_ACTIONS,
+        }
+    }
+}
+
+/// What `arn` names, or `None` when it names a resource kind that cannot carry a
+/// resource policy (a firewall, say).
+pub fn shared_resource_kind(arn: &str) -> Option<SharedResource> {
+    let resource = arn.split(':').next_back()?;
+    let (resource_type, _) = resource.split_once('/')?;
+    match resource_type {
+        "firewall-policy" => Some(SharedResource::FirewallPolicy),
+        "stateless-rulegroup" | "stateful-rulegroup" | "stateful-domain-rulegroup" => {
+            Some(SharedResource::RuleGroup)
+        }
+        _ => None,
+    }
+}
+
+/// Why `document` is not a resource policy this service accepts for a resource of
+/// `kind`, or `None` when it validates.
+///
+/// A Network Firewall resource policy is validated against the RAM managed
+/// permission for the shared resource's type, so the actions it grants must be
+/// exactly that type's fixed set ([`SharedResource::permitted_actions`]): an
+/// action outside the set and a missing one are the same failure, which is what
+/// the service's "The supplied policy does not match RAM managed permissions."
+/// rejection says. SET EQUALITY, not containment, is the rule here because the
+/// document is compared with a managed permission rather than merely checked for
+/// the permissions it carries: a subset does not match that permission, and an
+/// action outside the set is one the documentation does not allow the statement
+/// to name. The document itself must also be a policy: a JSON object with
+/// at least one `Allow` statement that names a principal and an action.
+pub fn resource_policy_breach(document: &str, kind: SharedResource) -> Option<String> {
+    let parsed: ::serde_json::Value = match ::serde_json::from_str(document) {
+        Ok(parsed) => parsed,
+        Err(error) => return Some(format!("The policy is not valid JSON: {error}")),
+    };
+    if !parsed.is_object() {
+        return Some("The policy must be a JSON object.".to_string());
+    }
+    let statements: Vec<&::serde_json::Value> = match parsed.get("Statement") {
+        Some(::serde_json::Value::Array(statements)) => statements.iter().collect(),
+        Some(statement) if statement.is_object() => vec![statement],
+        _ => return Some("The policy must carry a Statement.".to_string()),
+    };
+    if statements.is_empty() {
+        return Some("The policy's Statement must carry at least one statement.".to_string());
+    }
+
+    let mut granted: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
+    for statement in statements {
+        match statement.get("Effect").and_then(::serde_json::Value::as_str) {
+            Some("Allow") => {}
+            _ => {
+                return Some(
+                    "Every statement in the policy must have the Effect Allow.".to_string(),
+                )
+            }
+        }
+        if statement.get("Principal").is_none() {
+            return Some("Every statement in the policy must name a Principal.".to_string());
+        }
+        match statement.get("Action") {
+            Some(::serde_json::Value::String(action)) => {
+                granted.insert(action.clone());
+            }
+            Some(::serde_json::Value::Array(actions)) if !actions.is_empty() => {
+                for action in actions {
+                    match action.as_str() {
+                        Some(action) => {
+                            granted.insert(action.to_string());
+                        }
+                        None => {
+                            return Some(
+                                "Every entry of a statement's Action must be a string.".to_string(),
+                            )
+                        }
+                    }
+                }
+            }
+            _ => return Some("Every statement in the policy must name an Action.".to_string()),
+        }
+    }
+
+    let permitted = kind.permitted_actions();
+    let unexpected: Vec<&str> = granted
+        .iter()
+        .map(String::as_str)
+        .filter(|action| !permitted.contains(action))
+        .collect();
+    let missing: Vec<&str> = permitted
+        .iter()
+        .copied()
+        .filter(|action| !granted.contains(*action))
+        .collect();
+    if unexpected.is_empty() && missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "The supplied policy does not match RAM managed permissions. \
+         Unexpected actions: [{}]; missing actions: [{}].",
+        unexpected.join(", "),
+        missing.join(", ")
+    ))
 }
 
 /// Sixteen bytes nothing else in this process will produce again: the first half
@@ -924,7 +1073,12 @@ pub struct FirewallPolicyRecord {
 
 impl FirewallPolicyRecord {
     /// The `FirewallPolicyResponse` shape for this record.
-    pub fn to_response(&self) -> FirewallPolicyResponse {
+    ///
+    /// `consumed` is the capacity the rule groups this policy references reserve;
+    /// it is read from the rule-group store, so it is passed in rather than held
+    /// on the record (see
+    /// [`ComAmazonawsNetworkfirewallNetworkfirewall20201112State::consumed_policy_capacity`]).
+    pub fn to_response(&self, consumed: ConsumedPolicyCapacity) -> FirewallPolicyResponse {
         FirewallPolicyResponse {
             firewall_policy_name: self.policy_name.clone(),
             firewall_policy_arn: self.policy_arn.clone(),
@@ -935,11 +1089,9 @@ impl FirewallPolicyRecord {
             number_of_associations: Some(self.number_of_associations),
             encryption_configuration: self.encryption_configuration.clone(),
             last_modified_time: Some(as_date_time(self.last_modified_time)),
-            // The Consumed*Capacity members count capacity units drawn by the
-            // rule groups the policy references. `CreateFirewallPolicy` resolves
-            // those references (so an unresolvable one is refused), but the
-            // record does not total their capacity, so the members are left
-            // absent rather than filled with a guess.
+            consumed_stateless_rule_capacity: Some(consumed.stateless),
+            consumed_stateful_rule_capacity: Some(consumed.stateful),
+            consumed_stateful_domain_capacity: Some(consumed.stateful_domain),
             ..FirewallPolicyResponse::default()
         }
     }
@@ -951,6 +1103,25 @@ impl FirewallPolicyRecord {
             arn: Some(self.policy_arn.clone()),
         }
     }
+}
+
+/// The capacity the rule groups a firewall policy references reserve, as the
+/// `FirewallPolicyResponse` `Consumed*` members report it.
+///
+/// `CreateRuleGroupRequest$Capacity` documents the reservation: "When you
+/// reference a rule group from a firewall policy, Network Firewall reserves this
+/// capacity for the rule group."
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConsumedPolicyCapacity {
+    /// `ConsumedStatelessRuleCapacity`.
+    pub stateless: i32,
+    /// `ConsumedStatefulRuleCapacity`.
+    pub stateful: i32,
+    /// `ConsumedStatefulDomainCapacity` — "the total number of domain name
+    /// specifications across all domain list rule groups in the firewall policy
+    /// that use the `stateful-domain-rulegroup` resource type", which is the
+    /// consumed (not the declared) capacity of those rule groups.
+    pub stateful_domain: i32,
 }
 
 /// A rule group, as persisted. Every member `RuleGroupResponse` reports is read
@@ -1030,6 +1201,18 @@ pub struct ComAmazonawsNetworkfirewallNetworkfirewall20201112State {
     pub firewall_policies: HashMap<String, FirewallPolicyRecord>,
     /// `FirewallPolicyArn` -> `FirewallPolicyName`.
     pub firewall_policy_arn_index: HashMap<String, String>,
+    /// The resource policy attached to a shared rule group or firewall policy,
+    /// keyed by that resource's ARN. An absent entry is what makes
+    /// `DescribeResourcePolicy` answer `ResourceNotFoundException`.
+    ///
+    /// One entry can exist only for a resource this state still holds:
+    /// `PutResourcePolicy` refuses an ARN that names no stored resource, and
+    /// [`Self::detach_resource_policy`] drops the entry when that resource is
+    /// deleted. The map therefore never holds more entries than
+    /// [`MAX_STORED_FIREWALL_POLICIES`] + [`MAX_STORED_RULE_GROUPS`], which
+    /// [`MAX_STORED_RESOURCE_POLICIES`] states as the ceiling the attach path
+    /// checks.
+    pub resource_policies: HashMap<String, String>,
     /// Every created-and-not-deleted rule group, keyed by the ARN resource path
     /// [`rule_group_resource_path`] builds, so the stateless and the stateful
     /// half of the service each have their own name space.
@@ -1174,6 +1357,82 @@ impl ComAmazonawsNetworkfirewallNetworkfirewall20201112State {
         }
         None
     }
+
+    /// Drop the resource policy attached to `resource_arn`, if any.
+    ///
+    /// Called wherever a shareable resource is removed: the policy is reachable
+    /// only through that resource's own ARN, so an entry left behind would be
+    /// unreadable state that nothing can ever delete.
+    pub fn detach_resource_policy(&mut self, resource_arn: &str) {
+        self.resource_policies.remove(resource_arn);
+    }
+
+    /// The capacity the rule groups `policy` references reserve. A reference to a
+    /// rule group this emulator does not hold reserves nothing.
+    ///
+    /// The three members are deliberately NOT in one unit, because the model
+    /// does not define them in one unit: `ConsumedStatelessRuleCapacity` and
+    /// `ConsumedStatefulRuleCapacity` count the capacity a reference RESERVES, so
+    /// a referenced rule group contributes its declared `Capacity`
+    /// (`CreateRuleGroupRequest$Capacity`: "when you reference a rule group from
+    /// a firewall policy, Network Firewall reserves this capacity for the rule
+    /// group"), while `ConsumedStatefulDomainCapacity` is defined as a count of
+    /// domain name specifications ("the total number of domain name
+    /// specifications across all domain list rule groups in the firewall policy
+    /// that use the `stateful-domain-rulegroup` resource type"), which is a
+    /// domain-list group's CONSUMED capacity, not its declared one.
+    ///
+    /// A domain-list reference is therefore counted in the domain member ONLY,
+    /// not in `stateful` as well: the model singles those rule groups out as a
+    /// class of their own, measured in domain name specifications, so adding
+    /// their declared capacity to the stateful total would report one reference
+    /// under two members in two different units.
+    pub fn consumed_policy_capacity(&self, policy: &FirewallPolicy) -> ConsumedPolicyCapacity {
+        let mut consumed = ConsumedPolicyCapacity::default();
+        for arn in policy_rule_group_references(policy) {
+            let Some(record) = self
+                .rule_group_arn_index
+                .get(arn)
+                .and_then(|key| self.rule_groups.get(key))
+            else {
+                continue;
+            };
+            match record.rule_group_type.as_str() {
+                // Reserved: the declared capacity.
+                RULE_GROUP_STATELESS => {
+                    consumed.stateless = consumed.stateless.saturating_add(record.capacity);
+                }
+                // Counted in domain name specifications: the capacity the domain
+                // list consumes.
+                RULE_GROUP_STATEFUL_DOMAIN => {
+                    consumed.stateful_domain = consumed.stateful_domain.saturating_add(
+                        required_capacity(&record.rule_group_type, &record.rule_group),
+                    );
+                }
+                // Reserved: the declared capacity.
+                _ => {
+                    consumed.stateful = consumed.stateful.saturating_add(record.capacity);
+                }
+            }
+        }
+        consumed
+    }
+}
+
+/// Every rule-group ARN a firewall policy document references, stateless first.
+fn policy_rule_group_references(policy: &FirewallPolicy) -> impl Iterator<Item = &str> {
+    policy
+        .stateless_rule_group_references
+        .iter()
+        .flatten()
+        .map(|reference| reference.resource_arn.as_str())
+        .chain(
+            policy
+                .stateful_rule_group_references
+                .iter()
+                .flatten()
+                .map(|reference| reference.resource_arn.as_str()),
+        )
 }
 
 /// The shared name-or-ARN resolution rule: an ARN resolves through the index, a

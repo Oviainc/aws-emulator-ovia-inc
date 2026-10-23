@@ -269,7 +269,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let output = CreateFirewallPolicyOutput {
             update_token: record.update_token.clone(),
-            firewall_policy_response: record.to_response(),
+            firewall_policy_response: record
+                .to_response(state.consumed_policy_capacity(&record.policy)),
         };
 
         // `DryRun` asks the service to check the request rather than run it, so
