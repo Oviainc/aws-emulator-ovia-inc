@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAnalysisTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAnalysisTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAnalysisTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A new analysis template under a persisted membership. Its collaboration and
+//! membership identity is copied FROM the stored membership, never from the request, so
+//! an unknown membership has nothing to create under (404) and the template's ARN is
+//! nested in that membership's.
+//!
+//! A template's `name` identifies it within its membership: the store indexes
+//! `(membership, name)`, so a second create under a name already taken is the
+//! `ConflictException` the model declares rather than a second resource.
+//!
+//! The REQUIRED `schema` is the relation set in force
+//! (`crate::state::analysis_template_schema`): what the caller declared, else the
+//! relations a SQL analysis itself reads. That parse is CPU work over caller-supplied
+//! text, so it runs on the blocking pool with the store UNLOCKED, after every
+//! store-dependent refusal has been taken — a request that cannot be accepted never
+//! pays for it. The work itself is bounded before it is scheduled: at most
+//! `crate::state::MAX_PARSED_ANALYSIS_CHARS` of text is lexed, an analysis carrying
+//! more than `crate::state::MAX_PARSED_ANALYSIS_TOKENS` tokens is refused before the
+//! parser builds a tree (which bounds the tree's size, and so the depth of the parse,
+//! of the walk and of the tree's drop), the parser additionally carries
+//! `crate::state::MAX_PARSER_RECURSION`, at most
+//! `crate::state::MAX_REFERENCED_TABLES` relations are collected, and at most
+//! `crate::state::MAX_CONCURRENT_ANALYSIS_PARSES` parses run at once;
+//! `crate::state::ANALYSIS_PARSE_TIME_BUDGET` is a backstop on the caller's wait, not
+//! the bound on the work.
+//!
+//! Authorization is deliberately UNMODELLED here, as it is across this emulator: every
+//! request presents the one emulated account (`crate::state::caller_account_id`) and
+//! signatures are verified centrally, so there is no principal to refuse. The modelled
+//! `AccessDeniedException` is therefore unreachable in this handler — that is an absence
+//! of a check, not a check that passes.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +161,81 @@ impl From<CreateAnalysisTemplateErrorModeled> for CreateAnalysisTemplateError {
     }
 }
 
+/// The parse slots this service's analyses share.
+///
+/// Each parse occupies one slot for as long as it runs on the blocking pool, so at most
+/// `crate::state::MAX_CONCURRENT_ANALYSIS_PARSES` of them can be in that shared pool at
+/// once however many creates arrive together. Acquiring a slot is an await point inside
+/// the caller's time budget, so a request waiting for one is refused rather than left
+/// waiting.
+static PARSE_SLOTS: ::tokio::sync::Semaphore =
+    ::tokio::sync::Semaphore::const_new(crate::state::MAX_CONCURRENT_ANALYSIS_PARSES);
+
+/// The membership this create lands under, once the store says the create can be
+/// accepted at all: the membership exists, the name is free in it, and the store has
+/// room for another template.
+///
+/// Taken twice — once before the caller's analysis is parsed, so a request that will be
+/// refused never pays for the parse, and once with the lock held for the insert, so the
+/// decision is made on the state the insert lands in. The quota check comes last, so an
+/// unknown membership still answers 404 and a repeat name still answers 409 even at the
+/// cap; see `crate::state::MAX_ANALYSIS_TEMPLATES` — the cap and these quota
+/// identifiers are the emulator's own, not values AWS publishes.
+fn claim(
+    store: &crate::state::CleanRoomsState,
+    membership_id: &str,
+    name: &str,
+) -> Result<Membership, CreateAnalysisTemplateErrorModeled> {
+    use crate::state as st;
+
+    let Some(membership) = store.memberships.get(membership_id).cloned() else {
+        return Err(CreateAnalysisTemplateErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: format!("membership {membership_id} not found"),
+                resource_id: membership_id.to_string(),
+                resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
+            },
+        ));
+    };
+
+    // A template's name identifies it within its membership, so a name already in use
+    // names the resource that exists rather than being taken over by this call.
+    if let Some(existing) = store.analysis_template_named(&membership.id, name) {
+        return Err(CreateAnalysisTemplateErrorModeled::ConflictException(
+            ConflictException {
+                message: Some(format!(
+                    "analysis template {} already uses name {} in membership {}",
+                    existing.id, existing.name, membership.id
+                )),
+                resource_id: Some(existing.id.clone()),
+                // `ResourceType` (CONFIGURED_TABLE | COLLABORATION | MEMBERSHIP |
+                // CONFIGURED_TABLE_ASSOCIATION) has no analysis-template member, so this
+                // optional member is left absent rather than carrying a value the enum
+                // does not declare.
+                resource_type: None,
+                reason: Some(st::CONFLICT_REASON_ALREADY_EXISTS.to_string()),
+            },
+        ));
+    }
+
+    if store.analysis_templates.len() >= st::MAX_ANALYSIS_TEMPLATES {
+        return Err(
+            CreateAnalysisTemplateErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "the number of analysis templates would exceed the limit of {}",
+                        st::MAX_ANALYSIS_TEMPLATES
+                    ),
+                    quota_name: "AnalysisTemplates".to_string(),
+                    quota_value: st::MAX_ANALYSIS_TEMPLATES as f64,
+                },
+            ),
+        );
+    }
+
+    Ok(membership)
+}
+
 /// The `CreateAnalysisTemplate` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -175,18 +272,273 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAnalysisTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAnalysisTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAnalysisTemplate"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(CreateAnalysisTemplateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("cleanrooms state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = st::request_region(ctx.parts());
+        let membership_id = input.membership_identifier;
+        let name = input.name;
+
+        // Every refusal that depends on the store, taken BEFORE the caller's analysis is
+        // parsed, so a request that cannot be accepted never pays for the parse. The
+        // guard is dropped at the end of this block: the parse below runs with the store
+        // UNLOCKED, so one large analysis cannot hold up any other cleanrooms request.
+        let membership = claim(&state.lock(), &membership_id, &name)?;
+
+        // Reading the relations out of a SQL analysis is synchronous CPU work over
+        // caller-supplied text, so it runs OFF the async workers. The WORK is bounded
+        // before it is scheduled, not merely waited on: `st::MAX_PARSED_ANALYSIS_CHARS`
+        // caps the text that is lexed, `st::MAX_PARSED_ANALYSIS_TOKENS` caps the tree the
+        // parse may build (and so the depth the parse, the relation walk and the tree's
+        // drop recurse to), `st::MAX_REFERENCED_TABLES` caps the relations collected, and
+        // the permit below caps how many of these run at once. The time budget is only a
+        // backstop on the caller's wait.
+        let requested_schema = input.schema;
+        let format = input.format;
+        let source = input.source;
+        let parsed = if st::analysis_needs_parse(requested_schema.as_ref(), &format, &source) {
+            // The parse runs on its OWN thread with an explicitly sized stack
+            // (`st::ANALYSIS_PARSE_STACK_BYTES`), not on the shared blocking pool whose
+            // threads carry the runtime's default stack: the recursive walk and drop of a
+            // parsed analysis use stack in proportion to the tree, a Rust stack overflow
+            // ABORTS the process rather than unwinding, and only a stack sized against
+            // the token cap above makes that unreachable. The permit is MOVED INTO the
+            // thread, so a slot is held for as long as the work really runs — the work
+            // cannot be cancelled, so a permit released when the caller's budget elapses
+            // would admit another parse while the abandoned one still runs.
+            ::tokio::time::timeout(st::ANALYSIS_PARSE_TIME_BUDGET, async move {
+                let permit = PARSE_SLOTS.acquire().await;
+                let (done, wait) = ::tokio::sync::oneshot::channel();
+                ::std::thread::Builder::new()
+                    .name("cleanrooms-analysis-parse".to_string())
+                    .stack_size(st::ANALYSIS_PARSE_STACK_BYTES)
+                    .spawn(move || {
+                        let _permit = permit;
+                        let schema =
+                            st::analysis_template_schema(requested_schema, &format, &source);
+                        // The analysis is handed back rather than cloned for the parse:
+                        // the stored template carries the same text the parse read.
+                        let _ = done.send((schema, format, source));
+                    })
+                    .map_err(|error| error.to_string())?;
+                wait.await.map_err(|error| error.to_string())
+            })
+            .await
+        } else {
+            // Nothing to parse: the caller declared the schema, or the analysis carries
+            // no query to read relations out of. Answering here costs no thread and no
+            // parse slot, so the bounded machinery is kept for the one case that needs
+            // it.
+            Ok(Ok((
+                st::analysis_template_schema(requested_schema, &format, &source),
+                format,
+                source,
+            )))
+        };
+
+        let (schema, format, source) = match parsed {
+            Ok(Ok((Ok(schema), format, source))) => (schema, format, source),
+            // More analysis text than this service reads a relation set out of. Nothing
+            // parsed it, so nothing is claimed about it.
+            Ok(Ok((Err(st::SchemaError::TooMuchText(cap)), ..))) => {
+                let message =
+                    format!("source.text is longer than the {cap} characters of analysis this service reads");
+                return Err(CreateAnalysisTemplateErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message.clone()),
+                        reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "source.text".to_string(),
+                            message,
+                        }]),
+                    },
+                )
+                .into());
+            }
+            // More tokens than the tree this service walks: the parse was never run, so
+            // nothing is claimed about the analysis's relations.
+            Ok(Ok((Err(st::SchemaError::TooComplex(tokens)), ..))) => {
+                let message = format!(
+                    "source.text carries more than the {tokens} tokens of analysis this service parses"
+                );
+                return Err(CreateAnalysisTemplateErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message.clone()),
+                        reason: Some(st::VALIDATION_REASON_INVALID_QUERY.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "source.text".to_string(),
+                            message,
+                        }]),
+                    },
+                )
+                .into());
+            }
+            // The analysis nests deeper than this service parses. The parser stopped at
+            // the limit, so no relation set was read and none is claimed.
+            Ok(Ok((Err(st::SchemaError::TooDeep(depth)), ..))) => {
+                let message =
+                    format!("source.text nests deeper than the {depth} levels of analysis this service parses");
+                return Err(CreateAnalysisTemplateErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message.clone()),
+                        reason: Some(st::VALIDATION_REASON_INVALID_QUERY.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "source.text".to_string(),
+                            message,
+                        }]),
+                    },
+                )
+                .into());
+            }
+            // The analysis is not a query, so there are no relations to report: the
+            // modelled `INVALID_QUERY` validation failure, not a server error.
+            Ok(Ok((Err(st::SchemaError::NotAQuery(complaint)), format, _))) => {
+                return Err(CreateAnalysisTemplateErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "the {format} analysis in source.text is not a query: {complaint}"
+                        )),
+                        reason: Some(st::VALIDATION_REASON_INVALID_QUERY.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "source.text".to_string(),
+                            message: complaint,
+                        }]),
+                    },
+                )
+                .into());
+            }
+            // More relations than this emulator reads out of one analysis.
+            Ok(Ok((Err(st::SchemaError::TooManyRelations), ..))) => {
+                return Err(
+                    CreateAnalysisTemplateErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: format!(
+                                "the analysis references more than the {} tables this service reads out of one analysis",
+                                st::MAX_REFERENCED_TABLES
+                            ),
+                            quota_name: "ReferencedTablesPerAnalysisTemplate".to_string(),
+                            quota_value: st::MAX_REFERENCED_TABLES as f64,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // The query reads a relation this service cannot report in the modelled
+            // relation set. Reporting the rest would misstate what the analysis reads,
+            // so the analysis is refused instead.
+            Ok(Ok((Err(st::SchemaError::UnreportableRelation(relation)), ..))) => {
+                let message = format!(
+                    "source.text reads relation {relation}, whose name cannot appear in an analysis template's schema"
+                );
+                return Err(CreateAnalysisTemplateErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message.clone()),
+                        reason: Some(st::VALIDATION_REASON_INVALID_QUERY.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "source.text".to_string(),
+                            message,
+                        }]),
+                    },
+                )
+                .into());
+            }
+            // The parse thread could not be started, or it ended without answering:
+            // nothing was computed, so the only honest answer is the operation's own
+            // server error.
+            Ok(Err(error)) => {
+                return Err(CreateAnalysisTemplateErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!("the analysis was not read: {error}")),
+                    },
+                )
+                .into());
+            }
+            // Out of time. The deterministic bounds above are what refuse an analysis
+            // for being too much work, so reaching here means the SERVICE did not get to
+            // it in time — waiting for a parse slot, or a parse slower than its budget —
+            // which is a server condition, not the caller's input being invalid.
+            Err(_) => {
+                return Err(CreateAnalysisTemplateErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!(
+                            "the analysis was not read within {:?}",
+                            st::ANALYSIS_PARSE_TIME_BUDGET
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let id = st::new_uuid();
+        let arn = st::analysis_template_arn(&region, &membership.id, &id);
+        let mut store = state.lock();
+        // Re-taken with the lock held for the insert: the store was unlocked while the
+        // analysis was parsed, so the decision is made on the state the insert lands in
+        // rather than on what it looked like before.
+        let membership = claim(&store, &membership_id, &name).inspect_err(|refusal| {
+            // Attribution for a refused create, without the analysis text: `source` is
+            // modelled `@sensitive`.
+            ::tracing::debug!(
+                membership = %membership_id,
+                name = %name,
+                ?refusal,
+                "refusing to create an analysis template"
+            );
+        })?;
+        let analysis_template = st::NewAnalysisTemplate {
+            id: id.clone(),
+            arn: arn.clone(),
+            membership: &membership,
+            name: name.clone(),
+            description: input.description,
+            format,
+            source,
+            schema,
+            analysis_parameters: input.analysis_parameters,
+            error_message_configuration: input.error_message_configuration,
+            synthetic_data_parameters: input.synthetic_data_parameters,
+            created_at: st::now(),
+        }
+        .build();
+
+        if let Some(tags) = input.tags.filter(|tags| !tags.is_empty()) {
+            store.tags.insert(arn, tags);
+        }
+        store
+            .analysis_templates
+            .insert(id.clone(), analysis_template);
+        store.analysis_template_order.push(id.clone());
+        store
+            .analysis_template_by_name
+            .insert((membership.id.clone(), name), id.clone());
+
+        // Answer from the store, so the response is exactly what a later read reports.
+        let Some(analysis_template) = store.analysis_templates.get(&id).cloned() else {
+            return Err(CreateAnalysisTemplateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!("analysis template {id} was not persisted")),
+                },
+            )
+            .into());
+        };
+        // Attribution for the stored resource. The analysis itself is NOT logged:
+        // `AnalysisSource$text` is modelled `@sensitive`.
+        ::tracing::debug!(
+            membership = %analysis_template.membership_id,
+            analysis_template = %analysis_template.id,
+            name = %analysis_template.name,
+            "created an analysis template"
+        );
+        Ok(CreateAnalysisTemplateOutput { analysis_template })
     }
 }
+
