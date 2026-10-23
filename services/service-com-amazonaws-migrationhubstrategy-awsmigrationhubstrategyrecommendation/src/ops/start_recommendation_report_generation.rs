@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartRecommendationReportGeneration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartRecommendationReportGeneration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartRecommendationReportGeneration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +65,28 @@
 //!   again.
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
 //! * `ValidationException` (HTTP 400) — The request body isn't valid.
+//!
+//! ---
+//!
+//! # What this emulator serves
+//!
+//! * A start call mints ONE report generation task, `IN_PROGRESS`, and answers with its
+//!   `RecommendationTaskId`; `GetRecommendationReportDetails` reports that record.
+//! * While a task is in progress a further start call COALESCES onto it: it answers with
+//!   the running task's id and leaves the task as it was, so an account never holds two
+//!   report generations at once. `ConflictException` is therefore not an outcome of this
+//!   operation here — the one conflict this service can observe (a report generation is
+//!   already running) is answered by coalescing, which is the recorded behaviour.
+//! * The task's terminal status is `SUCCESS`, the status the service's recorded behaviour
+//!   shows a started task settling on, with a `statusMessage` reporting what was in scope
+//!   and that no report FILE was written: the report is an Excel or JSON file uploaded to
+//!   S3, and this emulator serves no S3 data plane to upload it to. `s3Bucket` and
+//!   `s3Keys` therefore stay absent (see `crate::state::REPORT_SUCCESS`).
+//! * The store is bounded: a `groupIdFilter` past
+//!   `crate::state::MAX_GROUP_FILTER_ENTRIES` is refused with 400 `ValidationException`
+//!   (and the filter is never stored, only the count of servers it selected), and past
+//!   `crate::state::REPORT_QUOTA` tasks a start call is refused with 429
+//!   `ThrottlingException` rather than minting another record.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -150,18 +163,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartRecommendationReportGeneration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartRecommendationReportGenerationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartRecommendationReportGeneration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                StartRecommendationReportGenerationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the migrationhub-strategy recommendation report store is unavailable"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every refusal is decided from the request alone, before the store is touched,
+        // so a refused call leaves no task behind.
+        let output_format = match input.output_format.as_deref() {
+            // "The default format is Microsoft Excel" when the request names none.
+            None => crate::state::DEFAULT_OUTPUT_FORMAT.to_string(),
+            Some(named) if OUTPUT_FORMAT_VALUES.contains(&named) => named.to_string(),
+            // A value `OutputFormat` does not declare: the boundary validator does not
+            // enforce enum membership, so the request is refused here rather than
+            // generating a report in a format that does not exist.
+            Some(_) => {
+                return Err(
+                    StartRecommendationReportGenerationErrorModeled::ValidationException(
+                        crate::state::invalid_request_body(),
+                    )
+                    .into(),
+                );
+            }
+        };
+        let group_id_filter = input.group_id_filter.unwrap_or_default();
+        if group_id_filter.len() > crate::state::MAX_GROUP_FILTER_ENTRIES
+            || !group_id_filter.iter().all(|group| {
+                group
+                    .name
+                    .as_deref()
+                    .is_none_or(|name| GROUP_NAME_VALUES.contains(&name))
+            })
+        {
+            return Err(
+                StartRecommendationReportGenerationErrorModeled::ValidationException(
+                    crate::state::invalid_request_body(),
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // One report generation task runs at a time: while one is in progress a start
+        // call does not mint a second task, it answers with the id of the task already
+        // running and leaves that task exactly as it was. The coalescing is decided from
+        // the STORE (is a task still owed its terminal status?), never from what this
+        // request carries, so two calls of any parameters inside one task's span get the
+        // same id back.
+        if let Some(running) = store.in_progress_report_id(now) {
+            return Ok(StartRecommendationReportGenerationOutput { id: Some(running) });
+        }
+
+        // The store is bounded: past its quota no further task is minted, so the state
+        // cannot grow without end. The operation models no quota error, so the refusal is
+        // its `ThrottlingException` — the request is denied because too many were made.
+        if store.recommendation_reports.len() >= crate::state::REPORT_QUOTA {
+            return Err(
+                StartRecommendationReportGenerationErrorModeled::ThrottlingException(
+                    ThrottlingException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} recommendation report \
+                             generation tasks",
+                            crate::state::REPORT_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The report covers the servers the filter names, counted from the inventory as
+        // it stands now. The count is what the task keeps; the filter itself is not
+        // stored.
+        let servers_covered = store.servers_in_groups(&group_id_filter);
+
+        let id = store.mint_recommendation_report_id();
+        let report = crate::state::RecommendationReport {
+            id: id.clone(),
+            // Generating the report is not done the instant the call returns: the clock
+            // owes the task a terminal status once the completion span has passed, and
+            // until then it is the task a further start call coalesces onto.
+            status: crate::state::REPORT_IN_PROGRESS.to_string(),
+            status_message: None,
+            output_format,
+            servers_covered,
+            start_time: now,
+            completion_time: None,
+            completion_due: Some(now + crate::state::COMPLETION_SPAN),
+        };
+        store.recommendation_reports.insert(id.clone(), report);
+
+        Ok(StartRecommendationReportGenerationOutput { id: Some(id) })
     }
 }

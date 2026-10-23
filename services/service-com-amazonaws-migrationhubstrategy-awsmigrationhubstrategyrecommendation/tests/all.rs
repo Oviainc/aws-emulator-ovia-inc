@@ -23,6 +23,9 @@ mod import_file_task_listing;
 #[path = "all/portfolio_preferences.rs"]
 mod portfolio_preferences;
 
+#[path = "all/recommendation_report.rs"]
+mod recommendation_report;
+
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
 
