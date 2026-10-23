@@ -931,7 +931,11 @@ async fn an_unresolvable_application_reference_is_refused_rather_than_invented()
                 );
             }
             None => assert!(
-                actual.contains("must be specified"),
+                // The exact wording of THIS refusal is pinned by
+                // `tests/all/application_reference_refusals.rs`, which owns the rule for
+                // the identifier set; here it is enough that a request naming nothing is
+                // refused for naming nothing.
+                actual.contains("need to be specified"),
                 "case {case:?}: a request naming nothing is refused for naming nothing, got {actual:?}"
             ),
         }

@@ -172,9 +172,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(application) = state.applications.get(&input.application_id) else {
             return Err(StopApplicationErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(format!(
-                    "No SAP application is registered with ID {} in this account and Region",
-                    input.application_id
+                crate::state::not_found(crate::state::application_not_found_message(
+                    &input.application_id,
                 )),
             )
             .into());

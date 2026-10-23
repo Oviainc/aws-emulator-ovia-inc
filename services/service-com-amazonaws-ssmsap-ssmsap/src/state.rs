@@ -593,8 +593,9 @@ fn join_labels(members: &[ConditionalMember]) -> String {
     }
 }
 
-/// The modelled `ValidationException` a lookup is refused with when no registered
-/// application answers the reference it named.
+/// The modelled `ValidationException` an operation that models no
+/// `ResourceNotFoundException` is refused with when no registered application answers
+/// the reference it named (`GetApplication`, `DeregisterApplication`).
 ///
 /// A registration is scoped to an account and Region, so what the refusal states is
 /// that THIS account holds no such application: it names the account the lookup ran in
@@ -616,6 +617,33 @@ pub fn not_found(message: impl Into<String>) -> ResourceNotFoundException {
         message: Some(message.into()),
     }
 }
+
+/// The message an application-CONTROL call reports when the application it names is not
+/// registered in this account and Region.
+///
+/// Built from the request: the `ApplicationId` the caller sent is the only variable part,
+/// so every handler that acts on the application a request names reports the SAME
+/// template around it — which is what a client surfacing or matching on the service's
+/// not-found wording reads. The template is AWS's, as the `ssm-sap`
+/// application-control recordings show it, and it goes with the 404
+/// `ResourceNotFoundException` those operations model. A call that merely LOOKS an
+/// application up models no not-found error and answers the same condition with
+/// [`no_registered_application`] (400) instead.
+pub fn application_not_found_message(reference: &str) -> String {
+    format!("Application {reference} doesn't exist.")
+}
+
+/// The message `GetApplication` reports when the request carries NONE of the identifier
+/// members that could name an application.
+///
+/// A fixed diagnostic for a fixed condition — the request carries nothing to build it
+/// from — so it is AWS's own wording for this refusal verbatim, as the `ssm-sap`
+/// application-lookup recording shows it. The identifier members this operation accepts
+/// are still the three the model gives it (`smithy_query(query="operation",
+/// operation="GetApplication")`); the message names the two an SAP application is
+/// ordinarily referenced by.
+pub const MISSING_APPLICATION_IDENTIFIER_MESSAGE: &str =
+    "applicationId or applicationArn need to be specified";
 
 /// This service's modelled `ConflictException` (HTTP 409) carrying `message`.
 pub fn conflict(message: impl Into<String>) -> ConflictException {

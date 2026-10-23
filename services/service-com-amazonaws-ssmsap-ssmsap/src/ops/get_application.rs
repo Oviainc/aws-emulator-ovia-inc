@@ -158,9 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             && input.app_registry_arn.is_none()
         {
             return Err(GetApplicationErrorModeled::ValidationException(
-                crate::state::validation(
-                    "One of ApplicationId, ApplicationArn or AppRegistryArn must be specified",
-                ),
+                crate::state::validation(crate::state::MISSING_APPLICATION_IDENTIFIER_MESSAGE),
             )
             .into());
         }

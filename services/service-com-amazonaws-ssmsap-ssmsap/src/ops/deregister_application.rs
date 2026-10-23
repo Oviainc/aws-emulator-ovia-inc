@@ -143,12 +143,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(application) = state.applications.remove(&input.application_id) else {
             // This operation models no `ResourceNotFoundException`, so an id naming no
-            // registered application is refused as a validation failure.
+            // registered application is refused as a validation failure — the same
+            // construction `GetApplication` answers that condition with, since the two
+            // refuse the same thing at the same status and error shape.
             return Err(DeregisterApplicationErrorModeled::ValidationException(
-                crate::state::validation(format!(
-                    "No SAP application is registered with ID {} in this account and Region",
-                    input.application_id
-                )),
+                crate::state::no_registered_application(&input.application_id),
             )
             .into());
         };
