@@ -115,7 +115,8 @@ use super::types::*;
 use std::time::SystemTime;
 
 use crate::state::{
-    AnalysisJob, JobFamily, JobOutcome, JobSubmission, SubmissionKey, PROCESSING_SPAN, QUEUE_SPAN,
+    AnalysisJob, JobFamily, JobOutcome, JobSubmission, SubmissionKey, PII_LANGUAGES,
+    PROCESSING_SPAN, QUEUE_SPAN,
 };
 
 /// The family every job this operation creates belongs to.
@@ -129,15 +130,6 @@ const ANALYSIS: &str = "PII entity detection";
 /// The `Mode` whose output is a redacted copy of each document, and which therefore
 /// needs a `RedactionConfig` saying what to redact and how.
 const REDACTION_MODE: &str = "ONLY_REDACTION";
-
-/// The `LanguageCode` values a PII entities detection job accepts.
-///
-/// From the modelled member documentation of
-/// `StartPiiEntitiesDetectionJobRequest$LanguageCode`: "Enter the language code for
-/// English (en) or Spanish (es)." Every other value the `LanguageCode` enum names is
-/// refused with this operation's `InvalidRequestException` — it models no
-/// `UnsupportedLanguageException`.
-const PII_LANGUAGES: &[&str] = &["en", "es"];
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -267,7 +259,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Membership of the `LanguageCode` enum is enforced at the boundary; which of
         // its values a PII job accepts is documented in prose only, so it is enforced
-        // here.
+        // here, against the one set the PII family shares
+        // ([`crate::state::PII_LANGUAGES`]). This operation models no
+        // `UnsupportedLanguageException`, so the refusal is its
+        // `InvalidRequestException`.
         if !PII_LANGUAGES.contains(&input.language_code.as_str()) {
             return Err(
                 StartPiiEntitiesDetectionJobErrorModeled::InvalidRequestException(

@@ -40,11 +40,20 @@ pub const STATUS_DELETING: &str = "DELETING";
 
 /// The `GatewayState` enum the model declares for a gateway
 /// (`smithy_query(query="shape",shape="GatewayState")`: CREATING | ACTIVE | UPDATING |
-/// ERROR | DELETING | DELETED). Only the two a gateway's lifecycle reaches here are
+/// ERROR | DELETING | DELETED). Only the four a gateway's lifecycle reaches here are
 /// named; the rest belong to operations that are still scaffolded.
 pub const GATEWAY_STATE_CREATING: &str = "CREATING";
 /// See [`GATEWAY_STATE_CREATING`].
 pub const GATEWAY_STATE_ACTIVE: &str = "ACTIVE";
+/// See [`GATEWAY_STATE_CREATING`]. The transient state a gateway enters when
+/// DeleteGateway accepts the delete; the clock settles it into
+/// [`GATEWAY_STATE_DELETED`] one [`TRANSITION_SPAN`] later.
+pub const GATEWAY_STATE_DELETING: &str = "DELETING";
+/// See [`GATEWAY_STATE_CREATING`]. The TERMINAL state of a deleted gateway: its presence
+/// in the `GatewayState` enum is the model's own statement that a deleted gateway stays a
+/// readable resource, so a delete retires the record rather than evicting it (see
+/// [`StoredGateway::deleted_at`]).
+pub const GATEWAY_STATE_DELETED: &str = "DELETED";
 
 /// The `BridgeState` enum the model declares for a bridge
 /// (`smithy_query(query="shape",shape="BridgeState")`: CREATING | STANDBY | STARTING |
@@ -124,11 +133,26 @@ pub const NOT_FOUND_PREFIX: &str = "Not found: ";
 /// about the request was unacceptable.
 ///
 /// Operators and clients tell a validation refusal from a semantic one by this prefix, so
-/// every `BadRequestException` this crate returns is built through
-/// [`validation_failed_message`] — including the ones the framework's own boundary walk
-/// raises, which `crate::service::EmulatedService::override_refusal` words through the
-/// same function.
+/// every `BadRequestException` this crate returns ABOUT THE REQUEST'S CONTENT is built
+/// through [`validation_failed_message`] — including the ones the framework's own boundary
+/// walk raises, which `crate::service::EmulatedService::override_refusal` words through the
+/// same function. A request refused by the addressed resource's STATE instead carries the
+/// other envelope, [`BAD_REQUEST_PREFIX`].
 pub const VALIDATION_FAILED_PREFIX: &str = "Validation failed:";
+
+/// The prefix MediaConnect puts in front of the detail of a request refused for a
+/// SEMANTIC reason — the request is well formed, but the resource it addresses is not in a
+/// state that admits it: `BadRequestException$Message` is `Bad request: ` then the
+/// sentence naming the precondition.
+///
+/// `BadRequestException` is "thrown if the request contains a semantic error. The precise
+/// meaning depends on the API, and is documented in the error message", so the two kinds
+/// of refusal this service answers 400 for read differently: a request whose CONTENT is
+/// unacceptable carries [`VALIDATION_FAILED_PREFIX`], and one refused by the addressed
+/// resource's STATE carries this prefix. The status and the error code are the contract;
+/// the sentence after the envelope is this emulator's wording of the documented
+/// precondition.
+pub const BAD_REQUEST_PREFIX: &str = "Bad request: ";
 
 /// MediaConnect's `NotFoundException` message for a request that named `identifier` — an
 /// ARN, or whatever else the request addressed the resource by — and resolved no resource.
@@ -156,6 +180,28 @@ pub fn not_found_message(identifier: &str) -> String {
 /// of a borrowed `&str`.
 pub fn validation_failed_message(detail: &str) -> String {
     format!("{VALIDATION_FAILED_PREFIX}\n{detail}")
+}
+
+/// MediaConnect's `BadRequestException` message for a well-formed request the addressed
+/// resource's STATE refuses: [`BAD_REQUEST_PREFIX`] then `detail`.
+///
+/// TOTAL for every `detail`, for the same reason as [`validation_failed_message`].
+pub fn bad_request_message(detail: &str) -> String {
+    format!("{BAD_REQUEST_PREFIX}{detail}")
+}
+
+/// The refusal message for a lifecycle precondition an operation documents: `resource`
+/// (`Flow`, `Gateway`, `Bridge`, …) may be addressed by `operation` (the verb as the API
+/// names it) only while it is in `required_state`.
+///
+/// Every operation whose documentation states such a precondition words its refusal HERE,
+/// so one rule cannot be worded two ways: the operation names the state its documentation
+/// requires and this builds the one envelope a client reads
+/// ([`bad_request_message`]).
+pub fn state_precondition_message(resource: &str, required_state: &str, operation: &str) -> String {
+    bad_request_message(&format!(
+        "{resource} must be in {required_state} in order for {operation} to be invoked."
+    ))
 }
 
 /// The ceiling on how many flows this store holds: the cap that bounds caller-driven
@@ -193,6 +239,17 @@ pub const MAX_FLOW_COLLECTION_ENTRIES: usize = 50;
 /// The number is the emulator's own bound, not a published AWS default, and it is high
 /// enough that no ordinary workflow meets it.
 pub const MAX_GATEWAYS: usize = 1_000;
+
+/// How many RETIRED (deleted) gateway records this store keeps beside its live ones.
+///
+/// A gateway delete is a soft delete, so a deleted gateway stays readable in
+/// [`GATEWAY_STATE_DELETED`] (see [`StoredGateway::deleted_at`]) — which, left unbounded,
+/// would let a create-then-delete loop grow the gateway map without limit. So the store
+/// retains the most recently deleted gateways up to this count and drops the oldest
+/// retired record past it, exactly as [`MAX_GATEWAYS`] bounds the live ones. The number is
+/// this emulator's own bound (AWS publishes no retention for a deleted gateway) and it is
+/// high enough that a client polling a delete it just made always finds its record.
+pub const MAX_RETIRED_GATEWAYS: usize = MAX_GATEWAYS;
 
 /// How many networks one gateway may carry: "Creates a new gateway. The request must
 /// include at least one network (up to four)"
@@ -1061,6 +1118,15 @@ pub struct StoredGateway {
     pub gateway_state: String,
     /// The state change the clock owes, if any. See [`TRANSITION_SPAN`].
     pub pending: Option<PendingStatus>,
+    /// When DeleteGateway accepted the delete of this gateway, or `None` while it is live.
+    ///
+    /// A gateway delete is a SOFT delete — `GatewayState` carries the terminal `DELETED`
+    /// value, so a deleted gateway stays a readable resource (see
+    /// [`GATEWAY_STATE_DELETED`]) — and this is the record of it: it makes a repeated
+    /// delete idempotent rather than a not-found, keeps a retired gateway out of the live
+    /// count the create ceiling bounds, and orders the retired records the store retains
+    /// (see [`MAX_RETIRED_GATEWAYS`]).
+    pub deleted_at: Option<SystemTime>,
 }
 
 impl StoredGateway {
@@ -1076,6 +1142,23 @@ impl StoredGateway {
                 self.pending = Some(pending);
             }
         }
+    }
+
+    /// Enter `transient` now and owe `settled` once [`TRANSITION_SPAN`] has passed — the
+    /// gateway counterpart of [`StoredFlow::begin_transition`], so every state a gateway
+    /// is answered in while the clock still owes a change is started one way.
+    pub fn begin_transition(&mut self, transient: &str, settled: &str, now: SystemTime) {
+        self.gateway_state = transient.to_string();
+        self.pending = Some(PendingStatus {
+            status: settled.to_string(),
+            due_at: now + TRANSITION_SPAN,
+        });
+    }
+
+    /// Whether this gateway has been deleted: the delete was accepted, so the record is
+    /// retired (`DELETING`, settling into `DELETED`) rather than live.
+    pub fn is_retired(&self) -> bool {
+        self.deleted_at.is_some()
     }
 
     /// The modelled `Gateway` for this record.
@@ -1264,7 +1347,12 @@ pub struct ComAmazonawsMediaconnectMediaconnectState {
     /// name, and the flow id in the ARN is what keeps two same-named flows apart — the
     /// same reasoning as for [`Self::gateways`].
     pub flows: BTreeMap<String, StoredFlow>,
-    /// Every live gateway, keyed by its ARN. Ordered, so ListGateways pages stably.
+    /// Every gateway the store holds, keyed by its ARN. Ordered, so ListGateways pages
+    /// stably.
+    ///
+    /// Live gateways and the retired (deleted) ones alike: a gateway delete is a soft
+    /// delete, so a deleted gateway stays in this map — and readable — in its terminal
+    /// `DELETED` state (see [`StoredGateway::deleted_at`]).
     ///
     /// There is no index by name beside it: like a flow name, a gateway name is under no
     /// uniqueness rule in the model, and the gateway id in the ARN is what keeps two
@@ -1317,6 +1405,46 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         }
         for bridge in self.bridges.values_mut() {
             bridge.settle(now);
+        }
+    }
+
+    /// How many LIVE gateways the store holds — the count [`MAX_GATEWAYS`] bounds.
+    ///
+    /// A retired (deleted) gateway stays in the map so it remains readable in its terminal
+    /// `DELETED` state, but it no longer occupies one of the account's gateway slots: the
+    /// ceiling counts the gateways that exist, so deleting one makes room for another.
+    pub fn live_gateway_count(&self) -> usize {
+        self.gateways
+            .values()
+            .filter(|gateway| !gateway.is_retired())
+            .count()
+    }
+
+    /// Drop the oldest retired gateway records once the store holds more than
+    /// [`MAX_RETIRED_GATEWAYS`] of them, so a create-then-delete loop cannot grow the
+    /// gateway map without limit.
+    ///
+    /// Called from DeleteGateway — the call that retires a record — and never from a
+    /// read: what a reporting operation reports is the record the store holds.
+    pub fn evict_oldest_retired_gateways(&mut self) {
+        let mut retired: Vec<(SystemTime, String)> = self
+            .gateways
+            .values()
+            .filter_map(|gateway| {
+                gateway
+                    .deleted_at
+                    .map(|deleted_at| (deleted_at, gateway.gateway_arn.clone()))
+            })
+            .collect();
+        if retired.len() <= MAX_RETIRED_GATEWAYS {
+            return;
+        }
+        // Oldest first, so the records dropped are the ones retired longest ago; the ARN
+        // breaks a tie between two retired in the same instant.
+        retired.sort();
+        let excess = retired.len() - MAX_RETIRED_GATEWAYS;
+        for (_, gateway_arn) in retired.into_iter().take(excess) {
+            self.gateways.remove(&gateway_arn);
         }
     }
 }

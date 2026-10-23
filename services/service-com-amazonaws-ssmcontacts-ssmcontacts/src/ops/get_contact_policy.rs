@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetContactPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetContactPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetContactPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resource policy attached to the contact or escalation plan `ContactArn`
+//! names, read from [`crate::state::ContactRecord::policy`].
+//!
+//! Two things happen before the report, in this order:
+//!
+//! 1. The ACCOUNT-level Incident Manager precondition
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]):
+//!    until the account has an active replication set the call is refused with the modelled
+//!    `ValidationException` (HTTP 400) WITHOUT resolving `ContactArn` — so a non-onboarded
+//!    account is told its account is not onboarded, not that its contact is missing.
+//! 2. The resource lookup: an onboarded account naming a contact the store does not hold
+//!    gets the modelled `ResourceNotFoundException` (HTTP 404). Only contacts carry a
+//!    resource policy, so any other ARN — a channel's, a rotation's — is refused the same
+//!    way.
+//!
+//! A contact that has had no `PutContactPolicy` is reported with its `ContactArn` and NO
+//! `Policy`: both output members are optional, and the modelled `Policy` has `length`
+//! 1..395000, so there is no empty policy to report.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +162,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetContactPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetContactPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetContactPolicy"))
+        // The contact is addressed by ARN; nothing is read off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetContactPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let state = state.lock();
+
+        // The account gate comes FIRST, before `ContactArn` is resolved.
+        state
+            .require_active_replication_set()
+            .map_err(account_precondition_failed)?;
+
+        let Some(contact) = state.contacts.get(&input.contact_arn) else {
+            return Err(GetContactPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Contact {} not found", input.contact_arn),
+                    resource_id: input.contact_arn.clone(),
+                    resource_type: CONTACT_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetContactPolicyOutput {
+            contact_arn: Some(contact.arn.clone()),
+            policy: contact.policy.clone(),
+        })
     }
+}
+
+/// The `resourceType` this operation's not-found error names, spelled as the contact
+/// handlers spell it.
+const CONTACT_RESOURCE_TYPE: &str = "contact";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` and `fields` is present but EMPTY: the failure is account
+/// level, so no field of the request is at fault.
+fn account_precondition_failed(message: String) -> GetContactPolicyError {
+    GetContactPolicyErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
 }

@@ -2,9 +2,15 @@
 
 //! @op DeleteGateway
 //!
-//! Removes the stored gateway the request names and answers with its ARN, or
-//! `NotFoundException` when no gateway has that ARN: afterwards DescribeGateway answers
-//! 404 and ListGateways no longer lists it.
+//! Retires the stored gateway the request names and answers with its ARN, or
+//! `NotFoundException` when no gateway has that ARN.
+//!
+//! The delete is a SOFT delete, because `GatewayState` carries a terminal `DELETED`
+//! value: the record stays readable — DescribeGateway keeps answering 200, with the
+//! gateway in `DELETING` and then, once the clock settles it, in `DELETED`, and
+//! ListGateways keeps listing the record the store holds — and a repeated delete of an
+//! already-retired gateway succeeds again, as the model's `@idempotent` on this operation
+//! says it must.
 //!
 //! ## Shape of an operation
 //!
@@ -161,12 +167,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // The state change the clock already owes a gateway is materialised before one is
+        // read, exactly as the reporting operations do it.
+        store.settle_due_transitions(now);
+
         // "Before you can delete a gateway, you must deregister its instances and delete
-        // its bridges": a gateway in this store holds neither — the instance and bridge
-        // operations are still scaffolded, so nothing can be attached to one — which
-        // leaves the gateway's own record as the only thing to remove.
-        let Some(gateway) = store.gateways.remove(&input.gateway_arn) else {
+        // its bridges": a gateway in this store holds no instances (the instance
+        // operations are still scaffolded), and the bridge a request places on a gateway
+        // carries its placement ARN unresolved while DeleteBridge is still scaffolded — so
+        // gating on bridges would make such a gateway undeletable for the life of the
+        // process. That leaves the gateway's own record as the only thing to retire.
+        let Some(gateway) = store.gateways.get_mut(&input.gateway_arn) else {
             return Err(DeleteGatewayErrorModeled::NotFoundException(
                 NotFoundException {
                     message: crate::state::not_found_message(&input.gateway_arn),
@@ -175,8 +188,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Deleting a gateway is not instantaneous: it reports `DELETING` and the clock
+        // owes the terminal `DELETED` one transition span later. A gateway already on its
+        // way out keeps the state it has, so a repeat of this `@idempotent` call answers
+        // the same ARN rather than restarting the transition or failing.
+        if !gateway.is_retired() {
+            gateway.deleted_at = Some(now);
+            gateway.begin_transition(
+                crate::state::GATEWAY_STATE_DELETING,
+                crate::state::GATEWAY_STATE_DELETED,
+                now,
+            );
+        }
+        let gateway_arn = gateway.gateway_arn.clone();
+
+        // The retired records the store keeps are bounded: see
+        // `crate::state::MAX_RETIRED_GATEWAYS`.
+        store.evict_oldest_retired_gateways();
+
         Ok(DeleteGatewayOutput {
-            gateway_arn: Some(gateway.gateway_arn),
+            gateway_arn: Some(gateway_arn),
         })
     }
 }

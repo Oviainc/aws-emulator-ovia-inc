@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEnvironmentConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEnvironmentConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates one connector in a stored Amazon EVS environment and reports the record it
+//! persisted, which [`crate::ops::list_environment_connectors`] reads back and
+//! [`crate::ops::update_environment_connector`] reconfigures. An `environmentId` this
+//! service holds no live environment for in the request's Region is a
+//! `ResourceNotFoundException`, and nothing is stored for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEnvironmentConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The connector starts `CREATING` and the clock owes it the move to `ACTIVE`: "A
+//! connector allows the Amazon EVS control plane to interface with VCF appliances
+//! using a fully qualified domain name", which is a connection to establish rather
+//! than a record to write.
+//!
+//! "You can create only one connector of each type per environment", so the
+//! `ConnectorType` is the identity of a connector within its environment. The
+//! operation is `@idempotent`
+//! (`smithy_query(query="operation",operation="CreateEnvironmentConnector")`): a
+//! repeat call naming a type the environment already has a LIVE connector of reports
+//! that stored record when the request asks for the same appliance and secret, and is
+//! refused with the modelled `ValidationException` when it asks for different ones —
+//! the second connector of a type cannot be created, and silently reconfiguring the
+//! first is `UpdateEnvironmentConnector`'s work, not a create's.
+//!
+//! The SDDC_MANAGER connector Amazon EVS creates automatically "for environments where
+//! Amazon EVS installs VCF" is deliberately NOT minted by `CreateEnvironment` here:
+//! its appliance FQDN and its credential secret are produced by the VCF installation,
+//! which this emulator does not run, so both values would have to be invented.
 //!
 //! ## Shape of an operation
 //!
@@ -114,12 +130,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `CreateEnvironmentConnectorError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#CreateEnvironmentConnector")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#CreateEnvironmentConnector",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateEnvironmentConnectorErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -173,18 +195,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEnvironmentConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEnvironmentConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEnvironmentConnector"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateEnvironmentConnectorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "The Amazon EVS environment store is unavailable.".to_string(),
+                },
+            )
+        })?;
+        // `clientToken` is read and ignored on purpose: "This parameter is not used in
+        // Amazon EVS currently. If you supply input for this parameter, it will have no
+        // effect." (`clientToken` doc). The operation is idempotent through the stored
+        // records instead — see the same-type match below.
+        let _ = &input.client_token;
+        let region = crate::state::request_region(ctx.parts());
+        let created_at_ms = crate::state::now_ms();
+
+        let mut state = state.lock();
+        // Reporting only: this materialises the state changes the clock already owed,
+        // which were due whether or not anybody called, so the environment and its
+        // connectors are in the state that is due at this instant before the create is
+        // evaluated.
+        state.materialise_due_transitions();
+        let connector_id = state.mint_connector_id();
+
+        // Regional resource: an environment exists at the endpoint of the Region it was
+        // created in, so a connector can only be created in one from that Region. An
+        // environment that has reached DELETED is gone as far as a create is concerned:
+        // "The resource might not be specified correctly, or it may have a state of
+        // DELETED" (`ResourceNotFoundException` doc).
+        let environment = state
+            .environment_in_region_mut(&region, &input.environment_id)
+            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .ok_or_else(|| {
+                CreateEnvironmentConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
+        let environment_id = environment.environment_id.clone();
+
+        // "You can create only one connector of each type per environment": the type is
+        // the identity of a connector within its environment, so a second create for a
+        // type already connected is either this request again or a conflict.
+        if let Some(existing) = crate::state::live_connector_of_type(environment, &input.r#type) {
+            if existing.appliance_fqdn == input.appliance_fqdn
+                && existing.secret_arn == input.secret_identifier
+            {
+                // `@idempotent`: the same create again reports the stored record and
+                // mints nothing.
+                return Ok(CreateEnvironmentConnectorOutput {
+                    connector: Some(existing.to_wire(&environment_id)),
+                });
+            }
+            return Err(CreateEnvironmentConnectorErrorModeled::ValidationException(
+                crate::state::field_validation_error(
+                    "type",
+                    &format!(
+                        "names a connector type environment {environment_id} already has a \
+                         connector of ({}); only one connector of each type can be created per \
+                         environment",
+                        existing.connector_id
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // Establishing the connection to the appliance has started but is not finished:
+        // the connector is CREATING and the clock owes it the move to ACTIVE.
+        let pending =
+            crate::state::PendingConnectorState::starting_now(crate::state::CONNECTOR_ACTIVE);
+        let due_at = pending.due_at;
+        let connector = crate::state::StoredConnector::creating(
+            connector_id.clone(),
+            &input.r#type,
+            &input.appliance_fqdn,
+            &input.secret_identifier,
+            created_at_ms,
+            pending,
+        );
+        let created = match environment.connectors.entry(connector_id) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(connector).to_wire(&environment_id)
+            }
+            // Unreachable: ids are minted from a strictly increasing seed. Answering
+            // honestly beats reporting some other connector as the created one.
+            std::collections::btree_map::Entry::Occupied(taken) => {
+                return Err(
+                    CreateEnvironmentConnectorErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: format!(
+                                "The connector id {} is already in use.",
+                                taken.key()
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+        state.note_transition_due(due_at);
+
+        Ok(CreateEnvironmentConnectorOutput {
+            connector: Some(created),
+        })
     }
 }

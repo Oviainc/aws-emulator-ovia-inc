@@ -1211,7 +1211,10 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 }
 
 /// The per-document quota a real-time (synchronous) inference operation accepts, in
-/// UTF-8 bytes, for every one of them EXCEPT `DetectDominantLanguage`.
+/// UTF-8 bytes, for every one of them EXCEPT those whose own member documentation
+/// states a larger maximum: `DetectDominantLanguage`
+/// ([`DOMINANT_LANGUAGE_TEXT_QUOTA_BYTES`]) and PII analysis
+/// ([`PII_TEXT_QUOTA_BYTES`]).
 ///
 /// Comprehend's model states no byte maximum — `CustomerInputString` carries only
 /// `@length min 1`, and the member prose rounds the quota to "5 KB" — so the
@@ -1226,6 +1229,31 @@ pub const REALTIME_TEXT_QUOTA_BYTES: usize = 5_000;
 /// operation alone carries the larger published quota (the member prose rounds it
 /// to "100 KB"): a 100001-byte document is refused, a 100000-byte one is accepted.
 pub const DOMINANT_LANGUAGE_TEXT_QUOTA_BYTES: usize = 100_000;
+
+/// The per-document quota of Comprehend's real-time PII analysis, in UTF-8 bytes.
+///
+/// PII analysis is the other real-time family whose own modelled member
+/// documentation states a maximum — `ContainsPiiEntitiesRequest$Text`: "A UTF-8 text
+/// string. The maximum string size is 100 KB." — so it carries the larger quota
+/// rather than [`REALTIME_TEXT_QUOTA_BYTES`]. That prose is read here exactly as
+/// [`DOMINANT_LANGUAGE_TEXT_QUOTA_BYTES`] reads the same rounding, as a count of
+/// BYTES: a 100001-byte document is refused with `TextSizeLimitExceededException`,
+/// a 100000-byte one is accepted.
+pub const PII_TEXT_QUOTA_BYTES: usize = 100_000;
+
+/// The `LanguageCode` values Comprehend's PII analysis accepts.
+///
+/// ONE set for the whole PII family — the synchronous analysis operations and the
+/// asynchronous detection job — so they can never drift apart on which languages
+/// PII analysis accepts. The set is the one the member documentation that names a
+/// set states, `StartPiiEntitiesDetectionJobRequest$LanguageCode` and
+/// `DetectPiiEntitiesRequest$LanguageCode`: "Enter the language code for English
+/// (en) or Spanish (es)." `ContainsPiiEntitiesRequest$LanguageCode` is "The language
+/// of the input documents" — it names no set, so it neither widens nor narrows this
+/// one. Every other value the `LanguageCode` enum names is refused with the error
+/// the calling operation models for it, rather than answered with an empty result
+/// that no analysis produced.
+pub const PII_LANGUAGES: &[&str] = &["en", "es"];
 
 /// The refusal message for a document past `quota_bytes`: `Some(message)` when
 /// `text` exceeds the quota, `None` when it fits.

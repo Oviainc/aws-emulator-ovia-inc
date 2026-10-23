@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches `Tags` to the resource `ResourceARN` names, writing them into that resource's
+//! own record ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::tags_mut`]) so the
+//! next `ListTagsForResource` reports what this call wrote.
+//!
+//! The write is a MERGE BY KEY, not an append: a tag key already on the resource takes the
+//! incoming value and a key that is not is added, because a key is unique per resource.
+//!
+//! The order of the checks is the order of the refusals:
+//!
+//! 1. The ACCOUNT-level Incident Manager precondition
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]):
+//!    until the account has an active replication set the call is refused with the modelled
+//!    `ValidationException` (HTTP 400) and NOTHING is written — so the follow-up
+//!    `ListTagsForResource` cannot report a tag this call fabricated.
+//! 2. Every tag must carry a `Key`: the modelled `Tag` makes both members optional, but a
+//!    tag with no key names nothing to read back or remove
+//!    ([`crate::state::require_tag_key`]).
+//! 3. The resource lookup: an onboarded account naming a resource the store does not hold
+//!    gets the modelled `ResourceNotFoundException` (HTTP 404). Contacts (including
+//!    escalation plans) and rotations are this service's taggable resources.
+//! 4. The per-resource tag ceiling: `TagsList` — the shape both this input and
+//!    `ListTagsForResource`'s output target — declares `length` 0..50, so a merge that
+//!    would leave the resource with more tags than
+//!    [`crate::state::MAX_TAGS_PER_RESOURCE`] is refused with the modelled
+//!    `ServiceQuotaExceededException` (HTTP 402) and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +166,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        use crate::state::{merge_tags, require_tag_key, MAX_TAGS_PER_RESOURCE};
+
+        // The resource is addressed by ARN; nothing is read off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+
+        // The account gate comes FIRST: before `ResourceARN` is resolved, and before
+        // anything is written.
+        state
+            .require_active_replication_set()
+            .map_err(account_precondition_failed)?;
+
+        for tag in &input.tags {
+            require_tag_key(tag).map_err(validation)?;
+        }
+
+        let resource_arn = input.resource_arn.clone();
+        let Some(tags) = state.tags_mut(&resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Resource {resource_arn} not found"),
+                    resource_id: resource_arn.clone(),
+                    resource_type: RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // What the merge WOULD leave, computed before the write, so a refused request
+        // leaves the resource's tags exactly as they were. Counted over DISTINCT incoming
+        // keys the resource does not already carry: a batch naming the same new key twice
+        // adds one tag, so counting it twice would refuse a merge that lands exactly on the
+        // ceiling.
+        let added: ::std::collections::BTreeSet<&str> = input
+            .tags
+            .iter()
+            .filter_map(|tag| tag.key.as_deref())
+            .filter(|key| {
+                !tags
+                    .iter()
+                    .any(|stored| stored.key.as_deref() == Some(*key))
+            })
+            .collect();
+        let projected = tags.len() + added.len();
+        if projected > MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "A resource holds at most {MAX_TAGS_PER_RESOURCE} tags; this request \
+                         would leave it with {projected}"
+                    ),
+                    resource_id: Some(resource_arn.clone()),
+                    resource_type: Some(RESOURCE_TYPE.to_string()),
+                    quota_code: "TagsPerResource".to_string(),
+                    service_code: "ssm-contacts".to_string(),
+                },
+            )
+            .into());
+        }
+
+        merge_tags(tags, &input.tags);
+
+        Ok(TagResourceOutput {})
     }
+}
+
+/// The `resourceType` this operation's not-found and quota errors name. `ResourceARN` is an
+/// `AmazonResourceName`, not an `SsmContactsArn`, so the kind of resource it named is not
+/// known to be one this service holds — only that this service holds no such resource.
+const RESOURCE_TYPE: &str = "resource";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` and `fields` is present but EMPTY: the failure is account
+/// level, so no field of the request is at fault.
+fn account_precondition_failed(message: String) -> TagResourceError {
+    TagResourceErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// A member-level refusal: the same modelled `ValidationException`, carrying `message`.
+fn validation(message: String) -> TagResourceError {
+    TagResourceErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: "tags".to_string(),
+            message: "Every tag must carry a Key".to_string(),
+        }]),
+    })
+    .into()
 }

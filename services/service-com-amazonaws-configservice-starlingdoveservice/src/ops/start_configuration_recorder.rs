@@ -181,6 +181,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        // Starting is a no-op on a service-linked configuration recorder: the service
+        // it is linked to turns it on, so this operation does not affect it
+        // (`UnmodifiableEntityException`: "For StartConfigurationRecorder and
+        // StopConfigurationRecorder, you will see this exception because these
+        // operations do not affect service-linked configuration recorders").
+        if recorder.service_principal.is_some() {
+            return Err(
+                StartConfigurationRecorderErrorModeled::UnmodifiableEntityException(
+                    UnmodifiableEntityException {
+                        message: Some(format!(
+                            "'{name}' is a service-linked configuration recorder; \
+                             StartConfigurationRecorder does not affect service-linked \
+                             configuration recorders"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
         let arn = recorder.arn.clone();
 
         // Config needs somewhere to deliver what it records before it can record.

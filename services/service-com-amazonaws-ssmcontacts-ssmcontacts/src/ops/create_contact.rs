@@ -239,6 +239,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             contact_type: input.r#type.clone(),
             plan: input.plan.clone(),
             tags: input.tags.clone().unwrap_or_default(),
+            // A contact is created with no resource policy; `PutContactPolicy` attaches
+            // one.
+            policy: None,
             created_at: ::std::time::SystemTime::now(),
         };
         state.alias_index.insert(input.alias.clone(), arn.clone());
