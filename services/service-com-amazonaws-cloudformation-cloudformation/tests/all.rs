@@ -15,6 +15,8 @@
 mod change_set_lifecycle;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/extension_registry.rs"]
+mod extension_registry;
 #[path = "all/stack_lifecycle.rs"]
 mod stack_lifecycle;
 #[path = "all/stack_output_resolution.rs"]

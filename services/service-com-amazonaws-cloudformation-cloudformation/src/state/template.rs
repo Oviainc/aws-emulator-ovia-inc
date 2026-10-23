@@ -322,7 +322,7 @@ fn compact_on_line_opener(compact_on_line: &mut usize) -> bool {
 /// The partition every ARN this emulator mints belongs to, which is what
 /// `{"Ref": "AWS::Partition"}` resolves to (`::emulator_server::emulator_arn` builds
 /// `arn:aws:…`).
-const PARTITION: &str = "aws";
+pub const PARTITION: &str = "aws";
 
 /// What `{"Ref": "AWS::URLSuffix"}` resolves to in the `aws` partition.
 const URL_SUFFIX: &str = "amazonaws.com";
@@ -1097,6 +1097,28 @@ fn generated_service_id(prefix: &str, name: &str, digits: usize) -> String {
     let digest = ::hex::encode(hasher.finalize());
     format!("{prefix}-{}", &digest[..digits])
 }
+
+/// The resource types this emulator IMPLEMENTS: the ones [`return_values`] below carries
+/// the documented `Ref` and `Fn::GetAtt` return values of, so a stack that declares one
+/// gets the physical id and the attributes the type's "Return values" section publishes
+/// rather than a name and nothing.
+///
+/// This is the list of extensions the registry of every account and Region holds as
+/// Amazon-Web-Services-published public resource types (see
+/// [`crate::state::registry::aws_published`]): the registry reports an extension for a
+/// resource type this emulator provisions, and nothing for a name it knows nothing about.
+/// Keep it in step with the `match` in [`return_values`] — one entry per arm.
+pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
+    "AWS::DynamoDB::Table",
+    "AWS::IAM::Role",
+    "AWS::Lambda::Function",
+    "AWS::Logs::LogGroup",
+    "AWS::S3::Bucket",
+    "AWS::SNS::Topic",
+    "AWS::SQS::Queue",
+    "AWS::Transfer::Server",
+    "AWS::Transfer::Workflow",
+];
 
 /// What `Ref` returns for a resource of this type, and what `Fn::GetAtt` reads off it.
 ///
@@ -1909,4 +1931,39 @@ fn substitute(
     budget.spend_text(rest.len())?;
     out.push_str(rest);
     (out.len() <= MAX_RESOLVED_TEXT_BYTES).then_some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`IMPLEMENTED_RESOURCE_TYPES`] is the catalogue of the arms of [`return_values`],
+    /// and the registry reports a published extension for exactly its entries — so an
+    /// entry that `return_values` does not actually know would make the registry report an
+    /// extension for a type this emulator provisions no better than any other. Every
+    /// catalogued type must therefore yield the attributes its "Return values" section
+    /// publishes, which a type outside the `match` has none of.
+    #[test]
+    fn every_implemented_resource_type_has_known_return_values() {
+        let scope = StackScope {
+            region: "us-east-1",
+            stack_name: "a-stack",
+            stack_id: "a-stack-id",
+        };
+        for resource_type in IMPLEMENTED_RESOURCE_TYPES {
+            let (_, attributes) = return_values(resource_type, "a-name", scope);
+            assert!(
+                !attributes.is_empty(),
+                "case {resource_type:?}: expected the type's documented Fn::GetAtt \
+                 attributes, got none — the catalogue and the return_values match have \
+                 drifted apart"
+            );
+        }
+        // And a type no arm carries is NOT in the catalogue: it has no attributes at all.
+        let (_, unknown) = return_values("AWS::NotAService::NotAType", "a-name", scope);
+        assert!(
+            unknown.is_empty(),
+            "case \"a type no arm carries\": expected no attributes, got {unknown:?}"
+        );
+    }
 }

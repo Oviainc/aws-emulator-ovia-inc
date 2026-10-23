@@ -63,6 +63,14 @@
 //! the deployment ([`StoredStack::deploy_template`]) and `settle` installs it with the
 //! terminal status, so a stack always reports the resources and outputs of the template
 //! that finished deploying.
+//!
+//! ## The extension registry
+//!
+//! Beside the stacks and their change sets the store holds this account and Region's
+//! EXTENSION REGISTRY — the resource types, modules and Hooks it has registered or
+//! activated, and the versions of each (see [`registry`]). It is a store of its own, not a
+//! stack's: nothing in a registry record settles on the stack clock, and `DescribeType`
+//! reads it the way `DescribeStacks` reads the stacks.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -70,6 +78,10 @@ use std::time::{Duration, SystemTime};
 /// Reading a stack's template body, and evaluating the resources and outputs it
 /// declares.
 pub mod template;
+
+/// The extension registry: the registered and activated extensions this account and
+/// Region holds, and the versions of each.
+pub mod registry;
 
 /// How long after the call that starts it a stack's terminal status becomes due.
 ///
@@ -893,6 +905,11 @@ pub struct ComAmazonawsCloudformationCloudformationState {
     /// does: CloudFormation deletes a stack's change sets with the stack, which is what
     /// [`Self::settle`] enforces here.
     pub change_sets: Vec<StoredChangeSet>,
+    /// This account and Region's extension registry, in the order its records entered it,
+    /// so `DescribeType` reads back exactly what a registry write wrote (see
+    /// [`registry`]). A registry record has nothing to do with a stack's lifecycle, so it
+    /// is neither settled nor reclaimed with one.
+    pub extensions: Vec<registry::StoredExtension>,
 }
 
 impl ComAmazonawsCloudformationCloudformationState {
@@ -1063,6 +1080,33 @@ impl ComAmazonawsCloudformationCloudformationState {
                 .iter()
                 .any(|deployed| deployed.resource.physical_resource_id == physical_resource_id)
         })
+    }
+
+    /// The registry record a `Type`-and-`TypeName` request names, in the Region the
+    /// request was signed for: `DescribeType` reads an extension "from the CloudFormation
+    /// registry in your current account and Region", so the same name in another Region
+    /// names no record.
+    pub fn extension_by_name(
+        &self,
+        region: &str,
+        type_kind: &str,
+        type_name: &str,
+    ) -> Option<&registry::StoredExtension> {
+        self.extensions.iter().find(|extension| {
+            extension.region == region
+                && extension.type_kind == type_kind
+                && extension.type_name == type_name
+        })
+    }
+
+    /// The registry record an `Arn` request names, in the Region the request was signed
+    /// for. An extension's ARN carries its Region and its kind already, and the registry
+    /// is regional like the records it holds, so an ARN minted for another Region names no
+    /// record HERE — the same gate [`Self::extension_by_name`] applies to the name form.
+    pub fn extension_by_arn(&self, region: &str, arn: &str) -> Option<&registry::StoredExtension> {
+        self.extensions
+            .iter()
+            .find(|extension| extension.region == region && extension.arn == arn)
     }
 
     fn position_of(&self, name_or_id: &str) -> Option<usize> {
@@ -1449,6 +1493,15 @@ pub fn new_request_id() -> String {
 /// addressable: no live stack has that name and no stack has that id.
 pub fn stack_does_not_exist(name_or_id: &str) -> String {
     format!("Stack with id {name_or_id} does not exist")
+}
+
+/// The message answered when a request names an extension the registry of this account and
+/// Region does not hold — an unknown name or ARN, a name registered under another kind or
+/// in another Region, a publisher that published no such extension, or a version the
+/// record does not carry. Built from what the request named, the way
+/// [`stack_does_not_exist`] is.
+pub fn extension_does_not_exist(identifier: &str) -> String {
+    format!("Extension with identifier {identifier} does not exist")
 }
 
 /// The message CloudFormation answers when a request names a `PhysicalResourceId` no
