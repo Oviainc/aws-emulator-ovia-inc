@@ -3581,9 +3581,482 @@ impl ClusterRecord {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The account's IAM roles and EC2 network: facts this service RESOLVES rather
+// than holds.
+//
+// A request can name an IAM role Amazon EKS is asked to assume, and the subnets
+// the network interfaces of a cluster or a node group are placed in. Neither is
+// a resource of this service: a role lives in IAM and a subnet in EC2, so what
+// a request names is resolved against THOSE services — reached the way any
+// emulated service reaches another, through the in-process callback
+// ([`smithy_server_runtime::OperationContext::callback`]), so this crate names
+// no other service's crate — and a value that resolves to nothing is what a
+// request is refused for.
+//
+// Every refusal here is grounded in what the other service ANSWERED. An
+// emulator with no IAM or no EC2 mounted knows nothing about the role or the
+// subnet, and nothing is what it refuses on: a refusal is never assumed from
+// silence.
+// ---------------------------------------------------------------------------
+
+/// The refusal a request that asks Amazon EKS to pass a role that is not a role
+/// of the caller's OWN account earns.
+///
+/// A fixed sentence tied to the rule — Amazon EKS authorizes the `iam:PassRole`
+/// of the value a request names, and a value that does not name a role of this
+/// account can never be passed, whatever its name or path — so it carries
+/// nothing from the request. It is the sentence the recorded service answers,
+/// including for a `roleArn` that is not an ARN at all: the pass-role is
+/// evaluated against the value AS A ROLE OF SOME OTHER ACCOUNT, not parsed as a
+/// parameter.
+pub const CROSS_ACCOUNT_PASS_ROLE_REFUSAL: &str = "Cross-account pass role is not allowed.";
+
+/// The refusal a `RegisterCluster` whose `connectorConfig.roleArn` is not a role
+/// of this account earns.
+///
+/// A registration does NOT answer the pass-role refusal above, and this is the
+/// one place in this service where that differs: the recorded service refuses an
+/// unusable `connectorConfig.roleArn` with HTTP 400 `InvalidParameterException`
+/// and this fixed sentence, while the same value in `CreateCluster$roleArn` is
+/// refused 403 with [`CROSS_ACCOUNT_PASS_ROLE_REFUSAL`]. The QUESTION is the same
+/// one [`pass_role_refusal`] answers — does the value name a role of this
+/// account? — so one reading serves both; only how each operation reports it
+/// differs, and each reports it as its own recording shows.
+pub const CONNECTOR_ROLE_ARN_REFUSAL: &str = "The provided roleArn is invalid.";
+
+/// The service principal the EKS connector role must let assume it: the cluster
+/// is registered as a Systems Manager managed instance, so SSM is what assumes
+/// the role `connectorConfig.roleArn` names (Amazon EKS User Guide, "Connecting
+/// an external cluster"), which is also the principal the recorded refusal for
+/// an unusable connector role names.
+pub const CONNECTOR_SERVICE_PRINCIPAL: &str = "ssm.amazonaws.com";
+
+/// The Amazon EKS service principal, for a role the model says Amazon EKS itself
+/// assumes: "This role must have a trust policy that allows the EKS service
+/// principal to assume it" (`CreateCapabilityRequest$roleArn`).
+pub const EKS_SERVICE_PRINCIPAL: &str = "eks.amazonaws.com";
+
+/// The EC2 error code for a subnet id no subnet of the account carries.
+pub const EC2_INVALID_SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetID.NotFound";
+
+/// The partition every ARN this emulator mints carries, read off one it mints
+/// rather than written out again.
+pub fn emulator_partition() -> String {
+    ::engine::emulator_arn("iam", "", "")
+        .split(':')
+        .nth(1)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Why `role_arn` is not a role this caller may have Amazon EKS assume, or
+/// `None` when it is one.
+///
+/// A role a request hands to Amazon EKS is passed to the service with the
+/// caller's own `iam:PassRole`, so the question is whether the value names a
+/// role THIS caller can pass: a well-formed IAM role ARN of the caller's own
+/// partition and account. The `region` field of such an ARN is empty — IAM is
+/// global, so an IAM ARN carries no Region.
+///
+/// EVERY failure of that question is one answer, a PERMISSION failure
+/// (`AccessDeniedException`, 403), never a malformed parameter: the recorded
+/// service refuses a `roleArn` of `not-an-arn` with
+/// [`CROSS_ACCOUNT_PASS_ROLE_REFUSAL`] and not as a bad parameter, because the
+/// authorization is evaluated against the value as the role of an account that
+/// is not this one. The message says which: the fixed sentence for a value that
+/// names no role of this account at all, and what else was wrong for a
+/// well-formed IAM ARN of this account that names something other than a role,
+/// or a role of another partition.
+///
+/// What is NOT answered here is whether such a role EXISTS and trusts the
+/// principal that would assume it: that lives in IAM, and
+/// [`service_principal_trust_violation`] is what asks it, for the roles whose
+/// contract names the principal.
+pub fn pass_role_refusal(role_arn: &str) -> Option<String> {
+    let own_account = ::engine::emulator_account_id();
+    let own_partition = emulator_partition();
+    // `splitn(6, ':')` leaves the whole resource — colons included — as the last field.
+    let fields: Vec<&str> = role_arn.splitn(6, ':').collect();
+    let [literal, partition, vendor, region, account, resource] = fields.as_slice() else {
+        return Some(CROSS_ACCOUNT_PASS_ROLE_REFUSAL.to_string());
+    };
+    // The IAM ARN form, `arn:<partition>:iam::<12-digit account>:<resource>` — IAM is a
+    // global service, so the Region segment is empty. This is the same reading
+    // [`is_iam_role_arn`] applies, minus the question of WHAT the resource names, which
+    // is the next step rather than part of the form.
+    let is_iam_arn = *literal == "arn"
+        && !partition.is_empty()
+        && *vendor == "iam"
+        && region.is_empty()
+        && account.len() == 12
+        && account.bytes().all(|byte| byte.is_ascii_digit())
+        && !resource.is_empty();
+    // A value that is not an IAM ARN of this account names no role of it, which is the
+    // same answer a role of another account gets.
+    if !is_iam_arn || *account != own_account {
+        return Some(CROSS_ACCOUNT_PASS_ROLE_REFUSAL.to_string());
+    }
+    // An IAM role's resource field is `role/<path><name>`; any other identity
+    // (`user/`, `group/`, `instance-profile/`) is not something a service assumes.
+    if resource.strip_prefix("role/").unwrap_or_default().is_empty() {
+        return Some(format!("{role_arn} does not name an IAM role"));
+    }
+    if *partition != own_partition.as_str() {
+        return Some(format!(
+            "{role_arn} is in partition {partition}, not {own_partition}"
+        ));
+    }
+    None
+}
+
+/// The role NAME `role_arn` names in the account this emulator serves, or `None`
+/// when it is not an in-account IAM role ARN at all — the case
+/// [`pass_role_refusal`] already reports, so this answers nothing about it.
+///
+/// IAM addresses a role by name, not by path, so the path a role sits under is
+/// dropped: `role/service-role/Connector` is the role `Connector`.
+fn iam_role_name(role_arn: &str) -> Option<&str> {
+    if pass_role_refusal(role_arn).is_some() {
+        return None;
+    }
+    let resource = role_arn.splitn(6, ':').nth(5)?;
+    let name = resource.strip_prefix("role/")?.split('/').next_back()?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// An AWS SDK client over the in-process callback into this same emulator.
+///
+/// The callback is the framework's documented seam for calling another emulated
+/// service: it routes in process, so no network client is configured here and
+/// this service names no other service's crate. `region` is the request's own
+/// signing region.
+macro_rules! callback_client {
+    ($sdk:ident, $ctx:expr, $endpoint:expr, $region:expr) => {{
+        let config = ::$sdk::Config::builder()
+            .behavior_version(::$sdk::config::BehaviorVersion::latest())
+            .http_client($ctx.callback().http_client())
+            .credentials_provider($ctx.callback().aws_credentials_provider())
+            .region(::$sdk::config::Region::new($region.to_string()))
+            .endpoint_url($endpoint)
+            // The transport is in-process: there is nothing to retry, time out
+            // or watch for a stalled stream, and each of those would need a
+            // sleep implementation this client is not given. The same goes for
+            // caching the identity: the credentials are handed over directly.
+            .retry_config(::$sdk::config::retry::RetryConfig::disabled())
+            .timeout_config(::$sdk::config::timeout::TimeoutConfig::disabled())
+            .identity_cache(::$sdk::config::IdentityCache::no_cache())
+            .stalled_stream_protection(
+                ::$sdk::config::StalledStreamProtectionConfig::disabled(),
+            )
+            .build();
+        ::$sdk::Client::from_conf(config)
+    }};
+}
+
+/// The refusal a role whose trust policy does not admit `principal` earns, or
+/// `None` when IAM holds the role and its trust policy lets `principal` assume
+/// it — and also when this emulator has no IAM to ask, because a refusal has to
+/// be grounded in what IAM answered rather than assumed from silence.
+///
+/// The trust document is read through the ONE evaluator every service that
+/// resolves a caller-supplied role shares
+/// (`service_common::iam_trust_policy::admits_service_principal`), so two
+/// services asked about the same document cannot answer differently. A document
+/// this emulator cannot read as a policy is not one Amazon EKS can act on, so it
+/// does not admit the assume.
+pub async fn service_principal_trust_violation(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+    principal: &str,
+) -> Option<String> {
+    // Not an in-account role at all: `pass_role_refusal` is what reports that,
+    // and it has already run by the time a handler asks this.
+    let role_name = iam_role_name(role_arn)?;
+    let answer = callback_client!(
+        aws_sdk_iam,
+        ctx,
+        format!("https://iam.{region}.amazonaws.com"),
+        region
+    )
+    .get_role()
+    .role_name(role_name)
+    .send()
+    .await;
+    match answer {
+        Ok(output) => {
+            let trusted = output
+                .role()
+                .and_then(::aws_sdk_iam::types::Role::assume_role_policy_document)
+                .is_some_and(|document| {
+                    ::service_common::iam_trust_policy::admits_service_principal(
+                        document, principal,
+                    )
+                    .unwrap_or(false)
+                });
+            (!trusted).then(|| trust_policy_refusal(role_arn, principal))
+        }
+        // IAM says this account holds no such role: the refusal is grounded.
+        Err(error) if iam_role_is_absent(&error) => {
+            Some(trust_policy_refusal(role_arn, principal))
+        }
+        // Any other answer is this emulator failing to ask, not IAM reporting a
+        // bad role, so it refuses nothing — and it is worth a warning, because a
+        // deployment with no IAM to ask is one where this gate does not run.
+        Err(error) => {
+            ::tracing::warn!(
+                %role_arn,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the role could not be verified against IAM"
+            );
+            None
+        }
+    }
+}
+
+/// The message a role that IAM does not hold, or whose trust policy does not let
+/// `principal` assume it, is refused with: the two cases are one refusal,
+/// because a caller cannot tell them apart without a role it may not be allowed
+/// to read, and it names the role at fault.
+fn trust_policy_refusal(role_arn: &str, principal: &str) -> String {
+    let service = principal.split('.').next().unwrap_or(principal);
+    format!("Nonexistent role or missing {service} service principal in trust policy: {role_arn}")
+}
+
+/// Whether an IAM `GetRole` failure is IAM reporting that the role does not
+/// exist (`NoSuchEntity`), as opposed to the call not reaching IAM.
+fn iam_role_is_absent(
+    error: &::aws_sdk_iam::error::SdkError<
+        ::aws_sdk_iam::operation::get_role::GetRoleError,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    error
+        .as_service_error()
+        .is_some_and(::aws_sdk_iam::operation::get_role::GetRoleError::is_no_such_entity_exception)
+}
+
+/// The refusal a `subnetIds` list earns when one of the subnets it names does
+/// not exist, or `None` when EC2 resolved every one of them — and also when this
+/// emulator has no EC2 to ask, for the same reason
+/// [`service_principal_trust_violation`] refuses nothing then.
+///
+/// Amazon EKS places the control plane's (or a node group's) network interfaces
+/// in the subnets a request names, so it resolves them before it provisions
+/// anything. The subnets of the account are EC2's, so EC2 is asked: it answers
+/// `InvalidSubnetID.NotFound` for an id no subnet of the account carries, and
+/// the message it gives — which names that id — is carried through to the
+/// caller with the service, status and error code it came from, the way Amazon
+/// EKS reports a failure of a call it made on the caller's behalf.
+pub async fn unresolved_subnet_refusal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    subnet_ids: &[String],
+) -> Option<String> {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    if subnet_ids.is_empty() {
+        return None;
+    }
+    let answer = callback_client!(
+        aws_sdk_ec2,
+        ctx,
+        format!("https://ec2.{region}.amazonaws.com"),
+        region
+    )
+    .describe_subnets()
+    .set_subnet_ids(Some(subnet_ids.to_vec()))
+    .send()
+    .await;
+    // Every requested id resolved: EC2 reports the subnets rather than refusing.
+    let error = answer.err()?;
+    let code = error
+        .as_service_error()
+        .and_then(ProvideErrorMetadata::code)
+        .unwrap_or_default()
+        .to_string();
+    if code != EC2_INVALID_SUBNET_ID_NOT_FOUND {
+        ::tracing::warn!(
+            error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            "the requested subnets could not be resolved against EC2"
+        );
+        return None;
+    }
+    let status = error
+        .raw_response()
+        .map(|response| format!("Status Code: {}; ", response.status().as_u16()))
+        .unwrap_or_default();
+    let detail = error
+        .as_service_error()
+        .and_then(ProvideErrorMetadata::message)
+        // EC2 names the offending id in its message; with no message to carry,
+        // the ids the request named are what is reported instead, so the caller
+        // is still told which list did not resolve.
+        .map_or_else(
+            || format!("One of the subnet IDs {subnet_ids:?} does not exist"),
+            str::to_string,
+        );
+    Some(format!(
+        "{detail} (Service: AmazonEC2; {status}Error Code: {code})"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pass-role rule over the ARN forms it generalises over: which account and
+    /// partition the role belongs to, what the IAM ARN names, the role's path, and the
+    /// forms that are not IAM ARNs at all. The rows differ along exactly those axes.
+    ///
+    /// Every failure is ONE answer — the role may not be passed — and the message says
+    /// which: the fixed cross-account sentence for a value that names no role of this
+    /// account (the recorded service answers it even for a value that is not an ARN), or
+    /// what else was wrong for an in-account IAM ARN.
+    #[test]
+    fn the_pass_role_rule_refuses_every_value_that_is_not_a_role_of_this_account() {
+        let own = ::engine::emulator_account_id();
+        /// What the row's message must be: the fixed sentence, a message naming the
+        /// value, or nothing at all (the role may be passed).
+        #[derive(Debug, PartialEq, Eq)]
+        enum Expected {
+            Passed,
+            CrossAccount,
+            Named,
+        }
+        let rows: Vec<(&str, String, Expected)> = vec![
+            (
+                "a role of this account",
+                format!("arn:aws:iam::{own}:role/eksClusterRole"),
+                Expected::Passed,
+            ),
+            (
+                "a role of this account under a path",
+                format!("arn:aws:iam::{own}:role/service-role/eksClusterRole"),
+                Expected::Passed,
+            ),
+            (
+                "a role of another account",
+                "arn:aws:iam::111122223333:role/eksClusterRole".to_string(),
+                Expected::CrossAccount,
+            ),
+            (
+                "a role of another account under a path",
+                "arn:aws:iam::210987654321:role/service-role/anything".to_string(),
+                Expected::CrossAccount,
+            ),
+            (
+                "a role of another partition",
+                format!("arn:aws-cn:iam::{own}:role/eksClusterRole"),
+                Expected::Named,
+            ),
+            (
+                "an IAM user of this account, which no service assumes",
+                format!("arn:aws:iam::{own}:user/operator"),
+                Expected::Named,
+            ),
+            (
+                "an IAM ARN of this account naming no role at all",
+                format!("arn:aws:iam::{own}:role/"),
+                Expected::Named,
+            ),
+            (
+                "another vendor's ARN",
+                format!("arn:aws:eks:us-west-2:{own}:cluster/other"),
+                Expected::CrossAccount,
+            ),
+            (
+                "an IAM ARN carrying a Region, which IAM ARNs do not",
+                format!("arn:aws:iam:us-west-2:{own}:role/eksClusterRole"),
+                Expected::CrossAccount,
+            ),
+            (
+                "an account that is not a 12-digit account id",
+                "arn:aws:iam::12345:role/short-account".to_string(),
+                Expected::CrossAccount,
+            ),
+            (
+                "an ARN that stops before its resource",
+                format!("arn:aws:iam::{own}"),
+                Expected::CrossAccount,
+            ),
+            (
+                "a value that is not an ARN at all",
+                "not-an-arn".to_string(),
+                Expected::CrossAccount,
+            ),
+            ("the empty string", String::new(), Expected::CrossAccount),
+        ];
+
+        for (case, role_arn, expected) in rows {
+            let refusal = pass_role_refusal(&role_arn);
+            let actual = match refusal.as_deref() {
+                None => Expected::Passed,
+                Some(CROSS_ACCOUNT_PASS_ROLE_REFUSAL) => Expected::CrossAccount,
+                Some(_) => Expected::Named,
+            };
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {refusal:?} for {role_arn}"
+            );
+            if actual == Expected::Named {
+                let message = refusal.clone().unwrap_or_default();
+                assert!(
+                    message.contains(&role_arn),
+                    "case {case:?}: a refusal that is not the fixed sentence must name the \
+                     value at fault, got {message:?}"
+                );
+            }
+            // A well-formed IAM ROLE ARN of this account is always passable: the two
+            // readings of that form in this crate cannot disagree.
+            if is_iam_role_arn(&role_arn) && role_arn.contains(&format!(":{own}:")) {
+                assert_eq!(
+                    pass_role_refusal(&role_arn).is_none(),
+                    emulator_partition() == role_arn.split(':').nth(1).unwrap_or_default(),
+                    "case {case:?}: {role_arn} is an IAM role ARN of this account, so only \
+                     its partition may refuse it"
+                );
+            }
+        }
+    }
+
+    /// IAM addresses a role by NAME, so the path is dropped — and a value that is not
+    /// an in-account role ARN names no role to ask IAM about.
+    #[test]
+    fn the_iam_role_name_is_the_last_segment_of_the_resource() {
+        let own = ::engine::emulator_account_id();
+        let rows: Vec<(&str, String, Option<&str>)> = vec![
+            (
+                "the default path",
+                format!("arn:aws:iam::{own}:role/Connector"),
+                Some("Connector"),
+            ),
+            (
+                "a role under a path",
+                format!("arn:aws:iam::{own}:role/service-role/Connector"),
+                Some("Connector"),
+            ),
+            (
+                "a role under a nested path",
+                format!("arn:aws:iam::{own}:role/team/dept/Connector"),
+                Some("Connector"),
+            ),
+            (
+                "a role of another account",
+                "arn:aws:iam::111122223333:role/Connector".to_string(),
+                None,
+            ),
+            ("not an ARN at all", "Connector".to_string(), None),
+        ];
+        for (case, role_arn, expected) in rows {
+            let name = iam_role_name(&role_arn);
+            assert_eq!(
+                name, expected,
+                "case {case:?}: expected {expected:?}, got {name:?} for {role_arn}"
+            );
+        }
+    }
 
     /// The seeded calendar's own invariants: every published date parses, the rows
     /// are ordered and unique, and each row's dates run release -> end of standard

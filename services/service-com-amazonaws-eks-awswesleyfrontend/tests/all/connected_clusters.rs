@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_eks_awswesleyfrontend::ops::types::CONNECTOR_CONFIG_PROVIDER_VALUES;
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    service_state, CONNECTOR_ACTIVATION_WINDOW, LIST_INCLUDE_ALL,
+    service_state, CONNECTOR_ACTIVATION_WINDOW, CONNECTOR_ROLE_ARN_REFUSAL, LIST_INCLUDE_ALL,
 };
 use service_com_amazonaws_eks_awswesleyfrontend::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -267,10 +267,13 @@ async fn a_registered_cluster_reads_back_exactly_as_stored() {
 }
 
 // ---------------------------------------------------------------------------
-// RULE: the connector role must be one the caller can have Amazon EKS assume —
-// a well-formed IAM role ARN of the caller's own partition and account. A value
-// that is not an IAM ARN at all is a bad parameter (400); a well-formed IAM ARN
-// naming something this caller cannot pass is a permission failure (403).
+// RULE: the connector role must name a role of the caller's own partition and
+// account. Every value that is not one — a role of another account, an IAM ARN
+// naming something other than a role, a value that is not an ARN at all — is
+// refused with HTTP 400 `InvalidParameterException` and the one sentence that
+// rule carries, which is what the recorded service answers for this member.
+// (`CreateCluster$roleArn` is recorded answering the SAME question with its
+// pass-role 403 instead — see `crate::pass_role_authorization`.)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -290,32 +293,32 @@ async fn the_connector_role_must_be_a_role_this_caller_can_pass() {
         (
             "an IAM role in another account",
             "arn:aws:iam::210987654321:role/connector",
-            403,
-            Some("AccessDeniedException"),
+            400,
+            Some("InvalidParameterException"),
         ),
         (
             "an IAM role in another partition",
             "arn:aws-cn:iam::000000000000:role/connector",
-            403,
-            Some("AccessDeniedException"),
+            400,
+            Some("InvalidParameterException"),
         ),
         (
             "an IAM user, which no service assumes",
             "arn:aws:iam::000000000000:user/operator",
-            403,
-            Some("AccessDeniedException"),
+            400,
+            Some("InvalidParameterException"),
         ),
         (
             "an IAM instance profile, which no service assumes",
             "arn:aws:iam::000000000000:instance-profile/nodes",
-            403,
-            Some("AccessDeniedException"),
+            400,
+            Some("InvalidParameterException"),
         ),
         (
             "an IAM ARN naming no role at all",
             "arn:aws:iam::000000000000:role/",
-            403,
-            Some("AccessDeniedException"),
+            400,
+            Some("InvalidParameterException"),
         ),
         (
             "another vendor's ARN",
@@ -332,6 +335,12 @@ async fn the_connector_role_must_be_a_role_this_caller_can_pass() {
         (
             "a bare role name",
             "AmazonEKSConnectorRole",
+            400,
+            Some("InvalidParameterException"),
+        ),
+        (
+            "a value that is not an ARN at all",
+            "not-an-arn",
             400,
             Some("InvalidParameterException"),
         ),
@@ -355,6 +364,20 @@ async fn the_connector_role_must_be_a_role_this_caller_can_pass() {
             *expected_code,
             "case {case:?}: expected error {expected_code:?}, got {answer:?}"
         );
+        if *expected_status != 200 {
+            // One sentence for the whole class, as the recording carries it.
+            assert_eq!(
+                answer.body["message"].as_str(),
+                Some(CONNECTOR_ROLE_ARN_REFUSAL),
+                "case {case:?}: expected the connector-role refusal, got {answer:?}"
+            );
+            assert_eq!(
+                answer.body["clusterName"].as_str(),
+                Some(name.as_str()),
+                "case {case:?}: the refusal must name the cluster the request asked for, \
+                 got {answer:?}"
+            );
+        }
 
         // A refused registration stored nothing; an accepted one is there.
         let described = describe(&router, &name).await;

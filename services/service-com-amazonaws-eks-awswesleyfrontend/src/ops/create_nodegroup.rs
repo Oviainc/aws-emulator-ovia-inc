@@ -174,6 +174,9 @@
 //! * `ServerException` (HTTP 500) — These errors are usually caused by a server-side issue.
 //! * `ServiceUnavailableException` (HTTP 503) — The service is unavailable. Back off and
 //!   retry the operation.
+//! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below): the
+//!   model's `errors` list for this operation omits it, but the SERVICE models it and it is
+//!   what a pass-role this caller may not perform is refused with.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -198,9 +201,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `CreateNodegroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#CreateNodegroup")]
+// `AccessDeniedException` — a shape this SERVICE models, and other operations declare,
+// which this one does not list — is widened in through `extra_errors`: `nodeRole` is a role
+// Amazon EKS passes to the node group's instances, so a role the caller may not pass is a
+// PERMISSION failure (403) rather than a bad parameter, exactly as it is on `CreateCluster`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#CreateNodegroup",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum CreateNodegroupErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     InvalidRequestException(InvalidRequestException),
@@ -295,6 +306,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = state::request_region(ctx.parts());
         let now = SystemTime::now();
+
+        // AUTHORIZATION FIRST, before the store is consulted and before anything is
+        // written: `nodeRole` is "the IAM role to associate with your node group", a role
+        // Amazon EKS passes to the nodes it launches, so the same pass-role rule
+        // `CreateCluster` applies to its own roles decides whether this caller may hand
+        // it over ([`state::pass_role_refusal`]).
+        if let Some(why) = state::pass_role_refusal(&input.node_role) {
+            return Err(CreateNodegroupErrorModeled::AccessDeniedException(
+                AccessDeniedException { message: Some(why) },
+            )
+            .into());
+        }
+
+        // The node group's Auto Scaling group launches its nodes into the subnets the
+        // request names, so those subnets have to exist — resolved against EC2, which
+        // owns them, exactly as `CreateCluster` resolves its own
+        // ([`state::unresolved_subnet_refusal`]). It runs with no lock held: it is a call
+        // out to another service.
+        if let Some(why) = state::unresolved_subnet_refusal(ctx, &region, &input.subnets).await {
+            return Err(invalid_parameter(
+                &input.cluster_name,
+                &input.nodegroup_name,
+                why,
+            ));
+        }
+
         let mut guard = store.lock();
         guard.materialize_due_transitions(now);
 

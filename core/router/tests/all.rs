@@ -126,3 +126,5 @@ mod lex_models_v2_runtime_v2_cross_service;
 mod wisdom_signing_name_routing;
 #[path = "all/cloudtrail_sdk_target_routing.rs"]
 mod cloudtrail_sdk_target_routing;
+#[path = "all/eks_cluster_inputs_resolve.rs"]
+mod eks_cluster_inputs_resolve;
