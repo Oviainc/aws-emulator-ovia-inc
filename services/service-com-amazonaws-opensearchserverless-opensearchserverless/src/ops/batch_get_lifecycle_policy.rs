@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetLifecyclePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetLifecyclePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetLifecyclePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: answers each `identifiers` entry from the `LifecyclePolicyRecord` stored
+//! in [`crate::state`] under its `(type, name)` pair — as a `LifecyclePolicyDetail` when
+//! one is stored, and as the modelled `NOT_FOUND` `LifecyclePolicyErrorDetail` when none
+//! is. A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +138,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetLifecyclePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetLifecyclePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetLifecyclePolicy"))
+        use crate::state::AuditOutcome;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::StoreUnreachable, None);
+            return Err(
+                BatchGetLifecyclePolicyErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `LifecyclePolicyType` is an enum the boundary validator does not narrow; a value
+        // outside the model's list names no policy type at all, so the whole request is
+        // refused rather than answered with a `NOT_FOUND` for a type that cannot exist.
+        if let Some(identifier) = input
+            .identifiers
+            .iter()
+            .find(|identifier| !LIFECYCLE_POLICY_TYPE_VALUES.contains(&identifier.r#type.as_str()))
+        {
+            let resource = crate::state::audit_lifecycle_policy_resource(
+                &identifier.r#type,
+                &identifier.name,
+            );
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::ValidationRefused,
+                Some(&resource),
+            );
+            return Err(BatchGetLifecyclePolicyErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "type must be one of [{}], got {:?}",
+                        LIFECYCLE_POLICY_TYPE_VALUES.join(", "),
+                        identifier.r#type
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let store = state.lock();
+
+        // Each requested identifier is answered in request order, either as the detail of
+        // the stored record or as the `NOT_FOUND` error detail the model documents, so a
+        // request mixing stored and unknown identifiers is a partial success.
+        let mut details: Vec<LifecyclePolicyDetail> = Vec::new();
+        let mut errors: Vec<LifecyclePolicyErrorDetail> = Vec::new();
+        for identifier in &input.identifiers {
+            let key = (identifier.r#type.clone(), identifier.name.clone());
+            match store.lifecycle_policies.get(&key) {
+                Some(record) => details.push(record.detail()),
+                None => errors.push(crate::state::lifecycle_policy_error_for(
+                    &identifier.r#type,
+                    &identifier.name,
+                )),
+            }
+        }
+        drop(store);
+
+        crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyRead, None);
+        Ok(BatchGetLifecyclePolicyOutput {
+            lifecycle_policy_details: Some(details),
+            lifecycle_policy_error_details: Some(errors),
+        })
     }
 }
