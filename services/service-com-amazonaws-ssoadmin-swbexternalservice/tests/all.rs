@@ -21,10 +21,16 @@ mod application_provider_describe;
 mod application_providers;
 #[path = "all/instance_create.rs"]
 mod instance_create;
+#[path = "all/instance_delete.rs"]
+mod instance_delete;
 #[path = "all/instance_describe.rs"]
 mod instance_describe;
+#[path = "all/instance_regions.rs"]
+mod instance_regions;
 #[path = "all/instance_update.rs"]
 mod instance_update;
+#[path = "all/list_instances_pagination.rs"]
+mod list_instances_pagination;
 #[path = "all/ssoadmin_permission_sets.rs"]
 mod ssoadmin_permission_sets;
 #[path = "all/state_roundtrip.rs"]
