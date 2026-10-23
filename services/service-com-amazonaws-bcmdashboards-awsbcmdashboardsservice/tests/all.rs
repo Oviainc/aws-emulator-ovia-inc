@@ -19,5 +19,7 @@ mod dashboard_lifecycle;
 mod resource_tags;
 #[path = "all/scheduled_report_lifecycle.rs"]
 mod scheduled_report_lifecycle;
+#[path = "all/scheduled_report_listing.rs"]
+mod scheduled_report_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -37,6 +37,10 @@ pub(crate) fn authorization(region: &str) -> String {
 /// it. Authentication is off so a test needs no signing key. The engine is handed back
 /// as well, so a case can read the persisted record for the members no implemented
 /// operation reports yet (the event buffer `PutRumEvents` appends to).
+///
+/// The CloudWatch Logs service is mounted beside RUM because a request that turns
+/// `CwLogEnabled` on provisions the vended log group by calling it in process, exactly as
+/// the assembled emulator does (`core/router`'s `build_router` registers every service).
 pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -44,6 +48,11 @@ pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     router.register_service(service_com_amazonaws_rum_rum::EmulatedService::new(
         Arc::clone(&engine),
     ));
+    router.register_service(
+        service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
     (router, engine)
 }
 

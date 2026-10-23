@@ -2,6 +2,13 @@
 
 //! @op PutRumEvents
 //!
+//! Appends a batch of telemetry to the app monitor the route names, AFTER evaluating
+//! whether the calling principal is allowed `rum:PutRumEvents` on that monitor: the
+//! decision is made on every call from the caller's identity-based policies and the
+//! monitor's own resource policy ([`crate::state::authorization`]), so an unauthorized
+//! write is refused with the modelled `AccessDeniedException` (HTTP 403) rather than
+//! accepted.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -146,9 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The data plane takes no request metadata beyond the signature the emulator
-        // has already verified.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutRumEventsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -159,10 +163,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let mut store = state.lock();
         // The route names the monitor by its MINTED id, so the batch is resolved through
         // the stored id index — an id no stored monitor holds (never created, or already
-        // deleted) is not found.
+        // deleted) is not found. Resolved under a SHORT read lock, because what comes
+        // next is the authorization decision, which reads the IAM and STS stores and
+        // needs no lock of this service's.
+        let (resource_arn, resource_policy) = {
+            let store = state.lock();
+            let Some(record) = store.app_monitor_by_id(&input.id) else {
+                return Err(PutRumEventsErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.id),
+                )
+                .into());
+            };
+            (record.arn.clone(), record.resource_policy_document())
+        };
+
+        // Who is calling, and may they write into THIS app monitor? Evaluated on every
+        // call, against the identity-based policies the caller holds now and the app
+        // monitor's resource policy as it stands now — so a grant that was just put
+        // works and one that was just deleted does not.
+        //
+        // `Alias` is the one condition key this operation publishes: "This alias will be
+        // compared to the rum:alias context key in the resource-based policy"
+        // (`PutRumEventsRequest$Alias`).
+        let context: Vec<(String, String)> = input
+            .alias
+            .iter()
+            .map(|alias| {
+                (
+                    crate::state::authorization::ALIAS_CONDITION_KEY.to_string(),
+                    alias.clone(),
+                )
+            })
+            .collect();
+        if let Err(denial) = crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::PUT_RUM_EVENTS,
+            &resource_arn,
+            resource_policy.as_deref(),
+            &context,
+        ) {
+            return Err(PutRumEventsErrorModeled::AccessDeniedException(
+                crate::state::access_denied(&denial),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // The monitor is resolved again under the write lock: the decision above held no
+        // lock, so a concurrent `DeleteAppMonitor` may have removed it in between.
         let Some(record) = store.app_monitor_by_id_mut(&input.id) else {
             return Err(PutRumEventsErrorModeled::ResourceNotFoundException(
                 crate::state::app_monitor_not_found(&input.id),
