@@ -33,6 +33,8 @@ mod execute_api_data_plane;
 mod flush_stage_cache;
 #[path = "all/gateway_response.rs"]
 mod gateway_response;
+#[path = "all/gateway_response_collection.rs"]
+mod gateway_response_collection;
 #[path = "all/integration_response.rs"]
 mod integration_response;
 #[path = "all/method_integration.rs"]

@@ -22,8 +22,9 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::ops::types::GATEWA
 
 use crate::rest_api_lifecycle::{assert_failure, create_api, Answer, Gateway};
 
-/// `PutGatewayResponse` for `response_type` on `api`.
-async fn put_gateway_response(
+/// `PutGatewayResponse` for `response_type` on `api`. Shared with the sibling
+/// `gateway_response_collection` suite, which customizes types before listing them.
+pub(crate) async fn put_gateway_response(
     gateway: &Gateway,
     api: &str,
     response_type: &str,
@@ -38,8 +39,13 @@ async fn put_gateway_response(
         .await
 }
 
-/// `GetGatewayResponse` for `response_type` on `api`.
-async fn get_gateway_response(gateway: &Gateway, api: &str, response_type: &str) -> Answer {
+/// `GetGatewayResponse` for `response_type` on `api`. Shared with the sibling
+/// `gateway_response_collection` suite, which compares a single read with the listing.
+pub(crate) async fn get_gateway_response(
+    gateway: &Gateway,
+    api: &str,
+    response_type: &str,
+) -> Answer {
     gateway
         .call(
             "GET",
@@ -58,7 +64,12 @@ async fn get_gateway_response(gateway: &Gateway, api: &str, response_type: &str)
 /// type's values only (`smithy_query(query="shape",
 /// shape="com.amazonaws.apigateway#GatewayResponseType")`). Written out here rather than
 /// read from the service, so the test checks the catalog instead of restating it.
-const GENERATED_STATUS_CODES: &[(&str, Option<&str>)] = &[
+///
+/// Deliberately independent of the service's own catalog
+/// (`DEFAULT_GATEWAY_STATUS_CODES` in `src/state.rs`, read through
+/// `crate::state::default_gateway_status_code`): the two are written from the same
+/// published table, so a change to one that the Developer Guide does not back fails here.
+pub(crate) const GENERATED_STATUS_CODES: &[(&str, Option<&str>)] = &[
     ("ACCESS_DENIED", Some("403")),
     ("API_CONFIGURATION_ERROR", Some("500")),
     ("AUTHORIZER_CONFIGURATION_ERROR", Some("500")),
@@ -83,7 +94,7 @@ const GENERATED_STATUS_CODES: &[(&str, Option<&str>)] = &[
 ];
 
 /// The generated status code of `response_type`, from [`GENERATED_STATUS_CODES`].
-fn generated_status_code(response_type: &str) -> Option<&'static str> {
+pub(crate) fn generated_status_code(response_type: &str) -> Option<&'static str> {
     GENERATED_STATUS_CODES
         .iter()
         .find(|(kind, _)| *kind == response_type)

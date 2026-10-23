@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGatewayResponses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGatewayResponses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGatewayResponses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the WHOLE gateway response collection of one API. Every modelled
+//! `GatewayResponseType` has a gateway response from the moment the API is created, so the
+//! collection is, per type, the customization `PutGatewayResponse` stored for it
+//! (`RestApiEntry::gateway_responses`) or, while it carries none, the response API Gateway
+//! generates for it ([`crate::state::default_gateway_response`], `defaultResponse: true`)
+//! — the same rule `GetGatewayResponse` reads one type through, so a listing and a single
+//! read cannot disagree. A read only.
 //!
 //! ## Shape of an operation
 //!
@@ -158,16 +156,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGatewayResponses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGatewayResponsesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGatewayResponses"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let store = state.lock();
+        let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+            GetGatewayResponsesErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+
+        // One entry per modelled response type, in the catalog's order: the API's
+        // customization of that type where a developer has put one, and otherwise the
+        // gateway response API Gateway generates for it. `GATEWAY_RESPONSE_TYPE_VALUES` is
+        // the modelled `GatewayResponseType` enum's own value list, so the collection
+        // covers exactly the supported response types and no hand-kept second list can
+        // drift from it.
+        let items = GATEWAY_RESPONSE_TYPE_VALUES
+            .iter()
+            .map(|response_type| {
+                api.gateway_responses
+                    .get(*response_type)
+                    .cloned()
+                    .unwrap_or_else(|| crate::state::default_gateway_response(response_type))
+            })
+            .collect();
+
+        // "The GatewayResponses collection does not support pagination and the limit does
+        // not apply here" (this operation's `limit` and `position` docs): the entire
+        // collection is returned whatever the caller asked for, and there is no cursor to
+        // hand back.
+        Ok(GetGatewayResponsesOutput {
+            items: Some(items),
+            position: None,
+        })
     }
 }

@@ -82,7 +82,7 @@ pub struct RestApiEntry {
     pub deployments: BTreeMap<String, DeploymentEntry>,
     /// The gateway responses a developer has CUSTOMIZED on this API, keyed by their
     /// `responseType`; written by `PutGatewayResponse` and reported by
-    /// `GetGatewayResponse`.
+    /// `GetGatewayResponse` and `GetGatewayResponses`.
     ///
     /// A type with no entry here is not missing: the API still has a gateway response
     /// for it, the one API Gateway generates itself, which
