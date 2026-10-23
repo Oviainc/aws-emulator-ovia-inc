@@ -25,6 +25,8 @@ use std::sync::Arc;
 use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::job_lifecycle::error_code;
+
 /// A SigV4 `Authorization` naming this service's signing name (`batch`) — how
 /// the router picks the service — and the region in its credential scope, which
 /// is the region every ARN the service mints carries.
@@ -82,16 +84,6 @@ async fn register(router: &MultiServiceRouter, body: &str) -> (u16, Value) {
 
 async fn describe(router: &MultiServiceRouter, body: &str) -> (u16, Value) {
     call(router, "/v1/describejobdefinitions", body).await
-}
-
-/// The wire error code of an error response, with any namespace prefix dropped
-/// the way an SDK client drops it.
-fn error_code(body: &Value) -> String {
-    let raw = body
-        .get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or("<none>");
-    raw.rsplit(['#', '/']).next().unwrap_or(raw).to_string()
 }
 
 /// The `message` of an error response.

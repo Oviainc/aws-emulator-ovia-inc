@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutWebhook
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutWebhook`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutWebhook::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Defines a webhook on the target pipeline: stores the caller's `WebhookDefinition`
+//! under its name, mints the webhook's trigger URL and ARN on first definition, and
+//! answers with the stored webhook (secret token redacted) — so a later
+//! `ListWebhooks` reports the same definition, URL and ARN. Defining a webhook whose
+//! name already exists REPLACES its definition in place, keeping the URL and the ARN
+//! the first definition minted.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +170,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutWebhook` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutWebhookErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutWebhook"))
+        let state = crate::state::require_state(&*self.engine)?;
+
+        // What the REQUEST says, refused before anything is looked up or stored: a
+        // defect in the definition itself does not depend on what the store holds.
+        if let Err(problem) = crate::state::validate_webhook_definition(&input.webhook) {
+            let message = Some(problem.message().to_string());
+            return Err(match problem {
+                crate::state::WebhookProblem::FilterPattern(_) => {
+                    PutWebhookErrorModeled::InvalidWebhookFilterPatternException(
+                        InvalidWebhookFilterPatternException { message },
+                    )
+                }
+                crate::state::WebhookProblem::Authentication(_) => {
+                    PutWebhookErrorModeled::InvalidWebhookAuthenticationParametersException(
+                        InvalidWebhookAuthenticationParametersException { message },
+                    )
+                }
+            }
+            .into());
+        }
+        if let Some(tags) = input.tags.as_deref() {
+            if let Err(problem) = crate::state::validate_tags(tags) {
+                let message = Some(problem.message().to_string());
+                return Err(match problem {
+                    crate::state::TagProblem::Invalid(_) => {
+                        PutWebhookErrorModeled::InvalidTagsException(InvalidTagsException {
+                            message,
+                        })
+                    }
+                    crate::state::TagProblem::TooMany(_) => {
+                        PutWebhookErrorModeled::TooManyTagsException(TooManyTagsException {
+                            message,
+                        })
+                    }
+                }
+                .into());
+            }
+        }
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let name = input.webhook.name.clone();
+        let mut state = state.lock();
+
+        // A webhook starts the pipeline named by `targetPipeline`, so that pipeline
+        // has to exist — the condition `PipelineNotFoundException` states ("The
+        // pipeline was specified in an invalid format or cannot be found").
+        if !state.pipelines.contains_key(&input.webhook.target_pipeline) {
+            return Err(PutWebhookErrorModeled::PipelineNotFoundException(
+                PipelineNotFoundException {
+                    message: Some(format!(
+                        "pipeline {} was not found",
+                        input.webhook.target_pipeline
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let webhook = match state.webhooks.get(&name).cloned() {
+            // Defining a webhook whose name already exists replaces its definition.
+            // The URL and the ARN were minted once and already identify this webhook
+            // to whoever holds them, so they are kept; the tags are left as they are
+            // unless this request states a set.
+            //
+            // The definition is stored exactly as sent, including
+            // `authenticationConfiguration.SecretToken`: the service cannot tell a
+            // caller who re-sent the redaction placeholder it reported from one whose
+            // real secret happens to be that string, so a caller redefining a webhook
+            // sends the secret again, as it does against AWS.
+            Some(mut stored) => {
+                stored.definition = input.webhook;
+                if let Some(tags) = input.tags {
+                    stored.tags = tags;
+                }
+                stored
+            }
+            None => {
+                // The store is bounded: past the account's webhook limit the service
+                // refuses another one with the error the model declares for it.
+                if state.webhooks.len() >= crate::state::MAX_WEBHOOKS_PER_ACCOUNT {
+                    return Err(PutWebhookErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(format!(
+                                "the number of webhooks for this account has reached \
+                                 the limit of {}",
+                                crate::state::MAX_WEBHOOKS_PER_ACCOUNT
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::Webhook::create(
+                    input.webhook,
+                    state.new_webhook_url(&region),
+                    ::engine::emulator_arn(
+                        crate::state::ARN_SERVICE,
+                        &region,
+                        &format!("webhook:{name}"),
+                    ),
+                    input.tags.unwrap_or_default(),
+                )
+            }
+        };
+
+        let item = webhook.to_item();
+        state.webhooks.insert(name, webhook);
+
+        Ok(PutWebhookOutput {
+            webhook: Some(item),
+        })
     }
 }

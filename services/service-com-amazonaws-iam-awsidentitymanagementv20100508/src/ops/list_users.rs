@@ -217,7 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 is_truncated = true;
                 break;
             }
-            users.push(user.clone());
+            // A resource-listing operation reports a SUBSET of a user's attributes:
+            // `PermissionsBoundary` and `Tags` are withheld here and reported by
+            // `GetUser` (`crate::state::listed_user`).
+            users.push(crate::state::listed_user(user));
             last_key = Some(key.clone());
         }
 

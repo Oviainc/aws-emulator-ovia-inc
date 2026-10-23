@@ -11,7 +11,20 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatchlogs-logs-20140328.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cloudwatchlogs#ListLogGroupsRequest")]
+// `logGroupNamePattern` is the member whose modelled constraints this OPERATION judges
+// itself. `LogGroupNameRegexPattern`'s `@pattern` decomposes the value into up to five
+// `|`-separated alternatives of 3..24 characters, and the service does NOT apply that
+// 24-character per-alternative maximum: it answers 200 for a pattern naming a log group
+// whose name is longer than that, which is most of them. `skip_validation` drops only
+// this member's constraint traits, so `crate::state::check_log_group_name_pattern` can
+// apply the rest of them (the `@length(min: 3, max: 129)` on the whole value, the
+// documented five-pattern ceiling, the per-alternative minimum and the character class)
+// and refuse with this operation's own modelled `InvalidParameterException`; every other
+// member of this shape is still validated at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.cloudwatchlogs#ListLogGroupsRequest",
+    skip_validation = ["logGroupNamePattern"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListLogGroupsInput {
     pub log_group_name_pattern: Option<String>,

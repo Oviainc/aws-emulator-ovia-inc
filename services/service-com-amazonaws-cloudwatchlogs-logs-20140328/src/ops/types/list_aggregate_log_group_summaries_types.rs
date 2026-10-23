@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatchlogs-logs-20140328.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cloudwatchlogs#ListAggregateLogGroupSummariesRequest")]
+// `logGroupNamePattern` carries `skip_validation` for the reason given on
+// `ListLogGroupsInput`: the two operations share `LogGroupNameRegexPattern`, whose
+// `@pattern` caps each `|`-separated alternative at 24 characters, and the service
+// accepts a longer one. `crate::state::check_log_group_name_pattern` applies the rest of
+// the member's constraints inside the handler; every other member of this shape is still
+// validated at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.cloudwatchlogs#ListAggregateLogGroupSummariesRequest",
+    skip_validation = ["logGroupNamePattern"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListAggregateLogGroupSummariesInput {
     pub account_identifiers: Option<Vec<String>>,

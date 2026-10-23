@@ -15,6 +15,8 @@
 mod account_gate_and_not_found;
 #[path = "all/builtin_readiness_rules.rs"]
 mod builtin_readiness_rules;
+#[path = "all/cell_lifecycle.rs"]
+mod cell_lifecycle;
 #[path = "all/cross_account_authorizations.rs"]
 mod cross_account_authorizations;
 #[path = "all/readiness_check_lifecycle.rs"]

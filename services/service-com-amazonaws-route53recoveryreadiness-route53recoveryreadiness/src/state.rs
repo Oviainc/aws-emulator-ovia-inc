@@ -3,14 +3,16 @@
 //! Engine state for the com-amazonaws-route53recoveryreadiness-route53recoveryreadiness service.
 //!
 //! Besides the state struct this module holds the few helpers the resource-set,
-//! readiness-check and recovery-group handlers share — ARN construction, name
-//! validation, the record-to-modelled-shape conversions and the list cursor codec — so
-//! the operation files agree on one implementation of each instead of carrying a copy
-//! apiece that can drift apart.
+//! readiness-check, cell and recovery-group handlers share — ARN construction, name
+//! validation, the record-to-modelled-shape conversions, the derived cell parent scopes
+//! and the list cursor codec — so the operation files agree on one implementation of
+//! each instead of carrying a copy apiece that can drift apart.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::ops::types::{ReadinessCheckOutput, RecoveryGroupOutput, Resource, ResourceSetOutput};
+use crate::ops::types::{
+    CellOutput, ReadinessCheckOutput, RecoveryGroupOutput, Resource, ResourceSetOutput,
+};
 
 /// The `arnNamespace` this service's ARNs carry, from the model's `aws.api#service`
 /// trait (`smithy_query(query="service_info")`: `arnNamespace:
@@ -305,6 +307,20 @@ impl CellRecord {
     pub fn modeled_tags(&self) -> Option<HashMap<String, String>> {
         modeled_tags(&self.tags)
     }
+
+    /// This record as a `ListCells` entry. `parent_readiness_scopes` is the list
+    /// [`ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState::parent_readiness_scopes`]
+    /// derives for this cell's ARN: it comes from the OTHER stored records, never from
+    /// this one.
+    pub fn to_cell_output(&self, parent_readiness_scopes: Vec<String>) -> CellOutput {
+        CellOutput {
+            cell_arn: self.arn.clone(),
+            cell_name: self.name.clone(),
+            cells: self.nested_cell_arns.clone(),
+            parent_readiness_scopes,
+            tags: self.modeled_tags(),
+        }
+    }
 }
 
 impl RecoveryGroupRecord {
@@ -339,7 +355,8 @@ fn modeled_tags(tags: &BTreeMap<String, String>) -> Option<HashMap<String, Strin
 ///
 /// GROWTH IS BOUNDED. Each store holds at most [`MAX_RECORDS_PER_STORE`] records, each
 /// record at most [`MAX_RESOURCES_PER_SET`] resources ([`MAX_READINESS_SCOPES_PER_RESOURCE`]
-/// scopes each) and [`MAX_TAGS_PER_RESOURCE`] tags, and each list response at most
+/// scopes each) or [`MAX_NESTED_CELLS_PER_CELL`] nested cells, and [`MAX_TAGS_PER_RESOURCE`]
+/// tags, and each list response at most
 /// [`MAX_RESULTS_MAX`] records — [`DEFAULT_MAX_RESULTS`] when the caller names no page
 /// size — so both the retained state and the largest response are a finite product of
 /// those ceilings rather than something a caller chooses. The size of the individual
