@@ -15,7 +15,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{
-    create_in as create_group_in, member, percent_encoded, reported_tags, timestamp, GROUPS,
+    create_in as create_group_in, epoch_seconds, get_in as get_group_in, member, percent_encoded,
+    reported_tags, timestamp, GROUPS,
 };
 use crate::wire::{call_in_region, error_code, medialive, ACCOUNT, DEFAULT_REGION};
 
@@ -876,6 +877,151 @@ async fn an_alarm_template_group_delete_is_refused_while_it_still_holds_template
             assert_eq!(
                 status, 200,
                 "case {case:?}: expected member {id} to survive, got {status}: {read}"
+            );
+        }
+    }
+}
+
+/// Rule: every create mints the template its OWN identity — an id no other
+/// template of the store carries, in the bare (caller-created) form of
+/// `__stringMin7Max11PatternAws097` rather than the `aws-` form the model
+/// reserves for AWS-provided templates, plus an ARN built from the signed region
+/// and that id — files it under the id of the group its `GroupIdentifier`
+/// resolves to, and writes NOTHING else: every template the store already holds
+/// still reads back exactly as its own create reported it, in creation order by
+/// `CreatedAt`, and so does every group, none of whose members this request
+/// carries.
+///
+/// The rows differ along how many templates one sequence creates, along how those
+/// templates are spread over groups (one group, two, one each), and along the
+/// region signed for, because that is what the rule generalises over: the
+/// recorded case — a single create into a single group — is one row of it.
+#[tokio::test]
+async fn each_create_mints_its_own_identity_and_leaves_what_is_stored_untouched() {
+    // (case, region, the groups the sequence creates templates in, how many templates)
+    let rows: [(&str, &str, &[&str], usize); 5] = [
+        ("one template, one group", DEFAULT_REGION, &["solo"], 1),
+        ("two templates, one group", DEFAULT_REGION, &["shared"], 2),
+        (
+            "five templates alternating over two groups",
+            DEFAULT_REGION,
+            &["left", "right"],
+            5,
+        ),
+        ("five templates in another region", "eu-central-1", &["eu"], 5),
+        (
+            "one template in each of three groups",
+            "ap-southeast-2",
+            &["a", "b", "c"],
+            3,
+        ),
+    ];
+
+    for (case, region, group_names, count) in rows {
+        let router = medialive();
+
+        // The parent groups, and what each reads back as BEFORE it holds anything.
+        let mut group_ids: Vec<String> = Vec::new();
+        let mut groups_before: Vec<Value> = Vec::new();
+        for name in group_names {
+            let group = create_group(&router, region, name).await;
+            group_ids.push(group["id"].as_str().unwrap_or_default().to_string());
+            groups_before.push(group);
+        }
+
+        let mut created: Vec<Value> = Vec::new();
+        for index in 0..count {
+            let group_index = index % group_names.len();
+            let mut request = request_with(&format!("alarm-{index}"), &json!({}));
+            request["groupIdentifier"] = json!(group_names[group_index]);
+
+            let (status, template) = create(&router, region, request).await;
+            assert_eq!(
+                status, 201,
+                "case {case:?}: expected template {index} to be created, got {status}: {template}"
+            );
+
+            let id = template["id"].as_str().unwrap_or_default().to_string();
+            assert!(
+                (7..=11).contains(&id.len()) && id.chars().all(|c| c.is_ascii_digit()),
+                "case {case:?}: expected template {index}'s id in the caller-created form of __stringMin7Max11PatternAws097, got {:?}",
+                template["id"]
+            );
+            assert_eq!(
+                template["arn"],
+                json!(format!(
+                    "arn:aws:medialive:{region}:{ACCOUNT}:cloudwatch-alarm-template:{id}"
+                )),
+                "case {case:?}: expected template {index}'s ARN built from the signed region and its minted id, got {:?}",
+                template["arn"]
+            );
+            assert_eq!(
+                template["groupId"],
+                json!(group_ids[group_index]),
+                "case {case:?}: expected template {index} filed under the group {:?} names, got {:?}",
+                group_names[group_index],
+                template["groupId"]
+            );
+
+            for (earlier_index, earlier) in created.iter().enumerate() {
+                assert_ne!(
+                    earlier["id"], template["id"],
+                    "case {case:?}: expected template {index} to get an id of its own, got template {earlier_index}'s {:?}",
+                    template["id"]
+                );
+                assert_ne!(
+                    earlier["arn"], template["arn"],
+                    "case {case:?}: expected template {index} to get an ARN of its own, got template {earlier_index}'s {:?}",
+                    template["arn"]
+                );
+                let before = epoch_seconds(timestamp(case, "createdAt", earlier));
+                let after = epoch_seconds(timestamp(case, "createdAt", &template));
+                assert!(
+                    before <= after,
+                    "case {case:?}: expected createdAt not to run backwards from template {earlier_index} to {index}, got {before} then {after}"
+                );
+            }
+
+            created.push(template);
+        }
+
+        let minted: std::collections::BTreeSet<&str> = created
+            .iter()
+            .map(|template| template["id"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            minted.len(),
+            count,
+            "case {case:?}: expected {count} distinct minted ids, got {minted:?}"
+        );
+
+        // Nothing a later create wrote reached an earlier template: each one
+        // still reads back as the record its own create reported.
+        for (index, template) in created.iter().enumerate() {
+            let id = template["id"].as_str().unwrap_or_default();
+            let (status, read) = get(&router, region, id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected template {index} ({id}) to read back, got {status}: {read}"
+            );
+            assert_eq!(
+                &read, template,
+                "case {case:?}: expected template {index} unchanged by the creates after it, got {read}"
+            );
+        }
+
+        // Nor did it reach a group: a create carries no member of the group it
+        // files the template under, so each group keeps the record its own create
+        // reported.
+        for (index, before) in groups_before.iter().enumerate() {
+            let (status, read) = get_group_in(&router, region, &group_ids[index]).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected group {index} to read back, got {status}: {read}"
+            );
+            assert_eq!(
+                &read, before,
+                "case {case:?}: expected group {index} unchanged by the templates created in it, got {read}"
             );
         }
     }
