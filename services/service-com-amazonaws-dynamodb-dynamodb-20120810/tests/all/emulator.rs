@@ -92,6 +92,15 @@ pub fn index_named(description: &Value, name: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// The `message` a refusal carries, under either of the casings a client reads it by.
+pub fn message(body: &Value) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
+        .to_string()
+}
+
 /// The wire error code of a refusal: the shape name the `__type` field carries, which
 /// is what an SDK client matches an error on.
 pub fn error_code(body: &Value) -> String {

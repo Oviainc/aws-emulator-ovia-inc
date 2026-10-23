@@ -35,13 +35,19 @@ use crate::contact_lifecycle::{error_code, parse, Emulator, ACCOUNT, REGION};
 /// Incident Manager's own `CreateReplicationSet` is deprecated and refuses every call, so
 /// the store is the only place an onboarded account can come from — which is exactly what
 /// the handler reads.
-fn set_replication_set(emulator: &Emulator, replication_set: Option<AccountReplicationSet>) {
+///
+/// `pub(crate)` because the engagement suite gates on the same account precondition and
+/// reads it from the same store.
+pub(crate) fn set_replication_set(
+    emulator: &Emulator,
+    replication_set: Option<AccountReplicationSet>,
+) {
     let state = service_state(&*emulator.engine).expect("the engine holds this service's state");
     state.lock().replication_set = replication_set;
 }
 
 /// An ACTIVE replication set for the account, as Incident Manager would have minted it.
-fn active_replication_set() -> AccountReplicationSet {
+pub(crate) fn active_replication_set() -> AccountReplicationSet {
     AccountReplicationSet {
         arn: format!("arn:aws:ssm-incidents::{ACCOUNT}:replication-set/emulator-set"),
         active: true,
@@ -49,7 +55,7 @@ fn active_replication_set() -> AccountReplicationSet {
 }
 
 /// Open the contact data plane for this emulator's account.
-fn onboard(emulator: &Emulator) {
+pub(crate) fn onboard(emulator: &Emulator) {
     set_replication_set(emulator, Some(active_replication_set()));
 }
 

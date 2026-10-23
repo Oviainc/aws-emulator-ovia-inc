@@ -16,6 +16,12 @@
 //! filter on, so every live scenario is the caller's. An issue that gives the emulator
 //! several accounts adds the scoping here.
 //!
+//! WHICH ACCOUNTS MAY CALL: the whole bill-scenario subject belongs to the account that
+//! pays the bills being modelled, this read as much as the write, so a member account's
+//! request is refused with the modelled `ValidationException` (HTTP 400) carrying
+//! `reason` `invalidRequestFromMember` before anything is read (the store's own
+//! `member_account_refusal`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -91,10 +97,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-bcmpricingcalculator-aw
 // here — hence the `ListBillScenariosError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.bcmpricingcalculator#ListBillScenarios")]
+// `ValidationException` is widened in through `extra_errors`: this SERVICE models it
+// (smithy_query `query="service_info"`: `common_errors`) but this operation does not
+// list it, and it is the modelled answer to a request the caller's account class does
+// not permit — the only one of this operation's errors that carries a `reason`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.bcmpricingcalculator#ListBillScenarios",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum ListBillScenariosErrorModeled {
     DataUnavailableException(DataUnavailableException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -201,6 +215,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut state = store.lock();
+        // The account-class gate, before anything is read: the whole bill-scenario
+        // subject belongs to the account that pays the bills being modelled, the read
+        // of it as much as the write.
+        if let Some(refusal) = state.member_account_refusal(Self::NAME) {
+            return Err(ListBillScenariosErrorModeled::ValidationException(refusal).into());
+        }
         // Materialise the expiry the clock has already made due, so a scenario past its
         // `expiresAt` reads as gone rather than lingering for the life of the process.
         state.purge_expired(crate::state::now_secs());

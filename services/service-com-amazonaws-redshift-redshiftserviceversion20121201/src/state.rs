@@ -599,6 +599,19 @@ pub const STATUS_AVAILABLE: &str = "available";
 /// `ClusterStatus` a `DeleteCluster` response reports.
 pub const STATUS_DELETING: &str = "deleting";
 
+/// `RestoreStatus$Status` while the cluster a `RestoreFromClusterSnapshot`
+/// minted is still being provisioned.
+///
+/// Source: `smithy_query(query="doc", shape="RestoreStatus", member="Status")` —
+/// "Returns starting, restoring, completed, or failed."
+pub const RESTORE_STATUS_RESTORING: &str = "restoring";
+
+/// `RestoreStatus$Status` once the restored cluster is `available`. Applied by
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::settle`] with the
+/// same clock-owed transition that makes the cluster available. See
+/// [`RESTORE_STATUS_RESTORING`] for the published value list.
+pub const RESTORE_STATUS_COMPLETED: &str = "completed";
+
 /// The `SnapshotType` of every snapshot a caller asks for, whether through
 /// `CreateClusterSnapshot` or as a `DeleteCluster` final snapshot.
 ///
@@ -719,6 +732,25 @@ pub struct StoredSnapshot {
     pub snapshot: Snapshot,
     /// When the `creating` -> `available` transition falls due.
     pub available_at: Instant,
+    /// The cluster the snapshot was taken OF, as it stood at that instant —
+    /// which is what `RestoreFromClusterSnapshot` rebuilds a cluster from.
+    ///
+    /// Captured when the snapshot is taken rather than read off the source
+    /// cluster at restore time, because "a snapshot contains a copy of the
+    /// cluster data as of this exact time"
+    /// (`smithy_query(query="doc", shape="Snapshot", member="SnapshotCreateTime")`):
+    /// the source cluster may have been modified, renamed or deleted since, and
+    /// a restore must still rebuild the configuration of that instant. It also
+    /// carries what the `Snapshot` shape models no member for (the admin
+    /// password, the maintenance window, the retention periods), so the restored
+    /// cluster can use "the admin credentials the cluster had at the time the
+    /// snapshot was taken".
+    ///
+    /// `None` for a snapshot record no `CreateClusterSnapshot` / `DeleteCluster`
+    /// final snapshot minted (one seeded straight into the store): a restore
+    /// from it rebuilds from the modelled [`StoredSnapshot::snapshot`] members
+    /// and this service's documented defaults alone.
+    pub source: Option<StoredCluster>,
 }
 
 /// Per-service state for com-amazonaws-redshift-redshiftserviceversion20121201. A handler reaches it through [`service_state`].
@@ -775,6 +807,12 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
                 stored.cluster.cluster_status = Some(STATUS_AVAILABLE.to_string());
                 stored.cluster.cluster_availability_status =
                     Some(availability_status(STATUS_AVAILABLE).to_string());
+                // A cluster a restore created reports that restore's progress,
+                // and the restore is done exactly when the cluster it was
+                // rebuilding is available.
+                if let Some(restore) = stored.cluster.restore_status.as_mut() {
+                    restore.status = Some(RESTORE_STATUS_COMPLETED.to_string());
+                }
             }
         }
         for stored in &mut self.snapshots {
@@ -805,6 +843,29 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.snapshots
             .iter()
             .find(|s| s.snapshot.snapshot_identifier.as_deref() == Some(identifier))
+    }
+
+    /// The stored snapshot an `Identifier`-or-`Arn` pair names, if any.
+    ///
+    /// The identifier is matched case-INSENSITIVELY: `smithy_query(query="doc",
+    /// shape="RestoreFromClusterSnapshotMessage", member="SnapshotIdentifier")`
+    /// — "This parameter isn't case sensitive." The ARN is matched exactly,
+    /// against the `Snapshot$SnapshotArn` the store persists. Naming neither
+    /// names no snapshot.
+    pub fn snapshot_located(
+        &self,
+        identifier: Option<&str>,
+        snapshot_arn: Option<&str>,
+    ) -> Option<&StoredSnapshot> {
+        self.snapshots.iter().find(|s| {
+            identifier.is_some_and(|wanted| {
+                s.snapshot
+                    .snapshot_identifier
+                    .as_deref()
+                    .is_some_and(|stored| stored.eq_ignore_ascii_case(wanted))
+            }) || snapshot_arn
+                .is_some_and(|wanted| s.snapshot.snapshot_arn.as_deref() == Some(wanted))
+        })
     }
 
     /// The stored cluster parameter group with this name, if any.

@@ -175,12 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(held) = store.tags_of_mut(&input.resource_arn) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("{} {} does not exist", parts.kind, parts.id),
-                    resource_id: parts.id.to_string(),
-                    resource_type: parts.kind.to_string(),
-                    context: None,
-                },
+                crate::state::resource_not_found(parts.kind, parts.id),
             )
             .into());
         };

@@ -36,7 +36,7 @@ const MAX_TAGS: usize = 50;
 /// `/tags/{ResourceArn}` binds a NON-greedy `@httpLabel`
 /// (`smithy_query query="operation" operation="TagResource"`), so a client sends the
 /// ARN's `:` and `/` encoded — which is what botocore does.
-fn escape(value: &str) -> String {
+pub(crate) fn escape(value: &str) -> String {
     value
         .bytes()
         .map(|byte| match byte {
@@ -49,13 +49,13 @@ fn escape(value: &str) -> String {
 }
 
 /// The `/tags/{ResourceArn}` URI of `arn`.
-fn tags_uri(arn: &str) -> String {
+pub(crate) fn tags_uri(arn: &str) -> String {
     format!("/tags/{}", escape(arn))
 }
 
 /// The `UntagResource` URI: the keys travel as repeated `tagKeys` query parameters
 /// (`TagKeys` is bound `@httpQuery("tagKeys")`).
-fn untag_uri(arn: &str, keys: &[&str]) -> String {
+pub(crate) fn untag_uri(arn: &str, keys: &[&str]) -> String {
     let query = keys
         .iter()
         .map(|key| format!("tagKeys={}", escape(key)))

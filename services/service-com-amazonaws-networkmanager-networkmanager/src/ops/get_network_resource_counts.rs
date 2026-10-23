@@ -1,22 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetNetworkResourceCounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetNetworkResourceCounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetNetworkResourceCounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `GetNetworkResourceCounts::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! Reports how many network resources of each type one global network holds, counted out
+//! of this service's store and paginated by `MaxResults`/`NextToken`; a `ResourceType`
+//! outside the documented set is refused with the modelled `ValidationException` (400).
+//! A reporting operation: it never writes. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -154,18 +143,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetNetworkResourceCounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetNetworkResourceCountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetNetworkResourceCounts"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetNetworkResourceCountsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+
+        // A `ResourceType` outside the set the member's documentation enumerates
+        // (`crate::state::NETWORK_RESOURCE_TYPES`) names no resource kind this service
+        // counts, so it is refused on the member rather than silently answered with a
+        // zero count. The modelled `ConstrainedString` only bounds the length, so this is
+        // the operation's own check; it reaches `handle` because the schema accepts it.
+        let requested_type = input.resource_type.as_deref();
+        if let Some(resource_type) = requested_type {
+            if !crate::state::is_network_resource_type(resource_type) {
+                return Err(GetNetworkResourceCountsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "ResourceType {resource_type:?} is not one of the supported network resource types: {}",
+                            crate::state::NETWORK_RESOURCE_TYPES.join(", ")
+                        ),
+                        reason: Some("FieldValidationFailed".to_string()),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: "ResourceType".to_string(),
+                            message: "must be a supported network resource type".to_string(),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                GetNetworkResourceCountsErrorModeled::ValidationException(ValidationException {
+                    message: "NextToken is not a token this service issued".to_string(),
+                    reason: Some("FieldValidationFailed".to_string()),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "NextToken".to_string(),
+                        message: "the token could not be parsed".to_string(),
+                    }]),
+                })
+            })?),
+            None => None,
+        };
+
+        let store = state.lock();
+        // The resource the path addresses is checked next. This operation models no
+        // `ResourceNotFoundException` (`smithy_query operation=GetNetworkResourceCounts`
+        // lists only AccessDenied / InternalServer / Throttling / Validation), so an
+        // unknown global network is refused on the `GlobalNetworkId` member with the
+        // modelled 400 — reporting an inventory for a global network the store does not
+        // hold would state a resource tree that does not exist.
+        if !store.global_networks.contains_key(&input.global_network_id) {
+            return Err(GetNetworkResourceCountsErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "GlobalNetworkId {} does not name a global network of this account",
+                        input.global_network_id
+                    ),
+                    reason: Some("FieldValidationFailed".to_string()),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "GlobalNetworkId".to_string(),
+                        message: "must name an existing global network".to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // With a `ResourceType` the answer is that one type's count; without one it is
+        // every supported type, which is what `MaxResults`/`NextToken` page over. Either
+        // way each count comes from the store, so a type this service holds none of
+        // reports the zero it really holds.
+        let types: Vec<&str> = match requested_type {
+            Some(resource_type) => vec![resource_type],
+            None => crate::state::NETWORK_RESOURCE_TYPES.to_vec(),
+        };
+        let entries: Vec<(String, NetworkResourceCount)> = types
+            .into_iter()
+            .map(|resource_type| {
+                (
+                    resource_type.to_string(),
+                    NetworkResourceCount {
+                        resource_type: Some(resource_type.to_string()),
+                        count: Some(
+                            store.network_resource_count(&input.global_network_id, resource_type),
+                        ),
+                    },
+                )
+            })
+            .collect();
+        drop(store);
+
+        let page = crate::state::paginate(entries, after.as_deref(), input.max_results);
+        Ok(GetNetworkResourceCountsOutput {
+            network_resource_counts: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

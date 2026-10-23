@@ -19,6 +19,13 @@
 //! [`crate::state::CLUSTER_ACTIVATION_DELAY`] later; the due instant is stored on the
 //! record and materialised by whichever read first runs after it.
 //!
+//! Nothing is written until the request is AUTHORIZED and its inputs RESOLVE: the role
+//! ARNs it asks Amazon EKS to pass must be roles of this account
+//! ([`crate::state::pass_role_refusal`], 403 `AccessDeniedException`), and the subnets it
+//! names must exist in EC2 ([`crate::state::unresolved_subnet_refusal`], 400
+//! `InvalidParameterException`) — a cluster is never minted against a role the caller
+//! cannot pass or a subnet nothing holds.
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -166,6 +173,9 @@
 //!   cluster subnets is in an Availability Zone that does not support Amazon EKS. The
 //!   exception output specifies the supported Availability Zones for your account, from which
 //!   you can choose subnets for your cluster.
+//! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below): the
+//!   model's `errors` list for this operation omits it, but the SERVICE models it and it is
+//!   what a pass-role this caller may not perform is refused with.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -189,9 +199,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `CreateClusterError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#CreateCluster")]
+//
+// `AccessDeniedException` — a shape this SERVICE models, and other operations
+// (`RegisterCluster` among them) declare, which this one does not list — is widened in
+// through `extra_errors`: Amazon EKS authorizes the `iam:PassRole` of the role a request
+// names before it provisions anything, and a role the caller may not pass is a PERMISSION
+// failure (403), not a bad parameter. The recorded refusal for a cross-account role is
+// exactly this shape and status.
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#CreateCluster",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum CreateClusterErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     ResourceInUseException(ResourceInUseException),
@@ -214,6 +235,30 @@ impl From<CreateClusterErrorModeled> for CreateClusterError {
     fn from(modeled: CreateClusterErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// A 400 `InvalidParameterException` naming the cluster and the constraint the request
+/// broke: "The specified parameter is invalid. Review the available parameters for the API
+/// request."
+fn invalid_parameter(cluster_name: &str, message: String) -> CreateClusterError {
+    CreateClusterErrorModeled::InvalidParameterException(InvalidParameterException {
+        cluster_name: Some(cluster_name.to_string()),
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// A 403 `AccessDeniedException` for a role this caller may not have Amazon EKS assume.
+///
+/// The shape carries `message` only, so the cluster the request named is not reported on
+/// it: an authorization failure is about the PRINCIPAL and the role it tried to pass, and
+/// no cluster was created to name.
+fn access_denied(message: String) -> CreateClusterError {
+    CreateClusterErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(message),
+    })
+    .into()
 }
 
 /// The `CreateCluster` operation.
@@ -262,6 +307,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = state::request_region(ctx.parts());
         let now = SystemTime::now();
+
+        // AUTHORIZATION FIRST, before any of the request's own body is reported on and
+        // before anything is written: a role a request hands to Amazon EKS is passed to
+        // the service with the caller's own `iam:PassRole`, so a value that does not name
+        // a role this caller can pass is refused whatever else the body says. This
+        // emulator serves ONE account, so anything that is not a role of that account —
+        // including a value that is not an ARN at all — earns
+        // `state::CROSS_ACCOUNT_PASS_ROLE_REFUSAL`, which is the refusal the recorded
+        // service answers.
+        for role_arn in [
+            Some(&input.role_arn),
+            input
+                .compute_config
+                .as_ref()
+                .and_then(|compute| compute.node_role_arn.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(why) = state::pass_role_refusal(role_arn) {
+                return Err(access_denied(why));
+            }
+        }
+
+        // Then the request's own body, which needs no store: the two cardinality rules
+        // `resourcesVpcConfig`'s own documentation states. "You must specify at least two
+        // subnets. You can specify up to five security groups." The subnet minimum is
+        // waived for a local cluster on an Outpost, which is created in a single subnet
+        // (`outpostConfig`); neither rule is modelled, so neither is refused before this
+        // handler runs.
+        let subnet_count = input
+            .resources_vpc_config
+            .subnet_ids
+            .as_ref()
+            .map_or(0, Vec::len);
+        if input.outpost_config.is_none() && subnet_count < 2 {
+            return Err(invalid_parameter(
+                &input.name,
+                format!(
+                    "resourcesVpcConfig.subnetIds must specify at least 2 subnets, \
+                     got {subnet_count}"
+                ),
+            ));
+        }
+        let security_group_count = input
+            .resources_vpc_config
+            .security_group_ids
+            .as_ref()
+            .map_or(0, Vec::len);
+        if security_group_count > 5 {
+            return Err(invalid_parameter(
+                &input.name,
+                format!(
+                    "resourcesVpcConfig.securityGroupIds must specify at most 5 \
+                     security groups, got {security_group_count}"
+                ),
+            ));
+        }
+
+        // Amazon EKS "provisions elastic network interfaces in your VPC subnets", so the
+        // subnets the request names have to exist before a control plane is provisioned
+        // in them. They are EC2's resources, so EC2 is what resolves them
+        // ([`state::unresolved_subnet_refusal`]); an id that names no subnet of the
+        // account is reported as the invalid parameter it is, with the cluster name set,
+        // and nothing is written. It runs with no lock held: it is a call out to another
+        // service.
+        if let Some(subnet_ids) = input.resources_vpc_config.subnet_ids.as_deref() {
+            if let Some(why) = state::unresolved_subnet_refusal(ctx, &region, subnet_ids).await {
+                return Err(invalid_parameter(&input.name, why));
+            }
+        }
+
         let mut guard = store.lock();
         guard.materialize_due_transitions(now);
 
@@ -340,48 +457,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(format!(
                         "You have reached the limit of {MAX_STORED_CLUSTERS} clusters for \
                          this account"
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
-        }
-
-        // The two cardinality rules `resourcesVpcConfig`'s own documentation states:
-        // "You must specify at least two subnets. You can specify up to five security
-        // groups." The subnet minimum is waived for a local cluster on an Outpost,
-        // which is created in a single subnet (`outpostConfig`); neither rule is
-        // modelled, so neither is refused before this handler runs.
-        let subnet_count = input
-            .resources_vpc_config
-            .subnet_ids
-            .as_ref()
-            .map_or(0, Vec::len);
-        if input.outpost_config.is_none() && subnet_count < 2 {
-            return Err(CreateClusterErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    cluster_name: Some(input.name.clone()),
-                    message: Some(format!(
-                        "resourcesVpcConfig.subnetIds must specify at least 2 subnets, \
-                         got {subnet_count}"
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
-        }
-        let security_group_count = input
-            .resources_vpc_config
-            .security_group_ids
-            .as_ref()
-            .map_or(0, Vec::len);
-        if security_group_count > 5 {
-            return Err(CreateClusterErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    cluster_name: Some(input.name.clone()),
-                    message: Some(format!(
-                        "resourcesVpcConfig.securityGroupIds must specify at most 5 \
-                         security groups, got {security_group_count}"
                     )),
                     ..Default::default()
                 },

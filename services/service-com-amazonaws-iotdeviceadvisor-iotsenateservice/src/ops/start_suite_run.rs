@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .suite_definition_version
             .clone()
             .unwrap_or_else(|| definition.latest_version.clone());
-        if !definition.versions.contains_key(&version) {
+        if !definition.holds_version(&version) {
             return Err(StartSuiteRunErrorModeled::ValidationException(ValidationException {
                 message: Some(crate::state::not_found_message(
                     "suiteDefinitionVersion",

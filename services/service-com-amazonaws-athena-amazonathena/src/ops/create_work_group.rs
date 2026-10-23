@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers a workgroup under its name in this service's state, with the
+//! engine version resolved, and refuses a name the registry already holds.
 //!
 //! ## Shape of an operation
 //!
@@ -145,20 +138,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkGroup"))
+        // Bound and check the caller-supplied collections FIRST, before any lock is
+        // taken: a request that is going to be refused never walks the registry, and
+        // no other Athena request waits behind the work of measuring it.
+        let tags = input.tags.unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(invalid_request(format!(
+                "Tags carries {} tags, more than the {} tags one resource can hold.",
+                tags.len(),
+                crate::state::MAX_TAGS_PER_RESOURCE
+            )));
+        }
+        // `Tag$Key` is 1 to 128 characters and a tag with no key names nothing to tag.
+        if crate::state::tag_without_key(&tags) {
+            return Err(invalid_request(
+                "Tags contains a tag with no key; every tag must carry a Tag.Key of 1 to \
+                 128 characters."
+                    .to_string(),
+            ));
+        }
+        // `Tag$Key`: "Tag keys are case-sensitive and must be unique per resource."
+        if let Some(key) = crate::state::first_duplicate_tag_key(&tags) {
+            return Err(invalid_request(format!(
+                "Tag keys must be unique per resource, and the key '{key}' appears more \
+                 than once in Tags."
+            )));
+        }
+
+        // Stored as the caller gave it, except for the engine version: that member is
+        // documented read-only on this operation, so it is resolved here rather than
+        // echoed, and every later read reports this one resolution.
+        let mut configuration = input.configuration.unwrap_or_default();
+        configuration.engine_version = Some(crate::state::resolved_engine_version(
+            configuration.engine_version.as_ref(),
+        ));
+        let configuration_bytes = crate::state::open_configuration_bytes(&configuration);
+        if configuration_bytes > crate::state::MAX_WORK_GROUP_CONFIGURATION_BYTES {
+            return Err(invalid_request(format!(
+                "Configuration carries {configuration_bytes} bytes of Spark properties, \
+                 classifications and log types, more than the {} bytes a workgroup \
+                 configuration can hold.",
+                crate::state::MAX_WORK_GROUP_CONFIGURATION_BYTES
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateWorkGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("Athena state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // A workgroup NAMES itself, so a create under a name the registry already holds
+        // would either overwrite a workgroup this call never made or report success for
+        // one it did not create. Refused instead.
+        if store.work_groups.contains_key(&input.name) {
+            return Err(invalid_request(format!(
+                "WorkGroup {} already exists.",
+                input.name
+            )));
+        }
+
+        if store.work_groups.len() >= crate::state::MAX_WORK_GROUPS {
+            return Err(invalid_request(format!(
+                "Cannot create another workgroup: this account already holds the maximum \
+                 of {} workgroups.",
+                crate::state::MAX_WORK_GROUPS
+            )));
+        }
+
+        let record = crate::state::WorkGroupRecord {
+            name: input.name.clone(),
+            // Athena hands back a workgroup queries can already run in, so there is no
+            // transition the clock owes afterwards.
+            state: crate::state::WORK_GROUP_STATE_ENABLED.to_string(),
+            description: input.description,
+            configuration,
+            created_at: ::std::time::SystemTime::now(),
+            tags,
+        };
+        store.work_groups.insert(input.name, record);
+
+        // `CreateWorkGroupOutput` models no members: the created workgroup is read back
+        // through `GetWorkGroup`.
+        Ok(CreateWorkGroupOutput {})
     }
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// Every refusal below is a bad request rather than an unwritten operation, and
+/// `InvalidRequestException` is the client error this operation models: "Indicates that
+/// something is wrong with the input to the request."
+fn invalid_request(message: String) -> CreateWorkGroupError {
+    CreateWorkGroupErrorModeled::InvalidRequestException(InvalidRequestException {
+        athena_error_code: None,
+        message: Some(message),
+    })
+    .into()
 }

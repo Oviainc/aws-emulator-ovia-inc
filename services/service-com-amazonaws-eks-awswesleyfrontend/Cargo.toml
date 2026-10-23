@@ -25,6 +25,20 @@ tracing = { workspace = true }
 # from its ARN, in `src/state.rs`.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The AWS SDK for IAM, driven over the in-process callback
+# (`OperationContext::callback`): `RegisterCluster` and `CreateCapability` verify
+# with `GetRole` that the role they are given exists and lets the service
+# principal that would use it assume it. Only the generated client is needed —
+# the emulator supplies the transport.
+aws-sdk-iam = { version = "1", default-features = false }
+# The AWS SDK for EC2, over the same callback: `CreateCluster` and
+# `CreateNodegroup` resolve the subnets they are given with `DescribeSubnets`
+# before they provision anything, because the account's subnets are EC2's.
+aws-sdk-ec2 = { version = "1", default-features = false }
+# `iam_trust_policy`: the one reading of an IAM trust policy — including the
+# decode of the URL-encoded form IAM reports a document in — shared with every
+# other service that resolves a caller-supplied role.
+service-common = { path = "../common" }
 
 [dev-dependencies]
 # The clock-owed `CREATING` -> `ACTIVE` test waits with `tokio::time::sleep`, so

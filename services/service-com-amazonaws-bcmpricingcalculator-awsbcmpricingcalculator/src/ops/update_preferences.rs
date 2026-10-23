@@ -11,6 +11,14 @@
 //! (`crate::state::Preferences::merge`). That is what makes the operation
 //! `@idempotent`: sending the same request again stores the same record.
 //!
+//! WHICH ACCOUNTS MAY WRITE: the rate-type preferences are the account-level setting the
+//! bills of an organization are quoted with, so writing them belongs to the account that
+//! pays those bills. A member account's write is refused with the modelled
+//! `ValidationException` (HTTP 400) carrying `reason`
+//! `invalidRequestFromMember`, BEFORE the request is applied, so a refused write leaves
+//! the stored record exactly as `GetPreferences` reported it
+//! (`crate::state::...::member_account_refusal`). Reading the record is not gated.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -74,6 +82,9 @@
 //! * `DataUnavailableException` (HTTP 400) — The requested data is currently unavailable.
 //! * `ServiceQuotaExceededException` (HTTP 402) — The request would cause you to exceed your
 //!   service quota.
+//! * `ValidationException` (HTTP 400) — The input provided fails to satisfy the constraints
+//!   specified by an Amazon Web Services service. Declared on the SERVICE rather than on
+//!   this operation, so it is widened in through `extra_errors`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -89,11 +100,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-bcmpricingcalculator-aw
 // here — hence the `UpdatePreferencesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.bcmpricingcalculator#UpdatePreferences")]
+// `ValidationException` is widened in through `extra_errors`: this SERVICE models it
+// (smithy_query `query="service_info"`: `common_errors`) but this operation does not
+// list it, and it is the modelled answer to a write the caller's account class does not
+// permit — it is the only one of this operation's errors that carries a `reason`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.bcmpricingcalculator#UpdatePreferences",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum UpdatePreferencesErrorModeled {
     DataUnavailableException(DataUnavailableException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -161,6 +180,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that broke them: reaching here means every supplied selection is well formed.
         let stored = {
             let mut state = store.lock();
+            // The account-class gate, applied before the merge: a refused write must
+            // leave the stored record untouched.
+            if let Some(refusal) = state.member_account_refusal(Self::NAME) {
+                return Err(UpdatePreferencesErrorModeled::ValidationException(refusal).into());
+            }
             state.preferences.merge(
                 input.management_account_rate_type_selections,
                 input.member_account_rate_type_selections,
@@ -170,9 +194,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(UpdatePreferencesOutput {
-            management_account_rate_type_selections: stored.management_account_rate_type_selections,
-            member_account_rate_type_selections: stored.member_account_rate_type_selections,
-            standalone_account_rate_type_selections: stored.standalone_account_rate_type_selections,
+            management_account_rate_type_selections: Some(
+                stored.management_account_rate_type_selections,
+            ),
+            member_account_rate_type_selections: Some(stored.member_account_rate_type_selections),
+            standalone_account_rate_type_selections: Some(
+                stored.standalone_account_rate_type_selections,
+            ),
         })
     }
 }

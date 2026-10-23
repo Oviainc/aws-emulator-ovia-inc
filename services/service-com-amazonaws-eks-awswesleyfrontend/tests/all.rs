@@ -45,6 +45,10 @@ mod identity_provider_configs;
 mod list_pod_identity_associations;
 #[path = "all/nodegroup_lifecycle.rs"]
 mod nodegroup_lifecycle;
+#[path = "all/pass_role_authorization.rs"]
+mod pass_role_authorization;
+#[path = "all/peer_resolution_is_grounded.rs"]
+mod peer_resolution_is_grounded;
 #[path = "all/pod_identity_associations.rs"]
 mod pod_identity_associations;
 #[path = "all/state_roundtrip.rs"]

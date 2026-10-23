@@ -489,7 +489,12 @@ fn scalable_dimension(dimension: &str) -> Option<(&'static str, &'static [&'stat
 /// How the service refuses a `(ServiceNamespace, ResourceId, ScalableDimension)` triple
 /// that does not describe one scalable resource: "Unsupported service namespace,
 /// resource type or scalable dimension".
-const UNSUPPORTED_RESOURCE: &str =
+///
+/// `pub` because every operation that names a scalable resource — the two write paths
+/// through [`validate_scaling_instructions`] and the forecast read in
+/// `crate::ops::get_scaling_plan_resource_forecast_data` — refuses such a triple with
+/// this one sentence.
+pub const UNSUPPORTED_RESOURCE: &str =
     "Unsupported service namespace, resource type or scalable dimension";
 
 /// The segment a DynamoDB global secondary index's resource id carries, from the same
@@ -596,7 +601,10 @@ fn validate_scaling_instruction(
 }
 
 /// A resource id has to identify a resource of the kind its scalable dimension scales.
-fn validate_resource_id(resource_id: &str, dimension: &str) -> Result<(), String> {
+///
+/// `pub` so the forecast read applies the same rule to its own `ResourceId` as the two
+/// write paths apply to a scaling instruction's.
+pub fn validate_resource_id(resource_id: &str, dimension: &str) -> Result<(), String> {
     // A dimension the model does not list is refused by its own enum check, not here.
     let Some((prefix, _)) = scalable_dimension(dimension) else {
         return Ok(());
@@ -854,7 +862,9 @@ fn validate_predictive_scaling(
 
 /// Refuse a value the model's own enum does not list, naming the member and the values
 /// it accepts.
-fn one_of(member: &str, value: &str, allowed: &[&str]) -> Result<(), String> {
+///
+/// `pub` so every handler refuses an off-enum value with the same sentence.
+pub fn one_of(member: &str, value: &str, allowed: &[&str]) -> Result<(), String> {
     if allowed.contains(&value) {
         return Ok(());
     }

@@ -21,7 +21,7 @@ use super::wire_target_routing::{SHAPE_ID_PREFIX, call_target};
 
 /// Every operation this service binds, from `smithy_query(query="list_operations")`
 /// (27 operations, one handler file each under `src/ops/`).
-const OPERATIONS: &[&str] = &[
+pub(crate) const OPERATIONS: &[&str] = &[
     "CreateConnection",
     "CreateHost",
     "CreateRepositoryLink",

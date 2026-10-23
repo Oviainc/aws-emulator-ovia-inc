@@ -8,6 +8,11 @@
 //! the maps below: every response those operations return is computed from what an
 //! earlier request stored here.
 //!
+//! The procurement-portal-preference plane
+//! (`CreateProcurementPortalPreference` / `ListProcurementPortalPreferences`) is served
+//! the same way: a create persists one [`StoredProcurementPortalPreference`] and the
+//! list reports exactly what is persisted, one summary per stored preference.
+//!
 //! An invoice unit keeps its superseded configurations as well as its current one,
 //! because `GetInvoiceUnit` and `ListInvoiceUnits` both accept `AsOf` and the model
 //! documents `LastModified` as "the version of invoice unit configuration used to
@@ -41,7 +46,8 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     AccessDeniedException, InternalServerException, InvoiceProfile, InvoiceSummary, InvoiceUnit,
-    InvoiceUnitRule, ProcurementPortalPreference, ResourceNotFoundException, ResourceTag,
+    InvoiceUnitRule, ProcurementPortalPreference, ProcurementPortalPreferenceSummary,
+    ResourceNotFoundException, ResourceTag, ValidationException,
 };
 
 /// Per-service state for com-amazonaws-invoicing-invoicing. A handler reaches it through [`service_state`].
@@ -68,9 +74,9 @@ pub struct ComAmazonawsInvoicingInvoicingState {
     /// Empty until something puts an invoice here, because nothing in this service's
     /// API issues one — see the module docs.
     pub invoices: BTreeMap<String, InvoiceSummary>,
-    /// `ResourceTags` per resource ARN, as `CreateInvoiceUnit` and `TagResource`
-    /// persisted them and `ListTagsForResource` reports them. One tag per key: a
-    /// later write of a key already set replaces that key's value.
+    /// `ResourceTags` per resource ARN, as a create or `TagResource` persisted them and
+    /// `ListTagsForResource` reports them, for every resource kind this service mints.
+    /// One tag per key: a later write of a key already set replaces that key's value.
     pub resource_tags: BTreeMap<String, BTreeMap<String, String>>,
     /// The result an `@idempotent` operation already produced for a `ClientToken`,
     /// keyed by `(operation, target, token)`: one token replayed against another
@@ -83,15 +89,16 @@ pub struct ComAmazonawsInvoicingInvoicingState {
     /// Every procurement portal preference this emulator holds, keyed by its
     /// `ProcurementPortalPreferenceArn` — the one copy of a preference, so the
     /// operations of the portal-validation flow cannot disagree about whether one
-    /// exists. A `BTreeMap` so a listing walks a stable, deterministic order.
+    /// exists. A `BTreeMap` so a listing walks a stable, deterministic order and a
+    /// pagination token (a position in that order) stays meaningful across calls.
     ///
     /// Empty until a create puts a preference here:
-    /// `CreateProcurementPortalPreference` and `PutProcurementPortalPreference` are the
-    /// operations that do so and are still scaffolded (their own stub issues own them),
-    /// so for now every ARN naming a preference resolves to nothing — which is exactly
-    /// what `SendProcurementPortalValidation` and `VerifyProcurementPortalValidation`
-    /// report as the modelled `ResourceNotFoundException`, rather than claiming a
-    /// validation state for a preference that does not exist.
+    /// `CreateProcurementPortalPreference` is the operation that does so, and
+    /// `ListProcurementPortalPreferences` reports exactly what it stored. An ARN naming
+    /// no preference resolves to nothing — which is what
+    /// `SendProcurementPortalValidation` and `VerifyProcurementPortalValidation` report
+    /// as the modelled `ResourceNotFoundException`, rather than claiming a validation
+    /// state for a preference that does not exist.
     pub procurement_portal_preferences: BTreeMap<String, StoredProcurementPortalPreference>,
     /// Source of invoice-unit ids for ARN minting.
     next_invoice_unit_id: u64,
@@ -102,7 +109,8 @@ pub struct ComAmazonawsInvoicingInvoicingState {
 }
 
 /// What an `@idempotent` replay record is keyed by: the operation, the request's target
-/// (the invoice unit it names, or the name it creates) and the caller's `ClientToken`.
+/// (the resource it names, the name it creates, or the preference identity it creates)
+/// and the caller's `ClientToken`.
 type IdempotencyKey = (String, String, String);
 
 /// How many invoice units this emulator holds. The model's `ValidationExceptionReason`
@@ -138,6 +146,15 @@ pub const TAG_QUOTA_EXCEEDED_MESSAGE: &str =
 /// history is: past this many the unit deleted longest ago is dropped, and an `AsOf`
 /// read can no longer answer with it.
 const MAX_RETIRED_INVOICE_UNITS: usize = 1000;
+
+/// How many procurement portal preferences this emulator holds. AWS publishes no
+/// number for this preview API, so this is the emulator's own maximum; a create past it
+/// is the modelled `ServiceQuotaExceededException` (HTTP 402), which
+/// `CreateProcurementPortalPreference` declares and whose documentation is "the request
+/// was rejected because it attempted to create resources beyond the current Amazon Web
+/// Services account limits". It also bounds the registry and the per-request walks over
+/// it.
+pub const MAX_PROCUREMENT_PORTAL_PREFERENCES: usize = 100;
 
 /// How many `@idempotent` replay records this service keeps, across every operation and
 /// `ClientToken`. The key is caller-supplied, so without a bound a long-lived emulator
@@ -236,7 +253,11 @@ impl ComAmazonawsInvoicingInvoicingState {
     /// Mint the ARN of a new procurement portal preference:
     /// `arn:aws:invoicing::<account>:procurement-portal-preference/<id>`, the form
     /// `ProcurementPortalPreferenceArnString`'s `@pattern` spells
-    /// (`smithy_query(query=\"shape\", shape=\"ProcurementPortalPreference\")`).
+    /// (`smithy_query(query="shape", shape="ProcurementPortalPreference")`).
+    ///
+    /// The id is zero-padded hex of a monotonic counter, so it is inside that pattern's
+    /// character class, an ARN is never reused, and the `BTreeMap` order of
+    /// `procurement_portal_preferences` is creation order.
     pub fn mint_procurement_portal_preference_arn(&mut self) -> String {
         self.next_procurement_portal_preference_id =
             self.next_procurement_portal_preference_id.wrapping_add(1);
@@ -246,6 +267,32 @@ impl ComAmazonawsInvoicingInvoicingState {
             "",
             &format!("procurement-portal-preference/{id:012x}"),
         )
+    }
+
+    /// Whether this service holds a resource named by `arn`.
+    ///
+    /// The tag plane (`TagResource` / `UntagResource` / `ListTagsForResource`) is keyed
+    /// by ARN alone and accepts the ARN of any resource of this service (`TagrisArn`'s
+    /// `@pattern` constrains the service and the account, not the resource kind), so
+    /// "does this resource exist" has to be asked of every kind this service mints — an
+    /// invoice unit and a procurement portal preference. An invoice unit a delete has
+    /// retired is history rather than a resource, so it is not one of them.
+    pub fn resource_exists(&self, arn: &str) -> bool {
+        self.live_invoice_unit(arn).is_some()
+            || self.procurement_portal_preferences.contains_key(arn)
+    }
+
+    /// The preference that already carries `identity`, if this account holds one. The
+    /// identity is the portal and the buyer/supplier pair the preference routes between
+    /// (see [`procurement_portal_preference_identity`]), which is what makes a second
+    /// create of the same preference a conflict rather than a second resource.
+    pub fn procurement_portal_preference_by_identity(
+        &self,
+        identity: &str,
+    ) -> Option<&StoredProcurementPortalPreference> {
+        self.procurement_portal_preferences
+            .values()
+            .find(|preference| preference.identity() == identity)
     }
 
     /// The validation code the next `SendProcurementPortalValidation` issues: six
@@ -383,6 +430,92 @@ pub struct IssuedPortalValidation {
     /// When a `VerifyProcurementPortalValidation` submitted this code back, which is
     /// what completes the validation. `None` while it is still outstanding.
     pub verified_at: Option<DateTime>,
+}
+
+impl StoredProcurementPortalPreference {
+    /// What identifies this preference apart from its ARN: the portal it talks to and
+    /// the buyer/supplier pair it routes between.
+    pub fn identity(&self) -> String {
+        procurement_portal_preference_identity(
+            &self.preference.procurement_portal_name,
+            &self.preference.buyer_domain,
+            &self.preference.buyer_identifier,
+            &self.preference.supplier_domain,
+            &self.preference.supplier_identifier,
+        )
+    }
+
+    /// This preference as the modelled `ProcurementPortalPreferenceSummary`: the
+    /// members of the stored `ProcurementPortalPreference` that summary shape declares,
+    /// and nothing else — the `@sensitive` shared secret and contacts are not among
+    /// them, so a listing does not carry them.
+    pub fn to_summary(&self) -> ProcurementPortalPreferenceSummary {
+        let preference = &self.preference;
+        ProcurementPortalPreferenceSummary {
+            aws_account_id: preference.aws_account_id.clone(),
+            procurement_portal_preference_arn: preference.procurement_portal_preference_arn.clone(),
+            procurement_portal_name: preference.procurement_portal_name.clone(),
+            buyer_domain: preference.buyer_domain.clone(),
+            buyer_identifier: preference.buyer_identifier.clone(),
+            supplier_domain: preference.supplier_domain.clone(),
+            supplier_identifier: preference.supplier_identifier.clone(),
+            selector: preference.selector.clone(),
+            einvoice_delivery_enabled: preference.einvoice_delivery_enabled,
+            purchase_order_retrieval_enabled: preference.purchase_order_retrieval_enabled,
+            marketplace_punch_out_enabled: preference.marketplace_punch_out_enabled,
+            einvoice_delivery_preference_status: preference
+                .einvoice_delivery_preference_status
+                .clone(),
+            einvoice_delivery_preference_status_reason: preference
+                .einvoice_delivery_preference_status_reason
+                .clone(),
+            purchase_order_retrieval_preference_status: preference
+                .purchase_order_retrieval_preference_status
+                .clone(),
+            purchase_order_retrieval_preference_status_reason: preference
+                .purchase_order_retrieval_preference_status_reason
+                .clone(),
+            version: preference.version,
+            create_date: preference.create_date,
+            last_update_date: preference.last_update_date,
+        }
+    }
+}
+
+/// `ProcurementPortalPreferenceStatus$PENDING_VERIFICATION` — the status a preference
+/// plane holds while the portal connection has not been verified yet. One of the values
+/// the modelled enum admits
+/// ([`crate::ops::types::PROCUREMENT_PORTAL_PREFERENCE_STATUS_VALUES`]), and the one a
+/// freshly created preference starts at: the service models
+/// `SendProcurementPortalValidation` and `VerifyProcurementPortalValidation` as the
+/// calls that carry a preference past it, so nothing but a caller's verification (or an
+/// explicit `UpdateProcurementPortalPreferenceStatus`) moves it.
+pub const STATUS_PENDING_VERIFICATION: &str = "PENDING_VERIFICATION";
+
+/// The identity of a procurement portal preference: its portal, buyer domain and
+/// identifier, and supplier domain and identifier.
+///
+/// Each part is LENGTH-PREFIXED before it is joined, because the identifiers are
+/// caller-supplied `^\S+$` strings that could otherwise contain whatever separator was
+/// chosen and so forge another preference's identity.
+pub fn procurement_portal_preference_identity(
+    procurement_portal_name: &str,
+    buyer_domain: &str,
+    buyer_identifier: &str,
+    supplier_domain: &str,
+    supplier_identifier: &str,
+) -> String {
+    [
+        procurement_portal_name,
+        buyer_domain,
+        buyer_identifier,
+        supplier_domain,
+        supplier_identifier,
+    ]
+    .iter()
+    .map(|part| format!("{}:{part}", part.len()))
+    .collect::<Vec<String>>()
+    .join("|")
 }
 
 /// One invoice unit as it is stored: the members that can never change, plus the
@@ -622,6 +755,51 @@ pub fn not_authorized_for_account(account_id: &str) -> AccessDeniedException {
 // refusal: the `message` envelope, each `fieldList` entry's own clause and the `reason`
 // they are stated under are one rendering, reached by every refusal this service
 // answers.
+
+/// A `NextToken` this service did not mint, or one minted for another operation's walk.
+#[derive(Debug)]
+pub struct InvalidPageToken;
+
+/// The `NextToken` that resumes a paginated walk at `position`, under the walk's own
+/// `prefix`.
+///
+/// The token is opaque to the caller (hex over the prefixed position) and the prefix is
+/// what makes a token this service did not mint — or one minted for another operation's
+/// walk — recognisable rather than silently resuming from arbitrary bytes.
+pub fn encode_page_token(prefix: &str, position: &str) -> String {
+    hex::encode(format!("{prefix}{position}"))
+}
+
+/// The position a caller's `NextToken` resumes at, or `Ok(None)` when it asked for the
+/// first page. A token that is not one this `prefix`'s walk minted is
+/// [`InvalidPageToken`], which the operation answers as its own modelled
+/// `ValidationException` ([`invalid_next_token`]).
+pub fn decode_page_token(
+    prefix: &str,
+    token: Option<&str>,
+) -> Result<Option<String>, InvalidPageToken> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|plain| plain.strip_prefix(prefix).map(str::to_string))
+        .map(Some)
+        .ok_or(InvalidPageToken)
+}
+
+/// The 400 any paginated operation of this service answers for a `NextToken` it did not
+/// mint: the model's own `invalidNextToken` reason
+/// ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]), so a client branches on
+/// the reason rather than on the prose.
+pub fn invalid_next_token() -> ValidationException {
+    ValidationException {
+        message: Some("The NextToken provided is not valid".to_string()),
+        reason: Some("invalidNextToken".to_string()),
+        ..Default::default()
+    }
+}
 
 /// The 500 a handler answers when the engine it was constructed with is not the shared
 /// in-memory engine, so this service has no store to read. Never construct an engine in

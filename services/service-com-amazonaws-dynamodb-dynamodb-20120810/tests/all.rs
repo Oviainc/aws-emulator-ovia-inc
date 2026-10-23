@@ -17,6 +17,8 @@ mod emulator;
 mod global_secondary_indexes;
 #[path = "all/index_capacity_and_item_collections.rs"]
 mod index_capacity_and_item_collections;
+#[path = "all/key_schema_element_refusals.rs"]
+mod key_schema_element_refusals;
 #[path = "all/number_canonicalization.rs"]
 mod number_canonicalization;
 #[path = "all/regions_indexes_and_capacity.rs"]

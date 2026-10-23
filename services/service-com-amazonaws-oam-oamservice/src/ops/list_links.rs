@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLinks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLinks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLinks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +102,98 @@ impl From<ListLinksErrorModeled> for ListLinksError {
     }
 }
 
+/// The largest page this operation will ever build, and the page size applied when
+/// the request omits `MaxResults`.
+///
+/// It is the maximum of the modelled `MaxResults` range (1..5, from
+/// `smithy_query(query="operation",operation="ListLinks")`), which the centralized
+/// walk already refuses values outside of — but this handler does not depend on
+/// that: the size is clamped to this constant here, so the page it allocates is
+/// decided by the server, never by the request.
+const MAX_PAGE_SIZE: usize = 5;
+
+/// The longest `NextToken` this operation will look at.
+///
+/// The member carries no modelled length, and the tokens this operation issues are a
+/// hex-encoded fingerprint, separator and UUID (138 characters), so this bound
+/// accepts every real token while keeping a caller from handing over an arbitrarily
+/// long one to decode.
+const MAX_PAGE_TOKEN_LEN: usize = 512;
+
+/// A fingerprint of the enumeration a page token belongs to: this request's Region
+/// and the source account it speaks for.
+///
+/// A DIGEST rather than the values themselves, because the source account is derived
+/// from the request's credential ([`crate::state::caller_source_account`]) and a
+/// response must never carry a credential back out, not even encoded. Equality is
+/// all a token needs of it: the fingerprint of the enumeration being walked now must
+/// equal the one the token was issued for.
+fn scope_fingerprint(region: &str, source_account: &str) -> String {
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    // Length-prefixed, so two different (region, account) pairs can never hash the
+    // same bytes by sliding the separator.
+    digest.update((region.len() as u64).to_be_bytes());
+    digest.update(region.as_bytes());
+    digest.update(source_account.as_bytes());
+    hex::encode(&digest.finalize()[..16])
+}
+
+/// A page token naming the enumeration it belongs to and the link the NEXT page
+/// starts at.
+///
+/// `NextToken` is modelled opaque, so the pair is hex-encoded rather than handed back
+/// in the clear — which makes the token opaque to a caller, not secret: hex is
+/// trivially reversible and the token carries nothing but a digest and an id this
+/// caller can already see. Neither half can contain the separator: the fingerprint is
+/// hexadecimal and a link id is a UUID.
+fn encode_page_token(scope: &str, link_id: &str) -> String {
+    hex::encode(format!("{scope}:{link_id}"))
+}
+
+/// How a pagination token this operation cannot resume is refused: HTTP 400, error
+/// code `ValidationException`, message exactly [`INVALID_PAGINATION_TOKEN`].
+///
+/// `NextToken` carries no modelled constraint, so a token the service cannot use is a
+/// request that is wrong in a way the model does not express — the case
+/// [`crate::scaffolded::Scaffolded::validation`] exists for, and the code and status
+/// OAM is recorded answering for it. The message is a FIXED, request-independent
+/// string: it names no token, no id and no member, so nothing of the request leaks
+/// into it.
+const INVALID_PAGINATION_TOKEN: &str = "Invalid pagination token";
+
+/// The link id a page token names, or the 400 refusal when the token is not one this
+/// operation issued for `scope`.
+///
+/// The token is a position to resume THIS source account's sorted enumeration at, not
+/// a handle on a live record: a token whose link has since been deleted still resumes
+/// correctly (the enumeration continues from where that id sat). What it may not do
+/// is resume another caller's or another Region's enumeration, so the fingerprint the
+/// token was issued for must be the one being enumerated now.
+fn decode_page_token(token: &str, scope: &str) -> Result<String, ListLinksError> {
+    let refused = || crate::scaffolded::Scaffolded::validation(INVALID_PAGINATION_TOKEN);
+    // `NextToken` carries no modelled length, so the token is bounded HERE, before
+    // anything is decoded from it.
+    if token.len() > MAX_PAGE_TOKEN_LEN {
+        return Err(refused());
+    }
+    let decoded = hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(refused)?;
+    let (token_scope, link_id) = decoded.split_once(':').ok_or_else(refused)?;
+    if token_scope != scope
+        || link_id.is_empty()
+        || link_id.len() > 64
+        || !link_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(refused());
+    }
+    Ok(link_id.to_string())
+}
+
 /// The `ListLinks` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -147,18 +230,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLinks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLinksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLinks"))
+        // `MaxResults`' 1..5 range is a modelled constraint, already refused by the
+        // centralized walk before this body runs. This operation is `@readonly`: it
+        // enumerates stored links and writes nothing.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListLinksErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the link store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let parts = ctx.parts();
+        let region = crate::state::request_region(parts);
+        // "Use this operation in a source account to return a list of links to
+        // monitoring account sinks that this source account has": the enumeration is
+        // the links THIS caller's source account owns, which is the account the
+        // request's credential speaks for — the same value `CreateLink` stored on
+        // each link.
+        let source_account = crate::state::caller_source_account(parts);
+        let scope = scope_fingerprint(&region, &source_account);
+        // Decoded against this caller's own enumeration, so a token can only resume
+        // the enumeration it was issued for.
+        let start = input
+            .next_token
+            .as_deref()
+            .map(|token| decode_page_token(token, &scope))
+            .transpose()?;
+        // The page size is the server's own decision: clamped into 1..=MAX_PAGE_SIZE
+        // whatever the request asked for, so no allocation below is sized by input.
+        let page_size = input.max_results.map_or(MAX_PAGE_SIZE, |requested| {
+            requested.clamp(1, MAX_PAGE_SIZE as i32) as usize
+        });
+
+        let store = state.lock();
+        // `links` is keyed by link id, so this walks a stable total order and a page
+        // token can name the id the next page starts at. Only this source account's
+        // links in this Region: a regional endpoint sees its own Region's resources,
+        // and one source account's list is not another's.
+        let remaining = match &start {
+            Some(id) => store.links.range(id.clone()..),
+            None => store.links.range::<String, _>(..),
+        }
+        .map(|(_id, link)| link)
+        .filter(|link| link.region == region && link.source_account == source_account);
+
+        let mut items = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for link in remaining {
+            // The first link that does not fit becomes the next page's start, and
+            // only then is a `NextToken` emitted — the last page carries none.
+            if items.len() == page_size {
+                next_token = Some(encode_page_token(&scope, &link.id));
+                break;
+            }
+            items.push(ListLinksItem {
+                arn: Some(link.arn.clone()),
+                id: Some(link.id.clone()),
+                label: Some(link.label.clone()),
+                resource_types: Some(link.resource_types.clone()),
+                sink_arn: Some(link.sink_arn.clone()),
+            });
+        }
+
+        // `Items` is `@required`, so a source account with no links reports an empty
+        // list rather than omitting the member.
+        Ok(ListLinksOutput { items, next_token })
     }
 }

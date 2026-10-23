@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDBCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDBCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation accepts the delete of the stored DB cluster, answers with
+//! the cluster in the transient `deleting` status and retires the record, so every later
+//! read of the identifier is the modelled `DBClusterNotFoundFault` — the signal a client
+//! (and every AWS waiter) polls for. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDBCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The records, the `deleting` status and the clock that removes the record live in
+//! [`crate::state`], shared with `CreateDBCluster` and `DescribeDBClusters`.
+//!
+//! Taking a FINAL DB CLUSTER SNAPSHOT is the one documented path this operation cannot
+//! serve: a DB cluster snapshot is a resource of its own, and this crate has no store for
+//! one — `CreateDBClusterSnapshot`, `DescribeDBClusterSnapshots` and
+//! `DeleteDBClusterSnapshot` are all still scaffolded — so a delete that asks for one is
+//! answered through the 501 channel rather than silently dropping the snapshot the caller
+//! asked to keep.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +198,253 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDBCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDBClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region = crate::state::request_region(ctx).map_err(DeleteDBClusterError::validation)?;
+        // "The DB cluster identifier for the DB cluster to be deleted. This parameter isn't
+        // case-sensitive" — folded to the identifier the store is keyed by, the same way
+        // every other member that names a DB cluster is.
+        let identifier = crate::state::db_cluster_identifier_of(&input.db_cluster_identifier)
+            .to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // The cluster this call ADDRESSES is resolved FIRST, before any rule about how the
+        // other members combine: `DBClusterIdentifier` names the resource the operation
+        // acts on — the operation models `DBClusterNotFoundFault` for exactly this — and a
+        // resource that does not exist has no deletion for a snapshot parameter to qualify.
+        // A caller deleting if-exists branches on 404/`DBClusterNotFound`, and so does one
+        // waiting for a delete it already issued to finish.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDBCluster"))
+        // RDS is regional: only the region the request was signed for is in scope.
+        let key = (region.clone(), identifier.clone());
+        let Some(record) = store.db_clusters.get(&key) else {
+            return Err(DeleteDBClusterErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(format!("DBCluster {identifier} not found.")),
+                },
+            )
+            .into());
+        };
+        let cluster_arn = record.arn();
+        let current_status = record.status.clone();
+        let deletion_protection = record.deletion_protection;
+        let already_deleting = record.is_deleting();
+        let multi_az_cluster = crate::state::is_multi_az_db_cluster(&record.engine);
+        let global_cluster_identifier = record.global_cluster_identifier.clone();
+        let resource_id = record.resource_id.clone();
+
+        // `SkipFinalSnapshot`: "If you set this value to false or don't specify it, RDS
+        // creates a DB cluster snapshot before it deletes the DB cluster … If
+        // SkipFinalSnapshot is disabled, you must specify a value for the
+        // FinalDBSnapshotIdentifier parameter", while naming both "results in an error".
+        // Neither combination has a modelled error, so both are refused with the
+        // `InvalidParameterCombination` code RDS answers members that cannot hold together
+        // with, naming them.
+        let skip_final_snapshot = input.skip_final_snapshot.unwrap_or(false);
+        match (skip_final_snapshot, &input.final_db_snapshot_identifier) {
+            (true, Some(_)) => {
+                return Err(DeleteDBClusterError::invalid_parameter_combination(
+                    "FinalDBSnapshotIdentifier can't be specified when SkipFinalSnapshot is \
+                     enabled",
+                ));
+            }
+            (false, None) => {
+                return Err(DeleteDBClusterError::invalid_parameter_combination(
+                    "FinalDBSnapshotIdentifier must be specified unless SkipFinalSnapshot is \
+                     enabled",
+                ));
+            }
+            _ => {}
+        }
+        if let Some(snapshot_identifier) = &input.final_db_snapshot_identifier {
+            // "Constraints: Must be 1 to 255 letters, numbers, or hyphens. First character
+            // must be a letter. Can't end with a hyphen or contain two consecutive hyphens"
+            // — the identifier rule this service checks for every identifier member, with
+            // this member's own length bound.
+            crate::state::check_identifier(
+                "FinalDBSnapshotIdentifier",
+                snapshot_identifier,
+                MAX_FINAL_DB_SNAPSHOT_IDENTIFIER_LEN,
+            )
+            .map_err(DeleteDBClusterError::validation)?;
+            // The request is well formed and asks for a DB cluster snapshot to outlive the
+            // cluster. A DB cluster snapshot is a resource of its own and this crate holds
+            // no store for one, so the honest answer is the 501 channel: accepting the
+            // delete here would report a snapshot nothing took, and the modelled
+            // `DBClusterSnapshotAlreadyExistsFault` / `SnapshotQuotaExceededFault` could
+            // never fire. `SkipFinalSnapshot=true` — the teardown path — is served below.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteDBCluster with a FinalDBSnapshotIdentifier (taking a final DB cluster \
+                 snapshot)",
+            ));
+        }
+
+        // "The database can't be deleted when deletion protection is enabled"
+        // (`DBCluster$DeletionProtection`) — a state the cluster is in, which is the
+        // modelled `InvalidDBClusterStateFault` rather than a not-found.
+        if deletion_protection {
+            return Err(DeleteDBClusterErrorModeled::InvalidDBClusterStateFault(
+                InvalidDBClusterStateFault {
+                    message: Some(format!(
+                        "DB cluster {identifier} can't be deleted because deletion protection \
+                         is enabled"
+                    )),
+                },
+            )
+            .into());
+        }
+        // Nor can one whose delete is already running: a delete "can't be canceled or
+        // reverted after it begins", so a second delete inside the window is the same state
+        // fault. Every other status accepts the delete — a provisioning status this
+        // emulator's clock has yet to settle included, because a delete does not need the
+        // cluster to be up.
+        if already_deleting {
+            return Err(DeleteDBClusterErrorModeled::InvalidDBClusterStateFault(
+                InvalidDBClusterStateFault {
+                    message: Some(format!(
+                        "DB cluster {identifier} is already being deleted (status \
+                         {current_status})"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The member DB instances of the cluster that are not themselves on their way out.
+        // Membership is recorded on the INSTANCE (`CreateDBInstance$DBClusterIdentifier`),
+        // so it is read off those records rather than from the cluster.
+        let live_members: Vec<String> = store
+            .instances_in(&region)
+            .into_iter()
+            .filter(|instance| {
+                instance
+                    .db_cluster_identifier
+                    .as_ref()
+                    .is_some_and(|named| named.eq_ignore_ascii_case(&identifier))
+                    && !instance.is_deleting()
+            })
+            .map(|instance| instance.identifier.clone())
+            .collect();
+        // The two cluster TYPES this operation documents differ here. A Multi-AZ DB
+        // cluster's members go with it: "If you're deleting a Multi-AZ DB cluster with read
+        // replicas, all cluster members are terminated". An AURORA DB cluster's do not —
+        // its DB instances are deleted one by one (`DeleteDBInstance`) before the cluster
+        // can go, so a delete that would leave members behind is refused with the modelled
+        // state fault instead of orphaning them.
+        if !live_members.is_empty() && !multi_az_cluster {
+            return Err(DeleteDBClusterErrorModeled::InvalidDBClusterStateFault(
+                InvalidDBClusterStateFault {
+                    message: Some(format!(
+                        "DB cluster {identifier} can't be deleted because it still has {} DB \
+                         instance(s): {}. Delete them first",
+                        live_members.len(),
+                        live_members.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A global database whose PRIMARY this cluster is cannot lose it while it still has
+        // secondaries: the secondary clusters are detached (`RemoveFromGlobalCluster`) or
+        // deleted first, and until they are, the global cluster is in a state this delete
+        // can't be performed in — the modelled `InvalidGlobalClusterStateFault`.
+        if let Some(global) = global_cluster_identifier
+            .as_deref()
+            .and_then(|named| store.global_clusters.get(named))
+        {
+            let is_primary = global.member_cluster_arns.first() == Some(&cluster_arn);
+            if is_primary && global.member_cluster_arns.len() > 1 {
+                return Err(
+                    DeleteDBClusterErrorModeled::InvalidGlobalClusterStateFault(
+                        InvalidGlobalClusterStateFault {
+                            message: Some(format!(
+                                "DB cluster {identifier} is the primary cluster of global \
+                                 cluster {} and can't be deleted while it still has {} \
+                                 secondary cluster(s)",
+                                global.identifier,
+                                global.member_cluster_arns.len() - 1
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Every refusal is behind us, so the delete is ACCEPTED from here: the cluster
+        // reports `deleting` and the clock owes its removal. The next read inside the span
+        // still sees `deleting`; every read after it is the `DBClusterNotFoundFault` above.
+        let accepted = {
+            let record = store
+                .db_clusters
+                .get_mut(&key)
+                .expect("the cluster was found above and the store is locked");
+            record.begin_deletion();
+            record.clone()
+        };
+        // A Multi-AZ DB cluster's members are terminated with it, as the operation
+        // documents; each reports `deleting` and is removed by the same clock.
+        for member in &live_members {
+            if let Some(instance) = store.db_instances.get_mut(&(region.clone(), member.clone())) {
+                instance.begin_deletion();
+            }
+        }
+        // "Read replicas are promoted to standalone": a cluster that replicates from this
+        // one stops naming it, which is also the invariant every projection in this service
+        // keeps — no stored record may name a resource the service no longer holds.
+        let replicas: Vec<String> = store
+            .clusters_in(&region)
+            .into_iter()
+            .filter(|other| other.replication_source_arn.as_deref() == Some(cluster_arn.as_str()))
+            .map(|other| other.identifier.clone())
+            .collect();
+        for replica in replicas {
+            if let Some(other) = store.db_clusters.get_mut(&(region.clone(), replica)) {
+                other.replication_source_arn = None;
+            }
+        }
+        // A cluster on its way out is no longer a member of the global database it joined:
+        // the membership lives on the global cluster's own record, so that is the record
+        // updated, exactly as `CreateDBCluster` adds it there.
+        if let Some(global) = global_cluster_identifier
+            .as_deref()
+            .and_then(|named| store.global_clusters.get_mut(named))
+        {
+            global
+                .member_cluster_arns
+                .retain(|member| *member != cluster_arn);
+        }
+
+        let db_cluster = store.cluster_to_wire(&accepted);
+        // The resource is on its way out, so this service stops claiming the id it minted:
+        // a monitoring service must not be told that an id whose resource is being deleted
+        // is still one of ours. The RDS store is already locked here and the directory is
+        // taken second, the order its doc fixes.
+        if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+            directory.lock().forget(&resource_id);
+        }
+
+        // `DeleteAutomatedBackups` "specifies whether to remove automated backups
+        // immediately after the DB cluster is deleted", and the documented default is to
+        // remove them. This service schedules no automated backup for a cluster at all —
+        // there is no automated-backup store, and `DescribeDBClusterAutomatedBackups` is
+        // scaffolded — so the cluster has none to retain or remove and the member leaves
+        // nothing to do either way.
+        let _ = input.delete_automated_backups;
+
+        Ok(DeleteDBClusterOutput {
+            db_cluster: Some(db_cluster),
+        })
     }
 }
+
+/// The longest `FinalDBSnapshotIdentifier` this operation accepts: "Must be 1 to 255
+/// letters, numbers, or hyphens", the bound the member itself publishes.
+const MAX_FINAL_DB_SNAPSHOT_IDENTIFIER_LEN: usize = 255;

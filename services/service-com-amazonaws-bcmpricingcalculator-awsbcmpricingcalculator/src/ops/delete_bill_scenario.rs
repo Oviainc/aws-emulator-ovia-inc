@@ -8,6 +8,12 @@
 //! The operation is `@idempotent` and its model declares no not-found error, so a
 //! second delete of the same identifier is an empty success rather than a failure.
 //!
+//! WHICH ACCOUNTS MAY CALL: the whole bill-scenario subject belongs to the account that
+//! pays the bills being modelled, so a member account's request is refused with the
+//! modelled `ValidationException` (HTTP 400) carrying `reason`
+//! `invalidRequestFromMember` before anything is removed (the store's own
+//! `member_account_refusal`).
+//!
 //! The modelled `ConflictException` (HTTP 409) is deliberately unreachable here: the
 //! only `BillScenarioStatus` this slice ever stores is `READY`, so no scenario is yet
 //! in a state a delete must refuse. Whichever issue adds `LOCKED`/`STALE` adds the
@@ -79,11 +85,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-bcmpricingcalculator-aw
 // here — hence the `DeleteBillScenarioError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.bcmpricingcalculator#DeleteBillScenario")]
+// `ValidationException` is widened in through `extra_errors`: this SERVICE models it
+// (smithy_query `query="service_info"`: `common_errors`) but this operation does not
+// list it, and it is the modelled answer to a request the caller's account class does
+// not permit — the only one of this operation's errors that carries a `reason`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.bcmpricingcalculator#DeleteBillScenario",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum DeleteBillScenarioErrorModeled {
     ConflictException(ConflictException),
     DataUnavailableException(DataUnavailableException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -148,6 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `remove_bill_scenario` reports whether anything was there; an absent
         // scenario is already in the state this call asks for, so it is a success.
         let mut state = store.lock();
+        // The account-class gate, before anything is read or written: the whole
+        // bill-scenario subject belongs to the account that pays the bills being
+        // modelled.
+        if let Some(refusal) = state.member_account_refusal(Self::NAME) {
+            return Err(DeleteBillScenarioErrorModeled::ValidationException(refusal).into());
+        }
         // Materialise the expiry the clock has already made due, so this call does not
         // resurrect a scenario that is already past its `expiresAt`.
         state.purge_expired(crate::state::now_secs());

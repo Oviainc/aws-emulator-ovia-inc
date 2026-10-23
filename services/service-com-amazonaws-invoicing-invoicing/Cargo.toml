@@ -21,7 +21,7 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Encodes/decodes the opaque `NextToken` ListInvoiceUnits hands out.
+# Encodes/decodes the opaque `NextToken` this service's paginated operations hand out.
 hex = { workspace = true }
 
 [build-dependencies]

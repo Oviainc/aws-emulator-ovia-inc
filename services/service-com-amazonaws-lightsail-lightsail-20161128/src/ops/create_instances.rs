@@ -327,6 +327,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .clone()
                         .unwrap_or_else(|| crate::state::DEFAULT_SSH_KEY_NAME.to_string()),
                     user_data: input.user_data.clone(),
+                    // The firewall Lightsail opens on a new instance: the
+                    // platform's management port and HTTP, from here on whatever
+                    // the public-ports operations make of them.
+                    ports: crate::state::default_port_rules(
+                        &input.blueprint_id,
+                        &ip_address_type,
+                    ),
                     state: crate::state::PENDING,
                     due: Some(due),
                 });

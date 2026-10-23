@@ -7,6 +7,10 @@
 //! for an application whose policy was never set. A REPORTING operation: it writes
 //! nothing, so reading a policy cannot change what a later caller reads.
 //!
+//! An application nobody has shared carries an EMPTY policy, which this operation
+//! reports as `statements: []` — the value of a policy with no grants, not a missing
+//! member. An application the catalogue does not hold is the modelled 404.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -151,6 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A read, and nothing but a read: the stored policy is reported as it stands.
         let store = state.lock();
         let Some(application) = store.applications.get(&input.application_id) else {
             return Err(GetApplicationPolicyErrorModeled::NotFoundException(

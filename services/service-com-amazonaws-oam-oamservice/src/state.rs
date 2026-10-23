@@ -25,7 +25,7 @@
 //! A few stored members are not reported by any operation in this slice — a sink's
 //! `policy` and `created_at`, a link's `sink_id` and `created_at`. They are written
 //! where the resource is created so the slices that read them (`Put`/`GetSinkPolicy`,
-//! the tagging and the `List` operations, all still 501 stubs) read the same record
+//! the tagging operations and `ListSinks`, all still 501 stubs) read the same record
 //! rather than a second copy of it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

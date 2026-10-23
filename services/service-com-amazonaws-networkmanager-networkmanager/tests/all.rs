@@ -15,6 +15,10 @@
 mod global_network_lifecycle;
 #[path = "all/link_lifecycle.rs"]
 mod link_lifecycle;
+#[path = "all/network_resource_counts.rs"]
+mod network_resource_counts;
+#[path = "all/resource_not_found_message.rs"]
+mod resource_not_found_message;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

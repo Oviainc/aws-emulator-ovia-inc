@@ -15,5 +15,7 @@
 mod contact_lifecycle;
 #[path = "all/contact_updates.rs"]
 mod contact_updates;
+#[path = "all/engagement_lifecycle.rs"]
+mod engagement_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

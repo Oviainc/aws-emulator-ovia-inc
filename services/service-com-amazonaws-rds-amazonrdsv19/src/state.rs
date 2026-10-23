@@ -173,6 +173,18 @@ pub const DB_CLUSTER_STATUS_CREATING: &str = "creating";
 /// The status a DB cluster reports once it is usable, as `DBCluster$Status` carries it.
 pub const DB_CLUSTER_STATUS_AVAILABLE: &str = "available";
 
+/// The status a DB cluster reports once a delete has been accepted for it, as
+/// `DBCluster$Status` carries it — the same `deleting` status the other delete paths of
+/// this service report ([`DB_INSTANCE_STATUS_DELETING`],
+/// [`GLOBAL_CLUSTER_STATUS_DELETING`]).
+///
+/// It is a TRANSIENT status: `DeleteDBCluster` "deletes a previously provisioned DB
+/// cluster", answering with the cluster it accepted the delete for, and the record then
+/// leaves the store [`STATUS_TRANSITION_DELAY`] later — after which the identifier names
+/// nothing and every read of it is the modelled `DBClusterNotFoundFault`, the signal the
+/// AWS waiters poll for.
+pub const DB_CLUSTER_STATUS_DELETING: &str = "deleting";
+
 /// The status an event notification subscription reports once it is set up and
 /// delivering, from `EventSubscription$Status`'s published list ("creating | modifying |
 /// deleting | active | no-permission | topic-not-exist").
@@ -1558,6 +1570,23 @@ impl DbClusterRecord {
         ::aws_smithy_types::DateTime::from_secs_f64(
             self.cluster_create_time.as_secs_f64() + SERVER_CERTIFICATE_VALIDITY.as_secs_f64(),
         )
+    }
+
+    /// Whether a delete has already been accepted for this cluster, so it is on its way
+    /// out and nothing further can be done to it.
+    pub fn is_deleting(&self) -> bool {
+        self.status == DB_CLUSTER_STATUS_DELETING
+    }
+
+    /// Accept a delete: the cluster reports `deleting` from now on, and the clock owes
+    /// its removal from the store [`STATUS_TRANSITION_DELAY`] from now, after which every
+    /// read of the identifier is a `DBClusterNotFoundFault`. Nothing sleeps: the due
+    /// instant is stored and materialised by
+    /// [`ComAmazonawsRdsAmazonrdsv19State::settle_due_transitions`], exactly as
+    /// [`DbInstanceRecord::begin_deletion`] does for a DB instance.
+    pub fn begin_deletion(&mut self) {
+        self.status = DB_CLUSTER_STATUS_DELETING.to_string();
+        self.pending_status = Some(PendingStatus::removal_in_a_moment());
     }
 
     /// `StorageEncryptionType`: "the type of encryption used to protect data at rest in

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutInstancePublicPorts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutInstancePublicPorts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutInstancePublicPorts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces an instance's whole inbound firewall with the rules the request
+//! carries, and logs the operation: "This action also closes all currently open
+//! ports that are not included in the request." A request carrying no rule at
+//! all therefore closes every port — use `OpenInstancePublicPorts` to add a rule
+//! without touching the others.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +167,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutInstancePublicPorts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutInstancePublicPortsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutInstancePublicPorts"))
+        // `ctx` carries request metadata only: the firewall this call changes is
+        // the one of the instance the request names, wherever that instance is.
+        let _ = ctx;
+
+        // Every modelled constraint on this input — the two `@required` members,
+        // the `ResourceName` pattern and each entry's port `@range` — was refused
+        // by the centralized walk before this body ran. What is left is what the
+        // model cannot express, and `crate::state::port_rule_from_request`
+        // checks it, entry by entry.
+        let name = input.instance_name;
+        let now = crate::state::now_ms();
+
+        // The caller-sized list is bounded BEFORE any entry of it is looked at,
+        // and before the store's lock is taken: the entry count is what decides
+        // the work this request buys, and the modelled `PortInfoList` carries no
+        // `@length`. `MAX_PORT_RULES` caps what the firewall HOLDS, which is a
+        // different bound, so this one is its own.
+        if input.port_infos.len() > crate::state::MAX_PORT_INFOS_PER_REQUEST {
+            return Err(invalid(format!(
+                "portInfos carries {} entries, more than the {} this service accepts in \
+                 one request",
+                input.port_infos.len(),
+                crate::state::MAX_PORT_INFOS_PER_REQUEST
+            )));
+        }
+
+        crate::state::with_state(&*self.engine, |store| {
+            let location = {
+                let Some(instance) = store.instance_mut(&name) else {
+                    return Err(not_found(&name));
+                };
+                // EVERY entry is resolved before the firewall is touched, so a
+                // request carrying one rule this service cannot accept leaves the
+                // instance's ports exactly as they were. The allocation is sized
+                // from the entry count, which the check above has already
+                // bounded.
+                let mut rules = Vec::with_capacity(input.port_infos.len());
+                for (position, port_info) in input.port_infos.iter().enumerate() {
+                    rules.push(
+                        crate::state::port_rule_from_request(
+                            &format!("portInfos[{position}]"),
+                            port_info,
+                            &instance.ip_address_type,
+                        )
+                        .map_err(invalid)?,
+                    );
+                }
+                instance.replace_ports(rules).map_err(invalid)?;
+                instance.location.clone()
+            };
+            // The firewall change is applied by the time this call answers, so
+            // its operation is terminal rather than one the clock still owes.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_PUT_INSTANCE_PUBLIC_PORTS,
+                crate::state::RESOURCE_TYPE_INSTANCE,
+                &name,
+                &location,
+                None,
+            );
+            Ok(PutInstancePublicPortsOutput {
+                operation: Some(operation.view()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No instance of that name is stored: Lightsail's `DoesNotExist` rejection —
+/// HTTP 400, wire error `NotFoundException`, body `code` `DoesNotExist` and a
+/// message naming the resource type and the requested name.
+fn not_found(name: &str) -> PutInstancePublicPortsError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_INSTANCE,
+        name,
+    )
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> PutInstancePublicPortsError {
+    PutInstancePublicPortsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> PutInstancePublicPortsError {
+    PutInstancePublicPortsErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail instance store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

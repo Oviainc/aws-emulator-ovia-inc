@@ -287,7 +287,7 @@ async fn the_default_version_is_what_create_cluster_uses() {
 
     let body = serde_json::json!({
         "name": "versions-default",
-        "roleArn": "arn:aws:iam::123456789012:role/eksClusterRole",
+        "roleArn": "arn:aws:iam::000000000000:role/eksClusterRole",
         "resourcesVpcConfig": { "subnetIds": ["subnet-aaaa1111", "subnet-bbbb2222"] },
     });
     let created = call(&router, REGION, "POST", "/clusters", &body.to_string()).await;

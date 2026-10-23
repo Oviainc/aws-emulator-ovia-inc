@@ -40,6 +40,9 @@
 //! * [`network`], the contract the account's EC2 network — which subnets a Region has —
 //!   is modelled against, so no two services answer "does this subnet exist"
 //!   differently;
+//! * [`rpc_target`], the ONE reading of an `awsJson` `X-Amz-Target` — which service and
+//!   which operation it names — for every service whose published target prefix carries
+//!   dots of its own, which the framework's first-dot readers cannot route;
 //!
 //! Beside them, two SHARED STORES live here, each held once in the shared engine so
 //! the services on either side of a hand-off cannot hold two copies of one fact:
@@ -149,12 +152,13 @@ pub mod iot_commands;
 pub mod iot_job_executions;
 pub mod lex;
 pub mod network;
+pub mod rpc_target;
 pub mod shared_path;
 pub mod validation;
 
 use aws_smithy_runtime_api::http::Request as RuntimeApiRequest;
 use aws_smithy_types::body::SdkBody;
-use emulator_server::{resolve_route_key, service_from_target, ROOT_PATH_SEGMENT};
+use emulator_server::{resolve_route_key, ROOT_PATH_SEGMENT};
 use smithy_server_runtime::ErasedServiceDefinition;
 
 /// A stable 64-bit mixing of `parts`, rendered as 16 hexadecimal digits.
@@ -269,7 +273,7 @@ fn runtime_request_from(parts: &http::request::Parts) -> Option<RuntimeApiReques
 /// target service in `X-Amz-Target: <Service>.<Operation>`, and `rpcv2Cbor` in the URI
 /// `/service/<Service>/operation/<Operation>`.
 fn is_rpc_addressed(parts: &http::request::Parts) -> bool {
-    parts.headers.contains_key("x-amz-target")
+    parts.headers.contains_key(rpc_target::TARGET_HEADER)
         || rpcv2_cbor_service_named(parts.uri.path()).is_some()
 }
 
@@ -280,15 +284,32 @@ fn is_rpc_addressed(parts: &http::request::Parts) -> bool {
 /// `X-Amz-Target` that names an RPC service is claimed by that service only on a path
 /// its protocol uses, so the path's own owner serves it alone.
 ///
-/// The `X-Amz-Target` side is read through the framework's OWN reader,
-/// `emulator_server::service_from_target`, which splits on the `.`, strips a trailing
-/// `_<digits>` API-version suffix and lower-cases the result, so the target-parsing rule
-/// stays in one place and a client sending either the versioned or the unversioned form
-/// reaches the service either way. The `rpcv2Cbor` side has no framework reader: its
+/// The `X-Amz-Target` side is read through [`rpc_target::names_service`], this crate's
+/// one statement of the target rule: the service is the last dot-separated segment of the
+/// target's PREFIX, compared the way the framework compares a routing key (trailing
+/// `_<digits>` API-version suffix dropped, case-insensitive), so a client sending either
+/// the versioned or the unversioned form reaches the service either way.
+///
+/// It is read there rather than through the framework's own
+/// `emulator_server::service_from_target` because that reader takes the segment before
+/// the FIRST dot, which is the service only while the target prefix is a single
+/// identifier: a service whose published prefix is its fully qualified Coral name or its
+/// absolute shape id is named by a namespace label (`com`) under that reading, so it
+/// claimed none of its own traffic. The `rpcv2Cbor` side has no framework reader: its
 /// `{Service}` label is compared case-insensitively.
+///
+/// A READABLE `X-Amz-Target` decides on its own: a request that names its service out of
+/// band in the `awsJson` form is answered by the service it names, and the `rpcv2Cbor` URI
+/// is consulted only for a request that carries no such header (one that does and names
+/// another service contradicts itself, so it reaches nobody). The URI is still the reader
+/// for a header whose bytes are not text at all, which names no service.
 fn rpc_names_this_service(parts: &http::request::Parts, declared: &str) -> bool {
-    if let Some(named) = service_from_target(&parts.headers) {
-        return named == strip_version_suffix(declared).to_ascii_lowercase();
+    if let Some(target) = parts
+        .headers
+        .get(rpc_target::TARGET_HEADER)
+        .and_then(|target| target.to_str().ok())
+    {
+        return rpc_target::names_service(target, declared);
     }
     rpcv2_cbor_service_named(parts.uri.path())
         .is_some_and(|named| named.eq_ignore_ascii_case(declared))
@@ -726,6 +747,95 @@ mod tests {
             assert_eq!(
                 claimed, expected,
                 "case {case:?}: expected claimed == {expected}, got {claimed}"
+            );
+        }
+    }
+
+    /// A target prefix carrying DOTS of its own names the same service as the bare shape
+    /// name: the service is the last segment of the prefix, not the first.
+    ///
+    /// Read at the first dot — the framework's own `service_from_target` — every row
+    /// below names the namespace label `com`, which is no service, so a service whose
+    /// SDK sends a fully qualified prefix claimed none of its own traffic.
+    #[test]
+    fn an_rpc_service_claims_a_dotted_target_prefix() {
+        const CODECONNECTIONS: &str = "com.amazonaws.codeconnections#CodeConnections_20231201";
+        const CLOUDTRAIL: &str = "com.amazonaws.cloudtrail#CloudTrail_20131101";
+
+        // (case, declared shape id, target, expected)
+        let rows: [(&str, &str, &str, bool); 10] = [
+            (
+                "the absolute shape id an SDK sends as the prefix",
+                CODECONNECTIONS,
+                "com.amazonaws.codeconnections.CodeConnections_20231201.DeleteRepositoryLink",
+                true,
+            ),
+            (
+                "the fully qualified Coral name, with a version label in the namespace",
+                CLOUDTRAIL,
+                "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.CreateTrail",
+                true,
+            ),
+            (
+                "the bare shape name, which the first-dot reader already routed",
+                CODECONNECTIONS,
+                "CodeConnections_20231201.DeleteRepositoryLink",
+                true,
+            ),
+            (
+                "one namespace label before the shape name",
+                CODECONNECTIONS,
+                "codeconnections.CodeConnections_20231201.GetHost",
+                true,
+            ),
+            (
+                "the version suffix dropped by the client",
+                CODECONNECTIONS,
+                "com.amazonaws.codeconnections.CodeConnections.GetHost",
+                true,
+            ),
+            (
+                "another service's dotted prefix",
+                CODECONNECTIONS,
+                "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.CreateTrail",
+                false,
+            ),
+            (
+                "a dotted prefix whose last segment merely ends in the shape name",
+                CODECONNECTIONS,
+                "com.amazonaws.codeconnections.NotCodeConnections_20231201.GetHost",
+                false,
+            ),
+            (
+                // A header that is present but names nothing decides the claim on its
+                // own: the request is addressed in the awsJson form, so the `rpcv2Cbor`
+                // URI is not consulted for it, and it names no service.
+                "an empty target header",
+                CODECONNECTIONS,
+                "",
+                false,
+            ),
+            (
+                "a target header that is only a prefix",
+                CODECONNECTIONS,
+                "com.amazonaws.codeconnections.",
+                true,
+            ),
+            (
+                "a target header that names neither a service nor an operation",
+                CODECONNECTIONS,
+                "...",
+                false,
+            ),
+        ];
+
+        for (case, shape_id, target, expected) in rows {
+            let parts = parts("codeconnections", "/", Some(target));
+            let claimed = claims_request(&parts, "codeconnections", &[], Some(shape_id));
+            assert_eq!(
+                claimed, expected,
+                "case {case:?}: expected claimed == {expected} for target {target:?}, got \
+                 {claimed}"
             );
         }
     }
