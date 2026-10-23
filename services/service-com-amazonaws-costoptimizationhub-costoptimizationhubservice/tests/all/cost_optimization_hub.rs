@@ -344,11 +344,10 @@ async fn list_enrollment_statuses_filters_and_pages() {
 /// for every member it never set — and the write answers with the same record a
 /// following read does.
 ///
-/// Only the members this account may write appear here:
-/// `memberAccountDiscountVisibility` and an explicit
-/// `savingsEstimationMode=AfterDiscounts` belong to the organization's
-/// management account, and their refusal is `management_account_gating`'s
-/// subject.
+/// `preference_writes` spans the rest of the class: every combination of the
+/// modelled enums (including `memberAccountDiscountVisibility` and an explicit
+/// `savingsEstimationMode=AfterDiscounts`), and the refusal a value outside an
+/// enum gets.
 #[tokio::test]
 async fn preferences_merge_and_read_back_with_the_service_defaults() {
     let router = router();
@@ -964,11 +963,6 @@ async fn get_recommendation_rejects_an_unknown_id() {
 /// reported before or after discounts — the same stored prices, read two ways —
 /// and an account that has stated no preference is reported under the default
 /// the service applies (`AfterDiscounts`), the same mode `GetPreferences` names.
-///
-/// `AfterDiscounts` is reachable here only as that default: an explicit write
-/// of it needs member-account discount visibility, which only the
-/// organization's management account can enable, so `UpdatePreferences` refuses
-/// it for this caller (`management_account_gating`).
 #[tokio::test]
 async fn savings_estimation_mode_changes_the_reported_money() {
     let router = enrolled_router().await;
@@ -978,11 +972,14 @@ async fn savings_estimation_mode_changes_the_reported_money() {
     // Row 0001 costs 280.32 before a 28.03 savings-plan discount and its
     // recommended resource 140.16 before a 14.02 discount. `None` is the
     // account that has set no preference, read under the default; the rows that
-    // follow are the undiscounted figures an account that chose
-    // `BeforeDiscounts` is shown.
-    let cases: [(Option<&str>, f64, f64); 3] = [
+    // follow are what each stored mode reports, each value of the model's
+    // `SavingsEstimationMode` enum written explicitly, and the last row shows
+    // the mode can be moved back.
+    let cases: [(Option<&str>, f64, f64); 5] = [
         (None, 252.29, 126.15),
         (Some("BeforeDiscounts"), 280.32, 140.16),
+        (Some("BeforeDiscounts"), 280.32, 140.16),
+        (Some("AfterDiscounts"), 252.29, 126.15),
         (Some("BeforeDiscounts"), 280.32, 140.16),
     ];
 

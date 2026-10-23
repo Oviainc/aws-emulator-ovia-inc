@@ -8,12 +8,14 @@
 //! service applies for a member the account has still never set, which is what a
 //! following `GetPreferences` reports as well.
 //!
-//! Two preferences are not the caller's to set on its own, and a request that
-//! asks for either is refused with the modelled `ValidationException` before
-//! anything is stored: `memberAccountDiscountVisibility`, which only the
-//! organization's management account may write, and
-//! `savingsEstimationMode=AfterDiscounts`, which needs member-account discount
-//! visibility enabled first.
+//! Every member the model declares is the caller's to set: the model states no
+//! precondition between `savingsEstimationMode`, `preferredCommitment` and
+//! `memberAccountDiscountVisibility`, and none about the caller
+//! (`smithy_query(query="operation", operation="UpdatePreferences")` lists an
+//! input of three independent, optional members). So a request whose values are
+//! inside their modelled enums is ACCEPTED and merged; the modelled
+//! `ValidationException` is reserved for a value the model itself refuses, which
+//! the boundary walk raises before this handler runs.
 //!
 //! ## Shape of an operation
 //!
@@ -175,39 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = {
             let mut store = state.lock();
 
-            // `memberAccountDiscountVisibility` decides what the organization's
-            // MEMBER accounts may see, so only the organization's management
-            // account may write it. Refused before anything is stored, so the
-            // record a later `GetPreferences` reports is the one this call did
-            // not change.
-            if input.member_account_discount_visibility.is_some()
-                && !store.is_management_account(&account_id)
-            {
-                return Err(not_the_management_account());
-            }
-
-            // `AfterDiscounts` reports figures net of commitments and discounts,
-            // which is only reachable once discount visibility is enabled — an
-            // act of the management account. The value the merge would leave in
-            // place is what decides it, so enabling visibility and asking for
-            // `AfterDiscounts` in one call is accepted. Read without inserting:
-            // a refused call must leave the store exactly as it found it.
-            if input.savings_estimation_mode.as_deref() == Some(crate::state::AFTER_DISCOUNTS) {
-                let enabled = input
-                    .member_account_discount_visibility
-                    .as_deref()
-                    .or_else(|| {
-                        store
-                            .preferences
-                            .get(&account_id)
-                            .and_then(|stored| stored.member_account_discount_visibility.as_deref())
-                    })
-                    == Some(crate::state::VISIBILITY_ALL);
-                if !enabled {
-                    return Err(discount_visibility_not_enabled());
-                }
-            }
-
+            // No pre-store gate: each member is independently settable, so the
+            // merge below is the whole write. A value outside its modelled enum
+            // never reaches here — the framework's constraint walk answers it in
+            // this service's structured `ValidationException` first.
             let preferences = store.preferences.entry(account_id.clone()).or_default();
             preferences.merge(
                 input.savings_estimation_mode,
@@ -225,33 +198,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             preferred_commitment: stored.preferred_commitment,
         })
     }
-}
-
-/// Refuse a caller that is not the organization's management account the
-/// member-account discount-visibility preference.
-///
-/// A 400 `ValidationException` and not the 403 `AccessDeniedException` this
-/// operation also models: the request is well formed and the caller may call
-/// `UpdatePreferences`, it is this one preference that the account cannot set,
-/// which is what the recorded refusal answers. No field accounts for it — the
-/// value is inside the member's enum — so `reason` is `Other` and the message
-/// states the rule.
-fn not_the_management_account() -> UpdatePreferencesError {
-    UpdatePreferencesErrorModeled::ValidationException(crate::service::other_validation_exception(
-        "Only management accounts can update member account discount visibility.",
-    ))
-    .into()
-}
-
-/// Refuse `savingsEstimationMode=AfterDiscounts` to an account whose
-/// member-account discount visibility is not enabled, naming what has to be
-/// enabled first.
-fn discount_visibility_not_enabled() -> UpdatePreferencesError {
-    UpdatePreferencesErrorModeled::ValidationException(crate::service::other_validation_exception(
-        "Invalid permission to update preferences. To use AfterDiscounts savings estimation \
-         mode, the management account must either enable member account discount visibility in \
-         Cost Optimization Hub, or enable linked account discount visibility in Cost Management \
-         Preferences.",
-    ))
-    .into()
 }
