@@ -77,8 +77,8 @@ use crate::ops::types::{
     Nodegroup, NodegroupHealth, NodegroupScalingConfig, NodegroupUpdateConfig,
     OidcIdentityProviderConfig, OutpostConfigResponse, PodIdentityAssociation,
     PodIdentityAssociationSummary, RemoteAccessConfig, RemoteNetworkConfigResponse,
-    StorageConfigResponse, Taint, Update, UpdateParam, UpgradePolicyResponse, VpcConfigResponse,
-    WarmPoolConfig, ZonalShiftConfigResponse,
+    ResourceNotFoundException, StorageConfigResponse, Taint, Update, UpdateParam,
+    UpgradePolicyResponse, VpcConfigResponse, WarmPoolConfig, ZonalShiftConfigResponse,
 };
 use crate::ops::types::{
     AllowedValuesConstraint, ControlPlaneConfigInfo, ControlPlaneScalingTierInfo,
@@ -453,18 +453,71 @@ pub fn default_disk_size_gib(ami_type: &str) -> i32 {
 /// [`MAX_STORED_CLUSTERS`], the capability map is bounded too.
 pub const MAX_CAPABILITIES_PER_CLUSTER: usize = crate::ops::types::CAPABILITY_TYPE_VALUES.len();
 
-/// The message the access-entry operations report when the cluster or the access
-/// entry a request names does not exist.
+/// The GENERIC not-found sentence: the message an operation that resolves a
+/// resource INSIDE a cluster reports, whichever half of the pair is missing.
 ///
-/// The access-entry APIs report a GENERIC not-found sentence rather than naming
-/// the resource the way the older cluster APIs do (`DescribeCluster` answers "No
-/// cluster found for name: <name>."), so this slice uses one constant across
-/// `CreateAccessEntry`, `DescribeAccessEntry`, `AssociateAccessPolicy` and
-/// `ListAssociatedAccessPolicies` instead of a sentence built per operation. The
-/// model documents no message text for `ResourceNotFoundException`, so a client
-/// branches on the error CODE (and on the `clusterName` the exception carries),
-/// never on this string.
+/// Such an operation addresses ONE resource (the `(cluster, child)` pair), so it
+/// does not tell the two apart the way the operations whose subject IS the cluster
+/// do ([`cluster_not_found_message`]). The model documents no message text for
+/// `ResourceNotFoundException`, so a client branches on the error CODE, never on
+/// this string.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource does not exist.";
+
+/// The message an operation that reports the CLUSTER as the resource it could not
+/// resolve carries, built from the request: "No cluster found for name: <name>."
+///
+/// `DescribeCluster` is the plainest case; every operation that only validates the
+/// cluster before creating in it or enumerating it reports the same sentence, as the
+/// recorded corpus shows for `CreateAddon`, `CreateAccessEntry` and
+/// `ListAccessEntries`.
+pub fn cluster_not_found_message(cluster_name: &str) -> String {
+    format!("No cluster found for name: {cluster_name}.")
+}
+
+/// The `ResourceNotFoundException` payload of an operation that reports the CLUSTER
+/// as the resource it could not resolve.
+///
+/// RULE (one template, two forms — see [`resource_not_found`] for the other): the
+/// exception's optional identity members are `clusterName`, `nodegroupName`,
+/// `fargateProfileName`, `addonName` and `subscriptionId`, and EKS never echoes the
+/// identifier of a resource INSIDE a cluster into them. It names only the resource
+/// whose absence it reports: this form sets `clusterName`, and nothing else, beside
+/// the message that names the same cluster.
+pub fn cluster_not_found(cluster_name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        cluster_name: Some(cluster_name.to_string()),
+        message: Some(cluster_not_found_message(cluster_name)),
+        ..Default::default()
+    }
+}
+
+/// The `ResourceNotFoundException` payload of an operation that resolves a resource
+/// INSIDE a cluster: NO identity member at all, and the generic sentence
+/// ([`RESOURCE_NOT_FOUND_MESSAGE`]).
+///
+/// See [`cluster_not_found`] for the rule. The missing half — the cluster or the
+/// child — is not disclosed, so nothing about either is serialized; that is what the
+/// recorded corpus shows for the reads and deletes of an add-on, a capability, a node
+/// group, an access entry and an identity-provider configuration.
+pub fn resource_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The same memberless payload as [`resource_not_found`], for the operations that
+/// report the missing CHILD in a sentence of their own (an update id, a certificate
+/// authority id, a pod identity association id).
+///
+/// The cluster is not the resource being reported, so `clusterName` stays unset here
+/// too — see [`cluster_not_found`] for the rule.
+pub fn child_resource_not_found(message: String) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(message),
+        ..Default::default()
+    }
+}
 
 /// The `type` an access entry gets when `CreateAccessEntry` is called without one:
 /// "If you don't specify a value, Amazon EKS sets the value to `STANDARD`"

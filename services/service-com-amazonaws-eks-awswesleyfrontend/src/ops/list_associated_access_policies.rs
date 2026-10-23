@@ -148,14 +148,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // This listing hangs off ONE resource — the `(cluster, access entry)` pair —
+        // so a miss of either half is the same generic, memberless payload:
+        // [`state::resource_not_found`].
         let not_found = || {
             ListAssociatedAccessPoliciesError::from(
                 ListAssociatedAccessPoliciesErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        cluster_name: Some(input.cluster_name.clone()),
-                        message: Some(state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                        ..Default::default()
-                    },
+                    state::resource_not_found(),
                 ),
             )
         };

@@ -167,19 +167,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Amazon EKS clusters and node groups are Amazon Web Services Region
         // specific" (`ResourceNotFoundException`), so both names are resolved in
-        // the region the request is signed for. The cluster is checked first: a
-        // node group name means nothing without the cluster that holds it.
+        // the region the request is signed for. This read addresses ONE resource —
+        // the `(cluster, node group)` pair — so neither half is named and no
+        // identity member is serialized ([`crate::state::resource_not_found`]); the
+        // cluster is still checked first, because a node group name means nothing
+        // without the cluster that holds it.
         if !guard
             .clusters
             .contains_key(&(region.clone(), input.cluster_name.clone()))
         {
             return Err(DescribeNodegroupErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    cluster_name: Some(input.cluster_name.clone()),
-                    nodegroup_name: Some(input.nodegroup_name.clone()),
-                    message: Some(format!("No cluster found for name: {}.", input.cluster_name)),
-                    ..Default::default()
-                },
+                crate::state::resource_not_found(),
             )
             .into());
         }
@@ -193,15 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 nodegroup: Some(record.to_nodegroup()),
             }),
             None => Err(DescribeNodegroupErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    cluster_name: Some(input.cluster_name.clone()),
-                    nodegroup_name: Some(input.nodegroup_name.clone()),
-                    message: Some(format!(
-                        "No node group found for name: {}.",
-                        input.nodegroup_name
-                    )),
-                    ..Default::default()
-                },
+                crate::state::resource_not_found(),
             )
             .into()),
         }

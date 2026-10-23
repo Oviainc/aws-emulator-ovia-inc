@@ -214,12 +214,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clusters
             .get_mut(&(region.clone(), input.cluster_name.clone()))
         else {
+            // The cluster is the resource this reports missing, so the payload names
+            // it: `CreateAccessEntry` only validates the cluster before writing into
+            // it, and the recorded corpus shows EKS naming the cluster on this path
+            // ([`state::cluster_not_found`]).
             return Err(CreateAccessEntryErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    cluster_name: Some(input.cluster_name.clone()),
-                    message: Some(state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                    ..Default::default()
-                },
+                state::cluster_not_found(&input.cluster_name),
             )
             .into());
         };

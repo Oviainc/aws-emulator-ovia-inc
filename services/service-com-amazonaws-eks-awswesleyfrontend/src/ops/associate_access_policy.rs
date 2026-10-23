@@ -174,16 +174,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
         // Both resource lookups report the same modelled failure with the same
-        // generic message (see [`state::RESOURCE_NOT_FOUND_MESSAGE`]): which of the
-        // two is missing is not something the caller is told apart.
+        // generic, memberless payload (see [`state::resource_not_found`]): which of
+        // the two is missing is not something the caller is told apart.
         let not_found = || {
             AssociateAccessPolicyError::from(
                 AssociateAccessPolicyErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        cluster_name: Some(input.cluster_name.clone()),
-                        message: Some(state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                        ..Default::default()
-                    },
+                    state::resource_not_found(),
                 ),
             )
         };

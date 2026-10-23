@@ -45,6 +45,8 @@ mod identity_provider_configs;
 mod list_pod_identity_associations;
 #[path = "all/nodegroup_lifecycle.rs"]
 mod nodegroup_lifecycle;
+#[path = "all/not_found_payload.rs"]
+mod not_found_payload;
 #[path = "all/pass_role_authorization.rs"]
 mod pass_role_authorization;
 #[path = "all/peer_resolution_is_grounded.rs"]
