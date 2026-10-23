@@ -429,4 +429,3 @@ async fn host_call(
     let parsed = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
     (status, parsed)
 }
-

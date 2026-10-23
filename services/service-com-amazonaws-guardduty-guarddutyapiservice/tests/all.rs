@@ -39,6 +39,8 @@ mod ip_set_update_and_delete;
 mod malware_protection_plan;
 #[path = "all/malware_scan.rs"]
 mod malware_scan;
+#[path = "all/malware_scan_lifecycle.rs"]
+mod malware_scan_lifecycle;
 #[path = "all/malware_scan_settings.rs"]
 mod malware_scan_settings;
 #[path = "all/member_accounts.rs"]
