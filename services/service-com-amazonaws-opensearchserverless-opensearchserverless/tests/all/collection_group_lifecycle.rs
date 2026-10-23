@@ -40,12 +40,12 @@ const STANDBY_REPLICAS: [&str; 2] = ["DISABLED", "ENABLED"];
 /// names no group, from `CollectionGroupErrorDetail$errorCode` and `$errorMessage`'s own
 /// documentation ("For example, `NOT_FOUND`" / "`The specified Collection Group is not
 /// found.`").
-const NOT_FOUND_CODE: &str = "NOT_FOUND";
-const NOT_FOUND_MESSAGE: &str = "The specified Collection Group is not found.";
+pub(crate) const NOT_FOUND_CODE: &str = "NOT_FOUND";
+pub(crate) const NOT_FOUND_MESSAGE: &str = "The specified Collection Group is not found.";
 
 /// Create the collection group `body` describes in `region`, asserting it was accepted,
 /// and answer its `createCollectionGroupDetail`.
-async fn create_group(
+pub(crate) async fn create_group(
     router: &smithy_server_runtime::MultiServiceRouter,
     region: &str,
     body: Value,
@@ -61,7 +61,7 @@ async fn create_group(
 
 /// Read the groups `body` selects, asserting the read was accepted, and answer the whole
 /// `BatchGetCollectionGroup` response.
-async fn batch_get(
+pub(crate) async fn batch_get(
     router: &smithy_server_runtime::MultiServiceRouter,
     region: &str,
     body: Value,
@@ -76,7 +76,7 @@ async fn batch_get(
 }
 
 /// The `collectionGroupDetails` entry at `index`, or `Value::Null`.
-fn detail_at(answer: &Value, index: usize) -> Value {
+pub(crate) fn detail_at(answer: &Value, index: usize) -> Value {
     at(answer, "collectionGroupDetails")
         .as_array()
         .and_then(|details| details.get(index))
@@ -85,7 +85,7 @@ fn detail_at(answer: &Value, index: usize) -> Value {
 }
 
 /// The `collectionGroupErrorDetails` entry at `index`, or `Value::Null`.
-fn error_at(answer: &Value, index: usize) -> Value {
+pub(crate) fn error_at(answer: &Value, index: usize) -> Value {
     at(answer, "collectionGroupErrorDetails")
         .as_array()
         .and_then(|errors| errors.get(index))
