@@ -444,8 +444,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let volume_id = store.next_id("vol");
-        let record = VolumeRecord {
-            view: VolumeView {
+        let record = VolumeRecord::created(
+            VolumeView {
                 volume_id: Some(volume_id.clone()),
                 volume_arn: Some(::engine::emulator_arn(
                     "ec2",
@@ -495,8 +495,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the available state" (`CopyVolumes`): the copy is handed back `creating` and
             // reaches `available` without anyone asking, over the same clock-owed span a
             // created volume takes.
-            available_at: now + TRANSITION_DELAY,
-        };
+            now + TRANSITION_DELAY,
+        );
         if let Some(token) = input.client_token.clone() {
             store.volume_client_tokens.insert(token, volume_id.clone());
         }

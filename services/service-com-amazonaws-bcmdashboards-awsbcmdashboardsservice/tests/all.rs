@@ -17,6 +17,8 @@ mod audit_records;
 mod dashboard_lifecycle;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
+#[path = "all/response_media_type.rs"]
+mod response_media_type;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/scheduled_report_lifecycle.rs"]

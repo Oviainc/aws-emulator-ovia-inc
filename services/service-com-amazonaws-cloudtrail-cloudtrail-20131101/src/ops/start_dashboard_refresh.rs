@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDashboardRefresh
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDashboardRefresh`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a refresh of one CloudTrail Lake dashboard in the shared dashboard registry
+//! (`crate::state`) and reports the refresh id it minted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDashboardRefresh::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What a refresh is, on this emulator: CloudTrail "runs queries to populate the
+//! dashboard's widgets" during a refresh, and the control plane around that — the
+//! dashboard a refresh is addressed to, the query parameters it accepts, the event data
+//! store a managed dashboard's refresh names, the id the refresh is known by and the
+//! dashboard's record of its last refresh — is what this operation owns and what every
+//! modelled member of this surface reports. No Lake query runs here (`StartQuery` is
+//! still a scaffold), so nothing claims query results, a run duration or a refresh
+//! outcome: the record carries the refresh that was started, and nothing more.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +163,188 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDashboardRefresh` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDashboardRefreshErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDashboardRefresh"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartDashboardRefreshErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "StartDashboardRefresh needs the CloudTrail dashboard registry, which \
+                         this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `DashboardId` is "the name or ARN of the dashboard": a bare name addresses
+        // the caller's own Region, an ARN the Region it carries. Which query
+        // parameters the refresh accepts depends on the dashboard's type, so the
+        // stored dashboard is read before the request is checked.
+        let key = store
+            .addressed_dashboard_key(&input.dashboard_id, &region)
+            .ok_or_else(no_matching_dashboard)?;
+        let (dashboard_type, managed) = store
+            .dashboards
+            .get(&key)
+            .map(|dashboard| (dashboard.dashboard_type.clone(), dashboard.is_managed()))
+            .ok_or_else(no_matching_dashboard)?;
+
+        // Only the query parameters the model documents for this dashboard's type may
+        // be given, and a managed dashboard's refresh must say which event data store
+        // to run its queries against.
+        let valid = valid_refresh_parameters(managed);
+        let supplied = input.query_parameter_values.unwrap_or_default();
+        let unsupported = supplied
+            .keys()
+            .map(String::as_str)
+            .filter(|parameter| !valid.contains(parameter))
+            // The refusal names one parameter, and the lexicographically first
+            // offender is the one it names, so the same request is always refused
+            // with the same wording.
+            .min();
+        if let Some(parameter) = unsupported {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "QueryParameterValues carries {parameter}, which is not a query parameter a \
+                 {dashboard_type} dashboard's refresh accepts; the valid query parameters \
+                 are {}",
+                valid.join(", ")
+            )));
+        }
+        if managed && !supplied.contains_key(EVENT_DATA_STORE_ID_PARAMETER) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "QueryParameterValues must carry {EVENT_DATA_STORE_ID_PARAMETER} to refresh a \
+                 {dashboard_type} dashboard"
+            )));
+        }
+        // A managed dashboard's refresh runs its queries against the event data store
+        // the request names, so that store has to exist and be queryable — which is
+        // what this operation's `EventDataStoreNotFoundException` and
+        // `InactiveEventDataStoreException` report.
+        if let Some(named_store) = supplied.get(EVENT_DATA_STORE_ID_PARAMETER) {
+            let identifier = crate::state::parse_event_data_store_identifier(named_store)
+                .map_err(|rejection| {
+                    // The operation models no ARN-invalid error, so an unreadable
+                    // identifier is refused as the bad request value it is.
+                    crate::scaffolded::Scaffolded::validation(format!(
+                        "QueryParameterValues carries {EVENT_DATA_STORE_ID_PARAMETER} {}",
+                        rejection.message(&region)
+                    ))
+                })?;
+            let addressed_arn = identifier.arn(&region);
+            let Some(record) = store.addressed_event_data_store(&identifier, &region) else {
+                return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                    StartDashboardRefreshErrorModeled::EventDataStoreNotFoundException(
+                        EventDataStoreNotFoundException {
+                            message: Some(crate::state::event_data_store_not_found_message(
+                                &addressed_arn,
+                            )),
+                        },
+                    ),
+                    NOT_FOUND_STATUS,
+                ));
+            };
+            if !record.status.is_queryable() {
+                return Err(
+                    StartDashboardRefreshErrorModeled::InactiveEventDataStoreException(
+                        InactiveEventDataStoreException {
+                            message: Some(format!(
+                                "The event data store {} is {}.",
+                                record.arn(),
+                                record.status.as_wire()
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The dashboard this call records the refresh on. It was read above under this
+        // same lock, so the key still names it — the id is minted only for a refresh
+        // that is recorded, and no two refreshes of a dashboard share one.
+        let refresh_id = next_refresh_id(&mut store);
+        let dashboard = store
+            .dashboards
+            .get_mut(&key)
+            .ok_or_else(no_matching_dashboard)?;
+        // The status transition the clock had already made due, materialised on the
+        // record this call writes to.
+        dashboard.settle(now);
+        // What the service records for a started refresh: this is now the dashboard's
+        // last refresh, and it carries no failure reason of an earlier one.
+        dashboard.last_refresh_id = Some(refresh_id.clone());
+        dashboard.last_refresh_failure_reason = None;
+
+        Ok(StartDashboardRefreshOutput {
+            refresh_id: Some(refresh_id),
+        })
     }
+}
+
+/// The query parameters a refresh of a CUSTOM dashboard accepts, from the model doc
+/// for `StartDashboardRefreshRequest$QueryParameterValues`: "For custom dashboards,
+/// the following query parameters are valid: $StartTime$, $EndTime$, and $Period$."
+const CUSTOM_REFRESH_PARAMETERS: [&str; 3] = ["$StartTime$", "$EndTime$", "$Period$"];
+
+/// The query parameter a MANAGED dashboard's refresh takes on top of
+/// [`CUSTOM_REFRESH_PARAMETERS`], from the same doc: "For managed dashboards, the
+/// following query parameters are valid: $StartTime$, $EndTime$, $Period$, and
+/// $EventDataStoreId$. The $EventDataStoreId$ query parameter is required."
+const EVENT_DATA_STORE_ID_PARAMETER: &str = "$EventDataStoreId$";
+
+/// The query parameters a refresh of a dashboard of this type accepts: the CUSTOM set,
+/// plus the managed-only parameter for a MANAGED dashboard.
+fn valid_refresh_parameters(managed: bool) -> &'static [&'static str] {
+    const MANAGED_REFRESH_PARAMETERS: [&str; 4] = [
+        CUSTOM_REFRESH_PARAMETERS[0],
+        CUSTOM_REFRESH_PARAMETERS[1],
+        CUSTOM_REFRESH_PARAMETERS[2],
+        EVENT_DATA_STORE_ID_PARAMETER,
+    ];
+    if managed {
+        &MANAGED_REFRESH_PARAMETERS
+    } else {
+        &CUSTOM_REFRESH_PARAMETERS
+    }
+}
+
+/// Where minted refresh ids start counting.
+///
+/// `RefreshId` is `^\d+$` with length 10..20, so an id is all digits and at least ten
+/// of them; counting up from here keeps every minted id inside that length for the life
+/// of the process.
+const REFRESH_ID_BASE: u64 = 1_000_000_000;
+
+/// Mint the id of the next dashboard refresh, off the service's own refresh counter.
+///
+/// Ids count up from [`REFRESH_ID_BASE`], so each one is unique for the life of the
+/// process and every one satisfies `RefreshId`'s `^\d+$` with length 10..20.
+fn next_refresh_id(
+    store: &mut crate::state::ComAmazonawsCloudtrailCloudtrail20131101State,
+) -> String {
+    let id = REFRESH_ID_BASE + store.refreshes_started;
+    store.refreshes_started += 1;
+    id.to_string()
+}
+
+/// The HTTP status this service answers an `EventDataStoreNotFoundException` with.
+///
+/// The model annotates that shape `@httpError(404)`, but CloudTrail answers 400 for it
+/// on the wire, which is how `get_event_data_store`, `disable_federation` and
+/// `describe_query` state it too: the error CODE is the model's, only the status is
+/// stated here, through [`crate::scaffolded::Scaffolded::modeled_with_status`].
+const NOT_FOUND_STATUS: u16 = 400;
+
+/// The refusal for a `DashboardId` that addresses no dashboard this call can see.
+///
+/// `StartDashboardRefresh` models no ARN-invalid or name-invalid error, so a
+/// well-formed-but-unknown identifier and one that cannot name a dashboard at all are
+/// the same answer: `ResourceNotFoundException`, HTTP 400.
+fn no_matching_dashboard() -> StartDashboardRefreshError {
+    StartDashboardRefreshErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::DASHBOARD_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
 }

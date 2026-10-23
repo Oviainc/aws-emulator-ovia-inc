@@ -353,9 +353,10 @@ use std::net::Ipv6Addr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    Address, ApplicationStatus, ApplicationStatusDetail, AvailabilityZone,
+    Address, ApplicationStatus, ApplicationStatusDetail, AttachVolumeOutput, AvailabilityZone,
     AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates, ByoipCidr,
-    CapacityBlock,
+    CapacityBlock, ExportTask, FpgaImage, FpgaImageState, ImageUsageReport, LoadPermission,
+    StorageLocation, VolumeRecycleBinInfo,
     CreateVolumeOutput, DescribeFastLaunchImagesSuccessItem, DisableFastLaunchOutput,
     EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
     Instance, InstanceApplicationStatus, IpamPool,
@@ -1163,6 +1164,32 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs. Ordered by endpoint id, which is the order
     /// `DescribeVpcEndpointConnections` reports and pages over.
     pub vpc_endpoint_connections: BTreeMap<String, VpcEndpointConnection>,
+    /// Every Amazon FPGA Image (AFI) the account holds, by `FpgaImageId` — see
+    /// [`FpgaImageRecord`]. Ordered by id, which is the order a report of them pages over.
+    pub fpga_images: BTreeMap<String, FpgaImageRecord>,
+    /// A `CreateFpgaImage` `ClientToken` and the AFI id it minted, so a repeat of the same
+    /// request answers with that AFI instead of creating a second one. Cleared for an AFI a
+    /// delete removes, so a token cannot name an image that is gone.
+    pub fpga_image_client_tokens: HashMap<String, String>,
+    /// Every volume in the account's Recycle Bin, by `VolumeId`, as the modelled
+    /// [`VolumeRecycleBinInfo`] shape `ListVolumesInRecycleBin` reports — so a member a
+    /// writer sets round-trips without a field-by-field copy. Ordered by id, which is the
+    /// order that report pages over.
+    ///
+    /// A volume reaches the bin when it is deleted while a Recycle Bin retention rule
+    /// covers it, and leaves it when it is restored or when its retention period runs out;
+    /// `DeleteVolume` and `RestoreVolumeFromRecycleBin` are the operations that move it,
+    /// and both are still scaffolds, so a fresh account's bin is empty — which is exactly
+    /// what the report answers with.
+    pub volumes_in_recycle_bin: BTreeMap<String, VolumeRecycleBinInfo>,
+    /// Every AMI usage report the account holds, by `ReportId`, as the modelled
+    /// [`ImageUsageReport`] shape the describe reports. `CreateImageUsageReport` is the
+    /// operation that adds one and `DeleteImageUsageReport` the one that removes it.
+    pub image_usage_reports: BTreeMap<String, ImageUsageReport>,
+    /// Every instance export task the account holds, by `ExportTaskId` — see
+    /// [`ExportTaskRecord`]. `CreateInstanceExportTask` is the operation that starts one and
+    /// `CancelExportTask` the one that cancels it.
+    pub export_tasks: BTreeMap<String, ExportTaskRecord>,
     /// Every secondary subnet the account holds, by `SecondarySubnetId`, as the modelled
     /// [`SecondarySubnet`] shape itself — see the module docs. Ordered by id, which is the
     /// order `DescribeSecondarySubnets` reports and pages over.
@@ -1265,6 +1292,11 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
+            fpga_images: BTreeMap::new(),
+            fpga_image_client_tokens: HashMap::new(),
+            volumes_in_recycle_bin: BTreeMap::new(),
+            image_usage_reports: BTreeMap::new(),
+            export_tasks: BTreeMap::new(),
             secondary_subnets: BTreeMap::new(),
             vpc_endpoint_connection_moves: BTreeMap::new(),
             vpc_endpoint_services: BTreeMap::new(),
@@ -3890,6 +3922,18 @@ pub const VOLUME_STATE_CREATING: &str = "creating";
 /// A created volume that is not attached to an instance: `VolumeState`'s `available`.
 pub const VOLUME_STATE_AVAILABLE: &str = "available";
 
+/// A created volume that an instance holds an attachment of: `VolumeState`'s `in-use`.
+pub const VOLUME_STATE_IN_USE: &str = "in-use";
+
+/// An attachment an instance holds: `VolumeAttachmentState`'s `attached`
+/// (`crate::ops::types::VOLUME_ATTACHMENT_STATE_VALUES` is the generated catalog).
+pub const VOLUME_ATTACHMENT_STATE_ATTACHED: &str = "attached";
+
+/// An attachment `DetachVolume` has started taking down: `VolumeAttachmentState`'s
+/// `detaching`. The move to `detached` is owed by the clock ([`TRANSITION_DELAY`]), at
+/// which point the attachment is gone and the volume is `available` again.
+pub const VOLUME_ATTACHMENT_STATE_DETACHING: &str = "detaching";
+
 /// The volume type `CreateVolume` uses when the request names none: "Default: gp2"
 /// (`CreateVolumeRequest$VolumeType`).
 pub const DEFAULT_VOLUME_TYPE: &str = "gp2";
@@ -3999,24 +4043,117 @@ pub struct VolumeRecord {
     /// and never reported, so a wall-clock adjustment cannot move a volume back to
     /// `creating`.
     pub available_at: Instant,
+    /// Whether this volume's I/O operations are enabled.
+    ///
+    /// Amazon EBS disables I/O for a volume "because the data on the volume was
+    /// potentially inconsistent" (`EnableVolumeIO`), and `EnableVolumeIO` is the call that
+    /// turns it back on — so that operation's precondition is a fact OF THE VOLUME, held
+    /// here because the modelled `Volume` shape carries no member for it (it is reported
+    /// by `DescribeVolumeStatus`'s `io-enabled` check). Nothing in this emulator finds a
+    /// volume's data inconsistent, so a volume is stored with its I/O enabled and the
+    /// enable is refused as out of state until something disables it.
+    pub io_enabled: bool,
+    /// For each attachment of this volume that is being taken down, the instant its
+    /// `detaching` -> `detached` move falls due, keyed by the `(InstanceId, Device)` pair
+    /// that identifies the attachment — an instance can hold the same Multi-Attach volume
+    /// at more than one device, so the instance alone does not name one attachment.
+    ///
+    /// `DetachVolume` answers an attachment in the non-terminal `detaching` state, so the
+    /// clock owes it `detached` [`TRANSITION_DELAY`] later whether or not anybody calls
+    /// again — the same span, read off the same monotonic clock, as this volume's
+    /// `creating` -> `available` move. A detached attachment is not a state of an
+    /// attachment the volume still holds: it is the attachment being gone, so
+    /// [`VolumeRecord::attachments_at`] drops it once the move is due rather than
+    /// reporting a `detached` row for ever, and the next writer materialises that removal
+    /// ([`VolumeRecord::materialize_due_detachments`]) so no entry outlives the attachment
+    /// it was made for.
+    pub detaching_at: BTreeMap<(String, String), Instant>,
 }
 
 impl VolumeRecord {
+    /// A volume this store has just created: attached to nothing, with its I/O enabled,
+    /// reaching `available` at `available_at`.
+    pub fn created(view: VolumeView, available_at: Instant) -> Self {
+        Self {
+            view,
+            available_at,
+            io_enabled: true,
+            detaching_at: BTreeMap::new(),
+        }
+    }
+
     /// This volume as of `now`: the stored view with the `State` the clock has
-    /// reached. A read observes the transition the clock already owed without
-    /// writing anything.
+    /// reached and the attachments it still holds. A read observes the transitions the
+    /// clock already owed without writing anything.
     pub fn view_at(&self, now: Instant) -> VolumeView {
         let mut view = self.view.clone();
+        view.attachments = Some(self.attachments_at(now));
         view.state = Some(self.state_at(now).to_string());
         view
     }
 
+    /// The attachments this volume holds at `now`: every stored attachment except one
+    /// whose `detaching` -> `detached` move the clock has already made due.
+    pub fn attachments_at(&self, now: Instant) -> Vec<AttachVolumeOutput> {
+        self.view
+            .attachments
+            .iter()
+            .flatten()
+            .filter(|attachment| !self.detach_is_due(attachment, now))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether the detach of `attachment` was owed by `now`.
+    fn detach_is_due(&self, attachment: &AttachVolumeOutput, now: Instant) -> bool {
+        self.detaching_at
+            .get(&Self::attachment_key(attachment))
+            .is_some_and(|due_at| now >= *due_at)
+    }
+
+    /// The `(InstanceId, Device)` pair that identifies `attachment` among the attachments
+    /// of one volume — the ONE reading of that key, so a writer and a reader cannot key
+    /// the same attachment two ways.
+    pub fn attachment_key(attachment: &AttachVolumeOutput) -> (String, String) {
+        (
+            attachment.instance_id.clone().unwrap_or_default(),
+            attachment.device.clone().unwrap_or_default(),
+        )
+    }
+
+    /// Apply the detachments the clock has already made due: the attachments they took
+    /// down are no longer the volume's, and nothing is owed on them any more.
+    ///
+    /// A WRITER calls this, which is the only thing that may materialise it — a report
+    /// observes the same removal through [`VolumeRecord::attachments_at`] without writing.
+    /// It keeps the stored record converging on what readers already see, so no entry
+    /// outlives the attachment it was made for and a later attachment of the same volume
+    /// to the same device cannot inherit a past-due one.
+    pub fn materialize_due_detachments(&mut self, now: Instant) {
+        self.detaching_at.retain(|_, due_at| now < *due_at);
+        let owed = &self.detaching_at;
+        if let Some(attachments) = self.view.attachments.as_mut() {
+            attachments.retain(|attachment| {
+                owed.contains_key(&(
+                    attachment.instance_id.clone().unwrap_or_default(),
+                    attachment.device.clone().unwrap_or_default(),
+                )) || attachment.state.as_deref() != Some(VOLUME_ATTACHMENT_STATE_DETACHING)
+            });
+        }
+    }
+
     /// The volume's `VolumeState` at `now`.
+    ///
+    /// A volume being created is `creating`; one an instance still holds an attachment of
+    /// is `in-use` ("The volume state", `Volume$State`, over `VolumeState`'s members); and
+    /// one attached to nothing is `available`.
     pub fn state_at(&self, now: Instant) -> &'static str {
         if now < self.available_at {
             VOLUME_STATE_CREATING
-        } else {
+        } else if self.attachments_at(now).is_empty() {
             VOLUME_STATE_AVAILABLE
+        } else {
+            VOLUME_STATE_IN_USE
         }
     }
 
@@ -4072,16 +4209,27 @@ pub fn require_known_volume<E>(
     volume_id: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
     if !volume_id_is_well_formed(volume_id) {
-        return Err(crate::scaffolded::Scaffolded::service_error(
-            INVALID_VOLUME_ID_MALFORMED,
-            400,
-            format!("Invalid id: '{volume_id}'"),
-        ));
+        return Err(invalid_volume_id_malformed(volume_id));
     }
     if !store.volumes.contains_key(volume_id) {
         return Err(invalid_volume_id_not_found(volume_id));
     }
     Ok(())
+}
+
+/// Refuse a request that named something that is not a volume id at all: HTTP 400
+/// `InvalidVolumeID.Malformed`, which EC2 answers BEFORE it looks the id up.
+///
+/// The ONE wording of that refusal: [`require_known_volume`] answers it for an operation
+/// that resolves the volume straight away, and an operation that answers its `DryRun`
+/// probe between the two halves of the rule calls this and
+/// [`invalid_volume_id_not_found`] itself.
+pub fn invalid_volume_id_malformed<E>(volume_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_VOLUME_ID_MALFORMED,
+        400,
+        format!("Invalid id: '{volume_id}'"),
+    )
 }
 
 /// Refuse a request that named a volume id no volume of the account has, the way EC2
@@ -4564,13 +4712,7 @@ pub fn invalid_snapshot_id_not_found<E>(snapshot_id: &str) -> crate::scaffolded:
 /// hexadecimal digits — the short and the long id form, as the model's own
 /// `^snap-([0-9a-f]{8}|[0-9a-f]{17})$` style id patterns read.
 pub fn snapshot_id_is_well_formed(id: &str) -> bool {
-    let Some(suffix) = id.strip_prefix("snap-") else {
-        return false;
-    };
-    matches!(suffix.len(), 8 | 17)
-        && suffix
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    prefixed_id_is_well_formed("snap", id)
 }
 
 /// Refuse a snapshot id the request named that this service cannot resolve: a malformed
@@ -5235,13 +5377,7 @@ pub const INVALID_USER_ID_MALFORMED: &str = "InvalidUserID.Malformed";
 /// answers `InvalidAMIID.Malformed` for anything else, BEFORE it looks the id up, which is
 /// a different answer from `InvalidAMIID.NotFound` for a well-formed id no image has.
 pub fn image_id_is_well_formed(id: &str) -> bool {
-    let Some(suffix) = id.strip_prefix("ami-") else {
-        return false;
-    };
-    matches!(suffix.len(), 8 | 17)
-        && suffix
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    prefixed_id_is_well_formed("ami", id)
 }
 
 /// Is `id` shaped like an Amazon Web Services account id — [`AWS_ACCOUNT_ID_DIGITS`]
@@ -9283,6 +9419,521 @@ impl ComAmazonawsEc2Amazonec2State {
 /// spirit as the count ceilings — the point is that a zero-tag connection is not free
 /// against [`MAX_STORED_BYTES`], not that it is byte-exact.
 pub const VPC_ENDPOINT_CONNECTION_RECORD_BYTES: usize = 512;
+
+// =============================================================================
+// Amazon S3 storage locations a request names
+// =============================================================================
+
+/// The code EC2 answers when it cannot read the Amazon S3 location a request named — the
+/// bucket is not one it can reach at all.
+pub const INACCESSIBLE_STORAGE_LOCATION: &str = "InaccessibleStorageLocation";
+
+/// The shortest name a general-purpose Amazon S3 bucket may have: "Bucket names must be
+/// between 3 (min) and 63 (max) characters long" (Amazon S3 User Guide, "General purpose
+/// bucket naming rules").
+pub const MIN_S3_BUCKET_NAME_CHARS: usize = 3;
+
+/// The longest name a general-purpose Amazon S3 bucket may have (see
+/// [`MIN_S3_BUCKET_NAME_CHARS`]).
+pub const MAX_S3_BUCKET_NAME_CHARS: usize = 63;
+
+/// The prefixes a general-purpose bucket name must not start with: "Bucket names must not
+/// start with the prefix `xn--`. … must not start with the prefix `sthree-`. … must not
+/// start with the prefix `amzn-s3-demo-`" (Amazon S3 User Guide, "General purpose bucket
+/// naming rules").
+pub const S3_BUCKET_NAME_RESERVED_PREFIXES: [&str; 3] = ["xn--", "sthree-", "amzn-s3-demo-"];
+
+/// The suffixes a general-purpose bucket name must not end with: "Bucket names must not end
+/// with the suffix `-s3alias`. … must not end with the suffix `--ol-s3`. … must not end with
+/// the suffix `.mrap`. … must not end with the suffix `--x-s3`. … must not end with the
+/// suffix `--table-s3`" (Amazon S3 User Guide, "General purpose bucket naming rules").
+pub const S3_BUCKET_NAME_RESERVED_SUFFIXES: [&str; 5] =
+    ["-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table-s3"];
+
+/// Is `name` a legal general-purpose Amazon S3 bucket name?
+///
+/// Every rule below is one sentence of the Amazon S3 User Guide's "General purpose bucket
+/// naming rules": the length ([`MIN_S3_BUCKET_NAME_CHARS`]..=[`MAX_S3_BUCKET_NAME_CHARS`]),
+/// "can consist only of lowercase letters, numbers, dots (.), and hyphens (-)", "must begin
+/// and end with a letter or number", "must not contain two adjacent periods", "must not be
+/// formatted as an IP address (for example, 192.168.5.4)", and the reserved prefixes and
+/// suffixes above. A value that breaks any of them names no bucket at all, so no service can
+/// read an object out of it.
+pub fn s3_bucket_name_is_well_formed(name: &str) -> bool {
+    // The character set FIRST, so the length rule below counts characters of a name that
+    // can only be ASCII — "can consist only of lowercase letters, numbers, dots (.), and
+    // hyphens (-)" — and a byte count is that character count.
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.')
+    {
+        return false;
+    }
+    if !(MIN_S3_BUCKET_NAME_CHARS..=MAX_S3_BUCKET_NAME_CHARS).contains(&name.len()) {
+        return false;
+    }
+    let begins_and_ends_alphanumeric = name
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && name
+            .bytes()
+            .next_back()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    if !begins_and_ends_alphanumeric {
+        return false;
+    }
+    if name.contains("..") {
+        return false;
+    }
+    // "Must not be formatted as an IP address": four dot-separated decimal octets.
+    if name.parse::<::std::net::Ipv4Addr>().is_ok() {
+        return false;
+    }
+    if S3_BUCKET_NAME_RESERVED_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        return false;
+    }
+    !S3_BUCKET_NAME_RESERVED_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+/// Refuse a request whose Amazon S3 storage location this service cannot read: HTTP 400
+/// `InaccessibleStorageLocation`.
+pub fn inaccessible_storage_location<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(INACCESSIBLE_STORAGE_LOCATION, 400, message)
+}
+
+/// The bucket and key of a storage location a request named, refused the way EC2 refuses
+/// one it cannot read.
+///
+/// `member` names the request member the location came from, so the message says which one
+/// was wrong. A location that names no bucket or no key names no object — there is nothing
+/// to read — and a bucket name outside [`s3_bucket_name_is_well_formed`] names no bucket at
+/// all, which is [`INACCESSIBLE_STORAGE_LOCATION`]. The bucket is checked BEFORE the key,
+/// because a name that is not a bucket name is already enough to answer with.
+pub fn readable_storage_location<'a, E>(
+    location: &'a StorageLocation,
+    member: &str,
+) -> Result<(&'a str, &'a str), Scaffolded<E>> {
+    let bucket = location
+        .bucket
+        .as_deref()
+        .filter(|bucket| !bucket.is_empty())
+        .ok_or_else(|| missing_parameter(format!("{member} must name an S3 bucket")))?;
+    if !s3_bucket_name_is_well_formed(bucket) {
+        return Err(inaccessible_storage_location(format!(
+            "The S3 bucket '{bucket}' named by {member} is not an accessible storage \
+             location: an S3 bucket name holds {MIN_S3_BUCKET_NAME_CHARS} to \
+             {MAX_S3_BUCKET_NAME_CHARS} lowercase letters, digits, dots and hyphens, \
+             begins and ends with a letter or a digit, and is not formatted as an IP address"
+        )));
+    }
+    let key = location
+        .key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| missing_parameter(format!("{member} must name an S3 object key")))?;
+    Ok((bucket, key))
+}
+
+// =============================================================================
+// Amazon FPGA Images (AFIs)
+// =============================================================================
+
+/// An AFI whose creation is still running: `FpgaImageStateCode`'s `pending`
+/// (`crate::ops::types::FPGA_IMAGE_STATE_CODE_VALUES` is the generated catalog).
+pub const FPGA_IMAGE_STATE_PENDING: &str = "pending";
+
+/// An AFI whose creation did not produce a bitstream: `FpgaImageStateCode`'s `failed`.
+pub const FPGA_IMAGE_STATE_FAILED: &str = "failed";
+
+/// The id prefix of an Amazon FPGA Image: `afi-`.
+pub const FPGA_IMAGE_ID_PREFIX: &str = "afi";
+
+/// The one resource type `CreateFpgaImage`'s `TagSpecifications` can name: "The tags to
+/// apply to the FPGA image during creation"
+/// (`CreateFpgaImageRequest$TagSpecifications`), which is the `fpga-image` member of
+/// `ResourceType`.
+pub const FPGA_IMAGE_TAGGABLE_RESOURCE: &str = "fpga-image";
+
+/// The resource types a restore of an AMI from Amazon S3 may tag: "You can tag the AMI, the
+/// snapshots, or both. To tag the AMI, the value for `ResourceType` must be `image`. To tag
+/// the snapshots, the value for `ResourceType` must be `snapshot`"
+/// (`CreateRestoreImageTaskRequest$TagSpecifications`) — the `image` and `snapshot` members
+/// of `ResourceType`.
+pub const IMAGE_TAGGABLE_RESOURCES: [&str; 2] = ["image", "snapshot"];
+
+/// The id prefix of the global identifier of an Amazon FPGA Image: `agfi-`
+/// ("The global FPGA image identifier (AGFI ID)", `CreateFpgaImageResult$FpgaImageGlobalId`).
+pub const FPGA_IMAGE_GLOBAL_ID_PREFIX: &str = "agfi";
+
+/// The code EC2 answers for something that is not an AFI id at all.
+pub const INVALID_FPGA_IMAGE_ID_MALFORMED: &str = "InvalidFpgaImageID.Malformed";
+
+/// The code EC2 answers for an AFI id the account holds no FPGA image for.
+pub const INVALID_FPGA_IMAGE_ID_NOT_FOUND: &str = "InvalidFpgaImageID.NotFound";
+
+/// EC2's own code for a request that would take the account past a resource limit this
+/// service answers no resource-specific code for — "You have exceeded an Amazon EC2
+/// resource limit" (EC2 API error codes, `ResourceLimitExceeded`).
+pub const RESOURCE_LIMIT_EXCEEDED: &str = "ResourceLimitExceeded";
+
+/// How many Amazon FPGA Images this emulator stores before `CreateFpgaImage` is refused.
+///
+/// CHOSEN, like [`MAX_STORED_VOLUMES`] and for the same reason: the store lives in this
+/// process's memory, so the number of AFIs a caller can create has to be finite. It is well
+/// above the published per-Region AFI quota (10 by default, which is adjustable), so a test
+/// that creates more than a real account's default quota is not refused for a reason this
+/// emulator cannot have.
+pub const MAX_FPGA_IMAGES: usize = 1_000;
+
+/// Refuse a request that would take the store past a ceiling with no resource-specific code
+/// of its own: HTTP 400 [`RESOURCE_LIMIT_EXCEEDED`].
+pub fn resource_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(RESOURCE_LIMIT_EXCEEDED, 400, message)
+}
+
+/// Is `id` shaped like an AFI id?
+///
+/// `afi-` followed by 8 or 17 lowercase hexadecimal digits — the short and the long id form,
+/// the same two forms [`volume_id_is_well_formed`] and [`image_id_is_well_formed`] accept,
+/// read by the one [`prefixed_id_is_well_formed`] every resource of this module asks.
+/// EC2 answers `InvalidFpgaImageID.Malformed` for anything else, BEFORE it looks the id up.
+pub fn fpga_image_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(FPGA_IMAGE_ID_PREFIX, id)
+}
+
+/// Refuse a request that named an AFI id the account holds no FPGA image for: HTTP 400
+/// `InvalidFpgaImageID.NotFound`.
+pub fn invalid_fpga_image_id_not_found<E>(fpga_image_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_FPGA_IMAGE_ID_NOT_FOUND,
+        400,
+        format!("The FPGA image id '{fpga_image_id}' does not exist"),
+    )
+}
+
+/// Refuse an AFI id the request named that is not an AFI id at all: HTTP 400
+/// `InvalidFpgaImageID.Malformed`, which EC2 answers BEFORE it looks the id up.
+///
+/// The pair of this and [`invalid_fpga_image_id_not_found`] is the ONE reading of the
+/// malformed-before-not-found order for an AFI; they are two functions rather than one
+/// `require_known_…` because every operation that takes an AFI id answers its `DryRun`
+/// probe between them.
+pub fn invalid_fpga_image_id_malformed<E>(fpga_image_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_FPGA_IMAGE_ID_MALFORMED,
+        400,
+        format!("Invalid id: '{fpga_image_id}'"),
+    )
+}
+
+/// One stored Amazon FPGA Image: the modelled [`FpgaImage`] every operation that reports one
+/// answers with, its load permissions, and the move the clock owes its creation.
+///
+/// The view holds no `State`: an AFI's state is a fact of how far its creation has got, so
+/// [`FpgaImageRecord::view_at`] derives it from the stored due instant rather than letting
+/// two writers store two different words for it — the same way [`VolumeRecord`] treats a
+/// volume's state.
+///
+/// "The create operation is asynchronous. To verify that the AFI was successfully created
+/// and is ready for use, check the output logs" (`CreateFpgaImage`): the call hands back a
+/// `pending` AFI, and the outcome of the creation is reported in the AFI's own state. This
+/// emulator stores no Amazon S3 objects, so nothing can read the design checkpoint the
+/// request named and no bitstream is ever produced — the creation therefore ends in the
+/// modelled `failed` state carrying [`FpgaImageRecord::failure_message`], which says so,
+/// rather than in an `available` AFI nothing built.
+#[derive(Debug, Clone)]
+pub struct FpgaImageRecord {
+    /// The AFI as the model shapes it, with `State` left for [`FpgaImageRecord::view_at`].
+    pub view: FpgaImage,
+    /// "The load permissions" (`FpgaImageAttribute$LoadPermissions`) of this AFI: which
+    /// accounts and groups may load it onto an FPGA. `ModifyFpgaImageAttribute` adds and
+    /// removes them and `ResetFpgaImageAttribute` resets them to the default, which is none
+    /// — an AFI starts loadable by its owner only.
+    pub load_permissions: Vec<LoadPermission>,
+    /// The instant from which this AFI's `pending` -> `failed` move is due. Monotonic
+    /// ([`Instant`]) for the same reason [`VolumeRecord::available_at`] is.
+    pub resolved_at: Instant,
+    /// Why the creation failed, reported as `FpgaImageState$Message` once the move above is
+    /// due. Built from the request's own storage location, never from a recording.
+    pub failure_message: String,
+    /// The caller-chosen bytes this record was charged against [`MAX_STORED_BYTES`] when it
+    /// was stored ([`fpga_image_payload_bytes`]), so the removal path gives back exactly
+    /// what the create charged.
+    pub payload_bytes: usize,
+}
+
+impl FpgaImageRecord {
+    /// This AFI as of `now`: the stored view with the `State` the clock has reached.
+    pub fn view_at(&self, now: Instant) -> FpgaImage {
+        let mut view = self.view.clone();
+        view.state = Some(self.state_at(now));
+        view
+    }
+
+    /// The AFI's `FpgaImageState` at `now`.
+    pub fn state_at(&self, now: Instant) -> FpgaImageState {
+        if now < self.resolved_at {
+            FpgaImageState {
+                code: Some(FPGA_IMAGE_STATE_PENDING.to_string()),
+                message: None,
+            }
+        } else {
+            FpgaImageState {
+                code: Some(FPGA_IMAGE_STATE_FAILED.to_string()),
+                message: Some(self.failure_message.clone()),
+            }
+        }
+    }
+}
+
+/// The caller-chosen bytes one stored AFI holds: its tags, the name and description the
+/// request gave it, the storage locations it named and the `ClientToken` the token map keeps
+/// for it. Everything else on the record — the ids, the account, the states and the
+/// timestamps — is derived by this module, so it is fixed-size.
+///
+/// The ONE definition of that charge, the way [`volume_payload_bytes`] is for a volume: a
+/// writer charges exactly it, and a removal path gives back the same number.
+pub fn fpga_image_payload_bytes(
+    tags: &[Tag],
+    name: Option<&str>,
+    description: Option<&str>,
+    locations: &[&str],
+    client_token: Option<&str>,
+) -> usize {
+    tag_list_bytes(tags)
+        .saturating_add(name.map_or(0, str::len))
+        .saturating_add(description.map_or(0, str::len))
+        .saturating_add(locations.iter().map(|value| value.len()).sum())
+        .saturating_add(client_token.map_or(0, str::len))
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Take the AFI `fpga_image_id` out of the store, and answer the record as it was last
+    /// stored; `None` when the store holds no such AFI.
+    ///
+    /// The bytes the record was charged are given back and any `ClientToken` that named it
+    /// is dropped, so a token can never name an AFI that is gone — the same contract
+    /// [`Self::remove_launch_template`] keeps for a launch template.
+    pub fn remove_fpga_image(&mut self, fpga_image_id: &str) -> Option<FpgaImageRecord> {
+        let record = self.fpga_images.remove(fpga_image_id)?;
+        self.fpga_image_client_tokens
+            .retain(|_, minted| minted != fpga_image_id);
+        self.release_stored_bytes(record.payload_bytes);
+        Some(record)
+    }
+}
+
+// =============================================================================
+// AMI watermarks
+// =============================================================================
+
+/// The characters a `WatermarkName` may carry beside letters and digits: "Constraints: 3-128
+/// alphanumeric characters, parentheses (()), square brackets ([]), spaces ( ), periods (.),
+/// slashes (/), dashes (-), single quotes ('), at-signs (@), or underscores(_)"
+/// (`AttachImageWatermarkRequest$WatermarkName`). The LENGTH of that sentence is modelled
+/// (`@length(min: 3, max: 128)`) and refused before a handler runs; the character set is
+/// not, so a handler is the only place it can be enforced.
+pub const WATERMARK_NAME_PUNCTUATION: &str = "()[] ./-'@_";
+
+/// How many watermarks one AMI carries before an attach is refused.
+///
+/// CHOSEN: AWS publishes no quota for watermarks per AMI, and each attach retains the
+/// caller's watermark name for the process's lifetime, so the list needs a ceiling that is
+/// not the process's memory. The bytes each watermark retains are charged against
+/// [`MAX_STORED_BYTES`] as well.
+pub const MAX_WATERMARKS_PER_IMAGE: usize = 50;
+
+/// Is `name` a well-formed `WatermarkName` — does it carry only the characters
+/// [`WATERMARK_NAME_PUNCTUATION`]'s sentence allows?
+pub fn watermark_name_is_well_formed(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || WATERMARK_NAME_PUNCTUATION.contains(c))
+}
+
+/// The `WatermarkKey` a watermark named `watermark_name` attached by `account` carries: "The
+/// watermark identifier, in `accountId:watermarkName` format (for example,
+/// `123456789012:approvedAmi`). The `accountId` portion is the Amazon Web Services account
+/// ID of the watermark creator. The `watermarkName` portion is customer-provided"
+/// (`ImageWatermark$WatermarkKey`).
+pub fn image_watermark_key(account: &str, watermark_name: &str) -> String {
+    format!("{account}:{watermark_name}")
+}
+
+// =============================================================================
+// The Recycle Bin
+// =============================================================================
+
+/// A volume that has been deleted: `VolumeState`'s `deleted`, which is what a volume held in
+/// the Recycle Bin reports — it has been deleted, and is kept only until its retention
+/// period runs out.
+pub const VOLUME_STATE_DELETED: &str = "deleted";
+
+/// The page sizes a report of the Recycle Bin's volumes accepts: "Valid range: 5 - 500"
+/// (`ListVolumesInRecycleBinRequest$MaxResults`). A request that names none gets the top of
+/// this range, so the `NextToken` path behaves the same whether or not a page size was asked
+/// for.
+pub const RECYCLE_BIN_PAGE_SIZE_RANGE: (i32, i32) = (5, 500);
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Move the stored volume `volume_id` into the Recycle Bin, where it stays for
+    /// `retention`, and answer the entry a report of the bin now holds for it.
+    ///
+    /// `None` when the store holds no such volume. The entry is DERIVED from the stored
+    /// volume rather than taken from a request, so a volume's size, type, zone and
+    /// provisioning cannot read differently inside the bin from outside it; `retention` is
+    /// the retention period of the Recycle Bin rule that covered the volume, which is a fact
+    /// of that rule (Amazon Recycle Bin, "Retention rules") and so is given by the caller.
+    pub fn move_volume_to_recycle_bin(
+        &mut self,
+        volume_id: &str,
+        now: SystemTime,
+        retention: Duration,
+    ) -> Option<VolumeRecycleBinInfo> {
+        let record = self.volumes.remove(volume_id)?;
+        if let Some(token) = self
+            .volume_client_tokens
+            .iter()
+            .find(|(_, minted)| minted.as_str() == volume_id)
+            .map(|(token, _)| token.clone())
+        {
+            self.volume_client_tokens.remove(&token);
+        }
+        let view = record.view;
+        let entry = VolumeRecycleBinInfo {
+            volume_id: view.volume_id.clone(),
+            volume_type: view.volume_type.clone(),
+            // "The state of the volume" (`VolumeRecycleBinInfo$State`): a volume in the
+            // Recycle Bin has been deleted and is kept only until its retention period runs
+            // out, which is `VolumeState`'s `deleted`.
+            state: Some(VOLUME_STATE_DELETED.to_string()),
+            size: view.size,
+            iops: view.iops,
+            throughput: view.throughput,
+            outpost_arn: view.outpost_arn.clone(),
+            availability_zone: view.availability_zone.clone(),
+            availability_zone_id: view.availability_zone_id.clone(),
+            source_volume_id: view.source_volume_id.clone(),
+            snapshot_id: view.snapshot_id.clone(),
+            operator: view.operator.clone(),
+            create_time: view.create_time,
+            // "The date and time when the volume entered the Recycle Bin" — now — and "the
+            // date and time when the volume is to be permanently deleted from the Recycle
+            // Bin", which is when the retention period that covered it runs out.
+            recycle_bin_enter_time: Some(system_time_to_date_time(now)),
+            recycle_bin_exit_time: Some(system_time_to_date_time(now + retention)),
+        };
+        self.volumes_in_recycle_bin
+            .insert(volume_id.to_string(), entry.clone());
+        Some(entry)
+    }
+}
+
+// =============================================================================
+// AMI usage reports
+// =============================================================================
+
+/// The code EC2 answers for a report id the account holds no AMI usage report for.
+///
+/// EC2 names a resource a request could not resolve `Invalid<Resource>Id.NotFound` — as
+/// [`INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND`] and [`INVALID_FPGA_IMAGE_ID_NOT_FOUND`] read —
+/// so a report id that names nothing is answered the same way.
+pub const INVALID_IMAGE_USAGE_REPORT_ID_NOT_FOUND: &str = "InvalidImageUsageReportId.NotFound";
+
+/// Refuse a request that named a report id the account holds no AMI usage report for: HTTP
+/// 400 `InvalidImageUsageReportId.NotFound`.
+pub fn invalid_image_usage_report_id_not_found<E>(report_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_IMAGE_USAGE_REPORT_ID_NOT_FOUND,
+        400,
+        format!("The image usage report id '{report_id}' does not exist"),
+    )
+}
+
+// =============================================================================
+// Instance export tasks
+// =============================================================================
+
+/// The code EC2 answers for an export task id the account holds no export task for.
+pub const INVALID_EXPORT_TASK_ID_NOT_FOUND: &str = "InvalidExportTaskID.NotFound";
+
+/// An export task that is still running: `ExportTaskState`'s `active`
+/// (`crate::ops::types::EXPORT_TASK_STATE_VALUES` is the generated catalog).
+pub const EXPORT_TASK_STATE_ACTIVE: &str = "active";
+
+/// An export task a cancel has started taking down: `ExportTaskState`'s `cancelling`.
+pub const EXPORT_TASK_STATE_CANCELLING: &str = "cancelling";
+
+/// An export task whose cancellation is done: `ExportTaskState`'s `cancelled`.
+pub const EXPORT_TASK_STATE_CANCELLED: &str = "cancelled";
+
+/// An export task that finished: `ExportTaskState`'s `completed`.
+pub const EXPORT_TASK_STATE_COMPLETED: &str = "completed";
+
+/// One stored instance export task: the modelled [`ExportTask`] every operation that reports
+/// one answers with, plus the move the clock owes a cancellation.
+///
+/// "Cancels an active export task" (`CancelExportTask`): a cancel puts the task into the
+/// non-terminal `cancelling` state, so the clock owes it `cancelled` [`TRANSITION_DELAY`]
+/// later whether or not anybody calls again. The due instant is stored and
+/// [`ExportTaskRecord::view_at`] derives the state from it, the way [`VolumeRecord`] does
+/// for a volume.
+#[derive(Debug, Clone)]
+pub struct ExportTaskRecord {
+    /// The export task as the model shapes it, carrying the state it has reached on its own.
+    pub view: ExportTask,
+    /// When the `cancelling` -> `cancelled` move of a cancelled task falls due; `None` for a
+    /// task nothing has cancelled.
+    pub cancelled_at: Option<Instant>,
+}
+
+impl ExportTaskRecord {
+    /// This export task as of `now`: the stored view with the state the clock has reached.
+    pub fn view_at(&self, now: Instant) -> ExportTask {
+        let mut view = self.view.clone();
+        if let Some(state) = self.cancellation_state_at(now) {
+            view.state = Some(state.to_string());
+        }
+        view
+    }
+
+    /// The state a cancelled task has reached at `now`, or `None` for a task nothing has
+    /// cancelled — whose state is the one the task itself carries.
+    fn cancellation_state_at(&self, now: Instant) -> Option<&'static str> {
+        self.cancelled_at.map(|due_at| {
+            if now >= due_at {
+                EXPORT_TASK_STATE_CANCELLED
+            } else {
+                EXPORT_TASK_STATE_CANCELLING
+            }
+        })
+    }
+
+    /// The task's `ExportTaskState` at `now`.
+    pub fn state_at(&self, now: Instant) -> String {
+        self.cancellation_state_at(now)
+            .map(str::to_string)
+            .or_else(|| self.view.state.clone())
+            .unwrap_or_else(|| EXPORT_TASK_STATE_ACTIVE.to_string())
+    }
+}
+
+/// Refuse a request that named an export task id the account holds no export task for: HTTP
+/// 400 `InvalidExportTaskID.NotFound`.
+pub fn invalid_export_task_id_not_found<E>(export_task_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_EXPORT_TASK_ID_NOT_FOUND,
+        400,
+        format!("The export task id '{export_task_id}' does not exist"),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Block public access for snapshots

@@ -179,7 +179,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // ONE answer of this operation is real: the ACCOUNT-INSTANCE restriction. Account
         // assignments are a feature of an organization instance, so on an account
         // instance this call can never do anything and AWS refuses it with the modelled
@@ -194,9 +193,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        if state
-            .lock()
-            .permission_set_surface_withdrawn(&input.instance_arn)
+        let withdrawn = {
+            let mut store = state.lock();
+            // The account's ambient instance if nothing has enabled one yet, and what the
+            // clock already owes, so this call resolves the same instance a read at this
+            // instant would resolve.
+            store.on_request(
+                &crate::state::request_region(ctx.parts()),
+                ::std::time::SystemTime::now(),
+            );
+            store.permission_set_surface_withdrawn(&input.instance_arn)
+        };
+        if withdrawn
         {
             return Err(DeleteAccountAssignmentErrorModeled::ValidationException(
                 ValidationException {
