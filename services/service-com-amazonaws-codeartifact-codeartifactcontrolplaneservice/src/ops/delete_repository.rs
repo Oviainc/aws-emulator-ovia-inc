@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRepository
-//! Removes a repository from its domain and answers with the record as it was just
-//! before removal, which is what makes the delete observable to the caller. Removing it
-//! is what moves the domain's derived `repositoryCount` back down.
+//! Removes a repository from its domain and answers with the record it removed, which is
+//! what makes the delete observable to the caller. Removing it is what moves the domain's
+//! derived `repositoryCount` back down.
+//!
+//! The disappearance of the named repository is the operation's goal, not a precondition:
+//! a repository the domain does not hold is NOT refused, the call succeeds with HTTP 200
+//! carrying no `repository`. The enclosing DOMAIN is a different matter — it is the scope
+//! the request is addressed to, so a domain this account does not hold is still the
+//! modelled `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -161,6 +167,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // The domain is the SCOPE the request addresses, not the resource it deletes: a
+        // domain this caller does not hold is the modelled not-found refusal.
         let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
             return Err(DeleteRepositoryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -176,24 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Removing it is the whole operation: the next DescribeRepository must answer
-        // 404, and the domain's derived `repositoryCount` drops by one.
-        let Some(removed) = domain.repositories.remove(&input.repository) else {
-            return Err(DeleteRepositoryErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::repository_not_found_message(
-                        &input.domain,
-                        input.domain_owner.as_deref(),
-                        &input.repository,
-                    ),
-                    resource_id: Some(input.repository.clone()),
-                    resource_type: Some("repository".to_string()),
-                },
-            )
-            .into());
-        };
+        // 404, and the domain's derived `repositoryCount` drops by one. A repository the
+        // domain does not hold leaves nothing to remove and nothing to report, which is
+        // success with no `repository` member — the delete is idempotent in its target.
+        let removed = domain.repositories.remove(&input.repository);
 
         Ok(DeleteRepositoryOutput {
-            repository: Some(removed.description()),
+            repository: removed.as_ref().map(crate::state::Repository::description),
         })
     }
 }

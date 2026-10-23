@@ -22,8 +22,10 @@
 //! 4. `policyDocument` must be a JSON policy object; anything else is
 //!    `ValidationException` (400) and stores nothing.
 //! 5. Addressing a resource that is not held is `ResourceNotFoundException` (404): an
-//!    unknown domain, an unknown repository, a domain owned by another account, and a
-//!    repository carrying no policy (for the reporting and deleting operations).
+//!    unknown domain, an unknown repository, and a domain owned by another account. A
+//!    repository that is held but carries NO policy is a different case: the report is a
+//!    404, while the delete — whose goal is already met — answers 200 with the bare
+//!    `ResourcePolicy` envelope naming the repository.
 //! 6. A delete answers with the policy as it was immediately before removal, and the
 //!    removal is observable to the very next call.
 
@@ -185,19 +187,21 @@ async fn policy_round_trips_verbatim_and_its_revision_locks_the_next_write() {
             "case {label:?}: create repository failed"
         );
 
-        // RULE 5: a repository starts with no policy, so there is nothing to report or
-        // delete yet.
+        // RULE 5: a repository starts with no policy, so there is nothing to report — and
+        // nothing to delete, which the delete answers as success carrying only the
+        // envelope that names the repository it targeted.
         let missing = get_policy(&router, &domain, &repository).await;
         assert_eq!(
             (missing.status, missing.code().as_str()),
             (404, "ResourceNotFoundException"),
             "case {label:?}: get before any put, got {missing:?}"
         );
-        let missing = delete_policy(&router, &domain, &repository, None).await;
+        let nothing = delete_policy(&router, &domain, &repository, None).await;
         assert_eq!(
-            (missing.status, missing.code().as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: delete before any put, got {missing:?}"
+            (nothing.status, policy(&nothing).clone()),
+            (200, json!({ "resourceArn": arn })),
+            "case {label:?}: delete before any put must answer the bare envelope, got \
+             {nothing:?}"
         );
 
         // RULE 2: naming a revision when nothing is attached cannot match, so the lock
