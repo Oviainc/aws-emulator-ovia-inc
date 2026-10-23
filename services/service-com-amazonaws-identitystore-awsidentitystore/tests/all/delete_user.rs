@@ -14,9 +14,8 @@
 
 use serde_json::{json, Value};
 
-use crate::identity_store_lifecycle::{
-    call, create_group, create_user, emulator, ok, refused, string, user_name, OTHER_STORE, STORE,
-};
+use crate::harness::{call, emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::identity_store_lifecycle::{create_group, create_user, user_name};
 
 /// The upper bound of the modelled `ResourceRevision` length
 /// (`smithy_query(query="operation",operation="DeleteUser")`: `Revision`, len 1..64,
@@ -86,9 +85,9 @@ async fn deleting_a_user_removes_that_user_and_nothing_else() {
         for index in 0..3 {
             users.push(create_user(&router, STORE, &user_name(case, index), case).await);
         }
-        // A user of another identity store with the same ordinal, so the delete's scope
-        // is observable: stores do not share records.
-        let elsewhere = create_user(&router, OTHER_STORE, &user_name(case, victim), case).await;
+        // A GROUP of the same store, so the delete's scope is observable: deleting a
+        // user removes that user and nothing else the store holds.
+        let group = create_group(&router, STORE, &format!("group-{case}"), case).await;
 
         let deleted = ok(
             &router,
@@ -108,10 +107,13 @@ async fn deleting_a_user_removes_that_user_and_nothing_else() {
                 index != victim
             );
         }
-        assert!(
-            user_exists(&router, OTHER_STORE, &elsewhere).await,
-            "case {case:?}: expected the other store's user {elsewhere} to survive"
-        );
+        ok(
+            &router,
+            "DescribeGroup",
+            json!({ "IdentityStoreId": STORE, "GroupId": group.clone() }),
+            case,
+        )
+        .await;
 
         // Deleting it again finds nothing to delete.
         let body = refused(
@@ -349,24 +351,27 @@ async fn a_delete_accepts_every_form_of_the_user_id_and_refuses_one_it_does_not_
     }
 
     // And the rows a delete cannot satisfy: the id names no user of the store the
-    // request names.
+    // request names, or the store itself does not exist.
     let router = emulator();
     let known = create_user(&router, STORE, "alice", "seed").await;
-    let missing: [(&str, Value); 3] = [
+    let missing: [(&str, Value, &str); 3] = [
         (
-            "an uncreated id in a live store",
+            "an uncreated id in the live store",
             json!({ "IdentityStoreId": STORE, "UserId": UNCREATED_ID }),
+            "USER",
         ),
         (
-            "a user of another store",
-            json!({ "IdentityStoreId": OTHER_STORE, "UserId": known.clone() }),
+            "a known user, through a store that does not exist",
+            json!({ "IdentityStoreId": MISSING_STORE, "UserId": known.clone() }),
+            "IDENTITY_STORE",
         ),
         (
-            "a store nothing was created in",
-            json!({ "IdentityStoreId": OTHER_STORE, "UserId": UNCREATED_ID }),
+            "a store that does not exist",
+            json!({ "IdentityStoreId": MISSING_STORE, "UserId": UNCREATED_ID }),
+            "IDENTITY_STORE",
         ),
     ];
-    for (case, request) in missing {
+    for (case, request, expected_type) in missing {
         let body = refused(
             &router,
             "DeleteUser",
@@ -378,18 +383,23 @@ async fn a_delete_accepts_every_form_of_the_user_id_and_refuses_one_it_does_not_
         .await;
         assert_eq!(
             body["ResourceType"].as_str().unwrap_or_default(),
-            "USER",
-            "case {case:?}: expected the modelled USER ResourceType, got {body}"
+            expected_type,
+            "case {case:?}: expected the modelled {expected_type} ResourceType, got {body}"
         );
     }
-    // A failed delete is not a write: the user it could not find in `OTHER_STORE` is
-    // still in the store that does hold it, and no store sprang into being.
+    // A failed delete is not a write: the user is still in the store that holds it, and
+    // the store that does not exist still does not.
     assert!(
         user_exists(&router, STORE, &known).await,
         "expected the known user {known} to survive three failed deletes"
     );
-    assert!(
-        !user_exists(&router, OTHER_STORE, &known).await,
-        "expected no user {known} in a store nothing was created in"
-    );
+    refused(
+        &router,
+        "DescribeUser",
+        json!({ "IdentityStoreId": MISSING_STORE, "UserId": known.clone() }),
+        404,
+        "ResourceNotFoundException",
+        "the store was not vivified",
+    )
+    .await;
 }
