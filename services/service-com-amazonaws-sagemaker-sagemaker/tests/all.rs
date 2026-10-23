@@ -35,6 +35,8 @@ mod experiment_lifecycle;
 mod feature_group_lifecycle;
 #[path = "all/hub_contents_listing.rs"]
 mod hub_contents_listing;
+#[path = "all/hyperpod_cluster_audit_record.rs"]
+mod hyperpod_cluster_audit_record;
 #[path = "all/hyperpod_cluster_listing.rs"]
 mod hyperpod_cluster_listing;
 #[path = "all/inference_deployment_lifecycle.rs"]
