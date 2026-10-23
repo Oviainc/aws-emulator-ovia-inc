@@ -26,7 +26,15 @@ pub struct ListGatewayTargetsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#TargetSummary")]
+/// `TargetSummary`, the row `ListGatewayTargets` carries. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt`, `updatedAt` and `lastSynchronizedAt` target `DateTimestamp`, which
+/// carries `@timestampFormat("date-time")` (`smithy_query(query="shape",
+/// shape="TargetSummary")`), and the derive does not put that trait on a member schema —
+/// see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct TargetSummary {
     pub target_id: String,
@@ -41,4 +49,44 @@ pub struct TargetSummary {
     pub target_type: Option<String>,
     pub listing_mode: Option<String>,
 }
+
+agentcore_schema_and_codec!(
+    TargetSummary,
+    TARGET_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#TargetSummary",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "TargetSummary",
+    (M_TARGET_ID, target_id, "targetId", 0, req, string),
+    (M_NAME, name, "name", 1, req, string),
+    (M_STATUS, status, "status", 2, req, string),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (M_CREATED_AT, created_at, "createdAt", 4, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 5, req, date_time),
+    (
+        M_RESOURCE_PRIORITY,
+        resource_priority,
+        "resourcePriority",
+        6,
+        opt,
+        integer
+    ),
+    (
+        M_LAST_SYNCHRONIZED_AT,
+        last_synchronized_at,
+        "lastSynchronizedAt",
+        7,
+        opt,
+        date_time
+    ),
+    (
+        M_AUTHORIZATION_DATA,
+        authorization_data,
+        "authorizationData",
+        8,
+        opt,
+        union_of(AuthorizationData)
+    ),
+    (M_TARGET_TYPE, target_type, "targetType", 9, opt, string),
+    (M_LISTING_MODE, listing_mode, "listingMode", 10, opt, string),
+);
 
