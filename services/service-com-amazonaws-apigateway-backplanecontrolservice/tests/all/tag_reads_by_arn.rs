@@ -17,9 +17,11 @@
 //! portion is the URI of the operation that reads that resource
 //! (`smithy_query(query="operation", operation="GetRestApi,GetStage,GetApiKey")`:
 //! `/restapis/{restApiId}`, `/restapis/{restApiId}/stages/{stageName}`,
-//! `/apikeys/{apiKey}`). Those three are the kinds this emulator stores records for, so
-//! the table spans all three; the kinds whose creates are still scaffolds can hold no
-//! record and are covered among the 404 rows.
+//! `/apikeys/{apiKey}`). Those three are the kinds this suite's harness builds records
+//! for, so the table spans all three; a custom domain name's tags are read by its ARN in
+//! the `domain_name_collection` suite, which is where that record is created, and the
+//! kinds whose creates are still scaffolds can hold no record and are covered among the
+//! 404 rows.
 //!
 //! [`Gateway`], [`Answer`], [`assert_failure`] and [`string_member`] are this crate's one
 //! wire-test harness, reused rather than standing a second emulator up another way.
@@ -376,7 +378,7 @@ async fn get_tags_answers_not_found_for_a_taggable_arn_no_record_answers_to() {
             apigateway_arn("/usageplans/zzzzz99999"),
         ),
         (
-            "a domain name, a kind with no records",
+            "a domain name no record answers to",
             apigateway_arn("/domainnames/api.example.com"),
         ),
         (

@@ -12,10 +12,11 @@
 //!
 //! The tests assert RULES over sets of inputs, not one recorded call:
 //!
-//! * the tag round trip over EVERY taggable resource kind this service stores (a REST
-//!   API, a stage, an API key) crossed with a table of tag shapes — ASCII, non-ASCII,
-//!   an empty value, the documented character set, and a key and a value at their
-//!   published length bounds;
+//! * the tag round trip over EVERY taggable resource kind this suite's harness builds a
+//!   record for (a REST API, a stage, an API key) crossed with a table of tag shapes —
+//!   ASCII, non-ASCII, an empty value, the documented character set, and a key and a
+//!   value at their published length bounds (a custom domain name's tags are read by its
+//!   ARN in the `domain_name_collection` suite, which is where that record is created);
 //! * the merge rule (`TagResource` "adds or updates") over a table of before/after
 //!   collections;
 //! * the `resourceArn` reading over a table spanning every way a value fails to name a
@@ -48,12 +49,11 @@ const STAGE: &str = "prod";
 /// The taggable resource kinds this emulator keeps no records of — the first path
 /// segment of each one's read URI. Source: `UNSTORED_TAGGABLE_KINDS` in
 /// `src/state.rs`, which lists them because the operations that would create a usage
-/// plan, a domain name, a client certificate, a VPC link or a domain name access
-/// association are still scaffolds. An ARN of one of these is well formed, so it
-/// resolves to a missing resource rather than to a bad request.
+/// plan, a client certificate, a VPC link or a domain name access association are still
+/// scaffolds. An ARN of one of these is well formed, so it resolves to a missing
+/// resource rather than to a bad request.
 const UNSTORED_KINDS: &[&str] = &[
     "usageplans",
-    "domainnames",
     "clientcertificates",
     "vpclinks",
     "domainnameaccessassociations",

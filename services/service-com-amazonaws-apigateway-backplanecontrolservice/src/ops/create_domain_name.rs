@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDomainName
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDomainName`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDomainName::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores one custom `DomainName` record — the name, the certificate and
+//! endpoint configuration the request carries, and the endpoint names API Gateway
+//! assigns it — and reports that stored record. Writes.
 //!
 //! ## Shape of an operation
 //!
@@ -191,6 +185,138 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    bound_chars, bound_domain_name, bound_entries, bound_tag, domain_name_key,
+    edge_distribution_domain_name, regional_endpoint_domain_name, DomainNameEntry,
+    DEFAULT_SECURITY_POLICY, EDGE_DISTRIBUTION_HOSTED_ZONE_ID, MAX_POLICY_CHARS, MAX_STRING_CHARS,
+    MAX_TAGS, PRIVATE_ENDPOINT_TYPE, REGIONAL_ENDPOINT_TYPE,
+};
+
+/// Refuse a request whose caller-sized members would grow the store past a bound.
+///
+/// Called BEFORE the store lock is taken, so an over-sized request never reaches the
+/// records at all. Each bound is a published API Gateway/AWS quota or, where the service
+/// publishes none, this emulator's own resource guard — see `crate::state`.
+///
+/// `certificateBody`, `certificatePrivateKey` and `certificateChain` are not among them:
+/// they are the uploaded certificate material, the `DomainName` shape declares no member
+/// for any of them, and so nothing reports them and nothing is stored — only THAT a
+/// certificate was uploaded, as `certificateUploadDate`. A private key is a secret, and
+/// this emulator keeps none.
+fn bound_input(input: &CreateDomainNameInput) -> Result<(), String> {
+    bound_domain_name(&input.domain_name)?;
+    for (member, value) in [
+        ("certificateName", &input.certificate_name),
+        ("certificateArn", &input.certificate_arn),
+        ("regionalCertificateName", &input.regional_certificate_name),
+        ("regionalCertificateArn", &input.regional_certificate_arn),
+        (
+            "ownershipVerificationCertificateArn",
+            &input.ownership_verification_certificate_arn,
+        ),
+    ] {
+        if let Some(value) = value {
+            bound_chars(member, value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(policy) = &input.policy {
+        bound_chars("policy", policy, MAX_POLICY_CHARS)?;
+    }
+    if let Some(authentication) = &input.mutual_tls_authentication {
+        if let Some(value) = &authentication.truststore_uri {
+            bound_chars("mutualTlsAuthentication.truststoreUri", value, MAX_STRING_CHARS)?;
+        }
+        if let Some(value) = &authentication.truststore_version {
+            bound_chars(
+                "mutualTlsAuthentication.truststoreVersion",
+                value,
+                MAX_STRING_CHARS,
+            )?;
+        }
+    }
+    if let Some(configuration) = &input.endpoint_configuration {
+        if let Some(types) = &configuration.types {
+            bound_entries(
+                "endpointConfiguration.types",
+                types.len(),
+                crate::state::MAX_COLLECTION_ENTRIES,
+            )?;
+        }
+        if let Some(ids) = &configuration.vpc_endpoint_ids {
+            bound_entries(
+                "endpointConfiguration.vpcEndpointIds",
+                ids.len(),
+                crate::state::MAX_COLLECTION_ENTRIES,
+            )?;
+            for value in ids {
+                bound_chars(
+                    "endpointConfiguration.vpcEndpointIds",
+                    value,
+                    MAX_STRING_CHARS,
+                )?;
+            }
+        }
+    }
+    // The tags a create carries are checked by the SAME rule `TagResource` applies, so a
+    // tag this service refuses on one path cannot be stored through the other.
+    if let Some(tags) = &input.tags {
+        bound_entries("tags", tags.len(), MAX_TAGS)?;
+        for (key, value) in tags {
+            bound_tag(key, value)?;
+        }
+    }
+    Ok(())
+}
+
+impl From<&DomainNameEntry> for CreateDomainNameOutput {
+    /// The `DomainName` body for a stored domain name — the one place this crate renders
+    /// that shape, so `CreateDomainName`, `GetDomainName` and `GetDomainNames` cannot
+    /// report a record differently.
+    fn from(entry: &DomainNameEntry) -> Self {
+        Self {
+            domain_name: Some(entry.domain_name.clone()),
+            domain_name_id: entry.domain_name_id.clone(),
+            domain_name_arn: Some(entry.domain_name_arn.clone()),
+            certificate_name: entry.certificate_name.clone(),
+            certificate_arn: entry.certificate_arn.clone(),
+            certificate_upload_date: entry.certificate_upload_date,
+            regional_domain_name: entry.regional_domain_name.clone(),
+            // The Route 53 hosted zone of the Region's API Gateway endpoint is a
+            // per-Region constant this service's model carries no value for; see
+            // `DomainNameEntry`.
+            regional_hosted_zone_id: None,
+            regional_certificate_name: entry.regional_certificate_name.clone(),
+            regional_certificate_arn: entry.regional_certificate_arn.clone(),
+            distribution_domain_name: entry.distribution_domain_name.clone(),
+            distribution_hosted_zone_id: entry.distribution_hosted_zone_id.clone(),
+            endpoint_configuration: entry.endpoint_configuration.clone(),
+            // Reported from the stored due instant, so the status a reader sees is the
+            // one the clock owes; see `DomainNameEntry::status`.
+            domain_name_status: Some(entry.status().to_string()),
+            domain_name_status_message: entry.domain_name_status_message.clone(),
+            security_policy: entry.security_policy.clone(),
+            endpoint_access_mode: entry.endpoint_access_mode.clone(),
+            // The collection of tags is ALWAYS reported, empty when the domain name
+            // carries none: `tags` is "the collection of tags" of the resource, which is
+            // an empty map on a resource that has none, not an absent one.
+            tags: Some(
+                entry
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            mutual_tls_authentication: entry.mutual_tls_authentication.clone(),
+            ownership_verification_certificate_arn: entry
+                .ownership_verification_certificate_arn
+                .clone(),
+            management_policy: entry.management_policy.clone(),
+            policy: entry.policy.clone(),
+            routing_mode: entry.routing_mode.clone(),
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -263,18 +389,188 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDomainName` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDomainNameErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDomainName"))
+        let bad_request = |message: String| -> Self::Error {
+            CreateDomainNameErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store unchecked: the request's members are
+        // bounded, and the domain name is read as a domain name, before the store lock
+        // is taken at all.
+        bound_input(&input).map_err(bad_request)?;
+
+        // The endpoint configuration is completed by the rule `CreateRestApi` completes
+        // it with — the model declares the shape for "an API (RestApi) or its custom
+        // domain name (DomainName)" — so a stored domain name always names its endpoint
+        // types and its IP address type.
+        let endpoint_configuration =
+            crate::state::defaulted_endpoint_configuration(input.endpoint_configuration);
+        let types = endpoint_configuration
+            .types
+            .clone()
+            .unwrap_or_default();
+
+        // A custom domain name is reached at ONE endpoint — the `types` member documents
+        // `EDGE` for "an edge-optimized API and its custom domain name", `REGIONAL` for a
+        // regional one and `PRIVATE` for a private one, and the endpoint members a record
+        // reports are that endpoint's — so a configuration naming several types names no
+        // single endpoint and is refused as the bad request it is, rather than served by a
+        // precedence this service publishes no rule for.
+        if types.len() > 1 {
+            return Err(bad_request(format!(
+                "endpointConfiguration.types must name exactly one endpoint type for a \
+                 custom domain name, got {types:?}"
+            )));
+        }
+        let private = types.iter().any(|kind| kind == PRIVATE_ENDPOINT_TYPE);
+        let regional = types.iter().any(|kind| kind == REGIONAL_ENDPOINT_TYPE);
+
+        // The endpoint members a domain name carries are the ones its endpoint type has:
+        // an edge-optimized domain name is served by the CloudFront distribution API
+        // Gateway creates for it, a regional one by the Region's API Gateway endpoint,
+        // and a private one through the VPC endpoints its endpoint configuration names —
+        // which is neither, so it is assigned no public alias at all.
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now();
+
+        let mut store = state.lock();
+
+        // Bound the growth a caller drives, at API Gateway's published quota.
+        if store.domain_names.len() >= crate::state::MAX_DOMAIN_NAMES {
+            return Err(CreateDomainNameErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    retry_after_seconds: None,
+                    message: Some(format!(
+                        "Maximum number of custom domain names exceeded: {}",
+                        crate::state::MAX_DOMAIN_NAMES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A `domainNameId` is minted only for a PRIVATE domain name, the one kind the
+        // member is "supported only for"; it is what lets several private records carry
+        // one name, so only a record WITHOUT one can collide on its name. The rule is
+        // therefore: at most ONE non-private record per domain name, however many private
+        // records carry that name, and a private create never collides because its key is
+        // minted. The name is checked BEFORE anything is minted, so a refused create
+        // consumes no id.
+        if !private && store.domain_names.contains_key(&input.domain_name) {
+            return Err(CreateDomainNameErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "The domain name you provided already exists: {}",
+                        input.domain_name
+                    )),
+                },
+            )
+            .into());
+        }
+        let domain_name_id = private.then(|| store.mint_id());
+        let key = domain_name_key(&input.domain_name, domain_name_id.as_deref());
+
+        // The host label of the endpoint name, from the store's own id bijection: it is
+        // assigned once and stored, so every later read reports the same endpoint. Minted
+        // only for a record that HAS a public endpoint alias — an edge-optimized or a
+        // regional one.
+        let endpoint_id = if private {
+            String::new()
+        } else {
+            store.mint_id()
+        };
+        let sequence = store.next_sequence();
+        let entry = DomainNameEntry {
+            domain_name: input.domain_name.clone(),
+            domain_name_id,
+            domain_name_arn: crate::state::domain_name_arn(&region, &key),
+            certificate_name: input.certificate_name,
+            certificate_arn: input.certificate_arn.clone(),
+            // "The timestamp when the certificate that was used by edge-optimized
+            // endpoint or private endpoint for this domain name was uploaded" — so it is
+            // stamped exactly when such an endpoint's certificate was supplied, by ARN or
+            // as uploaded material, and never for a regional record, whose certificate is
+            // the `regionalCertificate*` pair the member does not speak of.
+            certificate_upload_date: (!regional
+                && (input.certificate_arn.is_some() || input.certificate_body.is_some()))
+            .then_some(now),
+            regional_domain_name: (regional && !private)
+                .then(|| regional_endpoint_domain_name(&endpoint_id, &region)),
+            regional_certificate_name: input.regional_certificate_name,
+            regional_certificate_arn: input.regional_certificate_arn,
+            distribution_domain_name: (!regional && !private)
+                .then(|| edge_distribution_domain_name(&endpoint_id)),
+            distribution_hosted_zone_id: (!regional && !private)
+                .then(|| EDGE_DISTRIBUTION_HOSTED_ZONE_ID.to_string()),
+            endpoint_configuration: Some(endpoint_configuration),
+            // Only an edge-optimized domain name waits for an endpoint: the CloudFront
+            // distribution is not in place when this call answers. See
+            // `DomainNameEntry::status`.
+            available_at: (!regional && !private).then(|| {
+                ::std::time::Instant::now() + crate::state::DOMAIN_NAME_CREATE_SPAN
+            }),
+            // An "optional text message containing detailed information about status of
+            // the DomainName migration": nothing here has detail to add to the status.
+            domain_name_status_message: None,
+            security_policy: Some(
+                input
+                    .security_policy
+                    .unwrap_or_else(|| DEFAULT_SECURITY_POLICY.to_string()),
+            ),
+            endpoint_access_mode: input.endpoint_access_mode,
+            mutual_tls_authentication: input.mutual_tls_authentication.map(|requested| {
+                MutualTlsAuthentication {
+                    truststore_uri: requested.truststore_uri,
+                    truststore_version: requested.truststore_version,
+                    // The warnings are what AWS reports about certificates in the
+                    // truststore it could not read. The truststore is an S3 object this
+                    // emulator does not fetch, so nothing read one and there is nothing
+                    // to warn about.
+                    truststore_warnings: None,
+                }
+            }),
+            ownership_verification_certificate_arn: input.ownership_verification_certificate_arn,
+            // A policy "that applies to the API Gateway Management service for this
+            // DomainName": no member of this request sets it, so a created domain name
+            // has none until one is patched on.
+            management_policy: None,
+            policy: input.policy,
+            // `routingMode` has no documented default, so what is stored is what the
+            // request set — nothing when it set nothing.
+            routing_mode: input.routing_mode,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<String, String>>(),
+            sequence,
+        };
+
+        // Reading the record back means what the caller is told is what a later
+        // `GetDomainName` will report.
+        store.domain_names.insert(key.clone(), entry);
+        let stored = store
+            .domain_names
+            .get(&key)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let output = CreateDomainNameOutput::from(stored);
+        // Everything below is owned, so the store lock is released before the record is
+        // formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            domain_name = ?key,
+            outcome = "created",
+            "domain name created",
+        );
+        Ok(output)
     }
 }
