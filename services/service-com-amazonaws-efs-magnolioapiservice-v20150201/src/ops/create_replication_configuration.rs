@@ -305,7 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `ConflictException` is "returned if the source file system in a
                 // replication is encrypted but the destination file system is
                 // unencrypted".
-                if source.encrypted == Some(true) && existing.encrypted != Some(true) {
+                if source.encrypted && !existing.encrypted {
                     return Err(conflict(format!(
                         "Source file system {} is encrypted, but destination file system {} is \
                          not",
@@ -403,11 +403,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // bind yet.
                     last_restricted_throughput_change: None,
                     provisioned_throughput_in_mibps: None,
+                    // A file system Amazon EFS mints here has no throughput change
+                    // outstanding.
+                    pending_throughput: None,
                     // "To use an Key Management Service key other than the default KMS
                     // key, then specify it", and "after the file system is created, you
                     // cannot change the KMS key": a destination file system is encrypted
                     // either way, under the named key or the EFS default one.
-                    encrypted: Some(true),
+                    encrypted: true,
                     kms_key_id: Some(efs::kms_key_arn(
                         requested
                             .kms_key_id
@@ -424,7 +427,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // specify an AvailabilityZoneName, the default is true."
                     backup: requested.availability_zone_name.is_some(),
                     size_in_bytes: 0,
-                    size_measured_at: now,
+                    // Nothing has metered this file system yet, which is what leaves
+                    // `SizeInBytes.Timestamp` out of its description.
+                    size_measured_at: None,
                     tags: Vec::new(),
                     mount_target_ids: Vec::new(),
                     // "REPLICATING – The file system is being used as the destination

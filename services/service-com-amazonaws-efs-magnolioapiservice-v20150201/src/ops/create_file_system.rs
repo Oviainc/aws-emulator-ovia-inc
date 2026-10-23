@@ -438,7 +438,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If the file system has a Name tag, Amazon EFS returns the value in this field."
         // The one construction every operation that stores a tag set derives it through.
         let name = efs::name_tag(&tags);
-        let kms_key_id = (input.encrypted == Some(true)).then(|| {
+        // "A Boolean value that, if true, creates an encrypted file system" — absent is
+        // not encrypted, and the stored fact is what the description reports.
+        let encrypted = input.encrypted == Some(true);
+        let kms_key_id = encrypted.then(|| {
             efs::kms_key_arn(
                 input
                     .kms_key_id
@@ -475,13 +478,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // created, so `UpdateFileSystem`'s 24-hour restriction does not bind yet.
             last_restricted_throughput_change: None,
             provisioned_throughput_in_mibps: input.provisioned_throughput_in_mibps,
-            encrypted: input.encrypted,
+            // A file system that was just created has no throughput change outstanding.
+            pending_throughput: None,
+            encrypted,
             kms_key_id,
             availability_zone_name: input.availability_zone_name.clone(),
             availability_zone_id,
             backup,
             size_in_bytes: 0,
-            size_measured_at: now,
+            // Nothing has metered this file system yet, which is what leaves
+            // `SizeInBytes.Timestamp` out of its description.
+            size_measured_at: None,
             tags,
             mount_target_ids: Vec::new(),
             // "Replication overwrite protection is ENABLED by default."
