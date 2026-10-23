@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopImport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopImport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stops one running import in the shared import registry (`crate::state`), and
+//! reports the stored import record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopImport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An import that already reached a terminal status (`COMPLETED`, `FAILED`,
+//! `STOPPED`) is reported exactly as stored rather than refused: the model declares
+//! no error for "this import is past stopping" (`ImportNotFoundException`,
+//! `InvalidParameterException`, `OperationNotPermittedException` and
+//! `UnsupportedOperationException` are the four, and none of them names a status), so
+//! answering one would be inventing a refusal rather than emulating it. That makes
+//! this emulator the more permissive of the two where the real service rejects such a
+//! stop, and it is what keeps a repeated stop idempotent. `InvalidParameterException`
+//! and `OperationNotPermittedException` are therefore unreachable here: every
+//! `ImportId` rule the model states (length 36..36, pattern `^[a-f0-9\-]+$`) is
+//! already refused by the boundary validator before this handler runs.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +164,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopImport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopImportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopImport"))
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StopImportErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "StopImport needs the CloudTrail import registry, which this engine \
+                     does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // An import belongs to the Region it was created in, so an id naming no import
+        // THIS Region holds was not found — the same answer as an id naming no import
+        // at all.
+        let Some(record) = store.import_mut(&input.import_id, &region) else {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                StopImportErrorModeled::ImportNotFoundException(ImportNotFoundException {
+                    message: Some(crate::state::import_not_found_message(&input.import_id)),
+                }),
+                crate::state::IMPORT_NOT_FOUND_HTTP_STATUS,
+            ));
+        };
+
+        // A running import stops here; one that already reached a terminal status is
+        // reported exactly as stored, so a repeated stop changes nothing.
+        record.stop(::std::time::SystemTime::now());
+
+        Ok(StopImportOutput {
+            import_id: Some(record.import_id.clone()),
+            import_source: record.import_source.clone(),
+            destinations: Some(record.destinations.clone()),
+            import_status: Some(record.status.clone()),
+            created_timestamp: Some(::aws_smithy_types::DateTime::from(record.created_timestamp)),
+            updated_timestamp: Some(::aws_smithy_types::DateTime::from(record.updated_timestamp)),
+            start_event_time: record
+                .start_event_time
+                .map(::aws_smithy_types::DateTime::from),
+            end_event_time: record.end_event_time.map(::aws_smithy_types::DateTime::from),
+            import_statistics: record.statistics.clone(),
+        })
     }
 }
