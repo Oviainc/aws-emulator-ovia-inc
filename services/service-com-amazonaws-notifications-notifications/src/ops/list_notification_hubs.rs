@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNotificationHubs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNotificationHubs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNotificationHubs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `NotificationHubOverview` per registered `NotificationHub`, in
+//! registration order, cut into pages of `maxResults` with an opaque resume
+//! token. A reporting operation (`@readonly`): its only write is
+//! [`crate::state::ComAmazonawsNotificationsNotificationsState::settle_due_hubs`],
+//! which materialises the hub transitions the clock had already made due at this
+//! instant — a `REGISTERING` hub reaching `ACTIVE`, a `DEREGISTERING` hub leaving
+//! the store — whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +111,15 @@ impl From<ListNotificationHubsErrorModeled> for ListNotificationHubsError {
     }
 }
 
+/// The page size this operation uses when a request names none.
+///
+/// The model gives `maxResults` no default and pins it to a single value
+/// (`@range{min:3,max:3}`), which is also the documented ceiling on how many
+/// hubs an account can hold ([`crate::state::MAX_NOTIFICATION_HUBS`]) — so an
+/// unpaged listing reports every hub in one page, and asking for the one
+/// permitted page size reports the same.
+const DEFAULT_MAX_RESULTS: usize = crate::state::MAX_NOTIFICATION_HUBS;
+
 /// The `ListNotificationHubs` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -148,18 +156,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNotificationHubs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNotificationHubsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNotificationHubs"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListNotificationHubsErrorModeled::InternalServerException(InternalServerException {
+                message: "the notifications store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // Reporting only: this materialises the transitions the clock already
+        // owed at this instant, so the listing cannot report a hub as
+        // `REGISTERING` after its activation fell due, nor keep reporting one
+        // whose deregister has.
+        store.settle_due_hubs(::std::time::SystemTime::now());
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                // A token this process never issued is refused, rather than
+                // silently restarting the listing at the first hub.
+                ListNotificationHubsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                    reason: Some("fieldValidationFailed".to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message: "the value is not a pagination token this service issued"
+                            .to_string(),
+                    }]),
+                })
+            })?),
+            None => None,
+        };
+
+        let hubs = store.hubs_in_registration_order();
+
+        // The token carries the registration sequence of the last hub reported,
+        // so the next page starts at the first hub registered after it.
+        let start = match resume_after {
+            Some(cursor) => hubs
+                .iter()
+                .position(|hub| hub.sequence > cursor)
+                .unwrap_or(hubs.len()),
+            None => 0,
+        };
+        let page_size = match input.max_results {
+            Some(requested) => usize::try_from(requested).map_err(|_| {
+                // The modelled range makes this unreachable through the boundary
+                // validator; refuse rather than quietly substituting a page size
+                // the caller did not ask for.
+                ListNotificationHubsErrorModeled::ValidationException(ValidationException {
+                    message: "maxResults must be a positive count".to_string(),
+                    reason: Some("fieldValidationFailed".to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "maxResults".to_string(),
+                        message: "the value is not a positive count".to_string(),
+                    }]),
+                })
+            })?,
+            None => DEFAULT_MAX_RESULTS,
+        };
+
+        let page: Vec<&crate::state::NotificationHubRecord> =
+            hubs.iter().skip(start).take(page_size).copied().collect();
+
+        // A token is emitted only while hubs remain behind this page; the final
+        // page carries none.
+        let next_token = match page.last() {
+            Some(last) if start + page.len() < hubs.len() => {
+                Some(crate::state::encode_page_token(last.sequence))
+            }
+            _ => None,
+        };
+
+        Ok(ListNotificationHubsOutput {
+            next_token,
+            notification_hubs: page.into_iter().map(|hub| hub.overview()).collect(),
+        })
     }
 }

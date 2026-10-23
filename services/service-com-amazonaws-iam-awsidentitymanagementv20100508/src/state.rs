@@ -10,7 +10,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
-    InstanceProfile, Policy, PolicyVersion, Role, ServiceSpecificCredentialMetadata, Tag, User,
+    AttachedPermissionsBoundary, InstanceProfile, Policy, PolicyVersion, Role,
+    ServiceSpecificCredentialMetadata, Tag, User,
 };
 
 /// IAM's default entity path: every entity whose request omits `Path` is created
@@ -28,6 +29,26 @@ pub const DEFAULT_MAX_ITEMS: i32 = 100;
 /// (`smithy_query(query="shape", shape="PermissionsBoundaryAttachmentType")`),
 /// reported on every entity that carries a permissions boundary.
 pub const PERMISSIONS_BOUNDARY_TYPE: &str = "PermissionsBoundaryPolicy";
+
+/// The `EntityType` value that names an IAM role — the value `ListEntitiesForPolicy`'s
+/// `EntityFilter` documentation itself uses ("when EntityFilter is Role, only the
+/// roles that are attached to the specified policy are returned"). One of the five
+/// values the enum declares, which `ops::types::ENTITY_TYPE_VALUES` records.
+pub const ENTITY_FILTER_ROLE: &str = "Role";
+
+/// The `EntityType` value that names an IAM user. See [`ENTITY_FILTER_ROLE`].
+pub const ENTITY_FILTER_USER: &str = "User";
+
+/// The `PolicyUsageType` value that names a policy used as a permissions POLICY:
+/// "to list only permissions policies, set PolicyUsageFilter to PermissionsPolicy"
+/// (`ListEntitiesForPolicy$PolicyUsageFilter`). One of the two values the enum
+/// declares, which `ops::types::POLICY_USAGE_TYPE_VALUES` records.
+pub const POLICY_USAGE_PERMISSIONS_POLICY: &str = "PermissionsPolicy";
+
+/// The `PolicyUsageType` value that names a policy used to set a permissions
+/// BOUNDARY: "to list only the policies used to set permissions boundaries, set the
+/// value to PermissionsBoundary". See [`POLICY_USAGE_PERMISSIONS_POLICY`].
+pub const POLICY_USAGE_PERMISSIONS_BOUNDARY: &str = "PermissionsBoundary";
 
 /// The prefix AWS gives an IAM user's unique id. `User$UserId` is modelled as
 /// `idType` (len 16..128, pattern `^[\w]+$`), which this prefix plus
@@ -225,6 +246,15 @@ pub const MARKER_SCOPE_ROLES: &str = "roles";
 /// issued while paging one role's attachments does not name a position in
 /// another's: see [`role_attached_policies_marker_scope`].
 pub const MARKER_SCOPE_ROLE_ATTACHED_POLICIES: &str = "role-attached-policies";
+
+/// The marker scope of the entities ONE managed policy relates to, which
+/// `ListEntitiesForPolicy` pages over. The policy's ARN follows it, so a marker
+/// issued while paging the entities of one policy does not name a position in
+/// another's: see [`entities_for_policy_marker_scope`]. One scope covers that
+/// policy's whole entity collection because the operation pages over the same key
+/// order whichever entity type, usage or path prefix it filters by — the filters
+/// select within the order rather than changing it.
+pub const MARKER_SCOPE_ENTITIES_FOR_POLICY: &str = "entities-for-policy";
 
 /// The marker scope of the account's service-specific credentials, which
 /// `ListServiceSpecificCredentials` pages over. One scope covers the whole
@@ -786,6 +816,47 @@ pub fn service_linked_role_principal(path: &str) -> Option<&str> {
 /// The marker scope of the attachment set of the role keyed by `role_key`.
 pub fn role_attached_policies_marker_scope(role_key: &str) -> String {
     format!("{MARKER_SCOPE_ROLE_ATTACHED_POLICIES}:{role_key}")
+}
+
+/// The marker scope of the entity collection of the managed policy `policy_arn`
+/// names. See [`MARKER_SCOPE_ENTITIES_FOR_POLICY`].
+pub fn entities_for_policy_marker_scope(policy_arn: &str) -> String {
+    format!("{MARKER_SCOPE_ENTITIES_FOR_POLICY}:{policy_arn}")
+}
+
+/// The page key of ONE entity in the order `ListEntitiesForPolicy` enumerates the
+/// entities a managed policy relates to: the entity's TYPE tag followed by
+/// [`name_key`] of its name.
+///
+/// The byte order of these keys IS the enumeration order, which is what lets the
+/// operation resume strictly after the key a `Marker` names even when the entity it
+/// named has since been deleted. The three tags ([`ENTITY_KEY_TAG_GROUP`],
+/// [`ENTITY_KEY_TAG_ROLE`], [`ENTITY_KEY_TAG_USER`]) sort in that order and each is
+/// followed by the same separator, so the keys group by entity type and then run
+/// ascending by name within a type — the order each store is already keyed in.
+pub fn entity_page_key(type_tag: &str, name_key: &str) -> String {
+    format!("{type_tag}:{name_key}")
+}
+
+/// The [`entity_page_key`] type tag of an IAM group.
+pub const ENTITY_KEY_TAG_GROUP: &str = "group";
+
+/// The [`entity_page_key`] type tag of an IAM role.
+pub const ENTITY_KEY_TAG_ROLE: &str = "role";
+
+/// The [`entity_page_key`] type tag of an IAM user.
+pub const ENTITY_KEY_TAG_USER: &str = "user";
+
+/// The managed-policy ARN the entity's permissions boundary names, if it carries
+/// one.
+///
+/// A permissions boundary is "the ARN of the managed policy that is used to set the
+/// permissions boundary" (`AttachedPermissionsBoundary$PermissionsBoundaryArn`),
+/// which is what makes the entity one the boundary policy relates to.
+pub fn permissions_boundary_arn(
+    boundary: Option<&AttachedPermissionsBoundary>,
+) -> Option<&str> {
+    boundary?.permissions_boundary_arn.as_deref()
 }
 
 /// The parts of an IAM managed-policy ARN that an operation taking one reads.

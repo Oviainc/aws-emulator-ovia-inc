@@ -9,6 +9,11 @@
 //! terminated with a period, and `FileSystemAlreadyExists` names BOTH the id of the file
 //! system that already holds the token and the `CreationToken` the request carried.
 //!
+//! The other half of the rule: a refusal gets the optional `Message` member ONLY where a
+//! rule produces its sentence. `AccessPointAlreadyExists` has none — AWS neither
+//! documents nor models one and its recorded refusal carries no `Message` member at all
+//! — so that error is serialized with its required members only.
+//!
 //! The tables below vary what the rule generalises over — the id's hex length at both
 //! modelled bounds (`^(fs|fsmt|fsap)-[0-9a-f]{8,40}$`), the digits themselves, the id's
 //! FORM (bare id vs the ARN those members also accept), the resource the id names (file
@@ -300,12 +305,16 @@ async fn access_point_not_found_is_built_from_the_requested_id() {
 }
 
 #[tokio::test]
-async fn access_point_already_exists_names_the_existing_access_point_and_the_request_token() {
+async fn access_point_already_exists_carries_its_required_members_and_no_message() {
     let efs = Emulator::new();
     let file_system_id = efs.available_file_system("construction-access-point-1").await;
 
-    // The same construction as `FileSystemAlreadyExists`, over the same token table: the
-    // existing resource's id and the token the request carried, each single-quoted.
+    // The OPPOSITE of `FileSystemAlreadyExists` above: no rule produces a sentence for
+    // this error class — AWS neither documents nor models one, and its recorded refusal
+    // carries no `Message` member at all — so the refusal is serialized with the two
+    // members the model marks required (`ErrorCode` and `AccessPointId`) and nothing
+    // else. The actionable datum, WHICH access point already holds the token, travels in
+    // `AccessPointId`.
     for token in creation_tokens() {
         let created = efs
             .create_access_point(json!({
@@ -337,26 +346,19 @@ async fn access_point_already_exists_names_the_existing_access_point_and_the_req
             "case {token:?}: unexpected error type, got {:?}",
             repeat.error_type
         );
-        let message = repeat.string("Message");
-        assert_eq!(
-            message,
-            format!(
-                "Access point '{access_point_id}' already exists with creation token '{token}'"
-            ),
-            "case {token:?}: unexpected Message construction, got {message:?}"
-        );
-        assert_eq!(
-            quoted_values(&message),
-            vec![access_point_id.clone(), token.clone()],
-            "case {token:?}: expected the existing id then the request token quoted, got \
-             {message:?}"
-        );
+        assert_no_message_member(&format!("{token:?}"), &repeat);
         assert_eq!(
             repeat.string("AccessPointId"),
             access_point_id,
             "case {token:?}: AccessPointAlreadyExists$AccessPointId must be the existing id, \
              got {:?}",
             repeat.get("AccessPointId")
+        );
+        assert_eq!(
+            repeat.string("ErrorCode"),
+            "AccessPointAlreadyExists",
+            "case {token:?}: AccessPointAlreadyExists$ErrorCode must name the error, got {:?}",
+            repeat.get("ErrorCode")
         );
 
         // ROUND TRIP: the conflict named an access point that really is stored under that
@@ -382,6 +384,26 @@ async fn access_point_already_exists_names_the_existing_access_point_and_the_req
             listed[0]
         );
     }
+}
+
+/// Assert an error body carries NO message member: neither the modelled `Message` nor any
+/// spelling of it a client could read a sentence out of.
+pub(crate) fn assert_no_message_member(case: &str, reply: &Reply) {
+    let present: Vec<&String> = reply
+        .body
+        .as_object()
+        .map(|members| {
+            members
+                .keys()
+                .filter(|key| key.eq_ignore_ascii_case("message"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        present.is_empty(),
+        "case {case}: the refusal must carry no message member, got {present:?} in {:?}",
+        reply.body
+    );
 }
 
 /// The `CreationToken` values the already-exists rule is asserted over: the modelled

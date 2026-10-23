@@ -30,7 +30,11 @@ pub struct CreateCloudWatchAlarmTemplateInput {
     pub request_id: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.medialive#CreateCloudWatchAlarmTemplateResponse")]
+/// `CreateCloudWatchAlarmTemplateResponse`, with its schema written out instead of
+/// derived because `CreatedAt` and `ModifiedAt` target `__timestampIso8601`, which is
+/// `@timestampFormat("date-time")`; the note in `shared_types` says why that cannot be
+/// derived here. Member for member this is the model's shape: same ids, same order, same
+/// indices.
 #[derive(Debug, Clone, Default)]
 pub struct CreateCloudWatchAlarmTemplateOutput {
     pub arn: Option<String>,
@@ -51,4 +55,10 @@ pub struct CreateCloudWatchAlarmTemplateOutput {
     pub threshold: Option<f64>,
     pub treat_missing_data: Option<String>,
 }
+
+shared_types::cloud_watch_alarm_template_response!(
+    CreateCloudWatchAlarmTemplateOutput,
+    CREATE_CLOUD_WATCH_ALARM_TEMPLATE_OUTPUT_SCHEMA,
+    "CreateCloudWatchAlarmTemplateResponse"
+);
 

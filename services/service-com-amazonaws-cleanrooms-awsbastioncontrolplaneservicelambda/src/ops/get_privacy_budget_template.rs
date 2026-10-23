@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPrivacyBudgetTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPrivacyBudgetTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPrivacyBudgetTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reporting operation: it returns the stored `PrivacyBudgetTemplate` and writes
+//! nothing. The template is a resource of the COLLABORATION — "the privacy budget
+//! template is retrieved from the collaboration that this membership belongs to" — so
+//! the membership in the request selects the collaboration to look in, and a template
+//! of any other collaboration is not found through it.
 //!
 //! ## Shape of an operation
 //!
@@ -150,20 +147,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPrivacyBudgetTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPrivacyBudgetTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPrivacyBudgetTemplate"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(GetPrivacyBudgetTemplateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("cleanrooms state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+
+        let Some(membership) = store.memberships.get(&input.membership_identifier) else {
+            return Err(GetPrivacyBudgetTemplateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "membership {} not found",
+                        input.membership_identifier
+                    ),
+                    resource_id: input.membership_identifier,
+                    resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
+                },
+            )
+            .into());
+        };
+
+        match store.privacy_budget_template_in_collaboration(
+            &membership.collaboration_id,
+            &input.privacy_budget_template_identifier,
+        ) {
+            Some(template) => Ok(GetPrivacyBudgetTemplateOutput {
+                privacy_budget_template: template.clone(),
+            }),
+            None => Err(GetPrivacyBudgetTemplateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "privacy budget template {} not found in collaboration {}",
+                        input.privacy_budget_template_identifier, membership.collaboration_id
+                    ),
+                    // The model's `ResourceType` catalog (COLLABORATION | MEMBERSHIP |
+                    // CONFIGURED_TABLE | CONFIGURED_TABLE_ASSOCIATION) names no privacy
+                    // budget template, and both members are required here, so the pair
+                    // names ONE resource the catalog does have: the collaboration the
+                    // lookup was scoped to. The requested template id is in the message.
+                    resource_id: membership.collaboration_id.clone(),
+                    resource_type: st::RESOURCE_TYPE_COLLABORATION.to_string(),
+                },
+            )
+            .into()),
+        }
     }
 }

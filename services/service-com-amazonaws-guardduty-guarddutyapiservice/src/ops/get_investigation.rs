@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInvestigation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInvestigation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports one investigation `CreateInvestigation` persisted in
+//! [`crate::state`], the read side of that create.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInvestigation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING operation: the only thing it writes is the status change the CLOCK
+//! already made due ([`crate::state::InvestigationRecord::settle`]), which was owed at
+//! that instant whether or not anybody called.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +150,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInvestigation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInvestigationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInvestigation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetInvestigationErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        // The same Region catalogue `CreateInvestigation` is gated on: this
+        // operation's documentation lists exactly the same Regions
+        // (`smithy_query(query="doc",shape="GetInvestigation")`).
+        if !crate::state::investigations_available_in(&region) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::INVESTIGATION_REGION_MESSAGE,
+            ));
+        }
+
+        // The lock is taken MUTABLY only to materialise the clock-owed status
+        // change below; nothing here depends on the caller.
+        let mut state = state.lock();
+        let now = crate::state::now_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            return Err(detector_rejection(&input.detector_id));
+        };
+        let Some(investigation) = detector.investigations.get_mut(&input.investigation_id) else {
+            // An id no create minted: the modelled 404 for this operation, which
+            // `CreateInvestigation` does not declare and so cannot answer.
+            return Err(GetInvestigationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::INVESTIGATION_NOT_FOUND_MESSAGE.to_string()),
+                    r#type: Some("ResourceNotFoundException".to_string()),
+                },
+            )
+            .into());
+        };
+        investigation.settle(now);
+
+        Ok(GetInvestigationOutput {
+            investigation: Investigation {
+                investigation_id: investigation.id.clone(),
+                status: investigation.status.clone(),
+                trigger_prompt: investigation.trigger_prompt.clone(),
+                triggered_by: investigation.triggered_by.clone(),
+                // "Metadata about the product and version that produced the
+                // investigation" — nothing produced one, so there is none to
+                // report.
+                metadata: None,
+                cloud: Some(CloudDetails {
+                    provider: crate::state::CLOUD_PROVIDER.to_string(),
+                    region: investigation.region.clone(),
+                    account: investigation.triggered_by.clone(),
+                }),
+                // The assessment members stay absent while no analysis produced
+                // one: see `crate::state::INVESTIGATION_ENGINE_UNAVAILABLE`.
+                risk_level: None,
+                risk: None,
+                confidence: None,
+                summary: None,
+                start_time: Some(::aws_smithy_types::DateTime::from_millis(
+                    investigation.started_at_millis,
+                )),
+                end_time: investigation
+                    .ended_at_millis
+                    .map(::aws_smithy_types::DateTime::from_millis),
+                error: investigation.error.clone(),
+            },
+        })
+    }
+}
+
+/// Refuse a `DetectorId` the store does not resolve, the way this operation's own
+/// error set classifies it: the caller's PERMISSION on the detector is decided
+/// before the detector is resolved, so a well-formed id the account/Region does not
+/// hold is denied with HTTP 403 `AccessDeniedException` and discloses nothing about
+/// whether it names anything, while a value that cannot be a `DetectorId` at all
+/// stays the HTTP 400 parameter failure. `ResourceNotFoundException` is reserved for
+/// the sub-resource this operation reads — an `InvestigationId` the authorized
+/// detector does not hold.
+fn detector_rejection(detector_id: &str) -> GetInvestigationError {
+    if crate::state::is_detector_id(detector_id) {
+        GetInvestigationErrorModeled::AccessDeniedException(AccessDeniedException {
+            message: Some(crate::state::not_authorized_message(
+                crate::state::DETECTOR_ID_MEMBER,
+            )),
+            r#type: Some("AccessDeniedException".to_string()),
+        })
+        .into()
+    } else {
+        crate::scaffolded::Scaffolded::invalid_input(crate::state::invalid_parameter_message(
+            crate::state::DETECTOR_ID_MEMBER,
+        ))
     }
 }
