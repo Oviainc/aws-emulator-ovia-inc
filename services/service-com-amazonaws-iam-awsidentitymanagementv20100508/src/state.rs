@@ -215,6 +215,11 @@ const MARKER_PREFIX: &str = "iam:";
 /// over.
 pub const MARKER_SCOPE_USERS: &str = "users";
 
+/// The marker scope of the account's role collection, which `ListRoles` pages
+/// over. It is its OWN scope, so a marker issued while paging roles is not read
+/// as a position in the user collection and vice versa.
+pub const MARKER_SCOPE_ROLES: &str = "roles";
+
 /// The marker scope of ONE role's attached managed policies, which
 /// `ListAttachedRolePolicies` pages over. The role's key follows it, so a marker
 /// issued while paging one role's attachments does not name a position in
@@ -870,6 +875,40 @@ pub fn decode_marker(scope: &str, marker: &str) -> Option<String> {
     decoded
         .strip_prefix(&format!("{MARKER_PREFIX}{scope}:"))
         .map(str::to_string)
+}
+
+/// One stored role as a resource-LISTING operation reports it: the attributes
+/// `ListRoles` documents it withholds are dropped, every other one is reported as
+/// the account holds it.
+///
+/// `ListRoles`' documentation: "IAM resource-listing operations return a subset of
+/// the available attributes for the resource. This operation does not return the
+/// following attributes, even though they are an attribute of the returned object:
+/// PermissionsBoundary RoleLastUsed Tags. To view all of the information for a
+/// role, see GetRole."
+pub fn listed_role(role: &Role) -> Role {
+    Role {
+        permissions_boundary: None,
+        role_last_used: None,
+        tags: None,
+        ..role.clone()
+    }
+}
+
+/// One stored user as a resource-LISTING operation reports it, for the same reason
+/// [`listed_role`] exists.
+///
+/// `ListUsers`' documentation: "IAM resource-listing operations return a subset of
+/// the available attributes for the resource. This operation does not return the
+/// following attributes, even though they are an attribute of the returned object:
+/// PermissionsBoundary Tags. To view all of the information for a user, see
+/// GetUser." `PasswordLastUsed` is NOT among them, so it stays.
+pub fn listed_user(user: &User) -> User {
+    User {
+        permissions_boundary: None,
+        tags: None,
+        ..user.clone()
+    }
 }
 
 /// A unique entity id: `prefix` followed by [`UNIQUE_ID_SUFFIX_LEN`] base32
