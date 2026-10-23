@@ -4,13 +4,14 @@
 //!
 //! This module owns the records the handlers in `src/ops/` share — the directories
 //! `CreateDirectory` persists, the snapshots `CreateSnapshot` takes of them, the aliases
-//! `CreateAlias` assigns, the Amazon SNS topics `RegisterEventTopic` associates and the
-//! tags `AddTagsToResource` merges — plus the pieces of behaviour that cannot live in any
-//! single operation file:
+//! `CreateAlias` assigns, the Amazon SNS topics `RegisterEventTopic` associates, the
+//! assessments `StartADAssessment` starts and the tags `AddTagsToResource` merges — plus
+//! the pieces of behaviour that cannot live in any single operation file:
 //!
 //! * [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`], which
 //!   materialises the status transitions the clock has already made due (a directory
-//!   leaving `Requested`, a snapshot leaving `Creating`, an IP route leaving `Adding`).
+//!   leaving `Requested`, a snapshot leaving `Creating`, an IP route leaving `Adding`, an
+//!   assessment leaving `IN_PROGRESS`).
 //!   Every handler calls it before reading or writing, so a reporting operation reports
 //!   what the clock already owed and nothing more.
 //! * [`Directory::to_description`], the one place a stored directory is rendered as the
@@ -30,17 +31,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ClientAuthenticationSettingInfo, DirectoryDescription, DirectoryVpcSettingsDescription,
-    EventTopic, IpRouteInfo, LDAPSSettingInfo, Snapshot, SnapshotLimits, Tag,
+    Assessment, AssessmentSummary, ClientAuthenticationSettingInfo, DirectoryDescription,
+    DirectoryVpcSettingsDescription, EventTopic, IpRouteInfo, LDAPSSettingInfo, Snapshot,
+    SnapshotLimits, Tag,
 };
 
 /// How long a status transition a create owes takes to fall due.
 ///
 /// A create (`CreateDirectory`, `CreateMicrosoftAD`) answers while the directory is
 /// still being built — the modelled
-/// `DirectoryStage` enum's first value is `Requested` — and `CreateSnapshot` answers
+/// `DirectoryStage` enum's first value is `Requested` — `CreateSnapshot` answers
 /// while the snapshot is still being taken — the modelled `SnapshotStatus` enum's first
-/// value is `Creating` — so the move to `Active`/`Completed` is owed by the clock rather
+/// value is `Creating` — and `StartADAssessment` answers while the run it started is
+/// still `IN_PROGRESS`, so the move to `Active`/`Completed`/a terminal assessment status
+/// is owed by the clock rather
 /// than by any later call. The project's emulator contract requires such a transition to
 /// fall due 250–750 ms after the call that starts it, so a caller acting immediately
 /// after the create still observes the transient state. 500 ms sits in the middle of
@@ -144,6 +148,45 @@ pub const MAX_DIRECTORIES: usize = 10;
 /// AWS's tagging limit of 50 tags per resource, the bound
 /// `TagLimitExceededException` reports.
 pub const MAX_TAGS: usize = 50;
+
+/// The account quota on directory assessments, the bound
+/// `ADAssessmentLimitExceededException` reports.
+///
+/// From `StartADAssessment`'s own documentation: "Your Amazon Web Services account has a
+/// limit of 100 CUSTOMER directory assessments."
+pub const MAX_CUSTOMER_ASSESSMENTS: usize = 100;
+
+/// The status an assessment carries while the run it started is still owed by the
+/// clock, from `Assessment$Status`'s documentation: "Valid values include `SUCCESS`,
+/// `FAILED`, `PENDING`, and `IN_PROGRESS`."
+pub const ASSESSMENT_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The terminal status an assessment reaches in this emulator, from the same
+/// `Assessment$Status` value list. See [`ASSESSMENT_FAILED_REASON`] for why it is this
+/// value and not `SUCCESS`.
+pub const ASSESSMENT_STATUS_FAILED: &str = "FAILED";
+
+/// Why every assessment this emulator starts ends `FAILED`.
+///
+/// An assessment "checks compatibility and connectivity of the self-managed AD
+/// environment" (`StartADAssessment`'s documentation) by probing the customer's DNS
+/// servers and managed nodes. This emulator makes no outbound connection, so that run
+/// cannot be performed: the assessment resource is real — it is minted, listed,
+/// described and counted against the account quota — and the run it starts ends in the
+/// modelled failure status carrying this reason, rather than reporting validations that
+/// nothing performed. It is reported through `Assessment$StatusReason`, documented as
+/// "A human-readable description of the current assessment status, including any error
+/// details or progress information."
+pub const ASSESSMENT_FAILED_REASON: &str = "The assessment could not be run: this emulator has no network path to the self-managed AD environment, so no connectivity or compatibility validation was performed.";
+
+/// The `ReportType` of an assessment started by `StartADAssessment`.
+///
+/// From `Assessment$ReportType`'s documentation ("Valid values are `CUSTOMER` and
+/// `SYSTEM`") and `StartADAssessment`'s ("A directory assessment is automatically
+/// created when you create a hybrid directory. There are two types of assessments:
+/// CUSTOMER and SYSTEM") — a caller-started assessment is the CUSTOMER kind, and it is
+/// the CUSTOMER ones [`MAX_CUSTOMER_ASSESSMENTS`] bounds.
+pub const ASSESSMENT_REPORT_TYPE_CUSTOMER: &str = "CUSTOMER";
 
 /// The number of IP address blocks a directory may carry, from
 /// `IpRouteLimitExceededException`'s own documentation: "The maximum allowed number of
@@ -549,6 +592,97 @@ impl Directory {
     }
 }
 
+/// One stored directory assessment: what `StartADAssessment` persisted and
+/// `DescribeADAssessment` / `ListADAssessments` report.
+///
+/// Named `AssessmentRecord` rather than `Assessment` so it does not collide with the
+/// modelled `Assessment` shape [`Self::to_assessment`] renders it into.
+#[derive(Debug, Clone)]
+pub struct AssessmentRecord {
+    pub assessment_id: String,
+    /// The directory the assessment was started for, when `StartADAssessment` was
+    /// called with a `DirectoryId`. `None` for an assessment started from an
+    /// `AssessmentConfiguration`, which names no existing directory.
+    pub directory_id: Option<String>,
+    pub dns_name: Option<String>,
+    /// The self-managed DNS servers the configuration named; empty for an assessment
+    /// started from a `DirectoryId`, for which this emulator holds no self-managed DNS
+    /// record.
+    pub customer_dns_ips: Vec<String>,
+    pub vpc_id: Option<String>,
+    pub subnet_ids: Vec<String>,
+    pub security_group_ids: Vec<String>,
+    /// The Systems Manager managed nodes the configuration named, in the order it
+    /// listed them: `StartADAssessment`'s documentation requires `InstanceIds` to keep
+    /// a one-to-one positional correspondence with `CustomerDnsIps`, so the order is
+    /// preserved exactly as given.
+    pub self_managed_instance_ids: Vec<String>,
+    /// One of the modelled `AssessmentReportType` values;
+    /// [`ASSESSMENT_REPORT_TYPE_CUSTOMER`] for a caller-started assessment.
+    pub report_type: String,
+    /// One of the modelled `AssessmentStatus` values.
+    pub status: String,
+    pub status_reason: Option<String>,
+    pub start_time: SystemTime,
+    pub last_update: SystemTime,
+    /// When the status transition the start owes falls due; `None` once the assessment
+    /// has reached a terminal status. See [`TRANSITION_SPAN`].
+    pub status_due_at: Option<SystemTime>,
+    /// Creation rank, from
+    /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::next_seq`], the
+    /// same counter the directory records are stamped from. `ListADAssessments` pages
+    /// over assessments sorted by this, and its opaque `NextToken` carries the rank the
+    /// next page resumes after, so a page boundary survives an assessment being deleted
+    /// between pages.
+    pub seq: u64,
+}
+
+impl AssessmentRecord {
+    /// This assessment as the modelled `Assessment`.
+    ///
+    /// The members this emulator has no record behind are left absent rather than
+    /// invented: `StatusCode` ("a detailed status code providing additional information
+    /// about the assessment state", which AWS does not document a value list for) and
+    /// `Version` ("the version of the assessment framework used to evaluate your
+    /// self-managed AD environment" — no framework ran, see
+    /// [`ASSESSMENT_FAILED_REASON`]).
+    pub fn to_assessment(&self) -> Assessment {
+        Assessment {
+            assessment_id: Some(self.assessment_id.clone()),
+            directory_id: self.directory_id.clone(),
+            dns_name: self.dns_name.clone(),
+            start_time: Some(as_timestamp(self.start_time)),
+            last_update_date_time: Some(as_timestamp(self.last_update)),
+            status: Some(self.status.clone()),
+            status_code: None,
+            status_reason: self.status_reason.clone(),
+            customer_dns_ips: optional_list(&self.customer_dns_ips),
+            vpc_id: self.vpc_id.clone(),
+            subnet_ids: optional_list(&self.subnet_ids),
+            security_group_ids: optional_list(&self.security_group_ids),
+            self_managed_instance_ids: optional_list(&self.self_managed_instance_ids),
+            report_type: Some(self.report_type.clone()),
+            version: None,
+        }
+    }
+
+    /// This assessment as the modelled `AssessmentSummary`: the same record "without
+    /// detailed validation results", as that shape's own documentation puts it, so every
+    /// member it shares with [`Self::to_assessment`] reports the same value.
+    pub fn to_summary(&self) -> AssessmentSummary {
+        AssessmentSummary {
+            assessment_id: Some(self.assessment_id.clone()),
+            directory_id: self.directory_id.clone(),
+            dns_name: self.dns_name.clone(),
+            start_time: Some(as_timestamp(self.start_time)),
+            last_update_date_time: Some(as_timestamp(self.last_update)),
+            status: Some(self.status.clone()),
+            customer_dns_ips: optional_list(&self.customer_dns_ips),
+            report_type: Some(self.report_type.clone()),
+        }
+    }
+}
+
 /// One stored snapshot: what `CreateSnapshot` persisted and `DescribeSnapshots`
 /// reports.
 #[derive(Debug, Clone)]
@@ -590,11 +724,23 @@ impl SnapshotRecord {
     }
 }
 
+/// A stored list as an optional modelled list: absent when this emulator holds no
+/// entries for it, so an empty list is never reported as though one had been recorded.
+fn optional_list(values: &[String]) -> Option<Vec<String>> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.to_vec())
+    }
+}
+
 /// Per-service state for com-amazonaws-directoryservice-directoryservice-20150416. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// Every stored directory, keyed by its `DirectoryId`.
     pub directories: BTreeMap<String, Directory>,
+    /// Every stored directory assessment, keyed by its `AssessmentId`.
+    pub assessments: BTreeMap<String, AssessmentRecord>,
     /// Every stored snapshot, keyed by its `SnapshotId`. A snapshot names the directory
     /// it was taken of, so this is one store rather than one per directory.
     pub snapshots: BTreeMap<String, SnapshotRecord>,
@@ -607,6 +753,9 @@ pub struct ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     pub aliases: BTreeMap<String, String>,
     /// Drives [`Self::mint_directory_id`]; see there for how an id is derived from it.
     id_seed: u64,
+    /// Drives [`Self::mint_assessment_id`], the way [`Self::id_seed`] drives the
+    /// directory ids.
+    assessment_id_seed: u128,
     /// Drives [`Self::mint_snapshot_id`], kept apart from [`Self::id_seed`] so the two
     /// id spaces advance independently.
     snapshot_id_seed: u64,
@@ -626,6 +775,21 @@ const ID_MULTIPLIER: u64 = 1_000_000_007;
 
 /// The bijection's constant term, so the first id minted is not a run of leading zeros.
 const ID_OFFSET: u64 = 734_291;
+
+/// The number of distinct ids
+/// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::mint_assessment_id`]
+/// can render: `16^18 = 2^72`, the width the modelled `AssessmentId` pattern
+/// `^da-[0-9a-f]{18}$` allows. Wider than [`ID_SPACE`], which is why an assessment id
+/// cannot come from [`mint_id`].
+const ASSESSMENT_ID_SPACE: u128 = 1 << 72;
+
+/// Scrambles consecutive seeds across [`ASSESSMENT_ID_SPACE`], the same construction as
+/// [`ID_MULTIPLIER`]: odd, so it is coprime with `2^72` and the map is a BIJECTION.
+const ASSESSMENT_ID_MULTIPLIER: u128 = 1_000_000_000_000_000_003;
+
+/// The assessment bijection's constant term, so the first id minted is not a run of
+/// leading zeros.
+const ASSESSMENT_ID_OFFSET: u128 = 9_876_543_210_987;
 
 /// Mint the next id of one id space: `<prefix>-` followed by ten lower-case hex digits,
 /// the shape both the modelled `DirectoryId` (`^d-[0-9a-f]{10}$`) and `SnapshotId`
@@ -661,11 +825,28 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
         mint_id(&mut self.snapshot_id_seed, 's')
     }
 
-    /// The next creation rank. Stamped on a directory when it is created, so a listing
-    /// reports creation order even though the records are keyed by id.
+    /// The next creation rank. Stamped on a directory or an assessment when it is
+    /// created, so a listing reports creation order even though the records are keyed
+    /// by id.
     pub fn next_seq(&mut self) -> u64 {
         self.seq_counter = self.seq_counter.wrapping_add(1);
         self.seq_counter
+    }
+
+    /// Mint a fresh `AssessmentId` of the shape the model declares,
+    /// `^da-[0-9a-f]{18}$`.
+    ///
+    /// Derived from its own counter through the bijection described on
+    /// [`ASSESSMENT_ID_MULTIPLIER`]. Eighteen hex digits do not fit [`mint_id`]'s
+    /// ten-digit space, so this is the same construction over a wider one.
+    pub fn mint_assessment_id(&mut self) -> String {
+        self.assessment_id_seed = self.assessment_id_seed.wrapping_add(1);
+        let scrambled = self
+            .assessment_id_seed
+            .wrapping_mul(ASSESSMENT_ID_MULTIPLIER)
+            .wrapping_add(ASSESSMENT_ID_OFFSET)
+            % ASSESSMENT_ID_SPACE;
+        format!("da-{scrambled:018x}")
     }
 
     /// Materialise every status transition the clock has already made due at `now`.
@@ -674,7 +855,8 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// owed at `now` whether or not anybody called, because each due instant was stored
     /// when the record it belongs to was created — a directory's stage when
     /// `CreateDirectory` ran, a snapshot's status when `CreateSnapshot` ran, an IP
-    /// route's status when `AddIpRoutes` ran.
+    /// route's status when `AddIpRoutes` ran, an assessment's status when
+    /// `StartADAssessment` ran.
     pub fn advance_clock(&mut self, now: SystemTime) {
         for directory in self.directories.values_mut() {
             if let Some(due) = directory.stage_due_at {
@@ -703,6 +885,17 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                 snapshot.status_due_at = None;
             }
         }
+        for assessment in self.assessments.values_mut() {
+            let Some(due) = assessment.status_due_at else {
+                continue;
+            };
+            if now >= due {
+                assessment.status = ASSESSMENT_STATUS_FAILED.to_string();
+                assessment.status_reason = Some(ASSESSMENT_FAILED_REASON.to_string());
+                assessment.last_update = due;
+                assessment.status_due_at = None;
+            }
+        }
     }
 
     /// Directories in creation order — the order `DescribeDirectories` pages over.
@@ -710,6 +903,22 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
         let mut ordered: Vec<&Directory> = self.directories.values().collect();
         ordered.sort_by_key(|directory| directory.seq);
         ordered
+    }
+
+    /// Assessments in creation order — the order `ListADAssessments` pages over.
+    pub fn assessments_in_creation_order(&self) -> Vec<&AssessmentRecord> {
+        let mut ordered: Vec<&AssessmentRecord> = self.assessments.values().collect();
+        ordered.sort_by_key(|assessment| assessment.seq);
+        ordered
+    }
+
+    /// How many CUSTOMER assessments the account currently holds — what
+    /// [`MAX_CUSTOMER_ASSESSMENTS`] bounds.
+    pub fn customer_assessment_count(&self) -> usize {
+        self.assessments
+            .values()
+            .filter(|assessment| assessment.report_type == ASSESSMENT_REPORT_TYPE_CUSTOMER)
+            .count()
     }
 
     /// Snapshots in creation order — the order `DescribeSnapshots` pages over.
@@ -846,6 +1055,16 @@ pub fn no_such_directory_in_region(directory_id: &str, region: &str) -> String {
 /// same failure.
 pub fn no_such_snapshot(snapshot_id: &str) -> String {
     format!("Snapshot {snapshot_id} does not exist")
+}
+
+/// The `EntityDoesNotExistException` message for an id that names no stored assessment.
+///
+/// It names the member and the id the request sent, the way Directory Service's own
+/// message for this failure does, so the caller can tell which id was rejected. The
+/// request id Directory Service appends to its messages is per-run and is not
+/// fabricated here; it has its own modelled member.
+pub fn no_such_assessment(assessment_id: &str) -> String {
+    format!("Assessment Id {assessment_id} does not exist.")
 }
 
 /// The `InvalidNextTokenException` message for a token this service did not issue.
