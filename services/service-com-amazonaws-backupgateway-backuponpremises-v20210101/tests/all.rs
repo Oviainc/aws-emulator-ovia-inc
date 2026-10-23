@@ -25,3 +25,5 @@ mod hypervisor_reads;
 mod negative_paths;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/virtual_machine_listing.rs"]
+mod virtual_machine_listing;
