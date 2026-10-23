@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDatasourcePackages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDatasourcePackages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDatasourcePackages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the set of data source packages one behavior graph ingests, validated
+//! as a set and stored on the graph record.
 //!
 //! ## Shape of an operation
 //!
@@ -137,6 +131,26 @@ impl From<UpdateDatasourcePackagesErrorModeled> for UpdateDatasourcePackagesErro
     }
 }
 
+/// The requested package set as this operation validates it: the values outside the
+/// `DatasourcePackage` value set, in the order the request listed them, and the
+/// mandatory packages it left out.
+///
+/// Detective validates the SET rather than each value, which is why the two refusals
+/// list what was wrong: the message is the only place the service names which packages
+/// it did not recognise, or which mandatory one is missing.
+fn package_set_violations(requested: &[String]) -> (Vec<&str>, Vec<&str>) {
+    let unknown = requested
+        .iter()
+        .map(String::as_str)
+        .filter(|package| !DATASOURCE_PACKAGE_VALUES.contains(package))
+        .collect();
+    let missing = [crate::state::MANDATORY_DATASOURCE_PACKAGE]
+        .into_iter()
+        .filter(|mandatory| !requested.iter().any(|package| package == mandatory))
+        .collect();
+    (unknown, missing)
+}
+
 /// The `UpdateDatasourcePackages` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -173,18 +187,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDatasourcePackages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDatasourcePackagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDatasourcePackages"))
+        let _ = ctx;
+        // `GraphArn`'s pattern, `DatasourcePackages`' 1..25 length and each element's
+        // membership of the `DatasourcePackage` value set are modelled constraints the
+        // centralized walk refuses anything outside of. The SET rules below are this
+        // operation's own, and it owns the unknown-value rule too: the refusal renderer
+        // in `crate::service` words a boundary enum violation with the same sentence
+        // this does, so the message does not depend on which layer caught it.
+        let (unknown, missing) = package_set_violations(&input.datasource_packages);
+        if !unknown.is_empty() {
+            return Err(UpdateDatasourcePackagesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::unknown_datasource_packages_message(&unknown)),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+        // "missing mandatory datasource package(s)": the graph must keep ingesting the
+        // mandatory package, so a request that does not name it is refused rather than
+        // switching it off.
+        if !missing.is_empty() {
+            return Err(UpdateDatasourcePackagesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::missing_datasource_packages_message(&missing)),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDatasourcePackagesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the behavior graph store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let now = crate::state::now_epoch_millis();
+        let mut store = state.lock();
+        let graph = store.graph_mut(&input.graph_arn).ok_or_else(|| {
+            UpdateDatasourcePackagesErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(),
+            )
+        })?;
+
+        // "Starts a data source package for the Detective behavior graph": the request
+        // names the packages the graph is to ingest, so each one named is started and
+        // any package the graph was ingesting that this request leaves out is stopped.
+        // A package already in the state the request asks for keeps the instant it
+        // changed, so `LastIngestStateChange` reports when ingest actually changed
+        // rather than when it was last confirmed.
+        for (package, ingest) in graph.datasource_packages.iter_mut() {
+            let wanted = if input.datasource_packages.contains(package) {
+                crate::state::DATASOURCE_PACKAGE_STATE_STARTED
+            } else {
+                crate::state::DATASOURCE_PACKAGE_STATE_STOPPED
+            };
+            if ingest.state != wanted {
+                ingest.state = wanted.to_string();
+                ingest.last_state_change_millis = now;
+            }
+        }
+        for package in &input.datasource_packages {
+            graph
+                .datasource_packages
+                .entry(package.clone())
+                .or_insert_with(|| crate::state::DatasourcePackageIngest {
+                    state: crate::state::DATASOURCE_PACKAGE_STATE_STARTED.to_string(),
+                    last_state_change_millis: now,
+                });
+        }
+
+        Ok(UpdateDatasourcePackagesOutput)
     }
 }

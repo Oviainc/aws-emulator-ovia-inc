@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInvestigation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInvestigation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInvestigation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the investigation record `StartInvestigation` stored on this graph,
+//! read back by its id.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +133,11 @@ impl From<GetInvestigationErrorModeled> for GetInvestigationError {
     }
 }
 
+/// What this operation answers for a well-formed investigation id no investigation of
+/// the graph carries: the modelled 404, with a fixed sentence that echoes neither the
+/// id nor the ARN.
+const INVESTIGATION_NOT_FOUND_MESSAGE: &str = "The specified investigation does not exist";
+
 /// The `GetInvestigation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -175,18 +174,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInvestigation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInvestigationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInvestigation"))
+        let _ = ctx;
+        // `GraphArn`'s pattern and `InvestigationId`'s 21-character `^[0-9]+$` are
+        // modelled constraints, so the centralized walk has already refused anything
+        // outside them with a 400 before this body runs: an id that reaches here is
+        // well formed, and the only question left is whether this graph holds it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetInvestigationErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the behavior graph store is unavailable".to_string()),
+            })
+        })?;
+
+        let now = crate::state::now_epoch_millis();
+        let mut store = state.lock();
+        let graph = store.graph_mut(&input.graph_arn).ok_or_else(|| {
+            GetInvestigationErrorModeled::ResourceNotFoundException(crate::state::graph_not_found())
+        })?;
+        // The ONLY write this report makes: each investigation's run was due to finish
+        // at an instant the clock has already passed, so it is materialised here rather
+        // than reported as still running, and the next caller sees exactly this. See
+        // `crate::state::Investigation::settle`.
+        graph.settle_investigations(now);
+
+        let investigation = graph.investigations.get(&input.investigation_id).ok_or_else(|| {
+            GetInvestigationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(INVESTIGATION_NOT_FOUND_MESSAGE.to_string()),
+            })
+        })?;
+
+        Ok(GetInvestigationOutput {
+            graph_arn: Some(investigation.graph_arn.clone()),
+            investigation_id: Some(investigation.investigation_id.clone()),
+            entity_arn: Some(investigation.entity_arn.clone()),
+            entity_type: Some(investigation.entity_type.clone()),
+            created_time: Some(crate::state::millis_to_date_time(
+                investigation.created_time_millis,
+            )),
+            scope_start_time: Some(crate::state::millis_to_date_time(
+                investigation.scope_start_time_millis,
+            )),
+            scope_end_time: Some(crate::state::millis_to_date_time(
+                investigation.scope_end_time_millis,
+            )),
+            status: Some(investigation.status.clone()),
+            severity: Some(investigation.severity.clone()),
+            state: Some(investigation.state.clone()),
+        })
     }
 }

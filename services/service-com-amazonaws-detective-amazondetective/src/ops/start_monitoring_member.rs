@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartMonitoringMember
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartMonitoringMember`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartMonitoringMember::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: switches data ingest on for one member account of a behavior graph,
+//! over the member records `CreateMembers` stored.
 //!
 //! ## Shape of an operation
 //!
@@ -143,6 +137,11 @@ impl From<StartMonitoringMemberErrorModeled> for StartMonitoringMemberError {
     }
 }
 
+/// What this operation answers when the account it was given is not a member account
+/// of the graph: the modelled 404, with a fixed sentence that echoes neither the
+/// account id nor the ARN.
+const NOT_A_MEMBER_MESSAGE: &str = "The specified account is not a member account of the behavior graph";
+
 /// The `StartMonitoringMember` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -179,18 +178,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartMonitoringMember` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartMonitoringMemberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartMonitoringMember"))
+        let _ = ctx;
+        // `GraphArn`'s pattern and `AccountId`'s 12-digit pattern are modelled
+        // constraints the centralized walk has already refused anything outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartMonitoringMemberErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the behavior graph store is unavailable".to_string()),
+            })
+        })?;
+
+        let now = crate::state::now_epoch_millis();
+        let mut store = state.lock();
+        let graph = store.graph_mut(&input.graph_arn).ok_or_else(|| {
+            StartMonitoringMemberErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(),
+            )
+        })?;
+        // The verification `CreateMembers` started may have come due since, and this
+        // operation branches on the status it moves to. See
+        // `crate::state::Member::settle`.
+        graph.settle_members(now);
+
+        let member = graph.members.get_mut(&input.account_id).ok_or_else(|| {
+            StartMonitoringMemberErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(NOT_A_MEMBER_MESSAGE.to_string()),
+                },
+            )
+        })?;
+
+        // "Sends a request to enable data ingest for a member account that has a status
+        // of ACCEPTED_BUT_DISABLED": that status is the only one this operation acts
+        // on. Any other is an invalid action on the membership, which is what
+        // `ConflictException` (409) states.
+        if member.status != crate::state::MEMBER_STATUS_ACCEPTED_BUT_DISABLED {
+            return Err(StartMonitoringMemberErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Data ingest can only be enabled for a member account whose status is {}.",
+                        crate::state::MEMBER_STATUS_ACCEPTED_BUT_DISABLED
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Ingest is on: the membership is `ENABLED` and the reason it was disabled no
+        // longer holds.
+        member.status = crate::state::MEMBER_STATUS_ENABLED.to_string();
+        member.disabled_reason = None;
+        member.updated_time_millis = now;
+
+        Ok(StartMonitoringMemberOutput)
     }
 }

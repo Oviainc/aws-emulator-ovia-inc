@@ -160,9 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_epoch_millis();
         let mut store = state.lock();
         let graph = store.graph_mut(&input.graph_arn).ok_or_else(|| {
-            GetMembersErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("behavior graph {} does not exist", input.graph_arn)),
-            })
+            GetMembersErrorModeled::ResourceNotFoundException(crate::state::graph_not_found())
         })?;
         // The ONLY write a report makes: each member's verification was due at an
         // instant the clock has already passed, so it is materialised here rather than

@@ -10,14 +10,17 @@
 //! `DeleteGraph` documents ("removes the behavior graph from each member account's
 //! list of behavior graphs").
 //!
-//! `tags` lives on the graph record even though `TagResource`, `UntagResource` and
-//! `ListTagsForResource` are still scaffolded: those three key off the same graph
-//! ARN, so the map they will read is the one `CreateGraph` writes here.
+//! `tags` lives on the graph record, which is what `TagResource` writes and
+//! `ListTagsForResource` reads, and so does the investigation record `StartInvestigation`
+//! mints and `GetInvestigation` reads: the graph owns everything scoped to it, so
+//! deleting the graph drops all of it at once.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::{Graph as GraphDetail, MemberDetail, UnprocessedAccount};
+use crate::ops::types::{
+    Graph as GraphDetail, MemberDetail, ResourceNotFoundException, UnprocessedAccount,
+};
 
 /// Characters a behavior-graph id is built from.
 ///
@@ -96,6 +99,110 @@ pub const INVITATION_TYPE_INVITATION: &str = "INVITATION";
 /// reading straight back still observes the transient status.
 pub const MEMBER_VERIFICATION_MILLIS: i64 = 500;
 
+/// `MemberStatus$ACCEPTED_BUT_DISABLED`: the member accepted the invitation but data
+/// ingest is off, which is the one status `StartMonitoringMember` acts on ("Sends a
+/// request to enable data ingest for a member account that has a status of
+/// ACCEPTED_BUT_DISABLED"). One of `MEMBER_STATUS_VALUES`.
+pub const MEMBER_STATUS_ACCEPTED_BUT_DISABLED: &str = "ACCEPTED_BUT_DISABLED";
+
+/// `MemberStatus$ENABLED`: the member accepted the invitation and Detective is
+/// ingesting its data — what `StartMonitoringMember` leaves behind. One of
+/// `MEMBER_STATUS_VALUES`.
+pub const MEMBER_STATUS_ENABLED: &str = "ENABLED";
+
+/// The message every refusal of a behavior graph this service does not hold carries.
+///
+/// Recorded behaviour: Detective answers a graph-scoped request naming a graph it
+/// cannot resolve with `ResourceNotFoundException` and this one fixed sentence, which
+/// does not echo the caller-supplied ARN back. It is therefore a constant rather than
+/// a `format!`, and every operation that resolves a graph shares it.
+pub const GRAPH_NOT_FOUND_MESSAGE: &str = "Graph not found";
+
+/// The most tag keys one behavior graph may hold.
+///
+/// AWS's per-resource tag quota is 50 keys, which the modelled `TagMap` length 1..50
+/// states for ONE request — `TagResource` merges its keys into the map already stored
+/// on the graph, so the bound has to be on the STORE, not on a request. A request that
+/// would take the graph past it is refused rather than growing it, the way a create
+/// past [`MAX_GRAPHS`] or [`MAX_MEMBERS_PER_GRAPH`] is.
+pub const MAX_TAGS_PER_GRAPH: usize = 50;
+
+/// The reserved tag-key prefix no caller may set.
+///
+/// Recorded behaviour: a tag key beginning with this prefix — compared
+/// case-insensitively — is refused with error code `BadRequestException` at HTTP 400
+/// before any tag is applied.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// What that refusal says. Recorded as an example, and input-independent: it names the
+/// rule and echoes no key back.
+pub const RESERVED_TAG_KEY_MESSAGE: &str =
+    "Invalid tag key. Customers cannot set tag keys starting with aws: (case insensitive)";
+
+/// Length of the id segment of an investigation, from the modelled `InvestigationId`
+/// (length 21..21, pattern `^[0-9]+$`).
+pub const INVESTIGATION_ID_LEN: usize = 21;
+
+/// `Status$RUNNING`: the investigation is still being assembled. One of
+/// `STATUS_VALUES`.
+pub const INVESTIGATION_STATUS_RUNNING: &str = "RUNNING";
+
+/// `Status$SUCCESSFUL`: the investigation finished. One of `STATUS_VALUES`.
+pub const INVESTIGATION_STATUS_SUCCESSFUL: &str = "SUCCESSFUL";
+
+/// `State$ACTIVE`: the investigation has not been archived. One of `STATE_VALUES`.
+pub const INVESTIGATION_STATE_ACTIVE: &str = "ACTIVE";
+
+/// `Severity$INFORMATIONAL`: the lowest modelled severity, and the one an
+/// investigation that discovered no indicator of compromise carries.
+///
+/// `Severity` "is based on the likelihood and impact of the indicators of compromise
+/// discovered in the investigation", and this emulator ingests no account activity, so
+/// every investigation it runs discovers an empty indicator set — the severity that
+/// computation yields is the lowest of `SEVERITY_VALUES`, never a drawn or invented
+/// one.
+pub const INVESTIGATION_SEVERITY_INFORMATIONAL: &str = "INFORMATIONAL";
+
+/// `EntityType$IAM_USER` / `EntityType$IAM_ROLE`: the two entity kinds Detective
+/// investigates ("Detective supports IAM user ARNs and IAM role ARNs"). Both are in
+/// `ENTITY_TYPE_VALUES`.
+pub const ENTITY_TYPE_IAM_USER: &str = "IAM_USER";
+/// See [`ENTITY_TYPE_IAM_USER`].
+pub const ENTITY_TYPE_IAM_ROLE: &str = "IAM_ROLE";
+
+/// How long after `StartInvestigation` the investigation it starts is due to finish.
+///
+/// `StartInvestigation` returns an investigation whose `Status` is the non-terminal
+/// `RUNNING`, so the move to a terminal status is owed by the clock rather than by any
+/// later call. AWS publishes no duration for it; this is the span this emulator
+/// chooses, short enough not to slow a caller down and long enough that a caller
+/// reading straight back still observes `RUNNING`.
+pub const INVESTIGATION_RUN_MILLIS: i64 = 500;
+
+/// The most investigations one behavior graph will hold.
+///
+/// Emulator resource guard, NOT an AWS quota: it is what keeps the store finite, and a
+/// `StartInvestigation` that would exceed it is refused with the modelled
+/// `ValidationException` rather than growing the store without bound.
+pub const MAX_INVESTIGATIONS_PER_GRAPH: usize = 1_000;
+
+/// The data source package every behavior graph must ingest.
+///
+/// Recorded behaviour: an `UpdateDatasourcePackages` request that omits it is refused,
+/// naming it as the missing mandatory package, so it is the package `CreateGraph`
+/// starts a graph with and the one an update may never switch off. One of
+/// `DATASOURCE_PACKAGE_VALUES`.
+pub const MANDATORY_DATASOURCE_PACKAGE: &str = "DETECTIVE_CORE";
+
+/// `DatasourcePackageIngestState$STARTED`: Detective is ingesting this package. One of
+/// `DATASOURCE_PACKAGE_INGEST_STATE_VALUES`.
+pub const DATASOURCE_PACKAGE_STATE_STARTED: &str = "STARTED";
+
+/// `DatasourcePackageIngestState$STOPPED`: ingest for this package was switched off by
+/// an update that no longer named it. One of
+/// `DATASOURCE_PACKAGE_INGEST_STATE_VALUES`.
+pub const DATASOURCE_PACKAGE_STATE_STOPPED: &str = "STOPPED";
+
 /// One stored member account of a behavior graph: everything `MemberDetail`
 /// reports for it, plus the instant the verification `CreateMembers` started is
 /// due.
@@ -162,6 +269,55 @@ impl Member {
     }
 }
 
+/// One stored data source package of a behavior graph: whether Detective is ingesting
+/// it, and when that last changed.
+#[derive(Debug, Clone)]
+pub struct DatasourcePackageIngest {
+    /// One of `DATASOURCE_PACKAGE_INGEST_STATE_VALUES`.
+    pub state: String,
+    /// When the ingest state last changed, in epoch milliseconds.
+    pub last_state_change_millis: i64,
+}
+
+/// One stored investigation of a behavior graph: everything `GetInvestigation`
+/// reports for it, plus the instant its run is due to finish.
+#[derive(Debug, Clone)]
+pub struct Investigation {
+    pub investigation_id: String,
+    pub graph_arn: String,
+    pub entity_arn: String,
+    /// One of `ENTITY_TYPE_VALUES`, resolved from `entity_arn` by [`entity_type_of`].
+    pub entity_type: String,
+    pub created_time_millis: i64,
+    pub scope_start_time_millis: i64,
+    pub scope_end_time_millis: i64,
+    /// One of `STATUS_VALUES`.
+    pub status: String,
+    /// One of `SEVERITY_VALUES`.
+    pub severity: String,
+    /// One of `STATE_VALUES`.
+    pub state: String,
+    /// The instant the `RUNNING` -> `SUCCESSFUL` move is due, while that move is still
+    /// outstanding.
+    pub completion_due_millis: Option<i64>,
+}
+
+impl Investigation {
+    /// Materialise the completion the clock already made due.
+    ///
+    /// The same single write [`Member::settle`] makes, for the same reason: the move
+    /// was owed at `completion_due_millis` whether or not anybody called, so the record
+    /// a later caller sees is identical to this one.
+    pub fn settle(&mut self, now_millis: i64) {
+        if let Some(due) = self.completion_due_millis {
+            if due <= now_millis {
+                self.status = INVESTIGATION_STATUS_SUCCESSFUL.to_string();
+                self.completion_due_millis = None;
+            }
+        }
+    }
+}
+
 /// One stored behavior graph: its ARN, when it was created, its tags and the
 /// member accounts invited into it.
 #[derive(Debug, Clone, Default)]
@@ -175,6 +331,12 @@ pub struct Graph {
     /// Keyed by account id, so `ListMembers` walks a stable, total order and a page
     /// token can name the next account.
     pub members: BTreeMap<String, Member>,
+    /// Keyed by investigation id, so `ListInvestigations` will walk a stable order.
+    pub investigations: BTreeMap<String, Investigation>,
+    /// Keyed by data source package, so `ListDatasourcePackages` will walk a stable
+    /// order. `CreateGraph` seeds it with the mandatory package; everything else is
+    /// what `UpdateDatasourcePackages` stored.
+    pub datasource_packages: BTreeMap<String, DatasourcePackageIngest>,
 }
 
 impl Graph {
@@ -191,6 +353,14 @@ impl Graph {
     pub fn settle_members(&mut self, now_millis: i64) {
         for member in self.members.values_mut() {
             member.settle(now_millis);
+        }
+    }
+
+    /// Materialise every investigation completion the clock already made due. See
+    /// [`Member::settle`] for why a reporting operation is allowed to do this.
+    pub fn settle_investigations(&mut self, now_millis: i64) {
+        for investigation in self.investigations.values_mut() {
+            investigation.settle(now_millis);
         }
     }
 }
@@ -246,6 +416,113 @@ impl ComAmazonawsDetectiveAmazondetectiveState {
             .find(|arn| !self.graphs.contains_key(arn))
             .unwrap_or_else(|| graph_arn(region, &format!("{:032x}", self.graphs.len())))
     }
+
+    /// A 21-digit investigation id no investigation of the graph `graph_arn` names is
+    /// using, or `None` when that graph already holds
+    /// [`MAX_INVESTIGATIONS_PER_GRAPH`].
+    pub fn fresh_investigation_id(&mut self, graph_arn: &str) -> Option<String> {
+        if self
+            .graphs
+            .get(graph_arn)
+            .is_some_and(|graph| graph.investigations.len() >= MAX_INVESTIGATIONS_PER_GRAPH)
+        {
+            return None;
+        }
+        for _ in 0..1024 {
+            self.id_counter = self.id_counter.wrapping_add(1);
+            let candidate = investigation_id_from_seed(now_nanos() ^ self.id_counter.rotate_left(29));
+            let taken = self
+                .graphs
+                .get(graph_arn)
+                .is_some_and(|graph| graph.investigations.contains_key(&candidate));
+            if !taken {
+                return Some(candidate);
+            }
+        }
+        // Bounded fallback, so a pathological clock can never spin here: a decimal
+        // counter padded to the modelled length is also `[0-9]{21}`, and there are
+        // always more of them than the graph holds investigations.
+        let held = self
+            .graphs
+            .get(graph_arn)
+            .map_or(0, |graph| graph.investigations.len() as u64);
+        (0u64..=held)
+            .map(|n| format!("{:0width$}", n + 1, width = INVESTIGATION_ID_LEN))
+            .find(|candidate| {
+                self.graphs
+                    .get(graph_arn)
+                    .is_none_or(|graph| !graph.investigations.contains_key(candidate))
+            })
+    }
+}
+
+/// The refusal every operation answers a behavior graph this service does not hold
+/// with: the modelled 404, carrying [`GRAPH_NOT_FOUND_MESSAGE`] rather than anything
+/// built from the request.
+pub fn graph_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(GRAPH_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
+/// Whether `key` begins with the reserved [`RESERVED_TAG_KEY_PREFIX`], compared
+/// case-insensitively the way the recorded refusal describes ("Customers cannot set
+/// tag keys starting with aws: (case insensitive)").
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// How `CreateMembers` states a member of one of its `Accounts` entries failing its
+/// modelled `@pattern`: a fixed sentence naming the member in the API-level spelling
+/// the model uses, with neither the offending value nor its position in the list.
+///
+/// Recorded behaviour: two different 12-character non-numeric `AccountId`s produce the
+/// one same message, so the message is the rule rather than a report of the input. The
+/// one place it is written, so the operation's own check and the refusal the framework
+/// hands back cannot drift apart.
+pub fn account_member_pattern_message(member: &str) -> String {
+    format!("Account.{member} did not match the pattern.")
+}
+
+/// How `UpdateDatasourcePackages` states requested packages outside the
+/// `DatasourcePackage` value set: by listing them, which is the only place the service
+/// names which ones it did not recognise.
+pub fn unknown_datasource_packages_message(packages: &[&str]) -> String {
+    format!(
+        "UpdateDatasourcePackages request includes unknown datasource package(s): [{}]",
+        packages.join(", ")
+    )
+}
+
+/// How `UpdateDatasourcePackages` states a request that leaves out a package the graph
+/// must ingest — the companion of
+/// [`unknown_datasource_packages_message`], recorded for a request omitting
+/// [`MANDATORY_DATASOURCE_PACKAGE`].
+pub fn missing_datasource_packages_message(packages: &[&str]) -> String {
+    format!(
+        "UpdateDatasourcePackages request is missing mandatory datasource package(s): [{}]",
+        packages.join(", ")
+    )
+}
+
+/// The `EntityType` the entity ARN `arn` names, or `None` when it names neither of the
+/// two kinds Detective investigates.
+///
+/// From `StartInvestigation$EntityArn`: "The unique Amazon Resource Name (ARN).
+/// Detective supports IAM user ARNs and IAM role ARNs." An assumed-role session ARN
+/// names a role, so it resolves to `IAM_ROLE` too.
+pub fn entity_type_of(arn: &str) -> Option<&'static str> {
+    let resource = arn.splitn(6, ':').nth(5)?;
+    let (kind, rest) = resource.split_once('/')?;
+    if rest.is_empty() {
+        return None;
+    }
+    match kind {
+        "user" => Some(ENTITY_TYPE_IAM_USER),
+        "role" | "assumed-role" => Some(ENTITY_TYPE_IAM_ROLE),
+        _ => None,
+    }
 }
 
 /// The ARN of the behavior graph `id` in `region`.
@@ -261,6 +538,17 @@ pub fn graph_arn(region: &str, id: &str) -> String {
 /// emulator account every ARN and every account field carries.
 pub fn administrator_account_id() -> String {
     ::engine::emulator_account_id().to_string()
+}
+
+/// The account whose credentials every request this emulator serves is signed with.
+///
+/// This emulator serves exactly ONE account, so the value is the same one
+/// [`administrator_account_id`] answers. The two names are kept apart because the
+/// operations read them for different reasons: a graph's administrator is a property of
+/// the stored graph, while this is who is calling — which is what an invitee-side
+/// operation such as `RejectInvitation` resolves its own membership by.
+pub fn caller_account_id() -> String {
+    administrator_account_id()
 }
 
 /// The region this request was signed for, from its SigV4 credential scope; the
@@ -383,6 +671,24 @@ fn graph_id_from_seed(seed: u64) -> String {
         .map(|_| {
             let draw = splitmix64(&mut state);
             GRAPH_ID_ALPHABET[(draw % GRAPH_ID_ALPHABET.len() as u64) as usize] as char
+        })
+        .collect()
+}
+
+/// One `[0-9]{21}` investigation id from `seed`, as the modelled `InvestigationId`
+/// spells one. The leading digit is drawn from `1..=9` so the id reads as a number of
+/// its modelled length rather than a zero-padded shorter one.
+fn investigation_id_from_seed(seed: u64) -> String {
+    let mut state = seed;
+    (0..INVESTIGATION_ID_LEN)
+        .map(|position| {
+            let draw = splitmix64(&mut state);
+            let digit = if position == 0 {
+                1 + draw % 9
+            } else {
+                draw % 10
+            };
+            char::from(b'0' + digit as u8)
         })
         .collect()
 }
