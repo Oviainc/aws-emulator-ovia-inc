@@ -327,7 +327,9 @@ pub const AUTO_MODEL_REGISTRATION_DISABLED: &str = "AutoModelRegistrationDisable
 
 /// `EndpointStatus`'s and `ClusterStatus`'s members this emulator moves a resource
 /// through (both modelled enums also carry the update, rollback and delete states,
-/// which this slice does not reach). Named once here so no handler compares a bare
+/// which this slice does not reach). `InferenceComponentStatus` spells the same two
+/// members, so an inference component moves through these too. Named once here so no
+/// handler compares a bare
 /// string literal.
 pub const STATUS_CREATING: &str = "Creating";
 /// See [`STATUS_CREATING`].
@@ -576,22 +578,112 @@ pub struct Endpoint {
     pub in_service_at: SystemTime,
 }
 
+/// Materialise the `Creating` -> `InService` transition the clock already owes a
+/// resource that carries one.
+///
+/// This is the one write a reporting operation may make: the transition was due at
+/// `in_service_at` whether or not anybody called, so the observer makes no difference to
+/// the result. `last_modified_time` moves to the instant the transition was due, not to
+/// "now", so the value is stable across later reads.
+///
+/// Answers whether the transition happened on this call, so the caller can record it.
+fn settle_creating(
+    status: &mut String,
+    last_modified_time: &mut SystemTime,
+    in_service_at: SystemTime,
+    now: SystemTime,
+) -> bool {
+    if status == STATUS_CREATING && now >= in_service_at {
+        *status = STATUS_IN_SERVICE.to_string();
+        *last_modified_time = in_service_at;
+        return true;
+    }
+    false
+}
+
 impl Endpoint {
-    /// Materialise the `Creating` -> `InService` transition the clock already owes.
-    ///
-    /// This is the one write a reporting operation may make: the transition was due at
-    /// `in_service_at` whether or not anybody called, so the observer makes no
-    /// difference to the result. `LastModifiedTime` moves to the instant the
-    /// transition was due, not to "now", so the value is stable across later reads.
-    ///
-    /// Answers whether the transition happened on this call, so the caller can record it.
+    /// Materialise the `Creating` -> `InService` transition the clock already owes; see
+    /// [`settle_creating`].
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        if self.status == STATUS_CREATING && now >= self.in_service_at {
-            self.status = STATUS_IN_SERVICE.to_string();
-            self.last_modified_time = self.in_service_at;
-            return true;
+        settle_creating(
+            &mut self.status,
+            &mut self.last_modified_time,
+            self.in_service_at,
+            now,
+        )
+    }
+}
+
+/// How long after `CreateInferenceComponent` the clock owes that component the
+/// `Creating` -> `InService` transition, on the same terms as
+/// [`ENDPOINT_IN_SERVICE_AFTER`]: a caller that describes the component straight after
+/// creating it still observes `Creating` with no copies running, and one that waits
+/// observes `InService` with the copies it asked for. Compressed, never zero.
+///
+/// The span is measured from the later of the create and the instant the hosting
+/// endpoint goes `InService`, because a component's copies run on that endpoint's
+/// capacity and cannot be placed before it is serving.
+pub const INFERENCE_COMPONENT_IN_SERVICE_AFTER: Duration = Duration::from_millis(300);
+
+/// See [`MODEL_QUOTA`]: the same bound on the inference-component store, which
+/// `CreateInferenceComponent` answers `ResourceLimitExceeded` past and
+/// `DeleteInferenceComponent` releases a slot of.
+pub const INFERENCE_COMPONENT_QUOTA: usize = 1_000;
+
+/// An inference component created by `CreateInferenceComponent`, as
+/// `DescribeInferenceComponent` replays it.
+///
+/// The endpoint it is hosted on is snapshotted by name AND by ARN, so the component
+/// keeps reporting the endpoint it was deployed to even after that endpoint is deleted.
+/// Exactly one of `specification` / `specifications` is ever set: the model doc for
+/// `Specifications` says a caller uses "either this parameter or the singular
+/// Specification parameter, but not both".
+///
+/// `in_service_at` is the instant the clock owes the `Creating` -> `InService`
+/// transition; it is stored, never slept on, and materialised by whichever reporting
+/// call first runs at or after it.
+#[derive(Debug, Clone)]
+pub struct InferenceComponent {
+    pub name: String,
+    pub arn: String,
+    pub endpoint_name: String,
+    pub endpoint_arn: String,
+    pub variant_name: Option<String>,
+    pub specification: Option<crate::ops::types::InferenceComponentSpecification>,
+    pub specifications: Option<Vec<crate::ops::types::InferenceComponentSpecification>>,
+    pub runtime_config: Option<crate::ops::types::InferenceComponentRuntimeConfig>,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    pub in_service_at: SystemTime,
+}
+
+impl InferenceComponent {
+    /// Materialise the `Creating` -> `InService` transition the clock already owes; see
+    /// [`settle_creating`].
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        settle_creating(
+            &mut self.status,
+            &mut self.last_modified_time,
+            self.in_service_at,
+            now,
+        )
+    }
+
+    /// The specifications this component deploys, whether the caller sent the singular
+    /// `Specification` or the `Specifications` list: one slice both readers walk.
+    ///
+    /// A stored record carries at most ONE of the two members —
+    /// `CreateInferenceComponent` refuses a request that sends both — so the
+    /// both-populated pair is not a case this has to choose between.
+    pub fn specifications(&self) -> &[crate::ops::types::InferenceComponentSpecification] {
+        match (&self.specification, &self.specifications) {
+            (Some(single), None) => ::std::slice::from_ref(single),
+            (None, Some(list)) => list.as_slice(),
+            _ => &[],
         }
-        false
     }
 }
 
@@ -1273,6 +1365,8 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub servicecatalog_portfolio_enabled: bool,
     /// Keyed by `ModelName`.
     pub models: BTreeMap<String, Model>,
+    /// Keyed by `InferenceComponentName`.
+    pub inference_components: BTreeMap<String, InferenceComponent>,
     /// Keyed by `EndpointConfigName`.
     pub endpoint_configs: BTreeMap<String, EndpointConfig>,
     /// Keyed by `EndpointName`.
@@ -1372,6 +1466,12 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// Whether another model fits, i.e. the store is below [`MODEL_QUOTA`].
     pub fn models_below_quota(&self) -> bool {
         self.models.len() < MODEL_QUOTA
+    }
+
+    /// Whether another inference component fits, i.e. the store is below
+    /// [`INFERENCE_COMPONENT_QUOTA`].
+    pub fn inference_components_below_quota(&self) -> bool {
+        self.inference_components.len() < INFERENCE_COMPONENT_QUOTA
     }
 
     /// Whether another endpoint configuration fits, i.e. the store is below

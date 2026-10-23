@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end wire tests for SageMaker's inference-deployment lifecycle:
-//! model -> endpoint config -> endpoint, plus `ListModels` and the two deletes.
+//! model -> endpoint config -> endpoint -> inference component, plus `ListModels` and
+//! the two deletes.
 //!
 //! Every case goes over the wire (`POST /` with `X-Amz-Target: SageMaker.<Op>`,
 //! `awsJson1_1`) through the same `MultiServiceRouter` the production router uses, so
@@ -1535,5 +1536,903 @@ async fn requests_outside_the_modelled_constraints_are_refused() {
         listed_names(&listed),
         Vec::<String>::new(),
         "a refused request must write nothing, got {listed:?}"
+    );
+}
+
+/// Create `model -> endpoint config -> endpoint` named after `prefix` and let the
+/// endpoint's clock-owed `Creating` -> `InService` transition fall due, which is what
+/// `CreateInferenceComponent` requires of the endpoint it deploys onto.
+///
+/// Deliberately does NOT call `DescribeEndpoint` afterwards: the transition is owed by
+/// the clock, so `CreateInferenceComponent` has to see it without a reader having
+/// materialised it first.
+async fn in_service_endpoint(emulator: &Emulator, prefix: &str) -> (String, String) {
+    let model = format!("{prefix}-model");
+    let config = format!("{prefix}-cfg");
+    let endpoint = format!("{prefix}-ep");
+    emulator
+        .ok(
+            "CreateModel",
+            &json!({ "ModelName": model, "PrimaryContainer": primary_container("demo:1") }),
+        )
+        .await;
+    emulator
+        .ok("CreateEndpointConfig", &one_variant_config(&config, &model))
+        .await;
+    emulator
+        .ok(
+            "CreateEndpoint",
+            &json!({ "EndpointName": endpoint, "EndpointConfigName": config }),
+        )
+        .await;
+    tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
+    (endpoint, model)
+}
+
+/// One `InferenceComponentSpecification` naming `model`, with the compute requirement
+/// whose `MinMemoryRequiredInMb` member the shape makes required.
+fn model_specification(model: &str, instance_type: &str) -> Value {
+    json!({
+        "ModelName": model,
+        "InstanceType": instance_type,
+        "ComputeResourceRequirements": {
+            "MinMemoryRequiredInMb": 1024,
+            "NumberOfCpuCoresRequired": 1.5,
+        },
+    })
+}
+
+/// RULE: a specification summary replays every member of the specification that was
+/// stored, with the one shape difference the summary makes — the container's `Image` is
+/// reported as its `DeployedImage`'s `SpecifiedImage`.
+fn assert_specification_summary(case: &str, sent: &Value, summary: &Value) {
+    for member in [
+        "InstanceType",
+        "ModelName",
+        "BaseInferenceComponentName",
+        "StartupParameters",
+        "ComputeResourceRequirements",
+        "SchedulingConfig",
+        "DataCacheConfig",
+    ] {
+        assert_eq!(
+            summary.get(member),
+            sent.get(member),
+            "case {case}: {member} must be replayed as stored, got {summary:?}"
+        );
+    }
+    match sent.get("Container") {
+        None => assert!(
+            summary.get("Container").is_none(),
+            "case {case}: no container was sent, so none may be reported, got {summary:?}"
+        ),
+        Some(container) => {
+            let reported = summary
+                .get("Container")
+                .unwrap_or_else(|| panic!("case {case}: Container must be reported in {summary:?}"));
+            assert_eq!(
+                reported.pointer("/DeployedImage/SpecifiedImage"),
+                container.get("Image"),
+                "case {case}: the container image must be reported as the deployed image's \
+                 SpecifiedImage, got {reported:?}"
+            );
+            assert_eq!(
+                reported.get("ArtifactUrl"),
+                container.get("ArtifactUrl"),
+                "case {case}: ArtifactUrl, got {reported:?}"
+            );
+            assert_eq!(
+                reported.get("Environment"),
+                container.get("Environment"),
+                "case {case}: Environment, got {reported:?}"
+            );
+        }
+    }
+}
+
+/// RULE: `CreateInferenceComponent` mints
+/// `arn:aws:sagemaker:<signed region>:<account>:inference-component/<name>`, stores the
+/// component against its hosting endpoint in `Creating` with no copies placed, and
+/// `DescribeInferenceComponent` replays exactly what was stored for every shape of
+/// specification the model allows; once the clock-owed placement falls due the component
+/// reports `InService` with every requested copy current.
+#[tokio::test]
+async fn an_inference_component_round_trips_through_describe_for_every_specification_shape() {
+    let emulator = Emulator::new();
+    let (endpoint, model) = in_service_endpoint(&emulator, "ic").await;
+    let endpoint_arn = format!("arn:aws:sagemaker:us-east-1:{ACCOUNT}:endpoint/{endpoint}");
+
+    // A second model, so a multi-specification row names more than one.
+    emulator
+        .ok(
+            "CreateModel",
+            &json!({ "ModelName": "ic-model-two", "PrimaryContainer": primary_container("demo:2") }),
+        )
+        .await;
+
+    // Rows differ along the axes the rule generalises over: which of the two
+    // specification members carries the request, the list's size at both published
+    // bounds (`Specifications` is len 1..5), whether a production variant is named,
+    // the copy count (including the `CopyCount` range minimum, 0) and its absence, and
+    // which optional sub-structures the specification carries.
+    // `Specifications` is documented as "one per instance type", so the five-row case
+    // names five DIFFERENT instance types. Every value is a member of the modelled
+    // `ProductionVariantInstanceType` enum (smithy_query shape=ProductionVariantInstanceType),
+    // and none of them is the one the recorded case used.
+    let five_instance_types = [
+        "ml.m5.large",
+        "ml.c5.xlarge",
+        "ml.g5.2xlarge",
+        "ml.r5.large",
+        "ml.m6i.large",
+    ];
+    let five_specifications: Vec<Value> = five_instance_types
+        .iter()
+        .enumerate()
+        .map(|(index, instance_type)| {
+            let mut specification = model_specification(&model, instance_type);
+            specification["StartupParameters"] =
+                json!({ "ModelDataDownloadTimeoutInSeconds": 60 + index });
+            specification
+        })
+        .collect();
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "singular-model-specification-with-copies",
+            json!({
+                "Specification": model_specification(&model, "ml.m5.large"),
+                "RuntimeConfig": { "CopyCount": 2 },
+            }),
+        ),
+        (
+            "container-specification-on-a-named-variant",
+            json!({
+                "VariantName": "AllTraffic",
+                "Specification": {
+                    "Container": {
+                        "Image": "demo-image:3",
+                        "ArtifactUrl": "s3://bucket/model.tar.gz",
+                        "Environment": { "MODEL_ID": "tiny", "WORKERS": "2" },
+                    },
+                    "StartupParameters": {
+                        "ModelDataDownloadTimeoutInSeconds": 60,
+                        "ContainerStartupHealthCheckTimeoutInSeconds": 3600,
+                    },
+                    "ComputeResourceRequirements": {
+                        "MinMemoryRequiredInMb": 128,
+                        "MaxMemoryRequiredInMb": 256,
+                        "NumberOfAcceleratorDevicesRequired": 1.0,
+                    },
+                },
+                "RuntimeConfig": { "CopyCount": 1 },
+            }),
+        ),
+        (
+            "zero-copies-at-the-range-minimum",
+            json!({
+                "Specification": model_specification(&model, "ml.c5.large"),
+                "RuntimeConfig": { "CopyCount": 0 },
+            }),
+        ),
+        (
+            "no-runtime-config",
+            json!({ "Specification": model_specification(&model, "ml.m5.xlarge") }),
+        ),
+        (
+            "data-cache-and-scheduling-config",
+            json!({
+                "Specification": {
+                    "ModelName": model,
+                    "ComputeResourceRequirements": { "MinMemoryRequiredInMb": 2048 },
+                    "DataCacheConfig": { "EnableCaching": true },
+                    "SchedulingConfig": { "PlacementStrategy": "BINPACK" },
+                },
+                "RuntimeConfig": { "CopyCount": 4 },
+                "Tags": [{ "Key": "team", "Value": "inference" }],
+            }),
+        ),
+        (
+            "specifications-list-of-one",
+            json!({
+                "Specifications": [model_specification("ic-model-two", "ml.g5.xlarge")],
+                "RuntimeConfig": { "CopyCount": 1 },
+            }),
+        ),
+        (
+            "specifications-list-of-five",
+            json!({
+                "Specifications": five_specifications,
+                "RuntimeConfig": { "CopyCount": 3 },
+            }),
+        ),
+    ];
+
+    // Create every row, then read them all back before and after the due span, so the
+    // transition is observed once for the whole table.
+    let mut created: Vec<(&str, String, Value)> = Vec::new();
+    for (index, (case, extra)) in cases.into_iter().enumerate() {
+        let name = format!("ic-component{index}");
+        let mut body = json!({
+            "InferenceComponentName": name,
+            "EndpointName": endpoint,
+        });
+        for (member, value) in extra.as_object().expect("the row is an object") {
+            body[member] = value.clone();
+        }
+        let output = emulator.ok("CreateInferenceComponent", &body).await;
+        assert_eq!(
+            str_field(&output, "InferenceComponentArn"),
+            format!("arn:aws:sagemaker:us-east-1:{ACCOUNT}:inference-component/{name}"),
+            "case {case}: the minted ARN, got {output:?}"
+        );
+        created.push((case, name, body));
+    }
+
+    for (case, name, body) in &created {
+        let described = emulator
+            .ok(
+                "DescribeInferenceComponent",
+                &json!({ "InferenceComponentName": name }),
+            )
+            .await;
+
+        assert_eq!(
+            str_field(&described, "InferenceComponentName"),
+            *name,
+            "case {case}: InferenceComponentName, got {described:?}"
+        );
+        assert_eq!(
+            str_field(&described, "InferenceComponentArn"),
+            format!("arn:aws:sagemaker:us-east-1:{ACCOUNT}:inference-component/{name}"),
+            "case {case}: InferenceComponentArn, got {described:?}"
+        );
+        assert_eq!(
+            str_field(&described, "EndpointName"),
+            endpoint,
+            "case {case}: EndpointName, got {described:?}"
+        );
+        assert_eq!(
+            str_field(&described, "EndpointArn"),
+            endpoint_arn,
+            "case {case}: EndpointArn, got {described:?}"
+        );
+        assert_eq!(
+            described.get("VariantName"),
+            body.get("VariantName"),
+            "case {case}: VariantName must be replayed as sent, got {described:?}"
+        );
+        assert_eq!(
+            str_field(&described, "InferenceComponentStatus"),
+            "Creating",
+            "case {case}: a component whose placement is not yet due reports Creating, \
+             got {described:?}"
+        );
+        assert_eq!(
+            described.get("CreationTime"),
+            described.get("LastModifiedTime"),
+            "case {case}: nothing has changed the component yet, got {described:?}"
+        );
+        assert!(
+            described.get("FailureReason").is_none(),
+            "case {case}: a component that did not fail reports no reason, got {described:?}"
+        );
+        assert!(
+            described.get("LastDeploymentConfig").is_none(),
+            "case {case}: no update has run, so no deployment config is reported, \
+             got {described:?}"
+        );
+
+        // Exactly one of the two specification members comes back, matching the one that
+        // was sent, and each summary replays its specification.
+        match (body.get("Specification"), body.get("Specifications")) {
+            (Some(sent), None) => {
+                assert!(
+                    described.get("Specifications").is_none(),
+                    "case {case}: the plural member must not be reported beside the \
+                     singular one, got {described:?}"
+                );
+                let summary = described.get("Specification").unwrap_or_else(|| {
+                    panic!("case {case}: Specification must be reported in {described:?}")
+                });
+                assert_specification_summary(case, sent, summary);
+            }
+            (None, Some(sent)) => {
+                assert!(
+                    described.get("Specification").is_none(),
+                    "case {case}: the singular member must not be reported beside the \
+                     plural one, got {described:?}"
+                );
+                let sent = sent.as_array().expect("the row sent a list");
+                let summaries = described
+                    .get("Specifications")
+                    .and_then(Value::as_array)
+                    .unwrap_or_else(|| {
+                        panic!("case {case}: Specifications must be reported in {described:?}")
+                    });
+                assert_eq!(
+                    summaries.len(),
+                    sent.len(),
+                    "case {case}: one summary per specification, got {summaries:?}"
+                );
+                for (index, (sent, summary)) in sent.iter().zip(summaries).enumerate() {
+                    assert_specification_summary(&format!("{case}[{index}]"), sent, summary);
+                }
+            }
+            other => panic!("case {case}: the row must send exactly one member, sent {other:?}"),
+        }
+
+        // No copy is running while the placement is still owed.
+        match body.pointer("/RuntimeConfig/CopyCount") {
+            None => assert!(
+                described.get("RuntimeConfig").is_none(),
+                "case {case}: no runtime config was sent, so none may be reported, \
+                 got {described:?}"
+            ),
+            Some(desired) => {
+                let runtime = described.get("RuntimeConfig").unwrap_or_else(|| {
+                    panic!("case {case}: RuntimeConfig must be reported in {described:?}")
+                });
+                assert_eq!(
+                    runtime.get("DesiredCopyCount"),
+                    Some(desired),
+                    "case {case}: DesiredCopyCount, got {runtime:?}"
+                );
+                assert_eq!(
+                    runtime.get("CurrentCopyCount").and_then(Value::as_i64),
+                    Some(0),
+                    "case {case}: nothing is placed before the due span, got {runtime:?}"
+                );
+            }
+        }
+    }
+
+    tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
+
+    for (case, name, body) in &created {
+        let settled = emulator
+            .ok(
+                "DescribeInferenceComponent",
+                &json!({ "InferenceComponentName": name }),
+            )
+            .await;
+        assert_eq!(
+            str_field(&settled, "InferenceComponentStatus"),
+            "InService",
+            "case {case}: after the due span the component is placed, got {settled:?}"
+        );
+        let created_at = settled
+            .get("CreationTime")
+            .and_then(Value::as_f64)
+            .expect("CreationTime");
+        let modified_at = settled
+            .get("LastModifiedTime")
+            .and_then(Value::as_f64)
+            .expect("LastModifiedTime");
+        assert!(
+            modified_at > created_at,
+            "case {case}: LastModifiedTime {modified_at} must move past CreationTime \
+             {created_at} when the status changes"
+        );
+
+        if let Some(desired) = body.pointer("/RuntimeConfig/CopyCount") {
+            let runtime = settled
+                .get("RuntimeConfig")
+                .unwrap_or_else(|| panic!("case {case}: RuntimeConfig in {settled:?}"));
+            assert_eq!(
+                runtime.get("CurrentCopyCount"),
+                Some(desired),
+                "case {case}: every requested copy is current once placed, got {runtime:?}"
+            );
+            // `PlacementStatus` is keyed by instance type, so it is reported exactly
+            // when the specifications name ONE distinct type — then every current copy
+            // sits on it. Several distinct types, or none, leave the member out.
+            let mut instance_types: Vec<String> = match (
+                body.get("Specification"),
+                body.get("Specifications").and_then(Value::as_array),
+            ) {
+                (Some(single), None) => single
+                    .get("InstanceType")
+                    .and_then(Value::as_str)
+                    .map(|instance_type| vec![instance_type.to_string()])
+                    .unwrap_or_default(),
+                (None, Some(list)) => list
+                    .iter()
+                    .filter_map(|specification| specification.get("InstanceType"))
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            instance_types.sort();
+            instance_types.dedup();
+            match runtime.get("PlacementStatus").and_then(Value::as_array) {
+                None => assert_ne!(
+                    instance_types.len(),
+                    1,
+                    "case {case}: {instance_types:?} is one instance type, so a placement \
+                     status is owed, got {runtime:?}"
+                ),
+                Some(placements) => {
+                    let reported: Vec<String> = placements
+                        .iter()
+                        .map(|placement| str_field(placement, "InstanceType"))
+                        .collect();
+                    assert_eq!(
+                        reported, instance_types,
+                        "case {case}: the placement status names the one instance type the \
+                         specifications named, got {runtime:?}"
+                    );
+                    for placement in placements {
+                        assert_eq!(
+                            placement.get("CurrentCopyCount"),
+                            Some(desired),
+                            "case {case}: placed copies per instance type, got {placement:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// RULE: a component is only created from a request whose members it can satisfy — an
+/// endpoint or model that does not exist, a production variant the endpoint does not
+/// carry, a name already taken, and a request carrying both or neither specification
+/// member are all refused with HTTP 400 `ValidationException` and store nothing.
+#[tokio::test]
+async fn creating_an_inference_component_is_refused_when_the_request_cannot_be_satisfied() {
+    let emulator = Emulator::new();
+    let (endpoint, model) = in_service_endpoint(&emulator, "bad").await;
+
+    // One component that exists, so a duplicate name has something to collide with.
+    emulator
+        .ok(
+            "CreateInferenceComponent",
+            &json!({
+                "InferenceComponentName": "bad-taken",
+                "EndpointName": endpoint,
+                "Specification": model_specification(&model, "ml.m5.large"),
+                "RuntimeConfig": { "CopyCount": 1 },
+            }),
+        )
+        .await;
+
+    // Rows differ along which part of the request cannot be satisfied.
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "unknown-endpoint",
+            json!({
+                "InferenceComponentName": "bad-c1",
+                "EndpointName": "no-such-endpoint",
+                "Specification": model_specification(&model, "ml.m5.large"),
+            }),
+        ),
+        (
+            "unknown-model",
+            json!({
+                "InferenceComponentName": "bad-c3",
+                "EndpointName": endpoint,
+                "Specification": model_specification("no-such-model", "ml.m5.large"),
+            }),
+        ),
+        (
+            "unknown-production-variant",
+            json!({
+                "InferenceComponentName": "bad-c4",
+                "EndpointName": endpoint,
+                "VariantName": "NoSuchVariant",
+                "Specification": model_specification(&model, "ml.m5.large"),
+            }),
+        ),
+        (
+            "both-specification-members",
+            json!({
+                "InferenceComponentName": "bad-c5",
+                "EndpointName": endpoint,
+                "Specification": model_specification(&model, "ml.m5.large"),
+                "Specifications": [model_specification(&model, "ml.m5.large")],
+            }),
+        ),
+        (
+            "neither-specification-member",
+            json!({
+                "InferenceComponentName": "bad-c6",
+                "EndpointName": endpoint,
+            }),
+        ),
+        (
+            "name-already-taken",
+            json!({
+                "InferenceComponentName": "bad-taken",
+                "EndpointName": endpoint,
+                "Specification": model_specification(&model, "ml.m5.large"),
+            }),
+        ),
+    ];
+
+    for (case, body) in cases {
+        let (status, parsed) = emulator.call("CreateInferenceComponent", &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case}: the create must be refused, got {status} {parsed}"
+        );
+        assert_eq!(
+            error_code(&parsed),
+            "ValidationException",
+            "case {case}: the refusal's error code, got {parsed:?}"
+        );
+        assert!(
+            !message(&parsed).is_empty(),
+            "case {case}: the refusal must say what was wrong, got {parsed:?}"
+        );
+
+        // Nothing was stored for a refused request.
+        let name = str_field(&body, "InferenceComponentName");
+        let (read_status, read_body) = emulator
+            .call(
+                "DescribeInferenceComponent",
+                &json!({ "InferenceComponentName": name }),
+            )
+            .await;
+        if case == "name-already-taken" {
+            assert_eq!(
+                read_status, 200,
+                "case {case}: the component that was already there must survive, \
+                 got {read_status} {read_body}"
+            );
+        } else {
+            assert_eq!(
+                read_status, 400,
+                "case {case}: the refused component must not be stored, \
+                 got {read_status} {read_body}"
+            );
+        }
+    }
+
+    // And a reader for a component nobody created is refused, not answered emptily.
+    let (status, parsed) = emulator
+        .call(
+            "DescribeInferenceComponent",
+            &json!({ "InferenceComponentName": "never-created" }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case describe-unknown-component: got {status} {parsed}"
+    );
+    assert_eq!(
+        error_code(&parsed),
+        "ValidationException",
+        "case describe-unknown-component: the refusal's error code, got {parsed:?}"
+    );
+}
+
+/// RULE: a component is accepted on an endpoint that is still being created, and its
+/// copies are placed only once that endpoint is serving: it reports `Creating` with no
+/// current copy until then, and the instant its placement falls due is after the instant
+/// the endpoint went `InService`.
+#[tokio::test]
+async fn a_component_on_a_still_creating_endpoint_is_placed_only_once_the_endpoint_serves() {
+    // The component's span runs from the endpoint's, and both are 300 ms
+    // (`state::ENDPOINT_IN_SERVICE_AFTER`, `state::INFERENCE_COMPONENT_IN_SERVICE_AFTER`),
+    // so this waits past the two of them with margin.
+    const PAST_BOTH_DUE: Duration = Duration::from_millis(1_200);
+
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateModel",
+            &json!({
+                "ModelName": "wait-ic-model",
+                "PrimaryContainer": primary_container("demo:1"),
+            }),
+        )
+        .await;
+    emulator
+        .ok(
+            "CreateEndpointConfig",
+            &one_variant_config("wait-ic-cfg", "wait-ic-model"),
+        )
+        .await;
+    emulator
+        .ok(
+            "CreateEndpoint",
+            &json!({ "EndpointName": "wait-ic-ep", "EndpointConfigName": "wait-ic-cfg" }),
+        )
+        .await;
+
+    // No wait at all: the endpoint is still `Creating` when the component is created.
+    let created = emulator
+        .ok(
+            "CreateInferenceComponent",
+            &json!({
+                "InferenceComponentName": "wait-ic",
+                "EndpointName": "wait-ic-ep",
+                "Specification": model_specification("wait-ic-model", "ml.m5.large"),
+                "RuntimeConfig": { "CopyCount": 2 },
+            }),
+        )
+        .await;
+    assert_eq!(
+        str_field(&created, "InferenceComponentArn"),
+        format!("arn:aws:sagemaker:us-east-1:{ACCOUNT}:inference-component/wait-ic"),
+        "case created-on-a-creating-endpoint: the minted ARN, got {created:?}"
+    );
+
+    let creating = emulator
+        .ok(
+            "DescribeInferenceComponent",
+            &json!({ "InferenceComponentName": "wait-ic" }),
+        )
+        .await;
+    assert_eq!(
+        str_field(&creating, "InferenceComponentStatus"),
+        "Creating",
+        "case created-on-a-creating-endpoint: got {creating:?}"
+    );
+    assert_eq!(
+        creating
+            .pointer("/RuntimeConfig/CurrentCopyCount")
+            .and_then(Value::as_i64),
+        Some(0),
+        "case created-on-a-creating-endpoint: no copy runs yet, got {creating:?}"
+    );
+
+    tokio::time::sleep(PAST_BOTH_DUE).await;
+
+    let endpoint = emulator
+        .ok("DescribeEndpoint", &json!({ "EndpointName": "wait-ic-ep" }))
+        .await;
+    assert_eq!(
+        str_field(&endpoint, "EndpointStatus"),
+        "InService",
+        "case after-both-due-spans: the endpoint serves, got {endpoint:?}"
+    );
+    let settled = emulator
+        .ok(
+            "DescribeInferenceComponent",
+            &json!({ "InferenceComponentName": "wait-ic" }),
+        )
+        .await;
+    assert_eq!(
+        str_field(&settled, "InferenceComponentStatus"),
+        "InService",
+        "case after-both-due-spans: the component is placed, got {settled:?}"
+    );
+    assert_eq!(
+        settled
+            .pointer("/RuntimeConfig/CurrentCopyCount")
+            .and_then(Value::as_i64),
+        Some(2),
+        "case after-both-due-spans: every requested copy runs, got {settled:?}"
+    );
+
+    // The placement is not due before the endpoint is serving: each `LastModifiedTime`
+    // is the instant its own transition fell due, so the component's is the later one.
+    let endpoint_in_service_at = endpoint
+        .get("LastModifiedTime")
+        .and_then(Value::as_f64)
+        .expect("the endpoint's LastModifiedTime");
+    let placed_at = settled
+        .get("LastModifiedTime")
+        .and_then(Value::as_f64)
+        .expect("the component's LastModifiedTime");
+    assert!(
+        placed_at > endpoint_in_service_at,
+        "case after-both-due-spans: the component was placed at {placed_at}, which must be \
+         after the endpoint started serving at {endpoint_in_service_at}"
+    );
+}
+
+/// RULE: `DeleteInferenceComponent` releases the component it names — the reader no
+/// longer finds it, a second delete is refused, the name is free again, and no other
+/// component is touched.
+#[tokio::test]
+async fn deleting_an_inference_component_releases_only_that_component() {
+    let emulator = Emulator::new();
+    let (endpoint, model) = in_service_endpoint(&emulator, "del").await;
+
+    // Rows differ along the shape of the component being deleted: a plain one, one
+    // pinned to a production variant, and one created from the plural member.
+    let bodies = [
+        json!({
+            "InferenceComponentName": "del-plain",
+            "EndpointName": endpoint,
+            "Specification": model_specification(&model, "ml.m5.large"),
+            "RuntimeConfig": { "CopyCount": 1 },
+        }),
+        json!({
+            "InferenceComponentName": "del-on-variant",
+            "EndpointName": endpoint,
+            "VariantName": "AllTraffic",
+            "Specification": model_specification(&model, "ml.m5.large"),
+        }),
+        json!({
+            "InferenceComponentName": "del-plural",
+            "EndpointName": endpoint,
+            "Specifications": [model_specification(&model, "ml.c5.large")],
+        }),
+    ];
+    for body in &bodies {
+        emulator.ok("CreateInferenceComponent", body).await;
+    }
+
+    for body in &bodies {
+        let name = str_field(body, "InferenceComponentName");
+        emulator
+            .ok(
+                "DeleteInferenceComponent",
+                &json!({ "InferenceComponentName": name }),
+            )
+            .await;
+
+        // Gone for the reader, and gone for a second delete.
+        for target in ["DescribeInferenceComponent", "DeleteInferenceComponent"] {
+            let (status, parsed) = emulator
+                .call(target, &json!({ "InferenceComponentName": name }))
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {name}/{target}: a deleted component is gone, got {status} {parsed}"
+            );
+            assert_eq!(
+                error_code(&parsed),
+                "ValidationException",
+                "case {name}/{target}: the refusal's error code, got {parsed:?}"
+            );
+        }
+
+        // The name is free again: the same create succeeds, and the record it leaves is
+        // readable.
+        emulator.ok("CreateInferenceComponent", body).await;
+        let described = emulator
+            .ok(
+                "DescribeInferenceComponent",
+                &json!({ "InferenceComponentName": name }),
+            )
+            .await;
+        assert_eq!(
+            str_field(&described, "InferenceComponentName"),
+            name,
+            "case {name}: the recreated component reads back, got {described:?}"
+        );
+    }
+
+    // Nothing else was released along the way: every component is still readable.
+    for body in &bodies {
+        let name = str_field(body, "InferenceComponentName");
+        emulator
+            .ok(
+                "DescribeInferenceComponent",
+                &json!({ "InferenceComponentName": name }),
+            )
+            .await;
+    }
+}
+
+/// RULE: an inference component's ARN names the region the caller signed for (the
+/// emulator default when the request is unsigned), the `inference-component` resource
+/// kind and the stored name, whatever the name's shape — and the component reports the
+/// ARN of the endpoint it was deployed onto in that same region.
+#[tokio::test]
+async fn an_inference_component_arn_names_the_signed_region_the_kind_and_the_stored_name() {
+    // Rows differ along the name's shape, including the modelled 63-character maximum
+    // (`InferenceComponentName` is len 0..63, smithy_query
+    // operation=CreateInferenceComponent).
+    let names = [
+        "c",
+        "component1",
+        "demo-component-with-hyphens",
+        "a234567890123456789012345678901234567890123456789012345678901b",
+    ];
+    // Rows differ along the signed region, plus the unsigned request, whose ARN falls
+    // back to `state::DEFAULT_REGION`.
+    let regions = ["us-east-1", "eu-west-1", "ap-southeast-2"];
+
+    for region in regions {
+        let emulator = Emulator::new();
+        let model = "arn-model";
+        let config = "arn-cfg";
+        let endpoint = "arn-ep";
+        emulator
+            .call_in(
+                region,
+                "CreateModel",
+                &json!({ "ModelName": model, "PrimaryContainer": primary_container("demo:1") }),
+            )
+            .await;
+        emulator
+            .call_in(region, "CreateEndpointConfig", &one_variant_config(config, model))
+            .await;
+        emulator
+            .call_in(
+                region,
+                "CreateEndpoint",
+                &json!({ "EndpointName": endpoint, "EndpointConfigName": config }),
+            )
+            .await;
+        tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
+
+        for name in names {
+            let (status, created) = emulator
+                .call_in(
+                    region,
+                    "CreateInferenceComponent",
+                    &json!({
+                        "InferenceComponentName": name,
+                        "EndpointName": endpoint,
+                        "Specification": model_specification(model, "ml.m5.large"),
+                        "RuntimeConfig": { "CopyCount": 1 },
+                    }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {region}/{name}: the create must succeed, got {status} {created}"
+            );
+            assert_eq!(
+                str_field(&created, "InferenceComponentArn"),
+                format!("arn:aws:sagemaker:{region}:{ACCOUNT}:inference-component/{name}"),
+                "case {region}/{name}: the minted ARN, got {created:?}"
+            );
+
+            let described = emulator
+                .call_in(
+                    region,
+                    "DescribeInferenceComponent",
+                    &json!({ "InferenceComponentName": name }),
+                )
+                .await
+                .1;
+            assert_eq!(
+                str_field(&described, "InferenceComponentArn"),
+                format!("arn:aws:sagemaker:{region}:{ACCOUNT}:inference-component/{name}"),
+                "case {region}/{name}: the replayed ARN, got {described:?}"
+            );
+            assert_eq!(
+                str_field(&described, "EndpointArn"),
+                format!("arn:aws:sagemaker:{region}:{ACCOUNT}:endpoint/{endpoint}"),
+                "case {region}/{name}: the hosting endpoint's ARN, got {described:?}"
+            );
+        }
+    }
+
+    // The unsigned request: no credential scope, so every ARN falls back to the
+    // emulator's default region.
+    let emulator = Emulator::new();
+    emulator
+        .call_unsigned(
+            "CreateModel",
+            &json!({ "ModelName": "u-model", "PrimaryContainer": primary_container("demo:1") }),
+        )
+        .await;
+    emulator
+        .call_unsigned("CreateEndpointConfig", &one_variant_config("u-cfg", "u-model"))
+        .await;
+    emulator
+        .call_unsigned(
+            "CreateEndpoint",
+            &json!({ "EndpointName": "u-ep", "EndpointConfigName": "u-cfg" }),
+        )
+        .await;
+    tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
+    let (status, created) = emulator
+        .call_unsigned(
+            "CreateInferenceComponent",
+            &json!({
+                "InferenceComponentName": "u-component",
+                "EndpointName": "u-ep",
+                "Specification": model_specification("u-model", "ml.m5.large"),
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case unsigned: the create must succeed, got {status} {created}"
+    );
+    assert_eq!(
+        str_field(&created, "InferenceComponentArn"),
+        format!("arn:aws:sagemaker:us-east-1:{ACCOUNT}:inference-component/u-component"),
+        "case unsigned: the ARN must name the emulator's default region, got {created:?}"
     );
 }
