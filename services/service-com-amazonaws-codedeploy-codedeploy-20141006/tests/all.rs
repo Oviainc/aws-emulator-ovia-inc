@@ -23,6 +23,8 @@ mod codedeploy_deployment_outcome;
 mod codedeploy_lifecycle;
 #[path = "all/deployment_configs.rs"]
 mod deployment_configs;
+#[path = "all/deployment_group_defaults.rs"]
+mod deployment_group_defaults;
 #[path = "all/deployment_group_update.rs"]
 mod deployment_group_update;
 #[path = "all/git_hub_account_token_names.rs"]
@@ -35,6 +37,8 @@ mod lifecycle_event_hook_status;
 mod on_premises_instances;
 #[path = "all/on_premises_revisions_and_blue_green.rs"]
 mod on_premises_revisions_and_blue_green;
+#[path = "all/on_premises_tag_removal.rs"]
+mod on_premises_tag_removal;
 #[path = "all/on_premises_tagging.rs"]
 mod on_premises_tagging;
 #[path = "all/state_roundtrip.rs"]
