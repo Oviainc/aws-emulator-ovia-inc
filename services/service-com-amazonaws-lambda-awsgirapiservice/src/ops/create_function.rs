@@ -511,6 +511,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policies: ::std::collections::BTreeMap::new(),
             // ... and no function URL until `CreateFunctionUrlConfig` creates one.
             url_configs: ::std::collections::BTreeMap::new(),
+            // ... and no alias until `CreateAlias` creates one.
+            aliases: ::std::collections::BTreeMap::new(),
         };
 
         // "Use the Publish parameter to create version 1 of your function from its

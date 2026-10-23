@@ -156,6 +156,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "The Amazon EVS environment store is unavailable.".to_string(),
             })
         })?;
+        // Authorization first: AWS decides it at the IAM layer. A listing names no
+        // resource of its own, so only a statement covering every resource decides it.
+        if let Some(denied) =
+            crate::state::authorization::denied(&*self.engine, ctx, Self::NAME, None)
+        {
+            return Err(denied);
+        }
 
         let start_after = match input.next_token.as_deref() {
             None => None,

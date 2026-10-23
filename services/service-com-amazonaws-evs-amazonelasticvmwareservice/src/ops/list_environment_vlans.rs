@@ -160,6 +160,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let region = crate::state::request_region(ctx.parts());
+        // Authorization first: AWS decides it at the IAM layer, BEFORE the resource the
+        // request names is evaluated, so the ARN is the one the REQUEST names.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&crate::state::environment_arn(&region, &input.environment_id)),
+        ) {
+            return Err(denied);
+        }
 
         // The cursor is the VLAN id the next page starts at.
         let start_at = match input.next_token.as_deref() {

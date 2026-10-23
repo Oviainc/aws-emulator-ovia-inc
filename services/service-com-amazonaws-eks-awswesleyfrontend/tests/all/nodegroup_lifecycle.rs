@@ -1032,7 +1032,8 @@ async fn the_documented_request_rules_are_enforced() {
 // `ResourceNotFoundException`, naming the cluster it could not resolve, and
 // stores nothing. (The error CLASS of that refusal, and the ordering that makes
 // it precede every report about the rest of the request, are the subject of
-// `tests/all/error_class_selection.rs`.)
+// `tests/all/error_class_selection.rs` and
+// `tests/all/child_create_resolves_the_cluster_first.rs`.)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1061,6 +1062,8 @@ async fn a_node_group_cannot_be_created_without_its_cluster() {
             Some("ResourceNotFoundException"),
             "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
         );
+        // The cluster is the resource reported missing, so the payload names it and
+        // never the node group the request asked for.
         assert_eq!(
             answer.body["clusterName"].as_str(),
             Some(cluster),

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one alias of the function the request names and persists it on that
+//! function's record in [`crate::state`] — the name it is addressed by, the version it
+//! invokes, its description and its traffic-shifting configuration — then answers the
+//! `AliasConfiguration` read back out of what it stored. Every value in the answer comes
+//! from the record: the ARN is the function's own ARN qualified by the alias name, and
+//! the revision id is minted once and stored, so a later `GetAlias` reports the same one.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +174,199 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAlias"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAliasErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+
+        // The `Alias` pattern's negative lookahead (`^(?!^[0-9]+$)([a-zA-Z0-9-_]+)$`) is
+        // what keeps an alias name out of the version-number namespace, so a name that
+        // does not satisfy it names no alias a function could ever address.
+        if !crate::state::is_alias_name(&input.name) {
+            return Err(invalid_parameter(crate::state::alias_name_message(
+                &input.name,
+            )));
+        }
+
+        // `VersionWithLatestPublished` also admits `$LATEST.PUBLISHED`, a destination
+        // this operation's own `FunctionVersion` output member cannot express
+        // (`^(\$LATEST|[0-9]+)$`) and which the model says nothing more about. Rather
+        // than invent what an alias to it invokes, that one value keeps the scaffold's
+        // 501; every other version is served below.
+        if input.function_version == LATEST_PUBLISHED {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "CreateAlias with FunctionVersion={LATEST_PUBLISHED}"
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // An alias belongs to the function and invokes the version `FunctionVersion`
+        // names, so a `FunctionName` qualified with anything else names no function an
+        // alias can be created on.
+        let reference =
+            crate::state::parse_function_reference(&input.function_name).ok_or_else(|| {
+                invalid_parameter(format!(
+                    "1 validation error detected: Value '{}' at 'functionName' failed to \
+                     satisfy constraint: Member must satisfy one of the documented name \
+                     formats (name, name:qualifier, partial ARN or function ARN)",
+                    input.function_name
+                ))
+            })?;
+        if let Some(qualifier) = reference
+            .qualifier
+            .as_deref()
+            .filter(|qualifier| *qualifier != crate::state::VERSION_LATEST)
+        {
+            return Err(invalid_parameter(format!(
+                "An alias belongs to a function and invokes the version named by \
+                 'FunctionVersion', and the qualifier '{qualifier}' in 'functionName' names \
+                 a published version or an alias"
+            )));
+        }
+
+        let Some(record) = store.functions.get_mut(&reference.name) else {
+            return Err(not_found(format!(
+                "Function not found: {}",
+                crate::state::function_arn(&region, &reference.name)
+            )));
+        };
+        record.materialize(now);
+
+        // "The function version that the alias invokes" has to be one the function has:
+        // its unpublished version, or one it published.
+        if record.config_of(&input.function_version).is_none() {
+            return Err(not_found(format!(
+                "Function not found: {}",
+                record.versioned_arn(&input.function_version)
+            )));
+        }
+
+        // An alias name identifies at most one alias of a function, so a second create
+        // of the same name conflicts rather than replacing the first: an already
+        // existing resource is what `ResourceConflictException` covers beside "another
+        // operation is in progress".
+        if record.aliases.contains_key(&input.name) {
+            return Err(CreateAliasErrorModeled::ResourceConflictException(
+                ResourceConflictException {
+                    r#type: None,
+                    message: Some(format!(
+                        "Alias already exists: {}",
+                        record.versioned_arn(&input.name)
+                    )),
+                },
+            )
+            .into());
+        }
+        if record.aliases.len() >= crate::state::MAX_FUNCTION_ALIASES {
+            return Err(CreateAliasErrorModeled::AliasLimitExceededException(
+                AliasLimitExceededException {
+                    r#type: None,
+                    message: Some(format!(
+                        "Alias limit exceeded: this function already holds the maximum of {} \
+                         aliases.",
+                        crate::state::MAX_FUNCTION_ALIASES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "You can also map an alias to split invocation requests between two versions.
+        // Use the RoutingConfig parameter to specify a second version and the percentage
+        // of invocation requests that it receives." That second version is one the
+        // function published, it is not the version the alias already invokes, and there
+        // is only ever one of it.
+        let additional_version_weights: ::std::collections::BTreeMap<String, f64> = input
+            .routing_config
+            .as_ref()
+            .and_then(|routing| routing.additional_version_weights.as_ref())
+            .map(|weights| {
+                weights
+                    .iter()
+                    .map(|(version, weight)| (version.clone(), *weight))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if additional_version_weights.len() > crate::state::MAX_ALIAS_ADDITIONAL_VERSIONS {
+            return Err(invalid_parameter(format!(
+                "RoutingConfig.AdditionalVersionWeights names {} versions, and an alias \
+                 splits its invocations between the version it invokes and at most {} other",
+                additional_version_weights.len(),
+                crate::state::MAX_ALIAS_ADDITIONAL_VERSIONS
+            )));
+        }
+        for additional in additional_version_weights.keys() {
+            // Traffic is shifted between two SNAPSHOTS of the function, and the
+            // unpublished version is not one: its code and configuration keep changing
+            // under the weights.
+            if input.function_version == crate::state::VERSION_LATEST {
+                return Err(invalid_parameter(format!(
+                    "An alias that routes invocations to a second version cannot invoke the \
+                     unpublished {latest} version",
+                    latest = crate::state::VERSION_LATEST
+                )));
+            }
+            if *additional == input.function_version {
+                return Err(invalid_parameter(format!(
+                    "RoutingConfig.AdditionalVersionWeights names version {additional}, which \
+                     is the version this alias already invokes"
+                )));
+            }
+            if record.config_of(additional).is_none() {
+                return Err(not_found(format!(
+                    "Function not found: {}",
+                    record.versioned_arn(additional)
+                )));
+            }
+        }
+
+        let created = crate::state::AliasRecord {
+            name: input.name.clone(),
+            function_version: input.function_version.clone(),
+            // Stored exactly as supplied: an alias the caller described no further
+            // carries no description this emulator made up.
+            description: input.description.clone(),
+            additional_version_weights,
+            revision_id: crate::state::mint_revision_id(),
+        };
+        record.aliases.insert(input.name.clone(), created);
+
+        // Answered by reading the alias back out of the record, so `GetAlias` reports
+        // exactly what this call persisted.
+        let Some(stored) = record.aliases.get(&input.name) else {
+            return Err(CreateAliasErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("The created alias could not be read back".to_string()),
+            })
+            .into());
+        };
+        Ok(record.alias_configuration(stored))
     }
+}
+
+/// The one `FunctionVersion` value this operation does not serve; see the handler.
+const LATEST_PUBLISHED: &str = "$LATEST.PUBLISHED";
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> CreateAliasError {
+    CreateAliasErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 404 for a function, or a version of one, this emulator does not hold.
+fn not_found(message: String) -> CreateAliasError {
+    CreateAliasErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
 }

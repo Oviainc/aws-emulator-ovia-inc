@@ -39,9 +39,10 @@ use base64::Engine as _;
 use sha2::Digest as _;
 
 use crate::ops::types::{
-    AccountLimit, AccountUsage, Cors, CreateFunctionOutput, EnvironmentResponse, EphemeralStorage,
-    FunctionCodeLocation, GetLayerVersionOutput, Layer, LayerVersionContentOutput,
-    PutFunctionConcurrencyOutput, ResolvedS3Object, TracingConfigResponse,
+    AccountLimit, AccountUsage, AliasRoutingConfiguration, Cors, CreateAliasOutput,
+    CreateFunctionOutput, EnvironmentResponse, EphemeralStorage, FunctionCodeLocation,
+    GetLayerVersionOutput, Layer, LayerVersionContentOutput, PutFunctionConcurrencyOutput,
+    ResolvedS3Object, TracingConfigResponse,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -603,6 +604,95 @@ impl FunctionUrlConfigRecord {
     }
 }
 
+/// The most aliases this emulator keeps for one function.
+///
+/// An EMULATOR-CHOSEN ceiling, in the sense [`MAX_FUNCTIONS`] is: the store is in memory
+/// and every `CreateAlias` adds to it. AWS bounds the aliases of a function too and
+/// answers the modelled `AliasLimitExceededException` for the create that would pass the
+/// bound ("Lambda couldn't create the alias because your Amazon Web Services account has
+/// exceeded the maximum number of aliases allowed per Lambda function"), but neither the
+/// model nor the published quotas carry the number, so this slice picks one and answers
+/// that same modelled error past it.
+pub const MAX_FUNCTION_ALIASES: usize = 100;
+
+/// The most versions one alias may route to BESIDE the version it invokes.
+///
+/// `CreateAlias`'s own documentation describes traffic shifting as a split between two
+/// versions — "You can also map an alias to split invocation requests between two
+/// versions. Use the RoutingConfig parameter to specify a second version and the
+/// percentage of invocation requests that it receives" — so `AdditionalVersionWeights`
+/// names at most one.
+pub const MAX_ALIAS_ADDITIONAL_VERSIONS: usize = 1;
+
+/// The model's `Alias` pattern, which every operation naming an alias puts on it.
+pub const ALIAS_NAME_PATTERN: &str = r"^(?!^[0-9]+$)([a-zA-Z0-9-_]+)$";
+
+/// Whether `name` is a name an alias may carry.
+///
+/// An alias shares the qualifier namespace with a function's published version numbers,
+/// and [`ALIAS_NAME_PATTERN`] is what keeps the two apart: its negative lookahead
+/// refuses an all-digit name, so no alias can ever be confused with a version.
+#[must_use]
+pub fn is_alias_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.bytes().all(|byte| byte.is_ascii_digit())
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+        })
+}
+
+/// The refusal for a name no alias may carry: a validation message built from the
+/// request, naming the member and the constraint it failed.
+#[must_use]
+pub fn alias_name_message(name: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{name}' at 'name' failed to satisfy constraint: \
+         Member must satisfy regular expression pattern: {ALIAS_NAME_PATTERN}"
+    )
+}
+
+/// One alias of a function: "a function identifier that you can update to invoke a
+/// different version", as `CreateAlias` documents it.
+///
+/// Held per name on [`FunctionRecord::aliases`], because an alias belongs to the
+/// function rather than to one of its versions, and a function has at most one alias of
+/// a given name.
+#[derive(Debug, Clone)]
+pub struct AliasRecord {
+    /// The name the alias is addressed by, which is also the qualifier of its ARN.
+    pub name: String,
+    /// "The function version that the alias invokes": [`VERSION_LATEST`] or a published
+    /// version number.
+    pub function_version: String,
+    /// The description, exactly as supplied; absent when the caller gave none.
+    pub description: Option<String>,
+    /// The second version this alias routes part of its invocations to, and the share it
+    /// receives, keyed by version number so the configuration reports in a stable order.
+    /// Empty when the alias does no traffic shifting.
+    pub additional_version_weights: BTreeMap<String, f64>,
+    /// "A unique identifier that changes when you update the alias", minted on every
+    /// write to it.
+    pub revision_id: String,
+}
+
+impl AliasRecord {
+    /// The `AliasRoutingConfiguration` the wire reports for this alias, present only
+    /// once the alias routes to a second version: the model gives the member no
+    /// default, so an alias that shifts no traffic carries no routing configuration at
+    /// all.
+    #[must_use]
+    pub fn routing_config(&self) -> Option<AliasRoutingConfiguration> {
+        (!self.additional_version_weights.is_empty()).then(|| AliasRoutingConfiguration {
+            additional_version_weights: Some(
+                self.additional_version_weights
+                    .iter()
+                    .map(|(version, weight)| (version.clone(), *weight))
+                    .collect(),
+            ),
+        })
+    }
+}
+
 /// One Lambda function: its unpublished (`$LATEST`) configuration, its code, its
 /// lifecycle state, its tags and its published versions.
 #[derive(Debug, Clone)]
@@ -652,6 +742,10 @@ pub struct FunctionRecord {
     /// each qualifier has at most one, so a second create on the same qualifier
     /// conflicts rather than replacing it.
     pub url_configs: BTreeMap<String, FunctionUrlConfigRecord>,
+    /// The aliases of this function, keyed by alias name so `ListAliases` pages through
+    /// them in a stable order. An alias belongs to the function, not to one of its
+    /// versions, and names the version it invokes.
+    pub aliases: BTreeMap<String, AliasRecord>,
 }
 
 impl FunctionRecord {
@@ -682,18 +776,62 @@ impl FunctionRecord {
         }
     }
 
+    /// The version label `qualifier` names, or `None` when this function has no such
+    /// version or alias.
+    ///
+    /// [`VERSION_LATEST`] and a published version number name themselves; every other
+    /// qualifier names an alias, and an alias names the version it invokes — "use
+    /// aliases to provide clients with a function identifier that you can update to
+    /// invoke a different version" (`CreateAlias`).
+    #[must_use]
+    pub fn resolved_version(&self, qualifier: &str) -> Option<String> {
+        if qualifier == VERSION_LATEST {
+            return Some(VERSION_LATEST.to_string());
+        }
+        if let Ok(number) = qualifier.parse::<u64>() {
+            return self
+                .versions
+                .contains_key(&number)
+                .then(|| number.to_string());
+        }
+        self.aliases
+            .get(qualifier)
+            .map(|alias| alias.function_version.clone())
+    }
+
     /// The configuration of `version`, or `None` when this function has no such
-    /// version.
+    /// version. An alias resolves to the configuration of the version it invokes; see
+    /// [`Self::resolved_version`].
     #[must_use]
     pub fn config_of(&self, version: &str) -> Option<&FunctionConfig> {
-        if version == VERSION_LATEST {
+        let resolved = self.resolved_version(version)?;
+        if resolved == VERSION_LATEST {
             return Some(&self.config);
         }
-        version
+        resolved
             .parse::<u64>()
             .ok()
             .and_then(|number| self.versions.get(&number))
             .map(|published| &published.config)
+    }
+
+    /// The `AliasConfiguration` the wire reports for one of this function's aliases,
+    /// built entirely out of what is stored.
+    ///
+    /// The model declares ONE `AliasConfiguration`, generated here as
+    /// [`CreateAliasOutput`]; an operation whose output is generated as its own struct
+    /// over that shape carries these members across one for one rather than rebuilding
+    /// them from state a second time.
+    #[must_use]
+    pub fn alias_configuration(&self, alias: &AliasRecord) -> CreateAliasOutput {
+        CreateAliasOutput {
+            alias_arn: Some(self.versioned_arn(&alias.name)),
+            name: Some(alias.name.clone()),
+            function_version: Some(alias.function_version.clone()),
+            description: alias.description.clone(),
+            routing_config: alias.routing_config(),
+            revision_id: Some(alias.revision_id.clone()),
+        }
     }
 
     /// The `FunctionConfiguration` the wire reports for `version`, built entirely out
@@ -712,7 +850,13 @@ impl FunctionRecord {
             memory_size: Some(config.memory_size),
             last_modified: Some(config.last_modified.clone()),
             code_sha256: config.code_sha256.clone(),
-            version: Some(version.to_string()),
+            // The `Version` member's own pattern (`^(\$LATEST|[0-9]+)$`) admits no alias
+            // name, so a request addressed by an alias reports the version that alias
+            // invokes, while the ARN above keeps the qualifier the caller named.
+            version: Some(
+                self.resolved_version(version)
+                    .unwrap_or_else(|| version.to_string()),
+            ),
             environment: (!config.environment.is_empty()).then(|| EnvironmentResponse {
                 variables: Some(
                     config
