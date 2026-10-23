@@ -30,6 +30,11 @@
 //! carries its own copy of this parse (as `arn_vendor`), inlined before this module
 //! existed and pinned by that service's own refusal-wording suite; it is to be
 //! migrated onto this one rather than copied again.
+//!
+//! Beside the vendor, a service that reads WHICH resource an ARN names gets the
+//! resource field ([`resource`]), the resource TYPE ([`resource_type`]) and the id
+//! of a resource of a given type ([`resource_id_of_type`]) from here, so the
+//! `<type>/<id>` and `<type>:<id>` forms are read in one place too.
 
 /// The six fields of a well-formed resource ARN, as a caller submitted them.
 ///
@@ -104,6 +109,39 @@ pub fn vendor(value: &str) -> Option<&str> {
     parse(value).map(|arn| arn.vendor)
 }
 
+/// The whole `resource` field of the ARN `value` (`thing/laser-1`,
+/// `execution:machine:run`), or `None` when `value` is not a well-formed resource
+/// ARN as [`vendor`] defines it.
+#[must_use]
+pub fn resource(value: &str) -> Option<&str> {
+    parse(value).map(|arn| arn.resource)
+}
+
+/// The TYPE of resource the ARN `value` names: the `thing` of `thing/laser-1`, the
+/// `execution` of `execution:machine:run`, and the whole resource field when it
+/// carries no id (`arn:aws:iot:…:job`).
+///
+/// AWS writes a resource in either form — `<type>/<id>` and `<type>:<id>` — so both
+/// separators end the type. `None` for a value that is not a resource ARN, and for
+/// one whose resource field begins with a separator and so names no type.
+#[must_use]
+pub fn resource_type(value: &str) -> Option<&str> {
+    let resource_type = parse(value)?.resource_type();
+    (!resource_type.is_empty()).then_some(resource_type)
+}
+
+/// The ID of the resource the ARN `value` names, when that resource is of type
+/// `resource_type` (`thing/laser-1` with `thing` -> `laser-1`); `None` when `value`
+/// names another type, or is not a resource ARN.
+///
+/// The id may be empty (`thing/`): a caller that requires a non-empty id checks it,
+/// because "no id" and "another type" are different refusals.
+#[must_use]
+pub fn resource_id_of_type<'a>(value: &'a str, resource_type: &str) -> Option<&'a str> {
+    let rest = resource(value)?.strip_prefix(resource_type)?;
+    rest.strip_prefix('/').or_else(|| rest.strip_prefix(':'))
+}
+
 /// Whether `value` is a well-formed resource ARN whose vendor field is `expected`.
 ///
 /// The comparison is exact: an ARN namespace is a fixed lowercase token, so a value
@@ -154,7 +192,9 @@ pub fn region_of<'value>(value: &'value str, expected_vendor: &str) -> Option<&'
 
 #[cfg(test)]
 mod tests {
-    use super::{is_resource_arn_of, parse, parse_of, region_of, vendor};
+    use super::{
+        is_resource_arn_of, parse, parse_of, region_of, resource_id_of_type, resource_type, vendor,
+    };
 
     /// The vendor field is read from the third position, whatever the resource
     /// field's own shape, and only from a value that carries all six fields.
@@ -243,6 +283,84 @@ mod tests {
             !is_resource_arn_of("dp-1", "aws-marketplace"),
             "a value that is not an ARN is nobody's resource ARN"
         );
+    }
+
+    /// The resource type is what precedes the first separator of the resource
+    /// field, in either form AWS writes a resource in, and the id is read back
+    /// only for the type that is asked about.
+    #[test]
+    fn the_resource_type_and_id_are_read_out_of_the_resource_field() {
+        // (case, value, the type, the id of a `thing`)
+        let rows: &[(&str, &str, Option<&str>, Option<&str>)] = &[
+            (
+                "a slash-form thing",
+                "arn:aws:iot:us-east-1:000000000000:thing/laser-1",
+                Some("thing"),
+                Some("laser-1"),
+            ),
+            (
+                "a colon-form thing",
+                "arn:aws:iot:us-east-1:000000000000:thing:laser-1",
+                Some("thing"),
+                Some("laser-1"),
+            ),
+            (
+                "an id carrying further separators",
+                "arn:aws:states:us-east-1:000000000000:execution:machine:run",
+                Some("execution"),
+                None,
+            ),
+            (
+                "another type",
+                "arn:aws:iot:us-east-1:000000000000:job/upgrade-42",
+                Some("job"),
+                None,
+            ),
+            (
+                "a type that only prefixes the one asked about",
+                "arn:aws:iot:us-east-1:000000000000:thinggroup/plant-floor",
+                Some("thinggroup"),
+                None,
+            ),
+            (
+                "a resource with no id at all",
+                "arn:aws:iot:us-east-1:000000000000:job",
+                Some("job"),
+                None,
+            ),
+            (
+                "a thing with an empty id",
+                "arn:aws:iot:us-east-1:000000000000:thing/",
+                Some("thing"),
+                Some(""),
+            ),
+            (
+                "a resource field that begins with a separator",
+                "arn:aws:iot:us-east-1:000000000000:/laser-1",
+                None,
+                None,
+            ),
+            ("not an ARN at all", "laser-1", None, None),
+            (
+                "an ARN with an empty resource",
+                "arn:aws:iot:us-east-1:000000000000:",
+                None,
+                None,
+            ),
+        ];
+
+        for (case, value, expected_type, expected_id) in rows {
+            let read_type = resource_type(value);
+            assert_eq!(
+                read_type, *expected_type,
+                "case {case:?}: expected resource type {expected_type:?}, got {read_type:?}"
+            );
+            let read_id = resource_id_of_type(value, "thing");
+            assert_eq!(
+                read_id, *expected_id,
+                "case {case:?}: expected thing id {expected_id:?}, got {read_id:?}"
+            );
+        }
     }
 
     /// The Region a service may ACT on: read only from an ARN of the vendor asked

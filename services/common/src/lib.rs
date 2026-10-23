@@ -34,7 +34,7 @@
 //!   wire-visible id with;
 //! * [`network`], the contract the account's EC2 network — which subnets a Region has —
 //!   is modelled against, so no two services answer "does this subnet exist"
-//!   differently.
+//!   differently;
 //!
 //! Beside them, two SHARED STORES live here, each held once in the shared engine so
 //! the services on either side of a hand-off cannot hold two copies of one fact:
@@ -139,6 +139,7 @@ pub mod bedrock;
 pub mod db_data_sources;
 pub mod front_door;
 pub mod iam_trust_policy;
+pub mod iot_commands;
 pub mod iot_job_executions;
 pub mod lex;
 pub mod network;

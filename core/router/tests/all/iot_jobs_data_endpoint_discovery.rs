@@ -35,6 +35,11 @@ const REGION: &str = "us-east-1";
 /// A command for the data-plane leg to start an execution of. Its account
 /// segment is arbitrary: the Jobs data plane reads the thing name out of the
 /// target ARN and keeps the command ARN as given.
+///
+/// It is REGISTERED in the shared IoT command index below, because
+/// `StartCommandExecution` starts an execution only for a command that exists.
+/// The control plane's `CreateCommand` is the writer of that index and is still a
+/// scaffold (its own issue), so this test writes the entry that create will.
 const COMMAND_ARN: &str = "arn:aws:iot:us-east-1:111122223333:command/reboot";
 
 /// One endpoint type a client can discover its data plane with, and the host
@@ -99,6 +104,13 @@ fn a_discovered_iot_endpoint_address_serves_the_jobs_data_plane() {
         .stack_size(BOOT_STACK_SIZE)
         .spawn(|| {
             let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
+            // The command the data-plane leg starts has to EXIST; see
+            // [`COMMAND_ARN`].
+            service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::state::command_registry(&*engine)
+                .expect("the shared IoT command index")
+                .lock()
+                .register(COMMAND_ARN)
+                .expect("register the command this test starts");
             let mut router = build_router(engine);
             router.set_request_authentication(false);
 
