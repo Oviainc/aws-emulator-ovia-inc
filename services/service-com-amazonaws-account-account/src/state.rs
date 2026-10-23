@@ -15,13 +15,21 @@
 //! the operation" — which for this emulator is
 //! [`::emulator_server::emulator_account_id`]. So a standalone call and a
 //! management-account call that names that same id land on ONE record.
+//!
+//! The Region opt-in slice hangs off that same record:
+//! [`Account::region_opt_status`] holds the opt status of every Region the
+//! account has been opted into or out of, which `EnableRegion` and
+//! `DisableRegion` write and `GetRegionOptStatus` and `ListRegions` report.
+//! [`REGION_CATALOG`] is what decides whether a Region has an opt status at all
+//! and what it reports before any opt call.
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AccessDeniedException, AlternateContact, ContactInformation, ResourceNotFoundException,
-    ValidationException, ValidationExceptionField, ALTERNATE_CONTACT_TYPE_VALUES,
+    AccessDeniedException, AlternateContact, ConflictException, ContactInformation,
+    ResourceNotFoundException, ValidationException, ValidationExceptionField,
+    ALTERNATE_CONTACT_TYPE_VALUES,
 };
 
 /// The `AccountState` an account this emulator knows carries.
@@ -35,6 +43,10 @@ pub const ACTIVE_ACCOUNT_STATE: &str = "ACTIVE";
 /// The `ValidationExceptionReason` a refused input member reports: one of that
 /// enum's two values (`fieldValidationFailed | invalidRegionOptTarget`).
 pub const FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
+
+/// The other `ValidationExceptionReason` value: the request named a Region that
+/// cannot be the target of a Region opt-in or opt-out at all.
+pub const INVALID_REGION_OPT_TARGET: &str = "invalidRegionOptTarget";
 
 /// The `PhoneNumberVerificationStatus` the phone number of a stored primary
 /// contact carries: "UNVERIFIED – The phone number has not been verified"
@@ -230,6 +242,101 @@ impl AlternateContactRecord {
     }
 }
 
+/// Which column of the Region catalog a Region code is in: whether the Region
+/// is a Region-opt target at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionKind {
+    /// Available without opting in, so neither `EnableRegion` nor
+    /// `DisableRegion` can act on it.
+    EnabledByDefault,
+    /// Disabled until the account opts in.
+    OptIn,
+}
+
+/// Which kind of Region `region_name` is, read off [`REGION_CATALOG`], or `None`
+/// for a value the catalog does not hold.
+pub fn region_kind(region_name: &str) -> Option<RegionKind> {
+    catalog_region_status(region_name).map(|status| {
+        if status == ENABLED_BY_DEFAULT_REGION_STATUS {
+            RegionKind::EnabledByDefault
+        } else {
+            RegionKind::OptIn
+        }
+    })
+}
+
+/// How long this emulator takes to carry a Region from a transient opt status
+/// (`ENABLING`, `DISABLING`) to its terminal one (`ENABLED`, `DISABLED`).
+///
+/// AWS publishes no duration for it — `EnableRegion`'s `RegionName`
+/// documentation says only that the process "takes a few minutes for most
+/// accounts, but it can take several hours" — so this span is the emulator's
+/// OWN choice. It is deliberately non-zero: a caller that reads the status
+/// straight after the call still observes the transient status, and the state
+/// errors that go with it, exactly as it would against AWS.
+pub const REGION_OPT_TRANSITION: Duration = Duration::from_millis(500);
+
+/// A Region's opt status for one account: the `RegionOptStatus` enum
+/// (`DISABLED | DISABLING | ENABLED | ENABLED_BY_DEFAULT | ENABLING`).
+///
+/// A transient status carries the instant its terminal status is DUE, so the
+/// transition is owed by the CLOCK rather than by whoever happens to call next:
+/// [`settled`](Self::settled) reports the terminal status from that instant on,
+/// whether or not anybody read or wrote in between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionOptState {
+    /// Available without opting in: the status of every Region
+    /// [`REGION_CATALOG`] marks [`ENABLED_BY_DEFAULT_REGION_STATUS`].
+    EnabledByDefault,
+    /// Opted in, with the opt-in not yet complete.
+    Enabling { ready_at: SystemTime },
+    /// Opted in and usable.
+    Enabled,
+    /// Opted out, with the opt-out not yet complete.
+    Disabling { ready_at: SystemTime },
+    /// Not opted in: the status of an opt-in Region the account has never
+    /// enabled, and the one an opt-out settles to.
+    Disabled,
+}
+
+impl RegionOptState {
+    /// The wire value of this status, one of `REGION_OPT_STATUS_VALUES`.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::EnabledByDefault => ENABLED_BY_DEFAULT_REGION_STATUS,
+            Self::Enabling { .. } => "ENABLING",
+            Self::Enabled => "ENABLED",
+            Self::Disabling { .. } => "DISABLING",
+            Self::Disabled => DISABLED_REGION_STATUS,
+        }
+    }
+
+    /// The status a wire `RegionOptStatus` value names, with a transient value
+    /// settling at `ready_at`. `None` for a value the enum does not admit.
+    pub fn from_wire(value: &str, ready_at: SystemTime) -> Option<Self> {
+        match value {
+            ENABLED_BY_DEFAULT_REGION_STATUS => Some(Self::EnabledByDefault),
+            "ENABLING" => Some(Self::Enabling { ready_at }),
+            "ENABLED" => Some(Self::Enabled),
+            "DISABLING" => Some(Self::Disabling { ready_at }),
+            DISABLED_REGION_STATUS => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+
+    /// This status as of `now`: a transient status whose due instant has passed
+    /// IS its terminal status from that instant on, and every other status is
+    /// itself. A pure function of the record and the clock, so a reader reports
+    /// the settled status without writing anything.
+    pub fn settled(self, now: SystemTime) -> Self {
+        match self {
+            Self::Enabling { ready_at } if now >= ready_at => Self::Enabled,
+            Self::Disabling { ready_at } if now >= ready_at => Self::Disabled,
+            other => other,
+        }
+    }
+}
+
 /// The most recent primary email update of one account, as
 /// `StartPrimaryEmailUpdate` recorded it and `GetPrimaryEmailUpdateStatus`
 /// reports it.
@@ -288,9 +395,10 @@ pub struct Account {
     /// into or out of, keyed by Region code. A Region ABSENT from this map still
     /// reports its [`REGION_CATALOG`] status, so the map holds only what an
     /// opt-in call changed: `EnableRegion` and `DisableRegion` are the
-    /// operations that write it (each still scaffolded, with its own stub
-    /// issue), and `ListRegions` and `GetRegionOptStatus` report it.
-    pub region_opt_status: BTreeMap<String, String>,
+    /// operations that write it, and `ListRegions` and `GetRegionOptStatus`
+    /// report it. A transient entry carries the instant its terminal status is
+    /// due, so a reader settles it from the clock rather than from a write.
+    pub region_opt_status: BTreeMap<String, RegionOptState>,
     /// The MOST RECENT primary email update of this account, or `None` while
     /// none has ever been started — which is what makes a status read of an
     /// account with no update a refusal rather than a reported status.
@@ -312,33 +420,70 @@ impl Account {
         }
     }
 
-    /// The `RegionOptStatus` this account reports for `region_name`: the status
-    /// an opt-in call stored for it, else its [`REGION_CATALOG`] status. `None`
-    /// for a Region code the catalog does not hold.
+    /// Materialise every Region opt transition the clock already owes: an
+    /// `ENABLING` or `DISABLING` Region whose due instant is at or before `now`
+    /// becomes `ENABLED` or `DISABLED` in the store.
+    ///
+    /// Owed by the CLOCK, so this changes nothing a reader could not already
+    /// see — [`RegionOptState::settled`] reports the same status from the same
+    /// instant without writing — and it is idempotent. The mutating opt
+    /// operations call it before deciding, so the record they write over is the
+    /// settled one.
+    pub fn settle_region_opts(&mut self, now: SystemTime) {
+        for status in self.region_opt_status.values_mut() {
+            *status = status.settled(now);
+        }
+    }
+
+    /// This account's opt status for the Region `region_name` of kind `kind`,
+    /// as of `now`.
+    ///
+    /// A default-enabled Region reports `ENABLED_BY_DEFAULT` whatever the store
+    /// holds, and an opt-in Region the account never acted on reports
+    /// `DISABLED`. A transient stored status settles from the clock
+    /// ([`RegionOptState::settled`]), so the answer never depends on whether
+    /// anybody wrote the terminal status back.
+    pub fn region_opt_state(
+        &self,
+        region_name: &str,
+        kind: RegionKind,
+        now: SystemTime,
+    ) -> RegionOptState {
+        match kind {
+            RegionKind::EnabledByDefault => RegionOptState::EnabledByDefault,
+            RegionKind::OptIn => self
+                .region_opt_status
+                .get(region_name)
+                .copied()
+                .unwrap_or(RegionOptState::Disabled)
+                .settled(now),
+        }
+    }
+
+    /// The `RegionOptStatus` this account reports for `region_name` as of `now`:
+    /// the status an opt-in call stored for it, settled, else its
+    /// [`REGION_CATALOG`] status. `None` for a Region code the catalog does not
+    /// hold.
     ///
     /// A Region AWS turns on by default is never opted out of, so a stored
     /// status is honoured only where the catalog admits one — which keeps
     /// `ENABLED_BY_DEFAULT` the one status such a Region can report.
-    pub fn reported_region_status(&self, region_name: &str) -> Option<&str> {
-        let catalog = catalog_region_status(region_name)?;
-        if catalog == ENABLED_BY_DEFAULT_REGION_STATUS {
-            return Some(ENABLED_BY_DEFAULT_REGION_STATUS);
-        }
-        Some(
-            self.region_opt_status
-                .get(region_name)
-                .map(String::as_str)
-                .unwrap_or(catalog),
-        )
+    pub fn reported_region_status(
+        &self,
+        region_name: &str,
+        now: SystemTime,
+    ) -> Option<&'static str> {
+        let kind = region_kind(region_name)?;
+        Some(self.region_opt_state(region_name, kind, now).as_wire())
     }
 
     /// Every Region in [`REGION_CATALOG`], in catalog order, with the status this
-    /// account reports for it — what `ListRegions` projects.
-    pub fn reported_regions(&self) -> Vec<(&'static str, &str)> {
+    /// account reports for it as of `now` — what `ListRegions` projects.
+    pub fn reported_regions(&self, now: SystemTime) -> Vec<(&'static str, &'static str)> {
         REGION_CATALOG
             .iter()
             .filter_map(|(name, _)| {
-                self.reported_region_status(name)
+                self.reported_region_status(name, now)
                     .map(|status| (*name, status))
             })
             .collect()
@@ -517,6 +662,53 @@ pub fn invalid_alternate_contact_type(value: &str) -> ValidationException {
             name: "AlternateContactType".to_string(),
             message: format!("{value:?} is not one of {admitted}"),
         }]),
+    }
+}
+
+/// The `ValidationException` payload for a `RegionName` that is not a Region
+/// code of this partition.
+///
+/// `RegionName` is modelled only `@length(min: 1, max: 50)`, so the boundary
+/// admits any string of that length: WHICH strings name a Region is a rule this
+/// service enforces itself. `reason` is `fieldValidationFailed` and `fieldList`
+/// names the member, so the caller can see which input was rejected.
+pub fn unknown_region(region_name: &str) -> ValidationException {
+    ValidationException {
+        message: format!("RegionName {region_name:?} is not an Amazon Web Services Region code"),
+        reason: Some(FIELD_VALIDATION_FAILED.to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "RegionName".to_string(),
+            message: format!("{region_name:?} is not an Amazon Web Services Region code"),
+        }]),
+    }
+}
+
+/// The `ValidationException` payload for a Region that cannot be opted into or
+/// out of: it is enabled by default, so it is not a Region-opt target.
+///
+/// `reason` is `invalidRegionOptTarget` — the `ValidationExceptionReason` value
+/// that exists for exactly this refusal.
+pub fn region_not_opt_target(region_name: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "Region {region_name} is enabled by default and cannot be enabled or disabled"
+        ),
+        reason: Some(INVALID_REGION_OPT_TARGET.to_string()),
+        field_list: None,
+    }
+}
+
+/// The `ConflictException` payload for a Region-opt call that conflicts with
+/// the Region's current status — enabling one that is `DISABLING`, or disabling
+/// one that is `ENABLING`, neither of which can be reversed before the status
+/// in flight has settled.
+pub fn region_opt_in_progress(region_name: &str, status: &str) -> ConflictException {
+    ConflictException {
+        message: format!(
+            "Region {region_name} is in status {status}; wait for that operation to complete \
+             before changing its opt status again"
+        ),
+        error_type: None,
     }
 }
 
