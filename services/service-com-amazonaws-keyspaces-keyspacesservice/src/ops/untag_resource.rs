@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UntagResourceErrorModeled::InternalServerException(InternalServerException {
@@ -181,8 +181,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // The service-managed keyspaces and their system tables are part of the account
+        // before any call, so an ARN that names one resolves here.
+        store.ensure_service_managed_catalog(&crate::state::request_region(ctx));
         // See the note in `tag_resource.rs`: the transitions the clock already owed.
         store.settle(::std::time::SystemTime::now());
+
+        // See `tag_resource.rs`: a service-managed keyspace and its system tables take no
+        // change from a client, tags included.
+        if let Some(keyspace_name) = crate::state::arn_keyspace_name(&input.resource_arn) {
+            if crate::state::is_service_managed_keyspace(&keyspace_name) {
+                return Err(UntagResourceErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::service_managed_rejection(&keyspace_name)),
+                })
+                .into());
+            }
+        }
 
         let Some(tags) = store.resource_tags_mut(&input.resource_arn) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(

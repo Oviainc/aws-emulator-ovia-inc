@@ -43,6 +43,8 @@ mod platform_versions;
 mod record_projections;
 #[path = "all/rejection_rules.rs"]
 mod rejection_rules;
+#[path = "all/reported_instant_precision.rs"]
+mod reported_instant_precision;
 #[path = "all/request_refusals.rs"]
 mod request_refusals;
 #[path = "all/resource_tags.rs"]

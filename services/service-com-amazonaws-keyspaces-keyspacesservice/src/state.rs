@@ -12,7 +12,10 @@
 //! iteration order is total and stable, which a hash map's is not.
 //!
 //! This module also holds what more than one operation needs — ARN construction,
-//! the request's region, the modelled defaults, and [`settle`][ComAmazonawsKeyspacesKeyspacesserviceState::settle],
+//! the request's region, the modelled defaults, the [service-managed
+//! catalog][SERVICE_MANAGED_KEYSPACES] every account already holds (materialised by
+//! [`ensure_service_managed_catalog`][ComAmazonawsKeyspacesKeyspacesserviceState::ensure_service_managed_catalog]),
+//! and [`settle`][ComAmazonawsKeyspacesKeyspacesserviceState::settle],
 //! which materialises the status transitions the clock already owes — so the
 //! per-operation files never carry a second copy of any of it.
 
@@ -131,6 +134,109 @@ pub const SINGLE_REGION_STRATEGY: &str = "SINGLE_REGION";
 
 /// `rs` (replication strategy) = `MULTI_REGION`.
 pub const MULTI_REGION_STRATEGY: &str = "MULTI_REGION";
+
+/// The service-managed keyspaces every Amazon Keyspaces account holds in every Region
+/// before any client call, each with the system tables it holds.
+///
+/// Amazon Keyspaces is Cassandra-compatible, and a Cassandra cluster's schema and node
+/// metadata live in keyspaces the SERVICE owns: a driver resolves a keyspace, a table or
+/// a type by reading them, so they exist in an account that has created nothing. No
+/// `CreateKeyspace` ever makes one, so they are materialised by
+/// [`ComAmazonawsKeyspacesKeyspacesserviceState::ensure_service_managed_catalog`] rather
+/// than by a caller, and [`is_service_managed_keyspace`] is what keeps every operation
+/// that WRITES off them.
+///
+/// WHICH keyspaces exist is the one part of this the Smithy model does not state at all
+/// (it constrains only the shape of a `keyspaceName`), so the four names are the catalog
+/// a `ListKeyspaces` on an untouched account reports, and each keyspace's table list is
+/// the catalog that keyspace publishes:
+///
+/// * `system_schema`: the Cassandra schema catalog, whose tables are the ten schema
+///   views Apache Cassandra defines (`keyspaces`, `tables`, `columns`, `types`,
+///   `dropped_columns`, `triggers`, `views`, `functions`, `aggregates`, `indexes`).
+/// * `system_schema_mcs`: Amazon Keyspaces' own copy of that catalog — the schema views
+///   it serves (`SELECT * FROM system_schema_mcs.keyspaces`, `... .tables`,
+///   `... .columns` in the Amazon Keyspaces Developer Guide) plus the two
+///   Keyspaces-specific views the same guide reads a table's AWS settings out of,
+///   `tags` and `autoscaling`.
+/// * `system`: the node-local metadata Cassandra drivers read on connect; Amazon
+///   Keyspaces serves `system.local` and `system.peers` for exactly that handshake.
+/// * `system_multiregion_info`: the multi-Region replication status catalog, read as
+///   `SELECT * FROM system_multiregion_info.tables` in the Developer Guide's
+///   multi-Region section.
+///
+/// Ordered as a [`std::collections::BTreeMap`] would order it, so the seed is written in
+/// the one total order every listing reports.
+pub const SERVICE_MANAGED_KEYSPACES: &[(&str, &[&str])] = &[
+    ("system", SYSTEM_TABLES),
+    ("system_multiregion_info", SYSTEM_MULTIREGION_INFO_TABLES),
+    ("system_schema", SYSTEM_SCHEMA_TABLES),
+    ("system_schema_mcs", SYSTEM_SCHEMA_MCS_TABLES),
+];
+
+/// The tables of the `system` keyspace. See [`SERVICE_MANAGED_KEYSPACES`].
+pub const SYSTEM_TABLES: &[&str] = &["local", "peers"];
+
+/// The tables of the `system_multiregion_info` keyspace. See
+/// [`SERVICE_MANAGED_KEYSPACES`].
+pub const SYSTEM_MULTIREGION_INFO_TABLES: &[&str] = &["tables"];
+
+/// The tables of the `system_schema` keyspace: Cassandra's ten schema views, which is
+/// what a recorded `ListTables` on an untouched account reports for it. See
+/// [`SERVICE_MANAGED_KEYSPACES`].
+pub const SYSTEM_SCHEMA_TABLES: &[&str] = &[
+    "aggregates",
+    "columns",
+    "dropped_columns",
+    "functions",
+    "indexes",
+    "keyspaces",
+    "tables",
+    "triggers",
+    "types",
+    "views",
+];
+
+/// The tables of the `system_schema_mcs` keyspace: the schema views Amazon Keyspaces
+/// serves in its own copy of the catalog, plus the Keyspaces-specific `tags` and
+/// `autoscaling` views. `dropped_columns` is deliberately NOT here: it is a
+/// `system_schema` view that the recorded `system_schema_mcs` catalog does not carry.
+/// See [`SERVICE_MANAGED_KEYSPACES`].
+pub const SYSTEM_SCHEMA_MCS_TABLES: &[&str] = &[
+    "aggregates",
+    "autoscaling",
+    "columns",
+    "functions",
+    "indexes",
+    "keyspaces",
+    "tables",
+    "tags",
+    "triggers",
+    "types",
+    "views",
+];
+
+/// Whether `keyspace_name` names one of the [`SERVICE_MANAGED_KEYSPACES`].
+///
+/// A service-managed keyspace is READ-ONLY to a client: Cassandra refuses DDL against
+/// one as an invalid query ("system keyspace is not user-modifiable"), which is this
+/// service's `ValidationException` — "The operation failed due to an invalid or
+/// malformed request". Every operation that creates, updates or deletes inside a
+/// keyspace asks this first.
+pub fn is_service_managed_keyspace(keyspace_name: &str) -> bool {
+    SERVICE_MANAGED_KEYSPACES
+        .iter()
+        .any(|(managed, _)| *managed == keyspace_name)
+}
+
+/// The refusal message a write against the service-managed keyspace `keyspace_name`
+/// carries: ONE wording, so every operation refuses it the same way.
+pub fn service_managed_rejection(keyspace_name: &str) -> String {
+    format!(
+        "Keyspace '{keyspace_name}' is managed by Amazon Keyspaces and cannot be \
+         modified."
+    )
+}
 
 /// The most keyspaces this emulator holds, and — with [`MAX_TABLES_PER_KEYSPACE`] — the
 /// pair of caps that bound caller-driven growth of the store.
@@ -384,6 +490,21 @@ pub fn parse_resource_arn(arn: &str) -> Option<ResourceRef> {
     }
 }
 
+/// The keyspace a resource ARN belongs to: the keyspace itself for a keyspace ARN, the
+/// owning keyspace for a table ARN, and `None` for an ARN that names no Amazon Keyspaces
+/// resource.
+///
+/// What a caller may do to a resource is decided by its keyspace — a
+/// [service-managed][SERVICE_MANAGED_KEYSPACES] one takes no change at all — so the
+/// operations that address a resource by ARN resolve that keyspace through here rather
+/// than each re-parsing the ARN.
+pub fn arn_keyspace_name(resource_arn: &str) -> Option<String> {
+    match parse_resource_arn(resource_arn)? {
+        ResourceRef::Keyspace { keyspace_name } => Some(keyspace_name),
+        ResourceRef::Table { keyspace_name, .. } => Some(keyspace_name),
+    }
+}
+
 /// The `ResourceNotFoundException` payload for an ARN that names no stored resource.
 ///
 /// The ARN the caller supplied goes in the modelled `resourceArn` member, which is what a
@@ -410,6 +531,10 @@ pub struct ComAmazonawsKeyspacesKeyspacesserviceState {
     /// resource until that instant arrives, so a request pays O(1) for the clock except on
     /// the calls where a transition really is due.
     next_transition_at: Option<SystemTime>,
+    /// Whether the [`SERVICE_MANAGED_KEYSPACES`] have been written into `keyspaces` yet.
+    /// See [`Self::ensure_service_managed_catalog`], which the handlers call before they
+    /// read or write a keyspace.
+    service_managed_catalog_materialised: bool,
 }
 
 /// One keyspace, with the tables it owns.
@@ -419,7 +544,9 @@ pub struct Keyspace {
     pub name: String,
     /// The keyspace ARN minted by `CreateKeyspace` ([`keyspace_arn`]).
     pub resource_arn: String,
-    /// `replicationSpecification.replicationStrategy`.
+    /// `replicationSpecification.replicationStrategy`. A [service-managed
+    /// keyspace][SERVICE_MANAGED_KEYSPACES] is replicated in the Region it is read in, so
+    /// its strategy is [`SINGLE_REGION_STRATEGY`].
     pub replication_strategy: String,
     /// `replicationSpecification.regionList`.
     pub replication_regions: Vec<String>,
@@ -456,6 +583,13 @@ impl Keyspace {
 }
 
 /// One table: everything `CreateTable` was given, plus what the service derives.
+///
+/// A table of a [service-managed keyspace][SERVICE_MANAGED_KEYSPACES] is a table the
+/// SERVICE owns, so no `CreateTable` ever supplied the settings a customer table carries:
+/// every member below that only a create could have filled is `None` for one, and
+/// `GetTable` reports exactly the members the model leaves optional rather than a
+/// default nobody configured. Which tables those are is [`is_service_managed_keyspace`]
+/// of the owning keyspace, not a flag stored twice.
 #[derive(Debug, Clone)]
 pub struct Table {
     /// The owning keyspace's name.
@@ -464,19 +598,23 @@ pub struct Table {
     pub table_name: String,
     /// The table ARN minted by `CreateTable` ([`table_arn`]).
     pub resource_arn: String,
-    /// When `CreateTable` ran.
-    pub creation_timestamp: SystemTime,
+    /// When `CreateTable` ran, or `None` for a service-managed table, which predates
+    /// every call.
+    pub creation_timestamp: Option<SystemTime>,
     /// A `TableStatus` value.
     pub status: String,
     /// When the clock owes this table its next status, or `None` once it holds a
     /// status nothing is pending on. Never slept for: [`ComAmazonawsKeyspacesKeyspacesserviceState::settle`]
     /// compares it against the clock.
     pub status_due_at: Option<SystemTime>,
-    /// The schema exactly as supplied.
-    pub schema_definition: SchemaDefinition,
+    /// The schema exactly as supplied, or `None` for a service-managed table: Amazon
+    /// Keyspaces publishes no column list for its system tables, and
+    /// `GetTableResponse$schemaDefinition` is an optional member.
+    pub schema_definition: Option<SchemaDefinition>,
     /// The supplied capacity specification, or the modelled default, as last set by
-    /// `CreateTable` or `UpdateTable`.
-    pub capacity_specification: CapacitySpecification,
+    /// `CreateTable` or `UpdateTable`; `None` for a service-managed table, whose
+    /// throughput the service owns.
+    pub capacity_specification: Option<CapacitySpecification>,
     /// The supplied auto scaling settings, if any — "The optional auto scaling settings
     /// for a table in provisioned capacity mode" — reported back by
     /// `GetTableAutoScalingSettings`.
@@ -487,10 +625,12 @@ pub struct Table {
     /// that re-sets the mode the table is already in changed no throughput capacity, so
     /// it leaves this where it is.
     pub last_update_to_pay_per_request: Option<SystemTime>,
-    /// The supplied encryption specification, or the modelled default.
-    pub encryption_specification: EncryptionSpecification,
-    /// The supplied point-in-time-recovery setting, or the modelled default.
-    pub point_in_time_recovery: PointInTimeRecovery,
+    /// The supplied encryption specification, or the modelled default; `None` for a
+    /// service-managed table.
+    pub encryption_specification: Option<EncryptionSpecification>,
+    /// The supplied point-in-time-recovery setting, or the modelled default; `None` for a
+    /// service-managed table, which no backup setting applies to.
+    pub point_in_time_recovery: Option<PointInTimeRecovery>,
     /// The supplied custom TTL setting, if any.
     pub ttl: Option<TimeToLive>,
     /// The supplied default TTL in seconds, if any.
@@ -559,11 +699,15 @@ impl Keyspace {
         self.tables
             .values()
             .filter(|table| {
-                table.schema_definition.all_columns.iter().any(|column| {
-                    referenced_type_names(&column.r#type)
-                        .iter()
-                        .any(|referenced| referenced == type_name)
-                })
+                table
+                    .schema_definition
+                    .iter()
+                    .flat_map(|schema| &schema.all_columns)
+                    .any(|column| {
+                        referenced_type_names(&column.r#type)
+                            .iter()
+                            .any(|referenced| referenced == type_name)
+                    })
             })
             .map(|table| table.table_name.clone())
             .collect()
@@ -780,6 +924,80 @@ pub fn referenced_type_names(type_expression: &str) -> Vec<String> {
 }
 
 impl ComAmazonawsKeyspacesKeyspacesserviceState {
+    /// Materialise the keyspaces this account ALREADY HELD before any call: the
+    /// [`SERVICE_MANAGED_KEYSPACES`] and the system tables each of them holds. Nothing a
+    /// caller does creates them, so an account that has created nothing still enumerates
+    /// them and still resolves a table inside them.
+    ///
+    /// The engine hands every service an EMPTY store, so the catalog is written on first
+    /// touch rather than by a constructor; the flag makes that a one-off, so the seed is
+    /// never re-applied. `region` is the requesting caller's, exactly as every other
+    /// resource in this store takes the region of the call that brought it into being —
+    /// it is what the ARNs are built from ([`keyspace_arn`], [`table_arn`]).
+    ///
+    /// Every handler calls this before it looks at `keyspaces`, including the reporting
+    /// ones: materialising a resource that existed before the call changes nothing a
+    /// later caller would not have seen anyway, which is the same ground
+    /// [`Self::settle`] stands on.
+    pub fn ensure_service_managed_catalog(&mut self, region: &str) {
+        if self.service_managed_catalog_materialised {
+            return;
+        }
+        self.service_managed_catalog_materialised = true;
+        for (keyspace_name, table_names) in SERVICE_MANAGED_KEYSPACES {
+            let tables = table_names
+                .iter()
+                .map(|table_name| {
+                    (
+                        (*table_name).to_string(),
+                        Table {
+                            keyspace_name: (*keyspace_name).to_string(),
+                            table_name: (*table_name).to_string(),
+                            resource_arn: table_arn(region, keyspace_name, table_name),
+                            // Every member below is one only a `CreateTable` could have
+                            // filled, and no create made this table: the service owns it.
+                            creation_timestamp: None,
+                            // A table the account already had is in service: there is no
+                            // create for the clock to owe a transition to.
+                            status: TABLE_STATUS_ACTIVE.to_string(),
+                            status_due_at: None,
+                            schema_definition: None,
+                            capacity_specification: None,
+                            auto_scaling_specification: None,
+                            last_update_to_pay_per_request: None,
+                            encryption_specification: None,
+                            point_in_time_recovery: None,
+                            ttl: None,
+                            default_time_to_live: None,
+                            comment: None,
+                            client_side_timestamps: None,
+                            tags: TagSet::new(),
+                        },
+                    )
+                })
+                .collect();
+            self.keyspaces.insert(
+                (*keyspace_name).to_string(),
+                Keyspace {
+                    name: (*keyspace_name).to_string(),
+                    resource_arn: keyspace_arn(region, keyspace_name),
+                    // A system keyspace is served in the Region it is read in, so it is
+                    // single-Region and reports no `replicationRegions`.
+                    replication_strategy: SINGLE_REGION_STRATEGY.to_string(),
+                    replication_regions: vec![region.to_string()],
+                    tags: TagSet::new(),
+                    // Nothing is being created, so the keyspace is usable now.
+                    status: KEYSPACE_STATUS_ACTIVE.to_string(),
+                    status_due_at: None,
+                    tables,
+                    // Amazon Keyspaces publishes no user-defined type in a system
+                    // keyspace, and no `CreateType` can put one there.
+                    types: BTreeMap::new(),
+                },
+            );
+        }
+    }
+
     /// Record that some table or type now has a transition due at `due`, so
     /// [`Self::settle`] knows the earliest instant at which it has to look at the store
     /// again.

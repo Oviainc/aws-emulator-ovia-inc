@@ -1,15 +1,84 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TestParsing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TestParsing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Parses the EDI interchange held by the Amazon S3 object `inputFile` names and answers
+//! it as a document in the requested `fileFormat`: a JSON document for `JSON`, an XML
+//! document for `XML`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TestParsing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The object is READ from object storage over the in-process callback into this same
+//! emulator (the framework's seam for calling another emulated service), so what is
+//! parsed is the bytes a client's own `s3:PutObject` stored — nothing here is derived
+//! from the request's own members, and an `inputFile` that names no stored object is the
+//! modelled `ResourceNotFoundException`.
+//!
+//! This operation owns no resource — AWS persists nothing for it — so it neither reads
+//! nor writes [`crate::state`], and a call leaves what every later caller sees untouched.
+//!
+//! ## The parsed document
+//!
+//! X12 is a nest of three envelopes, and the parsed document is that nest: an
+//! interchange (ISA ... IEA), holding functional groups (GS ... GE), holding transaction
+//! sets (ST ... SE), holding the transaction's own segments:
+//!
+//! ```text
+//! interchanges[]                       ISA elements, then IEA elements
+//!   functional_groups[]                GS elements, then GE elements
+//!     transactions[]                   ST elements, segments[], then SE elements
+//! ```
+//!
+//! An envelope segment's elements sit DIRECTLY in the object that holds the segment,
+//! keyed `<SEGMENT>_<position>_<ElementName>` (`ST_01_TransactionSetIdentifierCode`); a
+//! segment of the transaction's own body is one entry of that transaction's `segments`
+//! list, carrying its `segment_id` and its elements keyed `<SEGMENT>_<position>`
+//! (`BEG_03`), with a composite element's components keyed
+//! `<SEGMENT>_<position>_<component>`. That is the SAME tree, with the same keys, that
+//! `CreateStarterMappingTemplate` generates a mapping template for, so a template written
+//! against a starter template addresses the document this operation answers with.
+//!
+//! The delimiters are the interchange's OWN: the element separator is the character that
+//! follows `ISA`, the component separator is ISA16 and the segment terminator is the
+//! character after it, exactly as the ASC X12 envelope declares them — so a document
+//! delimited any other way than `*` / `>` / `~` parses the same.
+//!
+//! A segment that sits inside an interchange or a functional group but outside every
+//! transaction set (an interchange acknowledgment, say) is one entry of THAT object's
+//! `segments` list. `splitBy TRANSACTION` answers one document per transaction set, each
+//! carrying the interchange and group envelope its transaction set sits in — with the
+//! control counts GE01 and IEA01 reporting what that one file really holds — and not those
+//! loose segments, which belong to the input file as a whole and not to any one
+//! transaction set (see [`Scope`]).
+//!
+//! ## What is refused, and why
+//!
+//! Each of these is the modelled `ValidationException` (HTTP 400) — the request, not the
+//! service, is what cannot be honoured:
+//!
+//! * content that does not begin with the interchange header of an EDI standard this
+//!   emulator parses (X12's `ISA`), which is what a client is testing a document for;
+//! * an envelope that does not close (an ISA without its IEA, a GS without its GE, an ST
+//!   without its SE) or a trailer with no matching header: the file is not an interchange
+//!   even though it starts like one;
+//! * an object larger than [`MAX_INPUT_FILE_BYTES`] — "The input file has a file size
+//!   limit of 250 KB" (this operation's own documentation);
+//! * a split that would answer more than [`MAX_SPLIT_FILES`] files or more than
+//!   [`MAX_SPLIT_OUTPUT_BYTES`] of them together, and more than
+//!   [`MAX_VALIDATION_RULES`] configured validation rules: the file count, the per-file
+//!   size and the rule count are factors of the work this operation does that AWS's input
+//!   limit does not bound on its own, so each one carries its own bound;
+//! * an object whose bytes are not UTF-8 text, which this emulator cannot read as EDI;
+//! * `fileFormat` `NOT_USED`, which names no document format to answer in ("the currently
+//!   supported file formats for EDI transformations are JSON and XML");
+//! * an `advancedOptions.x12.validationOptions` rule keyed by a four-digit X12 DATA
+//!   ELEMENT id (`codeListValidationRule`, `elementLengthValidationRule`): applying one
+//!   needs the X12 data element dictionary that maps every segment position to its
+//!   element id, which this emulator does not carry, and answering 200 with no message
+//!   would report a validation that never ran. `elementRequirementValidationRule` is
+//!   keyed by position (`"ST-01"`), so it IS applied, and its violations are the
+//!   `validationMessages` the response carries.
+//!
+//! * `AccessDeniedException` (HTTP 403) answers an input file the read was not permitted
+//!   for — the S3 read answering `AccessDenied` (and the other permission codes) is a
+//!   terminal refusal of this request, not a service fault a caller should retry.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +203,1223 @@ impl From<TestParsingErrorModeled> for TestParsingError {
     }
 }
 
+/// AWS's documented size limit on the input file: "The input file has a file size limit
+/// of 250 KB" (this operation's own documentation). A larger object is refused rather
+/// than parsed, so the work one request can drive is bounded by the limit AWS publishes.
+pub const MAX_INPUT_FILE_BYTES: usize = 250 * 1024;
+
+/// How many characters of the document the delimiter scan reads while locating the end of
+/// the interchange control header.
+///
+/// The ASC X12 envelope's ISA segment is 106 characters with fixed-width elements; twice
+/// that is read before giving up, so a sender that pads an element wider is still read
+/// while a file that merely starts with `ISA` cannot make the scan walk the whole 250 KB.
+const ISA_SCAN_CHARS: usize = 212;
+
+/// The first X12 release whose ISA11 is the Repetition Separator; in the releases before
+/// it ISA11 is the Interchange Control Standards Identifier (ASC X12 interchange control
+/// header, element ISA11), so the element's name follows the interchange's release.
+const FIRST_REPETITION_SEPARATOR_RELEASE: u32 = 4020;
+
+/// The number of elements the ASC X12 interchange control header (ISA) carries.
+const ISA_ELEMENT_COUNT: usize = 16;
+
+/// How many characters of an unparsable file a refusal quotes back: the three an
+/// interchange identifier occupies (`ISA`), which is what the check for a supported EDI
+/// standard reads, so the caller sees what was rejected without the message carrying the
+/// document.
+const REFUSAL_EXCERPT_CHARS: usize = 3;
+
+/// The longest message this handler puts in a modelled error, the maximum of the modelled
+/// `ErrorMessage` (`len 10..1024`).
+const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
+
+/// The member a parsed body segment carries its X12 segment id in, so a segment that
+/// carries no element at all is still identified by the document.
+const SEGMENT_ID_KEY: &str = "segment_id";
+
+/// The most split files one request is answered with.
+///
+/// The number of transaction sets and the size of each one are SEPARATE factors of the
+/// split output, and AWS's input limit bounds only their sum, so a 250 KB file of minimal
+/// transaction sets would otherwise be answered with a multiple of its own size: each
+/// split file repeats the interchange and group envelope its transaction set sits in. This
+/// bounds the count; [`MAX_SPLIT_OUTPUT_BYTES`] bounds what they hold together. A request
+/// past either is refused with the modelled `ValidationException` rather than answered.
+pub const MAX_SPLIT_FILES: usize = 1_000;
+
+/// The most bytes the split files of one request hold together — sixteen times the input
+/// limit, which leaves room for the key-per-element document a 250 KB interchange renders
+/// to while keeping one request's resident output bounded. See [`MAX_SPLIT_FILES`].
+pub const MAX_SPLIT_OUTPUT_BYTES: usize = 16 * MAX_INPUT_FILE_BYTES;
+
+/// The most validation rules one request configures.
+///
+/// Each rule is evaluated over every segment of the document, so the work and the messages
+/// are the product of the rule count and the segment count: the rule list is the factor
+/// the request chooses, and it is bounded here. A request past it is refused with the
+/// modelled `ValidationException`.
+pub const MAX_VALIDATION_RULES: usize = 100;
+
+/// The most `validationMessages` one response carries. Past it the response reports how
+/// many further violations it is not listing, rather than growing without a bound.
+pub const MAX_VALIDATION_MESSAGES: usize = 100;
+
+/// The `X12SplitBy` value that splits the input file into one file per transaction set.
+const SPLIT_BY_TRANSACTION: &str = "TRANSACTION";
+
+/// The `X12SplitBy` value that splits nothing — the default when no split options are
+/// given.
+const SPLIT_BY_NONE: &str = "NONE";
+
+/// The `ElementRequirement` value that makes an element required.
+const REQUIREMENT_MANDATORY: &str = "MANDATORY";
+
+/// The element names of the interchange control header (ISA), in positional order.
+///
+/// Source: the element table of the ASC X12 interchange control header. Position 11 is
+/// release-dependent — see [`isa_element_names`]. These are the same envelope element
+/// names `CreateStarterMappingTemplate` keys a starter template's elements by, so a
+/// parsed document and a starter template describe the same tree with the same keys; that
+/// operation's table is private to its own file, which this change does not edit.
+const ISA_ELEMENTS: &[&str] = &[
+    "AuthorizationInformationQualifier",
+    "AuthorizationInformation",
+    "SecurityInformationQualifier",
+    "SecurityInformation",
+    "InterchangeIdQualifier",
+    "InterchangeSenderId",
+    "InterchangeIdQualifier",
+    "InterchangeReceiverId",
+    "InterchangeDate",
+    "InterchangeTime",
+    // Position 11, replaced per release by `isa_element_names`.
+    "RepetitionSeparator",
+    "InterchangeControlVersionNumber",
+    "InterchangeControlNumber",
+    "AcknowledgmentRequested",
+    "UsageIndicator",
+    "ComponentElementSeparator",
+];
+
+/// Element 11 of the interchange control header from X12 release 004020 on.
+const ISA11_FROM_4020: &str = "RepetitionSeparator";
+
+/// Element 11 of the interchange control header before X12 release 004020.
+const ISA11_PRE_4020: &str = "InterchangeControlStandardsIdentifier";
+
+/// The element names of the interchange control trailer (IEA), in positional order.
+const IEA_ELEMENTS: &[&str] = &["NumberOfIncludedFunctionalGroups", "InterchangeControlNumber"];
+
+/// The element names of the functional group header (GS), in positional order.
+const GS_ELEMENTS: &[&str] = &[
+    "FunctionalIdentifierCode",
+    "ApplicationSendersCode",
+    "ApplicationReceiversCode",
+    "Date",
+    "Time",
+    "GroupControlNumber",
+    "ResponsibleAgencyCode",
+    "VersionReleaseIndustryIdentifierCode",
+];
+
+/// The element names of the functional group trailer (GE), in positional order.
+const GE_ELEMENTS: &[&str] = &["NumberOfTransactionSetsIncluded", "GroupControlNumber"];
+
+/// The element names of the transaction set header (ST), in positional order.
+const ST_ELEMENTS: &[&str] = &[
+    "TransactionSetIdentifierCode",
+    "TransactionSetControlNumber",
+    "ImplementationConventionReference",
+];
+
+/// The element names of the transaction set trailer (SE), in positional order.
+const SE_ELEMENTS: &[&str] = &["NumberOfIncludedSegments", "TransactionSetControlNumber"];
+
+/// The X12 segment ids the three envelopes are opened and closed with.
+const ISA: &str = "ISA";
+const IEA: &str = "IEA";
+const GS: &str = "GS";
+const GE: &str = "GE";
+const ST: &str = "ST";
+const SE: &str = "SE";
+
+/// [`ISA_ELEMENTS`] with position 11 named for `release`.
+fn isa_element_names(release: u32) -> Vec<&'static str> {
+    let mut names = ISA_ELEMENTS.to_vec();
+    names[10] = if release < FIRST_REPETITION_SEPARATOR_RELEASE {
+        ISA11_PRE_4020
+    } else {
+        ISA11_FROM_4020
+    };
+    names
+}
+
+/// One node of a parsed document's tree, rendered to JSON for `fileFormat` `JSON` and to
+/// XML for `XML`.
+///
+/// A map keeps its members in INSERTION order — the positional order of an X12 segment's
+/// elements — which a `serde_json::Value` (a sorted map) would lose.
+enum Node {
+    /// A leaf: one element's value, as the interchange carries it.
+    Text(String),
+    /// Named children, in order.
+    Map(Vec<(String, Node)>),
+    /// A repeated child — an interchange, a functional group, a transaction set, a
+    /// segment. `item` is the element name each repetition takes in the XML rendering;
+    /// JSON renders the repetitions as an array.
+    List { item: String, items: Vec<Node> },
+}
+
+impl ::serde::Serialize for Node {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Node::Text(text) => serializer.serialize_str(text),
+            Node::Map(members) => {
+                serializer.collect_map(members.iter().map(|(key, child)| (key.as_str(), child)))
+            }
+            Node::List { items, .. } => serializer.collect_seq(items.iter()),
+        }
+    }
+}
+
+/// One X12 segment as the interchange carries it: its segment id and its elements, in
+/// positional order, each element's value verbatim.
+#[derive(Debug, Clone)]
+struct Segment {
+    id: String,
+    elements: Vec<String>,
+}
+
+impl Segment {
+    /// The value of element `position` (1-based), or `""` when the segment carries no
+    /// such element. An element that is PRESENT but empty is the X12 encoding of an
+    /// absent element, so both read the same way here.
+    fn element(&self, position: usize) -> &str {
+        position
+            .checked_sub(1)
+            .and_then(|index| self.elements.get(index))
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+
+    /// This segment with element 1 replaced by `count` — the control count a SPLIT
+    /// envelope carries, since the split file holds `count` of what the original counted.
+    /// A trailer carrying no element at all is left alone.
+    fn with_count(&self, count: usize) -> Segment {
+        let mut split = self.clone();
+        if let Some(first) = split.elements.first_mut() {
+            *first = count.to_string();
+        }
+        split
+    }
+}
+
+/// One transaction set: ST, the segments of its body, and SE.
+#[derive(Debug, Clone)]
+struct Transaction {
+    st: Segment,
+    body: Vec<Segment>,
+    se: Segment,
+}
+
+/// One functional group: GS, its transaction sets, and GE. `loose` holds the segments
+/// that sit inside the group but outside every transaction set.
+#[derive(Debug, Clone)]
+struct Group {
+    gs: Segment,
+    loose: Vec<Segment>,
+    transactions: Vec<Transaction>,
+    ge: Segment,
+}
+
+/// One interchange: ISA, its functional groups, and IEA. `loose` holds the segments that
+/// sit inside the interchange but outside every functional group — an interchange
+/// acknowledgment (TA1), say.
+#[derive(Debug, Clone)]
+struct Interchange {
+    isa: Segment,
+    loose: Vec<Segment>,
+    groups: Vec<Group>,
+    iea: Segment,
+}
+
+/// The delimiters an X12 interchange declares in its own interchange control header.
+#[derive(Debug, Clone, Copy)]
+struct Delimiters {
+    /// The character between two elements of a segment: the character that follows `ISA`.
+    element: char,
+    /// The character between two components of a composite element: ISA16.
+    component: char,
+    /// The character that ends a segment: the character after ISA16.
+    segment: char,
+}
+
+/// The refusal for content that does not begin with the interchange header of an EDI
+/// standard this emulator parses.
+///
+/// Quotes back the leading characters it read, so a caller testing a document learns
+/// which file was rejected and not merely that one was.
+fn unsupported_standard(content: &str) -> String {
+    let excerpt: String = content.chars().take(REFUSAL_EXCERPT_CHARS).collect();
+    format!(
+        "The EDI file could not be parsed. No supported EDI standard interchange begins \
+         with {excerpt}"
+    )
+}
+
+/// The refusal for an interchange whose structure is not one: `detail` says what about it.
+fn unparsable(detail: impl ::std::fmt::Display) -> String {
+    format!("The EDI file could not be parsed. {detail}")
+}
+
+/// `message` held inside the modelled `ErrorMessage` length bound.
+fn bounded_message(message: String) -> String {
+    if message.chars().count() <= MAX_ERROR_MESSAGE_CHARS {
+        return message;
+    }
+    message.chars().take(MAX_ERROR_MESSAGE_CHARS).collect()
+}
+
+/// The modelled `ValidationException` (HTTP 400): the REQUEST cannot be honoured.
+fn validation(message: impl Into<String>) -> TestParsingError {
+    TestParsingErrorModeled::ValidationException(ValidationException {
+        message: bounded_message(message.into()),
+    })
+    .into()
+}
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) for an `inputFile` that names no
+/// stored object — "occurs when the requested resource does not exist, or cannot be
+/// found".
+fn not_found(bucket: &str, key: &str, detail: &str) -> TestParsingError {
+    TestParsingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: bounded_message(format!(
+            "The input file s3://{bucket}/{key} could not be read: {detail}"
+        )),
+    })
+    .into()
+}
+
+/// The modelled `InternalServerException` (HTTP 500) for a read or a rendering this
+/// service could not complete — not a statement about the request.
+fn internal(detail: impl ::std::fmt::Display) -> TestParsingError {
+    TestParsingErrorModeled::InternalServerException(InternalServerException {
+        message: bounded_message(format!("The input file could not be parsed: {detail}")),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+/// The modelled `AccessDeniedException` (HTTP 403) for an input file this caller is not
+/// permitted to read — "you do not have sufficient access to perform this action".
+fn access_denied(bucket: &str, key: &str, code: &str) -> TestParsingError {
+    TestParsingErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: bounded_message(format!(
+            "The input file s3://{bucket}/{key} could not be read: {code}"
+        )),
+    })
+    .into()
+}
+
+/// The delimiters `content` declares in its interchange control header.
+///
+/// The X12 envelope is self-delimiting: `ISA` is followed by the element separator, the
+/// header's sixteenth element is the component separator, and the character after it ends
+/// the segment. None of the three may be a character an element's value is made of, which
+/// is what tells a file that merely starts with the letters `ISA` from an interchange.
+fn detect_delimiters(content: &str) -> Result<Delimiters, String> {
+    if !content.starts_with(ISA) {
+        return Err(unsupported_standard(content));
+    }
+    let header: Vec<char> = content.chars().take(ISA_SCAN_CHARS).collect();
+    let Some(&element) = header.get(ISA.len()) else {
+        return Err(unsupported_standard(content));
+    };
+    if element.is_ascii_alphanumeric() || element.is_whitespace() {
+        return Err(unsupported_standard(content));
+    }
+
+    let mut separators = 0usize;
+    let mut component_at = None;
+    for (index, character) in header.iter().enumerate().skip(ISA.len()) {
+        if *character == element {
+            separators += 1;
+            if separators == ISA_ELEMENT_COUNT {
+                component_at = Some(index + 1);
+                break;
+            }
+        }
+    }
+    let Some(component_at) = component_at else {
+        return Err(unparsable(format!(
+            "The interchange control header (ISA) does not carry the {ISA_ELEMENT_COUNT} \
+             elements the X12 envelope requires."
+        )));
+    };
+    let (Some(&component), Some(&segment)) =
+        (header.get(component_at), header.get(component_at + 1))
+    else {
+        return Err(unparsable(
+            "The interchange control header (ISA) ends before its component element \
+             separator and segment terminator.",
+        ));
+    };
+    // The segment terminator is the one delimiter whitespace is accepted for: a line
+    // break is what many real senders end a segment with, and the X12 standard puts no
+    // character class on it beyond its not being one an element's value is made of.
+    if component.is_ascii_alphanumeric()
+        || component.is_whitespace()
+        || segment.is_ascii_alphanumeric()
+        || component == element
+        || segment == element
+        || segment == component
+    {
+        return Err(unparsable(
+            "The interchange control header (ISA) does not declare a distinct component \
+             element separator and segment terminator.",
+        ));
+    }
+    Ok(Delimiters {
+        element,
+        component,
+        segment,
+    })
+}
+
+/// Every segment of `content`, in document order, split on the delimiters the interchange
+/// declared.
+///
+/// A segment terminator may be followed by line breaks (and a file may end with one), so
+/// a piece is trimmed of leading whitespace and trailing line breaks — never of the
+/// trailing SPACES an X12 fixed-width element is padded with, which belong to the value.
+///
+/// A segment id is alphanumeric and STARTS WITH A LETTER, as every id in the X12 segment
+/// directory does. That is also what keeps the keys built from it legal XML element names,
+/// so an `XML` parse cannot answer a success a conforming parser would reject.
+fn split_segments(content: &str, delimiters: &Delimiters) -> Result<Vec<Segment>, String> {
+    let mut segments: Vec<Segment> = Vec::new();
+    for raw in content.split(delimiters.segment) {
+        let piece = raw.trim_start().trim_end_matches(['\r', '\n']);
+        if piece.is_empty() {
+            continue;
+        }
+        let mut fields = piece.split(delimiters.element);
+        let id = fields.next().unwrap_or_default().trim().to_string();
+        let shaped = id
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic())
+            && id.chars().all(|character| character.is_ascii_alphanumeric());
+        if !shaped {
+            return Err(unparsable(format!(
+                "{id:?} is not an X12 segment identifier."
+            )));
+        }
+        segments.push(Segment {
+            id,
+            elements: fields.map(str::to_string).collect(),
+        });
+    }
+    Ok(segments)
+}
+
+/// The interchanges `segments` holds, each with its functional groups and transaction
+/// sets.
+///
+/// Every envelope must be closed by its own trailer and every trailer must close an
+/// envelope that is open: a file whose envelopes do not nest is not an interchange, which
+/// is the whole of what this operation is called to find out.
+fn parse_interchanges(segments: Vec<Segment>) -> Result<Vec<Interchange>, String> {
+    let mut interchanges: Vec<Interchange> = Vec::new();
+    // The envelopes currently open, innermost last: ISA, then GS, then ST.
+    let mut isa: Option<(Segment, Vec<Segment>, Vec<Group>)> = None;
+    let mut gs: Option<(Segment, Vec<Segment>, Vec<Transaction>)> = None;
+    let mut st: Option<(Segment, Vec<Segment>)> = None;
+
+    for segment in segments {
+        match segment.id.as_str() {
+            ISA => {
+                if isa.is_some() {
+                    return Err(unparsable(
+                        "An interchange control header (ISA) opens inside an interchange \
+                         that was never closed by its trailer (IEA).",
+                    ));
+                }
+                isa = Some((segment, Vec::new(), Vec::new()));
+            }
+            IEA => {
+                if st.is_some() || gs.is_some() {
+                    return Err(unparsable(
+                        "An interchange control trailer (IEA) closes an interchange whose \
+                         functional group or transaction set is still open.",
+                    ));
+                }
+                let Some((header, loose, groups)) = isa.take() else {
+                    return Err(unparsable(
+                        "An interchange control trailer (IEA) closes an interchange no \
+                         header (ISA) opened.",
+                    ));
+                };
+                interchanges.push(Interchange {
+                    isa: header,
+                    loose,
+                    groups,
+                    iea: segment,
+                });
+            }
+            GS => {
+                if isa.is_none() {
+                    return Err(unparsable(
+                        "A functional group header (GS) opens outside any interchange.",
+                    ));
+                }
+                if gs.is_some() {
+                    return Err(unparsable(
+                        "A functional group header (GS) opens inside a functional group \
+                         that was never closed by its trailer (GE).",
+                    ));
+                }
+                gs = Some((segment, Vec::new(), Vec::new()));
+            }
+            GE => {
+                if st.is_some() {
+                    return Err(unparsable(
+                        "A functional group trailer (GE) closes a functional group whose \
+                         transaction set is still open.",
+                    ));
+                }
+                let Some((header, loose, transactions)) = gs.take() else {
+                    return Err(unparsable(
+                        "A functional group trailer (GE) closes a functional group no \
+                         header (GS) opened.",
+                    ));
+                };
+                let Some((_, _, groups)) = isa.as_mut() else {
+                    return Err(unparsable(
+                        "A functional group closes outside any interchange.",
+                    ));
+                };
+                groups.push(Group {
+                    gs: header,
+                    loose,
+                    transactions,
+                    ge: segment,
+                });
+            }
+            ST => {
+                if gs.is_none() {
+                    return Err(unparsable(
+                        "A transaction set header (ST) opens outside any functional group.",
+                    ));
+                }
+                if st.is_some() {
+                    return Err(unparsable(
+                        "A transaction set header (ST) opens inside a transaction set that \
+                         was never closed by its trailer (SE).",
+                    ));
+                }
+                st = Some((segment, Vec::new()));
+            }
+            SE => {
+                let Some((header, body)) = st.take() else {
+                    return Err(unparsable(
+                        "A transaction set trailer (SE) closes a transaction set no header \
+                         (ST) opened.",
+                    ));
+                };
+                let Some((_, _, transactions)) = gs.as_mut() else {
+                    return Err(unparsable(
+                        "A transaction set closes outside any functional group.",
+                    ));
+                };
+                transactions.push(Transaction {
+                    st: header,
+                    body,
+                    se: segment,
+                });
+            }
+            _ => {
+                if let Some((_, body)) = st.as_mut() {
+                    body.push(segment);
+                } else if let Some((_, loose, _)) = gs.as_mut() {
+                    loose.push(segment);
+                } else if let Some((_, loose, _)) = isa.as_mut() {
+                    loose.push(segment);
+                } else {
+                    return Err(unparsable(format!(
+                        "The segment {} appears outside any interchange.",
+                        segment.id
+                    )));
+                }
+            }
+        }
+    }
+
+    if st.is_some() {
+        return Err(unparsable(
+            "A transaction set is not closed by its trailer (SE).",
+        ));
+    }
+    if gs.is_some() {
+        return Err(unparsable(
+            "A functional group is not closed by its trailer (GE).",
+        ));
+    }
+    if isa.is_some() {
+        return Err(unparsable(
+            "The interchange is not closed by its trailer (IEA).",
+        ));
+    }
+    if interchanges.is_empty() {
+        return Err(unparsable("The file holds no interchange."));
+    }
+    Ok(interchanges)
+}
+
+/// The X12 release the request's `ediType` names, as a number — `VERSION_4010` is 4010 —
+/// or `None` when it names none.
+fn requested_release(details: &X12Details) -> Option<u32> {
+    let value = details.version.as_deref()?;
+    let rest = value.strip_prefix("VERSION_")?;
+    let release = rest.strip_suffix("_HIPAA").unwrap_or(rest);
+    release.parse().ok()
+}
+
+/// The X12 release the interchange itself declares in ISA12, the Interchange Control
+/// Version Number: a five-digit code whose release is that code with its trailing release
+/// digit — `00401` is release 004010. `None` for an ISA12 that is not such a code.
+fn declared_release(isa: &Segment) -> Option<u32> {
+    let value = isa.element(12).trim();
+    if value.len() != 5 || !value.chars().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u32>().ok().map(|code| code * 10)
+}
+
+/// An envelope segment's elements as named members, in positional order.
+///
+/// An element the standard's table does not name — one past the table, which a later X12
+/// release may add — keeps the segment and position key without a name, so the document
+/// still carries its value.
+fn envelope_members(segment: &Segment, names: &[&str]) -> Vec<(String, Node)> {
+    segment
+        .elements
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(index, value)| {
+            let position = index + 1;
+            let key = match names.get(index) {
+                Some(name) => format!("{}_{position:02}_{name}", segment.id),
+                None => format!("{}_{position:02}", segment.id),
+            };
+            (key, Node::Text(value.clone()))
+        })
+        .collect()
+}
+
+/// One segment of a transaction's body: its `segment_id`, then its elements keyed by
+/// segment and position, a composite element's components keyed by segment, position and
+/// component.
+///
+/// An element that is present but EMPTY is the X12 encoding of an absent element, so it
+/// is left out rather than carried as an empty value.
+fn body_segment_node(segment: &Segment, delimiters: &Delimiters) -> Node {
+    let mut members = vec![(
+        SEGMENT_ID_KEY.to_string(),
+        Node::Text(segment.id.clone()),
+    )];
+    for (index, value) in segment.elements.iter().enumerate() {
+        if value.is_empty() {
+            continue;
+        }
+        let position = index + 1;
+        let key = format!("{}_{position:02}", segment.id);
+        if value.contains(delimiters.component) {
+            let components: Vec<(String, Node)> = value
+                .split(delimiters.component)
+                .enumerate()
+                .filter(|(_, component)| !component.is_empty())
+                .map(|(sub, component)| {
+                    let sub_position = sub + 1;
+                    (
+                        format!("{key}_{sub_position:02}"),
+                        Node::Text(component.to_string()),
+                    )
+                })
+                .collect();
+            members.push((key, Node::Map(components)));
+        } else {
+            members.push((key, Node::Text(value.clone())));
+        }
+    }
+    Node::Map(members)
+}
+
+/// `segments` as a named list of body segments, or nothing when there are none.
+fn body_segments_member(
+    name: &str,
+    segments: &[Segment],
+    delimiters: &Delimiters,
+) -> Option<(String, Node)> {
+    if segments.is_empty() {
+        return None;
+    }
+    Some((
+        name.to_string(),
+        Node::List {
+            item: "segment".to_string(),
+            items: segments
+                .iter()
+                .map(|segment| body_segment_node(segment, delimiters))
+                .collect(),
+        },
+    ))
+}
+
+/// Whether a rendering is of the WHOLE input file or of ONE split file.
+///
+/// A split file holds ONE transaction set, so the segments that sit inside the enclosing
+/// interchange or functional group but outside every transaction set belong to the input
+/// file as a whole and not to any one transaction: the whole-file rendering carries them
+/// and a split file does not. That also keeps the split output LINEAR in the input, rather
+/// than repeating every such segment once per transaction set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    WholeFile,
+    SplitFile,
+}
+
+impl Scope {
+    /// The segments outside every transaction set that this scope carries.
+    fn loose(self, loose: &[Segment]) -> &[Segment] {
+        match self {
+            Self::WholeFile => loose,
+            Self::SplitFile => &[],
+        }
+    }
+}
+
+/// One transaction set: its ST elements, the segments of its body, then its SE elements.
+fn transaction_node(transaction: &Transaction, delimiters: &Delimiters) -> Node {
+    let mut members = envelope_members(&transaction.st, ST_ELEMENTS);
+    members.extend(body_segments_member(
+        "segments",
+        &transaction.body,
+        delimiters,
+    ));
+    members.extend(envelope_members(&transaction.se, SE_ELEMENTS));
+    Node::Map(members)
+}
+
+/// One functional group holding `transactions`: its GS elements, the segments that sit
+/// inside it but outside every transaction set, its transaction sets, then its GE
+/// elements.
+///
+/// `ge` is the group's own trailer unless the rendering holds FEWER transaction sets than
+/// the group does (a split file), in which case GE01 — the number of transaction sets
+/// included — is the number this rendering really holds.
+fn group_node(
+    group: &Group,
+    transactions: &[&Transaction],
+    delimiters: &Delimiters,
+    scope: Scope,
+) -> Node {
+    let mut members = envelope_members(&group.gs, GS_ELEMENTS);
+    members.extend(body_segments_member(
+        "segments",
+        scope.loose(&group.loose),
+        delimiters,
+    ));
+    members.push((
+        "transactions".to_string(),
+        Node::List {
+            item: "transaction".to_string(),
+            items: transactions
+                .iter()
+                .map(|transaction| transaction_node(transaction, delimiters))
+                .collect(),
+        },
+    ));
+    let ge = if transactions.len() == group.transactions.len() {
+        group.ge.clone()
+    } else {
+        group.ge.with_count(transactions.len())
+    };
+    members.extend(envelope_members(&ge, GE_ELEMENTS));
+    Node::Map(members)
+}
+
+/// One interchange holding `groups`: its ISA elements, the segments that sit inside it but
+/// outside every functional group, its functional groups, then its IEA elements.
+///
+/// IEA01 — the number of functional groups included — follows the same rule as GE01 in
+/// [`group_node`]: the interchange's own value unless this rendering holds fewer groups.
+fn interchange_node(
+    interchange: &Interchange,
+    groups: &[(&Group, Vec<&Transaction>)],
+    delimiters: &Delimiters,
+    release: u32,
+    scope: Scope,
+) -> Node {
+    let names = isa_element_names(release);
+    let mut members = envelope_members(&interchange.isa, &names);
+    members.extend(body_segments_member(
+        "segments",
+        scope.loose(&interchange.loose),
+        delimiters,
+    ));
+    members.push((
+        "functional_groups".to_string(),
+        Node::List {
+            item: "functional_group".to_string(),
+            items: groups
+                .iter()
+                .map(|(group, transactions)| group_node(group, transactions, delimiters, scope))
+                .collect(),
+        },
+    ));
+    let iea = if groups.len() == interchange.groups.len() {
+        interchange.iea.clone()
+    } else {
+        interchange.iea.with_count(groups.len())
+    };
+    members.extend(envelope_members(&iea, IEA_ELEMENTS));
+    Node::Map(members)
+}
+
+/// The document tree for `interchanges`: every interchange, every group and every
+/// transaction set the input file holds.
+fn document_node(interchanges: &[Interchange], delimiters: &Delimiters, release: u32) -> Node {
+    let items: Vec<Node> = interchanges
+        .iter()
+        .map(|interchange| {
+            let groups: Vec<(&Group, Vec<&Transaction>)> = interchange
+                .groups
+                .iter()
+                .map(|group| (group, group.transactions.iter().collect()))
+                .collect();
+            interchange_node(interchange, &groups, delimiters, release, Scope::WholeFile)
+        })
+        .collect();
+    Node::Map(vec![(
+        "interchanges".to_string(),
+        Node::List {
+            item: "interchange".to_string(),
+            items,
+        },
+    )])
+}
+
+/// The document tree of ONE split file: a single transaction set, inside the functional
+/// group and the interchange it came from. See [`Scope`] for what a split file does NOT
+/// carry.
+fn split_document_node(
+    interchange: &Interchange,
+    group: &Group,
+    transaction: &Transaction,
+    delimiters: &Delimiters,
+    release: u32,
+) -> Node {
+    let groups = vec![(group, vec![transaction])];
+    Node::Map(vec![(
+        "interchanges".to_string(),
+        Node::List {
+            item: "interchange".to_string(),
+            items: vec![interchange_node(
+                interchange,
+                &groups,
+                delimiters,
+                release,
+                Scope::SplitFile,
+            )],
+        },
+    )])
+}
+
+/// Every split file's parsed content: one per transaction set the input file holds.
+///
+/// Bounded twice, INDEPENDENTLY of the input's own 250 KB limit — by [`MAX_SPLIT_FILES`]
+/// over the number of files and by [`MAX_SPLIT_OUTPUT_BYTES`] over the bytes they hold
+/// together — because the number of transaction sets and the size of each one are separate
+/// factors of the output and the input limit bounds only their sum. Each rendering yields
+/// to the runtime afterwards, so a cancelled or timed-out request stops here rather than
+/// running the whole split out first.
+async fn split_file_contents(
+    interchanges: &[Interchange],
+    delimiters: &Delimiters,
+    release: u32,
+    format: DocumentFormat,
+) -> Result<Vec<String>, TestParsingError> {
+    let transaction_sets: usize = interchanges
+        .iter()
+        .flat_map(|interchange| interchange.groups.iter())
+        .map(|group| group.transactions.len())
+        .sum();
+    if transaction_sets > MAX_SPLIT_FILES {
+        return Err(validation(format!(
+            "The input file holds {transaction_sets} transaction sets, more than the \
+             {MAX_SPLIT_FILES} split files this emulator answers one request with. Parse it \
+             without advancedOptions.x12.splitOptions.splitBy TRANSACTION, or split the \
+             input file first."
+        )));
+    }
+
+    let mut contents: Vec<String> = Vec::with_capacity(transaction_sets);
+    let mut rendered = 0usize;
+    for interchange in interchanges {
+        for group in &interchange.groups {
+            for transaction in &group.transactions {
+                let document = format.render(&split_document_node(
+                    interchange,
+                    group,
+                    transaction,
+                    delimiters,
+                    release,
+                ))?;
+                rendered = rendered.saturating_add(document.len());
+                if rendered > MAX_SPLIT_OUTPUT_BYTES {
+                    return Err(validation(format!(
+                        "The split files of this input file hold more than the \
+                         {MAX_SPLIT_OUTPUT_BYTES} bytes this emulator answers one request \
+                         with. Parse it without \
+                         advancedOptions.x12.splitOptions.splitBy TRANSACTION, or split the \
+                         input file first."
+                    )));
+                }
+                contents.push(document);
+                ::tokio::task::yield_now().await;
+            }
+        }
+    }
+    Ok(contents)
+}
+
+/// The JSON rendering of a parsed document.
+fn json_document(document: &Node) -> Result<String, TestParsingError> {
+    ::serde_json::to_string_pretty(document).map_err(internal)
+}
+
+/// The XML rendering of a parsed document: the same tree, each node an element named by
+/// its key — the document an XSLT mapping template consumes.
+fn xml_document(document: &Node) -> Result<String, TestParsingError> {
+    use ::quick_xml::events::{BytesDecl, Event};
+
+    let Node::Map(roots) = document else {
+        return Err(internal("the parsed document is not a map"));
+    };
+    let mut writer = ::quick_xml::Writer::new_with_indent(Vec::new(), b' ', 2);
+    writer
+        .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
+        .map_err(internal)?;
+    for (key, child) in roots {
+        write_xml_node(&mut writer, key, child)?;
+    }
+    String::from_utf8(writer.into_inner()).map_err(internal)
+}
+
+/// One node of the document tree, as an XML element named `name`.
+fn write_xml_node(
+    writer: &mut ::quick_xml::Writer<Vec<u8>>,
+    name: &str,
+    node: &Node,
+) -> Result<(), TestParsingError> {
+    use ::quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+
+    match node {
+        Node::Text(text) => {
+            writer
+                .write_event(Event::Start(BytesStart::new(name)))
+                .map_err(internal)?;
+            writer
+                .write_event(Event::Text(BytesText::new(text)))
+                .map_err(internal)?;
+            writer
+                .write_event(Event::End(BytesEnd::new(name)))
+                .map_err(internal)?;
+        }
+        Node::Map(members) if members.is_empty() => {
+            writer
+                .write_event(Event::Empty(BytesStart::new(name)))
+                .map_err(internal)?;
+        }
+        Node::Map(members) => {
+            writer
+                .write_event(Event::Start(BytesStart::new(name)))
+                .map_err(internal)?;
+            for (key, child) in members {
+                write_xml_node(writer, key, child)?;
+            }
+            writer
+                .write_event(Event::End(BytesEnd::new(name)))
+                .map_err(internal)?;
+        }
+        Node::List { item, items } => {
+            writer
+                .write_event(Event::Start(BytesStart::new(name)))
+                .map_err(internal)?;
+            for child in items {
+                write_xml_node(writer, item, child)?;
+            }
+            writer
+                .write_event(Event::End(BytesEnd::new(name)))
+                .map_err(internal)?;
+        }
+    }
+    Ok(())
+}
+
+/// The document format `fileFormat` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentFormat {
+    Json,
+    Xml,
+}
+
+impl DocumentFormat {
+    /// The format `value` names, or `None` for a `FileFormat` value that names no document
+    /// format a parse can be answered in (`NOT_USED`).
+    fn decode(value: &str) -> Option<Self> {
+        match value {
+            "JSON" => Some(Self::Json),
+            "XML" => Some(Self::Xml),
+            _ => None,
+        }
+    }
+
+    /// `document` rendered in this format.
+    fn render(self, document: &Node) -> Result<String, TestParsingError> {
+        match self {
+            Self::Json => json_document(document),
+            Self::Xml => xml_document(document),
+        }
+    }
+}
+
+/// An `elementPosition` of an element requirement rule, split into its segment id and its
+/// element position: "the format follows the pattern of segment identifier followed by
+/// element position (e.g., \"ST-01\" for the first element of the ST segment)"
+/// (`X12ElementRequirementValidationRule$elementPosition`).
+fn decode_element_position(value: &str) -> Option<(String, usize)> {
+    let (segment, position) = value.split_once('-')?;
+    // The same shape a real segment id has (see `split_segments`): alphanumeric, starting
+    // with a letter.
+    let shaped = segment
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && segment
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric());
+    if !shaped {
+        return None;
+    }
+    let position: usize = position.parse().ok()?;
+    (position > 0).then(|| (segment.to_string(), position))
+}
+
+/// Every segment of `interchanges` in document order, envelope segments included: what an
+/// element requirement rule is evaluated over.
+fn all_segments(interchanges: &[Interchange]) -> Vec<&Segment> {
+    let mut segments: Vec<&Segment> = Vec::new();
+    for interchange in interchanges {
+        segments.push(&interchange.isa);
+        segments.extend(interchange.loose.iter());
+        for group in &interchange.groups {
+            segments.push(&group.gs);
+            segments.extend(group.loose.iter());
+            for transaction in &group.transactions {
+                segments.push(&transaction.st);
+                segments.extend(transaction.body.iter());
+                segments.push(&transaction.se);
+            }
+            segments.push(&group.ge);
+        }
+        segments.push(&interchange.iea);
+    }
+    segments
+}
+
+/// The validation messages the configured element requirement rules produce over the
+/// parsed document: one per occurrence of a segment that does not carry an element the
+/// request made MANDATORY.
+///
+/// A rule whose requirement is `OPTIONAL` makes an element permitted to be absent, so it
+/// can produce no message; a rule naming a segment the file does not carry has nothing to
+/// check.
+fn requirement_messages(
+    rules: &[&X12ElementRequirementValidationRule],
+    interchanges: &[Interchange],
+) -> Vec<String> {
+    let segments = all_segments(interchanges);
+    let mut messages: Vec<String> = Vec::new();
+    let mut withheld = 0usize;
+    for rule in rules {
+        if rule.requirement != REQUIREMENT_MANDATORY {
+            continue;
+        }
+        let Some((segment_id, position)) = decode_element_position(&rule.element_position) else {
+            continue;
+        };
+        let mut occurrence = 0usize;
+        for segment in segments.iter().filter(|segment| segment.id == segment_id) {
+            occurrence += 1;
+            if segment.element(position).is_empty() {
+                // One slot of the bound is kept for the notice below, so a saturated
+                // response carries MAX_VALIDATION_MESSAGES entries and not one more.
+                if messages.len() + 1 >= MAX_VALIDATION_MESSAGES {
+                    withheld += 1;
+                    continue;
+                }
+                messages.push(format!(
+                    "Element {} is configured MANDATORY but occurrence {occurrence} of \
+                     segment {segment_id} in the input file carries no value for it.",
+                    rule.element_position
+                ));
+            }
+        }
+    }
+    if withheld > 0 {
+        messages.push(format!(
+            "{withheld} further validation messages are not listed: this emulator reports \
+             at most {MAX_VALIDATION_MESSAGES} validation messages for one request."
+        ));
+    }
+    messages
+}
+
+/// An Amazon S3 client over the in-process callback into this same emulator.
+///
+/// The callback is the framework's documented seam for calling another emulated service:
+/// it routes in process, so no network client is configured here and this service names
+/// no other service's crate. `region` is the request's own signing region, so the object
+/// is read where the caller's own S3 requests go.
+fn s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The in-process transport routes on the request's own path, and a virtual-host
+        // bucket name is not a host this emulator resolves, so the bucket is addressed in
+        // the path.
+        .force_path_style(true)
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or watch for a
+        // stalled stream, and each of those would need a sleep implementation this client
+        // is not given. The same goes for caching the identity: the credentials are handed
+        // over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// The S3 error codes that mean the object `inputFile` names is not there — which is the
+/// modelled `ResourceNotFoundException`, not a service fault.
+const ABSENT_OBJECT_CODES: &[&str] = &["NoSuchKey", "NoSuchBucket", "NotFound"];
+
+/// The S3 error codes that mean the input file could not be read because the read was not
+/// PERMITTED — which is the modelled `AccessDeniedException` (HTTP 403), "you do not have
+/// sufficient access to perform this action", and not a service fault either: a caller
+/// that is told 500 would retry a request that can never succeed.
+const DENIED_READ_CODES: &[&str] = &[
+    "AccessDenied",
+    "AllAccessDisabled",
+    "InvalidAccessKeyId",
+    "SignatureDoesNotMatch",
+];
+
+/// The text of the EDI document `location` names, read from object storage.
+async fn read_input_file(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    location: &S3Location,
+) -> Result<String, TestParsingError> {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    let Some(bucket) = location
+        .bucket_name
+        .as_deref()
+        .filter(|bucket| !bucket.is_empty())
+    else {
+        return Err(validation(
+            "inputFile.bucketName is required: TestParsing parses the EDI document held \
+             by the Amazon S3 object inputFile names.",
+        ));
+    };
+    let Some(key) = location.key.as_deref().filter(|key| !key.is_empty()) else {
+        return Err(validation(
+            "inputFile.key is required: TestParsing parses the EDI document held by the \
+             Amazon S3 object inputFile names.",
+        ));
+    };
+
+    let object = match s3_client(ctx, region)
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+    {
+        Ok(object) => object,
+        Err(error) => {
+            let code = error.code().unwrap_or_default().to_string();
+            let detail = ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string();
+            if ABSENT_OBJECT_CODES.contains(&code.as_str()) {
+                return Err(not_found(bucket, key, &code));
+            }
+            if DENIED_READ_CODES.contains(&code.as_str()) {
+                return Err(access_denied(bucket, key, &code));
+            }
+            return Err(internal(detail));
+        }
+    };
+    // The object's listed length is what the size limit is decided from, before any of it
+    // is buffered; the fetched length is checked again below in case the two disagree.
+    if object
+        .content_length()
+        .is_some_and(|length| length > MAX_INPUT_FILE_BYTES as i64)
+    {
+        return Err(oversized(bucket, key, object.content_length().unwrap_or(0)));
+    }
+    let body = object.body.collect().await.map_err(internal)?.into_bytes();
+    if body.len() > MAX_INPUT_FILE_BYTES {
+        return Err(oversized(bucket, key, body.len() as i64));
+    }
+    String::from_utf8(body.to_vec()).map_err(|_| {
+        validation(format!(
+            "The input file s3://{bucket}/{key} is not UTF-8 text, so it holds no EDI \
+             document this emulator can parse."
+        ))
+    })
+}
+
+/// The refusal for an input file past AWS's documented [`MAX_INPUT_FILE_BYTES`] limit.
+fn oversized(bucket: &str, key: &str, bytes: i64) -> TestParsingError {
+    validation(format!(
+        "The input file s3://{bucket}/{key} is {bytes} bytes, more than the \
+         {MAX_INPUT_FILE_BYTES} byte limit TestParsing documents for the input file."
+    ))
+}
+
+/// The `splitBy` the request configures, defaulted to `NONE` when it configures none.
+fn split_by(advanced: Option<&AdvancedOptions>) -> &str {
+    advanced
+        .and_then(|advanced| advanced.x12.as_ref())
+        .and_then(|x12| x12.split_options.as_ref())
+        .map(|options| options.split_by.as_str())
+        .unwrap_or(SPLIT_BY_NONE)
+}
+
 /// The `TestParsing` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -170,18 +1456,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TestParsing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TestParsingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TestParsing"))
+        // No state is touched: this operation owns no resource (AWS persists nothing for
+        // it — the model gives a parse no id and no Get/List), so the answer is computed
+        // from the stored OBJECT the request names and nothing a later caller sees
+        // changes. The engine is bound (and not used) so the constructor seam every
+        // operation shares stays visible here.
+        let _ = &self.engine;
+
+        let Some(format) = DocumentFormat::decode(&input.file_format) else {
+            return Err(validation(format!(
+                "fileFormat value '{}' names no document format a parsed EDI file can be \
+                 answered in: the currently supported file formats for EDI transformations \
+                 are JSON and XML.",
+                input.file_format
+            )));
+        };
+
+        // `EdiType` is a union with one member: X12 is the only EDI standard this
+        // operation parses ("currently, only X12 is supported").
+        let EdiType::x12Details(details) = &input.edi_type;
+
+        let split = match split_by(input.advanced_options.as_ref()) {
+            SPLIT_BY_NONE => false,
+            SPLIT_BY_TRANSACTION => true,
+            other => {
+                return Err(validation(format!(
+                    "advancedOptions.x12.splitOptions.splitBy value '{other}' is not one of \
+                     {SPLIT_BY_NONE}, {SPLIT_BY_TRANSACTION}."
+                )))
+            }
+        };
+
+        // The validation rules this emulator can apply are the positional ones; the two
+        // kinds keyed by a four-digit X12 DATA ELEMENT id need the data element dictionary
+        // this emulator does not carry, and answering 200 with no message for one would
+        // report a validation that never ran.
+        let mut requirement_rules: Vec<&X12ElementRequirementValidationRule> = Vec::new();
+        let configured = input
+            .advanced_options
+            .as_ref()
+            .and_then(|advanced| advanced.x12.as_ref())
+            .and_then(|x12| x12.validation_options.as_ref())
+            .and_then(|options| options.validation_rules.as_deref())
+            .unwrap_or_default();
+        if configured.len() > MAX_VALIDATION_RULES {
+            return Err(validation(format!(
+                "advancedOptions.x12.validationOptions.validationRules carries {} rules, \
+                 more than the {MAX_VALIDATION_RULES} rules this emulator evaluates over \
+                 one input file.",
+                configured.len()
+            )));
+        }
+        for rule in configured {
+            match rule {
+                X12ValidationRule::elementRequirementValidationRule(rule) => {
+                    if decode_element_position(&rule.element_position).is_none() {
+                        return Err(validation(format!(
+                            "advancedOptions.x12.validationOptions.validationRules \
+                             elementRequirementValidationRule.elementPosition value '{}' is \
+                             not a segment identifier followed by an element position, as \
+                             in 'ST-01'.",
+                            rule.element_position
+                        )));
+                    }
+                    requirement_rules.push(rule);
+                }
+                X12ValidationRule::codeListValidationRule(rule) => {
+                    return Err(validation(format!(
+                        "advancedOptions.x12.validationOptions.validationRules carries a \
+                         codeListValidationRule for element id '{}': a rule keyed by an X12 \
+                         data element id cannot be applied by this emulator, which carries \
+                         no X12 data element dictionary, so no code list validation was \
+                         performed. Configure elementRequirementValidationRule rules, which \
+                         are keyed by element position.",
+                        rule.element_id
+                    )))
+                }
+                X12ValidationRule::elementLengthValidationRule(rule) => {
+                    return Err(validation(format!(
+                        "advancedOptions.x12.validationOptions.validationRules carries an \
+                         elementLengthValidationRule for element id '{}': a rule keyed by an \
+                         X12 data element id cannot be applied by this emulator, which \
+                         carries no X12 data element dictionary, so no element length \
+                         validation was performed. Configure \
+                         elementRequirementValidationRule rules, which are keyed by element \
+                         position.",
+                        rule.element_id
+                    )))
+                }
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let content = read_input_file(ctx, &region, &input.input_file).await?;
+        // Leading whitespace is file formatting, not part of the interchange; the
+        // interchange header itself is what declares the delimiters.
+        let content = content.trim_start();
+
+        let delimiters = detect_delimiters(content).map_err(validation)?;
+        let segments = split_segments(content, &delimiters).map_err(validation)?;
+        let interchanges = parse_interchanges(segments).map_err(validation)?;
+
+        // ISA11 is the Repetition Separator from X12 release 004020 and the Interchange
+        // Control Standards Identifier before it, so the element's name follows the
+        // release: the one the request names, else the one the interchange declares in
+        // ISA12.
+        let release = requested_release(details)
+            .or_else(|| {
+                interchanges
+                    .first()
+                    .and_then(|interchange| declared_release(&interchange.isa))
+            })
+            .unwrap_or_default();
+
+        let parsed_file_content = format.render(&document_node(&interchanges, &delimiters, release))?;
+
+        let parsed_split_file_contents = if split {
+            Some(split_file_contents(&interchanges, &delimiters, release, format).await?)
+        } else {
+            None
+        };
+
+        // A violated requirement rule is REPORTED, not refused: `validationMessages`
+        // carries "validation errors, warnings, or confirmations based on the configured
+        // X12 validation rules" (that member's own documentation), which is what it exists
+        // for — a caller testing a document wants the parse AND the findings in one
+        // answer. The modelled `ValidationException` is kept for a request that cannot be
+        // honoured at all: content that is not an interchange, or a rule this emulator
+        // cannot apply.
+        let messages = requirement_messages(&requirement_rules, &interchanges);
+        let validation_messages = (!messages.is_empty()).then_some(messages);
+
+        Ok(TestParsingOutput {
+            parsed_file_content,
+            parsed_split_file_contents,
+            validation_messages,
+        })
     }
 }

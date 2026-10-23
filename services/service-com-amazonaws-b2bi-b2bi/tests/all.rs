@@ -29,6 +29,8 @@ mod tagging;
 mod tagging_and_test_harness;
 #[path = "all/test_mapping.rs"]
 mod test_mapping;
+#[path = "all/test_parsing.rs"]
+mod test_parsing;
 #[path = "all/transformer_lifecycle.rs"]
 mod transformer_lifecycle;
 #[path = "all/untag_resource.rs"]

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the resource-based policy document attached to one CloudTrail resource,
+//! read from the shared resource-policy registry (`crate::state`) and addressed by
+//! that resource's ARN.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only, with one exception the clock owes: resolving the ARN materialises
+//! a resource still loading into the status its settle instant already made due — a
+//! transition owed at that instant whether or not anybody read the policy.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +174,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourcePolicy"))
+        // A resource ARN carries its own Region, so this operation reads no Region
+        // off the request.
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetResourcePolicyErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "GetResourcePolicy needs the CloudTrail resource-policy registry, \
+                         which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // The ARN names the resource whose policy this reads. The three ways it can
+        // fail to name a stored resource are the rule every resource-policy
+        // operation shares.
+        let resource = store
+            .resolve_policy_resource(&input.resource_arn, now)
+            .map_err(resource_rejection)?;
+
+        // A resource that exists but carries no policy is the one case
+        // `ResourcePolicyNotFoundException` (HTTP 404) is modelled for.
+        let policy = store
+            .resource_policies
+            .get(&resource.arn)
+            .cloned()
+            .ok_or_else(|| {
+                GetResourcePolicyErrorModeled::ResourcePolicyNotFoundException(
+                    ResourcePolicyNotFoundException {
+                        message: Some(format!(
+                            "No resource policy is attached to {}",
+                            resource.arn
+                        )),
+                    },
+                )
+            })?;
+
+        Ok(GetResourcePolicyOutput {
+            resource_arn: Some(resource.arn),
+            resource_policy: Some(policy),
+            // "The default resource-based policy that is automatically generated for
+            // the delegated administrator of an Organizations organization": no
+            // delegated administrator has been registered —
+            // `RegisterOrganizationDelegatedAdmin` is not implemented — so no such
+            // policy has ever been generated.
+            delegated_admin_resource_policy: None,
+        })
+    }
+}
+
+/// Answer a rejected `ResourceArn` with the modelled error its case names.
+///
+/// Stated per operation because the error enum is per operation: this names the
+/// variants `GetResourcePolicy`'s own model declares, which is what
+/// `#[operation_error]` makes explicit.
+fn resource_rejection(
+    rejection: crate::state::PolicyResourceRejection,
+) -> GetResourcePolicyErrorModeled {
+    let message = Some(rejection.message().to_string());
+    match rejection {
+        crate::state::PolicyResourceRejection::ArnNotValid(_) => {
+            GetResourcePolicyErrorModeled::ResourceARNNotValidException(
+                ResourceARNNotValidException { message },
+            )
+        }
+        crate::state::PolicyResourceRejection::TypeNotSupported(_) => {
+            GetResourcePolicyErrorModeled::ResourceTypeNotSupportedException(
+                ResourceTypeNotSupportedException { message },
+            )
+        }
+        crate::state::PolicyResourceRejection::ResourceNotFound(_) => {
+            GetResourcePolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message,
+            })
+        }
     }
 }

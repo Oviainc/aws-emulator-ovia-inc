@@ -245,20 +245,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        let id = crate::state::security_config_id(&input.r#type, &input.name);
         let mut store = state.lock();
 
         // A replayed `clientToken` is a retry of the call that created the configuration,
         // so it answers that configuration instead of creating or conflicting with a
-        // second one.
+        // second one. The replay is scoped to the id THIS request addresses: a token spent
+        // again on a different `(type, name)` is a request for another configuration, which
+        // is still created rather than answered with the first one.
         if let Some(token) = input.client_token.as_deref() {
-            if let Some(record) = store.replayed_security_config(Self::NAME, token) {
+            let replayed = store
+                .replayed_security_config(Self::NAME, token)
+                .filter(|record| record.id == id)
+                .map(crate::state::SecurityConfigRecord::detail);
+            if let Some(detail) = replayed {
                 return Ok(CreateSecurityConfigOutput {
-                    security_config_detail: Some(record.detail()),
+                    security_config_detail: Some(detail),
                 });
             }
         }
 
-        let id = crate::state::security_config_id(&input.r#type, &input.name);
         if store.security_configs.contains_key(&id) {
             return Err(CreateSecurityConfigErrorModeled::ConflictException(
                 ConflictException {

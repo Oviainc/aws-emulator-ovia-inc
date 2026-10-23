@@ -547,6 +547,36 @@ pub struct Model {
     pub creation_time: SystemTime,
 }
 
+/// A training job, as `ListTrainingJobs` summarises it.
+///
+/// One record per `TrainingJobName` (the name AWS keys a training job by, unique within
+/// an account and Region), holding exactly the members a `TrainingJobSummary` projects
+/// plus the `LastModifiedTime` the listing filters on. The job's full description — its
+/// algorithm, channels, artifacts and secondary-status transitions — is not kept here
+/// yet: `CreateTrainingJob` and `DescribeTrainingJob` are still scaffold stubs, each with
+/// its own issue, and whichever lands first extends THIS record rather than adding a
+/// second store beside it.
+#[derive(Debug, Clone)]
+pub struct TrainingJob {
+    pub name: String,
+    pub arn: String,
+    /// A `TrainingJobStatus` member (`InProgress` | `Completed` | `Failed` | `Stopping` |
+    /// `Stopped` | `Deleting`), as stored — never derived from the read that reports it.
+    pub status: String,
+    /// A `SecondaryStatus` member, when the job has one.
+    pub secondary_status: Option<String>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    /// Set only once the job reached a terminal status, per `TrainingJobSummary`'s
+    /// `TrainingEndTime` doc ("set only if the training job has one of the terminal
+    /// statuses").
+    pub training_end_time: Option<SystemTime>,
+    /// The warm pool associated with the job, when it has one.
+    pub warm_pool_status: Option<crate::ops::types::WarmPoolStatus>,
+    /// The training plan the job reserves capacity from, when it has one.
+    pub training_plan_arn: Option<String>,
+}
+
 /// An endpoint configuration created by `CreateEndpointConfig`, as
 /// `DescribeEndpointConfig` replays it and `CreateEndpoint` reads it.
 #[derive(Debug, Clone)]
@@ -1377,6 +1407,8 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub servicecatalog_portfolio_enabled: bool,
     /// Keyed by `ModelName`.
     pub models: BTreeMap<String, Model>,
+    /// Keyed by `TrainingJobName`.
+    pub training_jobs: BTreeMap<String, TrainingJob>,
     /// Keyed by `InferenceComponentName`.
     pub inference_components: BTreeMap<String, InferenceComponent>,
     /// Keyed by `EndpointConfigName`.
