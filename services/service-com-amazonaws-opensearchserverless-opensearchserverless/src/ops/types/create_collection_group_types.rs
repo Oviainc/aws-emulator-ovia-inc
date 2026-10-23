@@ -41,5 +41,6 @@ pub struct CreateCollectionGroupDetail {
     pub created_date: Option<i64>,
     pub capacity_limits: Option<CollectionGroupCapacityLimits>,
     pub generation: Option<String>,
+    pub storage_configuration: Option<CollectionGroupStorageConfiguration>,
 }
 

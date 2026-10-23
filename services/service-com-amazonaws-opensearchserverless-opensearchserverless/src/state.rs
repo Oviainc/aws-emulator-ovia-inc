@@ -22,11 +22,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     AccessPolicyDetail, AccountSettingsDetail, CapacityDetails, CapacityLimits, CollectionDetail,
     CollectionErrorDetail, CollectionGroupCapacityLimits, CollectionGroupDetail,
-    CollectionGroupErrorDetail, CollectionSummary, CreateCollectionDetail,
-    CreateCollectionGroupDetail, CurrentCapacity, DeleteCollectionDetail, FipsEndpoints,
-    IamFederationConfigOptions, IamIdentityCenterConfigOptions, LifecyclePolicyDetail,
-    LifecyclePolicyErrorDetail, SamlConfigOptions, SecurityConfigDetail, SecurityConfigSummary,
-    SecurityPolicyDetail, Tag, UpdateCollectionGroupDetail, VectorOptions,
+    CollectionGroupErrorDetail, CollectionGroupStorageConfiguration, CollectionSummary,
+    CreateCollectionDetail, CreateCollectionGroupDetail, CurrentCapacity, DeleteCollectionDetail,
+    FipsEndpoints, IamFederationConfigOptions, IamIdentityCenterConfigOptions,
+    LifecyclePolicyDetail, LifecyclePolicyErrorDetail, SamlConfigOptions, SecurityConfigDetail,
+    SecurityConfigSummary, SecurityPolicyDetail, Tag, UpdateCollectionGroupDetail, VectorOptions,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -105,6 +105,11 @@ pub const DELETABLE_STATUSES: [&str; 3] =
 /// VALUE is a choice this emulator makes; the fact that one is always reported is the
 /// model's.
 pub const SERVERLESS_GENERATION_CLASSIC: &str = "CLASSIC";
+
+/// `ServerlessGeneration$NEXTGEN`, the generation a caller opts into by naming it. It is
+/// the generation that runs on the next-generation (v2) storage stack, so it is what
+/// [`CollectionGroupRecord::storage_configuration`] reports `v2Enabled` from.
+pub const SERVERLESS_GENERATION_NEXTGEN: &str = "NEXTGEN";
 
 // The single policy/configuration type values the account-wide statistics counters are
 // keyed by. `GetPoliciesStatsResponse` reports ONE counter per type
@@ -228,6 +233,22 @@ pub const DEFAULT_MAX_INDEXING_CAPACITY_IN_OCU: i32 = 10;
 
 /// The `maxSearchCapacityInOCU` default; see [`DEFAULT_MAX_INDEXING_CAPACITY_IN_OCU`].
 pub const DEFAULT_MAX_SEARCH_CAPACITY_IN_OCU: i32 = 10;
+
+/// The `CollectionGroupCapacityLimits$maxIndexingCapacityInOCU` a COLLECTION GROUP
+/// carries when its create request named no indexing ceiling of its own.
+///
+/// A group-level ceiling, distinct from the ACCOUNT's
+/// [`DEFAULT_MAX_INDEXING_CAPACITY_IN_OCU`] above: the model declares no default for
+/// either `CollectionGroupCapacityLimits` member, and the wire recordings this emulator
+/// replays show the live API answering a create that named no `capacityLimits` with a
+/// defaulted ceiling of 96 OCUs for indexing and 96 for search. The VALUE comes from that
+/// recorded default; what the model fixes is that the member is reported at all, since
+/// every collection-group detail shape carries `capacityLimits`.
+pub const DEFAULT_COLLECTION_GROUP_MAX_INDEXING_CAPACITY_IN_OCU: f32 = 96.0;
+
+/// The group-level `maxSearchCapacityInOCU` default; see
+/// [`DEFAULT_COLLECTION_GROUP_MAX_INDEXING_CAPACITY_IN_OCU`].
+pub const DEFAULT_COLLECTION_GROUP_MAX_SEARCH_CAPACITY_IN_OCU: f32 = 96.0;
 
 /// The page bound a listing applies when the caller names none, from each listing's own
 /// `maxResults` documentation: "The maximum number of results to return. Default is 20."
@@ -504,9 +525,11 @@ pub struct CollectionGroupRecord {
     /// The `ServerlessGeneration` wire value, defaulted by
     /// [`SERVERLESS_GENERATION_CLASSIC`] when the create request named none.
     pub generation: String,
-    /// The limits the create (or a later update) stored; `None` while the group names no
-    /// limit of its own.
-    pub capacity_limits: Option<CollectionGroupCapacityLimits>,
+    /// The group's EFFECTIVE capacity limits: every member the create (or a later
+    /// update) named, plus the service default for each ceiling it did not — see
+    /// [`effective_capacity_limits`]. Not an `Option`, because a group always HAS
+    /// effective limits: the ones it was asked for, or the defaults it starts at.
+    pub capacity_limits: CollectionGroupCapacityLimits,
     /// The tags the create request carried. `CreateCollectionGroupDetail` and
     /// `CollectionGroupDetail` both model `tags`, so unlike a collection a group reports
     /// its own tags on a read.
@@ -529,8 +552,9 @@ impl CollectionGroupRecord {
             description: self.description.clone(),
             tags: Some(self.tags.clone()),
             created_date: Some(self.created_date),
-            capacity_limits: self.capacity_limits.clone(),
+            capacity_limits: Some(self.capacity_limits.clone()),
             generation: Some(self.generation.clone()),
+            storage_configuration: Some(self.storage_configuration()),
         }
     }
 
@@ -546,10 +570,29 @@ impl CollectionGroupRecord {
             description: self.description.clone(),
             tags: Some(self.tags.clone()),
             created_date: Some(self.created_date),
-            capacity_limits: self.capacity_limits.clone(),
+            capacity_limits: Some(self.capacity_limits.clone()),
             current_capacity: self.current_capacity(),
             number_of_collections: Some(number_of_collections),
             generation: Some(self.generation.clone()),
+            storage_configuration: Some(self.storage_configuration()),
+        }
+    }
+
+    /// The group's `storageConfiguration`, computed from the generation it stores.
+    ///
+    /// `v2Enabled` reports whether the group's data is held on the next-generation (v2)
+    /// storage stack, which is what [`SERVERLESS_GENERATION_NEXTGEN`] selects: a group's
+    /// `generation` is the only setting it carries that chooses a storage stack, so a
+    /// `NEXTGEN` group is `v2Enabled: true` and a `CLASSIC` one `false`. Reported on every
+    /// detail, so a client can read the group's storage mode off either the create or a
+    /// later read.
+    ///
+    /// Only the `CLASSIC` -> `false` half is backed by a recording; the `NEXTGEN` -> `true`
+    /// half is INFERRED from what the two generations are, and a later recording of a
+    /// `NEXTGEN` group is what would confirm or correct it.
+    fn storage_configuration(&self) -> CollectionGroupStorageConfiguration {
+        CollectionGroupStorageConfiguration {
+            v2_enabled: Some(self.generation == SERVERLESS_GENERATION_NEXTGEN),
         }
     }
 
@@ -562,7 +605,7 @@ impl CollectionGroupRecord {
             arn: Some(self.arn.clone()),
             name: Some(self.name.clone()),
             description: self.description.clone(),
-            capacity_limits: self.capacity_limits.clone(),
+            capacity_limits: Some(self.capacity_limits.clone()),
             created_date: Some(self.created_date),
             last_modified_date: Some(self.last_modified_date),
             generation: Some(self.generation.clone()),
@@ -577,7 +620,9 @@ impl CollectionGroupRecord {
     /// `capacityLimits` is replaced WHOLE rather than merged member by member: the request
     /// carries `CollectionGroupCapacityLimits` as one structure ("Updated capacity limits
     /// for the collection group"), so the limits the request states are the limits the
-    /// group has. Every write stamps `lastModifiedDate`.
+    /// group has — passed through [`effective_capacity_limits`], so an update that states
+    /// no ceiling leaves the group with the service default rather than with none, exactly
+    /// as a create does. Every write stamps `lastModifiedDate`.
     pub fn apply_update(
         &mut self,
         description: Option<String>,
@@ -588,7 +633,7 @@ impl CollectionGroupRecord {
             self.description = description;
         }
         if capacity_limits.is_some() {
-            self.capacity_limits = capacity_limits;
+            self.capacity_limits = effective_capacity_limits(capacity_limits.as_ref());
         }
         self.last_modified_date = written_at;
     }
@@ -598,11 +643,12 @@ impl CollectionGroupRecord {
     /// Nothing in this emulator runs OCUs, so the only capacity a group demonstrably
     /// holds is the FLOOR its own stored limits name — `minSearchCapacityInOCU` and
     /// `minIndexingCapacityInOCU` — and it holds exactly that while no autoscaling action
-    /// is in progress ([`AUTOSCALING_NO_ACTION`]). A group whose limits name no floor, or
-    /// which carries no limits at all, reports no current capacity rather than a number
-    /// nothing measured.
+    /// is in progress ([`AUTOSCALING_NO_ACTION`]). A group whose limits name no floor
+    /// reports no current capacity rather than a number nothing measured — and the
+    /// defaults [`effective_capacity_limits`] fills in are CEILINGS, so a group created
+    /// without capacity limits names no floor.
     fn current_capacity(&self) -> Option<CurrentCapacity> {
-        let limits = self.capacity_limits.as_ref()?;
+        let limits = &self.capacity_limits;
         let at_floor = |floor: Option<f32>| {
             floor.map(|capacity_in_ocu| CapacityDetails {
                 capacity_in_ocu: Some(capacity_in_ocu),
@@ -615,6 +661,37 @@ impl CollectionGroupRecord {
             return None;
         }
         Some(CurrentCapacity { search, indexing })
+    }
+}
+
+/// The EFFECTIVE capacity limits of a collection group whose create (or update) request
+/// named `requested`.
+///
+/// Every collection-group detail shape models `capacityLimits`, and the live API reports
+/// it on a group whose create named none, so a group's limits are never absent: each
+/// member the request named is kept as given, and each CEILING it did not name falls back
+/// to the service default ([`DEFAULT_COLLECTION_GROUP_MAX_INDEXING_CAPACITY_IN_OCU`],
+/// [`DEFAULT_COLLECTION_GROUP_MAX_SEARCH_CAPACITY_IN_OCU`]). A FLOOR stays absent when
+/// the request named none: the recorded default names neither `min*` member, and a floor
+/// nobody asked for would otherwise claim capacity this emulator never reserved.
+///
+/// The default is a CEILING the service fills in, not a bound a caller is held to, so a
+/// floor named above it is stored as given rather than refused: only the halves one
+/// request named itself are checked against each other
+/// ([`validate_capacity_limits`]).
+pub fn effective_capacity_limits(
+    requested: Option<&CollectionGroupCapacityLimits>,
+) -> CollectionGroupCapacityLimits {
+    CollectionGroupCapacityLimits {
+        max_indexing_capacity_in_ocu: requested
+            .and_then(|limits| limits.max_indexing_capacity_in_ocu)
+            .or(Some(DEFAULT_COLLECTION_GROUP_MAX_INDEXING_CAPACITY_IN_OCU)),
+        max_search_capacity_in_ocu: requested
+            .and_then(|limits| limits.max_search_capacity_in_ocu)
+            .or(Some(DEFAULT_COLLECTION_GROUP_MAX_SEARCH_CAPACITY_IN_OCU)),
+        min_indexing_capacity_in_ocu: requested
+            .and_then(|limits| limits.min_indexing_capacity_in_ocu),
+        min_search_capacity_in_ocu: requested.and_then(|limits| limits.min_search_capacity_in_ocu),
     }
 }
 
