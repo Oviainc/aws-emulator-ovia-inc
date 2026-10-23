@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCloudFrontOriginAccessIdentity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCloudFrontOriginAccessIdentity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCloudFrontOriginAccessIdentity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an origin access identity: mints its id, the Amazon S3 canonical user id a
+//! bucket policy names it by and its first version token, stores the submitted
+//! configuration, and reports the record it stored — which is what a later
+//! `GetCloudFrontOriginAccessIdentity` answers from.
+//!
+//! A `CallerReference` identifies ONE identity for its whole life: a repeat carrying the
+//! configuration that reference already names is answered with that identity and creates
+//! nothing, and a repeat that changes the configuration is refused with
+//! `CloudFrontOriginAccessIdentityAlreadyExists`.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +158,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCloudFrontOriginAccessIdentity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCloudFrontOriginAccessIdentityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCloudFrontOriginAccessIdentity"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let config = input.cloud_front_origin_access_identity_config;
+        let mut store = state.lock();
+        // Materialise whatever the clock owes the rest of the store before this call
+        // reads it, as every handler here does. An identity itself has no transition
+        // owed: CloudFront answers a create with the identity usable at once.
+        store.settle(::std::time::SystemTime::now());
+
+        // "A comment to describe the origin access identity. The comment cannot be longer
+        // than 128 characters." The member carries no `@length` in the model, so the
+        // documented bound is refused here — with the refusal this operation models for an
+        // unusable argument — BEFORE anything is minted.
+        let comment_length = config.comment.chars().count();
+        if comment_length > crate::state::MAX_ORIGIN_ACCESS_IDENTITY_COMMENT {
+            return Err(
+                CreateCloudFrontOriginAccessIdentityErrorModeled::InvalidArgument(
+                    crate::state::comment_too_long(comment_length),
+                )
+                .into(),
+            );
+        }
+
+        // A caller reference identifies ONE identity for its whole life. "If the
+        // `CallerReference` is a value already sent in a previous identity request, and
+        // the content of the `CloudFrontOriginAccessIdentityConfig` is identical to the
+        // original request (ignoring white space), the response includes the same
+        // information returned to the original request" — and a repeat that changes the
+        // configuration "returns a `CloudFrontOriginAccessIdentityAlreadyExists` error".
+        // The same rule the distribution create path follows for its own reference.
+        if let Some(existing) =
+            store.origin_access_identity_by_caller_reference(&config.caller_reference)
+        {
+            if crate::state::same_origin_access_identity_config(&existing.config, &config) {
+                // The same request again: the record the first create left behind, at its
+                // current version. Nothing is minted and nothing is stored.
+                return Ok(CreateCloudFrontOriginAccessIdentityOutput {
+                    cloud_front_origin_access_identity: Some(existing.to_identity()),
+                    location: Some(crate::state::location_uri(
+                        &crate::state::origin_access_identity_path(&existing.id),
+                    )),
+                    e_tag: Some(existing.etag.clone()),
+                });
+            }
+            let message =
+                crate::state::origin_access_identity_already_exists_message(&existing.id);
+            return Err(
+                CreateCloudFrontOriginAccessIdentityErrorModeled::CloudFrontOriginAccessIdentityAlreadyExists(
+                    CloudFrontOriginAccessIdentityAlreadyExists {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Processing your request would cause you to exceed the maximum number of origin
+        // access identities allowed." An identity record is what a later read answers
+        // from, so it cannot be evicted: the bound is an entry count refused BEFORE
+        // anything is minted.
+        if store.origin_access_identities.len() >= crate::state::MAX_ORIGIN_ACCESS_IDENTITIES {
+            return Err(
+                CreateCloudFrontOriginAccessIdentityErrorModeled::TooManyCloudFrontOriginAccessIdentities(
+                    TooManyCloudFrontOriginAccessIdentities {
+                        message: Some(format!(
+                            "Processing your request would cause you to exceed the maximum \
+                             number of origin access identities allowed ({})",
+                            crate::state::MAX_ORIGIN_ACCESS_IDENTITIES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.allocate_origin_access_identity_id();
+        let s3_canonical_user_id = store.allocate_s3_canonical_user_id();
+        let etag = store.next_etag();
+        let stored = crate::state::StoredOriginAccessIdentity {
+            id: id.clone(),
+            s3_canonical_user_id,
+            etag: etag.clone(),
+            // Stored whole: a later read answers from this record, never from the request
+            // that was served.
+            config,
+        };
+        let identity = stored.to_identity();
+        let location = crate::state::location_uri(&crate::state::origin_access_identity_path(&id));
+        store.origin_access_identities.insert(id, stored);
+
+        Ok(CreateCloudFrontOriginAccessIdentityOutput {
+            // "The origin access identity's information."
+            cloud_front_origin_access_identity: Some(identity),
+            // "The fully qualified URI of the new origin access identity just created."
+            location: Some(location),
+            // "The current version of the origin access identity created."
+            e_tag: Some(etag),
+        })
     }
 }
