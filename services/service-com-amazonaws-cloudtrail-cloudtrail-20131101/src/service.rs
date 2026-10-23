@@ -48,37 +48,15 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-/// The target rule in isolation: which operation an `X-Amz-Target` names, over the
-/// prefix forms a client can write. Lives beside this file rather than inline so the
-/// table can grow without pushing the seams it tests off the screen; the wire behaviour
-/// it produces is asserted end-to-end in `tests/all/target_prefix_dispatch.rs`.
+/// The target rule in isolation, as THIS service's prefix forms exercise it: which
+/// operation an `X-Amz-Target` names, over the prefix forms a client can write.
+///
+/// The rule itself lives in `service_common::rpc_target`, which states it once for every
+/// service whose published prefix carries dots; this table pins the answers for this
+/// service's own shape name, and the wire behaviour they produce is asserted end-to-end
+/// in `tests/all/target_prefix_dispatch.rs`.
 #[cfg(test)]
 mod rpc_target;
-
-/// The header an `awsJson` client names the operation in.
-const TARGET_HEADER: &str = "x-amz-target";
-
-/// The operation the `X-Amz-Target` value `target` names, for the service whose shape's
-/// local name is `service_shape_name`; `None` when the target names another service, or
-/// names no operation at all.
-///
-/// An `awsJson` target is `<targetPrefix>.<OperationName>`, and a target prefix MAY
-/// itself contain dots: this service's is the fully qualified Coral service name
-/// (`com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101`), which is what every AWS
-/// SDK sends. So the operation is the segment after the LAST dot, and the service it
-/// belongs to is the last dotted segment of what precedes it — the service shape's local
-/// name, with or without a leading namespace. The framework's own reader
-/// (`aws_smithy_schema_server::rpc::routing_key_from_x_amz_target`) splits at the FIRST
-/// dot, which is right only for a single-segment prefix, so this service resolves its own
-/// targets through the `override_operation` seam.
-fn operation_from_target<'target>(
-    target: &'target str,
-    service_shape_name: &str,
-) -> Option<&'target str> {
-    let (prefix, operation) = target.trim().rsplit_once('.')?;
-    let named_service = prefix.split('.').next_back()?;
-    (named_service == service_shape_name && !operation.is_empty()).then_some(operation)
-}
 
 /// The `com-amazonaws-cloudtrail-cloudtrail-20131101` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -99,20 +77,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         }
     }
 
-    /// This service's shape name — the local name of the model-derived shape id
-    /// (`com.amazonaws.cloudtrail#CloudTrail_20131101` -> `CloudTrail_20131101`), which
-    /// is the last segment of every `X-Amz-Target` prefix a client writes for it.
-    /// Read off the generated identity rather than written out, so it cannot drift from
-    /// the model.
-    fn shape_name(&self) -> &str {
-        let shape_id = self.entry.identity().shape_id();
-        shape_id.split('#').next_back().unwrap_or(shape_id)
-    }
-
-    /// The operation an `X-Amz-Target` names for THIS service, by the rule in
-    /// [`operation_from_target`].
-    fn target_operation<'target>(&self, target: &'target str) -> Option<&'target str> {
-        operation_from_target(target, self.shape_name())
+    /// This service's model shape id, as the generated identity states it
+    /// (`com.amazonaws.cloudtrail#CloudTrail_20131101`), whose LOCAL name is the last
+    /// segment of every `X-Amz-Target` prefix a client writes for it. Read off the model
+    /// rather than written out, so it cannot drift from it.
+    fn shape_id(&self) -> &str {
+        self.entry.identity().shape_id()
     }
 }
 
@@ -138,12 +108,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // segment before the FIRST dot — which, for this service's fully qualified
         // target prefix, is a namespace label (`com`) that names no service. The target
         // still names THIS service, so read it by the same rule the operation is read
-        // by rather than leaving such a request unclaimed.
-        parts
-            .headers
-            .get(TARGET_HEADER)
-            .and_then(|target| target.to_str().ok())
-            .and_then(|target| self.target_operation(target))
+        // by: `service_common::rpc_target`, this emulator's one statement of the target
+        // rule (the service is the last segment of the prefix, the operation the segment
+        // after it).
+        service_common::rpc_target::target_operation_of(&parts.headers, self.shape_id())
             .is_some()
     }
 
@@ -160,12 +128,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // name, so the prefix itself contains dots and the framework's first-dot split
         // leaves the whole `<namespace>.<Service>.<Operation>` tail as the routing key,
         // which matches no modelled operation and refuses every call with 501
-        // `NotImplemented`. Resolving the operation as the segment after the LAST dot
-        // dispatches the target an SDK actually sends; a target naming another service,
-        // or an operation this model does not bind, still falls through to the
+        // `NotImplemented`. `service_common::rpc_target` states the rule once for every
+        // service in this emulator whose prefix carries dots: the operation is the
+        // segment after the LAST dot, which dispatches the target an SDK actually sends
+        // and is the same answer for a single-identifier prefix. A target naming another
+        // service, or an operation this model does not bind, still falls through to the
         // framework's own routing (and its routing error).
-        let target = req.headers().get(TARGET_HEADER)?;
-        let operation = self.target_operation(target)?;
+        let operation = service_common::rpc_target::requested_operation(req, self.shape_id())?;
         self.entry.routing_table().get(operation)
     }
 
