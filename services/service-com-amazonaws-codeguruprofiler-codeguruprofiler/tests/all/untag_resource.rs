@@ -28,13 +28,14 @@ use crate::profiling_group_lifecycle::{Answer, Harness};
 /// RFC 3986 unreserved characters stay literal; everything else is percent-encoded.
 /// That is what an SDK does to a value it puts in a single-segment `@httpLabel` (so an
 /// ARN's `:` and `/` arrive as `%3A` and `%2F`) or in an `@httpQuery` value.
-const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
+/// `pub(crate)` so the sibling tagging suites encode a wire value exactly once.
+pub(crate) const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
     .remove(b'.')
     .remove(b'~');
 
-fn encode(value: &str) -> String {
+pub(crate) fn encode(value: &str) -> String {
     percent_encode(value.as_bytes(), UNRESERVED).to_string()
 }
 
@@ -179,7 +180,8 @@ async fn create(harness: &Harness, case: &UntagCase) -> Answer {
 
 /// `UntagResource`: `DELETE /tags/{resourceArn}?tagKeys=…`, with `resourceArn` in one
 /// path segment and one `tagKeys` query pair per key, exactly as the model binds them.
-async fn untag(harness: &Harness, arn: &str, keys: &[&str]) -> Answer {
+/// `pub(crate)` so `ListTagsForResource`'s suite reads back what this writer stored.
+pub(crate) async fn untag(harness: &Harness, arn: &str, keys: &[&str]) -> Answer {
     let query = keys
         .iter()
         .map(|key| format!("tagKeys={}", encode(key)))
