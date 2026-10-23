@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeliverConfigSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeliverConfigSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Schedules the delivery of a configuration snapshot for the delivery channel the
+//! request names, mints the `configSnapshotId` of the snapshot being created and
+//! records the delivery on that channel in [`crate::state`], where
+//! `DescribeDeliveryChannelStatus` reads it back as the channel's last snapshot
+//! delivery attempt — and, once the delivery is due to have completed, as its last
+//! successful delivery.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeliverConfigSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What this handler does NOT do is the delivery LEG itself: writing the snapshot
+//! object into the channel's Amazon S3 bucket and streaming the start/completion
+//! notifications to its Amazon SNS topic. Config's recording and delivery side
+//! effects are a cross-service pipeline with an issue of its own
+//! (`issues/things-that-do-not-work/20261022T190340Z-config-has-no-recording-delivery-side-effects-and.md`,
+//! cause 3), so nothing here fabricates one: the control plane this operation owns —
+//! the preconditions, the snapshot id and the delivery status the channel reports —
+//! is real, and no object or notification is claimed for work nothing performed.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +83,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// How this operation words `NoRunningConfigurationRecorderException`, a paraphrase
+/// of the shape's own doc ("There is no configuration recorder running") naming the
+/// operation that turns one on. AWS publishes no text for this refusal, so the
+/// requirement is the HTTP 400 and the error code; this message is the emulator's.
+const NO_RUNNING_RECORDER_TO_DELIVER: &str =
+    "there is no configuration recorder running; use StartConfigurationRecorder to turn \
+     one on before delivering a configuration snapshot";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +162,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeliverConfigSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeliverConfigSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeliverConfigSnapshot"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The recorder facts this call turns on, read before the channel is borrowed
+        // for the write, so the channel is looked up exactly ONCE below.
+        let has_customer_managed_recorder = store.has_customer_managed_recorder();
+        let recorder_is_recording = store.recording_customer_managed_recorder().is_some();
+        let seq = store.next_config_snapshot_seq;
+
+        // The snapshot is delivered THROUGH the channel the request names, so an
+        // account that holds no such channel has nothing to deliver through. This is
+        // the one lookup of that channel: the binding that resolves it is the binding
+        // the delivery is recorded on, so no later reordering can let a request for a
+        // channel this account does not hold answer 200 having stored nothing.
+        let Some(channel) = store
+            .delivery_channels
+            .get_mut(&input.delivery_channel_name)
+        else {
+            return Err(
+                DeliverConfigSnapshotErrorModeled::NoSuchDeliveryChannelException(
+                    NoSuchDeliveryChannelException {
+                        message: Some(crate::state::no_such_delivery_channel_message(
+                            &input.delivery_channel_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A snapshot captures what a CUSTOMER MANAGED configuration recorder records
+        // for this account, so one has to exist...
+        if !has_customer_managed_recorder {
+            return Err(
+                DeliverConfigSnapshotErrorModeled::NoAvailableConfigurationRecorderException(
+                    NoAvailableConfigurationRecorderException {
+                        message: Some(
+                            crate::state::NO_AVAILABLE_CONFIGURATION_RECORDER_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // ...and it has to be recording: a recorder that is turned off is capturing
+        // nothing to snapshot.
+        if !recorder_is_recording {
+            return Err(
+                DeliverConfigSnapshotErrorModeled::NoRunningConfigurationRecorderException(
+                    NoRunningConfigurationRecorderException {
+                        message: Some(NO_RUNNING_RECORDER_TO_DELIVER.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The id of the snapshot being created: distinct per delivery, taken from the
+        // store's own sequence rather than from anything in the request.
+        let config_snapshot_id = crate::state::mint_config_snapshot_id(seq);
+
+        // Recording the delivery on the channel is what makes it that channel's last
+        // snapshot delivery attempt.
+        channel.last_snapshot_delivery = Some(crate::state::SnapshotDeliveryEntry::scheduled(
+            config_snapshot_id.clone(),
+            now,
+        ));
+
+        // The sequence advances only for a delivery that was actually scheduled, so a
+        // refused call consumes no snapshot id.
+        store.next_config_snapshot_seq = seq.wrapping_add(1);
+
+        Ok(DeliverConfigSnapshotOutput {
+            config_snapshot_id: Some(config_snapshot_id),
+        })
     }
 }

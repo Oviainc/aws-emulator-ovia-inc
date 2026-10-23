@@ -25,7 +25,7 @@ use crate::config_setup_and_rule_loop::{recorder_request, Emulator, ROLE_ARN};
 /// `smithy_query(query="shape", shape="MaximumExecutionFrequency")` on this service's
 /// model: `One_Hour`, `Three_Hours`, `Six_Hours`, `Twelve_Hours`, `TwentyFour_Hours`.
 /// Each value spells its own number of hours between two snapshot deliveries.
-const SNAPSHOT_FREQUENCIES: [(&str, u64); 5] = [
+pub(crate) const SNAPSHOT_FREQUENCIES: [(&str, u64); 5] = [
     ("One_Hour", 3_600),
     ("Three_Hours", 3 * 3_600),
     ("Six_Hours", 6 * 3_600),
@@ -36,7 +36,7 @@ const SNAPSHOT_FREQUENCIES: [(&str, u64); 5] = [
 /// The interval a channel that names no `deliveryFrequency` delivers snapshots at:
 /// the emulator's documented default, the least frequent published value
 /// (`crate::state::DEFAULT_SNAPSHOT_DELIVERY_FREQUENCY` is `TwentyFour_Hours`).
-const DEFAULT_SNAPSHOT_INTERVAL: u64 = 24 * 3_600;
+pub(crate) const DEFAULT_SNAPSHOT_INTERVAL: u64 = 24 * 3_600;
 
 /// How often Config delivers a configuration history file (AWS Config Developer
 /// Guide: a new configuration history file every six hours), the schedule the
@@ -50,7 +50,7 @@ const NOT_APPLICABLE: &str = "Not_Applicable";
 
 /// Wall-clock seconds since the epoch, the unit `awsJson1_1` puts a modelled
 /// timestamp on the wire in.
-fn epoch_seconds() -> f64 {
+pub(crate) fn epoch_seconds() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the test clock is after the epoch")
@@ -58,7 +58,7 @@ fn epoch_seconds() -> f64 {
 }
 
 /// `value` read as an epoch-seconds instant.
-fn instant(case: &str, path: &str, value: &Value) -> f64 {
+pub(crate) fn instant(case: &str, path: &str, value: &Value) -> f64 {
     value.as_f64().unwrap_or_else(|| {
         panic!("case {case:?}: {path} must be an epoch-seconds timestamp, got {value}")
     })
@@ -66,7 +66,7 @@ fn instant(case: &str, path: &str, value: &Value) -> f64 {
 
 /// The delivery channel body for `PutDeliveryChannel`, with the snapshot frequency
 /// `frequency` when one is given.
-fn channel_request(frequency: Option<&str>) -> Value {
+pub(crate) fn channel_request(frequency: Option<&str>) -> Value {
     let mut channel = json!({ "name": "default", "s3BucketName": "config-bucket" });
     if let Some(frequency) = frequency {
         channel["configSnapshotDeliveryProperties"] =

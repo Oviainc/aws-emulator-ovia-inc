@@ -233,17 +233,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A channel this account already holds is UPDATED, so it keeps the creation
         // instant its delivery schedule is anchored at; a new one is anchored now.
-        let created_at = store
-            .delivery_channels
-            .get(&name)
+        let existing = store.delivery_channels.get(&name);
+        let created_at = existing
             .map(|existing| existing.created_at)
             .unwrap_or_else(::std::time::SystemTime::now);
+        // An update also keeps the snapshot delivery already scheduled for this
+        // channel: the delivery was attempted against the channel, not against the
+        // configuration this call replaces.
+        let last_snapshot_delivery =
+            existing.and_then(|existing| existing.last_snapshot_delivery.clone());
 
         store.delivery_channels.insert(
             name.clone(),
             crate::state::DeliveryChannelEntry {
                 name,
                 created_at,
+                last_snapshot_delivery,
                 s3_bucket_name: requested.s3_bucket_name.clone(),
                 s3_key_prefix: requested.s3_key_prefix.clone(),
                 s3_kms_key_arn: requested.s3_kms_key_arn.clone(),

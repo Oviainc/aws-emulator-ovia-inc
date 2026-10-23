@@ -331,6 +331,18 @@ pub fn delivery_frequency_interval(frequency: &str) -> Option<Duration> {
 /// status straight after starting the recorder.
 pub const RECORDER_STATUS_SETTLE_AFTER: Duration = Duration::from_millis(500);
 
+/// How long after `DeliverConfigSnapshot` the configuration-snapshot delivery that
+/// call schedules completes.
+///
+/// A snapshot delivery is in flight when the call returns — `DeliverConfigSnapshot`
+/// answers with "the ID of the snapshot that is being created" and Config notifies
+/// the start of the delivery and then its completion — so the completion is a change
+/// the clock owes rather than one the call itself makes. AWS documents no duration
+/// for it, so the span is CHOSEN: it sits inside the 250–750 ms window this project
+/// uses for such a transition, which keeps the in-flight delivery observable to a
+/// caller that describes the channel's status straight after scheduling it.
+pub const SNAPSHOT_DELIVERY_SETTLE_AFTER: Duration = Duration::from_millis(500);
+
 /// The most Config rules this account and Region can hold, after which
 /// `PutConfigRule` refuses a new rule with `MaxNumberOfConfigRulesExceededException`.
 /// 150 is the Config rules service quota (managed plus custom rules per Region).
@@ -823,6 +835,41 @@ impl RecorderStatusEntry {
     }
 }
 
+/// One configuration-snapshot delivery `DeliverConfigSnapshot` scheduled for a
+/// delivery channel.
+///
+/// The delivery is NOT complete when the call returns (see
+/// [`SNAPSHOT_DELIVERY_SETTLE_AFTER`]), so the entry stores both the instant the
+/// delivery was attempted and the instant it is due to complete; nothing sleeps for
+/// it and no read moves it, because every reported instant is derived from these two.
+#[derive(Debug, Clone)]
+pub struct SnapshotDeliveryEntry {
+    /// The `configSnapshotId` the scheduling call answered with.
+    pub id: String,
+    /// When the delivery was scheduled, which is when it was attempted.
+    pub attempted_at: SystemTime,
+    /// When the delivery completes — [`SNAPSHOT_DELIVERY_SETTLE_AFTER`] after it was
+    /// attempted.
+    pub completes_at: SystemTime,
+}
+
+impl SnapshotDeliveryEntry {
+    /// The delivery `DeliverConfigSnapshot` scheduled at `at`, carrying the snapshot
+    /// id it answered with.
+    pub fn scheduled(id: String, at: SystemTime) -> Self {
+        Self {
+            id,
+            attempted_at: at,
+            completes_at: at + SNAPSHOT_DELIVERY_SETTLE_AFTER,
+        }
+    }
+
+    /// Whether this delivery has completed as of `now`.
+    pub fn completed_by(&self, now: SystemTime) -> bool {
+        now >= self.completes_at
+    }
+}
+
 /// One persisted delivery channel.
 #[derive(Debug, Clone)]
 pub struct DeliveryChannelEntry {
@@ -837,6 +884,13 @@ pub struct DeliveryChannelEntry {
     /// `DescribeDeliveryChannelStatus` derives every reported instant from it. An
     /// update keeps the instant the channel was first created.
     pub created_at: SystemTime,
+    /// The last configuration-snapshot delivery `DeliverConfigSnapshot` scheduled for
+    /// this channel, if any.
+    ///
+    /// ONE entry, not a history: `ConfigExportDeliveryInfo` reports the LAST attempt
+    /// and the last success, so an on-demand delivery supersedes the one before it and
+    /// however many snapshots a caller schedules, this channel grows no further.
+    pub last_snapshot_delivery: Option<SnapshotDeliveryEntry>,
 }
 
 impl DeliveryChannelEntry {
@@ -875,17 +929,24 @@ impl DeliveryChannelEntry {
     }
 
     /// The status of this channel as of `now`, DERIVED from the delivery schedule its
-    /// creation instant anchors: nothing here is stored at write time and reading it
-    /// changes no state, so two callers reading at the same instant see the same thing.
+    /// creation instant anchors and from the snapshot delivery a call last scheduled
+    /// for it: reading it changes no state, so two callers reading at the same instant
+    /// see the same thing.
     pub fn status_at(&self, now: SystemTime) -> DeliveryChannelStatus {
         DeliveryChannelStatus {
             name: Some(self.name.clone()),
-            config_snapshot_delivery_info: Some(
-                self.export_delivery_info(now, self.snapshot_delivery_interval()),
-            ),
-            config_history_delivery_info: Some(
-                self.export_delivery_info(now, CONFIG_HISTORY_DELIVERY_INTERVAL),
-            ),
+            config_snapshot_delivery_info: Some(self.export_delivery_info(
+                now,
+                self.snapshot_delivery_interval(),
+                self.last_snapshot_delivery.as_ref(),
+            )),
+            config_history_delivery_info: Some(self.export_delivery_info(
+                now,
+                CONFIG_HISTORY_DELIVERY_INTERVAL,
+                // The configuration history has a schedule only: no operation of this
+                // API delivers one on demand.
+                None,
+            )),
             config_stream_delivery_info: self.stream_delivery_info(),
         }
     }
@@ -893,11 +954,29 @@ impl DeliveryChannelEntry {
     /// The delivery info of one periodic export (the snapshot or the configuration
     /// history) as of `now`, for a schedule that delivers every `interval`.
     ///
-    /// Exactly `floor((now - created_at) / interval)` deliveries are behind us, so the
-    /// next one falls one interval after the last of them — strictly after `now`, and
-    /// never more than one interval after it. Before the first delivery there is no
-    /// attempt to report, so only `nextDeliveryTime` carries a value.
-    fn export_delivery_info(&self, now: SystemTime, interval: Duration) -> ConfigExportDeliveryInfo {
+    /// Exactly `floor((now - created_at) / interval)` scheduled deliveries are behind
+    /// us. The next delivery falls ONE INTERVAL AFTER THE LAST DELIVERY THAT
+    /// COMPLETED — that is what makes the `deliveryFrequency` the bound on the next
+    /// delivery time — and one interval after the channel's creation while no delivery
+    /// has completed at all. Either way it is strictly after `now` and never more than
+    /// one interval after it, because the instant it is measured from is at or before
+    /// `now` and later than one interval before it. Before the first delivery there is
+    /// no attempt to report, so only `nextDeliveryTime` carries a value.
+    ///
+    /// `on_demand` is the delivery of this kind that was last scheduled by a call
+    /// rather than by the schedule. It is an attempt of its own, so the reported
+    /// attempt is the LATER of it and the last scheduled delivery; it counts as a
+    /// completed delivery only once it has completed, and from then on it is what the
+    /// next delivery is measured from. `lastStatus` is the status of the last delivery
+    /// that COMPLETED: `DeliveryStatus` publishes no in-progress value (`Success`,
+    /// `Failure`, `Not_Applicable`), so a delivery still in flight contributes an
+    /// attempt time and no status.
+    fn export_delivery_info(
+        &self,
+        now: SystemTime,
+        interval: Duration,
+        on_demand: Option<&SnapshotDeliveryEntry>,
+    ) -> ConfigExportDeliveryInfo {
         let interval_secs = interval.as_secs().max(1);
         let elapsed = now
             .duration_since(self.created_at)
@@ -906,14 +985,35 @@ impl DeliveryChannelEntry {
         let delivered = elapsed / interval_secs;
         let last_delivery = (delivered > 0)
             .then(|| self.created_at + Duration::from_secs(delivered * interval_secs));
-        let next_delivery = self.created_at + Duration::from_secs((delivered + 1) * interval_secs);
+
+        let last_attempt = [last_delivery, on_demand.map(|delivery| delivery.attempted_at)]
+            .into_iter()
+            .flatten()
+            .max();
+        let last_success = [
+            last_delivery,
+            on_demand
+                .filter(|delivery| delivery.completed_by(now))
+                .map(|delivery| delivery.completes_at),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+
+        // ONE form of the interval in both branches, so the periodic and the on-demand
+        // schedules advance by provably the same step.
+        let step = Duration::from_secs(interval_secs);
+        let next_delivery = match last_success {
+            Some(delivered_at) => delivered_at + step,
+            None => self.created_at + step,
+        };
 
         ConfigExportDeliveryInfo {
-            last_status: last_delivery.map(|_| DELIVERY_STATUS_SUCCESS.to_string()),
+            last_status: last_success.map(|_| DELIVERY_STATUS_SUCCESS.to_string()),
             last_error_code: None,
             last_error_message: None,
-            last_attempt_time: last_delivery.map(timestamp),
-            last_successful_time: last_delivery.map(timestamp),
+            last_attempt_time: last_attempt.map(timestamp),
+            last_successful_time: last_success.map(timestamp),
             next_delivery_time: Some(timestamp(next_delivery)),
         }
     }
@@ -1924,6 +2024,9 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Source of the next configuration recorder id, so every recorder Config
     /// creates here gets a distinct one.
     pub next_recorder_seq: u64,
+    /// Source of the next `configSnapshotId`, so every configuration-snapshot delivery
+    /// `DeliverConfigSnapshot` schedules gets a distinct one.
+    pub next_config_snapshot_seq: u64,
     /// Stored queries, keyed by `QueryName` — unique per account per Region, which is
     /// what one engine's store stands for. A `BTreeMap` so a list of them pages over a
     /// stable ordering and a page token survives inserts and deletes.
@@ -2062,6 +2165,18 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
             .values()
             .filter(|status| status.recording)
             .find_map(|status| self.recorders.get(&status.name))
+    }
+
+    /// The CUSTOMER MANAGED configuration recorder that is RECORDING right now, if
+    /// any: this account's delivery channel delivers what such a recorder records,
+    /// while a service-linked recorder records for the Amazon Web Services service it
+    /// is linked to.
+    pub fn recording_customer_managed_recorder(&self) -> Option<&RecorderEntry> {
+        self.customer_managed_recorders().find(|recorder| {
+            self.recorder_status
+                .get(&recorder.name)
+                .is_some_and(|status| status.recording)
+        })
     }
 
     /// The `RecordingFrequency` Config records `resource_type` at: the frequency the
@@ -2284,6 +2399,19 @@ pub fn mint_stored_query_id(seq: u64) -> String {
 /// so every operation that refuses an absent stored query words it the same way.
 pub fn no_such_stored_query_message(name: &str) -> String {
     format!("The stored query '{name}' provided in the request does not exist.")
+}
+
+/// The `configSnapshotId` of the `seq`-th configuration-snapshot delivery scheduled
+/// in this emulator: sixteen base-36 characters, the same opaque shape this service's
+/// other server-assigned ids take (see [`mint_recorder_id`]). The model constrains
+/// `DeliverConfigSnapshotResponse$configSnapshotId` to a plain `String`, so the only
+/// requirement is that it identifies one snapshot.
+///
+/// [`splitmix64`] is a bijection on `u64`, so distinct sequence numbers give distinct
+/// ids; the mixing input differs from the other mints', so the n-th snapshot and the
+/// n-th recorder do not carry the same id.
+pub fn mint_config_snapshot_id(seq: u64) -> String {
+    base36(splitmix64(seq ^ 0x5347_4e41_5053_4e50), 16)
 }
 
 /// The DNS suffix every Amazon Web Services service principal ends with, which is
