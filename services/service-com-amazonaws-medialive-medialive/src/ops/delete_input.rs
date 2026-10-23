@@ -173,14 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An input a channel still attaches is busy: "Deletes the input end
         // point" cannot happen while some channel's `InputAttachments` names it,
         // so the answer is this operation's modelled `ConflictException` and the
-        // input is left exactly as it was.
-        let attached_to = state.attached_channels(&input.input_id);
-        if !attached_to.is_empty() {
+        // input is left exactly as it was. The refusal names only the input the
+        // request asked about: which channels hold it is state the caller did
+        // not supply, and `DescribeInput` is what reports it.
+        if !state.attached_channels(&input.input_id).is_empty() {
             return Err(DeleteInputErrorModeled::ConflictException(ConflictException {
-                message: Some(crate::state::attached_input_message(
-                    &input.input_id,
-                    &attached_to,
-                )),
+                message: Some(crate::state::busy_input_message(&input.input_id)),
             })
             .into());
         }

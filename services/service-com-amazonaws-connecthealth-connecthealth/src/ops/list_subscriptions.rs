@@ -173,10 +173,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => MAX_PAGE_SIZE,
             Some(requested) if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&requested) => requested,
             Some(requested) => {
+                // Worded as AWS words a constraint violation, and in the one place that
+                // sentence is written (`crate::service::error_detail`), so this refusal
+                // reads identically to the boundary validator's for the same violation.
                 return Err(ListSubscriptionsErrorModeled::ValidationException(
                     ValidationException {
-                        message: Some(format!(
-                            "maxResults {requested} is outside {MIN_PAGE_SIZE}..{MAX_PAGE_SIZE}"
+                        message: Some(crate::service::error_detail::range_violation_message(
+                            "maxResults",
+                            requested,
+                            MIN_PAGE_SIZE,
+                            MAX_PAGE_SIZE,
                         )),
                     },
                 )
