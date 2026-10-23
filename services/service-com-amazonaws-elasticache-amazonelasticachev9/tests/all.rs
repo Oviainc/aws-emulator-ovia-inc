@@ -37,3 +37,12 @@ mod serverless_cache_lifecycle;
 mod snapshots;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+
+// Declared after the list above rather than inside it: suites land in this file
+// concurrently, and every insertion into the sorted run collides with another
+// branch's insertion at the same place. These two are the snapshot-rule suite
+// and the two drivers it calls through.
+#[path = "all/snapshot_lifecycle.rs"]
+mod snapshot_lifecycle;
+#[path = "all/harness.rs"]
+mod harness;
