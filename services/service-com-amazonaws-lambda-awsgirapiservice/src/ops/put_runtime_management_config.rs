@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRuntimeManagementConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRuntimeManagementConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRuntimeManagementConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the runtime management configuration of ONE version of a function on the
+//! record [`crate::state`] holds — "Sets the runtime management configuration for a
+//! function's version" — so `GetRuntimeManagementConfig` reports exactly what this call
+//! persisted and nothing is echoed back out of a request without being stored first.
+//!
+//! The two configuration members are coupled by the model: `RuntimeVersionArn` is "only
+//! required if you're using the Manual runtime update mode", and the response's own
+//! `RuntimeVersionArn` is returned only "if the runtime update mode is manual,
+//! otherwise null is returned". So a `Manual` mode naming no runtime version, and any
+//! other mode naming one, each describe no single configuration and are refused with
+//! this operation's own `InvalidParameterValueException` ("One of the parameters in the
+//! request is not valid") before any record is read: the pair is wrong whatever
+//! function it names.
+//!
+//! Setting the configuration again replaces it — it is one value a version always has,
+//! starting at the documented `Auto` (see [`crate::state::DEFAULT_UPDATE_RUNTIME_ON`]).
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +187,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRuntimeManagementConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRuntimeManagementConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRuntimeManagementConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutRuntimeManagementConfigErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `UpdateRuntimeOn` is a required enum member, so the boundary validator has
+        // already refused everything outside the model's `Auto | Manual |
+        // FunctionUpdate` value set and only one of those three reaches here. What is
+        // left to check is the PAIR: only `Manual` pins a runtime version, so only
+        // `Manual` both needs and accepts a `RuntimeVersionArn`.
+        let manual = input.update_runtime_on == crate::state::UPDATE_RUNTIME_ON_MANUAL;
+        let refusal = match (manual, input.runtime_version_arn.is_some()) {
+            (true, false) => Some(format!(
+                "RuntimeVersionArn must be specified when UpdateRuntimeOn is {}",
+                crate::state::UPDATE_RUNTIME_ON_MANUAL
+            )),
+            (false, true) => Some(format!(
+                "RuntimeVersionArn can only be specified when UpdateRuntimeOn is {}, not {}",
+                crate::state::UPDATE_RUNTIME_ON_MANUAL, input.update_runtime_on
+            )),
+            _ => None,
+        };
+        if let Some(message) = refusal {
+            return Err(
+                PutRuntimeManagementConfigErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        // "Specify a version of the function" — the `Qualifier` names the version this
+        // configuration belongs to, and with "no value specified" it is the `$LATEST`
+        // version's configuration that is addressed, which is what resolution defaults
+        // to.
+        let (record, version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                PutRuntimeManagementConfigErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                PutRuntimeManagementConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+
+        record.set_runtime_management_config(
+            &version,
+            crate::state::RuntimeManagementConfigRecord {
+                update_runtime_on: input.update_runtime_on.clone(),
+                runtime_version_arn: input.runtime_version_arn.clone(),
+            },
+        );
+
+        // Answered by reading the record back, so the response reports what is stored
+        // rather than what the request carried.
+        let stored = record.runtime_management_config(&version);
+        Ok(PutRuntimeManagementConfigOutput {
+            update_runtime_on: stored.update_runtime_on,
+            function_arn: record.versioned_arn(&version),
+            runtime_version_arn: stored.runtime_version_arn,
+        })
     }
 }

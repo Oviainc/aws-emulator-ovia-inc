@@ -41,6 +41,14 @@
 //! reason; nothing invents a result, a log tail or a duration for a function that did
 //! not run.
 //!
+//! The runtime-management slice hangs off the same record, one entry per version:
+//! `PutRuntimeManagementConfig` "sets the runtime management configuration for a
+//! function's version", so what it persists lives on
+//! [`FunctionRecord::runtime_management_configs`] keyed by the version label the call
+//! addressed, and `GetRuntimeManagementConfig` reports exactly that. A version nobody
+//! has configured carries the documented default rather than nothing at all (see
+//! [`RuntimeManagementConfigRecord::default`]).
+//!
 //! The capacity-provider slice is the other resource this store holds, in
 //! [`ComAmazonawsLambdaAwsgirapiserviceState::capacity_providers`]: one
 //! [`CapacityProviderRecord`] per provider `CreateCapacityProvider` persisted, keyed by
@@ -195,6 +203,20 @@ pub const DEFAULT_TRACING_MODE: &str = "PassThrough";
 /// `GetFunctionRecursionConfig`'s output and on `PutFunctionRecursionConfig`'s input:
 /// "By default, Lambda sets your function's configuration to Terminate."
 pub const DEFAULT_RECURSIVE_LOOP: &str = "Terminate";
+
+/// The `UpdateRuntimeOn` values a runtime management configuration may carry, from the
+/// model's `UpdateRuntimeOn` enum (`Auto | Manual | FunctionUpdate`).
+pub const UPDATE_RUNTIME_ON_AUTO: &str = "Auto";
+/// See [`UPDATE_RUNTIME_ON_AUTO`]. In this mode "You specify a runtime version in your
+/// function configuration", so it is the only mode that carries a `RuntimeVersionArn`.
+pub const UPDATE_RUNTIME_ON_MANUAL: &str = "Manual";
+/// See [`UPDATE_RUNTIME_ON_AUTO`].
+pub const UPDATE_RUNTIME_ON_FUNCTION_UPDATE: &str = "FunctionUpdate";
+
+/// The runtime update mode a function version has before anyone sets one, which the
+/// model's own `UpdateRuntimeOn` member documentation states: "Auto (default) -
+/// Automatically update to the most recent and secure runtime version".
+pub const DEFAULT_UPDATE_RUNTIME_ON: &str = UPDATE_RUNTIME_ON_AUTO;
 
 /// The `FunctionCodeLocation` `RepositoryType` of a .zip file archive package: Lambda
 /// keeps the archive in its own S3 bucket and vends a download location for it.
@@ -821,6 +843,36 @@ impl FunctionUrlConfigRecord {
     }
 }
 
+/// The runtime management configuration of one function version: "the runtime update
+/// mode" and, in [`UPDATE_RUNTIME_ON_MANUAL`] mode only, the runtime version the
+/// version is pinned to.
+///
+/// Held per version label on [`FunctionRecord::runtime_management_configs`], because
+/// `PutRuntimeManagementConfig` "sets the runtime management configuration for a
+/// function's version" and takes a `Qualifier` to say which one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeManagementConfigRecord {
+    /// One of the model's `UpdateRuntimeOn` values, as supplied.
+    pub update_runtime_on: String,
+    /// The pinned runtime version ARN, as supplied. Present only in
+    /// [`UPDATE_RUNTIME_ON_MANUAL`] mode — "The ARN of the runtime the function is
+    /// configured to use. If the runtime update mode is manual, the ARN is returned,
+    /// otherwise null is returned" — and never invented here, because no mode but
+    /// `Manual` names one.
+    pub runtime_version_arn: Option<String>,
+}
+
+impl Default for RuntimeManagementConfigRecord {
+    /// The configuration a version carries until a `PutRuntimeManagementConfig` call
+    /// stores another: [`DEFAULT_UPDATE_RUNTIME_ON`], with no pinned runtime version.
+    fn default() -> Self {
+        Self {
+            update_runtime_on: DEFAULT_UPDATE_RUNTIME_ON.to_string(),
+            runtime_version_arn: None,
+        }
+    }
+}
+
 /// What has become of one queued asynchronous invocation.
 ///
 /// A queued event is NOT a run: the queue is the only thing an asynchronous
@@ -1030,6 +1082,12 @@ pub struct FunctionRecord {
     /// The asynchronous invocations accepted for this function, oldest first, bounded
     /// by [`MAX_QUEUED_ASYNC_INVOCATIONS`].
     pub async_invocations: VecDeque<AsyncInvocationRecord>,
+    /// The runtime management configuration of each version that has had one stored,
+    /// keyed by the version label it belongs to — [`VERSION_LATEST`] or a published
+    /// version number. A version with no entry carries
+    /// [`RuntimeManagementConfigRecord::default`]; see
+    /// [`Self::runtime_management_config`].
+    pub runtime_management_configs: BTreeMap<String, RuntimeManagementConfigRecord>,
 }
 
 impl FunctionRecord {
@@ -1327,6 +1385,41 @@ impl FunctionRecord {
             tenancy_config: config.tenancy_config.clone(),
             ..CreateFunctionOutput::default()
         }
+    }
+
+    /// The runtime management configuration of the version `qualifier` names.
+    ///
+    /// A version nobody has configured carries the documented default
+    /// ([`RuntimeManagementConfigRecord::default`]), so every version always has one —
+    /// the configuration is a value, not a resource that may be absent. An alias reads
+    /// the configuration of the version it invokes, because the configuration belongs
+    /// to the version; see [`Self::resolved_version`].
+    #[must_use]
+    pub fn runtime_management_config(&self, qualifier: &str) -> RuntimeManagementConfigRecord {
+        self.runtime_management_configs
+            .get(&self.runtime_management_key(qualifier))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Store `config` as the runtime management configuration of the version
+    /// `qualifier` names, replacing whatever that version held: the configuration is
+    /// one value a version always has rather than a list to append to.
+    pub fn set_runtime_management_config(
+        &mut self,
+        qualifier: &str,
+        config: RuntimeManagementConfigRecord,
+    ) {
+        let key = self.runtime_management_key(qualifier);
+        self.runtime_management_configs.insert(key, config);
+    }
+
+    /// The version label a runtime management configuration is keyed by: the version
+    /// `qualifier` resolves to, so a call addressed by an alias and one addressed by
+    /// the version that alias invokes reach the same configuration.
+    fn runtime_management_key(&self, qualifier: &str) -> String {
+        self.resolved_version(qualifier)
+            .unwrap_or_else(|| qualifier.to_string())
     }
 
     /// The `FunctionCodeLocation` `GetFunction` reports for this function's package.

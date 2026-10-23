@@ -39,6 +39,8 @@ mod layer_versions;
 mod resource_policy;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/runtime_management_config.rs"]
+mod runtime_management_config;
 #[path = "all/signing_name_routing.rs"]
 mod signing_name_routing;
 #[path = "all/state_roundtrip.rs"]
