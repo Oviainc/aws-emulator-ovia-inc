@@ -74,13 +74,17 @@ use base64::Engine as _;
 use sha2::Digest as _;
 
 use crate::ops::types::{
-    AccountLimit, AccountUsage, AliasRoutingConfiguration, CapacityProvider,
-    CapacityProviderConfig, CapacityProviderPermissionsConfig, CapacityProviderScalingConfig,
-    CapacityProviderTelemetryConfig, CapacityProviderVpcConfig, Cors, CreateAliasOutput,
-    CreateFunctionOutput, DeadLetterConfig, DurableConfig, Environment, EnvironmentResponse,
-    EphemeralStorage, FileSystemConfig, FunctionCodeLocation, GetLayerVersionOutput, ImageConfig,
-    ImageConfigResponse, InstanceRequirements, Layer, LayerVersionContentOutput, LoggingConfig,
-    PropagateTags, PutFunctionConcurrencyOutput, ResolvedS3Object, SnapStartResponse,
+    AccountLimit, AccountUsage, AliasRoutingConfiguration, AmazonManagedKafkaEventSourceConfig,
+    CapacityProvider, CapacityProviderConfig, CapacityProviderPermissionsConfig,
+    CapacityProviderScalingConfig, CapacityProviderTelemetryConfig, CapacityProviderVpcConfig,
+    Cors, CreateAliasOutput, CreateEventSourceMappingOutput, CreateFunctionOutput,
+    DeadLetterConfig, DestinationConfig, DocumentDBEventSourceConfig, DurableConfig, Environment,
+    EnvironmentResponse, EphemeralStorage, EventSourceMappingLoggingConfig,
+    EventSourceMappingMetricsConfig, FileSystemConfig, FilterCriteria, FunctionCodeLocation,
+    GetLayerVersionOutput, ImageConfig, ImageConfigResponse, InstanceRequirements, Layer,
+    LayerVersionContentOutput, LoggingConfig, PropagateTags, ProvisionedPollerConfig,
+    PutFunctionConcurrencyOutput, ResolvedS3Object, ScalingConfig, SelfManagedEventSource,
+    SelfManagedKafkaEventSourceConfig, SnapStartResponse, SourceAccessConfiguration,
     TenancyConfig, TracingConfigResponse, VpcConfig, VpcConfigResponse,
 };
 
@@ -1638,6 +1642,404 @@ impl CapacityProviderRecord {
     }
 }
 
+/// `State` values this slice moves an event source mapping through, from the model's
+/// `EventSourceMappingConfiguration$State` documentation: "The state of the event source
+/// mapping. It can be one of the following: Creating, Enabling, Enabled, Disabling,
+/// Disabled, Updating, or Deleting."
+pub const EVENT_SOURCE_MAPPING_STATE_CREATING: &str = "Creating";
+/// See [`EVENT_SOURCE_MAPPING_STATE_CREATING`].
+pub const EVENT_SOURCE_MAPPING_STATE_ENABLED: &str = "Enabled";
+/// See [`EVENT_SOURCE_MAPPING_STATE_CREATING`].
+pub const EVENT_SOURCE_MAPPING_STATE_DISABLED: &str = "Disabled";
+
+/// `StateTransitionReason`: "Indicates whether a user or Lambda made the last change to
+/// the event source mapping." A mapping this store holds only ever changes because a
+/// caller asked it to, which Lambda reports as `USER_INITIATED`.
+pub const EVENT_SOURCE_MAPPING_USER_INITIATED: &str = "USER_INITIATED";
+
+/// How long after `CreateEventSourceMapping` the move out of `Creating` becomes due.
+///
+/// An EMULATOR-CHOSEN span (how long Lambda takes to stand a poller up is not in the
+/// model), deliberately non-zero for the same reason as [`ACTIVATION_DELAY`]: a caller
+/// that reads the mapping straight after creating it sees the `Creating` state the
+/// create answered with. The instant it becomes due is stored on the record and nothing
+/// sleeps for it.
+pub const EVENT_SOURCE_MAPPING_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+/// The most event source mappings this emulator keeps.
+///
+/// An EMULATOR-CHOSEN ceiling, not an AWS quota: the store is in memory and every
+/// `CreateEventSourceMapping` adds to it, so past this point the slice refuses rather
+/// than growing without bound.
+pub const MAX_EVENT_SOURCE_MAPPINGS: usize = 1_000;
+
+/// The most event source mappings one `ListEventSourceMappings` page reports, from that
+/// operation's own `MaxItems` documentation: "Note that ListEventSourceMappings returns
+/// a maximum of 100 items in each response, even if you set the number higher."
+pub const MAX_EVENT_SOURCE_MAPPING_PAGE_SIZE: usize = 100;
+
+/// `BatchSize` when the request states none, from the member's own documentation:
+/// "Default value: Varies by service. For Amazon SQS, the default is 10. For all other
+/// services, the default is 100."
+pub const DEFAULT_BATCH_SIZE_QUEUE: i32 = 10;
+/// See [`DEFAULT_BATCH_SIZE_QUEUE`].
+pub const DEFAULT_BATCH_SIZE_STREAM: i32 = 100;
+
+/// `MaximumBatchingWindowInSeconds` when the request states none, from the member's own
+/// documentation: "For Kinesis, DynamoDB, and Amazon SQS event sources, the default
+/// batching window is 0 seconds. For Amazon MSK, Self-managed Apache Kafka, Amazon MQ,
+/// and DocumentDB event sources, the default batching window is 500 ms" — which is not
+/// expressible in this member's unit, so those sources report none at all.
+pub const DEFAULT_BATCHING_WINDOW_SECONDS: i32 = 0;
+
+/// `ParallelizationFactor` when the request states none, from the member's own
+/// documentation: "(Kinesis and DynamoDB Streams only) The number of batches to process
+/// concurrently from each shard. The default value is 1."
+pub const DEFAULT_PARALLELIZATION_FACTOR: i32 = 1;
+
+/// `MaximumRecordAgeInSeconds` and `MaximumRetryAttempts` when the request states
+/// neither: both are documented as "The default value is -1, which sets the maximum
+/// \[age|number of retries\] to infinite."
+pub const INFINITE_RETENTION: i32 = -1;
+
+/// The ARN vendor field of the event sources whose documented defaults differ: a queue
+/// batches 10 records, a stream 100 ("Amazon Simple Queue Service – The ARN of the
+/// queue").
+pub const EVENT_SOURCE_VENDOR_QUEUE: &str = "sqs";
+/// The two event sources `StartingPosition` is documented as "Required for": "Amazon
+/// Kinesis – The ARN of the data stream or a stream consumer" and "Amazon DynamoDB
+/// Streams – The ARN of the stream".
+pub const EVENT_SOURCE_VENDOR_KINESIS: &str = "kinesis";
+/// See [`EVENT_SOURCE_VENDOR_KINESIS`].
+pub const EVENT_SOURCE_VENDOR_DYNAMODB: &str = "dynamodb";
+/// The ARN vendor field of an Amazon MSK cluster ("Amazon Managed Streaming for Apache
+/// Kafka – The ARN of the cluster").
+pub const EVENT_SOURCE_VENDOR_KAFKA: &str = "kafka";
+/// The ARN vendor field of an Amazon DocumentDB cluster ("Amazon DocumentDB – The ARN of
+/// the DocumentDB change stream"), whose ARNs are in the `rds` namespace.
+pub const EVENT_SOURCE_VENDOR_DOCUMENT_DB: &str = "rds";
+
+/// The `EventSourcePosition` value that reads "from which to start reading" at a stated
+/// instant, from the model's enum (`AT_TIMESTAMP | LATEST | TRIM_HORIZON`).
+pub const STARTING_POSITION_AT_TIMESTAMP: &str = "AT_TIMESTAMP";
+
+/// The ARN of an event source mapping:
+/// `arn:aws:lambda:<region>:<account>:event-source-mapping:<uuid>`, as the model's
+/// `EventSourceMappingArn` pattern requires.
+#[must_use]
+pub fn event_source_mapping_arn(region: &str, uuid: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("event-source-mapping:{uuid}"),
+    )
+}
+
+/// A fresh event source mapping identifier. The model's `UUIDString` is
+/// `@length(min: 36, max: 36)` and `EventSourceMappingArn`'s pattern spells out the
+/// hyphenated UUID form, so the id is a UUID.
+#[must_use]
+pub fn mint_event_source_mapping_uuid() -> String {
+    ::uuid::Uuid::new_v4().to_string()
+}
+
+/// The service an `EventSourceArn` names, which is what the per-source defaults and
+/// requirements documented for `BatchSize`, `MaximumBatchingWindowInSeconds` and
+/// `StartingPosition` are keyed on.
+///
+/// Read through `service_common::arn` — the one parse this repository states for a
+/// caller-supplied ARN — so `None` means the value is not a resource ARN at all.
+#[must_use]
+pub fn event_source_vendor(event_source_arn: &str) -> Option<&str> {
+    service_common::arn::vendor(event_source_arn)
+}
+
+/// Whether `vendor` names one of the two sources that deliver records per SHARD, which
+/// is the scope the model gives `ParallelizationFactor` and `TumblingWindowInSeconds`
+/// ("Kinesis and DynamoDB Streams only") and the two sources `StartingPosition` is
+/// "Required for".
+#[must_use]
+pub fn is_shard_source(vendor: Option<&str>) -> bool {
+    matches!(
+        vendor,
+        Some(EVENT_SOURCE_VENDOR_KINESIS | EVENT_SOURCE_VENDOR_DYNAMODB)
+    )
+}
+
+/// Whether the event source is one of the STREAM sources the model scopes its error
+/// handling options to: "The following error handling options are available for stream
+/// sources (DynamoDB, Kinesis, Amazon MSK, and self-managed Apache Kafka)".
+///
+/// `self_managed` says whether the request named a self-managed Apache Kafka cluster
+/// instead of an event source ARN, which is a stream source with no ARN to read a vendor
+/// from.
+#[must_use]
+pub fn is_stream_source(vendor: Option<&str>, self_managed: bool) -> bool {
+    self_managed || is_shard_source(vendor) || vendor == Some(EVENT_SOURCE_VENDOR_KAFKA)
+}
+
+/// Whether the event source supports reading from a stated instant, from
+/// `StartingPosition`'s own documentation: "AT_TIMESTAMP is supported only for Amazon
+/// Kinesis streams, Amazon DocumentDB, Amazon MSK, and self-managed Apache Kafka."
+#[must_use]
+pub fn supports_at_timestamp(vendor: Option<&str>, self_managed: bool) -> bool {
+    self_managed
+        || matches!(
+            vendor,
+            Some(
+                EVENT_SOURCE_VENDOR_KINESIS
+                    | EVENT_SOURCE_VENDOR_KAFKA
+                    | EVENT_SOURCE_VENDOR_DOCUMENT_DB
+            )
+        )
+}
+
+/// `BatchSize` when the request states none: see [`DEFAULT_BATCH_SIZE_QUEUE`].
+#[must_use]
+pub fn default_batch_size(vendor: Option<&str>) -> i32 {
+    if vendor == Some(EVENT_SOURCE_VENDOR_QUEUE) {
+        DEFAULT_BATCH_SIZE_QUEUE
+    } else {
+        DEFAULT_BATCH_SIZE_STREAM
+    }
+}
+
+/// `MaximumBatchingWindowInSeconds` when the request states none: 0 seconds for the
+/// three sources documented with that default, and none at all for the sources whose
+/// documented default — 500 ms — this member's unit cannot carry. See
+/// [`DEFAULT_BATCHING_WINDOW_SECONDS`].
+#[must_use]
+pub fn default_batching_window_seconds(vendor: Option<&str>) -> Option<i32> {
+    (is_shard_source(vendor) || vendor == Some(EVENT_SOURCE_VENDOR_QUEUE))
+        .then_some(DEFAULT_BATCHING_WINDOW_SECONDS)
+}
+
+/// One event source mapping this emulator holds.
+///
+/// `CreateEventSourceMapping` "creates a mapping between an event source and an Lambda
+/// Event Function", so what it persists is the mapping the request described: which
+/// event source, which function, and every polling, filtering, destination and logging
+/// setting it stated, beside the lifecycle this emulator owns. Every member
+/// `GetEventSourceMapping` and `ListEventSourceMappings` report comes back out of this
+/// record (see [`EventSourceMappingRecord::reported`]), so nothing of a request is
+/// echoed straight back to its caller.
+///
+/// No poller runs in this emulator, so the record carries no `LastProcessingResult`:
+/// that member is "The result of the event source mapping's last processing attempt",
+/// and no attempt has been made.
+#[derive(Debug, Clone)]
+pub struct EventSourceMappingRecord {
+    /// `UUID`: "The identifier of the event source mapping", which is also the key it is
+    /// stored under.
+    pub uuid: String,
+    /// `EventSourceMappingArn`, minted once at creation; see
+    /// [`event_source_mapping_arn`].
+    pub arn: String,
+    /// `FunctionArn`: "The ARN of the Lambda function", qualified when the request named
+    /// a version or an alias.
+    pub function_arn: String,
+    /// The bare name of the function the mapping invokes, which is what a
+    /// `ListEventSourceMappings` `FunctionName` filter resolves to.
+    pub function_name: String,
+    /// The qualifier the request named the function by, when it named one.
+    pub function_qualifier: Option<String>,
+    /// `EventSourceArn`: "The Amazon Resource Name (ARN) of the event source", absent
+    /// for a self-managed Apache Kafka cluster, which is named by
+    /// [`Self::self_managed_event_source`] instead.
+    pub event_source_arn: Option<String>,
+    /// `Enabled`: "When true, the event source mapping is active. When false, Lambda
+    /// pauses polling and invocation." Not reported as such — it is the state the
+    /// mapping settles into; see [`EventSourceMappingRecord::materialize`].
+    pub enabled: bool,
+    /// `BatchSize`: "The maximum number of records in each batch that Lambda pulls from
+    /// your stream or queue".
+    pub batch_size: i32,
+    /// `MaximumBatchingWindowInSeconds`, when the source has a default expressible in
+    /// seconds or the request stated one.
+    pub maximum_batching_window_in_seconds: Option<i32>,
+    /// `ParallelizationFactor`, for the two sources it applies to.
+    pub parallelization_factor: Option<i32>,
+    /// `StartingPosition`: "The position in a stream from which to start reading."
+    pub starting_position: Option<String>,
+    /// `StartingPositionTimestamp`: "With StartingPosition set to AT_TIMESTAMP, the time
+    /// from which to start reading."
+    pub starting_position_timestamp: Option<::aws_smithy_types::DateTime>,
+    /// `FilterCriteria`: "An object that defines the filter criteria that determine
+    /// whether Lambda should process an event."
+    pub filter_criteria: Option<FilterCriteria>,
+    /// `KMSKeyArn`: the customer managed key "that Lambda uses to encrypt your
+    /// function's filter criteria".
+    pub kms_key_arn: Option<String>,
+    /// `MetricsConfig`: "The metrics configuration for your event source."
+    pub metrics_config: Option<EventSourceMappingMetricsConfig>,
+    /// `LoggingConfig`: "(Amazon MSK, and self-managed Apache Kafka only) The logging
+    /// configuration for your event source."
+    pub logging_config: Option<EventSourceMappingLoggingConfig>,
+    /// `ScalingConfig`: "(Amazon SQS only) The scaling configuration for the event
+    /// source."
+    pub scaling_config: Option<ScalingConfig>,
+    /// `DestinationConfig`: where "an event after Lambda processes it" is sent.
+    pub destination_config: Option<DestinationConfig>,
+    /// `MaximumRecordAgeInSeconds`, for the stream sources it applies to.
+    pub maximum_record_age_in_seconds: Option<i32>,
+    /// `BisectBatchOnFunctionError`, for the stream sources it applies to.
+    pub bisect_batch_on_function_error: Option<bool>,
+    /// `MaximumRetryAttempts`, for the stream sources it applies to.
+    pub maximum_retry_attempts: Option<i32>,
+    /// `TumblingWindowInSeconds`: "(Kinesis and DynamoDB Streams only) The duration in
+    /// seconds of a processing window".
+    pub tumbling_window_in_seconds: Option<i32>,
+    /// `Topics`: "The name of the Kafka topic."
+    pub topics: Option<Vec<String>>,
+    /// `Queues`: "(Amazon MQ) The name of the Amazon MQ broker destination queue to
+    /// consume."
+    pub queues: Option<Vec<String>>,
+    /// `SourceAccessConfigurations`: "An array of the authentication protocol, VPC
+    /// components, or virtual host to secure and define your event source."
+    pub source_access_configurations: Option<Vec<SourceAccessConfiguration>>,
+    /// `SelfManagedEventSource`: "The self-managed Apache Kafka cluster for your event
+    /// source."
+    pub self_managed_event_source: Option<SelfManagedEventSource>,
+    /// `FunctionResponseTypes`: "A list of current response type enums applied to the
+    /// event source mapping."
+    pub function_response_types: Option<Vec<String>>,
+    /// `AmazonManagedKafkaEventSourceConfig`, when the request stated one.
+    pub amazon_managed_kafka_event_source_config: Option<AmazonManagedKafkaEventSourceConfig>,
+    /// `SelfManagedKafkaEventSourceConfig`, when the request stated one.
+    pub self_managed_kafka_event_source_config: Option<SelfManagedKafkaEventSourceConfig>,
+    /// `DocumentDBEventSourceConfig`, when the request stated one.
+    pub document_db_event_source_config: Option<DocumentDBEventSourceConfig>,
+    /// `ProvisionedPollerConfig`: "the provisioned mode configuration for the event
+    /// source".
+    pub provisioned_poller_config: Option<ProvisionedPollerConfig>,
+    /// `Tags`: "A list of tags to apply to the event source mapping", kept in key order
+    /// so `ListTags` reports them deterministically.
+    pub tags: BTreeMap<String, String>,
+    /// The mapping's `State`, one of the values
+    /// [`EVENT_SOURCE_MAPPING_STATE_CREATING`] documents.
+    pub state: String,
+    /// `StateTransitionReason`; see [`EVENT_SOURCE_MAPPING_USER_INITIATED`].
+    pub state_transition_reason: String,
+    /// When the move out of `Creating` becomes due; see
+    /// [`EventSourceMappingRecord::materialize`].
+    pub settled_due: SystemTime,
+    /// `LastModified`: "The date that the event source mapping was last updated or that
+    /// its state changed."
+    pub last_modified: SystemTime,
+}
+
+impl EventSourceMappingRecord {
+    /// Bring this record up to whatever the clock has already made due.
+    ///
+    /// The ONLY transition it applies is the one the clock owed at `now`: a mapping whose
+    /// poller has finished being stood up leaves `Creating` for the state its `Enabled`
+    /// setting asks for — "When true, the event source mapping is active. When false,
+    /// Lambda pauses polling and invocation." It would have been owed at the same instant
+    /// even if nobody had called, so applying it on a read reports the truth rather than
+    /// inventing a change.
+    pub fn materialize(&mut self, now: SystemTime) {
+        if self.state == EVENT_SOURCE_MAPPING_STATE_CREATING && now >= self.settled_due {
+            self.state = if self.enabled {
+                EVENT_SOURCE_MAPPING_STATE_ENABLED.to_string()
+            } else {
+                EVENT_SOURCE_MAPPING_STATE_DISABLED.to_string()
+            };
+            // `LastModified` is "The date that the event source mapping was last updated
+            // or that its state changed", and this IS a state change: it changed at the
+            // instant the clock owed it, not at the instant somebody happened to read
+            // the record, so that is what is stored.
+            self.last_modified = self.settled_due;
+        }
+    }
+
+    /// The `EventSourceMappingConfiguration` the wire reports for this record, built
+    /// entirely out of what is stored.
+    ///
+    /// The model declares ONE `EventSourceMappingConfiguration`, generated here as
+    /// [`CreateEventSourceMappingOutput`]; an operation whose output is generated as its
+    /// own struct over that shape carries these members across one for one rather than
+    /// rebuilding them from state a second time.
+    #[must_use]
+    pub fn reported(&self) -> CreateEventSourceMappingOutput {
+        CreateEventSourceMappingOutput {
+            uuid: Some(self.uuid.clone()),
+            event_source_mapping_arn: Some(self.arn.clone()),
+            function_arn: Some(self.function_arn.clone()),
+            event_source_arn: self.event_source_arn.clone(),
+            batch_size: Some(self.batch_size),
+            maximum_batching_window_in_seconds: self.maximum_batching_window_in_seconds,
+            parallelization_factor: self.parallelization_factor,
+            starting_position: self.starting_position.clone(),
+            starting_position_timestamp: self.starting_position_timestamp,
+            filter_criteria: self.filter_criteria.clone(),
+            // "An object that contains details about an error related to filter criteria
+            // encryption": this store decrypts nothing and no such error has occurred.
+            filter_criteria_error: None,
+            kms_key_arn: self.kms_key_arn.clone(),
+            metrics_config: self.metrics_config.clone(),
+            logging_config: self.logging_config.clone(),
+            scaling_config: self.scaling_config.clone(),
+            last_modified: Some(::aws_smithy_types::DateTime::from(self.last_modified)),
+            // "The result of the event source mapping's last processing attempt" — no
+            // poller runs here, so there has been no attempt to report the result of.
+            last_processing_result: None,
+            state: Some(self.state.clone()),
+            state_transition_reason: Some(self.state_transition_reason.clone()),
+            destination_config: self.destination_config.clone(),
+            topics: self.topics.clone(),
+            queues: self.queues.clone(),
+            source_access_configurations: self.source_access_configurations.clone(),
+            self_managed_event_source: self.self_managed_event_source.clone(),
+            maximum_record_age_in_seconds: self.maximum_record_age_in_seconds,
+            bisect_batch_on_function_error: self.bisect_batch_on_function_error,
+            maximum_retry_attempts: self.maximum_retry_attempts,
+            tumbling_window_in_seconds: self.tumbling_window_in_seconds,
+            function_response_types: self.function_response_types.clone(),
+            amazon_managed_kafka_event_source_config: self
+                .amazon_managed_kafka_event_source_config
+                .clone(),
+            self_managed_kafka_event_source_config: self
+                .self_managed_kafka_event_source_config
+                .clone(),
+            document_db_event_source_config: self.document_db_event_source_config.clone(),
+            provisioned_poller_config: self.provisioned_poller_config.clone(),
+        }
+    }
+
+    /// What `ListEventSourceMappings` reports for this record.
+    ///
+    /// The ONE member a listing reports differently is the one the model says so about:
+    /// `FilterCriteria` is "null in the response of ListEventSourceMapping API calls"
+    /// when the criteria are encrypted — "You can view this field in plaintext in the
+    /// response of GetEventSourceMapping and DeleteEventSourceMapping calls if you have
+    /// kms:Decrypt permissions for the correct KMS key" — and a mapping's criteria are
+    /// encrypted exactly when it names a key to encrypt them with ("By default, Lambda
+    /// does not encrypt your filter criteria object. Specify this property to encrypt
+    /// data using your own customer managed key.").
+    #[must_use]
+    pub fn listed(&self) -> CreateEventSourceMappingOutput {
+        let mut reported = self.reported();
+        if self.kms_key_arn.is_some() {
+            reported.filter_criteria = None;
+        }
+        reported
+    }
+
+    /// Whether this mapping is one of the function `name` names, qualified by
+    /// `qualifier` when the caller qualified it.
+    ///
+    /// An unqualified reference names the FUNCTION, so it matches every mapping of it;
+    /// a qualified one names one version or alias of that function, so it matches only
+    /// the mappings created against that qualifier.
+    #[must_use]
+    pub fn is_of_function(&self, name: &str, qualifier: Option<&str>) -> bool {
+        self.function_name == name
+            && qualifier.is_none_or(|qualifier| {
+                self.function_qualifier.as_deref() == Some(qualifier)
+            })
+    }
+}
+
 /// Per-service state for com-amazonaws-lambda-awsgirapiservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsLambdaAwsgirapiserviceState {
@@ -1650,6 +2052,9 @@ pub struct ComAmazonawsLambdaAwsgirapiserviceState {
     /// Every capacity provider this emulator holds, keyed by provider name so
     /// `ListCapacityProviders` pages through them in a stable order.
     pub capacity_providers: BTreeMap<String, CapacityProviderRecord>,
+    /// Every event source mapping this emulator holds, keyed by its UUID so
+    /// `ListEventSourceMappings` pages through them in a stable order.
+    pub event_source_mappings: BTreeMap<String, EventSourceMappingRecord>,
 }
 
 /// One entry of a `ListFunctions` page: the key it is addressed by in the flattened
@@ -1663,15 +2068,19 @@ pub struct ListedFunction {
 }
 
 impl ComAmazonawsLambdaAwsgirapiserviceState {
-    /// Bring every function and every capacity provider up to whatever the clock has
-    /// already made due; see [`FunctionRecord::materialize`] and
-    /// [`CapacityProviderRecord::materialize`].
+    /// Bring every function, every capacity provider and every event source mapping up
+    /// to whatever the clock has already made due; see [`FunctionRecord::materialize`],
+    /// [`CapacityProviderRecord::materialize`] and
+    /// [`EventSourceMappingRecord::materialize`].
     pub fn materialize_all(&mut self, now: SystemTime) {
         for function in self.functions.values_mut() {
             function.materialize(now);
         }
         for provider in self.capacity_providers.values_mut() {
             provider.materialize(now);
+        }
+        for mapping in self.event_source_mappings.values_mut() {
+            mapping.materialize(now);
         }
     }
 
@@ -2041,11 +2450,23 @@ pub fn code_location_url(region: &str, name: &str, revision_id: &str) -> String 
 
 /// `at` as the ISO-8601 instant the model's `LastModified` member describes
 /// ("in ISO-8601 format (YYYY-MM-DDThh:mm:ss.sTZD)").
+///
+/// The subsecond field is TRUNCATED to whole milliseconds and rendered at a fixed three
+/// digits, so two instants this service reports always compare the same way as strings
+/// as they do as instants — two instants inside one millisecond render as the same
+/// string, so the order is not strict, but it is never reversed. The `DateTime`
+/// formatter trims trailing zeros instead, which makes one rendering a PREFIX of another
+/// (`…:43.848Z` against `…:43.848766Z`) and so reverses their order under a string
+/// comparison, and a caller reading `LastModified` of one resource twice, or of two
+/// resources, has only the string to order them by.
 #[must_use]
 pub fn iso8601(at: SystemTime) -> String {
-    ::aws_smithy_types::DateTime::from(at)
+    let instant = ::aws_smithy_types::DateTime::from(at);
+    let seconds = ::aws_smithy_types::DateTime::from_secs(instant.secs())
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let millis = instant.subsec_nanos() / 1_000_000;
+    format!("{}.{millis:03}Z", seconds.trim_end_matches('Z'))
 }
 
 /// The base64-encoded SHA-256 of `bytes`, which is what the model's `CodeSha256`
@@ -2194,6 +2615,9 @@ pub enum TaggableResourceRef {
     /// `…:capacity-provider:<name>` — one capacity provider, whose tag set is
     /// [`CapacityProviderRecord::tags`].
     CapacityProvider(String),
+    /// `…:event-source-mapping:<uuid>` — one event source mapping, whose tag set is
+    /// [`EventSourceMappingRecord::tags`].
+    EventSourceMapping(String),
     /// Another Lambda resource type the pattern admits, by its ARN resource type.
     Other(String),
 }
@@ -2216,10 +2640,10 @@ pub enum TaggableResourceRef {
 /// `service_common::arn::parse_of` for the fields when it does.
 ///
 /// [`TaggableResourceRef::Other`] is only a resource TYPE because this store holds no
-/// records of those types yet — whoever implements `CreateCodeSigningConfig`,
-/// `CreateEventSourceMapping` or the network-connector operations has to carry the type's
-/// id through here and turn the tag handlers' `Other` branch into a real lookup against
-/// the new records, the way a capacity provider is resolved here.
+/// records of those types yet — whoever implements `CreateCodeSigningConfig` or the
+/// network-connector operations has to carry the type's id through here and turn the tag
+/// handlers' `Other` branch into a real lookup against the new records, the way a
+/// capacity provider and an event source mapping are resolved here.
 #[must_use]
 pub fn parse_taggable_resource(value: &str) -> Option<TaggableResourceRef> {
     let arn = service_common::arn::parse_of(value, ARN_NAMESPACE)?;
@@ -2233,6 +2657,14 @@ pub fn parse_taggable_resource(value: &str) -> Option<TaggableResourceRef> {
         return Some(TaggableResourceRef::CapacityProvider(
             parse_capacity_provider_name(value)?,
         ));
+    }
+    // An event source mapping is named by `…:event-source-mapping:<uuid>`, and this store
+    // holds one record per mapping, so the ARN resolves to the UUID that record is keyed
+    // by.
+    if resource_type == "event-source-mapping" {
+        let uuid = service_common::arn::resource_id_of_type(value, resource_type)?;
+        return (!uuid.is_empty())
+            .then(|| TaggableResourceRef::EventSourceMapping(uuid.to_string()));
     }
     if resource_type != "function" {
         return Some(TaggableResourceRef::Other(resource_type.to_string()));
@@ -2309,6 +2741,44 @@ pub fn resolve_function<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reported_instant_sorts_as_a_string_exactly_as_it_does_as_an_instant() {
+        // `LastModified` is reported as a string, so a caller ordering two reads of it
+        // has only the string to order them by. The offsets are the subsecond values a
+        // trimming formatter renders at different widths: none at all, one nanosecond,
+        // a value whose trimmed rendering is a PREFIX of the next one, and each end of
+        // the field.
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_793_000_000);
+        let offsets = [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_millis(848),
+            Duration::from_nanos(848_766_000),
+            Duration::from_millis(999),
+            Duration::new(0, 999_999_999),
+            Duration::from_secs(1),
+        ];
+        let width = "2026-10-23T17:13:43.848Z".len();
+        let mut earlier: Option<(Duration, String)> = None;
+        for offset in offsets {
+            let rendered = iso8601(base + offset);
+            assert_eq!(
+                rendered.len(),
+                width,
+                "case {offset:?}: a reported instant is rendered at a fixed width, got \
+                 {rendered:?}"
+            );
+            if let Some((before, rendered_before)) = &earlier {
+                assert!(
+                    rendered_before.as_str() <= rendered.as_str(),
+                    "case {offset:?}: {rendered:?} is at or after {rendered_before:?} \
+                     ({before:?}) as an instant, so it must be as a string too"
+                );
+            }
+            earlier = Some((offset, rendered));
+        }
+    }
 
     #[test]
     fn every_documented_function_name_form_resolves_to_one_record() {
@@ -2398,8 +2868,8 @@ mod tests {
             (
                 "arn:aws:lambda:us-east-1:000000000000:event-source-mapping:\
                  12345678-1234-1234-1234-123456789012",
-                Some(TaggableResourceRef::Other(
-                    "event-source-mapping".to_string(),
+                Some(TaggableResourceRef::EventSourceMapping(
+                    "12345678-1234-1234-1234-123456789012".to_string(),
                 )),
             ),
             (
