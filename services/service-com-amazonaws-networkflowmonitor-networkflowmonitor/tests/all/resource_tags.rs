@@ -9,7 +9,8 @@
 //! resource of this service through one `resourceArn`, `ListTagsForResource`
 //! answers exactly the tag set the store holds for that resource, `TagResource`
 //! adds or replaces only the keys it names, `UntagResource` removes only the keys
-//! it names, and an ARN the store does not hold is the modelled 404 for all three.
+//! it names, a successful mutation answers 204 (it reports no content), and an ARN
+//! the store does not hold is the modelled 404 for all three.
 //! Every test asserts that over a SET of inputs — both taggable resource types
 //! (scope, monitor) and tag sets differing in count, key and value — so no row is
 //! privileged.
@@ -29,6 +30,10 @@ const MAX_TAG_KEY_LEN: usize = 128;
 /// `TagValue`'s own `@length` maximum, from the same shape (len 0..256).
 const MAX_TAG_VALUE_LEN: usize = 256;
 
+/// The status a successful tag mutation answers with: its output declares no
+/// members, so there is no content to report (`state::NO_CONTENT_SUCCESS_STATUS`).
+const NO_CONTENT: u16 = 204;
+
 /// `TagMap`'s own `@length` maximum (0..200): the most tags one resource can carry,
 /// and so the most any one request may leave it carrying.
 const MAX_TAGS: usize = 200;
@@ -36,7 +41,7 @@ const MAX_TAGS: usize = 200;
 /// The `/tags/{resourceArn}` path for an ARN. `resourceArn` is an `@httpLabel` on a
 /// NON-greedy label, so an SDK percent-encodes the ARN's `:` and `/` — this is what
 /// the service sees on the wire.
-fn tags_path(arn: &str) -> String {
+pub(crate) fn tags_path(arn: &str) -> String {
     let encoded: String = arn
         .chars()
         .map(|c| match c {
@@ -49,7 +54,7 @@ fn tags_path(arn: &str) -> String {
 
 /// The `/tags/{resourceArn}?tagKeys=...` path `UntagResource` is called on:
 /// `tagKeys` is an `@httpQuery` list, so each key is its own repeated parameter.
-fn untag_path(arn: &str, keys: &[&str]) -> String {
+pub(crate) fn untag_path(arn: &str, keys: &[&str]) -> String {
     let query: Vec<String> = keys.iter().map(|key| format!("tagKeys={key}")).collect();
     if query.is_empty() {
         tags_path(arn)
@@ -59,29 +64,29 @@ fn untag_path(arn: &str, keys: &[&str]) -> String {
 }
 
 impl Emulator {
-    async fn list_tags(&self, arn: &str) -> Answer {
+    pub(crate) async fn list_tags(&self, arn: &str) -> Answer {
         self.call("GET", &tags_path(arn), None).await
     }
 
-    async fn tag_resource(&self, arn: &str, tags: &Value) -> Answer {
+    pub(crate) async fn tag_resource(&self, arn: &str, tags: &Value) -> Answer {
         self.call("POST", &tags_path(arn), Some(json!({ "tags": tags })))
             .await
     }
 
-    async fn untag_resource(&self, arn: &str, keys: &[&str]) -> Answer {
+    pub(crate) async fn untag_resource(&self, arn: &str, keys: &[&str]) -> Answer {
         self.call("DELETE", &untag_path(arn, keys), None).await
     }
 }
 
 /// A created, taggable resource: the ARN the tagging operations address it by, and
 /// how to read the record back through the reader that already serves it.
-enum Resource {
+pub(crate) enum Resource {
     Scope { arn: String, scope_id: String },
     Monitor { arn: String, name: String },
 }
 
 impl Resource {
-    fn arn(&self) -> &str {
+    pub(crate) fn arn(&self) -> &str {
         match self {
             Self::Scope { arn, .. } | Self::Monitor { arn, .. } => arn.as_str(),
         }
@@ -89,7 +94,7 @@ impl Resource {
 
     /// The record itself, through `GetScope`/`GetMonitor` — so a tag write is
     /// proved to have landed on the resource and not in a store of its own.
-    async fn read(&self, emulator: &Emulator) -> Answer {
+    pub(crate) async fn read(&self, emulator: &Emulator) -> Answer {
         match self {
             Self::Scope { scope_id, .. } => emulator.get_scope(scope_id).await,
             Self::Monitor { name, .. } => emulator.get_monitor(name).await,
@@ -100,16 +105,21 @@ impl Resource {
 /// The two taggable resource types this service mints, as a table dimension: every
 /// rule below holds for both, because both are reached through `resourceArn`.
 #[derive(Clone, Copy, Debug)]
-enum Kind {
+pub(crate) enum Kind {
     Scope,
     Monitor,
 }
 
-const KINDS: &[Kind] = &[Kind::Scope, Kind::Monitor];
+pub(crate) const KINDS: &[Kind] = &[Kind::Scope, Kind::Monitor];
 
 /// Create a resource of `kind` carrying `tags` (absent when `None`), and answer
 /// with what addresses and reads it.
-async fn create(emulator: &Emulator, kind: Kind, seed: u32, tags: Option<&Value>) -> Resource {
+pub(crate) async fn create(
+    emulator: &Emulator,
+    kind: Kind,
+    seed: u32,
+    tags: Option<&Value>,
+) -> Resource {
     match kind {
         Kind::Scope => {
             let mut body = json!({
@@ -330,8 +340,8 @@ async fn tagging_and_untagging_change_exactly_the_keys_they_name() {
                 Call::Untag(keys) => emulator.untag_resource(resource.arn(), keys).await,
             };
             assert_eq!(
-                answer.status, 200,
-                "case {kind:?}/{case:?}: expected 200, got {} with body {}",
+                answer.status, NO_CONTENT,
+                "case {kind:?}/{case:?}: expected {NO_CONTENT}, got {} with body {}",
                 answer.status, answer.body
             );
 
@@ -482,7 +492,7 @@ async fn a_merge_past_the_published_tag_maximum_is_refused() {
         let full = many_tags(MAX_TAGS, "x");
         let accepted = emulator.tag_resource(resource.arn(), &full).await;
         assert_eq!(
-            accepted.status, 200,
+            accepted.status, NO_CONTENT,
             "case {kind:?}: {MAX_TAGS} tags is at the bound, got {} with body {}",
             accepted.status, accepted.body
         );
@@ -493,7 +503,7 @@ async fn a_merge_past_the_published_tag_maximum_is_refused() {
             .tag_resource(resource.arn(), &json!({ "key-000": "replaced" }))
             .await;
         assert_eq!(
-            replace.status, 200,
+            replace.status, NO_CONTENT,
             "case {kind:?}: replacing a key keeps the set at {MAX_TAGS}, got {} with body {}",
             replace.status, replace.body
         );

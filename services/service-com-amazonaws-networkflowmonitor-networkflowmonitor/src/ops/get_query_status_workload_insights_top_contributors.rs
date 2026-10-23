@@ -166,6 +166,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+
+        // The FORM of the `scopeId` first: a value that cannot be an identifier this
+        // service generates is the modelled 400, decided before the store is reached.
+        if !crate::state::is_scope_id(&input.scope_id) {
+            return Err(
+                GetQueryStatusWorkloadInsightsTopContributorsErrorModeled::ValidationException(
+                    crate::state::invalid_scope_id(),
+                )
+                .into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 GetQueryStatusWorkloadInsightsTopContributorsErrorModeled::InternalServerException(
@@ -177,6 +189,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = state.lock();
         state.settle(::std::time::SystemTime::now());
+
+        // The scope the query hangs off, before the query itself: this operation
+        // models no `ResourceNotFoundException`, so a well-formed scope reference the
+        // store cannot resolve — and therefore cannot authorize — is the modelled
+        // 403 rather than a refusal naming the `queryId`.
+        if !state.scopes.contains_key(&input.scope_id) {
+            return Err(
+                GetQueryStatusWorkloadInsightsTopContributorsErrorModeled::AccessDeniedException(
+                    crate::state::reference_denied(crate::state::SCOPE_RESOURCE),
+                )
+                .into(),
+            );
+        }
 
         let Some(query) = state.query(
             crate::state::QueryKind::WorkloadInsightsTopContributors,

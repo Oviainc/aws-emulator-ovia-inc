@@ -9,20 +9,24 @@
 //! poll.
 //!
 //! Two things this slice deliberately does NOT emulate, so a reader does not
-//! mistake a modelled error for reachable behaviour: authorization (every
-//! operation models `AccessDeniedException`, and the emulator holds no principals
-//! to evaluate, so no handler constructs it) and throttling
-//! (`ThrottlingException`, likewise). The emulator verifies request signatures in
-//! the framework, before any handler runs.
+//! mistake a modelled error for reachable behaviour: PRINCIPAL authorization (the
+//! emulator holds no principals to evaluate, so no handler decides what a caller
+//! may do) and throttling (`ThrottlingException`, likewise). The emulator verifies
+//! request signatures in the framework, before any handler runs.
+//!
+//! `AccessDeniedException` is still reachable, for the one condition that does not
+//! need a principal: an operation that models no `ResourceNotFoundException` cannot
+//! report a reference to a scope or a monitor the store does not hold as an absence,
+//! and a reference it cannot resolve it also cannot authorize, so that is the
+//! modelled 403 ([`reference_denied`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ConflictException, CreateMonitorInput, CreateScopeInput, InternalServerException,
-    MonitorLocalResource, MonitorRemoteResource, ResourceNotFoundException,
-    ServiceQuotaExceededException, TargetId, TargetResource, UpdateMonitorInput,
-    ValidationException,
+    AccessDeniedException, ConflictException, CreateMonitorInput, CreateScopeInput,
+    InternalServerException, MonitorLocalResource, MonitorRemoteResource, ResourceNotFoundException,
+    ServiceQuotaExceededException, TargetId, TargetResource, UpdateMonitorInput, ValidationException,
 };
 
 /// The Region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -114,6 +118,24 @@ pub const QUERY_COMPLETION_DELAY: Duration = Duration::from_millis(500);
 
 /// What a `queryId` names in the modelled errors of the query operations.
 pub const QUERY_RESOURCE: &str = "query";
+
+/// The HTTP status a successful TAG MUTATION of this service answers with.
+///
+/// `TagResource` and `UntagResource` leave their success code defaulted in the model
+/// (`@http` carries no `code:`, i.e. `codeDefaulted: true`,
+/// `smithy_query(query="operation",operation="TagResource,UntagResource")`), so the
+/// Smithy default of 200 is not a statement about this service: the status of a
+/// bodiless success is a BEHAVIOURAL fact, and the recorded AWS responses are what
+/// state it — a successful tag write answers 204 No Content, because its output shape
+/// (`TagResourceOutput`/`UntagResourceOutput`) declares no members and there is
+/// nothing for a client to parse. A 200 there promises an entity the response does not
+/// carry, so every client path gated on 204 takes the wrong branch.
+///
+/// This is NOT extended to the other operations of this model whose output structure
+/// is also memberless (`DeleteScope`, `DeleteMonitor`, `StopQuery*`): their codes are
+/// defaulted too, no recorded response in this corpus states their status, and the
+/// model's 200 is all there is to go on until one does.
+pub const NO_CONTENT_SUCCESS_STATUS: u16 = 204;
 
 /// The most entries one monitor's `localResources` or `remoteResources` list
 /// holds, and the most entries one request may name in any ONE of its resource
@@ -974,6 +996,26 @@ pub fn scope_id(sequence: u64) -> String {
     format!("00000000-0000-4000-8000-{sequence:012x}")
 }
 
+/// Whether `value` has the FORM of a `scopeId`: 8-4-4-4-12 groups of hex digits, the
+/// UUID shape the real service's "internally-generated identifier"s take and the one
+/// [`scope_id`] mints, so no id this store holds is ever refused by this check.
+///
+/// `ScopeId` carries no `@pattern`, so nothing before a handler runs checks the form —
+/// but the form is still part of the request's SHAPE: a value that cannot be an
+/// identifier this service generates names no scope under any state of the store, and
+/// is refused as a bad request ([`invalid_scope_id`]) rather than looked up. Hex is
+/// accepted in either case, so a client that upper-cases a UUID it was handed is not
+/// told its request is malformed.
+pub fn is_scope_id(value: &str) -> bool {
+    let mut groups = value.split('-');
+    let well_formed = [8usize, 4, 4, 4, 12].iter().all(|len| {
+        groups.next().is_some_and(|group| {
+            group.len() == *len && group.chars().all(|c| c.is_ascii_hexdigit())
+        })
+    });
+    well_formed && groups.next().is_none()
+}
+
 /// A `queryId` for sequence number `sequence`.
 ///
 /// `queryId` is a plain `String` in the model with no pattern, and the real
@@ -1110,6 +1152,42 @@ pub fn quota_exceeded(resource_type: &str, limit: usize) -> ServiceQuotaExceeded
 pub fn field_validation(member: &str, message: impl Into<String>) -> ValidationException {
     ValidationException {
         message: Some(format!("{member}: {}", message.into())),
+    }
+}
+
+/// The wording a `scopeId` that is not of the generated form is refused with.
+///
+/// The status (400) and the code (`ValidationException`) are the contract; the text is
+/// the fixed sentence the real service answers this condition with, recorded rather
+/// than built from the request, which is why it is a constant and echoes nothing of
+/// the `scopeId` that failed.
+pub const INVALID_SCOPE_ID: &str = "The provided Scope ARN is not valid";
+
+/// The modelled 400 for a `scopeId` whose FORM is not one this service generates
+/// ([`is_scope_id`]).
+///
+/// Raised BEFORE the store is consulted: a malformed identifier is a fault in the
+/// request itself (the client's own bug, never retryable), and reporting it as the
+/// absence of a resource (404) would tell a reconciling client to retry or recreate.
+pub fn invalid_scope_id() -> ValidationException {
+    ValidationException {
+        message: Some(INVALID_SCOPE_ID.to_string()),
+    }
+}
+
+/// The modelled 403 for a reference to a scope or a monitor the store does not hold,
+/// on an operation whose model declares NO `ResourceNotFoundException`.
+///
+/// Those operations cannot report an unresolvable reference as an absence, and a
+/// reference the service cannot resolve it also cannot authorize — a scope and a
+/// monitor each carry their own ARN, and so their own resource-level permission — so
+/// the refusal is the modelled `AccessDeniedException` (403) rather than a 400, which
+/// belongs to a request this service would refuse whatever the store held. The text is
+/// built from the resource TYPE the request named, in the wording the real service
+/// answers this condition with.
+pub fn reference_denied(resource_type: &str) -> AccessDeniedException {
+    AccessDeniedException {
+        message: Some(format!("{resource_type} supplied doesn't exist")),
     }
 }
 
