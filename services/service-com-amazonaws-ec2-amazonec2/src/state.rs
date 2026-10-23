@@ -189,6 +189,16 @@
 //! [`ComAmazonawsEc2Amazonec2State::vpc_endpoint_connection_moves`] holds the instant the
 //! clock owes it `Available`.
 //!
+//! That pair of bounds — a count ceiling the writer itself re-checks, and a per-record byte
+//! floor so a record carrying no tags is not free — is the rule for EVERY store nothing in
+//! this emulator reclaims, not just this one. The writers of the transit gateway
+//! attachments, multicast domains and route table announcements, the VPC endpoint services
+//! and endpoints, and the IPAM pools answer `None` past [`MAX_STORED_RECORDS_PER_STORE`]
+//! and charge [`STORED_RECORD_OVERHEAD_BYTES`] on top of the caller-chosen bytes they hold,
+//! so repeated writes cannot grow this process's memory without bound whatever the records
+//! carry. The Allowed AMIs settings are bounded the same way
+//! ([`MAX_ALLOWED_IMAGES_SETTINGS_REGIONS`] and [`image_criteria_payload_bytes`]).
+//!
 //! ## VPC endpoints, endpoint services, transit gateway attachments and IPAM pools
 //!
 //! Each of these is held as the modelled shape its own operations report —
@@ -237,6 +247,27 @@
 //! [`ComAmazonawsEc2Amazonec2State::insert_image`]. Each one's `CreationDate` is the build
 //! date its published name carries, so it is the same across reads and across runs and the
 //! newest image of a name pattern is always the same image.
+//!
+//! ## Allowed AMIs is an account-and-Region SETTING, not a resource
+//!
+//! [`ComAmazonawsEc2Amazonec2State::allowed_images_settings`] holds the Allowed AMIs
+//! setting of the account "at the account level in the specified Region"
+//! (`GetAllowedImagesSettings`) as an [`AllowedImagesSettings`], keyed by the Region the
+//! request that wrote it was signed for ([`request_region`]) — the one thing a request
+//! says about the Region it is asking in. It is not a resource: nothing mints or deletes
+//! one, so a Region nobody has configured has NO entry and reports
+//! [`AllowedImagesSettings::default`] — the `disabled` state with no criteria, which is
+//! what an account that has never enabled the feature has. `GetAllowedImagesSettings`
+//! therefore writes nothing at all, the way `DescribeAvailabilityZones` does.
+//!
+//! The two facts the setting carries move independently, which is why one record holds
+//! both: `EnableAllowedImagesSettings` / `DisableAllowedImagesSettings` move the state and
+//! leave the criteria alone (`GetAllowedImagesSettings` reports "the current state of the
+//! Allowed AMIs setting AND the list of Allowed AMIs criteria" whichever state it is in),
+//! and `ReplaceImageCriteriaInAllowedImagesSettings` replaces the criteria and leaves the
+//! state alone. The criteria are stored as the modelled [`ImageCriterion`] shape the get
+//! reports, so the request shapes a replace carries are converted once, where they are
+//! validated, rather than at every read.
 //!
 //! ## The default VPC's default subnets
 //!
@@ -374,7 +405,7 @@ use crate::ops::types::{
     StorageLocation, VolumeRecycleBinInfo,
     CreateVolumeOutput, DescribeFastLaunchImagesSuccessItem, DisableFastLaunchOutput,
     EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
-    Instance, InstanceApplicationStatus, IpamPool,
+    ImageCriterion, Instance, InstanceApplicationStatus, IpamPool,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, Monitoring, OperatorResponse, PeeringAttachmentStatus, Placement,
     PrivateDnsNameOptionsOnLaunch,
@@ -1191,6 +1222,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs. Ordered by endpoint id, which is the order
     /// `DescribeVpcEndpointConnections` reports and pages over.
     pub vpc_endpoint_connections: BTreeMap<String, VpcEndpointConnection>,
+    /// The account's Allowed AMIs setting in each Region a caller has configured it in, by
+    /// Region name — see the module docs. A Region with no entry has the setting an account
+    /// that never enabled the feature has ([`AllowedImagesSettings::default`]), so a read
+    /// never has to store one.
+    pub allowed_images_settings: BTreeMap<String, AllowedImagesSettings>,
     /// Every Amazon FPGA Image (AFI) the account holds, by `FpgaImageId` — see
     /// [`FpgaImageRecord`]. Ordered by id, which is the order a report of them pages over.
     pub fpga_images: BTreeMap<String, FpgaImageRecord>,
@@ -1321,6 +1357,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
+            allowed_images_settings: BTreeMap::new(),
             fpga_images: BTreeMap::new(),
             fpga_image_client_tokens: HashMap::new(),
             volumes_in_recycle_bin: BTreeMap::new(),
@@ -5890,8 +5927,12 @@ impl ComAmazonawsEc2Amazonec2State {
             // image this store has only just published reports none.
             last_launched_time: None,
             // "If `true`, the AMI satisfies the criteria for Allowed AMIs"
-            // (`Image$ImageAllowed`). This account declares no Allowed AMIs criteria, so
-            // every image it can see satisfies them.
+            // (`Image$ImageAllowed`), which is the value of an account whose Allowed AMIs
+            // criteria every image satisfies — among them an account that declares none,
+            // which is what [`Self::allowed_images_settings`] starts empty at. Evaluating
+            // stored criteria against an image is `DescribeImages`'s own behaviour and the
+            // `ImageCriterion` matcher it would need does not exist yet, so nothing writes
+            // another value here.
             image_allowed: Some(true),
             // Set only for an image copied from another (`CopyImage`).
             source_image_id: None,
@@ -10899,3 +10940,311 @@ impl ComAmazonawsEc2Amazonec2State {
         stored
     }
 }
+
+// ---------------------------------------------------------------------------
+// Allowed AMIs: the account's image-criteria setting in one Region
+// ---------------------------------------------------------------------------
+//
+// See the module docs for why this is a SETTING keyed by Region rather than a resource,
+// and why one record holds both the state and the criteria. The words below are members
+// of the model's own enums, named here so the four operations that read or write the
+// setting cannot spell one value two ways.
+
+/// The Allowed AMIs state of an account that has not enabled the feature, and the one
+/// `DisableAllowedImagesSettings` moves it to: the `AllowedImagesSettingsDisabledState`
+/// enum's only member, `disabled` — "All AMIs are allowed"
+/// (`GetAllowedImagesSettingsResult$State`). The generated catalog is
+/// `crate::ops::types::ALLOWED_IMAGES_SETTINGS_DISABLED_STATE_VALUES`.
+pub const ALLOWED_IMAGES_SETTINGS_DISABLED: &str = "disabled";
+
+/// `AllowedImagesSettingsEnabledState`'s `enabled` member — "Only AMIs matching the image
+/// criteria are discoverable and available for use". The generated catalog of the two
+/// states an enable accepts is
+/// `crate::ops::types::ALLOWED_IMAGES_SETTINGS_ENABLED_STATE_VALUES`.
+pub const ALLOWED_IMAGES_SETTINGS_ENABLED: &str = "enabled";
+
+/// `AllowedImagesSettingsEnabledState`'s `audit-mode` member — "All AMIs are allowed, but
+/// the ImageAllowed field is set to true if the AMI would be allowed with the current list
+/// of criteria if allowed AMIs was enabled" (see [`ALLOWED_IMAGES_SETTINGS_ENABLED`] for
+/// the catalog).
+pub const ALLOWED_IMAGES_SETTINGS_AUDIT_MODE: &str = "audit-mode";
+
+// The entity that manages the setting is `ManagedBy`'s `account` member for Allowed AMIs
+// exactly as it is for snapshot block public access — "the Allowed AMIs settings is managed
+// by the account" (`GetAllowedImagesSettingsResult$ManagedBy`), the account being the only
+// writer of either setting this emulator has — so this crate spells it once, as
+// [`MANAGED_BY_ACCOUNT`] above, and `GetAllowedImagesSettings` reports that constant.
+
+/// The most `ImageCriterion` entries one Allowed AMIs setting may carry.
+///
+/// `ImageCriterionRequest`'s own doc: "The `ImageCriteria` can include up to: 10
+/// `ImageCriterion`". The model declares no `@length` on `ImageCriterionRequestList`, so
+/// the handler is the only place the bound can be enforced.
+pub const MAX_IMAGE_CRITERIA: usize = 10;
+
+/// The most `ImageProviders` values one `ImageCriterion` may carry: "Maximum: 200 values"
+/// (`ImageCriterionRequest$ImageProviders`).
+pub const MAX_IMAGE_PROVIDERS_PER_CRITERION: usize = 200;
+
+/// The most `ImageNames` values one `ImageCriterion` may carry: "Maximum: 50 values"
+/// (`ImageCriterionRequest$ImageNames`).
+pub const MAX_IMAGE_NAMES_PER_CRITERION: usize = 50;
+
+/// The most `MarketplaceProductCodes` values one `ImageCriterion` may carry: "Maximum: 50
+/// values" (`ImageCriterionRequest$MarketplaceProductCodes`).
+pub const MAX_MARKETPLACE_PRODUCT_CODES_PER_CRITERION: usize = 50;
+
+/// The most `ImageWatermarks` entries one `ImageCriterion` may carry: "50 values for
+/// `ImageWatermarks`" (`ImageCriterionRequest`'s own doc).
+pub const MAX_IMAGE_WATERMARKS_PER_CRITERION: usize = 50;
+
+/// The image-provider words `ImageProviders` accepts beside an account id and
+/// [`IMAGE_PROVIDER_NONE`]: "`amazon`: Allow AMIs created by Amazon or verified providers.
+/// `aws-marketplace`: Allow AMIs created by verified providers in the Amazon Web Services
+/// Marketplace. `aws-backup-vault`: Allow AMIs created by Amazon Web Services Backup"
+/// (`ImageCriterionRequest$ImageProviders`).
+///
+/// The same three aliases `DescribeImages`'s `Owners` accepts ([`IMAGE_OWNER_ALIASES`]),
+/// which is why that catalog is the one read here rather than a second copy.
+pub const IMAGE_PROVIDER_ALIASES: &[&str] = &IMAGE_OWNER_ALIASES;
+
+/// The `ImageProviders` word that stands for the account itself: "`none`: Allow AMIs
+/// created by your own account only. When `none` is specified, no other values can be
+/// specified" (`ImageCriterionRequest$ImageProviders`).
+pub const IMAGE_PROVIDER_NONE: &str = "none";
+
+/// The fewest characters an `ImageNames` value may carry: "Length: 1–128 characters"
+/// (`ImageCriterionRequest$ImageNames`).
+pub const MIN_IMAGE_NAME_CRITERION_CHARS: usize = 1;
+
+/// The most characters an `ImageNames` value may carry: the ceiling of that same
+/// documented "Length: 1–128 characters".
+///
+/// Enforced by this crate rather than relied on from the model: the `@length` the model
+/// carries sits on `ImageNameCriteriaRequestList`'s member, and a handler must not depend on
+/// where the request walk happens to apply it — without a per-STRING ceiling every stored
+/// name would be caller-sized.
+pub const MAX_IMAGE_NAME_CRITERION_CHARS: usize = 128;
+
+/// The fewest characters an `ImageNames` value carrying a `?` wildcard may have: "With
+/// `?`, the minimum is 3 characters" (`ImageCriterionRequest$ImageNames`).
+pub const MIN_IMAGE_NAME_CRITERION_CHARS_WITH_WILDCARD: usize = 3;
+
+/// The special characters an `ImageNames` value may carry beside letters, numbers and
+/// spaces: "Special characters: `( ) [ ] . / - ' @ _ * ?`"
+/// (`ImageCriterionRequest$ImageNames`).
+pub const IMAGE_NAME_CRITERION_SPECIAL_CHARACTERS: &str = "()[]./-'@_*?";
+
+/// The fewest characters a `MarketplaceProductCodes` value may carry: "Length: 1-25
+/// characters" (`ImageCriterionRequest$MarketplaceProductCodes`).
+pub const MIN_MARKETPLACE_PRODUCT_CODE_CHARS: usize = 1;
+
+/// The most characters a `MarketplaceProductCodes` value may carry (see
+/// [`MIN_MARKETPLACE_PRODUCT_CODE_CHARS`]); the model declares no `@length` for it.
+pub const MAX_MARKETPLACE_PRODUCT_CODE_CHARS: usize = 25;
+
+/// The most characters one `ImageWatermarkFilter` pattern — a `WatermarkKey` or a
+/// `SourceImageRegion` — may carry.
+///
+/// CHOSEN, not an AWS-documented length: the model bounds neither, and both are
+/// caller-chosen strings this store keeps. A watermark key is an `accountId:name` and a
+/// source image region is a Region name, with `*` and `?` wildcards allowed in either, so
+/// this is far above anything either form needs while keeping one stored setting's size
+/// finite.
+pub const MAX_IMAGE_WATERMARK_PATTERN_CHARS: usize = 128;
+
+/// The most Regions this emulator holds an Allowed AMIs setting for.
+///
+/// [`MAX_STORED_RECORDS_PER_STORE`] is the crate's ceiling for a store nothing reclaims, and
+/// this store is bounded by it like every other: a setting is keyed by the Region of the
+/// request's own SigV4 credential scope, so without a ceiling a caller could write a setting
+/// for unboundedly many Region names. The bytes each setting holds are charged against
+/// [`MAX_STORED_BYTES`] on top of that ([`image_criteria_payload_bytes`]), so neither the
+/// number of settings nor their size is unbounded.
+pub const MAX_ALLOWED_IMAGES_SETTINGS_REGIONS: usize = MAX_STORED_RECORDS_PER_STORE;
+
+/// The account's Allowed AMIs setting in ONE Region: the state the feature is in, and the
+/// criteria that are evaluated when it is applied.
+///
+/// Held in [`ComAmazonawsEc2Amazonec2State::allowed_images_settings`] under the Region's
+/// name. The criteria are the modelled [`ImageCriterion`] shape `GetAllowedImagesSettings`
+/// reports, so a replace converts and validates the request shapes once rather than at
+/// every read.
+#[derive(Debug, Clone)]
+pub struct AllowedImagesSettings {
+    /// "The current state of the Allowed AMIs setting at the account level in the specified
+    /// Amazon Web Services Region" (`GetAllowedImagesSettingsResult$State`): one of
+    /// [`ALLOWED_IMAGES_SETTINGS_DISABLED`], [`ALLOWED_IMAGES_SETTINGS_ENABLED`] or
+    /// [`ALLOWED_IMAGES_SETTINGS_AUDIT_MODE`].
+    pub state: String,
+    /// "The list of criteria for images that are discoverable and usable in the account in
+    /// the specified Amazon Web Services Region"
+    /// (`GetAllowedImagesSettingsResult$ImageCriteria`), at most
+    /// [`MAX_IMAGE_CRITERIA`] of them.
+    pub image_criteria: Vec<ImageCriterion>,
+}
+
+/// The setting of a Region nobody has configured: `disabled` — "All AMIs are allowed" — with
+/// no criteria, which is what an account that has never enabled Allowed AMIs has.
+impl Default for AllowedImagesSettings {
+    fn default() -> Self {
+        Self {
+            state: ALLOWED_IMAGES_SETTINGS_DISABLED.to_string(),
+            image_criteria: Vec::new(),
+        }
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The Allowed AMIs setting of `region` as it stands.
+    ///
+    /// A READ: a Region with no stored setting answers [`AllowedImagesSettings::default`]
+    /// without storing it, so `GetAllowedImagesSettings` cannot change what a later caller
+    /// sees.
+    pub fn allowed_images_settings_in(&self, region: &str) -> Cow<'_, AllowedImagesSettings> {
+        match self.allowed_images_settings.get(region) {
+            Some(settings) => Cow::Borrowed(settings),
+            None => Cow::Owned(AllowedImagesSettings::default()),
+        }
+    }
+
+    /// Move the state of `region`'s Allowed AMIs setting to `state`, leaving its criteria as
+    /// they stand — what `EnableAllowedImagesSettings` and `DisableAllowedImagesSettings`
+    /// do.
+    ///
+    /// `Err` means NOTHING was stored and the writer must refuse the request; see
+    /// [`AllowedImagesSettingsFull`].
+    pub fn set_allowed_images_settings_state(
+        &mut self,
+        region: &str,
+        state: &str,
+    ) -> Result<(), AllowedImagesSettingsFull> {
+        self.allowed_images_settings_entry(region)?.state = state.to_string();
+        Ok(())
+    }
+
+    /// Replace the image criteria of `region`'s Allowed AMIs setting, leaving its state as it
+    /// stands — what `ReplaceImageCriteriaInAllowedImagesSettings` does.
+    ///
+    /// The bytes the new criteria hold are charged against [`MAX_STORED_BYTES`] and the ones
+    /// the criteria they replace held are given back, so a store that is replaced over and
+    /// over does not drift, and a replace that would cross the budget is refused with
+    /// NOTHING stored ([`AllowedImagesSettingsFull::Bytes`]).
+    pub fn set_allowed_images_criteria(
+        &mut self,
+        region: &str,
+        criteria: Vec<ImageCriterion>,
+    ) -> Result<(), AllowedImagesSettingsFull> {
+        let requested = image_criteria_payload_bytes(&criteria);
+        let released = self
+            .allowed_images_settings
+            .get(region)
+            .map_or(0, |settings| {
+                image_criteria_payload_bytes(&settings.image_criteria)
+            });
+        // Only the GROWTH has to fit: a replace gives the bytes of the criteria it replaces
+        // back, so the charge is the difference.
+        if self.would_exceed_stored_bytes(requested.saturating_sub(released)) {
+            return Err(AllowedImagesSettingsFull::Bytes { requested });
+        }
+        self.allowed_images_settings_entry(region)?.image_criteria = criteria;
+        self.release_stored_bytes(released);
+        self.add_stored_bytes(requested);
+        Ok(())
+    }
+
+    /// The Allowed AMIs setting of `region` to write to, started at
+    /// [`AllowedImagesSettings::default`] when the Region has none yet and charged
+    /// [`STORED_RECORD_OVERHEAD_BYTES`] for the record it adds, the way every other store's
+    /// writer charges for one.
+    ///
+    /// `Err` once the store holds settings for [`MAX_ALLOWED_IMAGES_SETTINGS_REGIONS`] other
+    /// Regions: a writer refuses rather than growing past the ceiling. Private, so the two
+    /// public writers above are the only way a setting is written and neither can skip the
+    /// ceiling or the charge.
+    fn allowed_images_settings_entry(
+        &mut self,
+        region: &str,
+    ) -> Result<&mut AllowedImagesSettings, AllowedImagesSettingsFull> {
+        if !self.allowed_images_settings.contains_key(region) {
+            if self.allowed_images_settings.len() >= MAX_ALLOWED_IMAGES_SETTINGS_REGIONS {
+                return Err(AllowedImagesSettingsFull::Regions);
+            }
+            self.add_stored_bytes(STORED_RECORD_OVERHEAD_BYTES);
+        }
+        Ok(self
+            .allowed_images_settings
+            .entry(region.to_string())
+            .or_default())
+    }
+}
+
+/// Why a write to an Allowed AMIs setting was refused, with NOTHING stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowedImagesSettingsFull {
+    /// The store already holds the settings of
+    /// [`MAX_ALLOWED_IMAGES_SETTINGS_REGIONS`] other Regions.
+    Regions,
+    /// The criteria would take the store past [`MAX_STORED_BYTES`]; `requested` is what they
+    /// would have cost.
+    Bytes {
+        /// The bytes the refused criteria would have held.
+        requested: usize,
+    },
+}
+
+/// The caller-chosen bytes one Allowed AMIs criteria list holds: its image providers, image
+/// names, Marketplace product codes and watermark patterns. The day conditions are two
+/// integers bounded by the model's own range, so they are fixed-size.
+///
+/// The ONE definition of that charge, the way [`vpc_endpoint_connection_payload_bytes`] is
+/// for a connection: a writer charges exactly it, and a replace gives back exactly what the
+/// criteria it replaces cost.
+pub fn image_criteria_payload_bytes(criteria: &[ImageCriterion]) -> usize {
+    let text_bytes = |values: Option<&Vec<String>>| -> usize {
+        values.into_iter().flatten().map(String::len).sum()
+    };
+    criteria
+        .iter()
+        .map(|criterion| {
+            let watermark_bytes: usize = criterion
+                .image_watermarks
+                .iter()
+                .flatten()
+                .map(|watermark| {
+                    watermark.watermark_key.as_deref().unwrap_or_default().len()
+                        + watermark
+                            .source_image_region
+                            .as_deref()
+                            .unwrap_or_default()
+                            .len()
+                })
+                .sum();
+            text_bytes(criterion.image_providers.as_ref())
+                .saturating_add(text_bytes(criterion.image_names.as_ref()))
+                .saturating_add(text_bytes(criterion.marketplace_product_codes.as_ref()))
+                .saturating_add(watermark_bytes)
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
+/// Refuse a write to an Allowed AMIs setting this emulator has no room for: HTTP 400, EC2's
+/// `InvalidParameterValue`.
+///
+/// A bad request rather than a server error: nothing is wrong with the emulator, the Region
+/// and the criteria are values of the request, and a retry of the same request would be
+/// refused the same way.
+pub fn allowed_images_settings_full<E>(region: &str, full: AllowedImagesSettingsFull) -> Scaffolded<E> {
+    match full {
+        AllowedImagesSettingsFull::Regions => invalid_parameter_value(format!(
+            "This emulator holds the Allowed AMIs settings of \
+             {MAX_ALLOWED_IMAGES_SETTINGS_REGIONS} Regions, which is as many as it stores, so \
+             it cannot store the settings of '{region}' too"
+        )),
+        AllowedImagesSettingsFull::Bytes { requested } => invalid_parameter_value(format!(
+            "The image criteria carry {requested} bytes, which this emulator has no room for: \
+             it stores at most {MAX_STORED_BYTES} bytes of caller-supplied data"
+        )),
+    }
+}
+

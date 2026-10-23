@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReplaceImageCriteriaInAllowedImagesSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReplaceImageCriteriaInAllowedImagesSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReplaceImageCriteriaInAllowedImagesSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the account's Allowed AMIs image criteria in the Region the request was signed for,
+//! in [`crate::state`], replacing whatever criteria it held. A MUTATION: this call is what
+//! sets them.
+//!
+//! It replaces the CRITERIA only — the state of the setting beside them is untouched, so
+//! criteria can be set before the feature is enabled and are what a later enable applies.
+//! The request shapes are validated and converted into the modelled [`ImageCriterion`]
+//! shape `GetAllowedImagesSettings` reports HERE, once, so the store holds exactly what a
+//! read answers with.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +142,325 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReplaceImageCriteriaInAllowedImagesSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReplaceImageCriteriaInAllowedImagesSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReplaceImageCriteriaInAllowedImagesSettings"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{allowed_images_settings_full, request_region, require_service_state};
+
+        // "Sets or replaces the criteria for Allowed AMIs": the list the request carries
+        // becomes the whole set, so a request that carries none replaces the stored criteria
+        // with none. Validated and converted BEFORE anything is read or written, so a
+        // refusal leaves the settings exactly as they stood.
+        let criteria = validated_criteria(input.image_criteria.as_deref().unwrap_or_default())?;
+
+        // DryRun sits AFTER every member has been validated and BEFORE the write: the flag
+        // asks whether the request WOULD have succeeded, so one that would have been refused
+        // is refused with that reason instead, and one that would have succeeded leaves the
+        // stored criteria untouched. Of the member's two documented outcomes only
+        // `DryRunOperation` ("if you have the required permissions") can be answered here:
+        // this emulator models no principal permissions, so there is no caller for
+        // `UnauthorizedOperation` to describe.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The criteria are the ones "evaluated to determine whether AMIs are discoverable
+        // and usable in the account in the specified Amazon Web Services Region": the Region
+        // this request was signed for is the one they are set in.
+        let region = request_region(ctx.parts());
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        store
+            .set_allowed_images_criteria(&region, criteria)
+            .map_err(|full| allowed_images_settings_full(&region, full))?;
+
+        // "Returns `true` if the request succeeds; otherwise, it returns an error."
+        Ok(ReplaceImageCriteriaInAllowedImagesSettingsOutput {
+            return_value: Some(true),
+        })
     }
+}
+
+/// The criteria `requested` asks for, as the modelled shape a read reports — or EC2's
+/// refusal of the first value that is outside what the model and the member docs allow.
+///
+/// The documented maxima this holds the request to come from `ImageCriterionRequest`'s own
+/// doc and its members': at most [`MAX_IMAGE_CRITERIA`] criteria, each with at most
+/// [`MAX_IMAGE_PROVIDERS_PER_CRITERION`] providers,
+/// [`MAX_IMAGE_NAMES_PER_CRITERION`] names,
+/// [`MAX_MARKETPLACE_PRODUCT_CODES_PER_CRITERION`] product codes and
+/// [`MAX_IMAGE_WATERMARKS_PER_CRITERION`] watermark filters. None of them is modelled as a
+/// `@length`, so this is the only place they can be enforced — and enforcing them is also
+/// what bounds the size of one stored setting.
+fn validated_criteria(
+    requested: &[ImageCriterionRequest],
+) -> Result<Vec<ImageCriterion>, ReplaceImageCriteriaInAllowedImagesSettingsError> {
+    use crate::state::{MAX_IMAGE_CRITERIA, invalid_parameter_value};
+
+    if requested.len() > MAX_IMAGE_CRITERIA {
+        return Err(invalid_parameter_value(format!(
+            "ImageCriteria carries {} criteria, above the maximum of {MAX_IMAGE_CRITERIA}",
+            requested.len()
+        )));
+    }
+    requested
+        .iter()
+        .enumerate()
+        .map(|(index, criterion)| validated_criterion(index + 1, criterion))
+        .collect()
+}
+
+/// One criterion of the request as the modelled shape a read reports, or EC2's refusal of
+/// it. `position` is the criterion's 1-based place in the list, so a refusal names the entry
+/// it is about the way the request numbered it.
+fn validated_criterion(
+    position: usize,
+    criterion: &ImageCriterionRequest,
+) -> Result<ImageCriterion, ReplaceImageCriteriaInAllowedImagesSettingsError> {
+    use crate::state::{
+        IMAGE_PROVIDER_ALIASES, IMAGE_PROVIDER_NONE, MAX_IMAGE_NAMES_PER_CRITERION,
+        MAX_IMAGE_PROVIDERS_PER_CRITERION, MAX_IMAGE_WATERMARKS_PER_CRITERION,
+        MAX_MARKETPLACE_PRODUCT_CODES_PER_CRITERION, invalid_parameter_combination,
+        invalid_parameter_value,
+    };
+
+    let providers = criterion.image_providers.as_deref().unwrap_or_default();
+    let names = criterion.image_names.as_deref().unwrap_or_default();
+    let product_codes = criterion
+        .marketplace_product_codes
+        .as_deref()
+        .unwrap_or_default();
+    let watermarks = criterion.image_watermarks.as_deref().unwrap_or_default();
+
+    // "The criteria that are evaluated to determine which AMIs are discoverable and usable
+    // in your account" (`ImageCriterion`): an entry that names no criterion at all evaluates
+    // nothing, so it is refused rather than stored as a criterion that cannot be applied.
+    if providers.is_empty()
+        && names.is_empty()
+        && product_codes.is_empty()
+        && watermarks.is_empty()
+        && criterion.deprecation_time_condition.is_none()
+        && criterion.creation_date_condition.is_none()
+    {
+        return Err(invalid_parameter_value(format!(
+            "ImageCriterion {position} names no criteria; each ImageCriterion must name at \
+             least one of ImageProviders, ImageNames, MarketplaceProductCodes, \
+             ImageWatermarks, CreationDateCondition or DeprecationTimeCondition"
+        )));
+    }
+
+    for (member, count, maximum) in [
+        (
+            "ImageProviders",
+            providers.len(),
+            MAX_IMAGE_PROVIDERS_PER_CRITERION,
+        ),
+        ("ImageNames", names.len(), MAX_IMAGE_NAMES_PER_CRITERION),
+        (
+            "MarketplaceProductCodes",
+            product_codes.len(),
+            MAX_MARKETPLACE_PRODUCT_CODES_PER_CRITERION,
+        ),
+        (
+            "ImageWatermarks",
+            watermarks.len(),
+            MAX_IMAGE_WATERMARKS_PER_CRITERION,
+        ),
+    ] {
+        if count > maximum {
+            return Err(invalid_parameter_value(format!(
+                "{member} of ImageCriterion {position} carries {count} values, above the \
+                 maximum of {maximum}"
+            )));
+        }
+    }
+
+    // The provider words the member documents, beside "12-digit account ID: Allow AMIs
+    // created by the specified accounts".
+    for provider in providers {
+        if !image_provider_is_well_formed(provider) {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value '{provider}' for ImageProviders of ImageCriterion {position}. \
+                 Valid values: {}, {IMAGE_PROVIDER_NONE}, or a 12-digit account ID",
+                IMAGE_PROVIDER_ALIASES.join(", ")
+            )));
+        }
+    }
+
+    // "When `none` is specified, no other values can be specified"
+    // (`ImageCriterionRequest$ImageProviders`).
+    if providers.len() > 1 && providers.iter().any(|provider| provider == IMAGE_PROVIDER_NONE) {
+        return Err(invalid_parameter_combination(format!(
+            "ImageProviders of ImageCriterion {position} names '{IMAGE_PROVIDER_NONE}' \
+             together with {} other values; when '{IMAGE_PROVIDER_NONE}' is specified, no \
+             other values can be specified",
+            providers.len() - 1
+        )));
+    }
+
+    for name in names {
+        validate_image_name_criterion(position, name)?;
+    }
+    for product_code in product_codes {
+        validate_marketplace_product_code(position, product_code)?;
+    }
+
+    Ok(ImageCriterion {
+        // Each list is carried over exactly as the request gave it, absence and order
+        // included, so what a read reports is what the request asked for.
+        image_providers: criterion.image_providers.clone(),
+        marketplace_product_codes: criterion.marketplace_product_codes.clone(),
+        image_names: criterion.image_names.clone(),
+        // The two conditions are a single integer each, held to 0..=2147483647 by the
+        // model's own `@range`, so there is nothing left for this handler to check.
+        deprecation_time_condition: criterion.deprecation_time_condition.as_ref().map(
+            |condition| DeprecationTimeCondition {
+                maximum_days_since_deprecated: condition.maximum_days_since_deprecated,
+            },
+        ),
+        creation_date_condition: criterion
+            .creation_date_condition
+            .as_ref()
+            .map(|condition| CreationDateCondition {
+                maximum_days_since_created: condition.maximum_days_since_created,
+            }),
+        image_watermarks: match &criterion.image_watermarks {
+            None => None,
+            Some(filters) => Some(
+                filters
+                    .iter()
+                    .map(|filter| validated_watermark_filter(position, filter))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        },
+    })
+}
+
+/// Is `provider` something `ImageProviders` may carry — one of the words the member
+/// documents, or "12-digit account ID"?
+fn image_provider_is_well_formed(provider: &str) -> bool {
+    use crate::state::{IMAGE_PROVIDER_ALIASES, IMAGE_PROVIDER_NONE, aws_account_id_is_well_formed};
+
+    provider == IMAGE_PROVIDER_NONE
+        || IMAGE_PROVIDER_ALIASES.contains(&provider)
+        || aws_account_id_is_well_formed(provider)
+}
+
+/// Hold one `ImageNames` value to what the member documents: "Length: 1–128 characters.
+/// With `?`, the minimum is 3 characters" and the letters, numbers, spaces and special
+/// characters it lists. Both ends of the length are checked HERE rather than relied on from
+/// the model's `@length`, because without a per-string ceiling every stored name would be
+/// caller-sized.
+fn validate_image_name_criterion(
+    position: usize,
+    name: &str,
+) -> Result<(), ReplaceImageCriteriaInAllowedImagesSettingsError> {
+    use crate::state::{
+        IMAGE_NAME_CRITERION_SPECIAL_CHARACTERS, MAX_IMAGE_NAME_CRITERION_CHARS,
+        MIN_IMAGE_NAME_CRITERION_CHARS, MIN_IMAGE_NAME_CRITERION_CHARS_WITH_WILDCARD,
+        invalid_parameter_value,
+    };
+
+    let length = name.chars().count();
+    let minimum = if name.contains('?') {
+        MIN_IMAGE_NAME_CRITERION_CHARS_WITH_WILDCARD
+    } else {
+        MIN_IMAGE_NAME_CRITERION_CHARS
+    };
+    if !(minimum..=MAX_IMAGE_NAME_CRITERION_CHARS).contains(&length) {
+        return Err(invalid_parameter_value(format!(
+            "The image name '{name}' of ImageCriterion {position} carries {length} \
+             characters, outside {minimum}-{MAX_IMAGE_NAME_CRITERION_CHARS}"
+        )));
+    }
+    if let Some(character) = name.chars().find(|character| {
+        !character.is_ascii_alphanumeric()
+            && *character != ' '
+            && !IMAGE_NAME_CRITERION_SPECIAL_CHARACTERS.contains(*character)
+    }) {
+        return Err(invalid_parameter_value(format!(
+            "The image name '{name}' of ImageCriterion {position} carries the character \
+             '{character}', which is not a letter, a number, a space or one of \
+             {IMAGE_NAME_CRITERION_SPECIAL_CHARACTERS}"
+        )));
+    }
+    Ok(())
+}
+
+/// Hold one `MarketplaceProductCodes` value to what the member documents: "Length: 1-25
+/// characters. Valid characters: Letters (`A–Z, a–z`) and numbers (`0–9`)".
+fn validate_marketplace_product_code(
+    position: usize,
+    product_code: &str,
+) -> Result<(), ReplaceImageCriteriaInAllowedImagesSettingsError> {
+    use crate::state::{
+        MAX_MARKETPLACE_PRODUCT_CODE_CHARS, MIN_MARKETPLACE_PRODUCT_CODE_CHARS,
+        invalid_parameter_value,
+    };
+
+    let length = product_code.chars().count();
+    if !(MIN_MARKETPLACE_PRODUCT_CODE_CHARS..=MAX_MARKETPLACE_PRODUCT_CODE_CHARS).contains(&length)
+    {
+        return Err(invalid_parameter_value(format!(
+            "The Marketplace product code '{product_code}' of ImageCriterion {position} \
+             carries {length} characters, outside \
+             {MIN_MARKETPLACE_PRODUCT_CODE_CHARS}-{MAX_MARKETPLACE_PRODUCT_CODE_CHARS}"
+        )));
+    }
+    if let Some(character) = product_code
+        .chars()
+        .find(|character| !character.is_ascii_alphanumeric())
+    {
+        return Err(invalid_parameter_value(format!(
+            "The Marketplace product code '{product_code}' of ImageCriterion {position} \
+             carries the character '{character}', which is not a letter or a number"
+        )));
+    }
+    Ok(())
+}
+
+/// One watermark filter of the request as the modelled shape a read reports, or EC2's
+/// refusal of it.
+///
+/// "Each entry can specify one or more fields" (`ImageWatermarkFilterRequest`), so an entry
+/// that specifies none is refused. The two patterns are caller-chosen strings the model
+/// bounds no length for, so they are held to
+/// [`crate::state::MAX_IMAGE_WATERMARK_PATTERN_CHARS`]; the two day counts are bounded by
+/// the model's own documented range.
+fn validated_watermark_filter(
+    position: usize,
+    filter: &ImageWatermarkFilterRequest,
+) -> Result<ImageWatermarkFilterResponse, ReplaceImageCriteriaInAllowedImagesSettingsError> {
+    use crate::state::{MAX_IMAGE_WATERMARK_PATTERN_CHARS, invalid_parameter_value};
+
+    if filter.watermark_key.is_none()
+        && filter.source_image_region.is_none()
+        && filter.maximum_days_since_source_image_created.is_none()
+        && filter.maximum_days_since_watermark_created.is_none()
+    {
+        return Err(invalid_parameter_value(format!(
+            "An ImageWatermark of ImageCriterion {position} names no fields; each entry must \
+             name at least one of WatermarkKey, SourceImageRegion, \
+             MaximumDaysSinceSourceImageCreated or MaximumDaysSinceWatermarkCreated"
+        )));
+    }
+    for (member, pattern) in [
+        ("WatermarkKey", filter.watermark_key.as_deref()),
+        ("SourceImageRegion", filter.source_image_region.as_deref()),
+    ] {
+        let Some(pattern) = pattern else { continue };
+        let length = pattern.chars().count();
+        if pattern.is_empty() || length > MAX_IMAGE_WATERMARK_PATTERN_CHARS {
+            return Err(invalid_parameter_value(format!(
+                "The {member} '{pattern}' of an ImageWatermark of ImageCriterion {position} \
+                 carries {length} characters, outside \
+                 1-{MAX_IMAGE_WATERMARK_PATTERN_CHARS}"
+            )));
+        }
+    }
+    Ok(ImageWatermarkFilterResponse {
+        watermark_key: filter.watermark_key.clone(),
+        source_image_region: filter.source_image_region.clone(),
+        maximum_days_since_source_image_created: filter.maximum_days_since_source_image_created,
+        maximum_days_since_watermark_created: filter.maximum_days_since_watermark_created,
+    })
 }

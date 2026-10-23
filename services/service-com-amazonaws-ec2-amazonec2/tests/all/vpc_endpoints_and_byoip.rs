@@ -92,15 +92,16 @@ fn seed_connections(engine: &engine::InMemoryEngine) -> Connections {
     let mut guard = store.lock();
     let services: Vec<String> = (0..2)
         .map(|index| {
-            guard.insert_vpc_endpoint_service(ServiceConfiguration {
-                service_name: Some(format!("com.amazonaws.vpce.{REGION}.vpce-svc-{index}")),
-                // The `ServiceState` enum's `Available` member.
-                service_state: Some("Available".to_string()),
-                acceptance_required: Some(true),
-                tags: Some(vec![tag("Name", "shared")]),
-                ..Default::default()
-            })
-            .expect("the store holds the seeded endpoint service")
+            guard
+                .insert_vpc_endpoint_service(ServiceConfiguration {
+                    service_name: Some(format!("com.amazonaws.vpce.{REGION}.vpce-svc-{index}")),
+                    // The `ServiceState` enum's `Available` member.
+                    service_state: Some("Available".to_string()),
+                    acceptance_required: Some(true),
+                    tags: Some(vec![tag("Name", "shared")]),
+                    ..Default::default()
+                })
+                .expect("the store holds the seeded endpoint service")
         })
         .collect();
 
@@ -291,18 +292,19 @@ fn seed_endpoints(engine: &engine::InMemoryEngine) -> Vec<String> {
     endpoint_fixtures()
         .into_iter()
         .map(|fixture| {
-            guard.insert_vpc_endpoint(VpcEndpoint {
-                vpc_endpoint_type: Some(fixture.endpoint_type.to_string()),
-                vpc_id: Some(fixture.vpc_id.to_string()),
-                service_name: Some(fixture.service_name.to_string()),
-                service_region: Some(fixture.service_region.to_string()),
-                state: Some(fixture.state.to_string()),
-                ip_address_type: fixture.ip_address_type.map(str::to_string),
-                owner_id: Some(engine::emulator_account_id().to_string()),
-                tags: Some(fixture.tags),
-                ..Default::default()
-            })
-            .expect("the store holds the seeded endpoint")
+            guard
+                .insert_vpc_endpoint(VpcEndpoint {
+                    vpc_endpoint_type: Some(fixture.endpoint_type.to_string()),
+                    vpc_id: Some(fixture.vpc_id.to_string()),
+                    service_name: Some(fixture.service_name.to_string()),
+                    service_region: Some(fixture.service_region.to_string()),
+                    state: Some(fixture.state.to_string()),
+                    ip_address_type: fixture.ip_address_type.map(str::to_string),
+                    owner_id: Some(engine::emulator_account_id().to_string()),
+                    tags: Some(fixture.tags),
+                    ..Default::default()
+                })
+                .expect("the store holds the seeded endpoint")
         })
         .collect()
 }
@@ -743,17 +745,18 @@ async fn moving_a_range_to_ipam_is_checked_and_then_visible() {
         let store = engine.state::<Ec2State>();
         let mut guard = store.lock();
         let mut pool = |family: &str, owner: &str, scope: &str| -> String {
-            guard.insert_ipam_pool(IpamPool {
-                owner_id: Some(owner.to_string()),
-                address_family: Some(family.to_string()),
-                ipam_scope_type: Some(scope.to_string()),
-                ipam_region: Some(REGION.to_string()),
-                // The `IpamPoolState` enum's `create-complete` member.
-                state: Some("create-complete".to_string()),
-                public_ip_source: Some("byoip".to_string()),
-                ..Default::default()
-            })
-            .expect("the store holds the seeded IPAM pool")
+            guard
+                .insert_ipam_pool(IpamPool {
+                    owner_id: Some(owner.to_string()),
+                    address_family: Some(family.to_string()),
+                    ipam_scope_type: Some(scope.to_string()),
+                    ipam_region: Some(REGION.to_string()),
+                    // The `IpamPoolState` enum's `create-complete` member.
+                    state: Some("create-complete".to_string()),
+                    public_ip_source: Some("byoip".to_string()),
+                    ..Default::default()
+                })
+                .expect("the store holds the seeded IPAM pool")
         };
         (
             pool(ADDRESS_FAMILY_IPV4, &account, IPAM_SCOPE_TYPE_PUBLIC),
