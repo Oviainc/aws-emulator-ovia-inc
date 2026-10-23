@@ -83,6 +83,25 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             .filter(|detector| detector.region == region)
     }
 
+    /// Mint an `InvestigationId`: the 32 hexadecimal characters [`Self::mint_id`]
+    /// mints, grouped in the 8-4-4-4-12 form.
+    ///
+    /// `InvestigationId` is `len 1..64, pattern ^[a-fA-F0-9\-]+$`
+    /// (`smithy_query(operation="CreateInvestigation")`) — hexadecimal plus
+    /// hyphens — so the 36-character grouped form is a value of the member, and it
+    /// is distinguishable at a glance from the bare-hex `DetectorId` / finding id.
+    pub fn mint_investigation_id(&mut self) -> String {
+        let hex = self.mint_id();
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )
+    }
+
     /// The ids of the detectors `region`'s endpoint serves, in a total order.
     pub fn detector_ids_in(&self, region: &str) -> Vec<String> {
         let mut ids: Vec<String> = self
@@ -109,7 +128,13 @@ fn scramble(a: u64, b: u64) -> u64 {
     hasher.finish()
 }
 
-fn now_millis() -> i64 {
+/// The current instant in epoch milliseconds, straight off the wall clock.
+///
+/// A REPORTING operation reads the clock through this rather than through
+/// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::tick_millis`]: it needs to know
+/// what the clock has already made due without advancing the "this resource
+/// changed now" counter.
+pub fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
@@ -183,6 +208,11 @@ pub const FEATURE_EBS_MALWARE_PROTECTION: &str = "EBS_MALWARE_PROTECTION";
 /// The feature behind `DataSources.Database.Rds.DatabaseEvents`: RDS Protection
 /// watches Amazon RDS login activity.
 pub const FEATURE_RDS_LOGIN_EVENTS: &str = "RDS_LOGIN_EVENTS";
+
+/// GuardDuty Investigation's own feature: "To use this operation, the AI_ANALYST
+/// feature must be enabled on your detector"
+/// (`smithy_query(query="doc",shape="CreateInvestigation")`).
+pub const FEATURE_AI_ANALYST: &str = "AI_ANALYST";
 
 /// The feature behind `DataSources.CloudTrail`: GuardDuty's analysis of CloudTrail
 /// management events.
@@ -296,6 +326,17 @@ pub fn not_owned_message(member: &str) -> String {
 pub const DETECTOR_ALREADY_EXISTS_MESSAGE: &str =
     "The request is rejected because a detector already exists for the current account.";
 
+/// The message a request is DENIED with when the account is not authorized on the
+/// resource `member` names.
+///
+/// Like [`not_owned_message`], it names the member and not the caller's value: a
+/// denial must not disclose whether the id names anything at all.
+pub fn not_authorized_message(member: &str) -> String {
+    format!(
+        "The request is rejected because the current account is not authorized to perform this operation on the input {member}."
+    )
+}
+
 /// Classify a `DetectorId` the store does not resolve: a value that is not a
 /// detector id at all is a parameter failure, a well-formed one this
 /// account/Region does not hold is an ownership failure.
@@ -364,6 +405,10 @@ pub struct Detector {
     /// This detector's filters, keyed by filter name. `DeleteDetector` drops them
     /// with the detector.
     pub filters: BTreeMap<String, FilterRecord>,
+    /// This detector's investigations, keyed by investigation id. They hang off the
+    /// detector like its findings and filters, so `DeleteDetector` drops them with
+    /// it.
+    pub investigations: BTreeMap<String, InvestigationRecord>,
 }
 
 impl Detector {
@@ -406,6 +451,197 @@ impl Detector {
                 additional_configuration: Vec::new(),
             });
         }
+    }
+
+    /// The investigation a create already minted for `token`, if any — the seam
+    /// that makes `CreateInvestigation` idempotent under a replayed `ClientToken`.
+    pub fn investigation_for_token(&self, token: &str) -> Option<&InvestigationRecord> {
+        self.investigations
+            .values()
+            .find(|investigation| investigation.client_token.as_deref() == Some(token))
+    }
+
+    /// How many investigations this detector holds that were initiated at or after
+    /// `since`, in epoch milliseconds.
+    pub fn investigations_started_since(&self, since: i64) -> usize {
+        self.investigations
+            .values()
+            .filter(|investigation| investigation.started_at_millis >= since)
+            .count()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Investigations
+// ---------------------------------------------------------------------------
+
+/// `InvestigationStatus`, the status a created investigation starts in: the
+/// analysis is under way. One of `RUNNING | COMPLETED | FAILED`
+/// (`smithy_query(shape="InvestigationStatus")`).
+pub const INVESTIGATION_RUNNING: &str = "RUNNING";
+
+/// The `InvestigationStatus` an investigation reaches when its analysis could not
+/// be performed. See [`INVESTIGATION_RUNNING`] for the enum.
+pub const INVESTIGATION_FAILED: &str = "FAILED";
+
+/// How long a created investigation stays [`INVESTIGATION_RUNNING`] before the
+/// clock owes it a terminal status.
+///
+/// GuardDuty documents no duration for an investigation, so this emulator CHOOSES
+/// one. It is deliberately non-zero: a caller that reads the investigation back
+/// immediately after creating it still observes the transient `RUNNING` status.
+pub const INVESTIGATION_TRANSITION_MILLIS: i64 = 500;
+
+/// The window the per-day investigation limit is counted over: "you can initiate
+/// up to 10 investigations per account per day"
+/// (`smithy_query(query="doc",shape="CreateInvestigation")`).
+pub const INVESTIGATION_DAY_MILLIS: i64 = 24 * 60 * 60 * 1000;
+
+/// How many investigations an account may initiate per day: "During the preview,
+/// you can initiate up to 10 investigations per account per day"
+/// (`smithy_query(query="doc",shape="CreateInvestigation")`).
+pub const INVESTIGATIONS_PER_DAY: usize = 10;
+
+/// How many investigations an account may initiate in total: "with a total limit
+/// of 100 investigations per account"
+/// (`smithy_query(query="doc",shape="CreateInvestigation")`).
+pub const INVESTIGATIONS_PER_ACCOUNT: usize = 100;
+
+/// The Regions GuardDuty Investigation is available in, as `CreateInvestigation`
+/// and `GetInvestigation` both list them: "US East (N. Virginia), US East (Ohio),
+/// US West (Oregon), Canada (Central), Europe (Frankfurt), Europe (Ireland),
+/// Europe (London), Europe (Paris), Europe (Stockholm), and Asia Pacific (Tokyo)"
+/// (`smithy_query(query="doc",shape="CreateInvestigation")`), in that order.
+pub const INVESTIGATION_REGIONS: [&str; 10] = [
+    "us-east-1",
+    "us-east-2",
+    "us-west-2",
+    "ca-central-1",
+    "eu-central-1",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "eu-north-1",
+    "ap-northeast-1",
+];
+
+/// Is GuardDuty Investigation available through `region`'s endpoint? Decided from
+/// the documented [`INVESTIGATION_REGIONS`] catalogue, not from what the store
+/// happens to hold.
+pub fn investigations_available_in(region: &str) -> bool {
+    INVESTIGATION_REGIONS.contains(&region)
+}
+
+/// The message a request to a Region the feature is not available in is refused
+/// with. It does not name the caller's Region: the endpoint already carries it.
+pub const INVESTIGATION_REGION_MESSAGE: &str =
+    "The request is rejected because GuardDuty Investigation is not available in the current Region.";
+
+/// `CloudProvider`, the only value the enum carries: "The cloud provider.
+/// Currently, only AWS is supported" (`smithy_query(shape="CloudDetails")`).
+pub const CLOUD_PROVIDER: &str = "AWS";
+
+/// The message `GetInvestigation` answers an `InvestigationId` this detector does
+/// not hold with. GuardDuty does not echo the caller's id back, so this names the
+/// resource class only.
+pub const INVESTIGATION_NOT_FOUND_MESSAGE: &str =
+    "The request is rejected because the requested investigation could not be found.";
+
+/// The message `CreateInvestigation` is denied with when the detector does not
+/// have the AI_ANALYST feature enabled — the feature the operation requires
+/// (`smithy_query(query="doc",shape="CreateInvestigation")`).
+pub const INVESTIGATION_FEATURE_DENIED_MESSAGE: &str =
+    "The request is rejected because the AI_ANALYST feature is not enabled for the detector.";
+
+/// The message a request past the documented per-day investigation limit is
+/// refused with.
+pub fn investigation_daily_limit_message() -> String {
+    format!(
+        "The request is rejected because the account has reached the limit of {INVESTIGATIONS_PER_DAY} investigations per day."
+    )
+}
+
+/// The message a request past the documented total investigation limit is refused
+/// with.
+pub fn investigation_total_limit_message() -> String {
+    format!(
+        "The request is rejected because the account has reached the limit of {INVESTIGATIONS_PER_ACCOUNT} investigations."
+    )
+}
+
+/// Why an investigation this emulator accepted ends [`INVESTIGATION_FAILED`].
+///
+/// A GuardDuty investigation is produced by Amazon Bedrock models over the
+/// account's findings (`smithy_query(query="doc",shape="CreateInvestigation")`).
+/// This emulator has no such analysis engine, so it does NOT synthesise a summary,
+/// a risk level or a confidence: the run it cannot perform ends in the modelled
+/// failure state, carrying the reason it could not run.
+pub const INVESTIGATION_ENGINE_UNAVAILABLE: &str = "The investigation analysis engine is not available in this emulator, so no investigation summary was produced.";
+
+/// One stored investigation. Timestamps are epoch milliseconds, the single source
+/// for the instants the wire carries.
+#[derive(Debug, Clone)]
+pub struct InvestigationRecord {
+    pub id: String,
+    /// `TriggerPrompt`: what the caller asked to be investigated, stored verbatim.
+    pub trigger_prompt: String,
+    /// `TriggeredBy`: "The account that initiated the investigation"
+    /// (`smithy_query(shape="Investigation")`).
+    pub triggered_by: String,
+    /// The Region the investigation was initiated through.
+    pub region: String,
+    /// The `ClientToken` the create carried, so a replay returns this same
+    /// investigation instead of initiating a second one.
+    pub client_token: Option<String>,
+    /// `InvestigationStatus`.
+    pub status: String,
+    pub started_at_millis: i64,
+    /// When the clock owes this investigation its terminal status. See
+    /// [`INVESTIGATION_TRANSITION_MILLIS`].
+    pub terminal_due_millis: i64,
+    /// When it reached a terminal status, once it has.
+    pub ended_at_millis: Option<i64>,
+    /// `Error`: "Details about the error if the investigation status is FAILED"
+    /// (`smithy_query(shape="Investigation")`).
+    pub error: Option<String>,
+}
+
+impl InvestigationRecord {
+    /// An investigation initiated at `now`, still [`INVESTIGATION_RUNNING`].
+    pub fn started(
+        id: String,
+        trigger_prompt: String,
+        triggered_by: String,
+        region: String,
+        client_token: Option<String>,
+        now: i64,
+    ) -> Self {
+        Self {
+            id,
+            trigger_prompt,
+            triggered_by,
+            region,
+            client_token,
+            status: INVESTIGATION_RUNNING.to_string(),
+            started_at_millis: now,
+            terminal_due_millis: now.saturating_add(INVESTIGATION_TRANSITION_MILLIS),
+            ended_at_millis: None,
+            error: None,
+        }
+    }
+
+    /// Apply the status change the CLOCK already made due, if any.
+    ///
+    /// The move out of `RUNNING` was owed at [`Self::terminal_due_millis`] whether
+    /// or not anybody called, which is why a reporting operation may apply it. It
+    /// is applied exactly once: a terminal investigation never moves again.
+    pub fn settle(&mut self, now: i64) {
+        if self.status != INVESTIGATION_RUNNING || now < self.terminal_due_millis {
+            return;
+        }
+        self.status = INVESTIGATION_FAILED.to_string();
+        self.ended_at_millis = Some(self.terminal_due_millis);
+        self.error = Some(INVESTIGATION_ENGINE_UNAVAILABLE.to_string());
     }
 }
 
