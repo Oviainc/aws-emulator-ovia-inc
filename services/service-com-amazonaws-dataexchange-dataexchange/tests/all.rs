@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/data_sets.rs"]
 mod data_sets;
+#[path = "all/jobs.rs"]
+mod jobs;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
