@@ -131,6 +131,21 @@ pub const MAX_SNAP_RADIUS_M: i64 = 10_000;
 /// The documented default of `LegGeometryFormat` / `SnappedGeometryFormat`.
 pub const DEFAULT_GEOMETRY_FORMAT: &str = "FlexiblePolyline";
 
+/// The pricing TIER a geo-routes query is charged in.
+///
+/// `PricingBucket` is "the pricing bucket for which the query is charged at"
+/// (`CalculateRoutesResponse$PricingBucket`), `@required` and bound to the
+/// `x-amz-geo-pricing-bucket` header on every response of this service. The model
+/// enumerates no values, and recorded behavior is a tier token shared by the Location
+/// Service APIs — the sibling places service reports the same `Core` tier
+/// (`PRICING_BUCKET_CORE` in `service-com-amazonaws-geoplaces-placesservice`). So the
+/// bucket names the TIER the call is charged in and never the request or operation class:
+/// every query this service serves is a core routing query, because the features that
+/// would be charged differently (transit and intermodal modes, country exclusions,
+/// avoidance areas, span features and the leg features the road model holds no data for)
+/// are declined before any answer is computed.
+pub const PRICING_BUCKET_CORE: &str = "Core";
+
 /// Precision of the Flexible Polyline encoding: 6 decimal digits, the default of the
 /// `aws-geospatial/polyline` library the model's `LegGeometryFormat` documentation points
 /// at.
@@ -390,6 +405,16 @@ impl TravelledRoad {
         })
     }
 
+    /// The route number this road is designated by, where the network designates one.
+    ///
+    /// A motorway of this network is a numbered road — it is named after its number, and
+    /// it is the class `MajorRoadLabels` reports for a route that travels one. A street
+    /// and a footpath carry a name only, so they have no number to report: `None` is "this
+    /// road is unnumbered", not "the number is unknown".
+    pub fn route_number(&self) -> Option<String> {
+        matches!(self.class, RoadClass::Motorway).then(|| motorway_number(self.grid_index))
+    }
+
     /// Bearing travel takes along this road to get from `from` to `to`, in degrees
     /// clockwise from north: the road's own forward bearing, reversed where travel runs
     /// against it.
@@ -635,9 +660,10 @@ pub struct CachedRoute {
     pub legs: Vec<CachedLeg>,
     pub distance_m: i64,
     pub duration_s: i64,
-    /// Names of the fastest roads the route travels on, at most two (the length
-    /// `MajorRoadLabels` allows).
-    pub major_road_labels: Vec<String>,
+    /// The fastest roads the route travels on, at most two (the length `MajorRoadLabels`
+    /// allows). The ROAD is carried rather than its name alone, so a caller can label it
+    /// by its route number where the network numbers it.
+    pub major_roads: Vec<TravelledRoad>,
     /// Whether the route travels on a controlled-access highway (a motorway of the
     /// network), which is what an `Avoid.ControlledAccessHighways` request is answered
     /// against.
@@ -714,7 +740,7 @@ impl Default for ComAmazonawsGeoroutesRoutesserviceState {
             road_cells: HashMap::new(),
             travel_mode_speeds,
             routing_objective_factors,
-            pricing_bucket: "RoutesRequest".to_string(),
+            pricing_bucket: PRICING_BUCKET_CORE.to_string(),
             calculated_routes: HashMap::new(),
         }
     }
@@ -854,8 +880,8 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
         let factors = self.factors(objective);
         let speed = self.speed_mps(mode) * factors.speed.max(f64::MIN_POSITIVE);
         let mut legs: Vec<CachedLeg> = Vec::new();
-        // (road label, posted speed, times traversed), in first-seen order.
-        let mut roads: Vec<(String, f64, usize)> = Vec::new();
+        // (road, times traversed), in first-seen order.
+        let mut roads: Vec<(TravelledRoad, usize)> = Vec::new();
         let mut uses_controlled_access_highway = false;
 
         for pair in positions.windows(2) {
@@ -869,9 +895,9 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
                 .filter_map(|vertex| vertex.road.as_ref())
             {
                 uses_controlled_access_highway |= road.class == RoadClass::Motorway;
-                match roads.iter_mut().find(|(seen, _, _)| *seen == road.label) {
-                    Some(entry) => entry.2 += 1,
-                    None => roads.push((road.label.clone(), road.speed_kph, 1)),
+                match roads.iter_mut().find(|(seen, _)| seen.label == road.label) {
+                    Some(entry) => entry.1 += 1,
+                    None => roads.push((road.clone(), 1)),
                 }
             }
             // The distance IS the length of the geometry this leg reports, so a client
@@ -894,17 +920,18 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
         // alternatives": the fastest roads the route actually travels on, most-travelled
         // first among equals. The model allows at most two.
         roads.sort_by(|a, b| {
-            b.1.total_cmp(&a.1)
-                .then(b.2.cmp(&a.2))
-                .then_with(|| a.0.cmp(&b.0))
+            b.0.speed_kph
+                .total_cmp(&a.0.speed_kph)
+                .then(b.1.cmp(&a.1))
+                .then_with(|| a.0.label.cmp(&b.0.label))
         });
-        let major_road_labels = roads.into_iter().take(2).map(|(label, _, _)| label).collect();
+        let major_roads = roads.into_iter().take(2).map(|(road, _)| road).collect();
 
         let route = CachedRoute {
             distance_m: clamp_cost(legs.iter().map(|leg| leg.distance_m as f64).sum()),
             duration_s: clamp_cost(legs.iter().map(|leg| leg.duration_s as f64).sum()),
             legs,
-            major_road_labels,
+            major_roads,
             uses_controlled_access_highway,
         };
 
@@ -1031,10 +1058,17 @@ fn allows_of(class: RoadClass) -> Vec<TravelMode> {
     }
 }
 
+/// The route number designating a motorway of the network at grid index `index`: the
+/// network numbers its motorways, which is what [`TravelledRoad::route_number`] reports
+/// and what [`label_of`] names a motorway after.
+fn motorway_number(index: i64) -> String {
+    format!("M{index}")
+}
+
 /// The name of the road at grid index `index`.
 fn label_of(class: RoadClass, meridian: bool, index: i64) -> String {
     match (class, meridian) {
-        (RoadClass::Motorway, _) => format!("Motorway M{index}"),
+        (RoadClass::Motorway, _) => format!("Motorway {}", motorway_number(index)),
         (RoadClass::Footpath, _) => format!("Footpath F{index}"),
         (RoadClass::Street, true) => format!("Meridian Street {index}"),
         (RoadClass::Street, false) => format!("Parallel Avenue {index}"),

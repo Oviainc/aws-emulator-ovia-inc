@@ -45,6 +45,40 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether the request these `parts` came from resolves to this service's signing name
+/// AND addresses a first URI path segment this model publishes
+/// (`crate::ROUTE_PATH_SEGMENTS`).
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable owner
+/// of that rule, and it is CALLED here rather than re-implemented. It takes a whole
+/// `http::Request` while [`Service::can_handle`] is handed only the request's parts, so
+/// the two things it reads — the URI and the headers — are re-presented to it as a
+/// bodiless request. It reads neither the body nor the method, so nothing it decides on is
+/// missing.
+///
+/// `services/common`'s `claims_request` states the same rule over `Parts` and is what a
+/// service under a shared signing name normally calls; it is not used here only because
+/// depending on it edits `Cargo.lock`, which this repository's serialized squash merge
+/// refuses whenever another change lands against it — the same reason
+/// `services/service-com-amazonaws-wisdom-wisdomservice/src/service.rs` calls the
+/// framework predicate directly and records the migration as a one-line follow-up. The
+/// rule is identical: `claims_request`'s path conjunct for a REST model IS
+/// `claims_modeled_path`, which mirrors this framework function.
+fn claims_own_path_space(parts: &http::request::Parts, signing_name: &str) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    emulator_server::can_handle_based_on_route_key_and_path(
+        &request,
+        signing_name,
+        crate::ROUTE_PATH_SEGMENTS,
+    )
+}
+
 /// The `com-amazonaws-opensearch-amazonopensearchservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +108,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `es` — a signing name, endpointPrefix AND arnNamespace it
+        // SHARES with the legacy Amazon Elasticsearch Service model
+        // (`services/service-com-amazonaws-elasticsearchservice-amazonelasticsearchservice2015`;
+        // `smithy_query(query="service_info")` on either gives sigv4Name `es`,
+        // endpointPrefix `es`, arnNamespace `es`, protocol `restJson1`, differing only in
+        // sdkId and in the API version they declare — `2021-01-01` here, `2015-01-01`
+        // there). AWS serves both APIs on the one `es.<region>.amazonaws.com` endpoint and
+        // every SDK for either signs that one name, so the router — which resolves a
+        // request's routing key from the SigV4 credential scope first — handed both
+        // services the key `es`. Claiming on the signing name ALONE therefore made each
+        // claim the other's traffic, the router found two claimants and answered `500
+        // AmbiguousService` for EVERY request to the endpoint: a code no AWS model
+        // declares, and one botocore retries, so a client burnt its retry budget before
+        // failing.
+        //
+        // The claim is narrowed to this service's own modelled wire surface — the rule
+        // every service under a shared signing name claims by, delegated to the
+        // framework's own owner of it (see [`claims_own_path_space`]). This model is
+        // `restJson1`, which binds every operation to a URI, so the discriminator is the
+        // model-derived path space the generated `ROUTE_PATH_SEGMENTS` publishes — and it
+        // is exactly how AWS separates the two APIs behind that one endpoint: every
+        // operation of this model is bound under `/2021-01-01/…` and every operation of the
+        // legacy model under `/2015-01-01/…`, so the two first segments are disjoint and
+        // each request has exactly one claimant.
+        claims_own_path_space(parts, self.entry.identity().signing_name())
     }
 
     fn override_operation(

@@ -85,8 +85,11 @@ fn wire_resources(xml: &str) -> Vec<WireResource> {
     resources
 }
 
-/// One element's text inside a single `StackResource` member.
-fn element(entry: &str, tag: &str) -> Option<String> {
+/// One element's text inside a single reported resource.
+///
+/// Shared with `stack_resource_detail.rs`, which reads a `StackResourceDetail` block the
+/// same way.
+pub(crate) fn element(entry: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = entry.find(&open)?;
@@ -115,13 +118,14 @@ fn logical_ids(resources: &[WireResource]) -> Vec<String> {
         .collect()
 }
 
-fn sns_arn(name: &str) -> String {
+pub(crate) fn sns_arn(name: &str) -> String {
     format!("arn:aws:sns:{REGION}:{ACCOUNT_ID}:{name}")
 }
 
+
 /// Whether `value` is the ISO-8601 instant the query protocol renders a timestamp as
 /// (`2026-01-01T00:00:00Z`, with optional fractional seconds).
-fn is_iso8601_instant(value: &str) -> bool {
+pub(crate) fn is_iso8601_instant(value: &str) -> bool {
     let bytes = value.as_bytes();
     value.len() >= 20
         && value.ends_with('Z')
@@ -135,7 +139,7 @@ fn is_iso8601_instant(value: &str) -> bool {
 
 /// What the physical resource id of one reported resource must be.
 #[derive(Debug, Clone)]
-enum PhysicalId {
+pub(crate) enum PhysicalId {
     /// Exactly this id: the template NAMED the resource, so the documented `Ref` value of
     /// its type is built from that name.
     Exact(String),
@@ -298,6 +302,31 @@ fn resource_cases() -> Vec<ResourceCase> {
     ]
 }
 
+/// Assert a reported physical resource id against what the row expects of it: the exact
+/// id a NAMED resource takes, or the prefix plus unique segment a generated name takes.
+///
+/// Shared with `stack_resource_detail.rs`: `DescribeStackResource` reports the same
+/// physical id for the same resource, so both suites hold it to the same rule.
+pub(crate) fn assert_physical_id(case: &str, expected: &PhysicalId, actual: Option<&str>) {
+    match expected {
+        PhysicalId::Exact(id) => assert_eq!(
+            actual,
+            Some(id.as_str()),
+            "case {case:?}: expected the physical id {id:?}, got {actual:?}"
+        ),
+        PhysicalId::Generated(prefix) => {
+            let id = actual.unwrap_or_default().to_string();
+            let unique = id.strip_prefix(prefix.as_str()).unwrap_or_else(|| {
+                panic!("case {case:?}: expected a physical id starting {prefix:?}, got {id:?}")
+            });
+            assert!(
+                unique.len() == 12 && unique.chars().all(|c| c.is_ascii_hexdigit()),
+                "case {case:?}: expected a 12-character unique segment, got {unique:?}"
+            );
+        }
+    }
+}
+
 /// Assert one reported resource against what the row expects of it.
 fn assert_resource(
     case: &str,
@@ -319,23 +348,7 @@ fn assert_resource(
         "case {case:?}: expected the declared type {:?}, got {actual:?}",
         expected.resource_type
     );
-    match &expected.physical_id {
-        PhysicalId::Exact(id) => assert_eq!(
-            actual.physical_id.as_deref(),
-            Some(id.as_str()),
-            "case {case:?}: expected the physical id {id:?}, got {actual:?}"
-        ),
-        PhysicalId::Generated(prefix) => {
-            let id = actual.physical_id.clone().unwrap_or_default();
-            let unique = id.strip_prefix(prefix.as_str()).unwrap_or_else(|| {
-                panic!("case {case:?}: expected a physical id starting {prefix:?}, got {id:?}")
-            });
-            assert!(
-                unique.len() == 12 && unique.chars().all(|c| c.is_ascii_hexdigit()),
-                "case {case:?}: expected a 12-character unique segment, got {unique:?}"
-            );
-        }
-    }
+    assert_physical_id(case, &expected.physical_id, actual.physical_id.as_deref());
     assert_eq!(
         actual.stack_name.as_deref(),
         Some(stack_name),

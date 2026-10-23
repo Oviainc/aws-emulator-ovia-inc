@@ -1126,6 +1126,7 @@ pub fn provision(
             resource_type: declared.resource_type.clone(),
             physical_resource_id,
             attributes,
+            metadata: declared_metadata(declared),
             // Filled by [`resolve_properties`], once every resource's identity is
             // known; `materialised` by
             // [`super::provisioning`](crate::state::provisioning), once the owning
@@ -1148,6 +1149,27 @@ pub fn provision(
         attach_attributes(resource, declared, &name, &resolved, budget);
     }
     provisioned
+}
+
+/// The content of the `Metadata` resource attribute a declaration carries, as JSON.
+///
+/// `Metadata` is one of the resource attributes CloudFormation defines on a template's
+/// `Resources` entry (the model's `ResourceAttribute` enum lists it beside
+/// `CreationPolicy`, `DeletionPolicy`, `Properties`, `Tags`, `UpdatePolicy` and
+/// `UpdateReplacePolicy`), and `StackResourceDetail$Metadata` reports its content
+/// verbatim. Rendered as JSON whatever the body was spelled in, because the member is a
+/// string on the wire and `Metadata` is a JSON object in a template.
+///
+/// `None` for a declaration with no `Metadata`, and for one whose `Metadata` is `null` —
+/// never an invented value.
+fn declared_metadata(declared: &DeclaredResource) -> Option<String> {
+    let metadata = declared.declaration.get("Metadata")?;
+    if metadata.is_null() {
+        return None;
+    }
+    // `Value`'s `Display` is its compact JSON rendering and cannot fail, so no `Metadata`
+    // a template declares can be lost to a serialisation error here.
+    Some(metadata.to_string())
 }
 
 /// Whether a declared resource is one this deployment creates.

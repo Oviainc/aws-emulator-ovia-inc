@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Parses an entity set's `Location` as a URL, so a valid Amazon S3 URL is told
+# from an invalid one by the URL grammar rather than by string matching.
+url = "2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

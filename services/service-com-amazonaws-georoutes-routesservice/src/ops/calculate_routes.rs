@@ -33,22 +33,31 @@
 //! snapped geometry cuts into runs at the junctions where its road changes, and each
 //! junction carries the angle between the two roads' own directions. A step therefore
 //! reports the run's share of the leg's distance and duration (the shares sum to exactly
-//! the leg's own), its `GeometryOffset`, the `CurrentRoad` and `NextRoad` the network
-//! names, and a `Type` classified from the road classes it joins and leaves and from that
-//! angle — never chosen. `AfterTravelSteps` is the stop the route makes at the leg's end:
-//! a vehicle parks and a pedestrian waits for the waypoint's `StopDuration`, which is the
-//! one value each of those step-type enums declares; a leg with no stop at its end has
-//! nothing to perform after travelling and so an empty list.
+//! the leg's own), its `GeometryOffset`, and a `Type` classified from the road classes it
+//! joins and leaves and from that angle — never chosen. `AfterTravelSteps` is the stop the
+//! route makes at the leg's end: a vehicle parks and a pedestrian waits for the waypoint's
+//! `StopDuration`, which is the one value each of those step-type enums declares; a leg
+//! with no stop at its end has nothing to perform after travelling and so an empty list.
 //!
-//! What the network does NOT hold is left out rather than invented: it has no roundabout,
-//! ramp, exit number or route number, so no `RoundaboutEnter`/`RoundaboutExit`/
-//! `RoundaboutPass`/`Ramp` step arises and `ExitNumber`, `RouteNumber` and `Towards` stay
-//! empty. `Instruction` is built from the manoeuvre, the road name and the step's distance,
-//! and is carried only when the effective `TravelStepType` is `Default` — "Only available
-//! when the TravelStepType is Default" — while `Signpost` is carried only for `TurnByTurn`,
-//! as its own documentation says, and names the road the junction leads onto.
+//! A step carries only what the model REQUIRES of it (`Duration`, `Type`) and what the
+//! request asked for: the narration — `Instruction`, `CurrentRoad` and `NextRoad` — is
+//! reported only for a request whose `LegAdditionalFeatures` name
+//! `TravelStepInstructions`, the one additional feature that asks for the per-step detail,
+//! and within that `Instruction` only when the effective `TravelStepType` is `Default`
+//! ("Only available when the TravelStepType is Default"), while `Signpost` is carried only
+//! for `TurnByTurn`, as its own documentation says, and names the road the junction leads
+//! onto. `ExitNumber` is a list the service computes, so it is always reported — empty
+//! where the step takes no numbered exit, which is every step over this network.
 //!
-//! `Languages` and `InstructionsMeasurementSystem` act on that text: an instruction is
+//! What the network does NOT hold is left out rather than invented: it has no roundabout
+//! and no ramp, so no `RoundaboutEnter`/`RoundaboutExit`/`RoundaboutPass`/`Ramp` step
+//! arises, and it names no destination reachable along a road, so `Towards` stays empty.
+//! It DOES number its motorways, so a road the route travels is labelled by its
+//! `RouteNumber` where the network numbers it and by its `RoadName` otherwise — in
+//! `MajorRoadLabels`, in a step's `CurrentRoad`/`NextRoad` and on a signpost label alike.
+//!
+//! `Languages` and `InstructionsMeasurementSystem` act on the instruction text: an
+//! instruction is
 //! rendered in the requested language where this emulator holds text in it (English only),
 //! and otherwise in the regional default with the model's own `MainLanguageNotFound`
 //! notice, since "the request uses the regional default as the fallback if the requested
@@ -57,6 +66,32 @@
 //!
 //! `Allow`, `Tolls`, `Traffic` and `TravelModeOptions` have nothing to act on: the model
 //! carries no HOV/HOT lane, toll, traffic variation or vehicle restriction.
+//!
+//! ## Places
+//!
+//! A leg's departure and arrival report two positions, which the model keeps apart:
+//! `OriginalPosition` is "Position provided in the request", so it is the submitted
+//! position echoed verbatim at full double precision, and `Position` is the point in WGS 84
+//! the traveller actually departs from or arrives at — the submitted position MATCHED onto
+//! the road network by the same
+//! [`crate::state::ComAmazonawsGeoroutesRoutesserviceState::snap`] that SnapToRoads reports
+//! its snapped trace points with. The two therefore differ by the snap offset, and coincide
+//! only where the submitted position already lies on a road the travel mode may use. A
+//! pass-through waypoint's place reports the same pair, under the same rule.
+//!
+//! The leg GEOMETRY still begins and ends at the submitted positions, which is where the
+//! traveller is before the route reaches a road: the line runs from the submitted position
+//! onto the network and back off it, and its length is the leg's distance.
+//!
+//! ## Leg summary
+//!
+//! A leg's `Summary` summarises the leg that WAS computed — its `Overview` is the whole
+//! leg's distance and duration and its `TravelOnly` the travelling part — so it is
+//! reported for every leg, as the recorded behavior of a request naming no additional
+//! feature shows. `Summary` therefore stays an accepted `LegAdditionalFeature` that asks
+//! for nothing this answer does not already carry. `TypicalDuration` and `BestCaseDuration`
+//! are the computed duration: the road model carries no traffic variation for either to
+//! differ by.
 //!
 //! ## Authorization
 //!
@@ -228,11 +263,18 @@ const MAX_WAYPOINTS: usize = 23;
 /// The upper bound of `RouteWaypoint$StopDuration`'s modeled range (`0..49999`).
 const MAX_STOP_DURATION_S: i64 = 49_999;
 
-/// The `LegAdditionalFeatures` this slice computes: the leg summary, and the step
-/// instructions the travel steps carry. Every other feature asks for data the road model
+/// The `LegAdditionalFeatures` this slice ACCEPTS: the step instructions the travel steps
+/// carry, and `Summary` — which asks for the leg summary this answer reports for every leg
+/// anyway, so naming it adds nothing. Every other feature asks for data the road model
 /// does not hold (tolls, incidents, elevation, zones, truck road types, transit stops and
 /// departures), so a request naming one is declined rather than answered without it.
 const COMPUTED_LEG_FEATURES: [&str; 2] = ["Summary", "TravelStepInstructions"];
+
+/// The `RouteLegAdditionalFeature` that asks for the per-step narration: the step
+/// `Instruction`, and the `CurrentRoad`/`NextRoad` that instruction names. A step of a
+/// request that does not ask for it carries the members the model requires and nothing
+/// more.
+const TRAVEL_STEP_INSTRUCTIONS_FEATURE: &str = "TravelStepInstructions";
 
 /// The language this emulator holds instruction text in. A request whose `Languages` names
 /// no tag of this language is answered in it anyway — "the request uses the regional
@@ -322,6 +364,9 @@ struct StepRendering<'a> {
     language: &'a str,
     /// The effective `InstructionsMeasurementSystem`.
     measurement: Measurement,
+    /// Whether `LegAdditionalFeatures` asked for the per-step narration
+    /// ([`TRAVEL_STEP_INSTRUCTIONS_FEATURE`]).
+    narrate: bool,
 }
 
 /// Where the route's clock is pinned: at its departure or at its arrival.
@@ -337,8 +382,6 @@ struct Rendering<'a> {
     travel_mode: TravelMode,
     geometry_format: &'a str,
     anchor: Anchor,
-    /// Whether `LegAdditionalFeatures` asked for the leg summary.
-    wants_leg_summary: bool,
     /// Whether the route violates an avoidance the request asked for.
     violated_avoidance: bool,
     /// What the leg's travel steps are rendered with.
@@ -349,6 +392,11 @@ struct Rendering<'a> {
 #[derive(Debug, Clone)]
 struct SequencePoint {
     position: Position,
+    /// The point of the road network the submitted position is matched onto, which is
+    /// where the traveller departs from or arrives at. `None` only where the network holds
+    /// no road the travel mode may use near the position, which leaves nothing to match
+    /// it to.
+    matched_position: Option<Position>,
     /// Index in the request's `Waypoints` list, for the places that report one.
     waypoint_index: Option<usize>,
     /// Whether the point splits the route into legs. False only for a `PassThrough`
@@ -357,6 +405,15 @@ struct SequencePoint {
     is_stop: bool,
     /// `StopDuration`: how long the traveller stays at the point.
     stop_duration_s: i64,
+}
+
+impl SequencePoint {
+    /// `Position`: the point in WGS 84 the traveller departs from or arrives at, which is
+    /// the submitted position matched onto the road network. A position the network has no
+    /// road for is reported as submitted rather than moved to a road that does not exist.
+    fn reported_position(&self) -> Position {
+        self.matched_position.unwrap_or(self.position)
+    }
 }
 
 /// One leg of the answer: the computed sub-legs between two stops, merged.
@@ -500,7 +557,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "CalculateRoutes with the LegAdditionalFeature {feature}"
             )));
         }
-        let wants_leg_summary = leg_features.iter().any(|feature| feature == "Summary");
+        let wants_step_narration = leg_features
+            .iter()
+            .any(|feature| feature == TRAVEL_STEP_INSTRUCTIONS_FEATURE);
 
         // The model pins `MaxAlternatives` to `0..5` and the boundary validator refuses
         // anything outside that before this handler runs. A value that nonetheless reaches
@@ -538,6 +597,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut sequence = vec![SequencePoint {
             position: state::validate_position("Origin", &input.origin)
                 .map_err(|message| invalid("Origin", message))?,
+            matched_position: None,
             waypoint_index: None,
             is_stop: true,
             stop_duration_s: 0,
@@ -560,6 +620,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sequence.push(SequencePoint {
                 position: state::validate_position(&member, &waypoint.position)
                     .map_err(|message| invalid(&member, message))?,
+                matched_position: None,
                 waypoint_index: Some(index),
                 is_stop: waypoint.pass_through != Some(true),
                 stop_duration_s: waypoint.stop_duration,
@@ -568,6 +629,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         sequence.push(SequencePoint {
             position: state::validate_position("Destination", &input.destination)
                 .map_err(|message| invalid("Destination", message))?,
+            matched_position: None,
             waypoint_index: None,
             is_stop: true,
             stop_duration_s: 0,
@@ -580,9 +642,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every route of the answer is computed under ONE lock on the shared state: at
         // most `MAX_ALTERNATIVES + 1` routes, and the lock is taken once rather than per
-        // route.
+        // route. The submitted positions are matched onto the road network under the same
+        // lock, since that is what each leg's departure and arrival `Position` reports.
         let (computed_routes, pricing_bucket) = {
             let mut state = state_handle.lock();
+            for point in &mut sequence {
+                point.matched_position = state
+                    .snap(point.position, travel_mode)
+                    .map(|snapped| snapped.position);
+            }
             let computed: Vec<state::CachedRoute> = (0..=u32::try_from(alternatives).unwrap_or(0))
                 .map(|variant| state.compute_route(&positions, travel_mode, objective, variant))
                 .collect();
@@ -605,17 +673,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 && computed.uses_controlled_access_highway;
             routes.push(self.route_output(
                 &legs,
-                &computed.major_road_labels,
+                &computed.major_roads,
                 Rendering {
                     travel_mode,
                     geometry_format: &geometry_format,
                     anchor,
-                    wants_leg_summary,
                     violated_avoidance,
                     steps: StepRendering {
                         detail: step_detail,
                         language: &language,
                         measurement,
+                        narrate: wants_step_narration,
                     },
                 },
             )?);
@@ -674,7 +742,7 @@ impl<Eng> CalculateRoutes<Eng> {
     fn route_output(
         &self,
         legs: &[MergedLeg],
-        major_road_labels: &[String],
+        major_roads: &[TravelledRoad],
         rendering: Rendering<'_>,
     ) -> Result<Route, CalculateRoutesError> {
         let distance: i64 = state::clamp_cost(legs.iter().map(|leg| leg.distance_m as f64).sum());
@@ -708,15 +776,9 @@ impl<Eng> CalculateRoutes<Eng> {
 
         Ok(Route {
             legs: out,
-            major_road_labels: major_road_labels
+            major_road_labels: major_roads
                 .iter()
-                .map(|label| RouteMajorRoadLabel {
-                    road_name: Some(LocalizedString {
-                        language: None,
-                        value: label.clone(),
-                    }),
-                    route_number: None,
-                })
+                .map(|road| major_road_label(road, rendering.steps.language))
                 .collect(),
             summary: Some(RouteSummary {
                 distance,
@@ -736,7 +798,6 @@ impl<Eng> CalculateRoutes<Eng> {
         arrival: Instant,
     ) -> Result<RouteLeg, CalculateRoutesError> {
         let travel_mode = rendering.travel_mode;
-        let wants_leg_summary = rendering.wants_leg_summary;
         let violated_avoidance = rendering.violated_avoidance;
         let geometry = leg_geometry(&state::path_positions(&leg.path), rendering.geometry_format)?;
         let leg_type = LegType::for_mode(travel_mode);
@@ -779,7 +840,7 @@ impl<Eng> CalculateRoutes<Eng> {
                     // Spans are only computed for the features `SpanAdditionalFeatures`
                     // asks for, and this slice computes none of them.
                     spans: Vec::new(),
-                    summary: wants_leg_summary.then_some(RoutePedestrianSummary {
+                    summary: Some(RoutePedestrianSummary {
                         overview: Some(RoutePedestrianOverviewSummary {
                             distance: leg.distance_m,
                             duration: leg.duration_s,
@@ -832,7 +893,7 @@ impl<Eng> CalculateRoutes<Eng> {
                     },
                     pass_through_waypoints: pass_through_waypoints(leg),
                     spans: Vec::new(),
-                    summary: wants_leg_summary.then_some(RouteVehicleSummary {
+                    summary: Some(RouteVehicleSummary {
                         overview: Some(RouteVehicleOverviewSummary {
                             // This road model carries no traffic variation, so the best
                             // case and the typical case are the computed duration.
@@ -935,7 +996,7 @@ fn leg_geometry(positions: &[Position], format: &str) -> Result<RouteLegGeometry
 /// The place of a vehicle leg's departure or arrival.
 fn vehicle_place(point: &SequencePoint) -> RouteVehiclePlace {
     RouteVehiclePlace {
-        position: state::position_to_vec(point.position),
+        position: state::position_to_vec(point.reported_position()),
         original_position: Some(state::position_to_vec(point.position)),
         waypoint_index: point.waypoint_index.and_then(|index| i32::try_from(index).ok()),
         ..Default::default()
@@ -945,7 +1006,7 @@ fn vehicle_place(point: &SequencePoint) -> RouteVehiclePlace {
 /// The place of a pedestrian leg's departure or arrival.
 fn pedestrian_place(point: &SequencePoint) -> RoutePedestrianPlace {
     RoutePedestrianPlace {
-        position: state::position_to_vec(point.position),
+        position: state::position_to_vec(point.reported_position()),
         original_position: Some(state::position_to_vec(point.position)),
         waypoint_index: point.waypoint_index.and_then(|index| i32::try_from(index).ok()),
         ..Default::default()
@@ -1142,9 +1203,10 @@ fn vehicle_step(manoeuvre: &Manoeuvre, rendering: StepRendering<'_>) -> RouteVeh
         continue_step_details: (kind == StepKind::Continue).then(|| RouteContinueStepDetails {
             intersection: details.intersection.clone(),
         }),
-        current_road: manoeuvre
-            .current_road
-            .as_ref()
+        current_road: rendering
+            .narrate
+            .then_some(manoeuvre.current_road.as_ref())
+            .flatten()
             .map(|road| route_road(road, rendering.language)),
         distance: manoeuvre.distance_m,
         duration: manoeuvre.duration_s,
@@ -1154,8 +1216,10 @@ fn vehicle_step(manoeuvre: &Manoeuvre, rendering: StepRendering<'_>) -> RouteVeh
             turn_angle: details.turn_angle,
             turn_intensity: details.turn_intensity.clone(),
         }),
-        // This network numbers no road exit, so there is no exit number to report.
-        exit_number: None,
+        // `ExitNumber` is a list this service computes, so it is reported rather than
+        // omitted: this network numbers no road exit, so no step takes one and the list is
+        // empty.
+        exit_number: Some(Vec::new()),
         exit_step_details: (kind == StepKind::Exit).then(|| RouteExitStepDetails {
             intersection: details.intersection.clone(),
             // `RelativeExit` is which of several exits to take, which a junction of two
@@ -1166,16 +1230,18 @@ fn vehicle_step(manoeuvre: &Manoeuvre, rendering: StepRendering<'_>) -> RouteVeh
             turn_intensity: details.turn_intensity.clone(),
         }),
         geometry_offset: i32::try_from(manoeuvre.geometry_offset).ok(),
-        instruction: (rendering.detail == StepDetail::Default).then(|| instruction(manoeuvre, rendering)),
+        instruction: (rendering.narrate && rendering.detail == StepDetail::Default)
+            .then(|| instruction(manoeuvre, rendering)),
         keep_step_details: (kind == StepKind::Keep).then(|| RouteKeepStepDetails {
             intersection: details.intersection.clone(),
             steering_direction: details.steering_direction.clone(),
             turn_angle: details.turn_angle,
             turn_intensity: details.turn_intensity.clone(),
         }),
-        next_road: manoeuvre
-            .next_road
-            .as_ref()
+        next_road: rendering
+            .narrate
+            .then_some(manoeuvre.next_road.as_ref())
+            .flatten()
             .map(|road| route_road(road, rendering.language)),
         // The network holds no ramp and no roundabout, so no step of a route over it is
         // one: an empty detail structure in their place would be a manoeuvre invented.
@@ -1211,24 +1277,28 @@ fn pedestrian_step(manoeuvre: &Manoeuvre, rendering: StepRendering<'_>) -> Route
         continue_step_details: (kind == StepKind::Continue).then(|| RouteContinueStepDetails {
             intersection: details.intersection.clone(),
         }),
-        current_road: manoeuvre
-            .current_road
-            .as_ref()
+        current_road: rendering
+            .narrate
+            .then_some(manoeuvre.current_road.as_ref())
+            .flatten()
             .map(|road| route_road(road, rendering.language)),
         distance: manoeuvre.distance_m,
         duration: manoeuvre.duration_s,
-        exit_number: None,
+        // See `vehicle_step`: the list is computed and empty, not unknown.
+        exit_number: Some(Vec::new()),
         geometry_offset: i32::try_from(manoeuvre.geometry_offset).ok(),
-        instruction: (rendering.detail == StepDetail::Default).then(|| instruction(manoeuvre, rendering)),
+        instruction: (rendering.narrate && rendering.detail == StepDetail::Default)
+            .then(|| instruction(manoeuvre, rendering)),
         keep_step_details: (kind == StepKind::Keep).then(|| RouteKeepStepDetails {
             intersection: details.intersection.clone(),
             steering_direction: details.steering_direction.clone(),
             turn_angle: details.turn_angle,
             turn_intensity: details.turn_intensity.clone(),
         }),
-        next_road: manoeuvre
-            .next_road
-            .as_ref()
+        next_road: rendering
+            .narrate
+            .then_some(manoeuvre.next_road.as_ref())
+            .flatten()
             .map(|road| route_road(road, rendering.language)),
         roundabout_enter_step_details: None,
         roundabout_exit_step_details: None,
@@ -1296,16 +1366,52 @@ fn turn_intensity(angle_deg: f64) -> &'static str {
     }
 }
 
-/// A `RouteRoad` for a road the leg travels: its name and the road type its class is.
+/// A `RouteRoad` for a road the leg travels: how the network identifies it, and the road
+/// type its class is.
 ///
-/// `RouteNumber` and `Towards` are the empty required lists: this network numbers no road
-/// and names no destination reachable along one, so there is nothing to put in them.
+/// A numbered road carries its `RouteNumber`; `Towards` stays the empty required list,
+/// because the network names no destination reachable along a road.
 fn route_road(road: &TravelledRoad, language: &str) -> RouteRoad {
     RouteRoad {
         road_name: vec![localized(&road.label, language)],
-        route_number: Vec::new(),
+        route_number: road
+            .route_number()
+            .map(|number| route_number(&number, language))
+            .into_iter()
+            .collect(),
         towards: Vec::new(),
         r#type: Some(road_type(road.class).to_string()),
+    }
+}
+
+/// A `RouteMajorRoadLabel` for one of the roads that "differentiate the current route from
+/// the alternatives presented".
+///
+/// The two members of the shape are the two ways a road is identified, so the label carries
+/// the one the road HAS: a numbered road is labelled by its `RouteNumber` — which is what a
+/// client renders a highway shield from — and an unnumbered one by its `RoadName`. Either
+/// way the string declares the language it is rendered in, which is what a localized
+/// rendering keys on.
+fn major_road_label(road: &TravelledRoad, language: &str) -> RouteMajorRoadLabel {
+    match road.route_number() {
+        Some(number) => RouteMajorRoadLabel {
+            road_name: None,
+            route_number: Some(route_number(&number, language)),
+        },
+        None => RouteMajorRoadLabel {
+            road_name: Some(localized(&road.label, language)),
+            route_number: None,
+        },
+    }
+}
+
+/// A `RouteNumber` in the language the road text is rendered in. `Direction` is the
+/// directional identifier of a carriageway, which the roads of this network do not carry.
+fn route_number(value: &str, language: &str) -> RouteNumber {
+    RouteNumber {
+        direction: None,
+        language: Some(language.to_string()),
+        value: value.to_string(),
     }
 }
 
@@ -1327,8 +1433,8 @@ fn signpost(manoeuvre: &Manoeuvre, language: &str) -> Option<RouteSignpost> {
     let road = manoeuvre.junction.and(manoeuvre.current_road.as_ref())?;
     Some(RouteSignpost {
         labels: vec![RouteSignpostLabel {
-            // The network numbers no road, so the label carries its name only.
-            route_number: None,
+            // A sign identifies a numbered road by its number, as `route_road` does.
+            route_number: road.route_number().map(|number| route_number(&number, language)),
             text: Some(localized(&road.label, language)),
         }],
     })
@@ -1406,7 +1512,7 @@ fn pass_through_waypoints(leg: &MergedLeg) -> Vec<RoutePassThroughWaypoint> {
         .map(|(point, offset)| RoutePassThroughWaypoint {
             geometry_offset: i32::try_from(*offset).ok(),
             place: RoutePassThroughPlace {
-                position: state::position_to_vec(point.position),
+                position: state::position_to_vec(point.reported_position()),
                 original_position: Some(state::position_to_vec(point.position)),
                 waypoint_index: point.waypoint_index.and_then(|index| i32::try_from(index).ok()),
             },
