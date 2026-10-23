@@ -14,6 +14,9 @@
 #[path = "all/component_type_lifecycle.rs"]
 mod component_type_lifecycle;
 
+#[path = "all/component_type_update.rs"]
+mod component_type_update;
+
 #[path = "all/execute_query.rs"]
 mod execute_query;
 

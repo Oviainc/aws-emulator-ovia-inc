@@ -821,6 +821,320 @@ pub fn service_linked_role_principal(path: &str) -> Option<&str> {
     (!principal.is_empty()).then_some(principal)
 }
 
+/// What every service-linked role name starts with. AWS's "Using service-linked
+/// roles" guidance, echoed by `CreateServiceLinkedRole$CustomSuffix`'s
+/// documentation ("a string that you provide, which is combined with the
+/// service-provided prefix to form the complete role name"), is that the role a
+/// service links to itself is named for the service behind this prefix.
+pub const SERVICE_LINKED_ROLE_NAME_PREFIX: &str = "AWSServiceRoleFor";
+
+/// The IAM policy language version a generated trust policy declares. It is the
+/// current version of the policy grammar IAM documents, and the one AWS emits in
+/// the trust policy of a role it creates.
+pub const POLICY_LANGUAGE_VERSION: &str = "2012-10-17";
+
+/// The role name AWS PUBLISHES for a service principal's service-linked role.
+///
+/// The service-provided prefix is [`SERVICE_LINKED_ROLE_NAME_PREFIX`] followed by
+/// the service's own AWS-assigned label, and that label is NOT the first label of
+/// the principal and is not derivable from it: `ssm-sap.amazonaws.com` links
+/// `AWSServiceRoleForAWSSSMForSAP`, `ops.apigateway.amazonaws.com` links
+/// `AWSServiceRoleForAPIGateway`, `replication.cassandra.amazonaws.com` links
+/// `AWSServiceRoleForKeyspacesReplication`, and each Application Auto Scaling
+/// principal links a name suffixed with the resource type it scales. No part of the
+/// IAM model carries that label — `CreateServiceLinkedRole$CustomSuffix`'s
+/// documentation only says a suffix "is combined with the service-provided prefix to
+/// form the complete role name" — so the published names are listed here, and a
+/// principal this list does not name falls back to the name
+/// `CreateServiceLinkedRole` derives.
+///
+/// This is also the catalog of the roles the OWNING SERVICE keeps provisioned in
+/// the account ([`service_provisioned_role`]), which is why it lives beside the
+/// state rather than in one handler: the create and the read resolve one table.
+///
+/// Source: the "Using service-linked roles for <service>" page of each service's own
+/// user guide, which names the role that service creates; AWS's "Amazon Web Services
+/// services that work with IAM" table links them all. Rows marked `[model]` are
+/// additionally corroborated by the documentation a Smithy model in THIS repository
+/// carries, quoted in the named handler.
+///
+/// Sorted by principal, which is also the lookup key
+/// ([`published_service_linked_role_name`]).
+pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
+    ("access-analyzer.amazonaws.com", "AWSServiceRoleForAccessAnalyzer"),
+    // [model] service-com-amazonaws-applicationsignals-applicationsignals
+    // `src/ops/start_discovery.rs`: "creating the
+    // AWSServiceRoleForCloudWatchApplicationSignals service-linked role".
+    (
+        "application-signals.amazonaws.com",
+        "AWSServiceRoleForCloudWatchApplicationSignals",
+    ),
+    // [model] service-com-amazonaws-autoscaling-autoscaling-2011-01-01
+    // `src/ops/create_auto_scaling_group.rs`: "service-linked role named
+    // AWSServiceRoleForAutoScaling".
+    ("autoscaling.amazonaws.com", "AWSServiceRoleForAutoScaling"),
+    ("backup.amazonaws.com", "AWSServiceRoleForBackup"),
+    // [model] service-com-amazonaws-batch-awsbatchv20160810
+    // `src/ops/update_compute_environment.rs`: "the AWSServiceRoleForBatch
+    // service-linked role".
+    ("batch.amazonaws.com", "AWSServiceRoleForBatch"),
+    ("cloudtrail.amazonaws.com", "AWSServiceRoleForCloudTrail"),
+    // [model] service-com-amazonaws-configservice-starlingdoveservice
+    // `src/ops/put_service_linked_configuration_recorder.rs`: "creates a
+    // service-linked role AWSServiceRoleForConfig in your account".
+    ("config.amazonaws.com", "AWSServiceRoleForConfig"),
+    // Application Auto Scaling publishes one role per scaled service, named
+    // `AWSServiceRoleForApplicationAutoScaling_<resource type>` — the suffixes this
+    // repository already lists in
+    // service-com-amazonaws-applicationautoscaling-anyscalefrontendservice
+    // `src/state.rs` (`SERVICE_LINKED_ROLE_SUFFIXES`).
+    (
+        "dynamodb.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_DynamoDBTable",
+    ),
+    ("ec2fleet.amazonaws.com", "AWSServiceRoleForEC2Fleet"),
+    // [model] service-com-amazonaws-ecs-amazonec2containerservicev20141113
+    // `src/state.rs`: `role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS`.
+    ("ecs.amazonaws.com", "AWSServiceRoleForECS"),
+    (
+        "ecs.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_ECSService",
+    ),
+    ("eks-fargate.amazonaws.com", "AWSServiceRoleForAmazonEKSForFargate"),
+    ("eks-nodegroup.amazonaws.com", "AWSServiceRoleForAmazonEKSNodegroup"),
+    ("eks.amazonaws.com", "AWSServiceRoleForAmazonEKS"),
+    ("elasticache.amazonaws.com", "AWSServiceRoleForElastiCache"),
+    ("elasticbeanstalk.amazonaws.com", "AWSServiceRoleForElasticBeanstalk"),
+    (
+        "elasticloadbalancing.amazonaws.com",
+        "AWSServiceRoleForElasticLoadBalancing",
+    ),
+    // [model] service-com-amazonaws-fms-awsfms-20180101
+    // `src/ops/put_notification_channel.rs`: "a role other than the
+    // AWSServiceRoleForFMS".
+    ("fms.amazonaws.com", "AWSServiceRoleForFMS"),
+    ("globalaccelerator.amazonaws.com", "AWSServiceRoleForGlobalAccelerator"),
+    ("guardduty.amazonaws.com", "AWSServiceRoleForAmazonGuardDuty"),
+    // [model] service-com-amazonaws-lakeformation-awslakeformation
+    // `src/ops/register_resource.rs`: "choose the
+    // AWSServiceRoleForLakeFormationDataAccess".
+    (
+        "lakeformation.amazonaws.com",
+        "AWSServiceRoleForLakeFormationDataAccess",
+    ),
+    ("lex.amazonaws.com", "AWSServiceRoleForLexBots"),
+    ("macie.amazonaws.com", "AWSServiceRoleForAmazonMacie"),
+    (
+        "opensearchservice.amazonaws.com",
+        "AWSServiceRoleForAmazonOpenSearchService",
+    ),
+    ("ops.apigateway.amazonaws.com", "AWSServiceRoleForAPIGateway"),
+    ("organizations.amazonaws.com", "AWSServiceRoleForOrganizations"),
+    ("rds.amazonaws.com", "AWSServiceRoleForRDS"),
+    (
+        "rds.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_RDSCluster",
+    ),
+    // [model] service-com-amazonaws-keyspaces-keyspacesservice
+    // `src/ops/update_keyspace.rs`:
+    // `role/aws-service-role/replication.cassandra.amazonaws.com/AWSServiceRoleForKeyspacesReplication`.
+    (
+        "replication.cassandra.amazonaws.com",
+        "AWSServiceRoleForKeyspacesReplication",
+    ),
+    // AWS Backup Audit Manager: reporting is a FEATURE of AWS Backup with its own
+    // principal, and the role it links is named for the feature
+    // (`...ForBackupReports`), not for the principal's first label (`reports`) —
+    // "Using service-linked roles for AWS Backup" names
+    // `AWSServiceRoleForBackupReports` as the role AWS Backup creates to run report
+    // jobs, which is the name a client that provisions Backup reporting reads back.
+    ("reports.backup.amazonaws.com", "AWSServiceRoleForBackupReports"),
+    ("securityhub.amazonaws.com", "AWSServiceRoleForSecurityHub"),
+    // Amazon EC2 Spot and Spot Fleet: each role is assumed through the FEATURE's own
+    // principal (`spot.amazonaws.com`, `spotfleet.amazonaws.com`), which is neither
+    // the role's name nor the `ec2` endpoint prefix.
+    ("spot.amazonaws.com", "AWSServiceRoleForEC2Spot"),
+    ("spotfleet.amazonaws.com", "AWSServiceRoleForEC2SpotFleet"),
+    // AWS Systems Manager for SAP: the role AWS SSM for SAP requires in the account
+    // before it will register an application.
+    ("ssm-sap.amazonaws.com", "AWSServiceRoleForAWSSSMForSAP"),
+    ("ssm.amazonaws.com", "AWSServiceRoleForAmazonSSM"),
+    ("sso.amazonaws.com", "AWSServiceRoleForSSO"),
+    ("support.amazonaws.com", "AWSServiceRoleForSupport"),
+    ("trustedadvisor.amazonaws.com", "AWSServiceRoleForTrustedAdvisor"),
+];
+
+/// AWS's own role name for `service_principal`, when it publishes one.
+///
+/// Matched without regard to ASCII case: a service principal is a DNS-style name
+/// (`CreateServiceLinkedRole$AWSServiceName` — "a string similar to a URL but
+/// without the http:// in front"), so a differently-cased spelling addresses the
+/// same service, and IAM holds the resulting role name case-folded anyway
+/// ([`name_key`]).
+pub fn published_service_linked_role_name(service_principal: &str) -> Option<&'static str> {
+    PUBLISHED_SERVICE_LINKED_ROLE_NAMES
+        .iter()
+        .find(|(principal, _)| principal.eq_ignore_ascii_case(service_principal))
+        .map(|(_, role_name)| *role_name)
+}
+
+/// The catalog row whose PUBLISHED role name is `role_name` — its POSITION in
+/// [`PUBLISHED_SERVICE_LINKED_ROLE_NAMES`], the service principal the role is linked
+/// to, and the name AWS publishes for it — or `None` when no service publishes that
+/// name.
+///
+/// The inverse of [`published_service_linked_role_name`], matched the same way IAM
+/// resolves any entity name: "names are not distinguished by case"
+/// (`CreateRole$RoleName`), so a request spelling the name in any case addresses the
+/// same role, and the row carries the canonical spelling a read reports. The position
+/// comes back with it because it is what identifies the row to
+/// [`service_provisioned_role_id`].
+pub fn published_service_linked_role(
+    role_name: &str,
+) -> Option<(usize, &'static str, &'static str)> {
+    PUBLISHED_SERVICE_LINKED_ROLE_NAMES
+        .iter()
+        .enumerate()
+        .find(|(_, (_, published))| published.eq_ignore_ascii_case(role_name))
+        .map(|(row, (principal, published))| (row, *principal, *published))
+}
+
+/// The path a service-linked role for `service_principal` is filed under:
+/// [`SERVICE_LINKED_ROLE_PATH_PREFIX`] — the path AWS reserves for service-linked
+/// roles, since a role's path is what tells every operation the role is
+/// service-linked — followed by the principal and a closing `/`, which is
+/// `pathType`'s required form (`^(\u002F)|(\u002F[\u0021-\u007E]+\u002F)$`).
+pub fn service_linked_role_path(service_principal: &str) -> String {
+    format!("{SERVICE_LINKED_ROLE_PATH_PREFIX}{service_principal}/")
+}
+
+/// The trust policy of a service-linked role: the one statement that lets the
+/// service principal the role is linked to assume it.
+///
+/// Computed from the principal, so the document a read returns says which service
+/// controls the role rather than being a fixed blob.
+pub fn service_linked_role_trust_policy(service_principal: &str) -> String {
+    ::serde_json::json!({
+        "Version": POLICY_LANGUAGE_VERSION,
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "Service": service_principal },
+            "Action": ["sts:AssumeRole"],
+        }],
+    })
+    .to_string()
+}
+
+/// The `CreateDate` a service-provisioned role reports: the epoch.
+///
+/// Nothing in this account created the role — the service that owns it did, before
+/// any request this emulator served — so there is no creation instant to report, and
+/// a derived record that read the clock would answer a different `CreateDate` to
+/// every read. A FIXED instant keeps the record stable across reads, which is what a
+/// client polling for the role depends on, and the epoch is the value this
+/// repository already gives a derived record's timestamps: the xray crate's
+/// `default_sampling_rule` reports `CreatedAt`/`ModifiedAt` as the epoch "because
+/// nothing created it and nothing has modified it".
+const SERVICE_PROVISIONED_ROLE_CREATE_MILLIS: i64 = 0;
+
+/// The service-linked role the OWNING SERVICE keeps provisioned in the account under
+/// the name AWS publishes for it, or `None` when `role_name` is not one of those
+/// names.
+///
+/// A service-linked role "is a unique type of IAM role that is linked directly to an
+/// Amazon Web Services service … predefined by the service and includes all the
+/// permissions that the service requires"; the service, not the account, controls it
+/// ("to attach a policy to this service-linked role, you must make the request using
+/// the Amazon Web Services service that depends on this role",
+/// `CreateServiceLinkedRole`), and "only the service that depends on the
+/// service-linked role can modify or delete the role on your behalf"
+/// (`UnmodifiableEntityException`). For every service this emulator serves, that role
+/// is therefore already provisioned: the service provisions it on the account's
+/// behalf when the account uses the service, and no caller has to ask for it — which
+/// is why a client that waits for IAM to report one (the documented pattern before
+/// using a dependent resource) converges instead of spinning on `NoSuchEntity`.
+///
+/// DERIVED, never inserted into the store, exactly as this crate keeps AWS-managed
+/// policies out of [`ComAmazonawsIamAwsidentitymanagementv20100508State::policies`]:
+/// the record belongs to AWS rather than to the account, so the account's own
+/// collections stay the record of what the ACCOUNT holds, and no read writes
+/// anything. Every member is a pure function of the catalog row — the path and trust
+/// policy of the principal, the ARN of that path and name, an id keyed to the name
+/// ([`service_provisioned_role_id`]) and a fixed `CreateDate`
+/// ([`SERVICE_PROVISIONED_ROLE_CREATE_MILLIS`]) — so two reads answer the same
+/// record. A record the account creates for that name (`CreateServiceLinkedRole`)
+/// takes precedence: a reader looks in the store first.
+///
+/// WHAT RESOLVES THROUGH THIS, and what deliberately does not:
+///
+/// * `GetRole` — the role REPORT — answers the account's own record where there is
+///   one and this derived record otherwise.
+/// * `CreateServiceLinkedRole` still MINTS the account's own record for such a
+///   principal and answers 200 rather than refusing the name as taken. That is
+///   deliberate: the role a service predefines is not a record of the account's, and
+///   every client that follows a service's documented bootstrap (create the role,
+///   then read it back under the published name) depends on that create succeeding.
+///   The created record then supersedes this one for every later read.
+/// * The operations that CHANGE a role or report the ACCOUNT's own record of its
+///   attachments (`DeleteRole`, `UpdateRole`, `UpdateAssumeRolePolicy`,
+///   `UpdateRoleDescription`, `Put`/`Get`/`DeleteRolePolicy`,
+///   `Attach`/`DetachRolePolicy`, `Tag`/`UntagRole`, the `ListRole*` listings and
+///   `ListRoles`) keep answering from the store alone, so a name only this function
+///   resolves is still `NoSuchEntity` there. None of them could legally change a
+///   service-linked role ("only the service that depends on the service-linked role
+///   can modify or delete the role on your behalf"), and reporting the policies a
+///   service attaches to its OWN role would mean inventing a catalog no model in
+///   this repository carries.
+pub fn service_provisioned_role(role_name: &str) -> Option<Role> {
+    let (row, service_principal, published_name) = published_service_linked_role(role_name)?;
+    let path = service_linked_role_path(service_principal);
+    Some(Role {
+        arn: role_arn(&path, published_name),
+        role_id: service_provisioned_role_id(row),
+        create_date: ::aws_smithy_types::DateTime::from_millis(
+            SERVICE_PROVISIONED_ROLE_CREATE_MILLIS,
+        ),
+        // The service that the role is linked to is the one that can assume it.
+        assume_role_policy_document: Some(service_linked_role_trust_policy(service_principal)),
+        // A role the service predefined carries no description of the account's, no
+        // permissions boundary and no tags of its own, and nothing in this account
+        // has assumed it, so there is no last-used activity to report.
+        description: None,
+        max_session_duration: Some(DEFAULT_MAX_SESSION_DURATION_SECONDS),
+        permissions_boundary: None,
+        tags: None,
+        role_last_used: None,
+        // Only a role created from a role template carries one
+        // (`smithy_query(query="shape", shape="Role")`), which this is not.
+        source_role_template: None,
+        role_name: published_name.to_string(),
+        path,
+    })
+}
+
+/// The `RoleId` of the service-provisioned role at position `row` of
+/// [`PUBLISHED_SERVICE_LINKED_ROLE_NAMES`]: an id minted by [`unique_id`], this
+/// module's one id minter, from the ROW rather than from a counter.
+///
+/// Keying it to the row is what makes it stable — the same name resolves the same row
+/// and so reads the same id, call after call — and distinct per role, since
+/// [`unique_id`] is injective in the position it is given. The position is offset by
+/// [`SERVICE_PROVISIONED_ROLE_ID_BASE`], past every value
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::role_id_seq`] can reach, so a
+/// provisioned role's id can never collide with one minted for a created role.
+fn service_provisioned_role_id(row: usize) -> String {
+    unique_id(ROLE_ID_PREFIX, SERVICE_PROVISIONED_ROLE_ID_BASE + row as u64)
+}
+
+/// Where the id positions of the service-provisioned roles start: the top half of the
+/// `u64` range.
+///
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::role_id_seq`] starts at zero
+/// and is bumped once per created role, so it cannot reach this base, and the
+/// catalog's length cannot carry a row past the range — which is what makes the two
+/// id spaces disjoint by construction.
+const SERVICE_PROVISIONED_ROLE_ID_BASE: u64 = 1 << 63;
+
 /// The marker scope of the attachment set of the role keyed by `role_key`.
 pub fn role_attached_policies_marker_scope(role_key: &str) -> String {
     format!("{MARKER_SCOPE_ROLE_ATTACHED_POLICIES}:{role_key}")

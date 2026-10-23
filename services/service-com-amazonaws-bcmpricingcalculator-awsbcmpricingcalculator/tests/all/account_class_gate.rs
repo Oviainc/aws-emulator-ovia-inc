@@ -7,11 +7,12 @@
 //! everything inside them, and the WRITE of the account-level rate-type preferences —
 //! belongs to the account that pays the bills being modelled, so a request for one of
 //! those subjects from an AWS Organizations MEMBER account is refused with HTTP 400
-//! `ValidationException` carrying `reason` `invalidRequestFromMember`, whatever the
-//! request carries and whether it reads or writes, and changes nothing; the same request
-//! from an account that pays its own bills (a payer/management account, or a standalone
-//! account in no organization) is admitted. Reading the preferences, and the whole
-//! workload-estimate surface, are not gated for any class.
+//! `ValidationException` carrying `reason` `INVALID_REQUEST_FROM_MEMBER` and ONE fixed,
+//! operation-independent message, whatever the request carries and whether it reads or
+//! writes, and changes nothing; the same request from an account that pays its own bills
+//! (a payer/management account, or a standalone account in no organization) is admitted.
+//! Reading the preferences, and the whole workload-estimate surface, are not gated for any
+//! class.
 //!
 //! The rows span what the rule generalises over: the operation (every implemented one of
 //! the gated subjects, read and write alike), the account class (all three values of
@@ -34,10 +35,20 @@ const ABSENT_ID: &str = "0f9e8d7c-6b5a-4938-2716-05f4e3d2c1b0";
 /// A 12-digit `AccountId`, the form `^\d{12}$` requires.
 const USAGE_ACCOUNT_ID: &str = "000000000000";
 
-/// The `ValidationExceptionReason` value an account-class refusal reports (smithy_query:
-/// `shape="ValidationExceptionReason"` → `[unknownOperation, cannotParse,
-/// fieldValidationFailed, invalidRequestFromMember, disallowedRate, other]`).
-const INVALID_REQUEST_FROM_MEMBER: &str = "invalidRequestFromMember";
+/// The `ValidationExceptionReason` value an account-class refusal reports, in the
+/// spelling the GATE puts on the wire: the SCREAMING_SNAKE_CASE rendering of the model's
+/// own `invalidRequestFromMember` (smithy_query: `shape="ValidationExceptionReason"` →
+/// `[unknownOperation, cannotParse, fieldValidationFailed, invalidRequestFromMember,
+/// disallowedRate, other]`). RECORDED behaviour, identical in every recorded refusal the
+/// gate makes; a refusal raised by the modelled input validator carries the model's own
+/// spelling instead (see `tests/all/validation_refusal_detail.rs`).
+const INVALID_REQUEST_FROM_MEMBER: &str = "INVALID_REQUEST_FROM_MEMBER";
+
+/// The one sentence the gate refuses with, whatever the operation. RECORDED behaviour:
+/// byte-identical in every recorded refusal the gate makes, of seven different
+/// operations, and naming none of them.
+const REFUSAL_MESSAGE: &str = "Operation not permitted for member accounts. This API is \
+     only allowed for regular or payer accounts.";
 
 /// Every account class a store can present (smithy_query corroborates the three-way
 /// split: `GetPreferencesResponse` reports one selection per class).
@@ -113,8 +124,9 @@ fn gated_calls() -> Vec<GatedCall> {
     ]
 }
 
-/// Assert `body` is the account-class refusal: the modelled code, the modelled `reason`,
-/// and a message that says what the caller has to change.
+/// Assert `body` is the account-class refusal: the modelled code, the `reason` in the
+/// spelling the gate puts on the wire, and the ONE fixed message — which names no
+/// operation, so it is byte-identical for every row of the table.
 fn assert_member_refusal(case: &str, status: u16, body: &Value) {
     assert_eq!(
         status, 400,
@@ -131,11 +143,17 @@ fn assert_member_refusal(case: &str, status: u16, body: &Value) {
         "case {case}: expected reason {INVALID_REQUEST_FROM_MEMBER:?}, got {:?} in {body}",
         body["reason"]
     );
-    assert!(
+    assert_eq!(
+        body["message"].as_str(),
+        Some(REFUSAL_MESSAGE),
+        "case {case}: expected the fixed message {REFUSAL_MESSAGE:?}, got {:?}",
         body["message"]
-            .as_str()
-            .is_some_and(|message| !message.is_empty()),
-        "case {case}: expected a message stating the refusal, got {body}"
+    );
+    // No field of the request is at fault, so the structured half a field-validation
+    // failure carries is absent.
+    assert!(
+        body.get("fieldList").is_none(),
+        "case {case}: an account-class refusal names no field, got {body}"
     );
 }
 
@@ -152,6 +170,13 @@ async fn a_member_account_is_refused_the_whole_bill_planning_surface() {
         let case = format!("{operation} from a member account");
         let (status, body) = emulator.call(operation, request).await;
         assert_member_refusal(&case, status, &body);
+        // The message is the gate's, not the operation's: it does not name the operation
+        // it refused, so a client matching the sentence matches it for every one.
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            !message.contains(operation),
+            "case {case}: the message names the operation: {message:?}"
+        );
     }
 }
 

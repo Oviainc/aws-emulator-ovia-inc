@@ -35,6 +35,8 @@ mod namespace_listing;
 mod public_dns_namespace;
 #[path = "all/service_attributes.rs"]
 mod service_attributes;
+#[path = "all/service_listing.rs"]
+mod service_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tagging.rs"]

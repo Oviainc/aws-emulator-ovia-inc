@@ -41,7 +41,9 @@ async fn update_flow_output(
 
 /// The value at a dotted path of a JSON object, where a numeric segment indexes a list:
 /// `transport.minLatency`, `mediaStreamOutputConfigurations.0.encodingName`.
-fn at_path<'a>(value: &'a Value, path: &str) -> &'a Value {
+///
+/// `pub(crate)` because the UpdateFlowSource suite reads a stored record the same way.
+pub(crate) fn at_path<'a>(value: &'a Value, path: &str) -> &'a Value {
     let mut current = value;
     for segment in path.split('.') {
         current = match segment.parse::<usize>() {
@@ -54,7 +56,9 @@ fn at_path<'a>(value: &'a Value, path: &str) -> &'a Value {
 
 /// `value` with the given top-level keys removed, so two outputs can be compared on
 /// everything the request did NOT touch.
-fn without_keys(value: &Value, keys: &[&str]) -> Value {
+///
+/// `pub(crate)` because the UpdateFlowSource suite makes the same comparison.
+pub(crate) fn without_keys(value: &Value, keys: &[&str]) -> Value {
     let mut stripped = value.clone();
     if let Some(object) = stripped.as_object_mut() {
         for key in keys {

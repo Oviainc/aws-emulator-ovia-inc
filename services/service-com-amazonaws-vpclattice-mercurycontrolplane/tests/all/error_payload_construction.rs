@@ -679,7 +679,9 @@ async fn conflict_messages_are_built_from_the_request_identifiers() {
     let message = message_of("listener duplicate name", &again);
     assert_eq!(
         message,
-        format!("Resource with name only-listener already exists in Service {host_id}."),
+        // A name scoped to an owning RESOURCE names the kind, the submitted name and
+        // that resource — not the account form the two rows above assert.
+        format!("Listener with name only-listener already exists in {host_id} service."),
         "case listener duplicate name: the conflict must name the name and the owning \
          service, got {message:?}"
     );

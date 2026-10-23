@@ -22,9 +22,9 @@ use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 
 use crate::cache_cluster_lifecycle::{
-    account_subnet_ids, create_available_cluster, create_cluster, params, subnet_group_params,
-    Emulator, RefusalCase, Reply, PAST_TRANSITION,
+    account_subnet_ids, create_available_cluster, create_cluster, subnet_group_params,
 };
+use crate::harness::{params, Emulator, RefusalCase, Reply, PAST_TRANSITION};
 
 /// One `Event` of a reply, reduced to where it came from and what it says.
 /// `Date` is read separately, as an instant inside the window asked for.

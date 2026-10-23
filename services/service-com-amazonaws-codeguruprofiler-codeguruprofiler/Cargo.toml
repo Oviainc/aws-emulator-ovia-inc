@@ -24,13 +24,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# SHA-256 and hex, which `state::revision_id` derives a policy `RevisionId` with from
+# the store's own mint count and the write it identifies.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 # RFC 3986 percent-encoding, so a test can put an ARN in a single-segment
 # `@httpLabel` and tag keys in `@httpQuery` values the way an SDK does.
 percent-encoding = "2.3"

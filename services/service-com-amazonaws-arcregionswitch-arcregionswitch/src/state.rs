@@ -423,8 +423,9 @@ pub struct StoredExecution {
     /// What the clock needs to know about each of those steps, in the same order.
     pub planned_steps: Vec<PlannedStep>,
     /// The execution's events, oldest first, as `ListPlanExecutionEvents` reports them.
-    /// Bounded by the step count of the workflow the execution runs plus the two
-    /// lifecycle events, so it cannot grow per request.
+    /// Bounded by the step count of the workflow the execution runs — each step records at
+    /// most one event of its own — plus its lifecycle events, so it cannot grow per
+    /// request.
     pub events: Vec<ExecutionEvent>,
     /// When the clock owes this execution its next transition; `None` once it owes none —
     /// because the execution has reached a state it never leaves, or because it is waiting
@@ -491,6 +492,11 @@ enum Advance {
 pub enum ApprovalOutcome {
     /// The decision was applied.
     Applied,
+    /// This emulator holds no plan under that ARN.
+    NoSuchPlan,
+    /// The plan is ongoing no execution at all, so it has nothing to decide: every
+    /// execution it ever started has reached a state it never leaves.
+    NoOngoingExecution,
     /// This plan holds no execution with that id.
     NoSuchExecution,
     /// The execution runs no step of that name.
@@ -651,12 +657,17 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
 
     /// Apply a manual-approval decision to one step of one execution.
     ///
+    /// The decision applies to the execution the plan is ONGOING, and to the step that
+    /// execution is actually waiting on. An execution that has reached a state it never
+    /// leaves is past deciding, so once the plan is ongoing none there is nothing to
+    /// decide at all ([`ApprovalOutcome::NoOngoingExecution`]) — which is what a caller
+    /// deciding a step twice runs into when the first decision finished the execution.
+    ///
     /// Approving releases the step — it reports [`STEP_COMPLETED`], the execution
     /// [`IN_PROGRESS`], and the clock owes the next step after [`EXECUTION_START_SPAN`],
     /// so a caller reading straight after the approval still sees the execution between
     /// steps. Declining stops the execution: the step is [`STEP_CANCELED`], the execution
-    /// [`CANCELED`], and the plan is released. Only the step the execution is actually
-    /// waiting on can be decided.
+    /// [`CANCELED`], and the plan is released.
     pub fn apply_approval(
         &mut self,
         key: &(String, String),
@@ -665,6 +676,20 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
         comment: Option<String>,
         now: SystemTime,
     ) -> ApprovalOutcome {
+        let Some(plan) = self.plans.get(&key.0) else {
+            return ApprovalOutcome::NoSuchPlan;
+        };
+        let ongoing = plan.active_execution.clone().filter(|execution_id| {
+            self.executions
+                .get(&(key.0.clone(), execution_id.clone()))
+                .is_some_and(|execution| !execution.is_terminal())
+        });
+        let Some(ongoing) = ongoing else {
+            return ApprovalOutcome::NoOngoingExecution;
+        };
+        if ongoing != key.1 {
+            return ApprovalOutcome::NoSuchExecution;
+        }
         let Some(execution) = self.executions.get(key) else {
             return ApprovalOutcome::NoSuchExecution;
         };
@@ -784,7 +809,7 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
         );
         if let Some(execution) = self.executions.get_mut(key) {
             let previous_event_id = execution.events.last().map(|event| event.event_id.clone());
-            execution.events.push(ExecutionEvent {
+            let event = ExecutionEvent {
                 timestamp: Some(at),
                 r#type: Some(event_type.to_string()),
                 step_name,
@@ -794,7 +819,8 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
                 description,
                 event_id,
                 previous_event_id,
-            });
+            };
+            execution.events.push(event);
         }
     }
 

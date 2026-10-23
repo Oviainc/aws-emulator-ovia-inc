@@ -24,10 +24,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test signs with, so the ARNs under test are region-sensitive
 /// rather than matching a hardcoded default.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Every value the model's `com.amazonaws.dataexchange#AssetType` enum admits.
 /// Source: `smithy_query(query="shape", shape="AssetType")`, mirrored by
@@ -50,19 +50,19 @@ const MAX_RESULTS_MIN: i64 = 1;
 const MAX_RESULTS_MAX: i64 = 200;
 
 /// One HTTP answer, reduced to what the assertions read.
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// The restJson1 error code, from `x-amzn-errortype` or the body's `__type`.
-    error: Option<String>,
-    body: Value,
+    pub(crate) error: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Answer {
-    fn member(&self, name: &str) -> &Value {
+    pub(crate) fn member(&self, name: &str) -> &Value {
         &self.body[name]
     }
 
-    fn string(&self, name: &str) -> String {
+    pub(crate) fn string(&self, name: &str) -> String {
         self.member(name)
             .as_str()
             .unwrap_or_else(|| panic!("member {name} is not a string: {:?}", self.body))
@@ -71,19 +71,31 @@ impl Answer {
 }
 
 /// A fresh emulator holding only this service, over its own engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
+    harness().0
+}
+
+/// The same emulator, handed back WITH the engine its state lives in — for an
+/// assertion about what a call did or did not persist, and for a stored state no
+/// implemented operation can reach yet.
+pub(crate) fn harness() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signature verification is the emulator's, not this service's, concern; the
     // tests assert handler behaviour, so it is switched off explicitly rather than
     // left to depend on the process default.
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
 }
 
 /// Send one restJson1 request and reduce the answer.
-async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option<Value>) -> Answer {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> Answer {
     let host = format!("dataexchange.{REGION}.amazonaws.com");
     let mut request = http::Request::builder()
         .method(method)
@@ -146,7 +158,7 @@ fn short_error_code(raw: &str) -> String {
 }
 
 /// The modelled `Id` pattern `^[a-zA-Z0-9]{30,40}$`.
-fn is_modelled_id(value: &str) -> bool {
+pub(crate) fn is_modelled_id(value: &str) -> bool {
     (30..=40).contains(&value.chars().count())
         && value.chars().all(|c| c.is_ascii_alphanumeric())
 }
@@ -157,7 +169,7 @@ fn is_modelled_id(value: &str) -> bool {
 /// restJson1 renders a timestamp as epoch seconds unless the member carries
 /// `@timestampFormat`, so both renderings are accepted here: the assertions are
 /// about the instants, not about which of the protocol's encodings carries them.
-fn seconds(value: &Value, case: &str) -> f64 {
+pub(crate) fn seconds(value: &Value, case: &str) -> f64 {
     if let Some(epoch) = value.as_f64() {
         return epoch;
     }
@@ -169,7 +181,7 @@ fn seconds(value: &Value, case: &str) -> f64 {
         .as_secs_f64()
 }
 
-async fn create_data_set(
+pub(crate) async fn create_data_set(
     router: &MultiServiceRouter,
     name: &str,
     description: &str,

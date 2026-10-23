@@ -182,7 +182,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::not_found_by_alternate_identifier(crate::state::ResourceKind::Group),
             )
         };
-        let store = state.store(&input.identity_store_id).ok_or_else(not_found)?;
+        // The identity store the request names must exist; one that does not is the
+        // missing resource, reported as `IDENTITY_STORE` rather than as a missing group
+        // of a store that is not there either.
+        let store = state
+            .resolve_store(&input.identity_store_id)
+            .map_err(GetGroupIdErrorModeled::ResourceNotFoundException)?;
         let group = lookup.find(store).ok_or_else(not_found)?;
 
         Ok(GetGroupIdOutput {

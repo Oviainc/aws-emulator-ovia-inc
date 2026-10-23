@@ -5,9 +5,9 @@
 //! Every assertion goes over the wire, through the same router the production
 //! emulator mounts, and nothing reaches into the service's state struct — so a
 //! response that is not computed from the published catalog and the clock
-//! cannot pass. The request builder and the XML reader are the ones the
-//! `cache_cluster_lifecycle` suite marks `pub(crate)`, so this target keeps one
-//! harness rather than a second copy that could drift.
+//! cannot pass. The request builder and the XML reader are the shared
+//! [`crate::harness`] ones, so this target keeps one harness rather than a
+//! second copy that could drift.
 //!
 //! The tests are tables: each row is one input along the axis the rule under
 //! test generalises over (the status filter and its combinations, the name
@@ -20,7 +20,7 @@ use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::cache_cluster_lifecycle::{params, Emulator, Reply};
+use crate::harness::{params, Emulator, Reply};
 
 /// One `ServiceUpdate` element of a response, as the wire reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]

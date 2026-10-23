@@ -8,8 +8,8 @@
 //! call made with a caller's own credentials is refused with the modelled
 //! `AccessDeniedException` (HTTP 403) and NO analyzer is created.
 //!
-//! Every request this emulator serves is signed with a caller's own SigV4 access key
-//! (see [`crate::state::caller_identity_arn`]) — an IAM identity of the emulator's
+//! Every request this emulator serves is signed with a caller's own SigV4 access key —
+//! an IAM identity of the emulator's
 //! account, never an Amazon Web Services service principal, because the emulator vends
 //! no service-principal credentials and no emulated service manages analyzers. So every
 //! call that can reach this handler is a direct customer invocation, which is exactly
@@ -18,6 +18,10 @@
 //! writes nothing. The service-linked analyzers an authorized service would own are
 //! therefore never minted here, which is also why
 //! [`crate::state::Analyzer::summary`] reports no `managedBy`.
+//!
+//! WHICH caller was refused is not in the message — AWS's text for this refusal is one
+//! constant naming no identity (see [`ACCESS_DENIED_MESSAGE`]) — it is in the audit
+//! record [`crate::state::audit`] writes, which carries the presented access key id.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +100,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `message` of the `AccessDeniedException` that refuses a direct customer
+/// invocation.
+///
+/// AWS's own constant for this refusal, as the recorded responses carry it: it names no
+/// caller identity, no account and no Region, so a client matching it reads the same
+/// string in every environment. The refused identity travels in the audit record
+/// instead.
+pub const ACCESS_DENIED_MESSAGE: &str = "The caller does not have sufficient permissions, \
+     or the service principal is not authorized to create analyzers";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -173,20 +187,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request body is read only to say so (the input is not stored, and no analyzer
         // is created, whatever `type`, `configuration` or `archiveRules` it carried).
         let _ = (&input, &self.engine);
-        // Name the caller that was refused, taken from the request's own SigV4 identity
-        // rather than invented, so a client can see WHICH principal the service declined.
-        // The identity is reduced to the characters an access key id can hold before it
-        // is rendered, so no caller-controlled text reaches the message unbounded.
-        let caller = crate::state::caller_identity_arn(ctx.parts());
-        // The denial is attributable: who was refused, on what target, is recorded.
+        // The denial is attributable: who was refused, on what target, is recorded — in
+        // the audit record, which is where a caller identity belongs. The MESSAGE is the
+        // service's constant for this refusal and names no caller, so it is the same text
+        // in every account and for every credential.
         crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::AccessDenied);
         Err(
             CreateServiceLinkedAnalyzerErrorModeled::AccessDeniedException(AccessDeniedException {
-                message: format!(
-                    "{caller} is not an authorized Amazon Web Services service principal: \
-                     CreateServiceLinkedAnalyzer can only be invoked by the service that \
-                     manages the analyzer, and a direct invocation by a customer is denied"
-                ),
+                message: ACCESS_DENIED_MESSAGE.to_string(),
             })
             .into(),
         )

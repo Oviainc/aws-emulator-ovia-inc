@@ -300,7 +300,7 @@ pub(crate) fn error_code(body: &Value) -> String {
 
 /// A timestamp member as epoch seconds, however the protocol rendered it
 /// (`IsoTimestamp` is `@timestampFormat("date-time")`, but a number is read too).
-fn instant(body: &Value, member: &str) -> f64 {
+pub(crate) fn instant(body: &Value, member: &str) -> f64 {
     match body.get(member) {
         Some(Value::Number(n)) => n.as_f64().unwrap_or_default(),
         Some(Value::String(s)) => {

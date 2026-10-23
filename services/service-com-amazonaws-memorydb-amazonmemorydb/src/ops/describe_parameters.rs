@@ -191,8 +191,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = state.parameter_groups.get(&parameter_group_name) else {
             return Err(DescribeParametersErrorModeled::ParameterGroupNotFoundFault(
                 ParameterGroupNotFoundFault {
-                    message: Some(format!(
-                        "Parameter group {parameter_group_name} not found."
+                    message: Some(crate::state::parameter_group_not_found_message(
+                        &parameter_group_name,
                     )),
                 },
             )

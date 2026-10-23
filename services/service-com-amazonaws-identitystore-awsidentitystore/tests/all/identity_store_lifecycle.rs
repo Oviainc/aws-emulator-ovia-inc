@@ -2,11 +2,9 @@
 
 //! The identity-store user / group / membership slice, driven end to end over HTTP.
 //!
-//! Every case goes through the same front door a client uses: `POST /` with
-//! `X-Amz-Target: AWSIdentityStore.<Operation>` and an `awsJson1_1` body
-//! (OPERATIONS.md, "Wire protocol"), dispatched by the production
-//! [`MultiServiceRouter`]. Nothing reaches into the state struct, so a response that
-//! is not computed from persisted state cannot pass.
+//! Every case goes through the same front door a client uses, through the shared
+//! harness in [`crate::harness`]: nothing reaches into the state struct, so a response
+//! that is not computed from persisted state cannot pass.
 //!
 //! The suites are TABLES: each row is one input along the axis the rule under test
 //! generalises over (which profile members are present, name form and length, page
@@ -14,22 +12,13 @@
 //! `engineering` case from the bootstrap issue is only one row.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
+
+use crate::harness::{emulator, error_message, ok, refused, string, MISSING_STORE, STORE};
 /// The crate under test, aliased so a capacity bound can be named rather than restated.
 use service_com_amazonaws_identitystore_awsidentitystore as identitystore;
 use smithy_server_runtime::MultiServiceRouter;
-
-/// The `X-Amz-Target` prefix from OPERATIONS.md, "Wire protocol".
-const TARGET_PREFIX: &str = "AWSIdentityStore";
-
-/// The identity store the issue's reproduction uses. Any id the modelled
-/// `IdentityStoreId` pattern admits works; this is one row's worth of that.
-pub(crate) const STORE: &str = "d-1234567890";
-
-/// A second store, so the per-store scope of a uniqueness claim is observable.
-pub(crate) const OTHER_STORE: &str = "d-abcdef0123";
 
 /// The bounds of the modelled `MaxResults` range every `List*` operation of this
 /// service shares (`smithy_query(query="operation",operation="ListUsers")` and
@@ -63,118 +52,6 @@ const PROFILE_MEMBERS: &[&str] = &[
     "Birthdate",
     "Roles",
 ];
-
-/// A router with just this service mounted on a fresh engine.
-///
-/// `pub(crate)` because the wire harness below is shared with this crate's other
-/// suites (`tests/all/delete_group.rs`, `tests/all/get_group_id.rs`,
-/// `tests/all/is_member_in_groups.rs`, `tests/all/list_groups.rs`,
-/// `tests/all/list_users.rs`) rather than copied into each of them.
-pub(crate) fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signatures are not what these tests are about; the request still carries a SigV4
-    // credential scope, which is what routes it to this service.
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_identitystore_awsidentitystore::EmulatedService::new(engine),
-    );
-    router
-}
-
-/// One `awsJson1_1` call: the HTTP status, the wire error code and the parsed body.
-pub(crate) async fn call(
-    router: &MultiServiceRouter,
-    operation: &str,
-    body: Value,
-) -> (u16, String, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
-        .header("host", "identitystore.us-east-1.amazonaws.com")
-        .header(
-            "authorization",
-            "AWS4-HMAC-SHA256 Credential=AKIDIDENTITYSTORE/20260101/us-east-1\
-             /identitystore/aws4_request, SignedHeaders=host;x-amz-target, Signature=00",
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(&body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let header_code = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let payload = response.into_body();
-    let parsed: Value = if payload.is_empty() {
-        json!({})
-    } else {
-        serde_json::from_slice(&payload)
-            .unwrap_or_else(|_| json!({ "__unparsed": String::from_utf8_lossy(&payload) }))
-    };
-    let code = if header_code.is_empty() {
-        parsed
-            .get("__type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    } else {
-        header_code
-    };
-    (status, code, parsed)
-}
-
-/// A call that must answer 200, returning its body.
-pub(crate) async fn ok(
-    router: &MultiServiceRouter,
-    operation: &str,
-    body: Value,
-    case: &str,
-) -> Value {
-    let (status, code, parsed) = call(router, operation, body).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected {operation} to answer 200, got {status} {code} with {parsed}"
-    );
-    parsed
-}
-
-/// A call that must be refused with `status` and an error code naming `error`.
-pub(crate) async fn refused(
-    router: &MultiServiceRouter,
-    operation: &str,
-    body: Value,
-    status: u16,
-    error: &str,
-    case: &str,
-) -> Value {
-    let (actual_status, code, parsed) = call(router, operation, body).await;
-    assert_eq!(
-        actual_status, status,
-        "case {case:?}: expected {operation} to answer {status} {error}, \
-         got {actual_status} {code} with {parsed}"
-    );
-    assert!(
-        code.contains(error),
-        "case {case:?}: expected {operation} to answer {error}, got {code:?} with {parsed}"
-    );
-    parsed
-}
-
-/// A required string member of a response body.
-pub(crate) fn string(body: &Value, member: &str, case: &str) -> String {
-    body[member]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case:?}: expected a string {member}, got {body}"))
-        .to_string()
-}
 
 /// Assert `id` is a lower-case hexadecimal UUID, the form the modelled `ResourceId`
 /// pattern demands (`[0-9a-f]{8}-…-[0-9a-f]{12}`, from
@@ -262,11 +139,14 @@ pub(crate) fn assert_absent(sent: &Map<String, Value>, got: &Value, case: &str) 
             "case {case:?}: expected no {member} on a user created without one, got {actual}"
         );
     }
-    // `CreateUser` models no `UserStatus`, so a freshly created user has none.
+    // A user this API creates is ENABLED: `CreateUser` models no `UserStatus` member,
+    // and the modelled enum's other value belongs to a status change no operation of
+    // this service carries.
     let status = got.get("UserStatus").unwrap_or(&Value::Null);
-    assert!(
-        status.is_null(),
-        "case {case:?}: expected no UserStatus on a freshly created user, got {status}"
+    assert_eq!(
+        status.as_str().unwrap_or_default(),
+        "ENABLED",
+        "case {case:?}: expected a created user to report UserStatus ENABLED, got {status}"
     );
 }
 
@@ -526,7 +406,7 @@ async fn a_created_user_is_reported_exactly_as_it_was_stored() {
 }
 
 #[tokio::test]
-async fn a_user_name_is_a_uniqueness_claim_within_one_identity_store() {
+async fn a_user_name_is_a_uniqueness_claim_and_a_store_that_does_not_exist_holds_none() {
     let router = emulator();
     // Rows differ along the form of the claimed name.
     let rows = [
@@ -564,13 +444,18 @@ async fn a_user_name_is_a_uniqueness_claim_within_one_identity_store() {
             "case {case:?}: expected the first user to keep the claimed UserName"
         );
 
-        // The claim is per identity store: the same name in another store is free.
-        let other = create_user(&router, OTHER_STORE, user_name, case).await;
-        assert_ne!(
-            other,
-            string(&described, "UserId", case),
-            "case {case:?}: expected a distinct user in the other identity store"
-        );
+        // The claim is scoped to the identity store: a store that does not exist has no
+        // namespace to claim a name in, so the same create addressed to one is refused
+        // as not found rather than stored.
+        refused(
+            &router,
+            "CreateUser",
+            json!({ "IdentityStoreId": MISSING_STORE, "UserName": user_name }),
+            404,
+            "ResourceNotFoundException",
+            case,
+        )
+        .await;
     }
 }
 
@@ -820,7 +705,7 @@ async fn a_membership_needs_both_of_its_ends_and_cannot_be_created_twice() {
         (
             "unknown identity store",
             json!({
-                "IdentityStoreId": OTHER_STORE,
+                "IdentityStoreId": MISSING_STORE,
                 "GroupId": group.clone(),
                 "MemberId": { "UserId": user.clone() },
             }),
@@ -1144,9 +1029,12 @@ async fn caller_driven_growth_is_refused_at_the_capacity_bound() {
     )
     .await;
 
-    // Members per group, which also bounds the list scanned under the shared lock.
+    // Members per group, which also bounds the list scanned under the shared lock. A
+    // fresh emulator, so the user bound this row's members would otherwise sit under is
+    // not the one being tested here.
     let case = "members per group";
-    let store = "d-000000000a";
+    let router = emulator();
+    let store = STORE;
     let group = create_group(&router, store, "crowded", case).await;
     let mut last_user = String::new();
     for index in 0..=identitystore::state::MAX_MEMBERSHIPS_PER_GROUP {
@@ -1185,86 +1073,42 @@ async fn caller_driven_growth_is_refused_at_the_capacity_bound() {
         identitystore::state::MAX_MEMBERSHIPS_PER_GROUP,
         "case {case:?}: expected the refused membership to have been stored nowhere"
     );
-
-    // Identity stores: a caller-chosen `IdentityStoreId` vivifies one, so that is
-    // capped too. A fresh emulator, so the count of stores in play is exactly the
-    // number this row creates: store number MAX_IDENTITY_STORES is accepted and
-    // number MAX_IDENTITY_STORES + 1 is refused.
-    let case = "identity stores";
-    let router = emulator();
-    for index in 0..identitystore::state::MAX_IDENTITY_STORES {
-        ok(
-            &router,
-            "CreateGroup",
-            json!({ "IdentityStoreId": format!("d-{index:010x}"), "DisplayName": "first" }),
-            case,
-        )
-        .await;
-    }
-    let one_too_many = format!("d-{:010x}", identitystore::state::MAX_IDENTITY_STORES);
-    refused(
-        &router,
-        "CreateGroup",
-        json!({ "IdentityStoreId": one_too_many.clone(), "DisplayName": "first" }),
-        402,
-        "ServiceQuotaExceededException",
-        case,
-    )
-    .await;
-    // The refused create vivified nothing: the store it named still holds no group.
-    refused(
-        &router,
-        "DescribeGroup",
-        json!({
-            "IdentityStoreId": one_too_many,
-            "GroupId": "0123abcd-4567-89ab-cdef-0123456789ab",
-        }),
-        404,
-        "ResourceNotFoundException",
-        case,
-    )
-    .await;
-    // And a store already in use still accepts another group, so the cap bounds how
-    // many stores exist rather than refusing every create once it is reached.
-    ok(
-        &router,
-        "CreateGroup",
-        json!({ "IdentityStoreId": "d-0000000000", "DisplayName": "second" }),
-        case,
-    )
-    .await;
 }
 
 #[tokio::test]
 async fn an_unknown_user_or_group_is_reported_as_not_found() {
     let router = emulator();
-    // Rows differ along which read is made and whether the identity store itself is
-    // one anything was ever created in.
+    // Rows differ along which read is made and whether the resource that is missing is
+    // the user, the group or the identity store itself.
     let missing = "0123abcd-4567-89ab-cdef-0123456789ab";
     let known_user = create_user(&router, STORE, "alice", "seed").await;
-    let rows: [(&str, &str, Value); 4] = [
+    let rows: [(&str, &str, Value, &str); 4] = [
         (
-            "unknown user in a live store",
+            "unknown user in the store",
             "DescribeUser",
             json!({ "IdentityStoreId": STORE, "UserId": missing }),
+            "USER",
         ),
         (
-            "unknown group in a live store",
+            "unknown group in the store",
             "DescribeGroup",
             json!({ "IdentityStoreId": STORE, "GroupId": missing }),
+            "GROUP",
         ),
         (
-            "a user of another store",
+            "a known user, read through a store that does not exist",
             "DescribeUser",
-            json!({ "IdentityStoreId": OTHER_STORE, "UserId": known_user }),
+            json!({ "IdentityStoreId": MISSING_STORE, "UserId": known_user }),
+            "IDENTITY_STORE",
         ),
         (
-            "a store nothing was created in",
+            "a store that does not exist",
             "DescribeGroup",
-            json!({ "IdentityStoreId": OTHER_STORE, "GroupId": missing }),
+            json!({ "IdentityStoreId": MISSING_STORE, "GroupId": missing }),
+            "IDENTITY_STORE",
         ),
     ];
-    for (case, operation, request) in rows {
+    for (case, operation, request, expected_type) in rows {
         let body = refused(
             &router,
             operation,
@@ -1275,9 +1119,9 @@ async fn an_unknown_user_or_group_is_reported_as_not_found() {
         )
         .await;
         let resource_type = body["ResourceType"].as_str().unwrap_or_default();
-        assert!(
-            ["USER", "GROUP"].contains(&resource_type),
-            "case {case:?}: expected a modelled ResourceType, got {body}"
+        assert_eq!(
+            resource_type, expected_type,
+            "case {case:?}: expected ResourceType {expected_type}, got {body}"
         );
     }
 }
@@ -1302,6 +1146,8 @@ const SHARED_MEMBERSHIP_MEMBERS: &[&str] = &[
     "MemberId",
     "CreatedAt",
     "UpdatedAt",
+    "CreatedBy",
+    "UpdatedBy",
 ];
 
 /// Create a membership and return its `CreateGroupMembership` response.
@@ -1335,15 +1181,6 @@ fn membership_identifier(form: &str, id: &str) -> String {
         "upper-case id" => id.to_ascii_uppercase(),
         other => panic!("unknown identifier form {other:?}"),
     }
-}
-
-/// The `Message` of an error body, under either protocol casing.
-fn error_message(body: &Value) -> String {
-    body["Message"]
-        .as_str()
-        .or_else(|| body["message"].as_str())
-        .unwrap_or_default()
-        .to_string()
 }
 
 #[tokio::test]
@@ -1447,16 +1284,22 @@ async fn a_created_membership_is_described_exactly_as_it_was_stored() {
              nothing updated, got {} and {}",
             body["CreatedAt"], body["UpdatedAt"]
         );
-        // Nothing resolves a caller to an identity-store principal, so these are not
-        // invented.
-        for member_name in ["CreatedBy", "UpdatedBy"] {
-            assert!(
-                body.get(member_name).unwrap_or(&Value::Null).is_null(),
-                "case {case:?}: expected no {member_name} on a membership no principal \
-                 created, got {}",
-                body[member_name]
-            );
-        }
+        // The membership records the principal that created it, so the describe reports
+        // a populated `CreatedBy`; nothing has updated the membership (the API models no
+        // membership update), so `UpdatedBy` is absent rather than invented.
+        assert!(
+            body.get("CreatedBy")
+                .and_then(Value::as_str)
+                .is_some_and(|principal| !principal.is_empty()),
+            "case {case:?}: expected CreatedBy populated on a membership the API \
+             created, got {}",
+            body.get("CreatedBy").unwrap_or(&Value::Null)
+        );
+        assert!(
+            body.get("UpdatedBy").unwrap_or(&Value::Null).is_null(),
+            "case {case:?}: expected no UpdatedBy on a membership nothing updated, got {}",
+            body["UpdatedBy"]
+        );
 
         // The describe and the listing report ONE record, so they agree member by
         // member.
@@ -1524,15 +1367,36 @@ async fn a_membership_the_store_does_not_hold_is_reported_as_not_found() {
     // so the refusal comes from state rather than from the boundary validator.
     let missing = "0123abcd-4567-89ab-cdef-0123456789ab";
 
-    // Rows differ along WHY the store does not hold the membership: never created,
-    // deleted, held by another store, or a store nothing was ever created in.
-    let rows: [(&str, &str, &str); 4] = [
-        ("a well-formed id nothing created", STORE, missing),
-        ("a membership that was deleted", STORE, deleted.as_str()),
-        ("a live membership of another store", OTHER_STORE, live.as_str()),
-        ("a store nothing was created in", OTHER_STORE, missing),
+    // Rows differ along WHY the read finds no membership: the id names none, it names
+    // one that was deleted, or the identity store the request is addressed to does not
+    // exist at all — which is a different missing resource.
+    let rows: [(&str, &str, &str, &str); 4] = [
+        (
+            "a well-formed id nothing created",
+            STORE,
+            missing,
+            "GROUP_MEMBERSHIP",
+        ),
+        (
+            "a membership that was deleted",
+            STORE,
+            deleted.as_str(),
+            "GROUP_MEMBERSHIP",
+        ),
+        (
+            "a live membership, through a store that does not exist",
+            MISSING_STORE,
+            live.as_str(),
+            "IDENTITY_STORE",
+        ),
+        (
+            "a store that does not exist",
+            MISSING_STORE,
+            missing,
+            "IDENTITY_STORE",
+        ),
     ];
-    for (row, store, membership) in rows {
+    for (row, store, membership, expected_type) in rows {
         let body = refused(
             &router,
             "DescribeGroupMembership",
@@ -1544,14 +1408,25 @@ async fn a_membership_the_store_does_not_hold_is_reported_as_not_found() {
         .await;
         let resource_type = body["ResourceType"].as_str().unwrap_or_default();
         assert_eq!(
-            resource_type, "GROUP_MEMBERSHIP",
-            "case {row:?}: expected the modelled ResourceType of a membership, got {body}"
+            resource_type, expected_type,
+            "case {row:?}: expected the modelled ResourceType {expected_type}, got {body}"
         );
         let message = error_message(&body);
-        assert_eq!(
-            message, MEMBERSHIP_NOT_FOUND_MESSAGE,
-            "case {row:?}: expected the service's fixed not-found message, got {message:?}"
-        );
+        if expected_type == "GROUP_MEMBERSHIP" {
+            assert_eq!(
+                message, MEMBERSHIP_NOT_FOUND_MESSAGE,
+                "case {row:?}: expected the service's fixed not-found message, got {message:?}"
+            );
+        } else {
+            // The store-not-found message is this class's constant, which
+            // `crate::state` states once.
+            assert_eq!(
+                message,
+                identitystore::state::IDENTITY_STORE_NOT_FOUND_MESSAGE,
+                "case {row:?}: expected the identity store's fixed not-found message, \
+                 got {message:?}"
+            );
+        }
     }
 
     // A refused read left the store as it was: the live membership still describes.

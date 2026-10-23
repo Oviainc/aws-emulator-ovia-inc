@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The account-class gate, before anything is read: a usage modification only
         // exists inside a bill scenario, so it belongs to the same account class that
         // may plan one — the read of it as much as the write.
-        if let Some(refusal) = state.member_account_refusal(Self::NAME) {
+        if let Some(refusal) = state.member_account_refusal() {
             return Err(
                 ListBillScenarioUsageModificationsErrorModeled::ValidationException(refusal).into(),
             );

@@ -70,7 +70,7 @@ async fn page(ivs: &Ivs, request: Value) -> (Vec<Value>, Option<String>) {
 
 /// Every persisted ad configuration, walked page by page through the `nextToken` the
 /// list issues, at the given page size (`None` = send no `maxResults`).
-async fn list_all(ivs: &Ivs, max_results: Option<usize>) -> Vec<Value> {
+pub(crate) async fn list_all(ivs: &Ivs, max_results: Option<usize>) -> Vec<Value> {
     let mut all = Vec::new();
     let mut token: Option<String> = None;
     loop {

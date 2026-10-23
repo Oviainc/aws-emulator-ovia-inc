@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutPermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutPermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutPermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the action group's statement into the profiling group's resource-based
+//! policy under optimistic locking on `revisionId`, and answers with the policy
+//! document and the revision the write minted — both read back out of the store.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +170,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutPermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutPermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutPermission"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutPermissionErrorModeled::InternalServerException(InternalServerException {
+                message: "the profiling-group store is unavailable".to_string(),
+            })
+        })?;
+
+        // `actionGroup` targets the closed `ActionGroup` enum, so the boundary
+        // validator already refuses anything outside it; this refusal keeps the stored
+        // policy to action groups whose permissions the service can name, rather than
+        // persisting a statement no reader can interpret.
+        if crate::state::action_group_actions(&input.action_group).is_empty() {
+            return Err(PutPermissionErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "actionGroup must be one of {}, got {}",
+                        ACTION_GROUP_VALUES.join(", "),
+                        input.action_group
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The `principals` doc: "A list ARNs for the roles and users you want to grant
+        // access to the profiling group. Wildcards are not are supported in the ARNs."
+        // The list's length bounds are modelled (1..50) and already enforced; that a
+        // principal is non-blank and carries no wildcard is not, so it is refused here.
+        for (index, principal) in input.principals.iter().enumerate() {
+            if principal.trim().is_empty() || principal.contains('*') {
+                return Err(PutPermissionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "principals.{} must be the ARN of a role or user, without \
+                             wildcards, got {principal}",
+                            index + 1
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let written = state.lock().put_permission(
+            &input.profiling_group_name,
+            &input.action_group,
+            &input.principals,
+            input.revision_id.as_deref(),
+        );
+
+        match written {
+            crate::state::PolicyWrite::Written {
+                policy,
+                revision_id,
+            } => Ok(PutPermissionOutput {
+                policy,
+                revision_id,
+            }),
+            crate::state::PolicyWrite::UnknownGroup => {
+                Err(PutPermissionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        // The service's own not-found text for an operation ON a group,
+                        // as `crate::state` words it for every group-scoped operation.
+                        message: crate::state::group_not_found_message(
+                            &input.profiling_group_name,
+                        ),
+                    },
+                )
+                .into())
+            }
+            // Unreachable: `put_permission` writes the statement it was asked for, so
+            // it never reports a policy that is missing that action group. Answered as
+            // a server fault rather than invented into a success.
+            crate::state::PolicyWrite::NoPolicy => {
+                Err(PutPermissionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the resource-based policy could not be written".to_string(),
+                    },
+                )
+                .into())
+            }
+            crate::state::PolicyWrite::RevisionMismatch(mismatch) => {
+                Err(PutPermissionErrorModeled::ConflictException(ConflictException {
+                    message: crate::state::revision_conflict_message(
+                        &input.profiling_group_name,
+                        &mismatch,
+                    ),
+                })
+                .into())
+            }
+            // The write would have left the policy past one of the store's bounds (the
+            // modelled `Principals` maximum, or one statement per modelled action
+            // group), so it is refused as a bad request and nothing changed.
+            crate::state::PolicyWrite::LimitExceeded(limit) => {
+                Err(PutPermissionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::policy_limit_message(
+                            &input.profiling_group_name,
+                            &limit,
+                        ),
+                    },
+                )
+                .into())
+            }
+        }
     }
 }

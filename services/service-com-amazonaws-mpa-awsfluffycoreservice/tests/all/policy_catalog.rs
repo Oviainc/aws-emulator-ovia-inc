@@ -73,12 +73,12 @@ fn stored_catalog(harness: &Harness) -> Vec<StoredPolicy> {
 /// `record_management_account` records an organization.
 fn record_policy(harness: &Harness, category: &str, name: &str, policy_type: state::PolicyType) {
     let store = state::service_state(&*harness.engine).expect("the service store");
-    store.lock().insert_policy(state::CatalogPolicy {
-        arn: state::policy_arn(category, name),
-        name: name.to_string(),
+    store.lock().insert_policy(state::CatalogPolicy::with_first_version(
+        category,
+        name,
         policy_type,
-        default_version: state::FIRST_POLICY_VERSION,
-    });
+        std::time::SystemTime::now(),
+    ));
 }
 
 /// A policy name for row `n`, inside `PolicyName`'s `length(max: 64)`.

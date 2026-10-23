@@ -1624,6 +1624,76 @@ pub fn parse_function_reference(value: &str) -> Option<FunctionReference> {
     })
 }
 
+/// What a `TaggableResource` ARN — the `Resource` label of the
+/// `/2017-03-31/tags/{Resource}` operations — names.
+///
+/// The member's own pattern admits exactly five Lambda resource types
+/// (`smithy_query(query="operation", operation="ListTags")`): a function, optionally
+/// qualified by a published version or an alias, a code-signing configuration, an event
+/// source mapping, a capacity provider and a network connector. A function is the only
+/// one of them this store holds a record of, so the rest are reported by their resource
+/// type and answered as what is true of them here — a resource of that type this
+/// account does not have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggableResourceRef {
+    /// `…:function:<name>` — one function, whose tag set is
+    /// [`FunctionRecord::tags`].
+    Function(String),
+    /// `…:function:<name>:<qualifier>` — a published version or an alias of a function.
+    /// The `Resource` member's own documentation says "Lambda does not support adding
+    /// tags to function aliases or versions", so a qualified ARN names no tag set.
+    FunctionQualifier {
+        /// The bare function name the ARN carries.
+        name: String,
+        /// The version label or alias name qualifying it.
+        qualifier: String,
+    },
+    /// Another Lambda resource type the pattern admits, by its ARN resource type.
+    Other(String),
+}
+
+/// Split a `TaggableResource` into the parts that identify what it names, or `None`
+/// when the value is not a `lambda` resource ARN at all.
+///
+/// The ARN is read through `service_common::arn` — the one parse this repository states
+/// for a caller-supplied ARN — so the `<type>:<id>` and `<type>/<id>` conventions are
+/// handled in one place, and the function form is then split by
+/// [`parse_function_reference`] so that every tag operation resolves a function exactly
+/// the way every other operation on this service does.
+///
+/// The ARN's region and account fields are read by that parse and deliberately NOT
+/// reported: this store keys a function by its name alone, exactly as
+/// [`resolve_function`] resolves every other `FunctionName`, so reporting them here
+/// would invite a caller to refuse a cross-region or cross-account ARN that every
+/// other operation on this service accepts. A tag operation that needs to refuse one
+/// has to make that rule hold for the whole service, and should call
+/// `service_common::arn::parse_of` for the fields when it does.
+///
+/// [`TaggableResourceRef::Other`] is only a resource TYPE because this store holds no
+/// records of those types yet — whoever implements `CreateCodeSigningConfig`,
+/// `CreateEventSourceMapping`, `CreateCapacityProvider` or the network-connector
+/// operations has to carry the type's id through here and turn the tag handlers'
+/// `Other` branch into a real lookup against the new records.
+#[must_use]
+pub fn parse_taggable_resource(value: &str) -> Option<TaggableResourceRef> {
+    let arn = service_common::arn::parse_of(value, ARN_NAMESPACE)?;
+    let resource_type = arn.resource_type();
+    if resource_type.is_empty() {
+        return None;
+    }
+    if resource_type != "function" {
+        return Some(TaggableResourceRef::Other(resource_type.to_string()));
+    }
+    let reference = parse_function_reference(value)?;
+    Some(match reference.qualifier {
+        Some(qualifier) => TaggableResourceRef::FunctionQualifier {
+            name: reference.name,
+            qualifier,
+        },
+        None => TaggableResourceRef::Function(reference.name),
+    })
+}
+
 /// Why a `FunctionName`/`Qualifier` pair names no record.
 #[derive(Debug, Clone)]
 pub enum ResolveFailure {
@@ -1727,6 +1797,74 @@ mod tests {
                 qualifier,
                 "case {input:?}: expected qualifier {qualifier:?}, got {:?}",
                 parsed.qualifier
+            );
+        }
+    }
+
+    #[test]
+    fn a_taggable_resource_arn_names_the_resource_it_carries() {
+        // One row per alternative the `TaggableResource` pattern admits
+        // (`smithy_query(query="operation", operation="ListTags")`), plus a value that
+        // is no `lambda` resource ARN at all.
+        let cases: Vec<(&str, Option<TaggableResourceRef>)> = vec![
+            (
+                "arn:aws:lambda:us-east-1:000000000000:function:my-function",
+                Some(TaggableResourceRef::Function("my-function".to_string())),
+            ),
+            (
+                "arn:aws-us-gov:lambda:us-gov-west-1:000000000000:function:my-function",
+                Some(TaggableResourceRef::Function("my-function".to_string())),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:function:my-function:3",
+                Some(TaggableResourceRef::FunctionQualifier {
+                    name: "my-function".to_string(),
+                    qualifier: "3".to_string(),
+                }),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:function:my-function:$LATEST",
+                Some(TaggableResourceRef::FunctionQualifier {
+                    name: "my-function".to_string(),
+                    qualifier: "$LATEST".to_string(),
+                }),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:function:my-function:blue",
+                Some(TaggableResourceRef::FunctionQualifier {
+                    name: "my-function".to_string(),
+                    qualifier: "blue".to_string(),
+                }),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:code-signing-config:csc-0123456789abcdefg",
+                Some(TaggableResourceRef::Other(
+                    "code-signing-config".to_string(),
+                )),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:event-source-mapping:\
+                 12345678-1234-1234-1234-123456789012",
+                Some(TaggableResourceRef::Other(
+                    "event-source-mapping".to_string(),
+                )),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:capacity-provider:fleet-1",
+                Some(TaggableResourceRef::Other("capacity-provider".to_string())),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:network-connector:link-1",
+                Some(TaggableResourceRef::Other("network-connector".to_string())),
+            ),
+            ("arn:aws:sqs:us-east-1:000000000000:queue:q", None),
+            ("my-function", None),
+        ];
+        for (input, expected) in cases {
+            let actual = parse_taggable_resource(input);
+            assert_eq!(
+                actual, expected,
+                "case {input:?}: expected {expected:?}, got {actual:?}"
             );
         }
     }

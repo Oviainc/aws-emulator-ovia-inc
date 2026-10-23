@@ -6,8 +6,12 @@
 //!
 //! The operation is a MUTATION with one precondition the model's own doc states: "You
 //! must first disable submissions for a queue with the UpdateJobQueue operation", so a
-//! queue whose state is still `ENABLED`, like a `jobQueue` this service does not hold, is
-//! refused with the modelled `ClientException` (HTTP 400) and nothing changes.
+//! queue whose state is still `ENABLED` is refused with the modelled `ClientException`
+//! (HTTP 400) and nothing changes.
+//!
+//! It is also IDEMPOTENT: a `jobQueue` this service does not hold asks for a post-state
+//! that already holds, so it answers the same empty success body rather than a not-found
+//! refusal (AWS is recorded answering 200 for a delete of an absent job queue).
 //!
 //! A delete AWS accepts does not make the queue vanish inside the call: it moves to the
 //! non-terminal `DELETING` status and the removal is owed by the CLOCK
@@ -155,10 +159,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(now);
 
         let Some(name) = state.job_queue_name(&input.job_queue) else {
-            return Err(DeleteJobQueueErrorModeled::ClientException(batch::client_exception(
-                format!("Job queue {} does not exist", input.job_queue),
-            ))
-            .into());
+            // A removal of something that is not there is ALREADY DONE: the post-state
+            // this call asks for already holds, so it answers its empty success body and
+            // changes nothing (see `DeleteComputeEnvironment`).
+            return Ok(DeleteJobQueueOutput {});
         };
         let Some(queue) = state.job_queues.get(&name) else {
             return Err(

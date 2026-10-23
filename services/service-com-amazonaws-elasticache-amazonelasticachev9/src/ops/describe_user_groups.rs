@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeUserGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeUserGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeUserGroups::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -151,18 +147,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeUserGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeUserGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeUserGroups"))
+        // A reporting operation: it reads the stored user groups. The one write
+        // it makes is materialising the status change the clock already owed
+        // each of them.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        let page_size = match crate::state::page_size(input.max_records) {
+            Ok(size) => size,
+            // This operation models no bad-parameter-value error, so an
+            // unserveable page size is refused through the wrapper.
+            Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+        };
+        let resume_from = match input.marker.as_deref() {
+            Some(marker) => match crate::state::decode_marker(marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "Invalid value {marker} for Marker."
+                    )))
+                }
+            },
+            None => None,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_user_groups(now);
+
+        if let Some(id) = input.user_group_id.as_deref() {
+            let Some(group) = store.user_groups.get(id) else {
+                return Err(DescribeUserGroupsErrorModeled::UserGroupNotFoundFault(
+                    UserGroupNotFoundFault {
+                        message: Some(format!("User group {id} not found.")),
+                    },
+                )
+                .into());
+            };
+            return Ok(DescribeUserGroupsOutput {
+                user_groups: Some(vec![group.to_modeled()]),
+                marker: None,
+            });
+        }
+
+        let mut page: Vec<CreateUserGroupOutput> = Vec::new();
+        let mut marker = None;
+        for (key, group) in store
+            .user_groups
+            .iter()
+            .filter(|(key, _)| resume_from.as_ref().is_none_or(|from| *key >= from))
+        {
+            if page.len() == page_size {
+                marker = Some(crate::state::encode_marker(key));
+                break;
+            }
+            page.push(group.to_modeled());
+        }
+
+        Ok(DescribeUserGroupsOutput {
+            user_groups: Some(page),
+            marker,
+        })
     }
 }

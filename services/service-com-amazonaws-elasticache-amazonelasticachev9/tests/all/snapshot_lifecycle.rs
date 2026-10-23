@@ -21,14 +21,13 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-// The harness every suite of this target shares; this suite names it the way the
-// others do, and reaches this suite's own snapshot helpers through
+// The harness every suite of this target shares; the cluster helpers live in
+// the cluster suite and the wire harness plus this suite's snapshot drivers in
 // `crate::harness`.
 use crate::cache_cluster_lifecycle::{
-    account_subnet_ids, create_available_cluster, describe_cluster, subnet_group_params, Emulator,
-    PAST_TRANSITION,
+    account_subnet_ids, create_available_cluster, describe_cluster, subnet_group_params,
 };
-use crate::harness::{describe_snapshot, snapshot};
+use crate::harness::{describe_snapshot, snapshot, Emulator, PAST_TRANSITION};
 
 #[tokio::test]
 async fn a_snapshot_reports_the_source_clusters_own_instants() {

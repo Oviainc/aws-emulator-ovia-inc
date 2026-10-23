@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPolicyVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPolicyVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the versions a catalog policy in [`crate::state`] holds, in version-id order.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPolicyVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A policy and its versions are AWS's, not the caller's: nothing in this model creates,
+//! updates or deletes either, so the catalog is seeded when the store is first touched
+//! and this handler only reads it — `@readonly`, and like `ListPolicies` it has no
+//! clock-owed change to materialise, because no catalog entry changes with time.
+//!
+//! `PolicyArn` names the policy whose versions are listed; an ARN the catalog does not
+//! hold earns `ResourceNotFoundException` (404), the same answer whatever its form, since
+//! the catalog is the only thing consulted. A policy ARN carries EMPTY region and account
+//! fields (`UnqualifiedPolicyArn`'s pattern: `arn:<partition>:mpa:::aws:policy/…`), so it
+//! names no account and there is no account boundary to decide here — unlike an
+//! operation whose ARN names an approval team.
+//!
+//! `NextToken` is the version id of the last version the previous page returned, so the
+//! next page is every version of that policy ordered after it: a client paging with any
+//! `MaxResults` sees each version exactly once. A token that is not one this service
+//! issued — a version id the policy does not hold, or anything that is not a version id
+//! at all — earns `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +98,8 @@
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the constraints specified
 //!   by an Amazon Web Services service.
 
+use std::ops::Bound;
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -163,18 +175,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPolicyVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPolicyVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPolicyVersions"))
+        // A policy ARN names no account (its region and account fields are empty), so
+        // there is no per-resource authorization to decide here; `ctx` carries nothing
+        // this answer depends on.
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPolicyVersionsError::Modeled(
+                ListPolicyVersionsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the policy catalog is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+
+        // `MaxResults` is modelled `range(1..20)` with `default: 20`, so the boundary
+        // validator has already closed it; the clamp only keeps the slice width sane.
+        let page_size =
+            usize::try_from(input.max_results.clamp(1, crate::state::MAX_LIST_PAGE)).unwrap_or(1);
+
+        let state = store.lock();
+
+        let Some(policy) = state.policy(&input.policy_arn) else {
+            return Err(ListPolicyVersionsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("No policy found for ARN '{}'.", input.policy_arn),
+                },
+            )
+            .into());
+        };
+
+        // The token is this service's own: the version id of the last version the
+        // previous page returned. Anything this policy does not hold never came from here.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            None => None,
+            Some(token) => match token.parse::<i32>() {
+                Ok(version_id) if policy.version(version_id).is_some() => Some(version_id),
+                _ => {
+                    return Err(ListPolicyVersionsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "NextToken is not a token this service issued.".to_string(),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // At most one entry past the page is read: enough to know whether more remain,
+        // without materialising the whole tail of a version history that has no fixed
+        // size.
+        let mut window: Vec<&crate::state::CatalogPolicyVersion> = match after {
+            None => policy.versions.values().take(page_size + 1).collect(),
+            Some(version_id) => policy
+                .versions
+                .range((Bound::Excluded(version_id), Bound::Unbounded))
+                .map(|(_, version)| version)
+                .take(page_size + 1)
+                .collect(),
+        };
+        let more_remain = window.len() > page_size;
+        window.truncate(page_size);
+        let next_token = window
+            .last()
+            .filter(|_| more_remain)
+            .map(|version| version.version_id.to_string());
+
+        Ok(ListPolicyVersionsOutput {
+            policy_versions: Some(
+                window
+                    .iter()
+                    .copied()
+                    .map(|version| entry(policy, version))
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// One `ListPolicyVersions` entry for a version of a catalog policy. The members a
+/// version shares with its policy are read off the policy, so a listed version can never
+/// disagree with the policy that owns it.
+fn entry(
+    policy: &crate::state::CatalogPolicy,
+    version: &crate::state::CatalogPolicyVersion,
+) -> PolicyVersionSummary {
+    PolicyVersionSummary {
+        arn: policy.version_arn(version.version_id),
+        policy_arn: policy.arn.clone(),
+        version_id: version.version_id,
+        policy_type: policy.policy_type.as_wire().to_string(),
+        is_default: policy.is_default_version(version.version_id),
+        name: policy.name.clone(),
+        status: version.status.as_wire().to_string(),
+        creation_time: ::aws_smithy_types::DateTime::from(version.creation_time),
+        last_updated_time: ::aws_smithy_types::DateTime::from(version.last_updated_time),
     }
 }

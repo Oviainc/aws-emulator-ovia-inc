@@ -150,14 +150,18 @@ async fn delete(batch: &Batch, class: &Deletable, reference: &str) -> (u16, Valu
 }
 
 /// A `Delete*` refuses what the model's preconditions refuse, and nothing it refuses
-/// changes the store: asserted for EVERY deletable class, named by name and by ARN.
+/// changes the store: asserted for EVERY deletable class, named by name and by ARN. An
+/// identifier the service holds nothing for is NOT one of those refusals — removing what
+/// is already absent is the same success (see
+/// `refusal_contract::removing_what_is_already_absent_is_the_same_success`).
 #[tokio::test]
 async fn a_delete_refuses_an_unknown_or_enabled_resource_and_changes_nothing() {
     let batch = Batch::new();
 
     for class in DELETABLES {
         // An identifier the service holds nothing for, in each of the two forms the
-        // member documents ("name or ARN").
+        // member documents ("name or ARN"): the removal it asks for has already
+        // happened, so it is accepted and stores nothing.
         let absent_name = format!("absent-{}", class.kind.replace(' ', "-"));
         let absent_arn = arn(&format!(
             "{}/{absent_name}",
@@ -168,18 +172,18 @@ async fn a_delete_refuses_an_unknown_or_enabled_resource_and_changes_nothing() {
             }
         ));
         for reference in [absent_name.as_str(), absent_arn.as_str()] {
-            let (status, refused) = delete(&batch, class, reference).await;
+            let (status, accepted) = delete(&batch, class, reference).await;
             assert_eq!(
-                status, 400,
-                "case delete an unknown {} by {reference:?}: expected 400, got {status} \
-                 {refused}",
+                status, 200,
+                "case delete an unknown {} by {reference:?}: expected the empty 200, got \
+                 {status} {accepted}",
                 class.kind
             );
-            assert_eq!(
-                error_code(&refused),
-                "ClientException",
-                "case delete an unknown {} by {reference:?}: expected the modelled \
-                 ClientException, got {refused}",
+            let described = describe_one(&batch, class, reference).await;
+            assert!(
+                described.is_none(),
+                "case delete an unknown {} by {reference:?}: nothing may be stored, got \
+                 {described:?}",
                 class.kind
             );
         }
@@ -302,13 +306,14 @@ async fn an_accepted_delete_reports_deleting_and_the_clock_removes_the_resource(
             "case delete a DISABLED {}: the clock must remove it, got {described:?}",
             class.kind
         );
-        // Both identifier forms stop resolving, so the delete is the modelled refusal.
+        // Both identifier forms stop resolving, and the delete stays idempotent: the
+        // removal it asks for is already done.
         for gone in [name.as_str(), resource_arn.as_str()] {
-            let (status, refused) = delete(&batch, class, gone).await;
+            let (status, accepted) = delete(&batch, class, gone).await;
             assert_eq!(
-                status, 400,
-                "case delete a removed {} by {gone:?}: expected 400, got {status} \
-                 {refused}",
+                status, 200,
+                "case delete a removed {} by {gone:?}: expected the empty 200, got \
+                 {status} {accepted}",
                 class.kind
             );
         }
@@ -1212,11 +1217,13 @@ async fn a_refusal_carries_the_message_the_refusing_code_states() {
          modelled ClientException, got {refused}"
     );
     assert_eq!(
-        error_message(&refused),
-        state::client_exception_message(
-            "ECS ContainerProperties, ecsProperties, or eksProperties is required when \
-             using type container."
-        ),
+        crate::refusal_contract::enveloped(
+            "a container job definition with no properties object",
+            &error_message(&refused)
+        )
+        .0,
+        "ECS ContainerProperties, ecsProperties, or eksProperties is required when \
+         using type container.",
         "case a container job definition with no properties object: expected the \
          enveloped detail, got {refused}"
     );

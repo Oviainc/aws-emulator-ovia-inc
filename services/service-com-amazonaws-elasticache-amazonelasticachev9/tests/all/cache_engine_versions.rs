@@ -17,7 +17,7 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::cache_cluster_lifecycle::{params, Emulator, Reply};
+use crate::harness::{params, Emulator, Reply};
 
 /// Every `CacheParameterGroupFamily` this service publishes, as `state` states
 /// it once for the whole crate (`state::PARAMETER_GROUP_FAMILIES`, whose source
@@ -759,7 +759,7 @@ async fn a_cluster_created_without_a_version_runs_a_published_one() {
         let created = emulator
             .call(
                 "CreateCacheCluster",
-                &params(&[("CacheClusterId", &id), ("Engine", engine)]),
+                &params(&[("CacheClusterId", id.as_str()), ("Engine", engine)]),
             )
             .await;
         assert_eq!(

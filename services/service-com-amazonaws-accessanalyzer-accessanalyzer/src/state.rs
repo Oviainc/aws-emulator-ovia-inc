@@ -187,10 +187,10 @@ pub const ARCHIVE_RULE_NAME_CONFLICT_MESSAGE: &str =
 pub const ARCHIVE_RULE_QUOTA_EXCEEDED_MESSAGE: &str =
     "Service quota met for archive rules on this analyzer";
 
-/// The fixed `message` of the `ResourceNotFoundException` that answers an ARN-addressed
-/// call (the tagging surface) naming a resource this account and Region does not hold.
-/// Same provenance as [`ANALYZER_NOT_FOUND_MESSAGE`]: constant text, with the ARN the
-/// request named travelling in `resourceId`.
+/// The fixed `message` of the `NotFoundException` that answers an ARN-addressed call
+/// (the tagging surface) naming a resource this account and Region does not hold.
+/// Same provenance as [`ANALYZER_NOT_FOUND_MESSAGE`]: ONE constant text for the refusal,
+/// whatever ARN was asked for.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
 
 /// The 404 for an analyzer that is not stored: fixed text, identifier in the modelled
@@ -1052,45 +1052,29 @@ pub fn field_validation_exception(member: &str, message: impl Into<String>) -> V
     }
 }
 
-/// The identity that made this request, as an ARN.
+/// The fixed `message` of the `ValidationException` that answers a well-formed request
+/// asking for something the resource it names does not support.
 ///
-/// Derived from the request's own SigV4 access key id, so an operation that reports or
-/// refuses a caller names the caller it actually had rather than a fabricated one. The
-/// access key id is caller-controlled text, so it is first reduced to the characters an
-/// access key id can hold.
-///
-/// Every request this emulator serves is signed with a caller's own access key, so the
-/// identity is always an IAM identity of the emulator's account — never an Amazon Web
-/// Services service principal.
-pub fn caller_identity_arn(parts: &::http::request::Parts) -> String {
-    let raw = ::engine::extract_akid(&parts.headers);
-    let filtered: String = raw
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(128)
-        .collect();
-    let akid = if filtered.is_empty() {
-        "default"
-    } else {
-        filtered.as_str()
-    };
-    ::engine::emulator_arn("iam", "", &format!("user/{akid}"))
-}
+/// AWS's own constant for this refusal, as the recorded responses carry it: it names
+/// neither the operation, nor the resource, nor its type, so it is the same string
+/// whatever was asked for and in whatever account or Region.
+pub const UNSUPPORTED_OPERATION_MESSAGE: &str = "Unsupported operation";
 
 /// A `ValidationException` for a well-formed request the action does not support against
 /// the resource it names — every member parses and satisfies its constraints, but the
 /// resource is not one this action acts on.
 ///
-/// Two things make it different from [`field_validation_exception`] and both come from
-/// what AWS answers: there is no `fieldList`, because no single member is at fault and so
-/// there is nothing for a client to correct; and the reason is still the
-/// FIELD-VALIDATION discriminator, because that is what the recorded refusal carries
-/// (HTTP 400, `reason = FIELD_VALIDATION_FAILED`) — the modelled `notSupported`
-/// discriminator is NOT what this service puts on a refusal that is about the resource a
-/// request names.
-pub fn unsupported_action_exception(message: impl Into<String>) -> ValidationException {
+/// Three things make it different from [`field_validation_exception`] and all three come
+/// from what AWS answers: the message is the FIXED
+/// [`UNSUPPORTED_OPERATION_MESSAGE`] rather than a sentence composed from the request;
+/// there is no `fieldList`, because no single member is at fault and so there is nothing
+/// for a client to correct; and the reason is still the FIELD-VALIDATION discriminator,
+/// because that is what the recorded refusal carries (HTTP 400,
+/// `reason = FIELD_VALIDATION_FAILED`) — the modelled `notSupported` discriminator is NOT
+/// what this service puts on a refusal that is about the resource a request names.
+pub fn unsupported_action_exception() -> ValidationException {
     ValidationException {
-        message: message.into(),
+        message: UNSUPPORTED_OPERATION_MESSAGE.to_string(),
         reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
         field_list: None,
     }
@@ -1241,18 +1225,23 @@ pub fn resource_arn_validation_exception(resource_arn: &str) -> ValidationExcept
     )
 }
 
-/// Report that no resource in this account and Region has the ARN `resource_arn`.
+/// Report that no resource in this account and Region has the ARN the request named —
+/// the refusal every ARN-addressed call on the `/tags/{resourceArn}` routes answers with.
 ///
-/// Same provenance as [`ANALYZER_NOT_FOUND_MESSAGE`] and the refusals beside it: the
-/// text is FIXED and the ARN travels in the modelled `resourceId`. `resourceType` is
-/// this service's only taggable resource kind, which is what an ARN this service minted
-/// always names — the ARN's own segments are not echoed back as a type.
-pub fn resource_arn_not_found(resource_arn: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: RESOURCE_NOT_FOUND_MESSAGE.to_string(),
-        resource_id: resource_arn.to_string(),
-        resource_type: ANALYZER_RESOURCE_TYPE.to_string(),
-    }
+/// The CODE is `NotFoundException` (HTTP 404), NOT the `ResourceNotFoundException` the
+/// analyzer-, archive-rule- and access-preview-scoped 404s above carry: the tagging path
+/// of this service answers its own code, which the model declares for no operation, so it
+/// travels through [`crate::scaffolded::Scaffolded::NotFound`] rather than through an
+/// operation's modelled error enum. The analyzer lookup behind `GetAnalyzer`,
+/// `DeleteAnalyzer` and every name-addressed call keeps [`analyzer_not_found`].
+///
+/// Takes no ARN: the synthetic shape declares no `resourceId`/`resourceType` to report
+/// one in, and the text is fixed, so nothing of the request reaches the refusal. The
+/// generic parameter is the calling operation's modelled error type, so all three tagging
+/// handlers refuse through this one constructor whichever error enum their operation
+/// declares.
+pub fn tag_target_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::not_found(RESOURCE_NOT_FOUND_MESSAGE)
 }
 
 /// Refuse a tag key outside this service's tag restrictions, naming the `member` that

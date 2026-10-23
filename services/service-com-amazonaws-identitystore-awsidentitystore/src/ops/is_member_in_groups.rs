@@ -170,11 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let state = state.lock();
-        let store = state.store(&input.identity_store_id).ok_or_else(|| {
-            IsMemberInGroupsErrorModeled::ResourceNotFoundException(
-                crate::state::identity_store_not_found(&input.identity_store_id),
-            )
-        })?;
+        let store = state
+            .resolve_store(&input.identity_store_id)
+            .map_err(IsMemberInGroupsErrorModeled::ResourceNotFoundException)?;
 
         // The modelled `MemberId` union declares exactly one variant, `UserId`, so the
         // member is always a user of this store — and a user the store does not hold is

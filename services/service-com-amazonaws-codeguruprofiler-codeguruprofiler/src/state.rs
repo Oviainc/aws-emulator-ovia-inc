@@ -134,6 +134,45 @@ pub const MAX_RETAINED_FINDINGS_REPORTS_PER_GROUP: usize = 64;
 /// first, so caller-chosen token strings cannot accumulate without limit.
 pub const MAX_RETAINED_PROFILE_TOKENS_PER_GROUP: usize = 64;
 
+/// The hex-digit group lengths a `RevisionId` carries, as the model's `RevisionId`
+/// pattern (`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`) spells them
+/// out: 32 lowercase hex characters in five hyphen-separated groups.
+pub const REVISION_ID_GROUPS: &[usize] = &[8, 4, 4, 4, 12];
+
+/// A `RevisionId` identifying one policy write: 32 lowercase hex characters grouped the
+/// way [`REVISION_ID_GROUPS`] records the modelled pattern, which is the form the
+/// `PutPermission` doc names ("A universally unique identifier (UUID) for the revision
+/// of the policy").
+///
+/// Derived with SHA-256 (the `sha2` crate) from the write itself — the store's own
+/// monotonically increasing mint count, the instant of the write, and the group and
+/// action group being written. The mint count is what makes two writes of the same
+/// grants carry different revisions, and it is store state a caller never sees, so a
+/// revision cannot be computed from the request that produced it.
+fn revision_id(mint: u64, at: DateTime, group_name: &str, action_group: &str) -> String {
+    let mut digest = <::sha2::Sha256 as ::sha2::Digest>::new();
+    ::sha2::Digest::update(&mut digest, mint.to_be_bytes());
+    ::sha2::Digest::update(&mut digest, at.secs().to_be_bytes());
+    ::sha2::Digest::update(&mut digest, at.subsec_nanos().to_be_bytes());
+    ::sha2::Digest::update(&mut digest, (group_name.len() as u64).to_be_bytes());
+    ::sha2::Digest::update(&mut digest, group_name.as_bytes());
+    ::sha2::Digest::update(&mut digest, action_group.as_bytes());
+    let hex = ::hex::encode(::sha2::Digest::finalize(digest));
+
+    // The first 32 hex characters of the digest, cut into the modelled groups.
+    let mut remaining = &hex[..REVISION_ID_GROUPS.iter().sum::<usize>()];
+    let mut revision = String::with_capacity(remaining.len() + REVISION_ID_GROUPS.len() - 1);
+    for (index, group) in REVISION_ID_GROUPS.iter().enumerate() {
+        if index > 0 {
+            revision.push('-');
+        }
+        let (head, tail) = remaining.split_at(*group);
+        revision.push_str(head);
+        remaining = tail;
+    }
+    revision
+}
+
 /// The IAM policy-language version a resource-based policy document carries. The
 /// version the service's own resource-policy document uses (the AWS CodeGuru Profiler
 /// User Guide, "Resource-based policies in CodeGuru Profiler").
@@ -142,6 +181,20 @@ pub const POLICY_VERSION: &str = "2012-10-17";
 /// The one action group a resource-based policy can grant, as the model's `ActionGroup`
 /// enum declares it (`smithy_query(query="shape",shape="ActionGroup")`).
 pub const ACTION_GROUP_AGENT_PERMISSIONS: &str = "agentPermissions";
+
+/// Every action group a resource-based policy can hold a statement for: the values the
+/// model's `ActionGroup` enum declares, as the generated
+/// [`crate::ops::types::ACTION_GROUP_VALUES`] lists them (one, `agentPermissions`) — the
+/// handlers refuse anything outside that list, so there is ONE list of them in this
+/// crate and the bound below follows the model rather than a copy of it.
+pub const MAX_POLICY_STATEMENTS: usize = crate::ops::types::ACTION_GROUP_VALUES.len();
+
+/// The most principals one statement grants to: the maximum length the model's
+/// `Principals` list declares (`smithy_query(query="shape",shape="Principals")`:
+/// `length 1..50`). The validating request walk already refuses a longer list at the
+/// boundary; the store holds to the same bound so no writer can grow a statement past
+/// what the model allows.
+pub const MAX_PRINCIPALS_PER_STATEMENT: usize = 50;
 
 /// The API actions an action group grants, as IAM action strings
 /// (`<arn namespace>:<operation>`). The model's `PutPermission` doc for `actionGroup`:
@@ -182,10 +235,12 @@ impl ResourcePolicy {
     /// writer that empties it clears the group's policy instead, and
     /// [`ProfilingGroup::resource_policy`] reports it as absent either way.
     ///
-    /// This constructor and the two writers below exist for the permission handlers —
-    /// `PutPermission` and `RemovePermission`, which are still scaffold stubs with their
-    /// own open issue — so the operations that return `policy` all render the same
-    /// document from the same grants. They are the writers, not dead code.
+    /// This constructor and the two writers below are what the permission handlers'
+    /// store writers —
+    /// [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::put_permission`] and
+    /// [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::remove_permission`] — build
+    /// a policy with, so every operation that returns `policy` renders the same
+    /// document from the same grants.
     pub fn new(revision_id: impl Into<String>) -> Self {
         Self {
             statements: BTreeMap::new(),
@@ -206,6 +261,13 @@ impl ResourcePolicy {
     /// grants rotates it; a read reports what is stored.
     pub fn set_revision(&mut self, revision_id: impl Into<String>) {
         self.revision_id = revision_id.into();
+    }
+
+    /// Drop `action_group`'s grant, reporting whether the policy held one. The
+    /// revision is not touched here, for the same reason as
+    /// [`ResourcePolicy::grant`]: the writer rotates it once for the change.
+    pub fn revoke(&mut self, action_group: &str) -> bool {
+        self.statements.remove(action_group).is_some()
     }
 
     /// The JSON-formatted resource-based policy document, as every operation that
@@ -329,9 +391,12 @@ pub struct ProfilingGroup {
     /// [`ProfilingGroup::remember_profile_token`], which is the only writer.
     pub seen_profile_tokens: VecDeque<String>,
     /// The group's resource-based policy, or `None` while it has none — a group is
-    /// created without one, and the permission writers attach and clear it. It lives
-    /// ON the group so deleting the group takes its policy with it and a re-created
-    /// group starts with none. Read it through [`ProfilingGroup::resource_policy`].
+    /// created without one, and the permission writers
+    /// ([`ComAmazonawsCodeguruprofilerCodeguruprofilerState::put_permission`] and
+    /// [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::remove_permission`], which
+    /// are what enforce the revision check) attach and clear it. It lives ON the group
+    /// so deleting the group takes its policy with it and a re-created group starts
+    /// with none. Read it through [`ProfilingGroup::resource_policy`].
     pub policy: Option<ResourcePolicy>,
     /// The recommendation reports recorded against this group, oldest recorded FIRST.
     /// Bounded at [`MAX_RETAINED_FINDINGS_REPORTS_PER_GROUP`] by
@@ -570,6 +635,10 @@ pub struct ComAmazonawsCodeguruprofilerCodeguruprofilerState {
     /// `DeleteProfilingGroup` removes every entry naming the group it deletes, so this
     /// map never holds more entries than there are live groups.
     pub create_tokens: HashMap<String, String>,
+    /// How many policy revisions this store has minted. Bumped by
+    /// [`Self::mint_revision_id`], the only minter, and mixed into every revision it
+    /// derives, so two writes of the same grants never carry the same revision.
+    pub revisions_minted: u64,
 }
 
 /// What [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::post_profile`] did with a
@@ -584,7 +653,215 @@ pub enum PostedProfile {
     UnknownGroup,
 }
 
+/// Why a policy write did not match the policy's current revision — every case a
+/// conflict, since each says the caller is writing against a revision that is not the
+/// one stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionMismatch {
+    /// A policy already exists, so the write must name the revision it updates:
+    /// `PutPermission`'s doc, "Subsequent calls must provide a revisionId to specify
+    /// which revision of the resource-based policy to add the permissions to."
+    Missing,
+    /// The write named a revision, but the group has no policy yet:
+    /// `PutPermission`'s doc, "The first time you call PutPermission on a profiling
+    /// group, do not specify a revisionId because it doesn't have a resource-based
+    /// policy."
+    Unexpected,
+    /// The write named a revision other than the current one — a stale revision. The
+    /// revision the policy actually carries is NOT recorded here: it is what a reader
+    /// of the policy learns through `GetPolicy`, so a write refused against it says
+    /// only that it was refused.
+    Stale,
+}
+
+/// Why a policy write would have left a policy larger than the service holds — the
+/// store's own bounds on a resource-based policy, named so the refusal can say which
+/// one was reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyLimit {
+    /// The grant named more principals than [`MAX_PRINCIPALS_PER_STATEMENT`].
+    Principals { requested: usize, limit: usize },
+    /// The write would have left the policy holding statements for more action groups
+    /// than [`MAX_POLICY_STATEMENTS`].
+    Statements { requested: usize, limit: usize },
+}
+
+/// What a policy write ([`ComAmazonawsCodeguruprofilerCodeguruprofilerState::put_permission`]
+/// or [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::remove_permission`]) did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyWrite {
+    /// Applied: the policy document as it now stands, and the revision it now carries.
+    Written { policy: String, revision_id: String },
+    /// There is no such profiling group.
+    UnknownGroup,
+    /// The group has no policy holding the named action group, so there is nothing to
+    /// remove from.
+    NoPolicy,
+    /// The write was refused against the stored revision; nothing changed.
+    RevisionMismatch(RevisionMismatch),
+    /// The write was refused because it would have left the policy past one of the
+    /// store's bounds; nothing changed.
+    LimitExceeded(PolicyLimit),
+}
+
 impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
+    /// The `RevisionId` the next policy write carries: the store's mint count is bumped
+    /// first, so every revision this store hands out is distinct even when two writes
+    /// grant exactly the same principals. The ONLY minter.
+    fn mint_revision_id(&mut self, group_name: &str, action_group: &str) -> String {
+        self.revisions_minted = self.revisions_minted.wrapping_add(1);
+        revision_id(self.revisions_minted, now(), group_name, action_group)
+    }
+
+    /// Grant `action_group`'s permissions to exactly `principals` on `group_name`,
+    /// under optimistic locking on `revision_id`.
+    ///
+    /// The principal set REPLACES whatever that action group last granted (the write
+    /// is a `PUT` of the action group's statement, not a merge), duplicate principals
+    /// in one request collapse to one, and a successful write mints a new revision —
+    /// so the revision a caller holds is good for exactly one write.
+    ///
+    /// Bounded like every other store in this module: a grant to more than
+    /// [`MAX_PRINCIPALS_PER_STATEMENT`] principals, or one that would leave the policy
+    /// holding more than [`MAX_POLICY_STATEMENTS`] statements, is refused with
+    /// [`PolicyWrite::LimitExceeded`] and changes nothing, so no sequence of writes can
+    /// grow one policy without limit.
+    pub fn put_permission(
+        &mut self,
+        group_name: &str,
+        action_group: &str,
+        principals: &[String],
+        revision_id: Option<&str>,
+    ) -> PolicyWrite {
+        let Some(group) = self.groups.get(group_name) else {
+            return PolicyWrite::UnknownGroup;
+        };
+        if principals.len() > MAX_PRINCIPALS_PER_STATEMENT {
+            return PolicyWrite::LimitExceeded(PolicyLimit::Principals {
+                requested: principals.len(),
+                limit: MAX_PRINCIPALS_PER_STATEMENT,
+            });
+        }
+        // A policy with no grants is no policy (`ProfilingGroup::resource_policy`), so
+        // a write against one is a FIRST write and must name no revision.
+        match (group.resource_policy(), revision_id) {
+            (None, Some(_)) => {
+                return PolicyWrite::RevisionMismatch(RevisionMismatch::Unexpected);
+            }
+            (Some(_), None) => {
+                return PolicyWrite::RevisionMismatch(RevisionMismatch::Missing);
+            }
+            (Some(policy), Some(named)) if policy.revision_id != named => {
+                return PolicyWrite::RevisionMismatch(RevisionMismatch::Stale);
+            }
+            _ => {}
+        }
+
+        // How many statements the policy would hold once this one is written: rewriting
+        // a statement the policy already holds adds none.
+        let would_hold = group
+            .resource_policy()
+            .map(|policy| {
+                policy.statements.len() + usize::from(!policy.statements.contains_key(action_group))
+            })
+            .unwrap_or(1);
+        if would_hold > MAX_POLICY_STATEMENTS {
+            return PolicyWrite::LimitExceeded(PolicyLimit::Statements {
+                requested: would_hold,
+                limit: MAX_POLICY_STATEMENTS,
+            });
+        }
+
+        // A grant is a SET of principals: the request's order is kept, and a principal
+        // it names twice is granted once. The `seen` set is what makes that one pass
+        // over the list rather than one scan of the kept principals per principal.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut granted: Vec<String> = Vec::with_capacity(principals.len());
+        for principal in principals {
+            if seen.insert(principal.as_str()) {
+                granted.push(principal.clone());
+            }
+        }
+
+        // The write is applied from here on, so this is where the revision it carries
+        // is minted.
+        let revision_id = self.mint_revision_id(group_name, action_group);
+        let Some(group) = self.groups.get_mut(group_name) else {
+            // Unreachable: the group was resolved above, under the same `&mut self`.
+            return PolicyWrite::UnknownGroup;
+        };
+        let arn = group.arn.clone();
+        let mut policy = group
+            .policy
+            .take()
+            .unwrap_or_else(|| ResourcePolicy::new(&revision_id));
+        policy.grant(action_group, granted);
+        policy.set_revision(&revision_id);
+        let document = policy.document(&arn);
+        group.policy = Some(policy);
+        PolicyWrite::Written {
+            policy: document,
+            revision_id,
+        }
+    }
+
+    /// Remove `action_group`'s statement from `group_name`'s policy, under the same
+    /// optimistic locking as [`Self::put_permission`]: the revision is checked first,
+    /// so a stale revision is answered as a conflict whatever else the request names.
+    ///
+    /// Removing the last statement leaves the group with no resource-based policy at
+    /// all, so a later `GetPolicy` finds none; the answer is the policy as it stands
+    /// after the removal, which is then the empty document. The revision that answer
+    /// carries is the one the removal minted, and with the policy gone it is stored
+    /// nowhere — a caller cannot write against it, exactly as it cannot write against
+    /// any revision of a policy that does not exist.
+    pub fn remove_permission(
+        &mut self,
+        group_name: &str,
+        action_group: &str,
+        revision_id: &str,
+    ) -> PolicyWrite {
+        // The checks first, under a shared borrow, so the revision is minted only for a
+        // removal that is actually applied.
+        let Some(group) = self.groups.get(group_name) else {
+            return PolicyWrite::UnknownGroup;
+        };
+        // An emptied policy is no policy, exactly as `resource_policy` reports it, so
+        // there is nothing to remove from.
+        let Some(policy) = group.resource_policy() else {
+            return PolicyWrite::NoPolicy;
+        };
+        if policy.revision_id != revision_id {
+            return PolicyWrite::RevisionMismatch(RevisionMismatch::Stale);
+        }
+        if !policy.statements.contains_key(action_group) {
+            return PolicyWrite::NoPolicy;
+        }
+
+        let revision_id = self.mint_revision_id(group_name, action_group);
+        let Some(group) = self.groups.get_mut(group_name) else {
+            // Unreachable: the group was resolved above, under the same `&mut self`.
+            return PolicyWrite::UnknownGroup;
+        };
+        let Some(policy) = group.policy.as_mut() else {
+            // Unreachable for the same reason: the policy was read above.
+            return PolicyWrite::NoPolicy;
+        };
+        policy.revoke(action_group);
+        policy.set_revision(&revision_id);
+        // Rendered before the policy is possibly cleared: this is the policy as it
+        // stands after the removal, which is the empty document when the removed
+        // statement was the last one.
+        let document = policy.document(&group.arn);
+        if policy.statements.is_empty() {
+            group.policy = None;
+        }
+        PolicyWrite::Written {
+            policy: document,
+            revision_id,
+        }
+    }
+
     /// Profiling-group names in a stable (lexicographic) order, so paging over
     /// `ListProfilingGroups` visits every group exactly once.
     pub fn sorted_group_names(&self) -> Vec<String> {
@@ -703,6 +980,47 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
             }
         }
         oldest.map(|(name, index, _)| (name, index))
+    }
+}
+
+/// The message a bound-refused policy write carries, for the `ValidationException` the
+/// write answers with: which bound the write would have passed, and by how much. The
+/// bounds themselves are the store's ([`MAX_PRINCIPALS_PER_STATEMENT`] is the modelled
+/// `Principals` maximum, [`MAX_POLICY_STATEMENTS`] the number of modelled action
+/// groups), so the text states the member and the constraint the request missed.
+pub fn policy_limit_message(group_name: &str, limit: &PolicyLimit) -> String {
+    match limit {
+        PolicyLimit::Principals { requested, limit } => format!(
+            "principals must name at most {limit} roles or users, got {requested}"
+        ),
+        PolicyLimit::Statements { requested, limit } => format!(
+            "the resource-based policy of profiling group {group_name} holds at most \
+             {limit} action group statements, and this write would leave it holding \
+             {requested}"
+        ),
+    }
+}
+
+/// Why a revision-checked policy write was refused, for the `ConflictException` the
+/// write answers with. The status (409) and the code are the contract; this text says
+/// how the caller gets out of the conflict — which revision the next write must name —
+/// without handing back the stored revision itself, which is for a reader of the policy
+/// to learn through `GetPolicy`.
+pub fn revision_conflict_message(group_name: &str, mismatch: &RevisionMismatch) -> String {
+    match mismatch {
+        RevisionMismatch::Missing => format!(
+            "profiling group {group_name} already has a resource-based policy; name its \
+             current revisionId to write to it"
+        ),
+        RevisionMismatch::Unexpected => format!(
+            "profiling group {group_name} has no resource-based policy yet; do not name a \
+             revisionId when creating one"
+        ),
+        RevisionMismatch::Stale => format!(
+            "the revisionId does not match the current revision of the resource-based \
+             policy of profiling group {group_name}; read it with GetPolicy and write \
+             against that revision"
+        ),
     }
 }
 

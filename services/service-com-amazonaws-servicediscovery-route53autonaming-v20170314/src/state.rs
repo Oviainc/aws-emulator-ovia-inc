@@ -29,7 +29,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     DnsConfig, HealthCheckConfig, HealthCheckCustomConfig, HttpProperties, Instance, Namespace,
-    NamespaceProperties, NamespaceSummary, Operation, Service, ServiceAttributes, Tag, SOA,
+    NamespaceProperties, NamespaceSummary, Operation, Service, ServiceAttributes, ServiceSummary,
+    Tag, SOA,
 };
 
 /// The region an ARN carries when the request is unsigned, matching the region a
@@ -1036,6 +1037,30 @@ pub fn service_view(record: &ServiceRecord) -> Service {
         create_date: Some(timestamp(record.create_date)),
         creator_request_id: record.creator_request_id.clone(),
         created_by_account: None,
+    }
+}
+
+/// The modelled `ServiceSummary` for a stored service — the same record
+/// [`service_view`] renders, minus the members `ServiceSummary` does not carry
+/// (`NamespaceId`, `CreatorRequestId`), so a listing and `GetService` can never
+/// disagree.
+pub fn service_summary_view(record: &ServiceRecord) -> ServiceSummary {
+    let service = service_view(record);
+    ServiceSummary {
+        id: service.id,
+        arn: service.arn,
+        // Absent for the same reason as on `Service`: this emulator shares no namespace
+        // across accounts, so no listing reports a different owner or creator.
+        resource_owner: service.resource_owner,
+        name: service.name,
+        r#type: service.r#type,
+        description: service.description,
+        instance_count: service.instance_count,
+        dns_config: service.dns_config,
+        health_check_config: service.health_check_config,
+        health_check_custom_config: service.health_check_custom_config,
+        create_date: service.create_date,
+        created_by_account: service.created_by_account,
     }
 }
 

@@ -2340,6 +2340,20 @@ pub fn aggregation_authorization_arn(
     )
 }
 
+/// The separator between the two halves of the key one aggregation authorization is
+/// held under. `AccountId`'s `^\d{12}$` pattern leaves no room for it in the account
+/// id, so the key splits unambiguously at its FIRST occurrence even when the
+/// authorized Region contains one.
+const AGGREGATION_AUTHORIZATION_KEY_SEPARATOR: char = '/';
+
+/// The exact length of an `AccountId` (`com.amazonaws.configservice#AccountId`,
+/// pattern `^\d{12}$`).
+const ACCOUNT_ID_LENGTH: usize = 12;
+
+/// The longest `AwsRegion` the model allows (`com.amazonaws.configservice#AwsRegion`,
+/// `length 1..64`).
+const AWS_REGION_MAX_LENGTH: usize = 64;
+
 /// The key one aggregation authorization is held under: the authorized account id and
 /// the authorized Region, in that order, so `DescribeAggregationAuthorizations` pages
 /// by account and then by Region. `AccountId`'s `^\d{12}$` pattern leaves no room for
@@ -2348,7 +2362,34 @@ pub fn aggregation_authorization_key(
     authorized_account_id: &str,
     authorized_aws_region: &str,
 ) -> String {
-    format!("{authorized_account_id}/{authorized_aws_region}")
+    format!(
+        "{authorized_account_id}{AGGREGATION_AUTHORIZATION_KEY_SEPARATOR}\
+         {authorized_aws_region}"
+    )
+}
+
+/// Encode the key a `DescribeAggregationAuthorizations` page should resume at as an
+/// opaque `NextToken`.
+pub fn encode_aggregation_authorization_token(key: &str) -> String {
+    encode_page_token(key)
+}
+
+/// The key a `NextToken` resumes at, or `None` when the token is malformed — i.e. not
+/// something [`encode_aggregation_authorization_token`] produced, so it does not decode
+/// to a key of the form [`aggregation_authorization_key`] builds: an authorized account
+/// id of exactly twelve digits (`AccountId`, pattern `^\d{12}$`) and an authorized
+/// Region within `AwsRegion`'s 1..64 length.
+pub fn decode_aggregation_authorization_token(token: &str) -> Option<String> {
+    let key = decode_page_token(token)?;
+    let well_formed = match key.split_once(AGGREGATION_AUTHORIZATION_KEY_SEPARATOR) {
+        Some((account, region)) => {
+            account.len() == ACCOUNT_ID_LENGTH
+                && account.chars().all(|digit| digit.is_ascii_digit())
+                && (1..=AWS_REGION_MAX_LENGTH).contains(&region.chars().count())
+        }
+        None => false,
+    };
+    well_formed.then_some(key)
 }
 
 /// The ARN of a Config rule: `arn:aws:config:<region>:<account>:config-rule/<id>`.

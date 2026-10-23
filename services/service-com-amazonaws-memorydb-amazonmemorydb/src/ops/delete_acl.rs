@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteACL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteACL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteACL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored ACL from [`crate::state`] (keyed by its FOLDED
+//! `ACLName`), drops the tags held under its ARN, records the `acl` event
+//! `DescribeEvents` reports for the deletion and answers with the record as the caller
+//! last had it, in the terminal `deleting` status — so a later `DescribeACLs` answers
+//! the modelled not-found fault for the name and no user reports it in `ACLNames`
+//! (membership is held ONCE, on the ACL). The ACL every account already has is the
+//! service's, not the caller's, and is refused; so is an ACL that is not settled, and
+//! one a cluster still references ("The ACL must first be disassociated from the
+//! cluster before it can be deleted").
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +142,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteACL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteACLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteACL"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); this operation models no server fault, so
+            // the request is refused rather than reporting a deletion nothing applied.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        let region = crate::state::request_region(ctx);
+        // An ACL name is a case-insensitive identifier, so the name this request
+        // deletes is folded exactly as the store is keyed.
+        let acl_name = crate::state::fold_name(&input.acl_name);
+        let mut state = state.lock();
+        state.settle(std::time::Instant::now());
+        // The resources the account ALREADY HAD before any call (MemoryDB's built-in
+        // `default` user and the `open-access` ACL holding it) are materialised on first
+        // touch, exactly as `DescribeACLs` does, so a delete naming one of them acts on
+        // the ACL the account really has instead of answering not-found for it. The
+        // materialisation flag makes that a one-off, so the removal below is not undone
+        // by a later call.
+        state.ensure_builtins(&region);
+
+        // WHICH ACL FIRST: a request naming an ACL state does not hold is answered
+        // not-found whatever else is wrong with it.
+        let Some(acl) = state.acls.get(&acl_name) else {
+            return Err(DeleteACLErrorModeled::ACLNotFoundFault(ACLNotFoundFault {
+                message: Some(format!("ACL {acl_name} not found.")),
+            })
+            .into());
+        };
+        // The ACL every MemoryDB account already has is the service's, not the
+        // caller's: it cannot be deleted. The refusal is built by the one rule every
+        // write path over a built-in resource reads.
+        if let Some(message) = crate::state::builtin_resource_rejection(
+            crate::state::ResourceKind::Acl,
+            &acl_name,
+            crate::state::Mutation::Delete,
+        ) {
+            return Err(DeleteACLErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // Only a SETTLED ACL can be deleted: one still `creating`, or `modifying` from
+        // an earlier `UpdateACL`, is not in a valid state for this request — the same
+        // guard `DeleteUser` makes for a user mid-update.
+        if acl.status != crate::state::acl_status::ACTIVE {
+            return Err(DeleteACLErrorModeled::InvalidACLStateFault(
+                InvalidACLStateFault {
+                    message: Some(format!(
+                        "ACL {} is in status {} and cannot be deleted; it must be {}.",
+                        acl_name,
+                        acl.status,
+                        crate::state::acl_status::ACTIVE
+                    )),
+                },
+            )
+            .into());
+        }
+        // "The ACL must first be disassociated from the cluster before it can be
+        // deleted": a cluster reaches its users only through the ACL it references, so
+        // an ACL a cluster still names cannot go away under it. The list is the one
+        // `DescribeACLs` reports in `ACL$Clusters`, so the refusal names exactly the
+        // clusters a caller reads there.
+        let clusters = state.clusters_using_acl(&acl_name);
+        if !clusters.is_empty() {
+            return Err(DeleteACLErrorModeled::InvalidACLStateFault(
+                InvalidACLStateFault {
+                    message: Some(format!(
+                        "ACL {acl_name} is associated with cluster(s) {} and must be \
+                         disassociated from them before it can be deleted.",
+                        clusters.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+        // Derived the way `DescribeACLs` derives it, from the membership the ACL held
+        // up to this call, so the answer agrees with the last read of the same ACL.
+        let minimum_engine_version = state.acl_minimum_engine_version(&acl.user_names);
+
+        // Gone from the store, so no later call reports it and `DescribeACLs` answers
+        // the modelled not-found fault for its name. Membership is held ONCE, on the
+        // ACL, so removing the ACL is also what takes it off every user's `ACLNames`.
+        let Some(mut acl) = state.acls.remove(&acl_name) else {
+            // Unreachable: the entry was read under this same lock just above.
+            return Err(DeleteACLErrorModeled::ACLNotFoundFault(ACLNotFoundFault {
+                message: Some(format!("ACL {acl_name} not found.")),
+            })
+            .into());
+        };
+        // Its tags go with it: a tag store keyed by an ARN nothing resolves would be
+        // read by a later `ListTags` for a resource that no longer exists.
+        state.tags.remove(&acl.arn);
+        // The response describes the ACL as the caller last had it, in the terminal
+        // `deleting` status — the same choice `DeleteUser` makes for a user it has just
+        // removed. Nothing settles a removed ACL, so it carries no due transition and
+        // nothing is still pending on it.
+        acl.status = crate::state::acl_status::DELETING.to_string();
+        acl.settles_at = None;
+        acl.pending_user_names_to_add.clear();
+        acl.pending_user_names_to_remove.clear();
+        let response = acl.to_api(clusters, minimum_engine_version);
+        // The change this call made, recorded against the resource it made it to, so
+        // `DescribeEvents` reports it.
+        state.record_event(
+            crate::state::event_source_type::ACL,
+            &acl_name,
+            crate::state::EventKind::Deleted,
+        );
+        Ok(DeleteACLOutput {
+            acl: Some(response),
+        })
     }
 }

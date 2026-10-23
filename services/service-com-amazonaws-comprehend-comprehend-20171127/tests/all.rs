@@ -27,6 +27,8 @@ mod comprehend_client;
 mod document_classifiers;
 #[path = "all/dominant_language_jobs.rs"]
 mod dominant_language_jobs;
+#[path = "all/endpoints.rs"]
+mod endpoints;
 #[path = "all/entity_detection.rs"]
 mod entity_detection;
 // Declared beside the suite it backs rather than under `s`: `scratch_dump` holds the

@@ -79,6 +79,16 @@ pub const ADMIN_PASSWORD_AUTH_FLOWS: [&str; 2] =
 /// `UserPoolTierType` defaults to `ESSENTIALS` (`CreateUserPool.UserPoolTier`).
 const DEFAULT_USER_POOL_TIER: &str = "ESSENTIALS";
 
+/// `UserPoolMfaType` is `OFF` for a pool that configures no MFA
+/// (`MfaConfiguration`: "Sets multi-factor authentication (MFA) to be on, off, or
+/// optional" in this service's model).
+const DEFAULT_MFA_CONFIGURATION: &str = "OFF";
+
+/// Deletion protection is opt-in: "When active, `DeletionProtection` prevents
+/// accidental deletion of your user pool" (this service's model), so a pool that
+/// asks for none can be deleted.
+const DEFAULT_DELETION_PROTECTION: &str = "INACTIVE";
+
 /// `PreventUserExistenceErrors` "Defaults to `LEGACY`"
 /// (`CreateUserPoolClient.PreventUserExistenceErrors` in this service's model),
 /// which is the mode that answers `UserNotFoundException` for an absent user.
@@ -986,6 +996,16 @@ pub fn effective_user_pool_tier(requested: Option<String>) -> String {
     requested.unwrap_or_else(|| DEFAULT_USER_POOL_TIER.to_string())
 }
 
+/// The MFA mode a request leaves unset: MFA is `OFF`.
+pub fn effective_mfa_configuration(requested: Option<String>) -> String {
+    requested.unwrap_or_else(|| DEFAULT_MFA_CONFIGURATION.to_string())
+}
+
+/// The deletion-protection mode a request leaves unset: `INACTIVE`.
+pub fn effective_deletion_protection(requested: Option<String>) -> String {
+    requested.unwrap_or_else(|| DEFAULT_DELETION_PROTECTION.to_string())
+}
+
 /// `PreventUserExistenceErrors` a request leaves unset: "Defaults to `LEGACY`".
 pub fn effective_prevent_user_existence_errors(requested: Option<String>) -> String {
     requested.unwrap_or_else(|| DEFAULT_PREVENT_USER_EXISTENCE_ERRORS.to_string())
@@ -1112,10 +1132,8 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         last_modified_date: now,
         policies: effective_policies(None),
         lambda_config: None,
-        // `UserPoolMfaType` is OFF for a pool that configures no MFA.
-        mfa_configuration: "OFF".to_string(),
-        // Deletion protection is opt-in: a pool created without it can be deleted.
-        deletion_protection: "INACTIVE".to_string(),
+        mfa_configuration: effective_mfa_configuration(None),
+        deletion_protection: effective_deletion_protection(None),
         user_pool_tier: DEFAULT_USER_POOL_TIER.to_string(),
         username_attributes: Vec::new(),
         alias_attributes: Vec::new(),

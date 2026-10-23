@@ -28,9 +28,8 @@ use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::cache_cluster_lifecycle::{
-    create_available_cluster, params, Emulator, Reply, PAST_TRANSITION,
-};
+use crate::cache_cluster_lifecycle::create_available_cluster;
+use crate::harness::{params, Emulator, Reply, PAST_TRANSITION};
 use crate::service_updates::{epoch_secs, now_secs};
 
 /// One published service update, as `DescribeServiceUpdates` reports it: the

@@ -171,6 +171,17 @@ fn invalid(violation: crate::state::FieldViolation) -> CreateListenerError {
     .into()
 }
 
+/// HTTP 400 for a value a documented SERVICE RULE refuses — one the model carries no
+/// constraint trait for — in the construction AWS reports those with
+/// ([`crate::state::service_rule_exception`]): the rule's own sentence over the bare
+/// member it constrains, not a modelled constraint report.
+fn refused_by_rule(violation: &crate::state::ServiceRuleViolation) -> CreateListenerError {
+    CreateListenerErrorModeled::ValidationException(crate::state::service_rule_exception(
+        violation,
+    ))
+    .into()
+}
+
 /// The `CreateListener` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -253,26 +264,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Err(violation) = crate::state::check_tag_count(input.tags.as_ref()) {
             return Err(invalid(violation));
         }
-        if let Err(violation) =
-            crate::state::check_rule_action("defaultAction", &input.default_action)
-        {
-            return Err(invalid(violation));
+        if let Err(violation) = crate::state::check_rule_action(&input.default_action) {
+            return Err(refused_by_rule(&violation));
         }
 
         // The `port` member documents a default for `HTTP` (80) and `HTTPS` (443) only,
         // so a create under any other protocol has to carry one: inventing a port the
-        // service documents nowhere would be worse than refusing the request.
-        let Some(port) = input
-            .port
-            .or_else(|| crate::state::default_port_for(&input.protocol))
-        else {
-            // Under a protocol with no documented default the member IS required, so it
-            // is refused the way every absent required member is reported.
-            return Err(invalid(crate::state::FieldViolation {
-                path: "port".to_string(),
-                kind: ::aws_smithy_schema_server::constraints::ViolationKind::MissingRequiredMember,
-                value: None,
-            }));
+        // service documents nowhere would be worse than refusing the request. That rule
+        // is the service's own, so it is reported as one.
+        let port = match crate::state::effective_port(&input.protocol, input.port) {
+            Ok(port) => port,
+            Err(violation) => return Err(refused_by_rule(&violation)),
         };
 
         // `clientToken` is an @idempotencyToken: a retry carrying the token of a
@@ -314,11 +316,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::conflict(
                     crate::state::ResourceKind::Listener,
                     taken_by,
-                    crate::state::duplicate_name_message(
+                    crate::state::duplicate_name_in_resource_message(
+                        crate::state::ResourceKind::Listener,
                         &input.name,
-                        crate::state::ResourceKind::Service.message_name(),
+                        crate::state::ResourceKind::Service,
                         &service.id,
                     ),
+                ),
+            )
+            .into());
+        }
+
+        // A listener's port is unique within its service, so a create that would bind a
+        // port another listener of this service already holds conflicts with that
+        // listener's current state. The EFFECTIVE port is what is compared — one taken
+        // from the protocol's documented default occupies it exactly as an explicit one
+        // does — and the refusal names the listener that holds it.
+        if let Some(occupant) = store.listener_with_port(&service.id, port) {
+            return Err(CreateListenerErrorModeled::ConflictException(
+                crate::state::conflict(
+                    crate::state::ResourceKind::Listener,
+                    &occupant.id,
+                    crate::state::port_occupied_message(port),
                 ),
             )
             .into());

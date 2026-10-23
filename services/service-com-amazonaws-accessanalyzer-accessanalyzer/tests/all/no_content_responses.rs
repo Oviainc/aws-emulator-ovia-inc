@@ -327,14 +327,16 @@ async fn a_successful_untag_answers_204_with_no_content() {
     }
 }
 
-/// 204 is a success status: a refused tag mutation keeps the modelled error's own
-/// status, over the whole class of refusals either operation raises.
+/// 204 is a success status: a refused tag mutation keeps the refusal's own status, over
+/// the whole class of refusals either operation raises.
 #[tokio::test]
 async fn a_refused_tag_mutation_keeps_its_modelled_status() {
     let emulator = Emulator::new();
     let arn = create_analyzer(&emulator, "nc_refusals", &[]).await;
 
-    // (case, resourceArn, status, error code) — the refusals the two mutations model.
+    // (case, resourceArn, status, error code) — the refusals the two mutations answer.
+    // The 404s carry the tagging path's own `NotFoundException` code; see
+    // `tests/all/resource_tags.rs` for the rule.
     let cases: Vec<(&str, String, u16, &str)> = vec![
         (
             "a bare resource name is not an ARN",
@@ -346,13 +348,13 @@ async fn a_refused_tag_mutation_keeps_its_modelled_status() {
             "a well-formed analyzer ARN naming no analyzer",
             expected_arn("nc_no_such_analyzer"),
             404,
-            "ResourceNotFoundException",
+            "NotFoundException",
         ),
         (
             "an analyzer ARN in another account",
             "arn:aws:access-analyzer:us-east-1:111122223333:analyzer/nc_refusals".to_string(),
             404,
-            "ResourceNotFoundException",
+            "NotFoundException",
         ),
     ];
 

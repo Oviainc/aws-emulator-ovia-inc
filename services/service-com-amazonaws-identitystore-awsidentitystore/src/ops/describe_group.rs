@@ -192,17 +192,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: it looks the store up rather than vivifying one, so describing a
         // group can never change what a later caller sees.
         let state = state.lock();
-        let not_found = || {
-            DescribeGroupErrorModeled::ResourceNotFoundException(crate::state::not_found(
-                crate::state::ResourceKind::Group,
-                &input.group_id,
-            ))
-        };
-        let store = state.store(&input.identity_store_id).ok_or_else(not_found)?;
+        // The identity store the request names must exist; one that does not is the
+        // missing resource, reported as `IDENTITY_STORE` rather than as a missing group
+        // of a store that is not there either.
+        let store = state
+            .resolve_store(&input.identity_store_id)
+            .map_err(DescribeGroupErrorModeled::ResourceNotFoundException)?;
         let group = store
             .groups
             .get(&crate::state::resource_key(&input.group_id))
-            .ok_or_else(not_found)?;
+            .ok_or_else(|| {
+                DescribeGroupErrorModeled::ResourceNotFoundException(crate::state::not_found(
+                    crate::state::ResourceKind::Group,
+                    &input.group_id,
+                ))
+            })?;
 
         Ok(DescribeGroupOutput {
             identity_store_id: store.identity_store_id.clone(),

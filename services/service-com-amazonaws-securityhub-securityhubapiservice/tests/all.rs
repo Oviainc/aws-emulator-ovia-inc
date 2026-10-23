@@ -19,6 +19,8 @@ mod insight_lifecycle;
 mod action_targets;
 #[path = "all/automation_rules.rs"]
 mod automation_rules;
+#[path = "all/batch_enable_standards.rs"]
+mod batch_enable_standards;
 #[path = "all/describe_standards.rs"]
 mod describe_standards;
 #[path = "all/enabled_standards.rs"]

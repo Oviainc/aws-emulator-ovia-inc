@@ -6,7 +6,8 @@
 //! The pipeline definition lifecycle (`CreatePipeline` / `GetPipeline` /
 //! `ListPipelines` / `DeletePipeline`), the tag set each pipeline carries
 //! (`TagResource` / `ListTagsForResource`), the custom action types
-//! `CreateCustomActionType` mints and `ListActionTypes` reports, the execution
+//! `CreateCustomActionType` mints and `ListActionTypes` reports, the action-type
+//! definitions `UpdateActionType` stores and `GetActionType` reports, the execution
 //! records `StartPipelineExecution` mints, the stage-transition states
 //! `DisableStageTransition` / `EnableStageTransition` change and the webhooks
 //! `PutWebhook` defines all live in the one store reached through [`service_state`],
@@ -18,7 +19,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     ActionConfiguration, ActionConfigurationProperty, ActionContext, ActionDeclaration,
-    ActionExecutionDetail, ActionExecutionInput, ActionRevision, ActionType, ActionTypeId,
+    ActionExecutionDetail, ActionExecutionInput, ActionRevision, ActionType,
+    ActionTypeDeclaration, ActionTypeId, ActionTypeIdentifier, ActionTypeProperty,
     ActionTypeSettings, Artifact, ArtifactDetail, ArtifactDetails, ArtifactLocation, Condition,
     ConditionState, CurrentRevision, EncryptionKey, ExecutionDetails, ExecutionTrigger, Job,
     JobData, ListWebhookItem, PipelineContext, PipelineDeclaration, PipelineExecution,
@@ -294,6 +296,28 @@ pub const MAX_CONCURRENT_EXECUTIONS_PARALLEL: usize = 50;
 /// one way into the map, so the bound holds whatever registers.
 pub const MAX_ACTION_TYPES_PER_ACCOUNT: usize = 1000;
 
+/// The most action-type definitions (`ActionTypeDeclaration`s) this emulator holds
+/// before another `UpdateActionType` call is refused — ACROSS every Region, not per
+/// Region.
+///
+/// A bound is required, and it has to be this total rather than the per-Region
+/// catalog bound: a definition is keyed by the Region its call was signed for, and
+/// that Region is CALLER-SUPPLIED ([`request_region`] reads it off the SigV4
+/// credential scope and [`is_region_token`] checks only its SHAPE, not that it is a
+/// Region that exists). Without a total cap, repeating one accepted update under a
+/// fresh Region token would grow the store without limit even though each Region's
+/// catalog is itself bounded. The refusal a handler answers past it is
+/// `RequestFailedException` ("The request failed because of an unknown error,
+/// exception, or failure"), the only error `UpdateActionType` models for a request it
+/// cannot carry out — it models no limit error.
+///
+/// AWS publishes no quota on action-type definitions, so the figure is this
+/// emulator's own: the size of ONE Region's catalog
+/// ([`BUILT_IN_ACTION_TYPES`] plus at most [`MAX_ACTION_TYPES_PER_ACCOUNT`]
+/// registrations), so that every action type a Region holds can always be defined.
+pub const MAX_ACTION_TYPE_DEFINITIONS: usize =
+    BUILT_IN_ACTION_TYPES.len() + MAX_ACTION_TYPES_PER_ACCOUNT;
+
 /// The most recent executions this emulator retains per pipeline; starting another
 /// one drops the oldest beyond this window, together with the `clientRequestToken`
 /// entries that named it.
@@ -364,6 +388,20 @@ pub const AUTHENTICATION_UNAUTHENTICATED: &str = "UNAUTHENTICATED";
 /// service mints is owned by `Custom`.
 pub const ACTION_OWNER_CUSTOM: &str = "Custom";
 
+/// The `ExecutorType` whose executor is a Lambda function, from the model's enum
+/// (`smithy_query query="shape" shape="ExecutorType"` -> `JobWorker`, `Lambda`).
+/// `ActionTypeExecutor$type` documents it as one of the two "integration model[s]
+/// used to create and update the action type", and
+/// `ExecutorConfiguration$lambdaExecutorConfiguration` carries "details about the
+/// `Lambda` executor of the action type" — so a declaration naming this model is the
+/// one whose configuration carries that member.
+pub const EXECUTOR_TYPE_LAMBDA: &str = "Lambda";
+
+/// The `ExecutorType` whose executor is a job worker that polls for jobs, from the
+/// same enum; its details live in
+/// `ExecutorConfiguration$jobWorkerExecutorConfiguration`.
+pub const EXECUTOR_TYPE_JOB_WORKER: &str = "JobWorker";
+
 /// The most tags one resource of this service holds before a tagging call is refused
 /// with `TooManyTagsException` ("The tags limit for a resource has been exceeded").
 ///
@@ -422,6 +460,36 @@ pub struct ComAmazonawsCodepipelineCodepipeline20150709State {
     /// and the [`MAX_ACTION_TYPES_PER_ACCOUNT`] bound cannot be bypassed; read it
     /// through `action_type_catalog` or `registered_action_type`.
     action_types: BTreeMap<ActionTypeKey, ActionTypeRecord>,
+    /// The action-type DEFINITIONS `UpdateActionType` has stored, keyed by the
+    /// Region they were stored in and the identity they belong to — the view of an
+    /// action type that `ActionTypeDeclaration` carries ("the parameters for the
+    /// action type definition that are provided when the action type is created or
+    /// updated"), which is what `GetActionType` reports.
+    ///
+    /// The REGION is part of the key because an action type is a regional resource:
+    /// two Regions each hold their own definition of one identity, and neither read
+    /// sees the other's.
+    ///
+    /// Separate from `action_types` because the two are different views of one
+    /// resource and neither renders the other: `ActionType` (what `ListActionTypes`
+    /// reports) carries `settings` and `actionConfigurationProperties` with artifact
+    /// counts bounded by `@range(min: 0, max: 5)`, while `ActionTypeDeclaration`
+    /// carries an `executor`, `permissions`, `urls` and `properties` with artifact
+    /// counts bounded by `@range(min: 0, max: 10)`, so a definition cannot be folded
+    /// into an `ActionTypeRecord` without either inventing members or clamping
+    /// counts the caller stated.
+    ///
+    /// PRIVATE for the same reason `action_types` is: every write goes through
+    /// [`ComAmazonawsCodepipelineCodepipeline20150709State::declare_action_type`],
+    /// which takes a definition only while the map holds fewer than
+    /// [`MAX_ACTION_TYPE_DEFINITIONS`] definitions in total — the Region half of the
+    /// key is CALLER-SUPPLIED, so a per-Region bound alone would not bound this map.
+    /// Whether an identity EXISTS to be defined is the request's question rather than
+    /// the store's, so `UpdateActionType` asks
+    /// [`ComAmazonawsCodepipelineCodepipeline20150709State::action_type_available_in`]
+    /// and answers `ActionTypeNotFoundException` itself. Read this map through
+    /// [`ComAmazonawsCodepipelineCodepipeline20150709State::declared_action_type`].
+    action_type_declarations: BTreeMap<(String, ActionTypeKey), ActionTypeDeclaration>,
     /// The partner integrations registered with this service: the identity of a
     /// `ThirdParty` action type -> the AWS account id of the partner whose job worker
     /// CodePipeline serves that action type's jobs to.
@@ -1108,6 +1176,70 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
         }
         catalog
     }
+
+    /// Whether the account holds an action type with the identity `key` that a caller
+    /// in `region` can use — the existence question every operation addressing an
+    /// action type by its id has to answer.
+    ///
+    /// Reads exactly what [`Self::action_type_catalog`] would report, without
+    /// building it: a registration under that id answers for it (and shadows a
+    /// built-in of the same id, so a registration made in another Region hides it the
+    /// same way the listing does), otherwise the catalog the service provides itself
+    /// does.
+    pub fn action_type_available_in(&self, key: &ActionTypeKey, region: &str) -> bool {
+        if let Some(record) = self.action_types.get(key) {
+            return record.available_in(region);
+        }
+        BUILT_IN_ACTION_TYPES
+            .iter()
+            .any(|entry| &entry.key() == key && entry.record().available_in(region))
+    }
+
+    /// Store `declaration` as the definition the Region `region` holds for the action
+    /// type `key`, replacing whatever definition that identity carried there, and
+    /// answer whether the store took it.
+    ///
+    /// `false` means the store already holds [`MAX_ACTION_TYPE_DEFINITIONS`]
+    /// definitions and this `(region, key)` is not one of them, so the call must be
+    /// refused rather than accepted. Re-defining a `(region, key)` the store already
+    /// holds is always accepted: it grows nothing. `UpdateActionType` "provide[s] the
+    /// full structure", so a stored definition is replaced whole rather than merged.
+    ///
+    /// This gate enforces the store's own cap only; whether an action type with that
+    /// identity EXISTS to be defined is the request's question, which the caller
+    /// settles with [`Self::action_type_available_in`] before calling.
+    pub fn declare_action_type(
+        &mut self,
+        region: &str,
+        key: ActionTypeKey,
+        declaration: ActionTypeDeclaration,
+    ) -> bool {
+        let entry = (region.to_string(), key);
+        if !self.action_type_declarations.contains_key(&entry)
+            && self.action_type_declarations.len() >= MAX_ACTION_TYPE_DEFINITIONS
+        {
+            return false;
+        }
+        self.action_type_declarations.insert(entry, declaration);
+        true
+    }
+
+    /// How many action-type definitions this emulator holds, of at most
+    /// [`MAX_ACTION_TYPE_DEFINITIONS`].
+    pub fn declared_action_type_count(&self) -> usize {
+        self.action_type_declarations.len()
+    }
+
+    /// The definition the Region `region` holds for the action type `key`, or `None`
+    /// when no `UpdateActionType` call signed for that Region has defined it.
+    pub fn declared_action_type(
+        &self,
+        key: &ActionTypeKey,
+        region: &str,
+    ) -> Option<&ActionTypeDeclaration> {
+        self.action_type_declarations
+            .get(&(region.to_string(), key.clone()))
+    }
 }
 
 /// The taggable resource an ARN resolved to, as the store holds it: which store, and
@@ -1628,6 +1760,21 @@ impl ActionTypeKey {
         }
     }
 
+    /// The identity an action-type DEFINITION names.
+    ///
+    /// `ActionTypeIdentifier` and `ActionTypeId` declare the same four members —
+    /// `ActionTypeIdentifier$owner` is the narrower of the two (`@pattern`
+    /// `^AWS|ThirdParty$`, so a definition never names a `Custom` action type) — so
+    /// one key type addresses an action type however a request names it.
+    pub fn from_identifier(id: &ActionTypeIdentifier) -> Self {
+        Self {
+            category: id.category.clone(),
+            owner: id.owner.clone(),
+            provider: id.provider.clone(),
+            version: id.version.clone(),
+        }
+    }
+
     /// This identity as the ordered key a pagination cursor names.
     ///
     /// `/` separates the members because neither `ActionProvider` nor `Version` can
@@ -1708,6 +1855,91 @@ impl ActionTypeRecord {
             output_artifact_details: self.output_artifact_details.clone(),
         }
     }
+}
+
+/// Refuse an `ActionTypeDeclaration` the service's own documented rules rule out,
+/// reporting why. `Ok(())` means the definition is storable.
+///
+/// None of these is a Smithy constraint (every one of those is refused before a
+/// handler runs), and they are the same rules
+/// [`validate_configuration_properties`] applies to the other view of an action
+/// type's properties:
+///
+/// * STATED by `ActionTypeProperty$queryable`: "An action type can have up to one
+///   queryable property. If it has one, that property must be both required and not
+///   secret" — a property is required when `optional` is false and secret when
+///   `noEcho` is true.
+/// * INFERRED from `ActionTypeProperty$name` ("The property name that is displayed
+///   to users"): a name identifies a property, so a list naming one twice does not
+///   describe a usable action type. The model does not say this in so many words.
+/// * STATED by `ActionTypeExecutor$type` ("The integration model used to create and
+///   update the action type, `Lambda` or `JobWorker`") together with the two members
+///   of `ExecutorConfiguration`, each documented as the details of ONE of those
+///   models: a definition carries the configuration of the model it declares, and
+///   not the other model's.
+pub fn validate_action_type_declaration(declaration: &ActionTypeDeclaration) -> Result<(), String> {
+    validate_action_type_properties(declaration.properties.as_deref().unwrap_or_default())?;
+    let configuration = &declaration.executor.configuration;
+    let (declared, other) = match declaration.executor.r#type.as_str() {
+        EXECUTOR_TYPE_LAMBDA => (
+            configuration.lambda_executor_configuration.is_some(),
+            configuration.job_worker_executor_configuration.is_some(),
+        ),
+        EXECUTOR_TYPE_JOB_WORKER => (
+            configuration.job_worker_executor_configuration.is_some(),
+            configuration.lambda_executor_configuration.is_some(),
+        ),
+        // `ExecutorType` is a modelled enum, so the boundary validator has already
+        // refused anything that is not one of its two values; a value this build does
+        // not know carries no configuration rule.
+        _ => (true, false),
+    };
+    if !declared {
+        return Err(format!(
+            "executor.configuration carries no details for the {} integration model",
+            declaration.executor.r#type
+        ));
+    }
+    if other {
+        return Err(format!(
+            "executor.configuration carries details for an integration model other than {}",
+            declaration.executor.r#type
+        ));
+    }
+    Ok(())
+}
+
+/// The property half of [`validate_action_type_declaration`], over the
+/// `ActionTypeProperty` view of an action type's configuration properties.
+fn validate_action_type_properties(properties: &[ActionTypeProperty]) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for property in properties {
+        if !seen.insert(property.name.as_str()) {
+            return Err(format!(
+                "properties names the property {} more than once",
+                property.name
+            ));
+        }
+    }
+    let queryable: Vec<&ActionTypeProperty> = properties
+        .iter()
+        .filter(|property| property.queryable)
+        .collect();
+    if queryable.len() > 1 {
+        return Err(format!(
+            "properties may declare at most one queryable property, but {} are queryable",
+            queryable.len()
+        ));
+    }
+    if let Some(property) = queryable.first() {
+        if property.optional || property.no_echo {
+            return Err(format!(
+                "the queryable property {} must be required and not secret",
+                property.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One entry of the catalog of action types this service provides itself: the four
@@ -2370,7 +2602,9 @@ pub fn poll_limit(max_batch_size: Option<i32>) -> usize {
 ///
 /// Built from the request, so it is a template over the caller's own values rather
 /// than text naming one particular action type, and the caller can tell from it which
-/// of the four fields it has to correct.
+/// of the four fields it has to correct. EVERY operation that resolves an action type
+/// by its id and answers `ActionTypeNotFoundException` ("The specified action type
+/// cannot be found") uses it, so one condition is reported one way.
 pub fn action_type_not_found_message(id: &ActionTypeId) -> String {
     format!(
         "ActionType (Category='{}', Owner='{}', Provider='{}', Version='{}') is not \

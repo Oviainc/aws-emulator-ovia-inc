@@ -25,7 +25,7 @@ use std::collections::BTreeSet;
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::cache_cluster_lifecycle::{params, Emulator, Reply};
+use crate::harness::{params, Emulator, Reply};
 
 /// The published families of each engine catalog, in version order
 /// (`state::FAMILY_LINES`). A later family's line covers every version an

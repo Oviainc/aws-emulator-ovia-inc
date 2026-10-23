@@ -44,9 +44,6 @@ const ACCOUNT: &str = "000000000000";
 /// role.
 const NO_EXECUTION_ROLE: &str = "executionRoleArn is required for Fargate jobs.";
 
-/// The envelope every `ClientException` this service raises is worded in.
-const REFUSAL_PREFIX: &str = "Error executing request, Exception : ";
-
 fn router() -> MultiServiceRouter {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -283,8 +280,8 @@ async fn fargate_job_definition_requires_an_execution_role_in_every_container_ob
                 "case {case:?}: expected a ClientException, got {response:?}"
             );
             assert_eq!(
-                error_message(&response),
-                format!("{REFUSAL_PREFIX}{NO_EXECUTION_ROLE}, RequestId: None"),
+                crate::refusal_contract::enveloped(case, &error_message(&response)).0,
+                NO_EXECUTION_ROLE,
                 "case {case:?}: expected the Fargate execution-role refusal, got {response:?}"
             );
             // Nothing is stored by a refused registration.

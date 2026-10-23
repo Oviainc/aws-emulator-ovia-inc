@@ -180,11 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@readonly`: it looks the store up rather than vivifying one, so listing users
         // can never change what a later caller sees.
         let state = state.lock();
-        let store = state.store(&input.identity_store_id).ok_or_else(|| {
-            ListUsersErrorModeled::ResourceNotFoundException(
-                crate::state::identity_store_not_found(&input.identity_store_id),
-            )
-        })?;
+        let store = state
+            .resolve_store(&input.identity_store_id)
+            .map_err(ListUsersErrorModeled::ResourceNotFoundException)?;
 
         // The (deprecated) `Filters` member carries at most one filter — the modelled
         // `Filters` list is `length 0..1` — which restricts the listing to the users

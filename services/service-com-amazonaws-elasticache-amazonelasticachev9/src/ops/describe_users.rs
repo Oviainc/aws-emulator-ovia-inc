@@ -227,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // that also asked for an engine or a property the user does not have
             // is answered with no users rather than with one it excluded.
             let users = if matches(user) {
-                vec![user.to_modeled()]
+                vec![user.to_modeled_in(store.user_group_ids_of(&key))]
             } else {
                 Vec::new()
             };
@@ -252,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 marker = Some(crate::state::encode_marker(key));
                 break;
             }
-            page.push(user.to_modeled());
+            page.push(user.to_modeled_in(store.user_group_ids_of(key)));
         }
 
         Ok(DescribeUsersOutput {

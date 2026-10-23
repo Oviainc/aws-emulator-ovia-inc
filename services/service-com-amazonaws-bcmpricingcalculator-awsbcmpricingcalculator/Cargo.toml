@@ -8,6 +8,10 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The shared collecting walk behind this service's own pre-handler refusal: the
+# violations of one request, read with the framework's own deserializer and constraint
+# validation (`service_common::validation::refusing_violations`).
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

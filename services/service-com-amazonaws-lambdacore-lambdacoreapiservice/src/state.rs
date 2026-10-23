@@ -506,16 +506,27 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 
 /// The `ResourceNotFoundException` payload for an identifier that names no
 /// connector (or no such version of one).
+///
+/// The message is BUILT FROM THE REQUEST: `NetworkConnectorIdentifier` is "a
+/// flexible identifier that accepts a network connector ID, name, or ARN", so
+/// the only thing the refusal can name is the identifier the caller supplied —
+/// echoed byte for byte, in whichever of those three forms it arrived, because
+/// that is what lets a caller correlate the refusal with its own request. The
+/// service states it as `Network connector not found: <identifier>`
+/// ([`NOT_FOUND_PREFIX`]), which is the form the recorded service answers, and
+/// no handler words it another way: every identifier-addressed operation
+/// refuses through this one helper.
 pub fn connector_not_found(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         // `Type` is "the exception type", a value no documented rule gives, so
         // it is left unset rather than invented.
         r#type: None,
-        message: Some(format!(
-            "The network connector {identifier} does not exist in this account and Region"
-        )),
+        message: Some(format!("{NOT_FOUND_PREFIX}{identifier}")),
     }
 }
+
+/// What [`connector_not_found`] states before the identifier the request carried.
+pub const NOT_FOUND_PREFIX: &str = "Network connector not found: ";
 
 /// The `ResourceConflictException` payload for a request that conflicts with
 /// what the store already holds.
