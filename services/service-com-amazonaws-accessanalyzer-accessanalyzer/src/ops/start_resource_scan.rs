@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartResourceScan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartResourceScan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a scan of the policies applied to one resource, with one analyzer.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartResourceScan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The call starts the scan and answers with no body, so nothing in the response says
+//! the scan has finished; what observes it is a later read of the analyzer, whose
+//! `lastResourceAnalyzed` / `lastResourceAnalyzedAt` report the resource whose scan
+//! finished most recently. The scan is recorded on the analyzer
+//! ([`crate::state::Analyzer::record_scan`]) with the instant it is DUE
+//! ([`crate::state::RESOURCE_SCAN_SPAN`]), so a read taken straight after this call
+//! still reports the previous result and no read ever has to write.
+//!
+//! This operation does NOT report findings: the policies attached to an arbitrary
+//! resource ARN are not state this emulator holds, so what it records is the scan that
+//! was asked for, never a synthesised finding about a policy nothing read. The
+//! finding-reporting operations (`ListFindings`, `GetFinding`, `GetAnalyzedResource`,
+//! `ListAnalyzedResources`) are still scaffolds with issues of their own.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +177,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartResourceScan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartResourceScanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartResourceScan"))
+        // `resourceArn`'s modelled pattern (`^arn:[^:]*:[^:]*:[^:]*:[^:]*:.*$`) is
+        // already enforced before this handler runs, but its last group accepts an EMPTY
+        // resource segment, which names no resource. Refused as this service refuses
+        // every `resourceArn` that is not an ARN.
+        if !crate::state::is_resource_arn(&input.resource_arn) {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::ValidationRefused);
+            return Err(StartResourceScanErrorModeled::ValidationException(
+                crate::state::resource_arn_validation_exception(&input.resource_arn),
+            )
+            .into());
+        }
+
+        // `resourceOwnerAccount` is an unconstrained `String` in the model and an account
+        // ID in its documentation, so the boundary let anything through and the account
+        // form is checked here.
+        if let Some(named) = input.resource_owner_account.as_deref() {
+            if let Err(refusal) = crate::state::validate_account_id("resourceOwnerAccount", named) {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                );
+                return Err(StartResourceScanErrorModeled::ValidationException(refusal).into());
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::StoreUnavailable);
+            StartResourceScanErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+
+        // Fixed text, with the ARN the caller named travelling in the modelled
+        // `resourceId`: every resource-scoped refusal in this service is built by
+        // `crate::state`'s constructors.
+        let analyzer = state
+            .analyzer_by_arn_mut(&input.analyzer_arn)
+            .ok_or_else(|| {
+                crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::NotFound);
+                StartResourceScanErrorModeled::ResourceNotFoundException(
+                    crate::state::analyzer_not_found(&input.analyzer_arn),
+                )
+            })?;
+
+        // "This action is supported only for external access analyzers" — an analyzer of
+        // the unused-access or internal-access family does not scan a resource's
+        // policies, so the request is refused rather than recorded against it. The
+        // refusal is about the analyzer the request names rather than about one malformed
+        // member, so it carries no `fieldList`; see
+        // [`crate::state::unsupported_action_exception`], and `UpdateAnalyzer`, which
+        // refuses the complementary family the same way.
+        if analyzer.configured_access().is_some() {
+            let analyzer_type = analyzer.r#type.clone();
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::ValidationRefused);
+            return Err(StartResourceScanErrorModeled::ValidationException(
+                crate::state::unsupported_action_exception(format!(
+                    "StartResourceScan is supported only for external access analyzers, so it is not supported for an analyzer of type {analyzer_type}"
+                )),
+            )
+            .into());
+        }
+
+        // The owner is the account the caller named, else the one the resource's own ARN
+        // names — never a value this operation invents.
+        let owner_account = crate::state::resource_owner_account(
+            &input.resource_arn,
+            input.resource_owner_account.as_deref(),
+        );
+        analyzer.record_scan(
+            &input.resource_arn,
+            owner_account,
+            ::std::time::SystemTime::now(),
+        );
+
+        // The store guard is released before the call is recorded, so the lock is held
+        // for the write alone.
+        drop(state);
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::ResourceScanStarted,
+        );
+        Ok(StartResourceScanOutput)
     }
 }

@@ -61,7 +61,7 @@ async fn create_cluster_in(router: &MultiServiceRouter, region: &str, name: &str
 
 /// Create a cluster in [`REGION`] and answer the Kubernetes version it reports,
 /// which is the only `version` a node group of it may name.
-async fn create_cluster(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_cluster(router: &MultiServiceRouter, name: &str) -> String {
     let answer = create_cluster_in(router, REGION, name).await;
     assert_eq!(
         answer.status, 200,
@@ -73,7 +73,7 @@ async fn create_cluster(router: &MultiServiceRouter, name: &str) -> String {
         .to_owned()
 }
 
-async fn create_nodegroup_in(
+pub(crate) async fn create_nodegroup_in(
     router: &MultiServiceRouter,
     region: &str,
     cluster: &str,
@@ -122,7 +122,7 @@ async fn describe_nodegroup(router: &MultiServiceRouter, cluster: &str, name: &s
 }
 
 /// The smallest request `CreateNodegroup` accepts: the three required members.
-fn minimal_request(name: &str) -> serde_json::Value {
+pub(crate) fn minimal_request(name: &str) -> serde_json::Value {
     serde_json::json!({
         "nodegroupName": name,
         "nodeRole": "arn:aws:iam::000000000000:role/eksNodeRole",
@@ -1028,8 +1028,11 @@ async fn the_documented_request_rules_are_enforced() {
 
 // ---------------------------------------------------------------------------
 // RULE: a node group needs a cluster — `CreateNodegroup` against a cluster name
-// this region does not hold is refused with the modelled client error, and
-// stores nothing.
+// this region does not hold is refused with the service's 404
+// `ResourceNotFoundException`, naming the cluster it could not resolve, and
+// stores nothing. (The error CLASS of that refusal, and the ordering that makes
+// it precede every report about the rest of the request, are the subject of
+// `tests/all/error_class_selection.rs`.)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1050,13 +1053,25 @@ async fn a_node_group_cannot_be_created_without_its_cluster() {
     for (case, region, cluster) in cases {
         let answer = create_nodegroup_in(&router, region, cluster, &minimal_request("nodes")).await;
         assert_eq!(
-            answer.status, 400,
-            "case {case:?}: expected 400, got {answer:?}"
+            answer.status, 404,
+            "case {case:?}: expected 404, got {answer:?}"
         );
         assert_eq!(
             answer.error_type.as_deref(),
-            Some("ClientException"),
-            "case {case:?}: expected ClientException, got {answer:?}"
+            Some("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
+        );
+        assert_eq!(
+            answer.body["clusterName"].as_str(),
+            Some(cluster),
+            "case {case:?}: the payload names the cluster it could not resolve, got {:?}",
+            answer.body["clusterName"]
+        );
+        assert_eq!(
+            answer.body["nodegroupName"],
+            serde_json::Value::Null,
+            "case {case:?}: the payload must not echo the requested nodegroupName, got {:?}",
+            answer.body["nodegroupName"]
         );
         let described = describe_nodegroup_in(&router, region, cluster, "nodes").await;
         assert_eq!(

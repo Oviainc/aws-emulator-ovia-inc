@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVerifiedAccessTrustProviders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVerifiedAccessTrustProviders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVerifiedAccessTrustProviders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the Verified Access trust providers this service stores, narrowed
+//! by `VerifiedAccessTrustProviderIds` and `Filters` and paged by
+//! `MaxResults`/`NextToken` — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +69,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+// The `tag:<key>` filter prefix has ONE definition in this crate, in `state`, so the
+// describes that answer that filter cannot spell it differently.
+use crate::state::TAG_FILTER_PREFIX;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +141,289 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVerifiedAccessTrustProviders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVerifiedAccessTrustProvidersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVerifiedAccessTrustProviders"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            decode_page_token, encode_page_token,
+            invalid_verified_access_trust_provider_id_not_found, invalid_pagination_token,
+            matches_every_filter, require_service_state, CompiledFilter, MatchBudget, MAX_FILTERS,
+            MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
+            MAX_RESOURCE_IDS, MAX_VERIFIED_ACCESS_TRUST_PROVIDERS_PAGE_SIZE,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — a trust
+        // provider is an account-level resource whose modelled shape names no Region. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // Read in place rather than copied: the ids are only compared against, and the cap
+        // below is asked before anything proportional to them is done.
+        let requested_ids: &[String] = input
+            .verified_access_trust_provider_ids
+            .as_deref()
+            .unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "VerifiedAccessTrustProviderIds carries {} ids, above the maximum of \
+                 {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // Matching cost is filters x values x held values x stored trust providers, and the
+        // model bounds none of those, so the request-controlled factors are capped here,
+        // before any work proportional to them is done — and their PRODUCT is charged to
+        // ONE [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not answer is refused whether or not any trust
+        // provider would have matched it, so an unsupported filter can never read as "no
+        // results".
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                Scaffolded::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(canonical.to_string(), values.to_vec()));
+        }
+
+        // "The token for the next page of results"
+        // (`DescribeVerifiedAccessTrustProvidersRequest$NextToken`) — anything else is
+        // refused rather than read as an id, and it is refused before any other member is
+        // looked at, so whether a bogus token is caught never depends on the rest of the
+        // request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // "Describes the specified Amazon Web Services Verified Access trust providers": an
+        // id that names no trust provider of the account is an error, not an absent row.
+        for trust_provider_id in requested_ids {
+            if !store
+                .verified_access_trust_providers
+                .contains_key(trust_provider_id)
+            {
+                return Err(invalid_verified_access_trust_provider_id_not_found(
+                    trust_provider_id,
+                ));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named trust
+        // provider resolved: the flag asks whether the request WOULD have succeeded, so one
+        // that would have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored trust
+        // providers, filters, values, held values and value length is bounded however the
+        // caller combines them — which is also what bounds how long this holds the state
+        // lock. This loop only READS: a trust provider AWS hands back is ready, so the
+        // clock owes it no transition for a read to materialise.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<&VerifiedAccessTrustProvider> = Vec::new();
+        for (trust_provider_id, provider) in &store.verified_access_trust_providers {
+            if budget.exhausted() {
+                break;
+            }
+            // The id narrowing is read off the stored key, so a trust provider the request
+            // did not name costs no comparison at all.
+            if !requested_ids.is_empty()
+                && !requested_ids
+                    .iter()
+                    .any(|id| id == trust_provider_id.as_str())
+            {
+                continue;
+            }
+            if matches_every_filter(&selectors, &mut budget, &|name| {
+                filter_values(provider, name)
+            }) {
+                selected.push(provider);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `VerifiedAccessTrustProviderId` order, which the cursor below names a
+        // position in. The store is an ordered map, so its iteration order already
+        // satisfies this sort; doing it here establishes the invariant the cursor depends on
+        // at the point of use.
+        selected.sort_by(|left, right| {
+            left.verified_access_trust_provider_id
+                .cmp(&right.verified_access_trust_provider_id)
+        });
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|provider| {
+                provider
+                    .verified_access_trust_provider_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this operation can be
+        // asked for, so the `NextToken` path behaves the same whether or not a page size was
+        // asked for. The modelled `range 5..200` has already refused a size outside it.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_VERIFIED_ACCESS_TRUST_PROVIDERS_PAGE_SIZE)
+            .clamp(1, MAX_VERIFIED_ACCESS_TRUST_PROVIDERS_PAGE_SIZE);
+
+        // A token only when a trust provider follows this page: "This value is null when
+        // there are no more results to return"
+        // (`DescribeVerifiedAccessTrustProvidersResult$NextToken`).
+        let next_token = page
+            .get(limit)
+            .and_then(|provider| provider.verified_access_trust_provider_id.as_deref())
+            .map(encode_page_token);
+
+        Ok(DescribeVerifiedAccessTrustProvidersOutput {
+            verified_access_trust_providers: Some(
+                page.iter().take(limit).map(|provider| (*provider).clone()).collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The filter names this operation answers.
+///
+/// The model documents no list of its own — "One or more filters. Filter names and values
+/// are case-sensitive" (`DescribeVerifiedAccessTrustProvidersRequest$Filters`) — and
+/// `Filter` itself says a filter matches resources "by specific criteria, such as tags,
+/// attributes, or IDs". So the names here are EC2's spelling (hyphenated, lower case) of
+/// the reported shape's own scalar members —
+/// `smithy_query(query="shape",shape="VerifiedAccessTrustProvider")` — plus `tag-key`, the
+/// resource-wide tag filter EC2 documents for every taggable resource ("List and filter
+/// using the CLI and API", linked from `Filter`). Every entry must be answered by
+/// [`filter_values`].
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather
+/// than listed here.
+const TRUST_PROVIDER_FILTERS: [&str; 9] = [
+    "creation-time",
+    "description",
+    "device-trust-provider-type",
+    "last-updated-time",
+    "policy-reference-name",
+    "tag-key",
+    "trust-provider-type",
+    "user-trust-provider-type",
+    "verified-access-trust-provider-id",
+];
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation answers no such filter.
+///
+/// The `tag:<key>` prefix comes from the crate's one definition of it,
+/// `crate::state::TAG_FILTER_PREFIX`, so that spelling cannot drift between the describes
+/// that answer the tag filter.
+///
+/// "Filter names and values are case-sensitive"
+/// (`DescribeVerifiedAccessTrustProvidersRequest$Filters`), so every comparison is exact —
+/// and a `tag:` prefix with no key names no tag, so it is as undocumented as any other
+/// misspelling. The `tag:<key>` family keeps its whole name, the key being part of what it
+/// selects on.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    if name
+        .strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return Some(name);
+    }
+    TRUST_PROVIDER_FILTERS.contains(&name).then_some(name)
+}
+
+/// The values the EC2 filter `name` compares against this trust provider.
+///
+/// A filter naming an attribute this trust provider does not carry compares against NO
+/// values, so it selects nothing — which is the answer for `user-trust-provider-type` on a
+/// device-based provider, and for `device-trust-provider-type` on a user-based one.
+/// `name` is a name [`canonical_filter_name`] resolved.
+fn filter_values<'a>(
+    provider: &'a VerifiedAccessTrustProvider,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return provider
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "creation-time" => text(provider.creation_time.as_deref()),
+        "description" => text(provider.description.as_deref()),
+        "device-trust-provider-type" => text(provider.device_trust_provider_type.as_deref()),
+        "last-updated-time" => text(provider.last_updated_time.as_deref()),
+        "policy-reference-name" => text(provider.policy_reference_name.as_deref()),
+        "tag-key" => provider
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "trust-provider-type" => text(provider.trust_provider_type.as_deref()),
+        "user-trust-provider-type" => text(provider.user_trust_provider_type.as_deref()),
+        "verified-access-trust-provider-id" => {
+            text(provider.verified_access_trust_provider_id.as_deref())
+        }
+        // Unreachable: `canonical_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
     }
 }

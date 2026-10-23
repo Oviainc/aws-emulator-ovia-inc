@@ -146,6 +146,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
+        // Every analyzer on the page is projected at ONE instant, so two analyzers whose
+        // scans fall due between them are not reported against different clocks.
+        let now = ::std::time::SystemTime::now();
         // `type` filters the listing; absent, every stored analyzer matches.
         let matching: Vec<(String, AnalyzerSummary)> = state
             .analyzers
@@ -156,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_deref()
                     .is_none_or(|wanted| analyzer.r#type == wanted)
             })
-            .map(|(name, analyzer)| (name.clone(), analyzer.summary()))
+            .map(|(name, analyzer)| (name.clone(), analyzer.summary_at(now)))
             .collect();
 
         let page = crate::state::page(matching, input.max_results, input.next_token.as_deref())

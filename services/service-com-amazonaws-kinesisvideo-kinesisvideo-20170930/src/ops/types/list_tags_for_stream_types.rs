@@ -26,3 +26,56 @@ pub struct ListTagsForStreamOutput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
+/// A [`ListTagsForStreamOutput`] as the operation puts it on the wire.
+///
+/// One property of this response cannot be expressed by the generated serializer
+/// alone, and it is what this type adds: EVERY modelled output member reaches the
+/// wire, and a member the service has no value for is JSON `null` rather than an
+/// absent key. The generated serializer skips an `Option` member holding `None`, so
+/// `NextToken` — which a stream's tag listing never carries, because the listing is
+/// never truncated — would be absent from the body, while AWS answers
+/// `{"NextToken": null, "Tags": {…}}`; a client dereferencing the member would get
+/// `undefined` instead of `null`.
+///
+/// The member list is the output shape's own [`Schema`], and the record writes its
+/// valued members through its own generated `SerializableStruct`, so neither the
+/// member names nor their wire forms are restated here.
+#[derive(Debug, Clone)]
+pub struct ListTagsForStreamReport(ListTagsForStreamOutput);
+
+impl ListTagsForStreamReport {
+    /// This response, as the operation computed it.
+    pub fn of(output: ListTagsForStreamOutput) -> Self {
+        Self(output)
+    }
+
+    /// Whether the record holds no value for `member`, so the wire form of that
+    /// member is JSON `null`.
+    fn has_no_value(&self, member: &::aws_smithy_schema::Schema) -> bool {
+        match member.member_name() {
+            Some("NextToken") => self.0.next_token.is_none(),
+            Some("Tags") => self.0.tags.is_none(),
+            // A member added to the model is written by the record itself; it is
+            // reported as absent only once this match names it.
+            _ => false,
+        }
+    }
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ListTagsForStreamReport {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // The members the record HAS values for, exactly as the model says.
+        self.0.serialize_members(serializer)?;
+        // Then the ones it has no value for, as JSON `null`.
+        for member in ListTagsForStreamOutput::SCHEMA.members() {
+            if self.has_no_value(member) {
+                serializer.write_null(member)?;
+            }
+        }
+        Ok(())
+    }
+}
+

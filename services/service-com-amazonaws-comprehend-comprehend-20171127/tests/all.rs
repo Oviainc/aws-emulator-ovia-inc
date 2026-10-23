@@ -57,3 +57,5 @@ mod sync_inference_refusals;
 mod syntax;
 #[path = "all/targeted_sentiment.rs"]
 mod targeted_sentiment;
+#[path = "all/toxic_content.rs"]
+mod toxic_content;

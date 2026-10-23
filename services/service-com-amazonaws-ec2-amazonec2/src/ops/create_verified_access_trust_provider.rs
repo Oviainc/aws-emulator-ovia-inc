@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVerifiedAccessTrustProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVerifiedAccessTrustProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVerifiedAccessTrustProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints a Verified Access trust provider from the request and stores it, so
+//! `DescribeVerifiedAccessTrustProviders` reports what this call created — this is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +156,279 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVerifiedAccessTrustProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVerifiedAccessTrustProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVerifiedAccessTrustProvider"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            iso8601_utc, require_service_state, tag_list, validate_tag_size,
+            verified_access_trust_provider_limit_exceeded,
+            verified_access_trust_provider_payload_bytes, MAX_CLIENT_TOKEN_CHARS,
+            MAX_STORED_BYTES, MAX_TAGS_PER_RESOURCE, MAX_VERIFIED_ACCESS_TRUST_PROVIDERS,
+            TRUST_PROVIDER_TYPE_DEVICE, TRUST_PROVIDER_TYPE_USER, USER_TRUST_PROVIDER_TYPE_OIDC,
+            VERIFIED_ACCESS_TRUST_PROVIDER_TAGGABLE_RESOURCE,
+        };
+
+        // `ctx` carries request metadata only, and nothing this record holds names a
+        // Region: the modelled `VerifiedAccessTrustProvider` carries no ARN and no zone.
+        let _ = ctx;
+
+        // "The type of trust provider" (`CreateVerifiedAccessTrustProviderRequest$
+        // TrustProviderType`), one of `user` or `device`. The modelled enum has already
+        // refused every other spelling before this handler runs, so an unknown value here
+        // can only be a value the model learned and this handler has not.
+        let trust_provider_type = input.trust_provider_type.as_str();
+        if trust_provider_type != TRUST_PROVIDER_TYPE_USER
+            && trust_provider_type != TRUST_PROVIDER_TYPE_DEVICE
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{trust_provider_type}' for trustProviderType"
+            )));
+        }
+        let is_user = trust_provider_type == TRUST_PROVIDER_TYPE_USER;
+
+        // Each kind of trust provider takes its OWN options and only those: "This
+        // parameter is required when the provider type is user"
+        // (`UserTrustProviderType`, `OidcOptions`) and "required when the provider type is
+        // device" (`DeviceTrustProviderType`, `DeviceOptions`). So a member the named kind
+        // does not take is refused rather than accepted and dropped, which would store a
+        // trust provider the caller did not describe.
+        let user_type = input.user_trust_provider_type.as_deref();
+        let device_type = input.device_trust_provider_type.as_deref();
+        match (is_user, user_type, device_type) {
+            (true, None, _) => {
+                return Err(Scaffolded::missing_parameter(
+                    "userTrustProviderType is required when trustProviderType is user",
+                ));
+            }
+            (true, Some(_), Some(_)) => {
+                return Err(Scaffolded::invalid_parameter_combination(
+                    "deviceTrustProviderType may not be specified when trustProviderType is user",
+                ));
+            }
+            (false, _, None) => {
+                return Err(Scaffolded::missing_parameter(
+                    "deviceTrustProviderType is required when trustProviderType is device",
+                ));
+            }
+            (false, Some(_), Some(_)) => {
+                return Err(Scaffolded::invalid_parameter_combination(
+                    "userTrustProviderType may not be specified when trustProviderType is device",
+                ));
+            }
+            _ => {}
+        }
+
+        // "The options for a OpenID Connect-compatible user-identity trust provider. This
+        // parameter is required when the provider type is user"
+        // (`CreateVerifiedAccessTrustProviderRequest$OidcOptions`), and
+        // `NativeApplicationOidcOptions` are the OIDC options of a native application. Both
+        // are members of a USER provider, so a DEVICE provider — which takes `DeviceOptions`
+        // — may not carry them. Within a user provider they are REQUIRED for the kind that
+        // is OpenID Connect; `iam-identity-center` is not OIDC and needs no endpoints of its
+        // own, so options named for it are stored and reported rather than refused: the
+        // model makes them a user-provider member without qualifying the kind.
+        let requires_oidc_options = is_user && user_type == Some(USER_TRUST_PROVIDER_TYPE_OIDC);
+        if requires_oidc_options
+            && input.oidc_options.is_none()
+            && input.native_application_oidc_options.is_none()
+        {
+            return Err(Scaffolded::missing_parameter(format!(
+                "oidcOptions is required when userTrustProviderType is \
+                 {USER_TRUST_PROVIDER_TYPE_OIDC}"
+            )));
+        }
+        if !is_user
+            && (input.oidc_options.is_some() || input.native_application_oidc_options.is_some())
+        {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "oidcOptions may be specified only for a {TRUST_PROVIDER_TYPE_USER} trust \
+                 provider"
+            )));
+        }
+        // The device options are the mirror of that rule: "The options for a device-based
+        // trust provider. This parameter is required when the provider type is device"
+        // (`CreateVerifiedAccessTrustProviderRequest$DeviceOptions`).
+        if !is_user && input.device_options.is_none() {
+            return Err(Scaffolded::missing_parameter(
+                "deviceOptions is required when trustProviderType is device",
+            ));
+        }
+        if is_user && input.device_options.is_some() {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "deviceOptions may not be specified when trustProviderType is user",
+            ));
+        }
+
+        // "The tags to assign to the Verified Access trust provider"
+        // (`CreateVerifiedAccessTrustProviderRequest$TagSpecifications`): the trust
+        // provider is the only resource this call creates, so a specification naming any
+        // other resource type is refused rather than accepted and discarded.
+        let mut tags: ::std::collections::BTreeMap<String, String> =
+            ::std::collections::BTreeMap::new();
+        for specification in input.tag_specifications.iter().flatten() {
+            match specification.resource_type.as_deref() {
+                Some(VERIFIED_ACCESS_TRUST_PROVIDER_TAGGABLE_RESOURCE) | None => {}
+                Some(resource_type) => {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{resource_type}' for resourceType. \
+                         CreateVerifiedAccessTrustProvider tags the \
+                         '{VERIFIED_ACCESS_TRUST_PROVIDER_TAGGABLE_RESOURCE}' it creates"
+                    )));
+                }
+            }
+            for tag in specification.tags.iter().flatten() {
+                let key = tag.key.clone().unwrap_or_default();
+                let value = tag.value.clone().unwrap_or_default();
+                validate_tag_size(&key, &value)?;
+                tags.insert(key, value);
+            }
+        }
+        if tags.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "A Verified Access trust provider carries at most {MAX_TAGS_PER_RESOURCE} \
+                 tags, not {}",
+                tags.len()
+            )));
+        }
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // The record this call would store, built BEFORE the store is locked. Every member
+        // is either taken from the request or derived here; nothing is read back from the
+        // request object after the insert, so the caller sees the stored trust provider.
+        let created_at = iso8601_utc(::std::time::SystemTime::now());
+        let provider = VerifiedAccessTrustProvider {
+            // Minted by the store at the insert, so an id is never chosen twice.
+            verified_access_trust_provider_id: None,
+            description: input.description.clone(),
+            trust_provider_type: Some(trust_provider_type.to_string()),
+            user_trust_provider_type: input.user_trust_provider_type.clone(),
+            device_trust_provider_type: input.device_trust_provider_type.clone(),
+            oidc_options: input.oidc_options.as_ref().map(|options| OidcOptions {
+                issuer: options.issuer.clone(),
+                authorization_endpoint: options.authorization_endpoint.clone(),
+                token_endpoint: options.token_endpoint.clone(),
+                user_info_endpoint: options.user_info_endpoint.clone(),
+                client_id: options.client_id.clone(),
+                client_secret: options.client_secret.clone(),
+                scope: options.scope.clone(),
+            }),
+            device_options: input.device_options.as_ref().map(|options| DeviceOptions {
+                tenant_id: options.tenant_id.clone(),
+                public_signing_key_url: options.public_signing_key_url.clone(),
+            }),
+            policy_reference_name: Some(input.policy_reference_name.clone()),
+            // A trust provider is created and updated in the same instant; a modify is what
+            // moves `LastUpdatedTime` on afterwards.
+            creation_time: Some(created_at.clone()),
+            last_updated_time: Some(created_at),
+            tags: Some(tag_list(&tags)),
+            // "The options for server side encryption"
+            // (`CreateVerifiedAccessTrustProviderRequest$SseSpecification`). The response
+            // shape reports whether a customer managed key is in use and which one, so a
+            // request that named no specification reports the AWS owned key: not customer
+            // managed, and no key ARN to name.
+            sse_specification: Some(VerifiedAccessSseSpecificationResponse {
+                customer_managed_key_enabled: Some(
+                    input
+                        .sse_specification
+                        .as_ref()
+                        .and_then(|sse| sse.customer_managed_key_enabled)
+                        .unwrap_or(false),
+                ),
+                kms_key_arn: input
+                    .sse_specification
+                    .as_ref()
+                    .and_then(|sse| sse.kms_key_arn.clone()),
+            }),
+            // The response shape of the native application options carries no
+            // `ClientSecret` member (`smithy_query(query="shape",
+            // shape="NativeApplicationOidcOptions")`), so a secret given here is stored
+            // nowhere a read can report it.
+            native_application_oidc_options: input.native_application_oidc_options.as_ref().map(
+                |options| NativeApplicationOidcOptions {
+                    public_signing_key_endpoint: options.public_signing_key_endpoint.clone(),
+                    issuer: options.issuer.clone(),
+                    authorization_endpoint: options.authorization_endpoint.clone(),
+                    token_endpoint: options.token_endpoint.clone(),
+                    user_info_endpoint: options.user_info_endpoint.clone(),
+                    client_id: options.client_id.clone(),
+                    scope: options.scope.clone(),
+                },
+            ),
+        };
+        // The caller-chosen bytes this create would retain for the process's lifetime,
+        // counted by the ONE definition of that charge. A COUNT ceiling admits gigabytes on
+        // its own, because the record holds strings the caller chose the length of, so both
+        // are asked below.
+        let payload_bytes = verified_access_trust_provider_payload_bytes(
+            &provider,
+            input.client_token.as_deref(),
+        );
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // Idempotency: "A unique, case-sensitive token that you provide to ensure
+        // idempotency of your modification request"
+        // (`CreateVerifiedAccessTrustProviderRequest$ClientToken`) — one token names the one
+        // trust provider it minted, so a replay reports that trust provider and creates
+        // nothing. Read here, answered below the DryRun check, because a replay stores
+        // nothing and so passes the ceilings a fresh create has to clear.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store
+                .verified_access_trust_provider_client_tokens
+                .get(token)
+                .cloned()
+        });
+
+        if replayed.is_none() && !store.has_verified_access_trust_provider_capacity() {
+            return Err(verified_access_trust_provider_limit_exceeded(format!(
+                "This emulator holds {MAX_VERIFIED_ACCESS_TRUST_PROVIDERS} Verified Access \
+                 trust providers, which is as many as it stores"
+            )));
+        }
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(verified_access_trust_provider_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let trust_provider_id = match replayed {
+            Some(trust_provider_id) => trust_provider_id,
+            None => store
+                .insert_verified_access_trust_provider(provider, input.client_token.as_deref()),
+        };
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // DescribeVerifiedAccessTrustProviders will see rather than the request object.
+        store
+            .verified_access_trust_providers
+            .get(&trust_provider_id)
+            .cloned()
+            .map(|verified_access_trust_provider| CreateVerifiedAccessTrustProviderOutput {
+                verified_access_trust_provider: Some(verified_access_trust_provider),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created Verified Access trust provider \
+                     '{trust_provider_id}' could not be read back"
+                ))
+            })
     }
 }

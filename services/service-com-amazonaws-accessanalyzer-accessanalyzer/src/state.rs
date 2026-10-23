@@ -16,6 +16,11 @@
 //! [`AccessPreviewRecord`] on the analyzer the request names, `GetAccessPreview`
 //! projects it back with [`AccessPreviewRecord::preview_at`], and deleting the analyzer
 //! takes its previews with it.
+//!
+//! So are resource scans: `StartResourceScan` records a [`ResourceScan`] on the analyzer
+//! it names, and the analyzer's `lastResourceAnalyzed` / `lastResourceAnalyzedAt` are
+//! DERIVED from those records against the clock by [`Analyzer::summary_at`] — there is no
+//! separately stored copy of either member for a scan to have to keep in step.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -109,6 +114,29 @@ pub const ACCESS_PREVIEW_ANALYSIS_SPAN: Duration = Duration::from_millis(500);
 /// `CreateAccessPreview` models `ServiceQuotaExceededException` (HTTP 402) for meeting
 /// a quota, so the ceiling is expressed with that error rather than with memory.
 pub const MAX_ACCESS_PREVIEWS_PER_ANALYZER: usize = 1_000;
+
+/// How long a scan started by `StartResourceScan` runs before the clock owes the
+/// analyzer the result.
+///
+/// `StartResourceScan` "immediately starts a scan" and answers with no body, so nothing
+/// in the response says the scan has FINISHED; what observes the result is a later read
+/// of the analyzer (`AnalyzerSummary$lastResourceAnalyzed` /
+/// `lastResourceAnalyzedAt`). AWS publishes no duration for the scan, so this span is
+/// the emulator's own choice, chosen like [`ACCESS_PREVIEW_ANALYSIS_SPAN`]: non-zero, so
+/// a caller reading the analyzer straight after the call still sees the scan outstanding,
+/// and short enough not to keep a caller waiting. Nothing sleeps for it — the due instant
+/// is stored and every read compares the clock against it.
+pub const RESOURCE_SCAN_SPAN: Duration = Duration::from_millis(500);
+
+/// How many distinct scanned resources this emulator remembers under one analyzer.
+///
+/// Scans are caller-driven growth keyed by `resourceArn`, and `StartResourceScan` models
+/// no quota error at all (only 400/403/404/429/500), so the ceiling cannot be reported as
+/// a quota: past it the LEAST recently scanned resource is forgotten, the way
+/// [`ClientTokens`] evicts its oldest record. Rescanning a resource already held replaces
+/// its record rather than adding one, so a caller rescanning one resource never evicts
+/// anything.
+pub const MAX_SCANNED_RESOURCES_PER_ANALYZER: usize = 1_000;
 
 // ---------------------------------------------------------------------------
 // Resource-scoped refusals.
@@ -423,8 +451,14 @@ pub struct Analyzer {
     pub status: String,
     pub status_reason: Option<StatusReason>,
     pub created_at: SystemTime,
-    pub last_resource_analyzed: Option<String>,
-    pub last_resource_analyzed_at: Option<SystemTime>,
+    /// Every resource `StartResourceScan` has been asked to scan with this analyzer,
+    /// keyed by `resourceArn` (ordered, for the same paging reason as `analyzers`).
+    ///
+    /// This is the ONLY source of `AnalyzerSummary$lastResourceAnalyzed` /
+    /// `lastResourceAnalyzedAt`, which [`Analyzer::summary_at`] derives from it against
+    /// the clock — there is no second, separately stored copy of those two members to
+    /// drift from the scans that produced them.
+    pub resource_scans: BTreeMap<String, ResourceScan>,
     /// The analyzer's tag set: exactly the `tags` map the create carried, EMPTY when it
     /// carried none, as the tagging operations have since changed it.
     ///
@@ -521,17 +555,76 @@ impl Analyzer {
         configured_access(&self.r#type)
     }
 
-    /// Project the stored analyzer onto the modelled `AnalyzerSummary`.
-    pub fn summary(&self) -> AnalyzerSummary {
+    /// The scan of this analyzer's that had FINISHED by `now`, most recently — or `None`
+    /// while no scan of it has finished yet.
+    ///
+    /// A scan started but not yet due ([`RESOURCE_SCAN_SPAN`]) has analyzed nothing, so
+    /// it is not a candidate: that is what makes a read taken straight after
+    /// `StartResourceScan` still report the previous result. Two scans due at the very
+    /// same instant are ordered by `resourceArn`, the map's own order, so the answer is
+    /// deterministic rather than dependent on iteration luck.
+    pub fn last_completed_scan(&self, now: SystemTime) -> Option<&ResourceScan> {
+        self.resource_scans
+            .values()
+            .filter(|scan| scan.completes_at <= now)
+            .max_by_key(|scan| scan.completes_at)
+    }
+
+    /// Record that `resource_arn` has been scanned by this analyzer, as of `now`.
+    ///
+    /// Rescanning a resource the analyzer already scanned REPLACES that resource's scan
+    /// (one resource has one most-recent scan), keeping the instant its first scan
+    /// started; a resource it has not scanned is added, evicting the least recently
+    /// scanned record once [`MAX_SCANNED_RESOURCES_PER_ANALYZER`] are held.
+    pub fn record_scan(&mut self, resource_arn: &str, owner_account: String, now: SystemTime) {
+        let first_started_at = self
+            .resource_scans
+            .get(resource_arn)
+            .map_or(now, |previous| previous.first_started_at);
+        if !self.resource_scans.contains_key(resource_arn)
+            && self.resource_scans.len() >= MAX_SCANNED_RESOURCES_PER_ANALYZER
+        {
+            if let Some(evicted) = self
+                .resource_scans
+                .values()
+                .min_by_key(|scan| scan.started_at)
+                .map(|scan| scan.resource_arn.clone())
+            {
+                self.resource_scans.remove(&evicted);
+            }
+        }
+        self.resource_scans.insert(
+            resource_arn.to_string(),
+            ResourceScan {
+                resource_arn: resource_arn.to_string(),
+                resource_owner_account: owner_account,
+                first_started_at,
+                started_at: now,
+                completes_at: now + RESOURCE_SCAN_SPAN,
+            },
+        );
+    }
+
+    /// Project the stored analyzer onto the modelled `AnalyzerSummary`, as of `now`.
+    ///
+    /// `now` is taken rather than read here because the two `lastResourceAnalyzed`
+    /// members are DERIVED from the analyzer's scans against the clock
+    /// ([`Analyzer::last_completed_scan`]), so a listing projects every analyzer it
+    /// reports at one instant instead of a slightly different one each.
+    pub fn summary_at(&self, now: SystemTime) -> AnalyzerSummary {
+        let last_scan = self.last_completed_scan(now);
         AnalyzerSummary {
             arn: self.arn.clone(),
             name: self.name.clone(),
             r#type: self.r#type.clone(),
             created_at: ::aws_smithy_types::DateTime::from(self.created_at),
-            last_resource_analyzed: self.last_resource_analyzed.clone(),
-            last_resource_analyzed_at: self
-                .last_resource_analyzed_at
-                .map(::aws_smithy_types::DateTime::from),
+            // "The resource that was most recently analyzed by the analyzer", and "the
+            // time at which the most recently analyzed resource was analyzed" — the
+            // instant the scan finished, not the instant it was asked for. Both are
+            // absent until a scan of this analyzer has finished.
+            last_resource_analyzed: last_scan.map(|scan| scan.resource_arn.clone()),
+            last_resource_analyzed_at: last_scan
+                .map(|scan| ::aws_smithy_types::DateTime::from(scan.completes_at)),
             // Present even when empty: an untagged analyzer has an empty tag set, which
             // is `{}` on the wire, not an absent member.
             tags: Some(self.tags.clone()),
@@ -773,6 +866,71 @@ pub fn new_access_preview_id() -> String {
         let _ = write!(rendered, "{byte:02x}");
     }
     rendered
+}
+
+/// One resource's most recent scan under one analyzer, as `StartResourceScan` records it.
+///
+/// A scan is not instantaneous, so the record keeps the instant it is DUE to have
+/// finished; what a read reports is computed from the clock against that instant by
+/// [`Analyzer::last_completed_scan`], so nothing sleeps and no read has to write.
+#[derive(Debug, Clone)]
+pub struct ResourceScan {
+    /// The `resourceArn` the scan was asked for, exactly as the request named it.
+    pub resource_arn: String,
+    /// The account that owns the resource; see [`resource_owner_account`].
+    pub resource_owner_account: String,
+    /// When the FIRST scan of this resource under this analyzer was started, kept across
+    /// a rescan so the resource's own creation instant does not move when it is rescanned.
+    pub first_started_at: SystemTime,
+    /// When the most recent scan of this resource was started.
+    pub started_at: SystemTime,
+    /// When the most recent scan is DUE to have finished: `started_at` plus
+    /// [`RESOURCE_SCAN_SPAN`].
+    pub completes_at: SystemTime,
+}
+
+/// How many decimal digits an Amazon Web Services account ID carries.
+///
+/// `StartResourceScan$resourceOwnerAccount` is documented as "The Amazon Web Services
+/// account ID that owns the resource" and the model leaves it an unconstrained `String`,
+/// so what bounds it is the documented TYPE: an account ID is a fixed-width 12-digit
+/// decimal number, which is also the form the account segment of every ARN takes.
+pub const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// Refuse a `member` documented as an account ID whose value is not one.
+///
+/// The message is composed from the request because it is a FIELD validation: it names
+/// the member and the constraint it violated, which is what a client has to fix.
+pub fn validate_account_id(member: &str, value: &str) -> Result<(), ValidationException> {
+    if value.len() == ACCOUNT_ID_DIGITS && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(());
+    }
+    Err(field_validation_exception(
+        member,
+        format!(
+            "{member} must be a {ACCOUNT_ID_DIGITS}-digit Amazon Web Services account ID, but was {value:?}"
+        ),
+    ))
+}
+
+/// The account that owns `resource_arn`, as a scan of it records the owner.
+///
+/// `resourceOwnerAccount` is OPTIONAL and documented as "for most Amazon Web Services
+/// resources, the owning account is the account in which the resource was created" — the
+/// account an ARN names in its own account segment. So the owner is the account the
+/// caller named when it named one, else the ARN's account segment, and for the ARN forms
+/// that carry no account segment (an S3 bucket ARN, for one) this emulator's account,
+/// which is the account every resource it serves belongs to.
+pub fn resource_owner_account(resource_arn: &str, named: Option<&str>) -> String {
+    if let Some(named) = named.filter(|account| !account.is_empty()) {
+        return named.to_string();
+    }
+    resource_arn
+        .split(':')
+        .nth(4)
+        .filter(|account| !account.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| ::engine::emulator_account_id().to_string())
 }
 
 /// A stored archive rule: the state `ArchiveRuleSummary` is rebuilt from.
@@ -1267,6 +1425,8 @@ pub enum AuditOutcome {
     NoChange,
     /// A policy check ran and answered a result.
     CheckEvaluated,
+    /// A scan of one resource's policies was started against an analyzer.
+    ResourceScanStarted,
     /// The request was refused as invalid (400).
     ValidationRefused,
     /// The caller may not perform the operation (403).
@@ -1293,6 +1453,7 @@ impl AuditOutcome {
             Self::TagsRemoved => "tags-removed",
             Self::NoChange => "no-change",
             Self::CheckEvaluated => "check-evaluated",
+            Self::ResourceScanStarted => "resource-scan-started",
             Self::ValidationRefused => "validation-refused",
             Self::AccessDenied => "access-denied",
             Self::NotFound => "not-found",
