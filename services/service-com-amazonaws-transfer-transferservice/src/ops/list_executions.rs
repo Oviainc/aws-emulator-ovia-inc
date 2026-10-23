@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the executions of ONE workflow out of this service's state: the workflow the
+//! request names is resolved first (an id the store does not hold is the modelled
+//! `ResourceNotFoundException`), then that workflow's contiguous run of the execution
+//! map is paged through the opaque `NextToken` every `List*` of this service shares.
+//! A pure read (`@readonly`): nothing here writes, and each listed execution's `Status`
+//! is derived from the record's own custom-step callbacks by
+//! [`crate::state::WorkflowExecution::reported_status`].
+//!
+//! EVERY stored execution of the workflow is listed, in whatever status it is in, and
+//! NOT only the ones still running — do not "fix" this back to a status filter. The
+//! model's own summary sentence says "Lists all in-progress executions for the specified
+//! workflow", but the output it models contradicts a listing that could answer only one
+//! status: `ListedExecution.Status` targets `ExecutionStatus`, whose value set is
+//! `[IN_PROGRESS, COMPLETED, EXCEPTION, HANDLING_EXCEPTION]`, so a filtered listing
+//! could never report a run that a callback has finished or failed, and the member's own
+//! doc ("Can be in progress, completed, exception encountered, or handling the
+//! exception") says a listed entry carries any of them.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +174,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExecutions"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            ListExecutionsErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        // A pure read: nothing below writes, and no clock transition is owed on an
+        // execution — only `SendWorkflowStepState` moves one on, and it does so when it
+        // is called.
+        let guard = state.lock();
+
+        // The named resource is resolved FIRST: "If the specified workflow ID cannot be
+        // found, ListExecutions returns a ResourceNotFound exception", whatever paging
+        // the request carries.
+        if !guard.workflows.contains_key(&input.workflow_id) {
+            return Err(st::not_found(
+                ListExecutionsErrorModeled::ResourceNotFoundException(st::unknown_workflow(
+                    &input.workflow_id,
+                )),
+            ));
+        }
+
+        // A token this service did not hand out resumes nothing, so it is refused
+        // rather than silently restarting the listing.
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
+                ListExecutionsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+                    message: "The NextToken is not valid".to_string(),
+                })
+            })?),
+            None => None,
+        };
+
+        // ONE range scan over this workflow's run of the execution map: the records to
+        // render come straight out of it, so no row is looked up a second time.
+        let stored: Vec<&st::WorkflowExecution> = guard.executions_of(&input.workflow_id).collect();
+        let ids: Vec<&str> = stored
+            .iter()
+            .map(|execution| execution.execution_id.as_str())
+            .collect();
+        let (page, next_key) =
+            st::page_bounds(&ids, after.as_deref(), st::page_limit(input.max_results));
+
+        let executions = stored
+            .get(page)
+            .unwrap_or_default()
+            .iter()
+            .map(|execution| ListedExecution {
+                execution_id: Some(execution.execution_id.clone()),
+                // Both containers are reported exactly as the record holds them: a run
+                // recorded without a file location or session details reports none,
+                // rather than an empty structure whose required members nothing filled.
+                initial_file_location: execution.initial_file_location.clone(),
+                service_metadata: execution.service_metadata.clone(),
+                // Every execution the workflow holds is listed, with the status the
+                // record is in: `ListedExecution.Status` carries the whole
+                // `ExecutionStatus` value set (`IN_PROGRESS`, `COMPLETED`, `EXCEPTION`,
+                // `HANDLING_EXCEPTION`), so a listing that could only answer
+                // `IN_PROGRESS` could never report a run a callback has finished.
+                status: Some(execution.reported_status().to_string()),
+            })
+            .collect();
+
+        Ok(ListExecutionsOutput {
+            // A token only when a further page remains.
+            next_token: next_key.as_deref().map(st::encode_page_token),
+            workflow_id: input.workflow_id,
+            executions,
+        })
     }
 }

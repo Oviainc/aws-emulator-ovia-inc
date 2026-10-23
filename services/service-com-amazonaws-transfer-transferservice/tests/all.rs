@@ -73,5 +73,7 @@ mod web_app_deletion;
 mod web_app_lifecycle;
 #[path = "all/web_app_listing.rs"]
 mod web_app_listing;
+#[path = "all/workflow_execution_listing.rs"]
+mod workflow_execution_listing;
 #[path = "all/workflow_lifecycle.rs"]
 mod workflow_lifecycle;
