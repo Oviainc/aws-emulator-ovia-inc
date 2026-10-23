@@ -5,6 +5,15 @@
 //! the persisted records — filtered by the `name` prefix when one is given, ordered by
 //! name and served one bounded page at a time with `nextToken` as the cursor.
 //!
+//! Every caller-supplied input only NARROWS that page: `name` and `nextToken` are filters
+//! over the records the workspace `{workspaceId}` names holds, so no value on the query
+//! string can make this read report a namespace the request did not name, and nothing it
+//! carries reaches anything outside this service's own store. A value outside a member's
+//! modelled constraint is refused with the modelled `ValidationException` (400) before any
+//! record is reported. `tests/all/rule_groups_namespace_listing_scope.rs` pins both over
+//! the cursors and filters a caller can send, including ones another workspace's listing
+//! minted.
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -211,7 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `nextToken` is the cursor this operation itself emitted: the name of the last
         // summary of the previous page, so the next page starts after it. "The other
         // parameters must be the same as the initial call", which is why the filter is
-        // applied before the cursor rather than after it.
+        // applied before the cursor rather than after it. It is a FILTER over the records
+        // already selected above, never a key into the store: whatever a caller sends —
+        // including a token another workspace's listing minted — can only drop entries
+        // from this workspace's page.
         if let Some(cursor) = input.next_token.as_deref() {
             namespaces.retain(|namespace| namespace.name.as_str() > cursor);
         }

@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 
 /// `GET /workspaces/{workspaceId}/rulegroupsnamespaces` — ListRuleGroupsNamespaces, with
 /// the `@httpQuery` members the request names.
-async fn list_namespaces(
+pub(crate) async fn list_namespaces(
     amp: &Amp,
     region: &str,
     workspace_id: &str,
@@ -46,7 +46,7 @@ async fn list_namespaces(
 }
 
 /// The `name` of every summary on one page, in the order the page carries them.
-fn names_of(case: &str, reply: &Reply) -> Vec<String> {
+pub(crate) fn names_of(case: &str, reply: &Reply) -> Vec<String> {
     let list = reply.body["ruleGroupsNamespaces"]
         .as_array()
         .unwrap_or_else(|| {
@@ -56,7 +56,7 @@ fn names_of(case: &str, reply: &Reply) -> Vec<String> {
 }
 
 /// The `nextToken` a page carries, `None` when it carries none.
-fn next_token(reply: &Reply) -> Option<String> {
+pub(crate) fn next_token(reply: &Reply) -> Option<String> {
     reply.body["nextToken"]
         .as_str()
         .map(|token| token.to_string())

@@ -29,6 +29,8 @@ mod rule_group_name_bound;
 mod rule_groups_namespace_lifecycle;
 #[path = "all/rule_groups_namespace_listing.rs"]
 mod rule_groups_namespace_listing;
+#[path = "all/rule_groups_namespace_listing_scope.rs"]
+mod rule_groups_namespace_listing_scope;
 #[path = "all/rule_groups_namespace_update.rs"]
 mod rule_groups_namespace_update;
 #[path = "all/scraper_listing.rs"]
