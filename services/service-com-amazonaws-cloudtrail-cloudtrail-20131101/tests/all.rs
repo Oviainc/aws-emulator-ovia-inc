@@ -23,6 +23,8 @@ mod dashboard_enumeration;
 mod dashboard_lifecycle;
 #[path = "all/dashboard_refresh.rs"]
 mod dashboard_refresh;
+#[path = "all/dashboard_updates.rs"]
+mod dashboard_updates;
 #[path = "all/disable_federation.rs"]
 mod disable_federation;
 #[path = "all/emulator.rs"]

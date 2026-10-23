@@ -20,6 +20,8 @@
 //! * a refresh schedule's frequency is one the model publishes (1, 6, 12 or 24
 //!   HOURS, or 1 DAYS) and its time of day is a UTC `HH:MM` defaulting to `00:00`;
 //! * a custom dashboard carries at most ten widgets;
+//! * a widget's `QueryStatement` is a query CloudTrail Lake can run — one SQL `SELECT`
+//!   — and one that is not is `InvalidQueryStatementException`;
 //! * a dashboard name is taken once per Region: a second create is a conflict, never
 //!   an overwrite, and a name in another Region is a different dashboard;
 //! * a tag set carries no duplicate key and no more than the documented limit;
@@ -456,6 +458,58 @@ async fn a_custom_dashboard_is_bounded_by_the_published_widget_limit() {
     }
 }
 
+/// RULE: a widget's `QueryStatement` has to be a query CloudTrail Lake can run — one
+/// SQL `SELECT` — and a create carrying one that is not is refused with
+/// `InvalidQueryStatementException` and persists no dashboard.
+///
+/// The same rule `UpdateDashboard` applies, exercised over the statement forms in
+/// `tests/all/dashboard_updates.rs`; the rows here are the create path's own, one
+/// runnable and one of each way a statement fails to be one query.
+#[tokio::test]
+async fn a_create_whose_widget_query_cannot_run_is_refused() {
+    let emulator = Emulator::new();
+    let querying = |statement: &str| -> Value {
+        json!({"QueryStatement": statement, "ViewProperties": {"type": "table"}})
+    };
+
+    // A runnable query, naming its event data store by the id form the modelled
+    // `UUID` shape pins, is stored as written.
+    let statement = "SELECT eventName FROM a7e5ba1c-9a2f-4c3b-8d6e-1f2a3b4c5d6e \
+                     WHERE eventTime > $StartTime$";
+    let created = emulator
+        .create("queried-dashboard", json!({"Widgets": [querying(statement)]}))
+        .await;
+    assert_eq!(
+        created.expect_ok("a runnable query")["Widgets"][0]["QueryStatement"],
+        json!(statement),
+        "case a runnable query: the statement must be stored as written, got {created:?}"
+    );
+
+    let unrunnable = [
+        ("prose, not SQL", "show me every console login"),
+        ("a statement cut off after FROM", "SELECT eventName FROM"),
+        ("two statements, not one", "SELECT 1; SELECT 2"),
+        ("a DDL statement, not a query", "DROP TABLE eds"),
+    ];
+    for (index, (case, statement)) in unrunnable.into_iter().enumerate() {
+        let name = format!("unrunnable-{index}");
+        let refused = emulator
+            .create(&name, json!({"Widgets": [querying(statement)]}))
+            .await;
+        refused.expect_error(case, 400, "InvalidQueryStatementException");
+        assert_eq!(
+            refused.body["Message"],
+            json!("Query is not valid."),
+            "case {case:?}: wrong refusal message, got {refused:?}"
+        );
+        emulator.get(&name).await.expect_error(
+            &format!("{case}: nothing may be persisted by a refusal"),
+            400,
+            "ResourceNotFoundException",
+        );
+    }
+}
+
 /// RULE: a dashboard name is taken once per Region — a second create is a conflict and
 /// leaves the stored dashboard alone — and the same name in another Region is a
 /// different dashboard.
@@ -475,7 +529,12 @@ async fn a_name_already_taken_is_a_conflict_not_an_overwrite() {
             json!({"Widgets": [widget(7), widget(8)], "TerminationProtectionEnabled": true}),
         )
         .await;
-    again.expect_error("the second create", 409, "ConflictException");
+    again.expect_error("the second create", 400, "ConflictException");
+    assert_eq!(
+        again.body["Message"],
+        json!("Dashboard with the provided name already exists."),
+        "case the second create: wrong conflict message, got {again:?}"
+    );
     let stored = emulator.get(name).await;
     let stored = stored.expect_ok("the dashboard after the conflict").clone();
     assert_eq!(

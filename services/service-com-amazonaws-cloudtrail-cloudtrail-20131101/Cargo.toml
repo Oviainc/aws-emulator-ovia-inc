@@ -29,6 +29,9 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# `sqlparser`: the SQL parse a dashboard widget's `QueryStatement` is READ with, so a
+# query CloudTrail Lake cannot run is refused by its syntax rather than by matching text.
+sqlparser = "0.59"
 tracing = { workspace = true }
 # Hex-codes the opaque `ListChannels` pagination token (`src/ops/list_channels.rs`).
 hex = { workspace = true }

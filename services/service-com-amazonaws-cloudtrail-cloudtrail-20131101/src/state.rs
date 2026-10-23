@@ -1484,6 +1484,12 @@ pub const MISSING_TRAIL_CONFIGURATION_MESSAGE: &str =
 /// target reading `src/service.rs` applies.
 pub mod channels;
 
+/// How a dashboard widget's `QueryStatement` is read, how many widgets one request may
+/// carry, and the sentence a statement CloudTrail Lake cannot run is refused with. In
+/// its own module beside the registry it guards, for the same reason [`channels`] is:
+/// both dashboard operations apply it.
+pub mod widget_query;
+
 /// Per-service state for com-amazonaws-cloudtrail-cloudtrail-20131101. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudtrailCloudtrail20131101State {
@@ -1800,7 +1806,8 @@ pub const DASHBOARD_STATUS_CREATING: &str = "CREATING";
 pub const DASHBOARD_STATUS_CREATED: &str = "CREATED";
 
 /// From the `CreateDashboard` model doc: "You can add up to 10 widgets to a custom
-/// dashboard."
+/// dashboard." The check both dashboard writers apply is
+/// [`widget_query::widgets_beyond_dashboard_limit_message`].
 pub const CUSTOM_DASHBOARD_WIDGET_LIMIT: usize = 10;
 
 /// How many dashboards the registry holds before `CreateDashboard` refuses with the
