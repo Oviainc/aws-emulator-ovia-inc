@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAdConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAdConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAdConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read over the persisted ad configurations, in one stable order (ARN), cut
+//! into pages of at most `maxResults`. The `nextToken` it issues names the last ARN
+//! of the page, so the following page is everything ordered strictly after it.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAdConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAdConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAdConfigurations"))
+        // Reporting only: this operation is modelled `@readonly` and "gets summary
+        // information about all ad configurations in your account", so it reads the
+        // store and writes nothing.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                ListAdConfigurationsErrorModeled::InternalServerException,
+            )
+        })?;
+
+        // The resume point the caller's token names. A token this service did not
+        // issue for THIS list is a bad request, not an empty page.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::AD_CONFIGURATION_PAGE, token)
+                    .ok_or_else(|| {
+                        crate::state::validation(
+                            ListAdConfigurationsErrorModeled::ValidationException,
+                            UNISSUED_PAGE_TOKEN.to_string(),
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        // `MaxAdConfigurationResults` is modelled `range(1..100)`, so the framework
+        // has already refused anything outside it; an absent value means the whole
+        // page, which the operation documents as "your service quota or 100,
+        // whichever is smaller".
+        let page_size = crate::state::page_size(input.max_results, MAX_AD_CONFIGURATION_RESULTS);
+
+        let store = state.lock();
+        let (window, next_token) = crate::state::page(
+            crate::state::AD_CONFIGURATION_PAGE,
+            store.ad_configurations.iter(),
+            after.as_deref(),
+            page_size,
+        );
+
+        Ok(ListAdConfigurationsOutput {
+            ad_configurations: window.into_iter().map(summary).collect(),
+            next_token,
+        })
+    }
+}
+
+/// The `maxResults` ceiling the model declares for this operation
+/// (`MaxAdConfigurationResults`, `range(min: 1, max: 100)`), and so also the page
+/// size an absent `maxResults` means.
+const MAX_AD_CONFIGURATION_RESULTS: i32 = 100;
+
+/// What this operation says about a `nextToken` it did not issue: a bad request, which
+/// is a different answer from a page that happens to be empty.
+const UNISSUED_PAGE_TOKEN: &str = "nextToken is not a pagination token this service issued";
+
+/// The `AdConfigurationSummary` projection of a persisted ad configuration: every
+/// member `AdConfigurationSummary` declares, read off the stored resource. The
+/// summary and the detail shape declare the same members, so the projection is the
+/// whole resource rather than a subset of it.
+fn summary(ad_configuration: &AdConfiguration) -> AdConfigurationSummary {
+    AdConfigurationSummary {
+        arn: ad_configuration.arn.clone(),
+        name: ad_configuration.name.clone(),
+        media_tailor_playback_configurations: ad_configuration
+            .media_tailor_playback_configurations
+            .clone(),
+        post_roll_configuration: ad_configuration.post_roll_configuration.clone(),
+        tags: ad_configuration.tags.clone(),
     }
 }

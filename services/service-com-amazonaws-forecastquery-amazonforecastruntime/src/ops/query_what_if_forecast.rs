@@ -38,7 +38,10 @@
 //! `what-if-forecast/<whatIfAnalysisName>/<whatIfForecastName>` in the `forecast` ARN
 //! namespace (see [`crate::state::WHAT_IF_FORECAST`]). An ARN that does not identifies no
 //! what-if forecast however the store is filled, so it is answered with the same modelled
-//! `InvalidInputException` (400) as an unreadable one, BEFORE resource resolution;
+//! `InvalidInputException` (400) as an unreadable one, BEFORE resource resolution, and
+//! with the same sentence — `Invalid ARN for <resource type>: <the value supplied>`
+//! ([`crate::state::ResourceKind::invalid_arn_message`]), since the answer says which
+//! resource was expected and not how the value fell short.
 //! `ResourceNotFoundException` (404) stays reserved for an ARN that does name a what-if
 //! forecast and that the store holds nothing under.
 //!
@@ -188,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 InvalidInputException {
                     message: Some(
                         crate::state::WHAT_IF_FORECAST
-                            .rejection_message(&input.what_if_forecast_arn),
+                            .invalid_arn_message(&input.what_if_forecast_arn),
                     ),
                 },
             )

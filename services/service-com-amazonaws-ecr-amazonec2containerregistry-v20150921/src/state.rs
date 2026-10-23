@@ -1645,12 +1645,25 @@ pub fn repository_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("ecr", region, &format!("repository/{name}"))
 }
 
+/// `<registry id>.dkr.ecr.<region>.amazonaws.com` — the host of this registry in `region`,
+/// which every repository URI and the `docker login` endpoint are built on.
+pub fn registry_host(region: &str) -> String {
+    format!("{}.dkr.ecr.{region}.amazonaws.com", registry_id())
+}
+
 /// `<registry id>.dkr.ecr.<region>.amazonaws.com/<name>` — the URI a docker client pushes to.
 pub fn repository_uri(region: &str, name: &str) -> String {
-    format!(
-        "{}.dkr.ecr.{region}.amazonaws.com/{name}",
-        registry_id()
-    )
+    format!("{}/{name}", registry_host(region))
+}
+
+/// `https://<registry id>.dkr.ecr.<region>.amazonaws.com` — the registry URL a
+/// `docker login` is pointed at.
+///
+/// `AuthorizationData$proxyEndpoint` states the format itself: "The registry URL to use
+/// for this authorization token in a `docker login` command. The Amazon ECR registry URL
+/// format is `https://aws_account_id.dkr.ecr.region.amazonaws.com`."
+pub fn registry_proxy_endpoint(region: &str) -> String {
+    format!("https://{}", registry_host(region))
 }
 
 /// Refuse a request that names a registry other than this emulator's: there is exactly
