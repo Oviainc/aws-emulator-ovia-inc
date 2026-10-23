@@ -352,6 +352,19 @@
 //! `TransitGatewayOptions$AssociationDefaultRouteTableId` and
 //! `$PropagationDefaultRouteTableId` report name that record.
 //!
+//! Which attachment propagates its routes into which of those route tables is a resource of
+//! its own too — "Enables the specified attachment to propagate routes to the specified
+//! propagation route table" (`EnableTransitGatewayRouteTablePropagation`) — so
+//! [`ComAmazonawsEc2Amazonec2State::transit_gateway_propagations`] holds one
+//! [`TransitGatewayPropagationRecord`] per (route table, attachment) pair, which is exactly
+//! as many as there can be: a pair either propagates or does not. The record carries the
+//! `TransitGatewayPropagationState` reached so far plus the move the clock owes it
+//! ([`PropagationMove`]) — `enabling` -> `enabled` after an enable, and the REMOVAL of the
+//! record after a disable, since a pair that no longer propagates is not a propagation the
+//! route table has at all. Both fall due on the same monotonic clock and at the same
+//! [`TRANSITION_DELAY`] as every other move this store owes, and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies them.
+//!
 //! ## Capacity Blocks
 //!
 //! [`ComAmazonawsEc2Amazonec2State::capacity_blocks`] holds the account's Capacity Blocks
@@ -459,8 +472,9 @@ use crate::ops::types::{
     TagSpecification,
     TransitGateway, TransitGatewayClientVpnAttachment,
     TransitGatewayMulticastDomainAssociation, TransitGatewayOptions,
-    TransitGatewayPeeringAttachment, TransitGatewayRequestOptions,
+    TransitGatewayPeeringAttachment, TransitGatewayPropagation, TransitGatewayRequestOptions,
     TransitGatewayRouteTable, TransitGatewayRouteTableAnnouncement,
+    TransitGatewayRouteTablePropagation,
     TransitGatewayVpcAttachment,
     UserIdGroupPair, Vpc, VpcBlockPublicAccessExclusion, VpcCidrBlockAssociation,
     VpcCidrBlockState, VpcEndpoint,
@@ -1262,6 +1276,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `CreateTransitGateway` makes (see the module docs). Ordered by id, the stable order
     /// every reader of it reports in.
     pub transit_gateway_route_tables: BTreeMap<String, TransitGatewayRouteTable>,
+    /// Which attachment propagates its routes into which transit gateway route table, by
+    /// (`TransitGatewayRouteTableId`, `TransitGatewayAttachmentId`) — see
+    /// [`TransitGatewayPropagationRecord`] and the module docs. One entry per pair, because
+    /// a pair either propagates or does not; ordered by route table and then by attachment,
+    /// which is the order `GetTransitGatewayRouteTablePropagations` reports and pages over.
+    pub transit_gateway_propagations: BTreeMap<(String, String), TransitGatewayPropagationRecord>,
     /// Every Dedicated Host the account holds, by `HostId`, as the modelled [`Host`]
     /// shape itself — so a member a writer sets round-trips through a describe without a
     /// field-by-field copy that can silently drop one. Ordered by id, which is the order
@@ -1419,6 +1439,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateways: BTreeMap::new(),
             transit_gateway_available_at: BTreeMap::new(),
             transit_gateway_route_tables: BTreeMap::new(),
+            transit_gateway_propagations: BTreeMap::new(),
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
@@ -2619,6 +2640,37 @@ impl ComAmazonawsEc2Amazonec2State {
             {
                 record.byoip_cidr.state = Some(state);
                 record.pending = None;
+            }
+        }
+        // The end of an enable or a disable of one route propagation: the pair either
+        // reaches `enabled`, or stops being a propagation of that route table at all —
+        // `TransitGatewayPropagationState` has no word for a pair that does not propagate,
+        // and a route table whose propagation was disabled simply does not have one any
+        // more. Due at its instant whether or not anybody called, like every other move
+        // above. The removals are collected first, the way the BYOIP block above collects
+        // its due ranges, so each one can give its bytes back to the store's budget.
+        let mut removed: Vec<(String, String)> = Vec::new();
+        for (key, record) in &mut self.transit_gateway_propagations {
+            let Some(due) = record
+                .pending
+                .as_ref()
+                .filter(|pending| now >= pending.due_at)
+                .map(|pending| pending.to)
+            else {
+                continue;
+            };
+            match due {
+                PropagationMove::Removed => removed.push(key.clone()),
+                PropagationMove::Enabled => {
+                    record.state = PROPAGATION_STATE_ENABLED.to_string();
+                    record.pending = None;
+                }
+            }
+        }
+        for key in removed {
+            if self.transit_gateway_propagations.remove(&key).is_some() {
+                // Exactly what the enable charged for the record.
+                self.release_stored_bytes(STORED_RECORD_OVERHEAD_BYTES);
             }
         }
         let connections = &mut self.vpc_endpoint_connections;
@@ -8467,7 +8519,7 @@ impl ComAmazonawsEc2Amazonec2State {
         let associates = options.default_route_table_association.as_deref() == Some(OPTION_ENABLE);
         let propagates = options.default_route_table_propagation.as_deref() == Some(OPTION_ENABLE);
         if associates || propagates {
-            let route_table_id = self.next_id("tgw-rtb");
+            let route_table_id = self.next_id(TRANSIT_GATEWAY_ROUTE_TABLE_ID_PREFIX);
             self.transit_gateway_route_tables.insert(
                 route_table_id.clone(),
                 TransitGatewayRouteTable {
@@ -8952,6 +9004,346 @@ pub fn transit_gateway_limit_exceeded<E>() -> Scaffolded<E> {
             "The maximum number of transit gateways has been reached ({MAX_TRANSIT_GATEWAYS})"
         ),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Transit gateway route tables, and the route propagations into them
+// ---------------------------------------------------------------------------
+
+/// The id prefix every transit gateway route table is minted with, the one
+/// [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway`] gives the default route table
+/// it creates.
+///
+/// A route table ANNOUNCEMENT id extends this prefix
+/// ([`TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT_ID_PREFIX`]), so the prefix alone cannot
+/// separate the two kinds; it is the hex suffix [`prefixed_id_is_well_formed`] requires that
+/// does, exactly as [`vpc_endpoint_id_is_well_formed`] separates the three `vpce-` kinds.
+pub const TRANSIT_GATEWAY_ROUTE_TABLE_ID_PREFIX: &str = "tgw-rtb";
+
+/// `InvalidRouteTableID.NotFound` (HTTP 400): the request named a route table id this
+/// account holds no transit gateway route table for. EC2 answers the route table's own code
+/// here rather than a transit-gateway-specific one.
+pub const INVALID_ROUTE_TABLE_ID_NOT_FOUND: &str = "InvalidRouteTableID.NotFound";
+
+/// `InvalidRouteTableId.Malformed` (HTTP 400): the request named something that is not a
+/// transit gateway route table id at all, so there is nothing to look up.
+pub const INVALID_ROUTE_TABLE_ID_MALFORMED: &str = "InvalidRouteTableId.Malformed";
+
+/// Refuse a request that named a transit gateway route table id no route table of the
+/// account has: HTTP 400 [`INVALID_ROUTE_TABLE_ID_NOT_FOUND`].
+///
+/// Worded like [`invalid_transit_gateway_id_not_found`], the refusal the gateway itself
+/// answers, so one family of resources reads one way.
+pub fn invalid_transit_gateway_route_table_id_not_found<E>(route_table_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ROUTE_TABLE_ID_NOT_FOUND,
+        400,
+        format!("Transit Gateway Route Table {route_table_id} was deleted or does not exist."),
+    )
+}
+
+/// A propagation whose enable is being carried out: the `TransitGatewayPropagationState`
+/// enum's `enabling` member ([`crate::ops::types::TRANSIT_GATEWAY_PROPAGATION_STATE_VALUES`]).
+pub const PROPAGATION_STATE_ENABLING: &str = "enabling";
+
+/// A propagation in force: that enum's `enabled` member.
+pub const PROPAGATION_STATE_ENABLED: &str = "enabled";
+
+/// A propagation whose disable is being carried out: that enum's `disabling` member.
+pub const PROPAGATION_STATE_DISABLING: &str = "disabling";
+
+/// What the clock owes one stored route propagation next.
+///
+/// The `disabled` member of `TransitGatewayPropagationState` is deliberately not a move:
+/// once the disable has been carried out the pair does not propagate at all, which is not a
+/// propagation of that route table — the same reading as [`FastLaunchMove::Discontinued`],
+/// where the state catalog has no word for "not configured" either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropagationMove {
+    /// `enabling` -> `enabled`: the attachment's routes are in the table.
+    Enabled,
+    /// `disabling` -> reported no longer: the propagation is gone.
+    Removed,
+}
+
+/// The move the clock owes one route propagation: a [`ClockTransition`] to the next
+/// [`PropagationMove`].
+pub type PropagationTransition = ClockTransition<PropagationMove>;
+
+/// One attachment's propagation of routes into one transit gateway route table.
+///
+/// Flattened rather than holding a modelled shape, because the two shapes that report a
+/// propagation carry different member sets — `TransitGatewayPropagation` names the route
+/// table, `TransitGatewayRouteTablePropagation` does not, being reported under it — so
+/// [`Self::view`] and [`Self::route_table_view`] build each from the one stored record and
+/// the two reports cannot disagree.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayPropagationRecord {
+    /// The propagation route table the routes go into.
+    pub transit_gateway_route_table_id: String,
+    /// The attachment whose routes propagate.
+    pub transit_gateway_attachment_id: String,
+    /// The resource that attachment attaches, which a report of the propagation names as
+    /// its `ResourceId`; absent for an attachment that carries no resource id.
+    pub resource_id: Option<String>,
+    /// That resource's `TransitGatewayAttachmentResourceType`.
+    pub resource_type: String,
+    /// The route table announcement the propagation was asked for through, when it was.
+    pub transit_gateway_route_table_announcement_id: Option<String>,
+    /// The propagation's state, a member of `TransitGatewayPropagationState`.
+    pub state: String,
+    /// The move the clock owes this propagation, while one is owed.
+    pub pending: Option<PropagationTransition>,
+}
+
+impl TransitGatewayPropagationRecord {
+    /// The propagation as `EnableTransitGatewayRouteTablePropagation` and
+    /// `DisableTransitGatewayRouteTablePropagation` answer with it.
+    pub fn view(&self) -> TransitGatewayPropagation {
+        TransitGatewayPropagation {
+            transit_gateway_attachment_id: Some(self.transit_gateway_attachment_id.clone()),
+            resource_id: self.resource_id.clone(),
+            resource_type: Some(self.resource_type.clone()),
+            transit_gateway_route_table_id: Some(self.transit_gateway_route_table_id.clone()),
+            state: Some(self.state.clone()),
+            transit_gateway_route_table_announcement_id: self
+                .transit_gateway_route_table_announcement_id
+                .clone(),
+        }
+    }
+
+    /// The propagation as `GetTransitGatewayRouteTablePropagations` reports it: the same
+    /// record without the route table id, which that request named.
+    pub fn route_table_view(&self) -> TransitGatewayRouteTablePropagation {
+        TransitGatewayRouteTablePropagation {
+            transit_gateway_attachment_id: Some(self.transit_gateway_attachment_id.clone()),
+            resource_id: self.resource_id.clone(),
+            resource_type: Some(self.resource_type.clone()),
+            state: Some(self.state.clone()),
+            transit_gateway_route_table_announcement_id: self
+                .transit_gateway_route_table_announcement_id
+                .clone(),
+        }
+    }
+
+    /// Put the propagation into `transient` now and owe it `to` [`TRANSITION_DELAY`] later.
+    ///
+    /// The span is never zero, so a caller acting straight after the enabling or disabling
+    /// call still sees the transient state and the refusals that go with it.
+    pub fn begin_move(&mut self, transient: &str, to: PropagationMove) {
+        self.state = transient.to_string();
+        self.pending = Some(PropagationTransition::starting_now(to));
+    }
+}
+
+/// What a propagation request asks of one (route table, attachment) pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropagationDecision {
+    /// "Enables the specified attachment to propagate routes to the specified propagation
+    /// route table" (`EnableTransitGatewayRouteTablePropagation`).
+    Enable,
+    /// "Disables the specified resource attachment from propagating routes to the specified
+    /// propagation route table" (`DisableTransitGatewayRouteTablePropagation`).
+    Disable,
+}
+
+/// The attachment, the route table announcement and the propagation route table one
+/// propagation request names: the members
+/// `Enable`/`DisableTransitGatewayRouteTablePropagationRequest` share.
+#[derive(Debug, Clone, Copy)]
+pub struct PropagationRequest<'a> {
+    /// "The ID of the propagation route table" (`$TransitGatewayRouteTableId`), the one
+    /// required member.
+    pub route_table_id: &'a str,
+    /// "The ID of the attachment" (`$TransitGatewayAttachmentId`), when the request names
+    /// one.
+    pub attachment_id: Option<&'a str>,
+    /// "The ID of the route table announcement" (`$TransitGatewayRouteTableAnnouncementId`),
+    /// when the request names one.
+    pub announcement_id: Option<&'a str>,
+}
+
+/// Act on the route propagation `request` names, and answer it as it now stands.
+///
+/// The ONE place the rule the enabling and the disabling operation share is written, so
+/// they cannot disagree about one pair:
+///
+/// * the propagation route table must be one the account holds, or there is nothing to
+///   propagate into ([`invalid_transit_gateway_route_table_id_not_found`]);
+/// * the attachment whose routes propagate is the one the request names, or — for a request
+///   that names a route table announcement instead — the peering attachment that
+///   announcement was made for, and a request that names neither has not said what to
+///   propagate;
+/// * that attachment must be one the account holds
+///   ([`INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND`]);
+/// * an enable needs a pair that does not propagate yet and a disable needs one that does,
+///   so the other way round each is refused with `IncorrectState` and NOTHING is written;
+/// * the pair then moves into the TRANSIENT state of the move asked for, with the clock
+///   owing it the end of it ([`PropagationMove`]).
+///
+/// The CALLER refuses a malformed id first, before its own `DryRun` arm, so nothing here
+/// depends on the request's form.
+pub fn decide_transit_gateway_route_table_propagation<E>(
+    store: &mut ComAmazonawsEc2Amazonec2State,
+    request: PropagationRequest<'_>,
+    decision: PropagationDecision,
+) -> Result<TransitGatewayPropagation, Scaffolded<E>> {
+    // The clock first: a propagation whose move has fallen due is already enabled, or gone,
+    // so whether this call is admissible is asked of the state the pair is ACTUALLY in
+    // rather than of the one it was left in.
+    store.materialize_due_transitions();
+    let route_table_id = request.route_table_id;
+    if !store
+        .transit_gateway_route_tables
+        .contains_key(route_table_id)
+    {
+        return Err(invalid_transit_gateway_route_table_id_not_found(
+            route_table_id,
+        ));
+    }
+
+    // "The ID of the route table announcement": an announcement is a propagation of the
+    // peering attachment it was made for, so the announcement names the attachment when the
+    // request does not — and when the request names both they must be the same attachment,
+    // rather than one silently winning over the other.
+    let announced: Option<String> = match request.announcement_id {
+        None => None,
+        Some(announcement_id) => store
+            .transit_gateway_route_table_announcements
+            .get(announcement_id)
+            .ok_or_else(|| {
+                id_not_found(
+                    INVALID_TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT_ID_NOT_FOUND,
+                    "transit gateway route table announcement ID",
+                    announcement_id,
+                )
+            })?
+            .view
+            .peering_attachment_id
+            .clone(),
+    };
+    let attachment_id = match (request.attachment_id, announced.as_deref()) {
+        (Some(named), Some(announced)) if named != announced => {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "The attachment '{named}' is not the attachment the route table \
+                 announcement was made for ('{announced}')"
+            )))
+        }
+        (Some(named), _) => named.to_string(),
+        (None, Some(announced)) => announced.to_string(),
+        (None, None) => {
+            return Err(Scaffolded::missing_parameter(
+                "The request must name the attachment whose routes propagate, either as \
+                 transitGatewayAttachmentId or through a route table announcement",
+            ))
+        }
+    };
+
+    let attachment = store
+        .transit_gateway_attachments
+        .get(&attachment_id)
+        .ok_or_else(|| {
+            id_not_found(
+                INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
+                "transit gateway attachment ID",
+                &attachment_id,
+            )
+        })?;
+    let resource_id = attachment.view.resource_id().map(str::to_string);
+    let resource_type = attachment.view.resource_type();
+    let key = (route_table_id.to_string(), attachment_id.clone());
+
+    match decision {
+        PropagationDecision::Enable => {
+            // A pair that already propagates, or is still finishing a disable, has no
+            // enable to perform: the request is refused and nothing is written, which is
+            // how the first call's write is observable to a later one.
+            if let Some(existing) = store.transit_gateway_propagations.get(&key) {
+                return Err(incorrect_state(format!(
+                    "The attachment '{attachment_id}' already propagates routes to the \
+                     transit gateway route table '{route_table_id}' in state '{state}'",
+                    state = existing.state,
+                )));
+            }
+            if !store.has_transit_gateway_propagation_capacity() {
+                return Err(resource_limit_exceeded(format!(
+                    "This emulator holds {} route propagations, which is as many as it \
+                     stores",
+                    store.transit_gateway_propagations.len()
+                )));
+            }
+            if store.would_exceed_stored_bytes(STORED_RECORD_OVERHEAD_BYTES) {
+                return Err(resource_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot store another route propagation",
+                    store.stored_bytes()
+                )));
+            }
+            let record = TransitGatewayPropagationRecord {
+                transit_gateway_route_table_id: route_table_id.to_string(),
+                transit_gateway_attachment_id: attachment_id,
+                resource_id,
+                resource_type: resource_type.to_string(),
+                transit_gateway_route_table_announcement_id: request
+                    .announcement_id
+                    .map(str::to_string),
+                // The TRANSIENT state of an enable, with the clock owing it `enabled`: the
+                // span is never zero, so a caller acting straight after this call still
+                // sees the pair enabling.
+                state: PROPAGATION_STATE_ENABLING.to_string(),
+                pending: Some(PropagationTransition::starting_now(
+                    PropagationMove::Enabled,
+                )),
+            };
+            let view = record.view();
+            store.add_stored_bytes(STORED_RECORD_OVERHEAD_BYTES);
+            store.transit_gateway_propagations.insert(key, record);
+            Ok(view)
+        }
+        PropagationDecision::Disable => {
+            let record = store
+                .transit_gateway_propagations
+                .get_mut(&key)
+                .filter(|record| record.state != PROPAGATION_STATE_DISABLING)
+                .ok_or_else(|| {
+                    incorrect_state(format!(
+                        "The attachment '{attachment_id}' does not propagate routes to the \
+                         transit gateway route table '{route_table_id}'"
+                    ))
+                })?;
+            record.begin_move(PROPAGATION_STATE_DISABLING, PropagationMove::Removed);
+            Ok(record.view())
+        }
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another route propagation fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`].
+    pub fn has_transit_gateway_propagation_capacity(&self) -> bool {
+        self.transit_gateway_propagations.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// The route propagations of one transit gateway route table, in attachment-id order —
+    /// the stable order `GetTransitGatewayRouteTablePropagations` reports and pages over.
+    ///
+    /// The store is keyed by (route table, attachment), so this is a RANGE over the keys of
+    /// one route table rather than a scan of every propagation stored: the cost is
+    /// proportional to the propagations of the table asked about.
+    ///
+    /// A read, so it writes nothing: the caller applies the clock-owed moves
+    /// ([`Self::materialize_due_transitions`]) before asking, exactly as every describe of
+    /// this module does.
+    pub fn transit_gateway_route_table_propagations<'a>(
+        &'a self,
+        route_table_id: &'a str,
+    ) -> impl Iterator<Item = &'a TransitGatewayPropagationRecord> {
+        self.transit_gateway_propagations
+            .range((route_table_id.to_string(), String::new())..)
+            .take_while(move |((table, _), _)| table == route_table_id)
+            .map(|(_, record)| record)
+    }
 }
 
 // ---------------------------------------------------------------------------
