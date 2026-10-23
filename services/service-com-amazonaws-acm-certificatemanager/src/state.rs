@@ -21,6 +21,12 @@
 //! records through [`acme_account_summary`], and deleting an endpoint drops the
 //! accounts registered with it ([`ComAmazonawsAcmCertificatemanagerState::remove_acme_endpoint`]).
 //!
+//! Every URL those two records carry is minted here, on the Region's ACME enrollment
+//! host ([`ACME_ENROLLMENT_HOST_LABEL`]) with the endpoint's own id in the path
+//! ([`acme_endpoint_url`], [`acme_account_url`]) — and read back by
+//! [`parse_acme_request_path`] and [`acme_enrollment_region`], so the ACME HTTP surface
+//! `crate::service::acme_http` serves resolves a published URL to the record behind it.
+//!
 //! Beside the certificates sits the account-level singleton
 //! [`AccountConfiguration`]: `PutAccountConfiguration` writes it and
 //! `GetAccountConfiguration` reports it, so that round trip reads one record too.
@@ -840,6 +846,19 @@ impl ComAmazonawsAcmCertificatemanagerState {
         }
     }
 
+    /// The stored ACME endpoint the id `endpoint_id` names in `region`, or `None` when
+    /// this account holds no such endpoint there.
+    ///
+    /// How a request to an endpoint's published ACME URL
+    /// ([`acme_endpoint_url`]) resolves to the record behind it: the Region comes off
+    /// the enrollment host the request addressed and the id off its path, and together
+    /// they are the ARN this map is keyed by — so one Region's enrollment host serves
+    /// only that Region's endpoints.
+    pub fn acme_endpoint_in(&self, region: &str, endpoint_id: &str) -> Option<&AcmeEndpointRecord> {
+        self.acme_endpoints
+            .get(&acme_endpoint_arn(region, endpoint_id))
+    }
+
     /// The tag map of the non-certificate ACM resource `arn` names, or `None` when
     /// this account holds no such resource.
     ///
@@ -942,30 +961,174 @@ pub fn acme_endpoint_arn(region: &str, endpoint_id: &str) -> String {
     )
 }
 
+/// The leading label of the host ACM serves its managed ACME endpoints on.
+///
+/// ACM publishes ONE enrollment host per Region and gives every endpoint in that
+/// Region a URL on it: the recorded behaviour grades `AcmeEndpoint$EndpointUrl` as
+/// being on `acm-acme-enroll.<region>.<dns suffix>`. The endpoint's own id therefore
+/// identifies it in the PATH ([`acme_endpoint_base_url`]) and never as a DNS label —
+/// an ACME client is configured with this URL as its ACME server, so a host of a form
+/// the service does not publish is one the client's TLS/SNI, and any host-based
+/// routing or allow-list built around the enrollment host, cannot match.
+pub const ACME_ENROLLMENT_HOST_LABEL: &str = "acm-acme-enroll";
+
+/// The DNS suffix of the AWS endpoint hosts this emulator publishes.
+pub const AWS_DNS_SUFFIX: &str = "amazonaws.com";
+
+/// The path prefix every ACME resource of every endpoint sits under, so one
+/// enrollment host serves every endpoint in its Region and a path that is not an ACME
+/// resource path is told apart from one that is.
+pub const ACME_PATH_PREFIX: &str = "/acme/";
+
+/// The ACME `directory` resource: the single URL an ACME client is configured with and
+/// starts from, which answers the resource map (RFC 8555 §7.1.1).
+pub const ACME_DIRECTORY_RESOURCE: &str = "directory";
+
+/// The ACME `newNonce` resource: it answers a fresh anti-replay nonce in a
+/// `Replay-Nonce` header (RFC 8555 §7.2).
+pub const ACME_NEW_NONCE_RESOURCE: &str = "new-nonce";
+
+/// The ACME `newAccount` resource, where a client registers an account (RFC 8555 §7.3).
+pub const ACME_NEW_ACCOUNT_RESOURCE: &str = "new-account";
+
+/// The ACME `newOrder` resource, where a client asks for a certificate (RFC 8555 §7.4).
+pub const ACME_NEW_ORDER_RESOURCE: &str = "new-order";
+
+/// The ACME `revokeCert` resource (RFC 8555 §7.6).
+pub const ACME_REVOKE_CERTIFICATE_RESOURCE: &str = "revoke-cert";
+
+/// The ACME `keyChange` resource, where an account rolls its key over (RFC 8555 §7.3.5).
+pub const ACME_KEY_CHANGE_RESOURCE: &str = "key-change";
+
+/// The resource-type segment of an ACME account's own URL ([`acme_account_url`]).
+pub const ACME_ACCOUNT_RESOURCE: &str = "acct";
+
+/// `acm-acme-enroll.<region>.amazonaws.com`, the host ACM serves the Region's ACME
+/// endpoints on ([`ACME_ENROLLMENT_HOST_LABEL`]).
+pub fn acme_enrollment_host(region: &str) -> String {
+    format!("{ACME_ENROLLMENT_HOST_LABEL}.{region}.{AWS_DNS_SUFFIX}")
+}
+
+/// The Region whose ACME enrollment host `host` is, or `None` for any other host.
+///
+/// The inverse of [`acme_enrollment_host`], so the host this service PUBLISHES is the
+/// host it recognises: the first label must be [`ACME_ENROLLMENT_HOST_LABEL`], the
+/// second is the Region, and at least one further non-empty label must follow it (the
+/// DNS suffix). The Region is held to the character set `AcmeEndpointArn`'s own
+/// `@pattern` allows for it (`[a-z0-9-]+`), because it is then the Region half of the
+/// ARN the request's endpoint record is looked up by.
+///
+/// Any userinfo and port are removed first, as they are part of the authority rather
+/// than of the host name.
+pub fn acme_enrollment_region(host: &str) -> Option<&str> {
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    let mut labels = host.split('.');
+    if labels.next() != Some(ACME_ENROLLMENT_HOST_LABEL) {
+        return None;
+    }
+    let region = labels.next()?;
+    let suffix: Vec<&str> = labels.collect();
+    if suffix.is_empty() || suffix.iter().any(|label| label.is_empty()) {
+        return None;
+    }
+    is_acme_region(region).then_some(region)
+}
+
+/// Whether `region` is a Region name an ACM ARN may carry
+/// (`AcmeEndpointArn`'s `@pattern` spells the Region field `[a-z0-9-]+`).
+fn is_acme_region(region: &str) -> bool {
+    !region.is_empty()
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Whether `endpoint_id` is an endpoint id an ACM ACME endpoint ARN may carry
+/// (`AcmeEndpointArn`'s `@pattern` spells the id `[a-zA-Z0-9-]+`).
+pub fn is_acme_endpoint_id(endpoint_id: &str) -> bool {
+    !endpoint_id.is_empty()
+        && endpoint_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// The base URL of one endpoint's ACME surface:
+/// `https://acm-acme-enroll.<region>.amazonaws.com/acme/<endpoint_id>`.
+///
+/// Every ACME resource of that endpoint hangs off it, which is why the endpoint's own
+/// id sits here — in the path on the Region's one enrollment host — rather than in the
+/// host name.
+pub fn acme_endpoint_base_url(region: &str, endpoint_id: &str) -> String {
+    format!(
+        "https://{}{ACME_PATH_PREFIX}{endpoint_id}",
+        acme_enrollment_host(region)
+    )
+}
+
+/// The URL of one ACME resource of one endpoint: its base URL
+/// ([`acme_endpoint_base_url`]) and the resource beneath it.
+pub fn acme_resource_url(region: &str, endpoint_id: &str, resource: &str) -> String {
+    format!("{}/{resource}", acme_endpoint_base_url(region, endpoint_id))
+}
+
 /// The ACME directory URL an endpoint serves on.
 ///
 /// `AcmeEndpoint$EndpointUrl` is documented only as "The URL of the ACME endpoint",
-/// and `CreateAcmeEndpoint` models no member a caller could propose one with, so what
-/// matters is the invariant rather than AWS's exact host: the URL is SERVER-MANAGED
-/// and derived from the endpoint's own id and Region, so it is unique per endpoint,
-/// identical on every later read, and carries nothing the caller sent. It ends at the
-/// `directory` resource, the single URL an ACME client is given and starts from
-/// (RFC 8555 §7.1.1).
+/// and neither `CreateAcmeEndpoint` nor `UpdateAcmeEndpoint` models a member a caller
+/// could propose one with, so the URL is SERVER-MANAGED: it is derived from the
+/// endpoint's own id and Region, is unique per endpoint, is identical on every later
+/// read, and carries nothing the caller sent. It is minted on the Region's ACME
+/// enrollment host ([`ACME_ENROLLMENT_HOST_LABEL`]) and ends at the `directory`
+/// resource, the single URL an ACME client is given and starts from (RFC 8555 §7.1.1)
+/// — which is the URL this service SERVES (`crate::service::acme_http`).
 pub fn acme_endpoint_url(region: &str, endpoint_id: &str) -> String {
-    format!("https://{endpoint_id}.acme.{region}.amazonaws.com/directory")
+    acme_resource_url(region, endpoint_id, ACME_DIRECTORY_RESOURCE)
 }
 
 /// The URL of the ACME account resource an endpoint assigned a registration.
 ///
 /// `AcmeAccount$AccountUrl` is documented only as "The URL of the ACME account", and
 /// nothing in this service's model lets a caller propose one, so what matters is the
-/// invariant: the URL is SERVER-ASSIGNED, sits under the same host as the endpoint's
-/// own directory URL ([`acme_endpoint_url`]), and is unique per account. It names the
-/// `account` resource an ACME server hands back in the `Location` header of a
-/// successful `newAccount` (RFC 8555 §7.3), which the client then uses as its account
-/// URL.
+/// invariant: the URL is SERVER-ASSIGNED, sits under the same endpoint base URL as the
+/// endpoint's own directory URL ([`acme_endpoint_url`]), and is unique per account. It
+/// names the `account` resource an ACME server hands back in the `Location` header of
+/// a successful `newAccount` (RFC 8555 §7.3), which the client then uses as its
+/// account URL.
 pub fn acme_account_url(region: &str, endpoint_id: &str, account_id: &str) -> String {
-    format!("https://{endpoint_id}.acme.{region}.amazonaws.com/acct/{account_id}")
+    acme_resource_url(
+        region,
+        endpoint_id,
+        &format!("{ACME_ACCOUNT_RESOURCE}/{account_id}"),
+    )
+}
+
+/// What a request path on an ACME enrollment host names: the endpoint it addresses,
+/// and the resource of that endpoint beneath it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcmeRequestPath {
+    /// The endpoint id in the path, which is the id half of the endpoint's ARN.
+    pub endpoint_id: String,
+    /// Everything after the endpoint id: `directory`, `new-nonce`, `acct/<id>`, …
+    pub resource: String,
+}
+
+/// The endpoint and resource an enrollment-host path names, or `None` when the path is
+/// not one this service publishes.
+///
+/// The inverse of [`acme_resource_url`]: the paths recognised are exactly the paths
+/// minted, so a URL this service hands out is a URL it can resolve back to an endpoint
+/// record.
+pub fn parse_acme_request_path(path: &str) -> Option<AcmeRequestPath> {
+    let rest = path.strip_prefix(ACME_PATH_PREFIX)?;
+    let (endpoint_id, resource) = rest.split_once('/')?;
+    if !is_acme_endpoint_id(endpoint_id) || resource.is_empty() {
+        return None;
+    }
+    Some(AcmeRequestPath {
+        endpoint_id: endpoint_id.to_string(),
+        resource: resource.to_string(),
+    })
 }
 
 /// The `ResourceNotFoundException` message for an ACME endpoint ARN that no stored
