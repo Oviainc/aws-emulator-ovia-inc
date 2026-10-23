@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCustomActionType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCustomActionType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCustomActionType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the custom action type the request names: the `(category, Custom,
+//! provider, version)` `ActionTypeId`, as registered in the Region the call was
+//! signed for, is dropped from this account's action-type store. So a later
+//! `ListActionTypes` no longer reports it, `PollForJobs` for it answers
+//! `ActionTypeNotFoundException`, and the tags it was created with are gone with it.
+//!
+//! Nothing else holds a custom action type: an `ActionTypeDeclaration` (what
+//! `UpdateActionType` stores and `GetActionType` reports) can only ever be stored for
+//! an `AWS`- or `ThirdParty`-owned identity, because `ActionTypeIdentifier$owner` is
+//! `@pattern("AWS|ThirdParty")` — so this operation has no definition to drop.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +165,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCustomActionType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCustomActionTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCustomActionType"))
+        let state = crate::state::require_state(&*self.engine)?;
+
+        // The input names three of the four `ActionTypeId` members; the owner is
+        // always `Custom`, because this operation is "used for custom actions only"
+        // and that is the owner `CreateCustomActionType` registers them under. So an
+        // action type the service provides itself (owner `AWS` or `ThirdParty`) is
+        // not addressable here at all.
+        let key = crate::state::ActionTypeKey {
+            category: input.category,
+            owner: crate::state::ACTION_OWNER_CUSTOM.to_string(),
+            provider: input.provider,
+            version: input.version,
+        };
+        // An action type belongs to the Region its registration was made in, so this
+        // call addresses the registration of the Region IT was signed for — the same
+        // Region a listing reports it in and a definition is stored under.
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        let mut store = state.lock();
+        let held = store
+            .registered_action_type(&key)
+            .is_some_and(|record| record.available_in(&region));
+        if held {
+            store.forget_action_type(&key);
+        }
+        // An identity this account holds no registration of in this Region is
+        // already in the state the call asks for, so it succeeds having changed
+        // nothing: marking a custom action deleted is idempotent, and the operation
+        // models no "not found" error to answer instead (its only failures are
+        // `ConcurrentModificationException` and `ValidationException`).
+        Ok(DeleteCustomActionTypeOutput)
     }
 }
