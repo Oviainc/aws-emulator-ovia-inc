@@ -21,8 +21,11 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. EDITED HERE: a `DELETE /tags/{ResourceArn}` that binds no `tagKeys`
+//!   value — the empty key list `UntagResource` models — is served by `UntagResource`,
+//!   which the framework's required-query-binding rule leaves unmatched (see
+//!   [`UNTAG_RESOURCE_ROUTE`]). Every other request resolves through the generated
+//!   routing table.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -107,6 +110,50 @@ fn is_resource_arn_syntax_violation(violations: &[Violation]) -> bool {
     })
 }
 
+/// The one route of this service whose operation the generated routing table cannot name
+/// when a `@required` `@httpQuery` member is absent, as
+/// `(method, collection segment, operation)`.
+///
+/// `UntagResource` is `DELETE /tags/{ResourceArn}` with `TagKeys` `@required` and bound to
+/// the `tagKeys` query parameter (`smithy_query(query="operation",
+/// operation="UntagResource")`). The framework's REST router rejects a candidate route
+/// whose `@required` query bindings are not on the request — the rule that lets an
+/// S3-class model tell several operations apart on ONE method + URI template by the SHAPE
+/// of the request. This service overloads no route: `GET`, `POST` and `DELETE` on
+/// `/tags/{ResourceArn}` name one operation each, so for `DELETE` the rule only misfires.
+/// A call that binds no `tagKeys` value — which is how a query-bound list spells the empty
+/// list `TagKeyList`'s `@length(min: 0)` admits — then matches NO route and is answered
+/// "unknown operation" (HTTP 501 `NotImplemented`, a status and code the operation does
+/// not model) instead of being served.
+///
+/// It is the only such route in this service: every other operation here either binds no
+/// `@required` member to the query string at all, or (`ListTagsForResource`,
+/// `TagResource`) binds none to it, so no other method+path pair can fail to resolve this
+/// way.
+const UNTAG_RESOURCE_ROUTE: (&str, &str, &str) = ("DELETE", "tags", "UntagResource");
+
+/// Whether `req` is a request to [`UNTAG_RESOURCE_ROUTE`]: the method, and a path whose
+/// segments are `tags` followed by ONE non-empty segment — the single `{ResourceArn}`
+/// label the modelled URI pattern ends in, which an SDK percent-encodes, so the label
+/// itself carries no `/`. Segments are read the way the framework's own matcher reads
+/// them (leading and trailing `/` ignored), or the two would disagree about which
+/// requests the generated table already resolves.
+///
+/// The URI this seam is handed is the whole one the SDK sent, so its path comes from the
+/// shared reader (`service_common::uri_path`) and its segments from the shared
+/// `nth_path_segment`, rather than from a private copy of either.
+fn is_untag_resource_route(req: &aws_smithy_runtime_api::http::Request) -> bool {
+    let (method, collection, _) = UNTAG_RESOURCE_ROUTE;
+    if req.method() != method {
+        return false;
+    }
+    let path = service_common::uri_path(req.uri());
+    let path = path.trim_end_matches('/');
+    service_common::nth_path_segment(path, 0) == Some(collection)
+        && service_common::nth_path_segment(path, 1).is_some_and(|label| !label.is_empty())
+        && service_common::nth_path_segment(path, 2).is_none()
+}
+
 /// The `com-amazonaws-rum-rum` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -145,16 +192,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         }
     }
 
+    /// Serve a request whose method and path name this service's `DELETE
+    /// /tags/{ResourceArn}` route even when the `@required` `tagKeys` query parameter is
+    /// ABSENT — the empty key list `TagKeyList`'s `@length(min: 0)` admits.
+    ///
+    /// Reached only when the protocol can name NO operation at all: the generated table
+    /// resolves every other request exactly as it does for an unedited service, including
+    /// a `DELETE /tags/{ResourceArn}?tagKeys=…` that carries keys. See
+    /// [`UNTAG_RESOURCE_ROUTE`] for why the framework's required-binding rule leaves this
+    /// one route unmatched, and `crate::ops::untag_resource`'s own input reader for how
+    /// the absent member is then read as the empty list.
     fn override_operation(
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        if self.entry.protocol().routing_key(req).is_ok() {
+            return None;
+        }
+        if !is_untag_resource_route(req) {
+            return None;
+        }
+        self.entry.routing_table().get(UNTAG_RESOURCE_ROUTE.2)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

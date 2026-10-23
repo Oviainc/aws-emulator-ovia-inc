@@ -190,6 +190,25 @@ pub(crate) fn tag_map(reported: &Value) -> Value {
     }
 }
 
+/// Percent-encode one URI path segment or query value: every byte outside RFC 3986's
+/// unreserved set is escaped.
+///
+/// A `ResourceArn` is a non-greedy `@httpLabel`, so an SDK encodes it into ONE path
+/// segment — its `:` and `/` included — and a tag key travels the same way in a
+/// `@httpQuery` value (so a `+` in a key is not read as a space). This is the one copy
+/// every suite in this crate uses, including the ones that bring their own router and
+/// `call`.
+pub(crate) fn percent_encoded(raw: &str) -> String {
+    raw.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(byte).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
 /// Create one app monitor, returning the `Id` the call minted.
 pub(crate) async fn create(router: &MultiServiceRouter, case: &str, body: Value) -> String {
     let reply = call(router, "POST", "/appmonitor", Some(body)).await;

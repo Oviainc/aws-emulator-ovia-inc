@@ -330,8 +330,8 @@ async fn the_reported_map_follows_the_stored_one_through_a_removal() {
     .await;
     assert_eq!(
         removed.status,
-        200,
-        "case {case:?}: expected UntagResource to answer 200, got {} {:?}",
+        204,
+        "case {case:?}: expected UntagResource to answer 204 No Content, got {} {:?}",
         removed.status,
         String::from_utf8_lossy(&removed.body)
     );

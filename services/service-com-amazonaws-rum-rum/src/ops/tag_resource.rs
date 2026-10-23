@@ -332,7 +332,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// A successful tag write reports NO CONTENT: HTTP 204, the status the service sends
+    /// for an operation whose modelled output declares no member. See
+    /// [`crate::state::TAGGING_NO_CONTENT_STATUS`] for the evidence and for the sibling
+    /// `UntagResource`, which answers through the same constant.
+    const SUCCESS_STATUS: u16 = crate::state::TAGGING_NO_CONTENT_STATUS;
 
     async fn handle(
         &self,
