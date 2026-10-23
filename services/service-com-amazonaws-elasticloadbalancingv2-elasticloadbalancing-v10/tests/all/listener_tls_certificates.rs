@@ -329,15 +329,19 @@ async fn every_bound_action_dispatches_at_the_models_api_version() {
         ("DescribeLoadBalancers", action("DescribeLoadBalancers"), 200),
         ("DescribeTargetGroups", action("DescribeTargetGroups"), 200),
         ("DescribeListeners", listeners_of, 200),
+        // Two catalogue reads: the account's quotas and the predefined TLS security
+        // policies, both reporting a catalogue the service publishes.
+        (
+            "DescribeAccountLimits",
+            action("DescribeAccountLimits"),
+            200,
+        ),
+        ("DescribeSSLPolicies", action("DescribeSSLPolicies"), 200),
         // Bound and still a scaffold: the 501 `NotImplemented` channel is also a
         // DISPATCHED answer — the request reached the operation — and is what a stub
         // must answer until its own issue implements it. What it must never be is
         // `InvalidAction`, which would tell the caller this API has no such action.
-        (
-            "DescribeAccountLimits",
-            action("DescribeAccountLimits"),
-            501,
-        ),
+        ("DescribeRules", action("DescribeRules"), 501),
     ];
 
     for (case, form, expected_status) in bound {

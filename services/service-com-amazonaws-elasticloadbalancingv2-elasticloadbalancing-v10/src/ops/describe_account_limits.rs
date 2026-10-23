@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAccountLimits
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAccountLimits`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAccountLimits::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this account's Elastic Load Balancing quotas as `Limit{Name, Max}` entries,
+//! paged by `PageSize`/`Marker`. AWS answers this out of per-account quota
+//! configuration rather than out of any resource a store holds, so the catalogue is
+//! [`LIMIT_CATALOGUE`] — and the quotas THIS emulator enforces take their maximum from
+//! the constant that enforces them, so a reported limit cannot drift from the one a
+//! caller actually hits.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +135,233 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAccountLimits` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAccountLimitsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAccountLimits"))
+        // Account quotas are the service's own configuration, not a resource this
+        // store holds, so nothing is read from the engine or the request metadata
+        // here. Both are bound so the signature stays the one every operation in this
+        // crate carries.
+        let _ = (ctx, &self.engine);
+
+        let (page, next_marker) = crate::state::paginate(
+            account_limits(),
+            input.marker.as_deref(),
+            input.page_size,
+        )
+        .map_err(|_| {
+            crate::scaffolded::Scaffolded::validation(
+                "The marker is not valid: it must be a NextMarker from a previous page of this collection",
+            )
+        })?;
+
+        Ok(DescribeAccountLimitsOutput {
+            limits: Some(page),
+            next_marker,
+        })
     }
+}
+
+/// One quota this operation reports: the name Elastic Load Balancing publishes for it,
+/// and its maximum.
+struct LimitEntry {
+    /// The published limit name, which is what a caller matches on.
+    name: &'static str,
+    /// The maximum, when it is a value this emulator does not itself enforce. A quota
+    /// the emulator DOES enforce leaves this `None` and names its constant in
+    /// [`enforced_max`] instead.
+    published_max: Option<u32>,
+}
+
+/// The Elastic Load Balancing quotas this operation reports, in the order a page walks
+/// them (the order of this table, which is stable across calls — pagination resumes by
+/// position).
+///
+/// The NAMES are the ones Elastic Load Balancing publishes for this operation's `Limit`
+/// shape; the MAXIMA are the per-Region defaults from the quota pages this operation's
+/// own model documentation points at — "Quotas for your Application Load Balancers",
+/// "Quotas for your Network Load Balancers", "Quotas for your Gateway Load Balancers"
+/// (`smithy_query(query="doc",shape="DescribeAccountLimits")`). This emulator models
+/// neither Service Quotas nor an account's own adjustments, so a default is what it has
+/// to report.
+///
+/// Some of these quotas are enforced by this emulator itself, and for those the table
+/// carries no number at all: [`enforced_max`] reads the constant in `crate::state` that
+/// the create path refuses past, so the limit reported here is the limit a caller hits.
+const LIMIT_CATALOGUE: &[LimitEntry] = &[
+    LimitEntry {
+        name: "application-load-balancers",
+        published_max: None,
+    },
+    LimitEntry {
+        name: "application-load-balancer-capacity-units",
+        published_max: Some(3_000),
+    },
+    LimitEntry {
+        name: "ca-certificates-per-trust-store",
+        published_max: Some(25),
+    },
+    LimitEntry {
+        name: "ca-certificates-subject-size-per-trust-store",
+        published_max: Some(256),
+    },
+    LimitEntry {
+        name: "certificates-per-application-load-balancer",
+        published_max: Some(25),
+    },
+    LimitEntry {
+        name: "certificates-per-network-load-balancer",
+        published_max: Some(25),
+    },
+    LimitEntry {
+        name: "condition-values-per-alb-rule",
+        published_max: Some(5),
+    },
+    LimitEntry {
+        name: "condition-wildcards-per-alb-rule",
+        published_max: Some(5),
+    },
+    LimitEntry {
+        name: "gateway-load-balancer-capacity-units",
+        published_max: Some(3_000),
+    },
+    LimitEntry {
+        name: "gateway-load-balancers",
+        published_max: None,
+    },
+    LimitEntry {
+        name: "gateway-load-balancers-per-vpc",
+        published_max: Some(100),
+    },
+    LimitEntry {
+        name: "geneve-target-groups",
+        published_max: Some(100),
+    },
+    LimitEntry {
+        name: "listeners-per-application-load-balancer",
+        published_max: None,
+    },
+    LimitEntry {
+        name: "listeners-per-network-load-balancer",
+        published_max: None,
+    },
+    LimitEntry {
+        name: "network-load-balancer-capacity-units",
+        published_max: Some(3_000),
+    },
+    LimitEntry {
+        name: "network-load-balancer-enis-per-vpc",
+        published_max: Some(1_200),
+    },
+    LimitEntry {
+        name: "network-load-balancers",
+        published_max: None,
+    },
+    LimitEntry {
+        name: "revocations-per-trust-store",
+        published_max: Some(5),
+    },
+    LimitEntry {
+        name: "revoked-entries-per-trust-store",
+        published_max: Some(100_000),
+    },
+    LimitEntry {
+        name: "rules-per-application-load-balancer",
+        published_max: Some(100),
+    },
+    LimitEntry {
+        name: "rules-per-network-load-balancer",
+        published_max: Some(100),
+    },
+    LimitEntry {
+        name: "target-groups",
+        published_max: None,
+    },
+    LimitEntry {
+        name: "target-groups-per-action-on-application-load-balancer",
+        published_max: Some(5),
+    },
+    LimitEntry {
+        name: "target-groups-per-action-on-network-load-balancer",
+        published_max: Some(1),
+    },
+    LimitEntry {
+        name: "target-groups-per-application-load-balancer",
+        published_max: Some(100),
+    },
+    LimitEntry {
+        name: "target-groups-per-network-load-balancer",
+        published_max: Some(100),
+    },
+    LimitEntry {
+        name: "target-id-registrations-per-application-load-balancer",
+        published_max: Some(1_000),
+    },
+    LimitEntry {
+        name: "targets-per-application-load-balancer",
+        published_max: Some(1_000),
+    },
+    LimitEntry {
+        name: "targets-per-availability-zone-per-gateway-load-balancer",
+        published_max: Some(300),
+    },
+    LimitEntry {
+        name: "targets-per-availability-zone-per-network-load-balancer",
+        published_max: Some(500),
+    },
+    LimitEntry {
+        name: "targets-per-network-load-balancer",
+        published_max: Some(3_000),
+    },
+    LimitEntry {
+        name: "targets-per-target-group",
+        published_max: None,
+    },
+    LimitEntry {
+        name: "trust-stores",
+        published_max: Some(1_000),
+    },
+];
+
+/// The maximum this emulator ENFORCES for `name`, or `None` when it enforces no bound
+/// of its own for that quota.
+///
+/// Each arm names the constant the matching create path refuses past, so the number a
+/// caller reads here is the number it hits: `crate::state::LOAD_BALANCER_QUOTA`
+/// (`CreateLoadBalancer` -> `TooManyLoadBalancersException`, one store for every load
+/// balancer type, which is why all three type quotas report it),
+/// `crate::state::TARGET_GROUP_QUOTA` (`CreateTargetGroup` ->
+/// `TooManyTargetGroupsException`), `crate::state::LISTENERS_PER_LOAD_BALANCER`
+/// (`CreateListener` -> `TooManyListenersException`, per load balancer whatever its
+/// type) and `crate::state::TARGETS_PER_TARGET_GROUP` (`RegisterTargets` ->
+/// `TooManyTargetsException`).
+fn enforced_max(name: &str) -> Option<usize> {
+    match name {
+        "application-load-balancers" | "network-load-balancers" | "gateway-load-balancers" => {
+            Some(crate::state::LOAD_BALANCER_QUOTA)
+        }
+        "target-groups" => Some(crate::state::TARGET_GROUP_QUOTA),
+        "targets-per-target-group" => Some(crate::state::TARGETS_PER_TARGET_GROUP),
+        "listeners-per-application-load-balancer" | "listeners-per-network-load-balancer" => {
+            Some(crate::state::LISTENERS_PER_LOAD_BALANCER)
+        }
+        _ => None,
+    }
+}
+
+/// [`LIMIT_CATALOGUE`] as the modelled `Limit` list. `Max` is a string in the model, so
+/// every maximum is rendered as its decimal digits.
+fn account_limits() -> Vec<Limit> {
+    LIMIT_CATALOGUE
+        .iter()
+        .map(|entry| Limit {
+            name: Some(entry.name.to_string()),
+            max: Some(match enforced_max(entry.name) {
+                Some(max) => max.to_string(),
+                // A quota the emulator does not enforce reports the published
+                // default; the table holds one for every such name.
+                None => entry
+                    .published_max
+                    .map(|max| max.to_string())
+                    .unwrap_or_default(),
+            }),
+        })
+        .collect()
 }
