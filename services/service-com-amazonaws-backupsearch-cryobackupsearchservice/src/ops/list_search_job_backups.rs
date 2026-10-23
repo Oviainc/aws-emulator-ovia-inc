@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSearchJobBackups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSearchJobBackups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSearchJobBackups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the recovery points one search job covered, read from that job's record
+//! in [`crate::state`]: an identifier that names no search job is the modelled
+//! `ResourceNotFoundException` (404), and a job that exists answers 200 with one page
+//! of its stored backups plus the `NextToken` that resumes after it.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +81,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::SEARCH_JOB_RESOURCE;
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -97,10 +95,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupsearch-cryobackup
 // here — hence the `ListSearchJobBackupsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupsearch#ListSearchJobBackups")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupsearch#ListSearchJobBackups",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListSearchJobBackupsErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    /// Declared on the service, not on this operation: the store this emulator keeps
+    /// its search jobs in could not be reached, which is a server fault.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -152,20 +156,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSearchJobBackups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSearchJobBackupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSearchJobBackups"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSearchJobBackupsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        // The status each covered backup is reported with is part of what a reader
+        // observes, so materialise what the clock already owed before reporting.
+        state.settle(SystemTime::now());
+
+        let job = state.job(&input.search_job_identifier).ok_or_else(|| {
+            ListSearchJobBackupsError::from(
+                ListSearchJobBackupsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        // The one not-found text every job-identifier lookup in this
+                        // service answers with (`crate::state::RESOURCE_NOT_FOUND`), so
+                        // this refusal cannot differ from `GetSearchJob`'s.
+                        message: crate::state::RESOURCE_NOT_FOUND.to_string(),
+                        resource_id: input.search_job_identifier.clone(),
+                        resource_type: SEARCH_JOB_RESOURCE.to_string(),
+                    },
+                ),
+            )
+        })?;
+
+        let context = crate::state::backups_page_context(&input.search_job_identifier);
+        let offset = crate::state::decode_next_token(
+            input.next_token.as_deref(),
+            &context,
+            job.backups.len(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+        let (results, next_token) = crate::state::page(
+            &job.backups,
+            offset,
+            crate::state::page_size(input.max_results),
+            &context,
+        );
+
+        Ok(ListSearchJobBackupsOutput {
+            results,
+            next_token,
+        })
     }
 }

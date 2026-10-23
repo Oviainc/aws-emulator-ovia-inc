@@ -285,6 +285,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             current_search_progress,
             // The matches recorded so far: nothing is in scope, so the scan finds none.
             results: Vec::new(),
+            // Nor does it cover any recovery point: this emulator holds none, so
+            // `ListSearchJobBackups` reports the empty set it actually covered.
+            backups: Vec::new(),
             tags,
             client_token: input.client_token.clone(),
             request_fingerprint: fingerprint,

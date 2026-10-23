@@ -8,16 +8,30 @@
 //! The members it answers with are read back out of that record, so
 //! `GetSearchResultExportJob` reports the same values.
 //!
-//! An export transmits a search job's RESULTS, so it is accepted only while that job is
-//! in one of the statuses export permits
-//! ([`crate::state::EXPORTABLE_SEARCH_JOB_STATES`]): a job still scanning is refused 400
-//! naming the status it is in and the ones export permits. A `SearchJobIdentifier` that
-//! names no job is a `ResourceNotFoundException` (404), and past the store's export-job
-//! cap the call is refused with the modelled `ServiceQuotaExceededException` (402).
-//!
 //! `ClientToken` is idempotent: the same token with the same body answers with the
 //! export job the first call minted, and the same token with a different body is a
 //! `ConflictException` (409).
+//!
+//! ## What this call refuses, and in which class
+//!
+//! In order, because each step needs the one before it to have held:
+//!
+//! 1. a `SearchJobIdentifier` that names no job — `ResourceNotFoundException` (404);
+//! 2. a search job whose results have not settled (any status outside
+//!    [`crate::state::EXPORTABLE_SEARCH_JOB_STATES`]) — `ValidationException` (400)
+//!    naming the status it is in and the ones export permits, because the caller's fix
+//!    is to poll and retry rather than to change the request;
+//! 3. an `ExportSpecification` carrying no member — `InternalServerException` (500):
+//!    the service accepts the malformed union through input validation and fails on it
+//!    server-side (see [`ReceivedExportSpecification`]);
+//! 4. a `RoleArn` this service cannot be passed — `AccessDeniedException` (403) from
+//!    [`crate::state::pass_role_denial`], an authorization decision rather than an
+//!    input refusal;
+//! 5. a tag set past the caps on one record, and the store's own export-job cap —
+//!    `ValidationException` (400) and the modelled `ServiceQuotaExceededException`
+//!    (402).
+//!
+//! A refused call creates nothing: the record is inserted only after every step holds.
 //!
 //! What this emulator does NOT do is write the .csv to the destination bucket: that
 //! object lives in another service and nothing here transmits it. So the export's own
@@ -121,15 +135,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupsearch-cryobackup
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.backupsearch#StartSearchResultExportJob",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["AccessDeniedException", "InternalServerException"]
 )]
 #[derive(Debug)]
 pub enum StartSearchResultExportJobErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
+    /// Declared on the service, not on this operation: the pass-role check refused the
+    /// submitted `RoleArn`, which is an authorization failure (HTTP 403).
+    AccessDeniedException(AccessDeniedException),
     /// Declared on the service, not on this operation: the store this emulator keeps
-    /// its jobs in could not be reached, which is a server fault.
+    /// its jobs in could not be reached, or the request carried an `ExportSpecification`
+    /// with no member set — both server faults (HTTP 500).
     InternalServerException(InternalServerException),
 }
 
@@ -264,6 +282,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The union the request carried, which `ReceivedExportSpecification` let through
+        // deserialization even with no member set: the service accepts it at the input
+        // boundary and fails on it here, as a server fault.
+        let Some(export_specification) = input.export_specification.specification.clone() else {
+            return Err(
+                StartSearchResultExportJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "Internal Server Error. Please try again".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Writing the results means assuming the submitted role, so the role has to be
+        // one this service can be passed. A well-formed ARN reaches this check rather
+        // than being turned away by input validation.
+        if let Some(role_arn) = input.role_arn.as_deref() {
+            if let Some(message) = crate::state::pass_role_denial(role_arn) {
+                return Err(
+                    StartSearchResultExportJobErrorModeled::AccessDeniedException(
+                        AccessDeniedException { message },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         // The tags this export job would be stored with have to fit the caps bounding
         // one record, so a create cannot grow a stored job without bound.
         let tags = input.tags.clone().unwrap_or_default();
@@ -334,7 +381,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time: crate::state::timestamp(now),
             completion_time: None,
             status_message: None,
-            export_specification: input.export_specification.clone(),
+            export_specification,
             role_arn: input.role_arn.clone(),
             tags,
             client_token: input.client_token.clone(),

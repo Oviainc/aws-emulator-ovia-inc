@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSearchResultExportJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSearchResultExportJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSearchResultExportJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the export jobs held in [`crate::state`], newest-last in creation order.
+//! `Status` and `SearchJobIdentifier` are both FILTERS: a `SearchJobIdentifier` that
+//! names no search job narrows the listing to nothing and answers 200 with an empty
+//! `ExportJobs`, exactly as filtering by a real search job with no exports does — a
+//! listing does not assert that its filter's value exists.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +80,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -95,11 +93,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupsearch-cryobackup
 // here — hence the `ListSearchResultExportJobsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupsearch#ListSearchResultExportJobs")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupsearch#ListSearchResultExportJobs",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListSearchResultExportJobsErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
+    /// Declared on the service, not on this operation: the store this emulator keeps
+    /// its export jobs in could not be reached, which is a server fault.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -151,20 +155,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSearchResultExportJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSearchResultExportJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSearchResultExportJobs"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListSearchResultExportJobsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::STORE_UNAVAILABLE.to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        // Report the statuses the clock has already made due, so an export that
+        // finished while nobody was looking is listed as COMPLETED.
+        state.settle(SystemTime::now());
+
+        // Both members are filters: an export job is listed when it matches every
+        // filter the request carried. Neither one is looked up as a resource, so
+        // neither can turn a listing into a not-found.
+        let summaries: Vec<ExportJobSummary> = state
+            .export_jobs_in_order()
+            .filter(|export| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|wanted| export.status == wanted)
+            })
+            .filter(|export| {
+                input
+                    .search_job_identifier
+                    .as_deref()
+                    .is_none_or(|wanted| export.search_job_identifier == wanted)
+            })
+            .map(|export| ExportJobSummary {
+                export_job_identifier: export.identifier.clone(),
+                export_job_arn: Some(export.arn.clone()),
+                status: Some(export.status.clone()),
+                creation_time: Some(export.creation_time),
+                completion_time: export.completion_time,
+                status_message: export.status_message.clone(),
+                search_job_arn: Some(export.search_job_arn.clone()),
+            })
+            .collect();
+
+        let context = crate::state::export_jobs_page_context(
+            input.status.as_deref(),
+            input.search_job_identifier.as_deref(),
+        );
+        let offset = crate::state::decode_next_token(
+            input.next_token.as_deref(),
+            &context,
+            summaries.len(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+        let (export_jobs, next_token) = crate::state::page(
+            &summaries,
+            offset,
+            crate::state::page_size(input.max_results),
+            &context,
+        );
+
+        Ok(ListSearchResultExportJobsOutput {
+            export_jobs,
+            next_token,
+        })
     }
 }

@@ -3,13 +3,14 @@
 //! Engine state for the com-amazonaws-backupsearch-cryobackupsearchservice service.
 //!
 //! The service's primary resource is the SEARCH JOB: `StartSearchJob` mints one,
-//! `GetSearchJob`/`ListSearchJobs`/`ListSearchJobResults` report it, `StopSearchJob`
-//! ends it, and `TagResource`/`ListTagsForResource` reach its tags through its ARN.
-//! Every one of those answers is computed from the record held here.
+//! `GetSearchJob`/`ListSearchJobs`/`ListSearchJobResults`/`ListSearchJobBackups` report
+//! it, `StopSearchJob` ends it, and `TagResource`/`ListTagsForResource` reach its tags
+//! through its ARN.
 //!
 //! Its second resource is the EXPORT JOB ([`ExportJob`]): `StartSearchResultExportJob`
 //! mints one for a search job whose results have settled, and
-//! `GetSearchResultExportJob` reports exactly that record.
+//! `GetSearchResultExportJob`/`ListSearchResultExportJobs` report exactly that record.
+//! Every one of those answers is computed from the records held here.
 //!
 //! ## The clock, not the reader, moves a status
 //!
@@ -26,8 +27,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    CurrentSearchProgress, ExportSpecification, ItemFilters, ResultItem, SearchScope,
-    SearchScopeSummary,
+    CurrentSearchProgress, ExportSpecification, ItemFilters, ResultItem, SearchJobBackupsResult,
+    SearchScope, SearchScopeSummary,
 };
 
 /// The `SearchJobState` values the model declares, so no handler spells one as a bare
@@ -166,6 +167,36 @@ pub fn export_job_arn(signing_name: &str, region: &str, identifier: &str) -> Str
     )
 }
 
+/// The account segment of an ARN, which is the fifth colon-separated field
+/// (`arn:<partition>:<service>:<region>:<account>:<resource>`). `None` when the string
+/// carries no such field.
+pub fn arn_account(arn: &str) -> Option<&str> {
+    arn.split(':').nth(4)
+}
+
+/// Why this service cannot pass `role_arn` to itself, or `None` when it can.
+///
+/// Starting an export makes the service assume the submitted role to write the results,
+/// so the role has to be passable to it. A role can only be passed by a principal in the
+/// role's OWN account — AWS refuses a cross-account pass-role — and every caller of this
+/// emulator is attributed to [`::engine::emulator_account_id`], so a `RoleArn` naming any
+/// other account cannot be passed and the modelled `AccessDeniedException` (HTTP 403) is
+/// the answer. A well-formed ARN is never turned away by input validation for this: the
+/// refusal is an authorization decision, which is the class a caller branches on.
+///
+/// A string with no account field at all cannot be judged here and is not denied; the
+/// `IamRoleArn` member's own `@pattern` already refuses it before any handler runs.
+pub fn pass_role_denial(role_arn: &str) -> Option<String> {
+    let account = arn_account(role_arn)?;
+    (account != ::engine::emulator_account_id())
+        .then(|| CROSS_ACCOUNT_PASS_ROLE.to_string())
+}
+
+/// The `AccessDeniedException` message for a role in another account. AWS states this
+/// refusal in one fixed sentence, because the rule behind it names nothing from the
+/// request: passing a role across accounts is not allowed at all.
+pub const CROSS_ACCOUNT_PASS_ROLE: &str = "Cross-account pass role is not allowed.";
+
 /// One persisted search job. Every member a modelled response carries is read from
 /// here; nothing in a response is recomputed from the request.
 #[derive(Debug, Clone)]
@@ -185,6 +216,11 @@ pub struct SearchJob {
     pub current_search_progress: CurrentSearchProgress,
     /// The matches the scan recorded. `ListSearchJobResults` pages over exactly this.
     pub results: Vec<ResultItem>,
+    /// The recovery points the scan covered, each with the status its backup index had.
+    /// `ListSearchJobBackups` pages over exactly this. A recovery point exists for this
+    /// account only once the Backup data plane holds one, and this emulator holds none,
+    /// so a job minted here covers none.
+    pub backups: Vec<SearchJobBackupsResult>,
     pub tags: HashMap<String, String>,
     /// The `ClientToken` the call that minted this job carried, if any. Idempotency is
     /// keyed off the job records themselves, so a caller cannot grow a second index by
@@ -233,8 +269,8 @@ impl SearchJob {
 }
 
 /// One persisted export job: the record `StartSearchResultExportJob` writes and
-/// `GetSearchResultExportJob` reports. Every member of a modelled response is read from
-/// here; nothing is recomputed from the request.
+/// `GetSearchResultExportJob`/`ListSearchResultExportJobs` report. Every member of a
+/// modelled response is read from here; nothing is recomputed from the request.
 #[derive(Debug, Clone)]
 pub struct ExportJob {
     pub identifier: String,
@@ -297,10 +333,8 @@ pub struct ComAmazonawsBackupsearchCryobackupsearchserviceState {
     minted: u64,
     /// Every export job, keyed by its `ExportJobIdentifier`.
     pub export_jobs: HashMap<String, ExportJob>,
-    /// Export-job identifiers in creation order, kept by `insert_export_job` so a
-    /// listing can page deterministically. NOTHING reads it yet —
-    /// `ListSearchResultExportJobs` is still a scaffold stub and owns its own issue — so
-    /// this is the order the store has recorded, not live ordering any response uses.
+    /// Export-job identifiers in creation order, so `ListSearchResultExportJobs` pages
+    /// deterministically.
     pub export_job_order: Vec<String>,
     /// How many export-job identifiers this store has minted.
     minted_export_jobs: u64,
@@ -386,6 +420,15 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// export job.
     pub fn export_job(&self, identifier: &str) -> Option<&ExportJob> {
         self.export_jobs.get(identifier)
+    }
+
+    /// Every export job in creation order, which is the sequence
+    /// `ListSearchResultExportJobs` filters and pages. `export_job_order` and
+    /// `export_jobs` are written together, so an identifier in the order always resolves.
+    pub fn export_jobs_in_order(&self) -> impl Iterator<Item = &ExportJob> {
+        self.export_job_order
+            .iter()
+            .filter_map(|identifier| self.export_jobs.get(identifier))
     }
 
     /// The export job the `StartSearchResultExportJob` call carrying `token` minted, if
@@ -495,54 +538,32 @@ pub fn results_page_context(identifier: &str) -> String {
     format!("results:{identifier}")
 }
 
-/// The page size to serve: the requested `MaxResults` clamped to the modelled maximum,
-/// or the modelled default when the member is absent (the framework leaves an absent
-/// integer at zero).
-pub fn page_size(max_results: i32) -> usize {
-    match usize::try_from(max_results) {
-        Ok(requested) if requested > 0 => requested.min(MAX_PAGE_SIZE),
-        _ => DEFAULT_MAX_RESULTS,
-    }
+/// The sequence a `ListSearchJobBackups` page indexes: one search job's backups.
+pub fn backups_page_context(identifier: &str) -> String {
+    format!("backups:{identifier}")
 }
 
-/// Refuse one tag entry whose key or value is longer than this store's cap, naming the
-/// member and the bound the way a validation refusal does.
-pub fn check_tag_entry(key: &str, value: &str) -> Result<(), String> {
-    let key_length = key.chars().count();
-    if key_length > MAX_TAG_KEY_LENGTH {
-        return Err(format!(
-            "Tags key is {key_length} characters, more than the maximum of {MAX_TAG_KEY_LENGTH}"
-        ));
-    }
-    let value_length = value.chars().count();
-    if value_length > MAX_TAG_VALUE_LENGTH {
-        return Err(format!(
-            "Tags value for key '{key}' is {value_length} characters, more than the maximum of {MAX_TAG_VALUE_LENGTH}"
-        ));
-    }
-    Ok(())
+/// The sequence a `ListSearchResultExportJobs` page indexes: the export jobs left by
+/// both of that request's filters. Part of the page's `NextToken` for the same reason
+/// [`jobs_page_context`] is: an offset alone does not say which filtered sequence it
+/// indexes.
+pub fn export_jobs_page_context(by_status: Option<&str>, by_search_job: Option<&str>) -> String {
+    format!(
+        "export-jobs:{}:{}",
+        by_status.unwrap_or("ALL"),
+        by_search_job.unwrap_or("ALL")
+    )
 }
 
-/// Refuse a tag set that would leave one job holding more than [`MAX_TAGS_PER_JOB`]
-/// tags. `count` is the number of tags the job would hold after the write.
-pub fn check_tag_count(count: usize) -> Result<(), String> {
-    if count > MAX_TAGS_PER_JOB {
-        return Err(format!(
-            "Tags would hold {count} entries, more than the maximum of {MAX_TAGS_PER_JOB} for one resource"
-        ));
-    }
-    Ok(())
-}
-
-/// A canonical rendering of one request's body, stored with the record it created so a
+/// A canonical rendering of one request's body, stored with the resource it created so a
 /// later call under the same `ClientToken` can be told apart: the same body is a repeat,
 /// a different body is a conflict.
 ///
 /// The body is re-serialized with the protocol's own JSON codec — so exactly the
 /// modelled members are compared, however the client sent them — with every object's
 /// members put in key order, because a JSON object's member order is not part of the
-/// request while a list's order is. Shared by every operation that takes a
-/// `ClientToken`, so two of them cannot disagree about what "the same body" means.
+/// request while a list's order is. One helper for every `Start` operation, so two
+/// idempotency checks cannot disagree about what "the same body" means.
 pub fn request_fingerprint(
     schema: &'static ::aws_smithy_schema::Schema,
     input: &dyn ::aws_smithy_schema::serde::SerializableStruct,
@@ -581,6 +602,45 @@ fn key_ordered(value: &::serde_json::Value) -> ::serde_json::Value {
         }
         scalar => scalar.clone(),
     }
+}
+
+/// The page size to serve: the requested `MaxResults` clamped to the modelled maximum,
+/// or the modelled default when the member is absent (the framework leaves an absent
+/// integer at zero).
+pub fn page_size(max_results: i32) -> usize {
+    match usize::try_from(max_results) {
+        Ok(requested) if requested > 0 => requested.min(MAX_PAGE_SIZE),
+        _ => DEFAULT_MAX_RESULTS,
+    }
+}
+
+/// Refuse one tag entry whose key or value is longer than this store's cap, naming the
+/// member and the bound the way a validation refusal does.
+pub fn check_tag_entry(key: &str, value: &str) -> Result<(), String> {
+    let key_length = key.chars().count();
+    if key_length > MAX_TAG_KEY_LENGTH {
+        return Err(format!(
+            "Tags key is {key_length} characters, more than the maximum of {MAX_TAG_KEY_LENGTH}"
+        ));
+    }
+    let value_length = value.chars().count();
+    if value_length > MAX_TAG_VALUE_LENGTH {
+        return Err(format!(
+            "Tags value for key '{key}' is {value_length} characters, more than the maximum of {MAX_TAG_VALUE_LENGTH}"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a tag set that would leave one job holding more than [`MAX_TAGS_PER_JOB`]
+/// tags. `count` is the number of tags the job would hold after the write.
+pub fn check_tag_count(count: usize) -> Result<(), String> {
+    if count > MAX_TAGS_PER_JOB {
+        return Err(format!(
+            "Tags would hold {count} entries, more than the maximum of {MAX_TAGS_PER_JOB} for one resource"
+        ));
+    }
+    Ok(())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

@@ -11,11 +11,76 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupsearch-cryobackupsearchservice.json");
 
+/// How `StartSearchResultExportJob` RECEIVES its `@required` `ExportSpecification`: the
+/// union when the request set one of its members, and nothing when the request carried
+/// the union with NO member set.
+///
+/// `ExportSpecification` itself cannot hold that second state — a Smithy union is
+/// exactly one member — and the generated reader refuses an empty one while
+/// deserializing, which turns it into a 400 refusal at the protocol boundary. The real
+/// service does not refuse it there: the request reaches the service and is answered
+/// with the modelled `InternalServerException` (HTTP 500), which is a different class
+/// and a different retry decision for every client. This wrapper is what lets the empty
+/// union through deserialization so the handler can answer it, and it is the ONLY
+/// difference from the generated member: a union with one member set reads and writes
+/// exactly as `ExportSpecification` does.
+#[derive(Debug, Clone)]
+pub struct ReceivedExportSpecification {
+    /// The union the request set, or `None` for a union with no member set.
+    pub specification: Option<ExportSpecification>,
+}
+
+impl ReceivedExportSpecification {
+    /// The member index the union's single modelled member, `s3ExportSpecification`,
+    /// carries in `ExportSpecification::SCHEMA` — the generated schema lists the
+    /// model's members in declaration order from zero.
+    const S3_MEMBER_INDEX: usize = 0;
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ReceivedExportSpecification {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match &self.specification {
+            // Delegate to the union's own members, so what goes back on the wire (and
+            // what the constraint walk sees) is exactly what the model declares.
+            Some(specification) => specification.serialize_members(s),
+            // A union with no member set writes no member.
+            None => Ok(()),
+        }
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ReceivedExportSpecification {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut specification: Option<ExportSpecification> = None;
+        d.read_struct(&ExportSpecification::SCHEMA, &mut |member, d| {
+            if member.member_index() == Some(Self::S3_MEMBER_INDEX) {
+                // A union carries at most one member, so a second one on the wire is
+                // ambiguous and is refused here rather than silently overwritten.
+                if specification.is_some() {
+                    return Err(::aws_smithy_schema::serde::SerdeError::custom(
+                        "union 'ExportSpecification' had more than one member set",
+                    ));
+                }
+                specification = Some(ExportSpecification::s3ExportSpecification(
+                    <S3ExportSpecification as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                ));
+            }
+            Ok(())
+        })?;
+        Ok(Self { specification })
+    }
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.backupsearch#StartSearchResultExportJobInput")]
 #[derive(Debug, Clone)]
 pub struct StartSearchResultExportJobInput {
     pub search_job_identifier: String,
-    pub export_specification: ExportSpecification,
+    pub export_specification: ReceivedExportSpecification,
     pub client_token: Option<String>,
     pub tags: Option<std::collections::HashMap<String, String>>,
     pub role_arn: Option<String>,

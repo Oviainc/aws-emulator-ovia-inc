@@ -101,6 +101,15 @@ pub struct InternalServerException {
     pub retry_after_seconds: Option<i32>,
 }
 
+/// The service-wide authorization refusal (`@error("client")`, HTTP 403). Declared on
+/// the service rather than on one operation, like [`InternalServerException`], so a
+/// handler names it through `extra_errors` on its own `#[operation_error]` enum.
+#[smithy_macros::smithy(shape = "com.amazonaws.backupsearch#AccessDeniedException")]
+#[derive(Debug, Clone, Default)]
+pub struct AccessDeniedException {
+    pub message: String,
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.backupsearch#ServiceQuotaExceededException")]
 #[derive(Debug, Clone, Default)]
 pub struct ServiceQuotaExceededException {

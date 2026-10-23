@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/export_jobs.rs"]
 mod export_jobs;
+#[path = "all/export_listing.rs"]
+mod export_listing;
 #[path = "all/search_jobs.rs"]
 mod search_jobs;
 #[path = "all/state_roundtrip.rs"]
