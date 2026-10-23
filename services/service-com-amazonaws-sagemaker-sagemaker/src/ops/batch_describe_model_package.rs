@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDescribeModelPackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDescribeModelPackage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDescribeModelPackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: each requested `ModelPackageArn` is resolved on its own against this
+//! service's stored model packages and answered in exactly one of the two output maps —
+//! `ModelPackageSummaries` with that versioned package's stored members, projected the
+//! way `DescribeModelPackage` replays them, or `BatchDescribeModelPackageErrorMap` with
+//! a per-ARN `ErrorCode`/`ErrorResponse` when no versioned package here answers to it —
+//! so the request itself always succeeds.
 //!
 //! ## Shape of an operation
 //!
@@ -98,6 +95,23 @@ impl From<BatchDescribeModelPackageErrorModeled> for BatchDescribeModelPackageEr
     }
 }
 
+/// The `ErrorCode` a per-ARN entry of `BatchDescribeModelPackageErrorMap` carries.
+///
+/// This operation models no errors of its own and never fails the whole request for one
+/// bad item: an ARN it cannot summarise is reported in that map instead. The code is the
+/// one `DescribeModelPackage` answers when asked for a package that cannot be described,
+/// so the two operations classify the same condition the same way.
+const ITEM_ERROR_CODE: &str = "ValidationException";
+
+/// One `BatchDescribeModelPackageErrorMap` entry, with [`ITEM_ERROR_CODE`] and the
+/// description of what stopped this ARN from being summarised.
+fn item_error(error_response: String) -> BatchDescribeModelPackageError2 {
+    BatchDescribeModelPackageError2 {
+        error_code: ITEM_ERROR_CODE.to_string(),
+        error_response,
+    }
+}
+
 /// The `BatchDescribeModelPackage` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -134,18 +148,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDescribeModelPackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDescribeModelPackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDescribeModelPackage"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // Every ARN is resolved independently and lands in exactly one of the two output
+        // maps, keyed by the ARN the request asked about: a batch read reports per item,
+        // so one ARN nothing answers to neither fails the call nor hides the others.
+        let mut summaries = ::std::collections::HashMap::new();
+        let mut errors = ::std::collections::HashMap::new();
+        // The ARNs whose owed status transition this call materialised, recorded once the
+        // lock is released.
+        let mut settled = Vec::new();
+        // One instant for the whole batch, so two items of one request never disagree
+        // about whether a transition was due.
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        for requested in &input.model_package_arn_list {
+            // A `ModelPackageArn` names the package whose store key is its resource part
+            // — the same key `DescribeModelPackage` resolves an identifier to. Unlike
+            // that operation's `VersionedArnOrName`, this input is an ARN and nothing
+            // else, so it identifies one resource of one account in one region: an ARN
+            // whose own text differs from the stored package's names no package here.
+            let key = crate::state::model_package_lookup_key(requested);
+            let found = store
+                .model_packages
+                .get_mut(key)
+                .filter(|package| package.arn == *requested);
+            let Some(package) = found else {
+                errors.insert(
+                    requested.clone(),
+                    item_error(format!("Could not find model package \"{requested}\".")),
+                );
+                continue;
+            };
+
+            // The only write a reporting call makes: the registration the clock already
+            // owed. It was due at the stored instant whether or not anybody read the
+            // package, so no caller's read changes the outcome — and for the same reason
+            // it is materialised for every package this call resolved, including one that
+            // is then reported as an item error: the transition is owed by the clock, not
+            // by whether this operation can summarise the package.
+            if package.settle_status(now) {
+                settled.push(package.arn.clone());
+            }
+
+            // A summary reports the group the version belongs to and the version number,
+            // both of which only a VERSIONED package has — this operation "batch
+            // describes a list of versioned model packages". An unversioned package
+            // carries no group, so there is no summary to report for it.
+            let Some(model_package_group_name) = package.group_name.clone() else {
+                errors.insert(
+                    requested.clone(),
+                    item_error(format!(
+                        "Model package \"{requested}\" is not a versioned model package: \
+                         BatchDescribeModelPackage describes versions registered into a \
+                         model package group."
+                    )),
+                );
+                continue;
+            };
+
+            // `InferenceSpecification` is required in a summary. A package registered
+            // from a `SourceAlgorithmSpecification` alone has none of its own, and this
+            // emulator holds no algorithm registry to derive one from — so the item is
+            // reported as an error rather than answered with an inference specification
+            // nothing produced.
+            let Some(inference_specification) = package.inference_specification.clone() else {
+                errors.insert(
+                    requested.clone(),
+                    item_error(format!(
+                        "Model package \"{requested}\" carries no InferenceSpecification, \
+                         which a model package summary reports."
+                    )),
+                );
+                continue;
+            };
+
+            summaries.insert(
+                requested.clone(),
+                BatchDescribeModelPackageSummary {
+                    model_package_group_name,
+                    model_package_version: package.version,
+                    model_package_arn: package.arn.clone(),
+                    model_package_description: package.description.clone(),
+                    creation_time: crate::state::timestamp(package.creation_time),
+                    inference_specification,
+                    model_package_status: package.status.clone(),
+                    model_approval_status: package.model_approval_status.clone(),
+                    model_package_registration_type: package.registration_type.clone(),
+                },
+            );
+        }
+        drop(store);
+
+        for arn in &settled {
+            crate::state::record_state_change(Self::NAME, arn, ctx);
+        }
+
+        // Both maps are always present, empty or not: a batch read reports the outcome of
+        // every requested ARN, so a caller reads one map per outcome kind rather than
+        // having to tell an absent map from an empty one.
+        Ok(BatchDescribeModelPackageOutput {
+            model_package_summaries: Some(summaries),
+            batch_describe_model_package_error_map: Some(errors),
+        })
     }
 }

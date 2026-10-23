@@ -21,6 +21,8 @@ mod app_image_config_registry;
 mod artifact_deletion;
 #[path = "all/artifact_lineage.rs"]
 mod artifact_lineage;
+#[path = "all/batch_describe_model_packages.rs"]
+mod batch_describe_model_packages;
 #[path = "all/batch_transform_jobs.rs"]
 mod batch_transform_jobs;
 #[path = "all/code_repositories.rs"]
