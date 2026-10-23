@@ -164,6 +164,12 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// Monotonic counter behind the resource-policy revision ids, so every update of a
     /// resource-scoped policy mints a revision no earlier update used.
     pub next_policy_revision: u64,
+    /// The KMS key associated with the account's stored query-insights results — the
+    /// `AssociateKmsKey` target named by the `query-result` ARN rather than by a log
+    /// group ("use that key to encrypt the stored results of all future StartQuery
+    /// operations in the account"). `None` until one is associated, and `None` again
+    /// after `DisassociateKmsKey`.
+    pub query_results_kms_key_id: Option<String>,
 }
 
 impl ComAmazonawsCloudwatchlogsLogs20140328State {
@@ -224,6 +230,12 @@ pub struct LogGroupRecord {
     pub kms_key_id: Option<String>,
     pub log_group_class: String,
     pub deletion_protection_enabled: bool,
+    /// Whether bearer token authentication is enabled for this group
+    /// (`LogGroup$bearerTokenAuthenticationEnabled`: "Indicates whether bearer token
+    /// authentication is enabled for this log group. When enabled, bearer token
+    /// authentication is allowed on operations until it is explicitly disabled.").
+    /// `PutBearerTokenAuthentication` is what moves it; a new group is not enabled.
+    pub bearer_token_authentication_enabled: bool,
     pub stored_bytes: i64,
     pub metric_filter_count: i32,
     pub tags: BTreeMap<String, String>,
@@ -256,6 +268,7 @@ impl LogGroupRecord {
             kms_key_id: None,
             log_group_class: DEFAULT_LOG_GROUP_CLASS.to_string(),
             deletion_protection_enabled: false,
+            bearer_token_authentication_enabled: false,
             stored_bytes: 0,
             metric_filter_count: 0,
             tags: BTreeMap::new(),
@@ -635,6 +648,29 @@ pub fn is_log_group_arn(arn: &str) -> bool {
     })
 }
 
+/// Whether an ARN names the account's stored query-insights results — the non-log-group
+/// target `AssociateKmsKey` / `DisassociateKmsKey` document: "Specify the following ARN
+/// to have future GetQueryResults operations in this account encrypt the results with
+/// the specified KMS key [...] arn:aws:logs:REGION:ACCOUNT_ID:query-result:*".
+pub fn is_query_result_arn(arn: &str) -> bool {
+    arn_service_and_resource(arn)
+        .is_some_and(|(service, resource)| service == "logs" && resource == "query-result:*")
+}
+
+/// Whether a `kmsKeyId` names a KMS key: the member is documented as "The Amazon
+/// Resource Name (ARN) of the KMS key to use when encrypting log data", so a value that
+/// is an ARN must be one of KMS's. A bare key id or alias carries no service segment and
+/// is left to KMS to resolve, but an empty value names nothing at all.
+pub fn is_kms_key_id(kms_key_id: &str) -> bool {
+    if kms_key_id.trim().is_empty() {
+        return false;
+    }
+    match arn_service_and_resource(kms_key_id) {
+        Some((service, resource)) => service == "kms" && !resource.is_empty(),
+        None => !kms_key_id.starts_with("arn:"),
+    }
+}
+
 /// Whether an ARN names a destination `PutSubscriptionFilter` supports delivering to:
 /// one of the services in [`SUBSCRIPTION_DESTINATIONS`], naming a resource of the kind
 /// that service's entry there gives.
@@ -683,6 +719,50 @@ pub fn resolve_log_group_target(
         ),
         (None, None) => {
             Err("either logGroupName or logGroupIdentifier must be specified".to_string())
+        }
+    }
+}
+
+/// What an `AssociateKmsKey` / `DisassociateKmsKey` request names: "you specify either
+/// the logGroupName parameter or the resourceIdentifier parameter", and a
+/// `resourceIdentifier` is either a log group's ARN or the account's query-result ARN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KmsKeyTarget {
+    /// One log group, by the name the store is keyed by.
+    LogGroup(String),
+    /// The account's stored query-insights results.
+    QueryResults,
+}
+
+/// Resolve the target of an `AssociateKmsKey` / `DisassociateKmsKey` request. The two
+/// parameters are documented as mutually exclusive with one of them required, and a
+/// `resourceIdentifier` naming neither a log group nor the query-result resource names
+/// no target at all; the `Err` carries the message to refuse with.
+pub fn resolve_kms_key_target(
+    log_group_name: Option<&str>,
+    resource_identifier: Option<&str>,
+) -> Result<KmsKeyTarget, String> {
+    match (log_group_name, resource_identifier) {
+        (Some(name), None) => Ok(KmsKeyTarget::LogGroup(name.to_string())),
+        (None, Some(identifier)) => {
+            if is_query_result_arn(identifier) {
+                Ok(KmsKeyTarget::QueryResults)
+            } else if is_log_group_arn(identifier) {
+                Ok(KmsKeyTarget::LogGroup(
+                    log_group_name_from_identifier(identifier).to_string(),
+                ))
+            } else {
+                Err(format!(
+                    "resourceIdentifier must be a log group ARN or a query-result ARN, got '{identifier}'"
+                ))
+            }
+        }
+        (Some(_), Some(_)) => Err(
+            "logGroupName and resourceIdentifier are mutually exclusive; specify only one"
+                .to_string(),
+        ),
+        (None, None) => {
+            Err("either logGroupName or resourceIdentifier must be specified".to_string())
         }
     }
 }
