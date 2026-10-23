@@ -387,6 +387,39 @@ pub struct ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
 pub type CleanRoomsState = ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState;
 
 impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
+    /// The stored collaboration `collaboration_id` names together with the grant
+    /// `account_id` holds in it, or `None` when this account has no authorization to
+    /// that collaboration at all.
+    ///
+    /// `None` covers all three indistinguishable cases: no collaboration is stored
+    /// under the id (it never existed, or `DeleteCollaboration` removed it), or one is
+    /// stored but the account is neither its creator nor one of its declared members.
+    /// A caller's authorization to a collaboration lives in the collaboration itself,
+    /// so it disappears with it — which is why these cases are one answer and not
+    /// three. Every operation that takes a `collaborationIdentifier` resolves it here,
+    /// so the refusal it reports is the same whichever case holds and no operation
+    /// leaks whether the id exists.
+    pub fn collaboration_grant(
+        &self,
+        collaboration_id: &str,
+        account_id: &str,
+    ) -> Option<(&CollaborationRecord, MemberGrant)> {
+        let record = self.collaborations.get(collaboration_id)?;
+        let grant = record.grant_for(account_id)?;
+        Some((record, grant))
+    }
+
+    /// The stored collaboration `account_id` is authorized to see under
+    /// `collaboration_id`. See [`Self::collaboration_grant`] for what `None` means.
+    pub fn visible_collaboration(
+        &self,
+        collaboration_id: &str,
+        account_id: &str,
+    ) -> Option<&CollaborationRecord> {
+        self.collaboration_grant(collaboration_id, account_id)
+            .map(|(record, _)| record)
+    }
+
     /// The membership `account_id` holds in `collaboration_id`, if any.
     pub fn membership_of(&self, collaboration_id: &str, account_id: &str) -> Option<&Membership> {
         let id = self
@@ -459,7 +492,7 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
         collaboration_id: &str,
         account_id: &str,
     ) -> Option<Collaboration> {
-        let record = self.collaborations.get(collaboration_id)?;
+        let record = self.visible_collaboration(collaboration_id, account_id)?;
         self.collaboration_view(record, account_id)
     }
 
@@ -579,6 +612,44 @@ pub fn membership_summary(membership: &Membership) -> MembershipSummary {
 /// source of truth. Never a literal.
 pub fn caller_account_id() -> &'static str {
     ::engine::emulator_account_id()
+}
+
+/// The message an operation reports when the caller has no authorization to the
+/// `collaborationIdentifier` it sent — see
+/// [`CleanRoomsState::collaboration_grant`] for the cases that reach it.
+///
+/// Composed from the request's collaboration identifier and the resolved caller
+/// account: those two are what the authorization decision was made on, and naming them
+/// is what tells a caller the collaboration is not reachable from THIS account rather
+/// than that the id is malformed. It deliberately does not say whether a collaboration
+/// is stored under the id.
+pub fn collaboration_access_denied_message(collaboration_id: &str, account_id: &str) -> String {
+    format!(
+        "Account {account_id} is not authorized to access collaboration: {collaboration_id}"
+    )
+}
+
+/// The message a membership lookup reports when the id names no membership of the
+/// caller's.
+///
+/// Composed from the request's `membershipIdentifier` and the resolved caller account:
+/// membership ids are account-scoped, so the account is what says the lookup failed in
+/// THIS account's namespace rather than that the id exists nowhere.
+pub fn membership_not_found_message(membership_id: &str, account_id: &str) -> String {
+    format!("No such membership: {membership_id} for account {account_id}")
+}
+
+/// The message `CreateMembership` reports when the caller already holds a membership in
+/// the collaboration it asked to join.
+///
+/// Composed from the resolved caller account and the request's collaboration
+/// identifier: one account holds at most one membership per collaboration, so the
+/// account the membership would be created for is the value that fails validation.
+pub fn duplicate_membership_message(account_id: &str, collaboration_id: &str) -> String {
+    format!(
+        "Cannot create membership for account: {account_id}. \
+         The account is already a member of collaboration: {collaboration_id}"
+    )
 }
 
 /// The `isMetricsEnabled` a created resource carries: what the caller asked for, else

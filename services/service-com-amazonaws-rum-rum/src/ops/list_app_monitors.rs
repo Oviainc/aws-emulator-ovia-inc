@@ -138,8 +138,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `@readonly`: paging a list never changes what a later caller sees.
-        let _ = ctx;
+        // `@readonly`: paging a list never changes what a later caller sees. `ctx`
+        // carries the credential the authorization decision below is made for.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListAppMonitorsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -149,6 +149,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // May this caller list the account's app monitors? The action is taken on the
+        // account's whole collection rather than on one monitor, so there is no resource
+        // policy to consult and the resource is the collection's ARN.
+        if let Err(denial) = crate::state::authorization::authorize_identity(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::LIST_APP_MONITORS,
+            &crate::state::app_monitor_collection_arn(&crate::state::request_region(ctx.parts())),
+        ) {
+            return Err(ListAppMonitorsErrorModeled::AccessDeniedException(
+                crate::state::access_denied(&denial),
+            )
+            .into());
+        }
 
         // No token starts at the beginning; a token resumes strictly after the last
         // summary the page that produced it returned. A token this operation never

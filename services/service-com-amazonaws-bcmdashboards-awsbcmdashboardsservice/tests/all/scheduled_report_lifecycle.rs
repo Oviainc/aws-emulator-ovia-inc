@@ -24,7 +24,8 @@ use super::dashboard_lifecycle::{call, graph_config, ok_call, router, timestamp}
 /// A well-formed `ServiceRoleArn` (pattern
 /// `^arn:aws[-a-z0-9]*:iam::[0-9]{12}:role/[a-zA-Z0-9+=,.@_/-]+$`, source:
 /// `smithy_query(query="operation",operation="CreateScheduledReport")`).
-const EXECUTION_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/BCMDashboardsReportRole";
+pub(crate) const EXECUTION_ROLE_ARN: &str =
+    "arn:aws:iam::123456789012:role/BCMDashboardsReportRole";
 
 /// A well-formed `DashboardArn` that no dashboard in a fresh store is keyed by, so a
 /// create naming it is a reference to a missing resource rather than a malformed input.
@@ -66,7 +67,7 @@ fn is_scheduled_report_arn(arn: &str) -> bool {
 }
 
 /// The wire error code (`__type`) of an error body.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -75,7 +76,7 @@ fn error_code(body: &Value) -> String {
 
 /// Create a dashboard with one widget and return `(dashboard arn, widget id)` — the
 /// resource a scheduled report has to point at.
-async fn source_dashboard(router: &MultiServiceRouter, name: &str) -> (String, String) {
+pub(crate) async fn source_dashboard(router: &MultiServiceRouter, name: &str) -> (String, String) {
     let created = ok_call(
         router,
         "CreateDashboard",

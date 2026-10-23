@@ -191,7 +191,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(format!("policy must be a JSON document: {error}")),
             })
         })?;
-        let policy = crate::state::document_from_json(&parsed);
+        // A document nested past the emulator's own conversion bound is refused rather
+        // than converted; see `crate::state::MAX_DOCUMENT_DEPTH`.
+        let Some(policy) = crate::state::document_from_json(&parsed) else {
+            return Err(CreateSecurityPolicyErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "policy must not nest deeper than {} levels",
+                        crate::state::MAX_DOCUMENT_DEPTH
+                    )),
+                },
+            )
+            .into());
+        };
 
         let mut store = state.lock();
 
@@ -254,7 +266,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         store.security_policies.insert(key.clone(), record);
         if let Some(token) = input.client_token.as_deref() {
-            let value = crate::state::security_policy_token_value(&key.0, &key.1);
+            let value = crate::state::policy_token_value(&key.0, &key.1);
             store.remember_token(Self::NAME, token, &value);
         }
 
