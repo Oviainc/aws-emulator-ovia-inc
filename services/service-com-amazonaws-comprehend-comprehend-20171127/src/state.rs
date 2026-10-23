@@ -3053,16 +3053,22 @@ pub const TOXIC_CONTENT_SEGMENT_QUOTA_BYTES: usize = 1_000;
 
 /// The `LanguageCode` values Comprehend's PII analysis accepts.
 ///
-/// ONE set for the whole PII family — the synchronous analysis operations and the
-/// asynchronous detection job — so they can never drift apart on which languages
-/// PII analysis accepts. The set is the one the member documentation that names a
-/// set states, `StartPiiEntitiesDetectionJobRequest$LanguageCode` and
+/// ONE set for the operations that DOCUMENT a set — `ContainsPiiEntities` and the
+/// asynchronous detection job — so they can never drift apart on which languages PII
+/// analysis accepts. The set is the one the member documentation that names a set
+/// states, `StartPiiEntitiesDetectionJobRequest$LanguageCode` and
 /// `DetectPiiEntitiesRequest$LanguageCode`: "Enter the language code for English
 /// (en) or Spanish (es)." `ContainsPiiEntitiesRequest$LanguageCode` is "The language
 /// of the input documents" — it names no set, so it neither widens nor narrows this
-/// one. Every other value the `LanguageCode` enum names is refused with the error
-/// the calling operation models for it, rather than answered with an empty result
-/// that no analysis produced.
+/// one. Every other value the `LanguageCode` enum names is refused with the error the
+/// calling operation models for it, rather than answered with an empty result that no
+/// analysis produced.
+///
+/// `DetectPiiEntities` is the one member of the family that does NOT check this set:
+/// recorded behaviour
+/// (`comprehend.detect-pii-entities-unsupported-language-still-succeeds`) is that it
+/// answers 200 for a language its own documentation does not name, so the check lives
+/// in each caller rather than in the recognizer.
 pub const PII_LANGUAGES: &[&str] = &["en", "es"];
 
 /// The refusal message for a document past `quota_bytes`: `Some(message)` when
