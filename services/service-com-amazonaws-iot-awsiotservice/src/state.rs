@@ -14,7 +14,10 @@
 //! `CreateThing` returns the created thing member-for-member: a reader clones what
 //! the writer stored and the two cannot drift.
 //!
-//! Beside the registry it holds the THING GROUP registry, keyed by `thingGroupName`
+//! Beside the registry it holds the POLICY registry, keyed by `policyName` — the
+//! name is the policy's identity and the `@httpLabel` of `/policies/{policyName}` —
+//! where each record carries its numbered document versions and which of them is the
+//! default, the THING GROUP registry, keyed by `thingGroupName`
 //! for the same reason — the name is the group's identity and the `@httpLabel` of
 //! `/thing-groups/{thingGroupName}` — the account's JOBS (`CreateJob` keys them by
 //! the `jobId` it documents as unique for the account), whose per-thing EXECUTIONS
@@ -329,6 +332,18 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// because `ListThingGroups` is `@paginated` and a page boundary is only
     /// meaningful over a stable order.
     pub thing_groups: BTreeMap<String, RegisteredThingGroup>,
+    /// Every IoT policy that exists, keyed by `policyName`.
+    ///
+    /// The name is the policy's identity — the model binds it as the `@httpLabel` of
+    /// `/policies/{policyName}` on every single-policy operation — so a `BTreeMap`
+    /// keyed by name is the registry itself. `BTreeMap` (not `HashMap`) because
+    /// `ListPolicies` is `@paginated` and a page boundary is only meaningful over a
+    /// stable order.
+    ///
+    /// A caller grows this store, so it is bounded: [`MAX_POLICIES`] is the ceiling
+    /// `CreatePolicy` refuses past, and [`MAX_POLICY_DOCUMENT_BYTES`] /
+    /// [`MAX_POLICY_TAGS`] bound what ONE record may cost.
+    pub policies: BTreeMap<String, RegisteredPolicy>,
     /// The names of the thing types that exist.
     ///
     /// `CreateThing` answers `ResourceNotFoundException` for a `thingTypeName` that
@@ -632,6 +647,273 @@ pub struct RegisteredJob {
 /// same ones [`thing_arn`] documents.
 pub fn thing_group_arn(region: &str, thing_group_name: &str) -> String {
     ::emulator_server::emulator_arn("iot", region, &format!("thinggroup/{thing_group_name}"))
+}
+
+/// The ARN of an IoT policy: `arn:aws:iot:<region>:<account>:policy/<policyName>`.
+///
+/// `policy` is the resource type AWS IoT's policy ARNs use; the namespace and
+/// account segments are the same ones [`thing_arn`] documents.
+pub fn policy_arn(region: &str, policy_name: &str) -> String {
+    ::emulator_server::emulator_arn("iot", region, &format!("policy/{policy_name}"))
+}
+
+/// The `policyVersionId` a freshly created policy's only version carries.
+///
+/// `CreatePolicy` documents it: "The created policy is the default version for the
+/// policy. This operation creates a policy version with a version identifier of 1
+/// and sets 1 as the policy's default version."
+pub const FIRST_POLICY_VERSION_ID: u32 = 1;
+
+/// The shortest policy document AWS IoT accepts, counted EXCLUDING whitespace.
+///
+/// `CreatePolicy$policyDocument`: "policyDocument must have a minimum length of 1,
+/// with a maximum length of 2048, excluding whitespace."
+pub const MIN_POLICY_DOCUMENT_LENGTH: usize = 1;
+
+/// The longest policy document AWS IoT accepts, counted EXCLUDING whitespace; the
+/// other half of the sentence [`MIN_POLICY_DOCUMENT_LENGTH`] quotes.
+///
+/// It is NOT the modelled `PolicyDocument` length (0..404600): that bound is what the
+/// wire shape admits, while this is the document rule the service itself enforces.
+pub const MAX_POLICY_DOCUMENT_LENGTH: usize = 2048;
+
+/// How many policies this emulator keeps for the account.
+///
+/// AWS publishes a service quota on an account's IoT policies; the exact figure is
+/// not in the model, so this is the emulator's own ceiling on a store a caller can
+/// grow — the same reason [`MAX_JOBS`] and [`MAX_TOPIC_RULES`] exist — and
+/// `CreatePolicy` past it refuses with a modelled error rather than growing without
+/// bound.
+pub const MAX_POLICIES: usize = 1_000;
+
+/// How many BYTES of policy document one policy version may keep.
+///
+/// [`MAX_POLICY_DOCUMENT_LENGTH`] is the documented rule, but it counts only
+/// SIGNIFICANT characters, while a record keeps the document verbatim (a reader hands
+/// back what the writer sent) — so whitespace alone would decide how much memory one
+/// record costs. This is the emulator's own ceiling on that cost: far above any
+/// document whose significant length fits the documented 2048, and well under the
+/// modelled `PolicyDocument` length (0..404600) that the wire shape admits.
+pub const MAX_POLICY_DOCUMENT_BYTES: usize = 32 * 1024;
+
+/// How many tags one policy may carry.
+///
+/// AWS IoT's tagging documentation publishes the limit as "You can add up to 50 tags
+/// to a resource"; `TagList` carries no modelled maximum, so without it one request
+/// would choose how large a single record is.
+pub const MAX_POLICY_TAGS: usize = 50;
+
+/// Why a string is not an IoT policy document.
+///
+/// Each variant is a DIFFERENT refusal, so the caller's message can state the rule
+/// that was violated rather than one fixed template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyDocumentRejection {
+    /// Its length excluding whitespace is outside
+    /// [`MIN_POLICY_DOCUMENT_LENGTH`]..=[`MAX_POLICY_DOCUMENT_LENGTH`]; carries that
+    /// length, which the request supplied.
+    Length(usize),
+    /// It is longer than [`MAX_POLICY_DOCUMENT_BYTES`]; carries its length in bytes,
+    /// which the request supplied.
+    TooManyBytes(usize),
+    /// It is not JSON at all; carries the parser's own complaint.
+    NotJson(String),
+    /// It is JSON, but not a JSON object, so it cannot be a policy document.
+    NotAnObject,
+    /// It carries no `Statement` at all.
+    MissingStatement,
+    /// Its `Statement` list is empty, so the document grants and denies nothing.
+    EmptyStatement,
+    /// A `Statement` entry is not a JSON object.
+    StatementNotAnObject,
+    /// A statement carries no `Effect`.
+    MissingEffect,
+    /// A statement's `Effect` is neither `Allow` nor `Deny`; carries what it was.
+    InvalidEffect(String),
+    /// A statement names neither `Action` nor `NotAction`.
+    MissingAction,
+}
+
+impl PolicyDocumentRejection {
+    /// What to tell the caller: the rule that was violated, built from the document
+    /// that violated it.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Length(length) => format!(
+                "policyDocument must have a minimum length of {MIN_POLICY_DOCUMENT_LENGTH}, \
+                 with a maximum length of {MAX_POLICY_DOCUMENT_LENGTH}, excluding whitespace; \
+                 this one is {length}"
+            ),
+            Self::TooManyBytes(bytes) => format!(
+                "policyDocument must be at most {MAX_POLICY_DOCUMENT_BYTES} bytes long; \
+                 this one is {bytes}"
+            ),
+            Self::NotJson(complaint) => {
+                format!("policyDocument is not a valid JSON document: {complaint}")
+            }
+            Self::NotAnObject => {
+                "policyDocument must be a JSON object carrying a Statement".to_string()
+            }
+            Self::MissingStatement => "policyDocument must carry a Statement".to_string(),
+            Self::EmptyStatement => {
+                "policyDocument must carry at least one statement in Statement".to_string()
+            }
+            Self::StatementNotAnObject => {
+                "every entry of Statement must be a JSON object".to_string()
+            }
+            Self::MissingEffect => "every statement must carry an Effect".to_string(),
+            Self::InvalidEffect(effect) => format!(
+                "a statement's Effect must be either Allow or Deny, not {effect:?}"
+            ),
+            Self::MissingAction => {
+                "every statement must name an Action or a NotAction".to_string()
+            }
+        }
+    }
+}
+
+/// Check `document` against the IoT policy-document rules, naming the first rule it
+/// violates.
+///
+/// An IoT policy document is an IAM-grammar JSON policy: a JSON object whose
+/// `Statement` is one statement object or a list of them, each carrying an `Effect`
+/// of exactly `Allow` or `Deny` and an `Action` (or `NotAction`). Everything else a
+/// statement may carry — `Resource`, `Condition`, `Sid` — is the caller's to shape,
+/// so nothing here reads or restricts it. The LENGTH rule is the one
+/// `CreatePolicy$policyDocument` documents, counted excluding whitespace; beside it,
+/// [`MAX_POLICY_DOCUMENT_BYTES`] bounds what the verbatim document a record keeps may
+/// cost, which the documented rule does not.
+///
+/// Shared by every operation that accepts a policy document, so `CreatePolicy` and
+/// `CreatePolicyVersion` cannot drift apart on what they accept.
+pub fn validate_policy_document(document: &str) -> Result<(), PolicyDocumentRejection> {
+    if document.len() > MAX_POLICY_DOCUMENT_BYTES {
+        return Err(PolicyDocumentRejection::TooManyBytes(document.len()));
+    }
+    let significant = document.chars().filter(|c| !c.is_whitespace()).count();
+    if !(MIN_POLICY_DOCUMENT_LENGTH..=MAX_POLICY_DOCUMENT_LENGTH).contains(&significant) {
+        return Err(PolicyDocumentRejection::Length(significant));
+    }
+    let parsed: ::serde_json::Value = ::serde_json::from_str(document)
+        .map_err(|error| PolicyDocumentRejection::NotJson(error.to_string()))?;
+    let members = parsed
+        .as_object()
+        .ok_or(PolicyDocumentRejection::NotAnObject)?;
+    let statement = members
+        .get("Statement")
+        .ok_or(PolicyDocumentRejection::MissingStatement)?;
+    // The IAM grammar admits both a single statement object and a list of them.
+    let statements: Vec<&::serde_json::Value> = match statement {
+        ::serde_json::Value::Array(entries) => entries.iter().collect(),
+        single => vec![single],
+    };
+    if statements.is_empty() {
+        return Err(PolicyDocumentRejection::EmptyStatement);
+    }
+    for entry in statements {
+        let statement = entry
+            .as_object()
+            .ok_or(PolicyDocumentRejection::StatementNotAnObject)?;
+        let effect = statement
+            .get("Effect")
+            .ok_or(PolicyDocumentRejection::MissingEffect)?;
+        match effect.as_str() {
+            Some("Allow" | "Deny") => {}
+            _ => {
+                return Err(PolicyDocumentRejection::InvalidEffect(effect.to_string()));
+            }
+        }
+        if !statement.contains_key("Action") && !statement.contains_key("NotAction") {
+            return Err(PolicyDocumentRejection::MissingAction);
+        }
+    }
+    Ok(())
+}
+
+/// One version of a policy's document, as this service persists it.
+#[derive(Debug, Clone)]
+pub struct PolicyVersion {
+    /// The document this version carries, verbatim as the writer supplied it: a
+    /// reader hands back what was written, never a reformatted copy.
+    pub document: String,
+    /// When this version was created.
+    pub created_at: SystemTime,
+}
+
+/// One IoT policy in the registry, as this service persists it.
+///
+/// A policy is a NAME plus a set of numbered document versions and a pointer to the
+/// one that is in effect, which is what the model describes: `GetPolicy` reports
+/// "the policy document of the default version" beside a `defaultVersionId`, and
+/// `CreatePolicyVersion` / `SetDefaultPolicyVersion` add versions and re-point that
+/// pointer.
+#[derive(Debug, Clone)]
+pub struct RegisteredPolicy {
+    /// The name the policy was created under; also its key in the registry.
+    pub policy_name: String,
+    /// `arn:aws:iot:<region>:<account>:policy/<policyName>`, minted on create.
+    pub policy_arn: String,
+    /// Every version that exists, keyed by its numeric `policyVersionId`. Ordered,
+    /// so `ListPolicyVersions` reads them oldest-first without sorting.
+    pub versions: BTreeMap<u32, PolicyVersion>,
+    /// Which version is in effect — the `defaultVersionId` a reader reports and the
+    /// version whose document `GetPolicy` hands back.
+    pub default_version_id: u32,
+    /// When the policy was created — `GetPolicy$creationDate`.
+    pub creation_date: SystemTime,
+    /// When the policy last changed — `GetPolicy$lastModifiedDate`. Equal to
+    /// [`RegisteredPolicy::creation_date`] until a later write moves it.
+    pub last_modified_date: SystemTime,
+    /// `GetPolicy$generationId`, "The generation ID of the policy": an opaque,
+    /// server-minted token identifying the policy's current generation. It is stable
+    /// across reads and re-minted by a write, so a caller can tell one generation
+    /// from another.
+    pub generation_id: String,
+    /// `Tag$Key` -> `Tag$Value` for the tags the create request carried. Tags
+    /// "are used to manage the resource" rather than describe the policy, so they are
+    /// not part of its document or its identity.
+    pub tags: BTreeMap<String, Option<String>>,
+}
+
+impl RegisteredPolicy {
+    /// A newly created policy: the minted identity, `document` as version
+    /// [`FIRST_POLICY_VERSION_ID`] and that version set as the default.
+    pub fn new(
+        policy_name: String,
+        policy_arn: String,
+        document: String,
+        tags: BTreeMap<String, Option<String>>,
+        created_at: SystemTime,
+    ) -> Self {
+        Self {
+            policy_name,
+            policy_arn,
+            versions: BTreeMap::from([(
+                FIRST_POLICY_VERSION_ID,
+                PolicyVersion {
+                    document,
+                    created_at,
+                },
+            )]),
+            default_version_id: FIRST_POLICY_VERSION_ID,
+            creation_date: created_at,
+            last_modified_date: created_at,
+            generation_id: fresh_uuid(),
+            tags,
+        }
+    }
+
+    /// The document of the version that is in effect — what `GetPolicy` reports.
+    pub fn default_document(&self) -> &str {
+        self.versions
+            .get(&self.default_version_id)
+            .map_or("", |version| version.document.as_str())
+    }
+
+    /// The default version's id in the modelled `PolicyVersionId` form (`^[0-9]+$`).
+    pub fn default_version_id(&self) -> String {
+        self.default_version_id.to_string()
+    }
 }
 
 /// The ARN of a topic rule: `arn:aws:iot:<region>:<account>:rule/<ruleName>`.
