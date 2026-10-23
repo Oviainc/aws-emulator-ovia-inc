@@ -638,6 +638,11 @@ async fn allocate_hosts_refuses_a_request_it_cannot_satisfy() {
     let zone = zone_name(0);
     let rows: Vec<(&str, Params, &str)> = vec![
         (
+            // The two members ask for two DIFFERENT hosts — one that supports a single
+            // instance type, one that supports a whole family — so no pair of values makes
+            // the request answerable: the REQUEST is invalid, which is `InvalidRequest`,
+            // where the zone-name/zone-id row below is a pair that agrees for some values
+            // and so is a parameter COMBINATION.
             "both instanceType and instanceFamily",
             vec![
                 p("InstanceType", "mac2.metal"),
@@ -645,7 +650,7 @@ async fn allocate_hosts_refuses_a_request_it_cannot_satisfy() {
                 p("AvailabilityZone", zone.clone()),
                 p("Quantity", "1"),
             ],
-            "InvalidParameterCombination",
+            "InvalidRequest",
         ),
         (
             "neither instanceType nor instanceFamily",

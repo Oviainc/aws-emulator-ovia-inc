@@ -88,3 +88,19 @@ All six clusters are status 400 -> 400 with '$.Response.Errors.Error.Code: value
 
 ## Steps to Reproduce
 Replay the fixture steps named under Traces. Minimal repros: (1) ec2:AcceptTransitGatewayMulticastDomainAssociations TransitGatewayAttachmentId='tgw-attach-00000000000000002'. (2) ec2:AllocateHosts with both InstanceType and InstanceFamily set. (3) ec2:CreateVpc CidrBlock='10.0.0.0/8'. (4) ec2:CopyVolumes with SourceVolumeId='vol-0123456789abcdef0'. (5) ec2:DescribeCoipPools PoolIds=['coip-pool-00000000000000000']. (6) ec2:DescribeVolumes VolumeIds=['vol-1234567890abcdef0'].
+
+## Resolution
+
+Fixed, each by a rule stated one level above its example and applied wherever that rule holds:
+
+* Cause 1 — an operation resolves the resource it ACTS ON before the scope it acts in, so `AcceptTransitGatewayMulticastDomainAssociations` reports the attachment, not the multicast domain, when neither id resolves.
+* Cause 2 — two members that may not both be PRESENT make the request itself invalid (`InvalidRequest`); `InvalidParameterCombination` stays for two members that are alternative spellings of one value (the zone name and the zone id), which hold together when they agree.
+* Cause 3 — a CIDR block of a size the resource does not permit is that resource's own `Invalid<Resource>.Range` (`CreateVpc` -> `InvalidVpc.Range`, `CreateSubnet` -> `InvalidSubnet.Range`, the code a block outside the VPC's range already carried); `InvalidParameterValue` stays for a value that is not a CIDR block at all.
+* Cause 5 — a value that is not an id of the kind a member names is refused on its FORM before any lookup, with that resource's `.Malformed` code (`DescribeCoipPools` -> `InvalidPoolID.Malformed`), and `InvalidPoolID.NotFound` is left for an id that could name a pool.
+* Cause 6, in part — WHICH bad-id code a refusal carries belongs to the OPERATION: `DescribeVolumes` validates its id list as a request PARAMETER, so an entry that is not a volume id is now `InvalidParameterValue` naming the parameter and the form it expected ("Value (…) for parameter volumes is invalid. Expected: 'vol-...'."), where an operation that resolves the one volume it acts on answers `InvalidVolumeID.Malformed`.
+
+DECLINED — the malformed-vs-not-found classification of the two recorded VOLUME IDS (cause 4, and the remaining half of cause 6):
+
+Both recorded ids (`vol-0123456789abcdef0` for `CopyVolumes`, `vol-1234567890abcdef0` for `DescribeVolumes`) are in the form EC2 publishes for a volume id — `vol-` plus 17 lowercase hexadecimal digits — and a third volume id of the same form, in `ec2-page-describe-volumes-tag-filtered-two-pages`, is resolved rather than refused in the same corpus. The recorded corpus therefore does not reveal the rule by which EC2 holds one such id invalid and another valid: no published AWS rule (the model declares no `@pattern` on `VolumeId`; AWS's `InvalidVolumeID.Malformed` entry states only the prefix-and-hex form), and the emulator cannot reproduce an unpublished internal id check. Separating the recorded ids would require a predicate fitted to them — one that would also refuse ids EC2 could have issued, misclassifying a real volume as malformed, which is the same defect in the other direction. The emulator therefore keeps the published form (`state::volume_id_is_well_formed`) and answers a well-formed id the account holds no volume for with `InvalidVolume.NotFound`.
+
+Also outside what the recordings reveal, and left as they are: the `AllocateHosts` refusals of an instance type the catalog does not offer and of an Availability Zone the Region does not have (two fixtures of cause 2's cluster that are not the both-set case) keep EC2's documented `InvalidParameterValue` for a value the service cannot accept; the recorded code for those two steps is withheld by the replay, and the documented alternative (`Unsupported`) was tried and did not match either.

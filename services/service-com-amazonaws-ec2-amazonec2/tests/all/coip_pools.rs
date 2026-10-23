@@ -340,25 +340,68 @@ async fn pool_ids_narrow_the_report_to_the_ids_named() {
     }
 }
 
-/// An id that names no pool of the account is refused with `InvalidPoolID.NotFound` —
-/// whatever else the request names — rather than reported as an absent row.
+/// An id that names no pool of the account is refused — whatever else the request names —
+/// rather than reported as an absent row, and WHICH refusal says whether the id could name
+/// a pool at all: a well-formed id nothing was created for is `InvalidPoolID.NotFound`,
+/// while a value that is not a pool id at all is `InvalidPoolID.Malformed`, answered before
+/// any lookup.
 #[tokio::test]
 async fn a_pool_id_that_names_no_pool_is_refused() {
     let (router, engine) = super::ec2_query::emulator();
     let seeded = seed(&engine);
 
     // Rows: a well-formed id nothing was created for, a known id beside an unknown one
-    // (order reversed in the next row, so the answer cannot depend on position), and a
-    // string that is not a pool id at all.
+    // (order reversed in the next row, so the answer cannot depend on position), and then
+    // one row per way a value can fail to be a pool id at all — the prefix of another
+    // resource, a prefix that is no EC2 id prefix, the wrong suffix length, a non-hex digit,
+    // an upper-case digit and no prefix at all.
     let unknown = "ipv4pool-coip-00000000000000000";
     let known = seeded[0].clone();
-    let cases: Vec<(&str, Vec<&str>)> = vec![
-        ("only an unknown id", vec![unknown]),
-        ("a known id then an unknown one", vec![&known, unknown]),
-        ("an unknown id then a known one", vec![unknown, &known]),
-        ("not an id at all", vec!["not-a-pool"]),
+    let cases: Vec<(&str, Vec<&str>, &str)> = vec![
+        ("only an unknown id", vec![unknown], "InvalidPoolID.NotFound"),
+        (
+            "a known id then an unknown one",
+            vec![&known, unknown],
+            "InvalidPoolID.NotFound",
+        ),
+        (
+            "an unknown id then a known one",
+            vec![unknown, &known],
+            "InvalidPoolID.NotFound",
+        ),
+        (
+            "an EC2 address pool id, not a customer-owned one",
+            vec!["ipv4pool-ec2-00000000000000000"],
+            "InvalidPoolID.Malformed",
+        ),
+        (
+            "a prefix EC2 mints no id with",
+            vec!["coip-pool-00000000000000000"],
+            "InvalidPoolID.Malformed",
+        ),
+        (
+            "a suffix of neither published length",
+            vec!["ipv4pool-coip-000000000"],
+            "InvalidPoolID.Malformed",
+        ),
+        (
+            "a non-hexadecimal digit",
+            vec!["ipv4pool-coip-00000000000000g"],
+            "InvalidPoolID.Malformed",
+        ),
+        (
+            "an upper-case digit",
+            vec!["ipv4pool-coip-0000000000000000A"],
+            "InvalidPoolID.Malformed",
+        ),
+        ("not an id at all", vec!["not-a-pool"], "InvalidPoolID.Malformed"),
+        (
+            "a malformed id beside a known one",
+            vec![&known, "not-a-pool"],
+            "InvalidPoolID.Malformed",
+        ),
     ];
-    for (case, asked) in cases {
+    for (case, asked, expected_code) in cases {
         let (status, body) = describe(&router, &indexed("PoolId", &asked)).await;
         assert_eq!(
             status, 400,
@@ -366,8 +409,8 @@ async fn a_pool_id_that_names_no_pool_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidPoolID.NotFound",
-            "case {case:?}: expected InvalidPoolID.NotFound, got {body}"
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
         );
     }
 }

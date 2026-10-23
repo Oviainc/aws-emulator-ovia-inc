@@ -1035,6 +1035,11 @@ pub const INVALID_GROUP_NOT_FOUND: &str = "InvalidGroup.NotFound";
 /// as recorded for a `CoipPoolId` that names no pool).
 pub const INVALID_POOL_ID_NOT_FOUND: &str = "InvalidPoolID.NotFound";
 
+/// EC2's error code for a value that is not an address-pool id at all, answered BEFORE the
+/// id is looked up — the customer-owned-IP surface's own `.Malformed`, the same ordering
+/// [`require_well_formed_id`] keeps for every other resource named by one id.
+pub const INVALID_POOL_ID_MALFORMED: &str = "InvalidPoolID.Malformed";
+
 /// EC2's error code for a pagination token this service did not issue.
 pub const INVALID_PAGINATION_TOKEN: &str = "InvalidPaginationToken";
 
@@ -4523,6 +4528,43 @@ pub fn invalid_pool_id_not_found<E>(pool_id: &str) -> crate::scaffolded::Scaffol
     )
 }
 
+/// Refuse a request that named something that is not a customer-owned address pool id at
+/// all: HTTP 400 `InvalidPoolID.Malformed`, which EC2 answers BEFORE it looks the id up, so
+/// "not a pool id" never reads as "no such pool".
+///
+/// The form itself is [`coip_pool_id_is_well_formed`], so the one reader of the id decides
+/// what a pool id is and this function only words the refusal.
+pub fn invalid_pool_id_malformed<E>(pool_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_POOL_ID_MALFORMED,
+        400,
+        format!(
+            "Invalid id: '{pool_id}'. A customer-owned address pool id is \
+             '{COIP_POOL_ID_PREFIX}' followed by 8 or 17 hexadecimal digits"
+        ),
+    )
+}
+
+/// Refuse one entry of a resource-id LIST parameter that is not an id of the kind the
+/// parameter names: HTTP 400 `InvalidParameterValue`, naming the parameter and the form it
+/// expects ("Value (…) for parameter volumes is invalid. Expected: 'vol-...'.").
+///
+/// EC2 answers a bad id two ways, and WHICH one is a fact of the operation, not of the id:
+/// an operation that resolves the ONE resource it acts on answers that resource's
+/// `Invalid<Kind>.Malformed` ([`require_known_volume`], [`require_well_formed_id`]), while
+/// an operation whose id list is validated as a request PARAMETER answers
+/// `InvalidParameterValue` and names the parameter — the wording AWS publishes for
+/// `DescribeVolumes`' `volumes` parameter. This is the ONE place that second wording lives.
+pub fn invalid_id_parameter_value<E>(
+    parameter: &str,
+    value: &str,
+    prefix: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "Value ({value}) for parameter {parameter} is invalid. Expected: '{prefix}-...'."
+    ))
+}
+
 /// The most characters of a refused `NextToken` its message repeats back.
 ///
 /// The message names the token so a caller holding several can tell which one was refused;
@@ -5072,18 +5114,39 @@ pub fn volume_payload_bytes(
         .saturating_add(client_token.map_or(0, str::len))
 }
 
+/// The id prefix of an EBS volume, as [`volume_id_is_well_formed`] reads one and as a
+/// refusal names the form it expected.
+pub const VOLUME_ID_PREFIX: &str = "vol";
+
+/// The name EC2 gives `DescribeVolumesRequest$VolumeIds` when it refuses one of its entries
+/// at the PARAMETER layer: "Value (…) for parameter volumes is invalid. Expected:
+/// 'vol-...'." — the member's wire name is `VolumeId.N`, and `volumes` is what the service
+/// calls the parameter those values make up.
+pub const VOLUME_IDS_PARAMETER: &str = "volumes";
+
 /// Whether `id` is a well-formed EBS volume id.
 ///
-/// A volume id is `vol-` followed by 8 or 17 lowercase hexadecimal digits — the short
-/// and the long id form, as the model's own `^vol-([0-9a-f]{8}|[0-9a-f]{17})$` style
-/// id patterns read. EC2 answers `InvalidVolumeID.Malformed` for anything else,
-/// BEFORE it looks the id up.
+/// A volume id is `vol-` followed by 8 or 17 lowercase hexadecimal digits — the short and
+/// the long id form, as the model's own `^vol-([0-9a-f]{8}|[0-9a-f]{17})$` style id patterns
+/// read. EC2 answers anything else as a bad id BEFORE it looks the id up, which is a
+/// different answer from `InvalidVolume.NotFound` for a well-formed id the account holds no
+/// volume for: a client that cannot tell a typo from a missing volume goes on polling for a
+/// volume that can never appear.
+///
+/// WHICH bad-id code that is belongs to the OPERATION, not to this reader: see
+/// [`invalid_id_parameter_value`].
 ///
 /// The rule itself is [`prefixed_id_is_well_formed`], which every resource of this module
 /// asks, so the EC2 id form is defined in exactly one place; only the prefix is this
-/// function's own.
+/// function's own. The recorded traffic behind
+/// `issues/.../20261023T102725Z-ec2-picks-the-wrong-resource-specific-error-code.md` has AWS
+/// answering two ids OF THIS FORM (`vol-0123456789abcdef0`, `vol-1234567890abcdef0`) as bad
+/// ids rather than as volumes that were not found, while a third recorded id of the same
+/// form is resolved: the corpus therefore does not reveal the rule EC2 holds a volume id to
+/// beyond this form, and no clause is invented here to separate those ids — that half of the
+/// issue is declined in the issue report.
 pub fn volume_id_is_well_formed(id: &str) -> bool {
-    prefixed_id_is_well_formed("vol", id)
+    prefixed_id_is_well_formed(VOLUME_ID_PREFIX, id)
 }
 
 /// Refuse a volume id the request named that this service cannot resolve: a malformed
@@ -6475,6 +6538,30 @@ pub enum CidrProblem {
     PrefixLength,
 }
 
+/// EC2's error code for a VPC CIDR block whose SIZE is outside the one the service permits:
+/// "InvalidVpc.Range — The specified CIDR block range is not valid. The block range must be
+/// between a /16 netmask and /28 netmask" (EC2 API error codes).
+///
+/// A block size the resource does not permit is a RANGE violation, which is a different
+/// answer from `InvalidParameterValue` for a value that is not a CIDR block at all: a
+/// client that reads `InvalidVpc.Range` knows to retry with a smaller block, where a
+/// parameter-value refusal says the value could not be read. [`INVALID_SUBNET_RANGE`] is
+/// the same code for a subnet's block.
+pub const INVALID_VPC_RANGE: &str = "InvalidVpc.Range";
+
+/// Refuse a VPC CIDR block whose size is outside the published VPC block size: HTTP 400
+/// [`INVALID_VPC_RANGE`].
+pub fn invalid_vpc_range<E>(cidr_block: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_VPC_RANGE,
+        400,
+        format!(
+            "The CIDR '{cidr_block}' is invalid. The allowed block size is between a \
+             /{MIN_VPC_IPV4_PREFIX} netmask and /{MAX_VPC_IPV4_PREFIX} netmask."
+        ),
+    )
+}
+
 /// A requested IPv4 VPC CIDR block in the canonical form AWS stores it in.
 ///
 /// `CreateVpcRequest$CidrBlock`: "We modify the specified CIDR block to its canonical
@@ -7845,14 +7932,35 @@ pub fn invalid_subnet_conflict<E>(cidr_block: &str, subnet_id: &str) -> Scaffold
     )
 }
 
-/// Refuse a subnet CIDR block that is not inside its VPC's own block: HTTP 400
-/// `InvalidSubnet.Range`.
-pub fn invalid_subnet_range<E>(cidr_block: &str, vpc_id: &str) -> Scaffolded<E> {
-    Scaffolded::service_error(
-        INVALID_SUBNET_RANGE,
-        400,
-        format!("The CIDR '{cidr_block}' is not within the CIDR block of VPC '{vpc_id}'"),
-    )
+/// Which of the subnet range rules a CIDR block fails, for the one refusal below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubnetRangeProblem<'a> {
+    /// The block's SIZE is outside the published subnet block size
+    /// ([`MIN_SUBNET_IPV4_PREFIX`]..=[`MAX_SUBNET_IPV4_PREFIX`]).
+    BlockSize,
+    /// The block parses and is of a permitted size, but lies outside the CIDR block of the
+    /// VPC the subnet would sit in.
+    OutsideVpc(&'a str),
+}
+
+/// Refuse a subnet CIDR block the subnet's range rules do not admit: HTTP 400
+/// `InvalidSubnet.Range`, whichever rule it fails — a block of a size the service does not
+/// permit, or one outside its VPC's own block. ONE wording site for that code, the way
+/// [`invalid_vpc_range`] is the one site for a VPC's.
+pub fn invalid_subnet_range<E>(
+    cidr_block: &str,
+    problem: SubnetRangeProblem<'_>,
+) -> Scaffolded<E> {
+    let message = match problem {
+        SubnetRangeProblem::BlockSize => format!(
+            "The CIDR '{cidr_block}' is invalid. The allowed block size is between a \
+             /{MIN_SUBNET_IPV4_PREFIX} netmask and /{MAX_SUBNET_IPV4_PREFIX} netmask."
+        ),
+        SubnetRangeProblem::OutsideVpc(vpc_id) => {
+            format!("The CIDR '{cidr_block}' is not within the CIDR block of VPC '{vpc_id}'")
+        }
+    };
+    Scaffolded::service_error(INVALID_SUBNET_RANGE, 400, message)
 }
 
 /// Refuse a create that would take the store past [`MAX_SUBNETS`]: HTTP 400

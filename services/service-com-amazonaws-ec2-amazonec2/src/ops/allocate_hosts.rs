@@ -178,8 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             availability_zones_in_region, host_limit_exceeded, host_payload_bytes,
             instance_family_is_modelled, instance_family_of, instance_type_is_modelled,
-            request_region, require_service_state, system_time_to_date_time, tag_list_bytes,
-            tags_from_specifications, ALLOWS_MULTIPLE_INSTANCE_TYPES_OFF,
+            invalid_request, request_region, require_service_state, system_time_to_date_time,
+            tag_list_bytes, tags_from_specifications, ALLOWS_MULTIPLE_INSTANCE_TYPES_OFF,
             ALLOWS_MULTIPLE_INSTANCE_TYPES_ON, AMD_SEV_SNP_DISABLED,
             DEDICATED_HOST_TAGGABLE_RESOURCE, DEFAULT_AUTO_PLACEMENT, DEFAULT_HOST_RECOVERY,
             HOST_STATE_AVAILABLE, MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES,
@@ -242,8 +242,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.instance_family.as_deref(),
         ) {
             (Some(_), Some(_)) => {
-                return Err(Scaffolded::invalid_parameter_combination(
-                    "You cannot specify instanceType and instanceFamily in the same request",
+                // "You cannot specify InstanceFamily and InstanceType in the same request"
+                // (`AllocateHostsRequest$InstanceFamily`): the pair is refused whatever the
+                // two values are — one asks for a host that supports a single instance type,
+                // the other for one that supports a whole family — so the REQUEST is what is
+                // invalid, which is `InvalidRequest`. `InvalidParameterCombination` stays for
+                // a value that cannot hold given another member's value (the zone name and
+                // the zone id above, which agree for some pair of values).
+                //
+                // The pairs a paginating describe refuses — `MaxResults` beside an id list,
+                // in `DescribeHosts` and `DescribeInstances` — keep that combination code:
+                // they are a documented SHAPE of request ("You cannot specify this parameter
+                // and the … IDs parameter in the same request"), no recorded response in this
+                // corpus says which code EC2 answers them with, and the one recorded pair of
+                // this kind is this operation's own, so they are left as they are rather than
+                // moved on a guess.
+                return Err(invalid_request(
+                    "You cannot specify InstanceFamily and InstanceType in the same request",
                 ));
             }
             (None, None) => {

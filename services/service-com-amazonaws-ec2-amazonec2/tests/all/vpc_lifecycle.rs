@@ -248,24 +248,15 @@ async fn create_vpc_canonicalises_the_cidr_block_and_round_trips_through_describ
 #[tokio::test]
 async fn a_cidr_block_outside_the_published_block_size_is_refused_and_stores_nothing() {
     let router = emulator();
-    // (case, the CidrBlock value, the EC2 error code)
+    // (case, the CidrBlock value, the EC2 error code). A block whose SIZE is outside the
+    // published range is a RANGE violation — `InvalidVpc.Range`, which tells a client to
+    // retry with a smaller block — while a value that is not an IPv4 CIDR block at all could
+    // not be read, which is `InvalidParameterValue`.
     let cases: [(&str, Option<&str>, &str); 10] = [
-        (
-            "one past the /16 bound",
-            Some("10.0.0.0/15"),
-            "InvalidParameterValue",
-        ),
-        (
-            "far past the /16 bound",
-            Some("10.0.0.0/8"),
-            "InvalidParameterValue",
-        ),
-        (
-            "one past the /28 bound",
-            Some("10.0.0.0/29"),
-            "InvalidParameterValue",
-        ),
-        ("a single address", Some("10.0.0.0/32"), "InvalidParameterValue"),
+        ("one past the /16 bound", Some("10.0.0.0/15"), "InvalidVpc.Range"),
+        ("far past the /16 bound", Some("10.0.0.0/8"), "InvalidVpc.Range"),
+        ("one past the /28 bound", Some("10.0.0.0/29"), "InvalidVpc.Range"),
+        ("a single address", Some("10.0.0.0/32"), "InvalidVpc.Range"),
         ("no prefix length", Some("10.0.0.0"), "InvalidParameterValue"),
         (
             "prefix length off the scale",

@@ -218,12 +218,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )))
             }
             Err(state::CidrProblem::PrefixLength) => {
-                return Err(state::invalid_parameter_value(format!(
-                    "The CIDR '{requested_cidr}' is invalid. The allowed block size is \
-                     between a /{min} netmask and /{max} netmask.",
-                    min = state::MIN_SUBNET_IPV4_PREFIX,
-                    max = state::MAX_SUBNET_IPV4_PREFIX,
-                )))
+                // The same rule as a VPC's own block, one resource down: a block whose size
+                // the subnet range rules do not admit is `InvalidSubnet.Range`, not an
+                // unreadable value.
+                return Err(state::invalid_subnet_range(
+                    requested_cidr,
+                    state::SubnetRangeProblem::BlockSize,
+                ))
             }
         };
 
@@ -301,7 +302,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter_map(|association| association.cidr_block.as_deref())
             .any(|associated| state::ipv4_cidr_block_contains(associated, &cidr_block));
         if !within_vpc {
-            return Err(state::invalid_subnet_range(&cidr_block, &input.vpc_id));
+            return Err(state::invalid_subnet_range(
+                &cidr_block,
+                state::SubnetRangeProblem::OutsideVpc(&input.vpc_id),
+            ));
         }
         // "A subnet CIDR block must not overlap the CIDR block of an existing subnet in the
         // VPC" (`CreateSubnet`) — the conflict is per VPC, so the same block in another VPC

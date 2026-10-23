@@ -157,10 +157,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            decode_page_token, encode_page_token, invalid_pagination_token_for, require_known_volume,
-            require_service_state, CompiledFilter, MatchBudget, MAX_FILTERS,
+            decode_page_token, encode_page_token, invalid_id_parameter_value,
+            invalid_pagination_token_for, invalid_volume_id_not_found, require_service_state,
+            volume_id_is_well_formed, CompiledFilter, MatchBudget, MAX_FILTERS,
             MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE,
-            MAX_RESOURCE_IDS,
+            MAX_RESOURCE_IDS, VOLUME_ID_PREFIX, VOLUME_IDS_PARAMETER,
         };
 
         // `ctx` carries request metadata only; this operation reads none of it. The store
@@ -173,6 +174,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "VolumeIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
                 requested_ids.len()
             )));
+        }
+        // Each entry's own FORM, as a PARAMETER of the request and before the store is
+        // reached: this operation's id list is validated at the parameter layer, so an entry
+        // that is not a volume id at all is `InvalidParameterValue` naming the parameter and
+        // the form it expects ("Value (…) for parameter volumes is invalid. Expected:
+        // 'vol-...'."), not the resource-level `InvalidVolumeID.Malformed` that an operation
+        // acting on ONE named volume answers. Either way it is a different answer from
+        // `InvalidVolume.NotFound`, which is for a well-formed id the account holds no volume
+        // for.
+        if let Some(malformed) = requested_ids
+            .iter()
+            .find(|volume_id| !volume_id_is_well_formed(volume_id))
+        {
+            return Err(invalid_id_parameter_value(
+                VOLUME_IDS_PARAMETER,
+                malformed,
+                VOLUME_ID_PREFIX,
+            ));
         }
         // The model declares no `@range` on `MaxResults`, so the handler is the only place
         // a page size can be bounded — and an unbounded one is how a caller asks for the
@@ -254,9 +273,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // "Describes the specified EBS volumes": an id that names no volume of the account
-        // is an error, not an absent row — a malformed one before an unknown one.
-        for volume_id in &requested_ids {
-            require_known_volume(&store, volume_id)?;
+        // is an error, not an absent row. Every id's form was refused above, so what is left
+        // here is a well-formed id nothing was created for.
+        if let Some(unknown) = requested_ids
+            .iter()
+            .find(|volume_id| !store.volumes.contains_key(volume_id.as_str()))
+        {
+            return Err(invalid_volume_id_not_found(unknown));
         }
 
         // DryRun sits AFTER every parameter has been validated and every named volume

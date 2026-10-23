@@ -158,16 +158,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The ids' own form next: an id that is not an id of its kind at all is refused as
         // malformed, so "not an id of this kind" never reads as "no such resource" and is
-        // never answered by the DryRun arm below either.
-        state::require_well_formed_id(
-            state::TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_PREFIX,
-            domain_id,
-            state::INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_MALFORMED,
-        )?;
+        // never answered by the DryRun arm below either. The ATTACHMENT's form is read
+        // first, for the same reason its existence is resolved first below: it is the
+        // resource this call acts on, the domain the scope it acts in.
         state::require_well_formed_id(
             state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
             attachment_id,
             state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
+        )?;
+        state::require_well_formed_id(
+            state::TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_PREFIX,
+            domain_id,
+            state::INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_MALFORMED,
         )?;
         // The model publishes no bound on `SubnetIds`, and each id named is compared against
         // every association of the attachment, so the number of ids one request may name is
@@ -196,6 +198,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An association whose own move has fallen due is already `associated`, so whether
         // this call is admissible is asked of the state each association is ACTUALLY in.
         store.materialize_due_transitions();
+
+        // The ATTACHMENT first, against the one id space every transit gateway attachment is
+        // minted into: it is the resource this call acts on — the request whose pending
+        // associations are being accepted belongs to it — while the multicast domain is the
+        // scope it is accepted into. So an attachment id naming no attachment is what the
+        // caller is told about, even when the domain id names no domain either: reporting
+        // the scope would send the client to fix a parameter that may well be right and
+        // never mention the one that is wrong.
+        if !store
+            .transit_gateway_attachments
+            .contains_key(attachment_id)
+        {
+            return Err(state::id_not_found(
+                state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
+                "transit gateway attachment ID",
+                attachment_id,
+            ));
+        }
 
         let domain = store
             .transit_gateway_multicast_domains
