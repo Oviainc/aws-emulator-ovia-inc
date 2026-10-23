@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeFlowEntitlement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeFlowEntitlement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeFlowEntitlement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +73,30 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
+/// in the request does not exist in the system" — the flow or the entitlement
+/// `identifier` addressed, in this service's not-found envelope
+/// ([`crate::state::not_found_message`]).
+///
+/// The identifier is whichever of the request's two ARNs resolved nothing, so a caller can
+/// tell a flow this service does not hold from an entitlement that flow does not carry —
+/// the same wording RemoveFlowOutput and UpdateFlowEntitlement answer with.
+fn not_found(identifier: &str) -> RevokeFlowEntitlementError {
+    RevokeFlowEntitlementErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
+
+/// The server-side failure for a store this handler cannot reach,
+/// `InternalServerErrorException` (HTTP 500).
+fn internal_error(message: impl Into<String>) -> RevokeFlowEntitlementError {
+    RevokeFlowEntitlementErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: message.into(),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,18 +171,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeFlowEntitlement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeFlowEntitlementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Nothing in this operation's answer depends on request metadata: both ARNs are
+        // `@httpLabel`s the deserializer already put on `input`, and the response is read
+        // back out of the stored flow.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error("the mediaconnect flow store is unavailable"));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write this call owes beyond the revocation: a status change the clock
+        // had already made due was owed at that instant whether or not anybody called, so
+        // it is materialised before the flow is read, exactly as the sibling flow
+        // operations do it.
+        store.settle_due_transitions(now);
+
+        // The entitlement is addressed by the PAIR of labels the model binds to the URI,
+        // `/v1/flows/{FlowArn}/entitlements/{EntitlementArn}`: the flow that holds it and
+        // the entitlement's own ARN. Either one naming nothing is "one or more of the
+        // resources in the request does not exist".
+        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
+            return Err(not_found(&input.flow_arn));
+        };
+
+        // `Entitlement.EntitlementArn` is unique per entitlement, so at most one position
+        // matches; an entitlement ARN of some other flow, or of one already revoked,
+        // resolves nothing here and the request is refused without changing the flow.
+        let Some(position) = flow
+            .entitlements
+            .iter()
+            .position(|entitlement| entitlement.entitlement_arn == input.entitlement_arn)
+        else {
+            return Err(not_found(&input.entitlement_arn));
+        };
+        let revoked = flow.entitlements.remove(position);
+
+        // "Once an entitlement is revoked, the content becomes unavailable to the
+        // subscriber and the associated output is removed." That associated output is the
+        // one MediaConnect creates on the SUBSCRIBER's flow from the entitlement — the only
+        // output carrying `Output$EntitlementArn` — and nothing in this emulator
+        // materialises one: `AddOutputRequest` has no entitlement member and
+        // GrantFlowEntitlements writes entitlements on the granting flow rather than
+        // outputs on another account's flow (the same reasoning RemoveFlowOutput records).
+        // So the revocation's whole effect on this store is that the flow no longer carries
+        // the entitlement: no reader reports it, and its name is free for a later grant.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeFlowEntitlement"))
+        // "The ARN of the entitlement that was revoked" and "the ARN of the flow that the
+        // entitlement was revoked from" — both read out of the STORE rather than echoed
+        // from the request, so the response can only name what this call actually revoked.
+        // Revoking moves nothing else about the flow: its status is left as it was, because
+        // no clock owes a change for a revoked entitlement.
+        Ok(RevokeFlowEntitlementOutput {
+            entitlement_arn: Some(revoked.entitlement_arn),
+            flow_arn: Some(flow.flow_arn.clone()),
+        })
     }
 }
