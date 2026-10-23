@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePrivateConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePrivateConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePrivateConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a private connection for reaching a self-hosted provider instance over
+//! private networking using Amazon VPC Lattice: resolves the VPC Lattice resources the
+//! requested mode references against the account, persists the connection, and answers
+//! its stored record with the status the clock owes it.
 //!
 //! ## Shape of an operation
 //!
@@ -113,13 +109,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityagent-securitya
 // here — hence the `CreatePrivateConnectionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityagent#CreatePrivateConnection")]
+//
+// `ServiceQuotaExceededException` (HTTP 402, "The request exceeds a service quota") is
+// widened in with `extra_errors`: the service models the shape but does not list it on
+// this operation, and it is what bounds the connection store (see
+// `crate::state::MAX_PRIVATE_CONNECTIONS`).
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityagent#CreatePrivateConnection",
+    extra_errors = ["ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum CreatePrivateConnectionErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -175,18 +180,288 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePrivateConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePrivateConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePrivateConnection"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePrivateConnectionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the private connection store is unavailable".to_string(),
+                },
+            )
+        })?;
+        // The region the referenced VPC Lattice and EC2 resources are resolved in comes
+        // from the request's own credential scope, so it is read before the store is
+        // locked.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let name = input.private_connection_name;
+        // The name IS this resource's identifier ("A unique name for the private
+        // connection within your account"), so an empty one would store a connection
+        // no later call can name. The model declares no `@length` for it, so the
+        // boundary validator lets it through and this refuses it.
+        if name.is_empty() {
+            return Err(invalid(
+                "privateConnectionName",
+                "must not be empty",
+                "privateConnectionName must not be empty",
+            ));
+        }
+
+        let mut state = state.lock();
+
+        // The name is unique within the account, so a second connection under a name
+        // the account already holds conflicts with the current state of that resource
+        // rather than replacing it.
+        if state.private_connections.contains_key(&name) {
+            return Err(CreatePrivateConnectionErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "A private connection named '{name}' already exists in this account"
+                    ),
+                },
+            )
+            .into());
+        }
+        // Every connection is a stored record, so how many a caller can create is
+        // bounded, as it is on the real service.
+        if state.private_connections.len() >= crate::state::MAX_PRIVATE_CONNECTIONS {
+            return Err(
+                CreatePrivateConnectionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The request would exceed the maximum number of private \
+                             connections ({}) for this account",
+                            crate::state::MAX_PRIVATE_CONNECTIONS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Nothing is persisted until every resource the mode references resolves: a
+        // reference the account cannot resolve is a `ResourceNotFoundException` and
+        // leaves the store exactly as it was.
+        let connection = match &input.mode {
+            PrivateConnectionMode::serviceManaged(configuration) => {
+                // The service creates the resource gateway, so the placement the
+                // request names has to exist: the VPC, and every subnet the gateway is
+                // to span.
+                if configuration.subnet_ids.is_empty() {
+                    return Err(invalid(
+                        "mode.serviceManaged.subnetIds",
+                        "must name at least one subnet",
+                        "mode.serviceManaged.subnetIds must name at least one subnet for \
+                         the resource gateway to span",
+                    ));
+                }
+                let vpc_id = &configuration.vpc_id;
+                if *vpc_id != crate::state::default_vpc_id(&region) {
+                    return Err(not_found(
+                        &name,
+                        "mode.serviceManaged.vpcId",
+                        vpc_id,
+                        "VPC",
+                    ));
+                }
+                for subnet_id in &configuration.subnet_ids {
+                    let resolved = crate::state::resolve_subnet(&region, subnet_id);
+                    if resolved.is_none_or(|subnet| subnet.vpc_id != *vpc_id) {
+                        return Err(not_found(
+                            &name,
+                            "mode.serviceManaged.subnetIds",
+                            subnet_id,
+                            "subnet",
+                        ));
+                    }
+                }
+                check_certificate_chain(
+                    "mode.serviceManaged.certificate",
+                    configuration.certificate.as_deref(),
+                )?;
+
+                let identity = state.mint_private_connection_identity();
+                crate::state::PrivateConnection {
+                    name: name.clone(),
+                    connection_type: crate::state::TYPE_SERVICE_MANAGED.to_string(),
+                    resource_gateway_id: Some(identity.resource_gateway_id),
+                    resource_configuration_id: Some(identity.resource_configuration_id),
+                    host_address: Some(configuration.host_address.clone()),
+                    vpc_id: Some(vpc_id.clone()),
+                    subnet_ids: configuration.subnet_ids.clone(),
+                    security_group_ids: configuration
+                        .security_group_ids
+                        .clone()
+                        .unwrap_or_default(),
+                    ip_address_type: configuration.ip_address_type.clone(),
+                    ipv4_addresses_per_eni: configuration.ipv4_addresses_per_eni,
+                    port_ranges: configuration.port_ranges.clone().unwrap_or_default(),
+                    // "Defaults to PUBLIC when not set"
+                    // (`ServiceManagedInput$dnsResolution`).
+                    dns_resolution: Some(
+                        configuration
+                            .dns_resolution
+                            .clone()
+                            .unwrap_or_else(|| {
+                                crate::state::DEFAULT_DNS_RESOLUTION.to_string()
+                            }),
+                    ),
+                    tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+                    created_at: now,
+                    active_at: now + crate::state::CREATE_TRANSITION,
+                }
+            }
+            PrivateConnectionMode::selfManaged(configuration) => {
+                // The caller manages the resource configuration, so the service only
+                // resolves the one it named — in either form the member admits.
+                let resource_configuration_id = state
+                    .resolve_resource_configuration(
+                        &region,
+                        &configuration.resource_configuration_id,
+                    )
+                    .ok_or_else(|| {
+                        not_found(
+                            &name,
+                            "mode.selfManaged.resourceConfigurationId",
+                            &configuration.resource_configuration_id,
+                            "VPC Lattice resource configuration",
+                        )
+                    })?;
+                check_certificate_chain(
+                    "mode.selfManaged.certificate",
+                    configuration.certificate.as_deref(),
+                )?;
+                crate::state::PrivateConnection {
+                    name: name.clone(),
+                    connection_type: crate::state::TYPE_SELF_MANAGED.to_string(),
+                    // The gateway behind a self-managed resource configuration is the
+                    // caller's own and is not named to this service, so there is none
+                    // to report.
+                    resource_gateway_id: None,
+                    resource_configuration_id: Some(resource_configuration_id),
+                    host_address: None,
+                    vpc_id: None,
+                    subnet_ids: Vec::new(),
+                    security_group_ids: Vec::new(),
+                    ip_address_type: None,
+                    ipv4_addresses_per_eni: None,
+                    port_ranges: Vec::new(),
+                    // The DNS resolution mode belongs to the caller's own resource
+                    // configuration, which this service did not create and does not
+                    // read, so it reports none.
+                    dns_resolution: None,
+                    tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+                    created_at: now,
+                    active_at: now + crate::state::CREATE_TRANSITION,
+                }
+            }
+        };
+
+        let summary = connection.summary(now);
+        state.private_connections.insert(name, connection);
+
+        Ok(CreatePrivateConnectionOutput {
+            name: summary.name,
+            r#type: summary.r#type,
+            status: summary.status,
+            resource_gateway_id: summary.resource_gateway_id,
+            host_address: summary.host_address,
+            vpc_id: summary.vpc_id,
+            resource_configuration_id: summary.resource_configuration_id,
+            certificate_expiry_time: summary.certificate_expiry_time,
+            dns_resolution: summary.dns_resolution,
+            failure_message: summary.failure_message,
+            tags: summary.tags,
+        })
     }
+}
+
+/// The modelled `ValidationException` for a request member this service refuses, with
+/// the member path in the `fieldList` a client reads.
+fn invalid(path: &str, requirement: &str, message: &str) -> CreatePrivateConnectionError {
+    CreatePrivateConnectionErrorModeled::ValidationException(ValidationException {
+        message: message.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            path: path.to_string(),
+            message: requirement.to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// The modelled `ResourceNotFoundException` for a reference the account cannot resolve.
+///
+/// The message is built from the request: which private connection was being created,
+/// which member carried the reference, the identifier itself, and what kind of resource
+/// it failed to name — then the documented tail of the modelled shape ("Verify that the
+/// resource identifier is correct and that the resource exists in the specified agent
+/// space or account.").
+fn not_found(
+    name: &str,
+    path: &str,
+    identifier: &str,
+    kind: &str,
+) -> CreatePrivateConnectionError {
+    CreatePrivateConnectionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!(
+            "A resource referenced by private connection '{name}' was not found: {path} \
+             '{identifier}' does not name a {kind} in this account. Verify that the \
+             resource identifier is correct and that the resource exists in the \
+             specified agent space or account."
+        ),
+    })
+    .into()
+}
+
+/// Refuses a `certificate` member that carries no PEM certificate chain, and accepts a
+/// create that supplied none (the member is optional in both modes).
+///
+/// A `CertificateChain` is "A PEM-encoded certificate chain for a private connection",
+/// so a value carrying no `CERTIFICATE` PEM block is not one, and is refused with the
+/// modelled `ValidationException` naming the member and its constraint rather than
+/// being stored. Only the PEM envelope is read: this emulator does not decode the
+/// X.509 inside it, which is why no connection reports a `certificateExpiryTime` (see
+/// `crate::state::PrivateConnection::summary`) rather than one it would have invented.
+fn check_certificate_chain(
+    path: &str,
+    certificate: Option<&str>,
+) -> Result<(), CreatePrivateConnectionError> {
+    let Some(certificate) = certificate else {
+        return Ok(());
+    };
+    if pem_certificate_block(certificate) {
+        return Ok(());
+    }
+    Err(invalid(
+        path,
+        "must be a PEM-encoded X.509 certificate chain",
+        &format!("{path} must be a PEM-encoded X.509 certificate chain"),
+    ))
+}
+
+/// Whether `value` carries at least one PEM `CERTIFICATE` block: the armour RFC 7468
+/// §5 states for an X.509 certificate — a `BEGIN CERTIFICATE` line, a non-empty
+/// base-64 body, and the matching `END CERTIFICATE` line. A PEM block of another label
+/// (a private key, say) is not a certificate chain.
+fn pem_certificate_block(value: &str) -> bool {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let Some(start) = value.find(BEGIN) else {
+        return false;
+    };
+    let body_start = start + BEGIN.len();
+    let Some(end) = value[body_start..].find(END) else {
+        return false;
+    };
+    let body = &value[body_start..body_start + end];
+    // A certificate's base-64 body is non-empty and carries only the base-64 alphabet
+    // (with `=` padding) and the line breaks the armour wraps it at.
+    let mut encoded = 0usize;
+    for character in body.chars() {
+        match character {
+            '\r' | '\n' | ' ' | '\t' => {}
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '+' | '/' | '=' => encoded += 1,
+            _ => return false,
+        }
+    }
+    encoded > 0
 }
