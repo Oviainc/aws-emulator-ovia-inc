@@ -678,6 +678,329 @@ async fn hub_scoped_operations_still_refuse_an_unsubscribed_account() {
     );
 }
 
+/// One entry of the published Security Hub CSPM standards catalog, written out by
+/// hand here rather than read from `STANDARDS_CATALOG`, so a seed edited to a
+/// different catalog fails this table instead of merely agreeing with itself.
+///
+/// Source: the AWS Security Hub user guide's "Security Hub standards reference" —
+/// the published catalog `DescribeStandards` reports ("Returns a list of the
+/// available standards in Security Hub CSPM. For each standard, the results include
+/// the standard ARN, the name, and a description", `smithy_query(query="operation",
+/// operation="DescribeStandards")`). The model itself enumerates no standard, so the
+/// catalog's membership is the service's published data, not a modelled constraint.
+struct PublishedStandard {
+    /// The standard's FULL published catalog name, which is what `Name` reports and
+    /// what a client keys the catalog on.
+    name: &'static str,
+    /// The `<slug>` and `<version>` of `standards/<slug>/v/<version>`.
+    slug: &'static str,
+    version: &'static str,
+    /// The `StandardsProvider` whose resources the standard evaluates.
+    provider: &'static str,
+    /// True for the one standard AWS kept in the partition-wide `ruleset/` ARN form.
+    legacy_ruleset_arn: bool,
+    /// A phrase the standard's published description text contains — the standard it
+    /// is about, so a description copied from another entry fails here.
+    description_mentions: &'static str,
+}
+
+/// The published catalog, in `Name` order. Rows the reported issue never cited (the
+/// CIS AWS Foundations Benchmark v1.4.0 and v3.0.0 entries, the Azure benchmark) are
+/// in the table on purpose: the rule is about the catalog, not about the entries one
+/// recording happened to flag.
+const PUBLISHED_CATALOG: [PublishedStandard; 13] = [
+    PublishedStandard {
+        name: "AI Security Best Practices v1.0.0",
+        slug: "ai-security-best-practices",
+        version: "1.0.0",
+        provider: "AWS",
+        legacy_ruleset_arn: false,
+        description_mentions: "AI Security Best Practices",
+    },
+    PublishedStandard {
+        name: "AWS Foundational Security Best Practices v1.0.0",
+        slug: "aws-foundational-security-best-practices",
+        version: "1.0.0",
+        provider: "AWS",
+        legacy_ruleset_arn: false,
+        description_mentions: "AWS Foundational Security Best Practices",
+    },
+    PublishedStandard {
+        name: "AWS Resource Tagging Standard v1.0.0",
+        slug: "aws-resource-tagging-standard",
+        version: "1.0.0",
+        provider: "AWS",
+        legacy_ruleset_arn: false,
+        description_mentions: "AWS Resource Tagging",
+    },
+    PublishedStandard {
+        name: "Azure Foundational Security Best Practices v1.0.0",
+        slug: "azure-foundational-security-best-practices",
+        version: "1.0.0",
+        provider: "Azure",
+        legacy_ruleset_arn: false,
+        description_mentions: "Azure Foundational Security Best Practices",
+    },
+    PublishedStandard {
+        name: "CIS AWS Foundations Benchmark v1.2.0",
+        slug: "cis-aws-foundations-benchmark",
+        version: "1.2.0",
+        provider: "AWS",
+        legacy_ruleset_arn: true,
+        description_mentions: "AWS Foundations Benchmark v1.2.0",
+    },
+    PublishedStandard {
+        name: "CIS AWS Foundations Benchmark v1.4.0",
+        slug: "cis-aws-foundations-benchmark",
+        version: "1.4.0",
+        provider: "AWS",
+        legacy_ruleset_arn: false,
+        description_mentions: "AWS Foundations Benchmark v1.4.0",
+    },
+    PublishedStandard {
+        name: "CIS AWS Foundations Benchmark v3.0.0",
+        slug: "cis-aws-foundations-benchmark",
+        version: "3.0.0",
+        provider: "AWS",
+        legacy_ruleset_arn: false,
+        description_mentions: "AWS Foundations Benchmark v3.0.0",
+    },
+    PublishedStandard {
+        name: "CIS AWS Foundations Benchmark v5.0.0",
+        slug: "cis-aws-foundations-benchmark",
+        version: "5.0.0",
+        provider: "AWS",
+        legacy_ruleset_arn: false,
+        description_mentions: "AWS Foundations Benchmark v5.0.0",
+    },
+    PublishedStandard {
+        name: "CIS Azure Foundations Benchmark v4.0.0",
+        slug: "cis-azure-foundations-benchmark",
+        version: "4.0.0",
+        provider: "Azure",
+        legacy_ruleset_arn: false,
+        description_mentions: "Azure Foundations Benchmark v4.0.0",
+    },
+    PublishedStandard {
+        name: "NIST Special Publication 800-171 Revision 2",
+        slug: "nist-800-171",
+        version: "2.0.0",
+        provider: "AWS",
+        legacy_ruleset_arn: false,
+        description_mentions: "800-171 Revision 2",
+    },
+    PublishedStandard {
+        name: "NIST Special Publication 800-53 Revision 5",
+        slug: "nist-800-53",
+        version: "5.0.0",
+        provider: "AWS",
+        legacy_ruleset_arn: false,
+        description_mentions: "800-53 Revision 5",
+    },
+    PublishedStandard {
+        name: "PCI DSS v3.2.1",
+        slug: "pci-dss",
+        version: "3.2.1",
+        provider: "AWS",
+        legacy_ruleset_arn: false,
+        description_mentions: "(PCI DSS) v3.2.1",
+    },
+    PublishedStandard {
+        name: "PCI DSS v4.0.1",
+        slug: "pci-dss",
+        version: "4.0.1",
+        provider: "AWS",
+        legacy_ruleset_arn: false,
+        description_mentions: "(PCI DSS) v4.0.1",
+    },
+];
+
+/// Abbreviated forms of a standard's name that the published catalog never uses: it
+/// spells a standard out ("NIST Special Publication 800-53 Revision 5"), because the
+/// name is the key a client matches the catalog on.
+const ABBREVIATED_NAME_FORMS: [&str; 5] = ["NIST SP", "SP 800", " Rev.", " Rev ", "Pub."];
+
+/// The three catalog descriptions whose published text is quoted verbatim in the
+/// AWS catalog (and in the divergence report this suite was extended for), asserted
+/// byte-for-byte here — including the U+2019 RIGHT SINGLE QUOTATION MARK the catalog
+/// spells the possessive "AWS\u{2019}s" with, which an ASCII apostrophe would break.
+const VERBATIM_DESCRIPTIONS: [(&str, &str); 3] = [
+    (
+        "AI Security Best Practices v1.0.0",
+        "The AI Security Best Practices standard is a set of automated security checks that detect when deployed AI resources do not align with security best practices. The standard is defined by AWS security experts. This curated set of controls helps improve your security posture for most popular AI services.",
+    ),
+    (
+        "AWS Foundational Security Best Practices v1.0.0",
+        "The AWS Foundational Security Best Practices standard is a set of automated security checks that detect when AWS accounts and deployed resources do not align to security best practices. The standard is defined by AWS security experts. This curated set of controls helps improve your security posture in AWS, and cover AWS\u{2019}s most popular and foundational services.",
+    ),
+    (
+        "AWS Resource Tagging Standard v1.0.0",
+        "The AWS Resource Tagging standard is a set of automated security checks that detect when AWS resources are not tagged.",
+    ),
+];
+
+/// The entry a response reports under `name`, if any.
+fn entry_named(body: &Value, name: &str) -> Option<Value> {
+    returned_standards(body)
+        .into_iter()
+        .find(|standard| standard["Name"].as_str() == Some(name))
+}
+
+/// RULE: `DescribeStandards` reports the catalog AWS publishes — one entry per
+/// published managed standard, keyed by that standard's FULL published name (never an
+/// abbreviation of it), with the published description text for that standard carried
+/// verbatim (its own typography included, so the catalog's U+2019 possessive stays
+/// U+2019) and the `standards/<slug>/v/<version>` ARN the standard is published
+/// under.
+///
+/// The table spans the whole catalog — every standard family (AI, the two
+/// Foundational Security Best Practices standards, resource tagging, four CIS AWS
+/// benchmark versions, the CIS Azure benchmark, both NIST publications and both PCI
+/// DSS revisions), both providers, and the one standard still published under the
+/// partition-wide `ruleset/` ARN — so an entry renamed, dropped, invented or
+/// paraphrased fails here whether or not any recording flagged it.
+#[tokio::test]
+async fn the_catalog_reports_every_published_standard_under_its_full_name() {
+    let region = "us-west-2";
+    let harness = Harness::new(region);
+    let (status, body) = harness.describe_standards("").await;
+    assert_eq!(status, 200, "expected 200, got {status} with {body}");
+
+    // The entry set keyed by Name: exactly the published names, in Name order.
+    let reported: Vec<String> = returned_standards(&body)
+        .iter()
+        .map(|standard| standard["Name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    let published: Vec<String> = PUBLISHED_CATALOG
+        .iter()
+        .map(|standard| standard.name.to_string())
+        .collect();
+    assert_eq!(
+        reported, published,
+        "the catalog must report exactly the published standards in Name order, got {reported:?}"
+    );
+
+    for standard in &PUBLISHED_CATALOG {
+        let case = standard.name;
+        let entry = entry_named(&body, case)
+            .unwrap_or_else(|| panic!("case {case:?}: the catalog must report this standard"));
+
+        let expected_arn = if standard.legacy_ruleset_arn {
+            format!(
+                "arn:aws:securityhub:::ruleset/{}/v/{}",
+                standard.slug, standard.version
+            )
+        } else {
+            format!(
+                "arn:aws:securityhub:{region}::standards/{}/v/{}",
+                standard.slug, standard.version
+            )
+        };
+        assert_eq!(
+            entry["StandardsArn"].as_str(),
+            Some(expected_arn.as_str()),
+            "case {case:?}: expected {expected_arn}, got {entry}"
+        );
+        assert_eq!(
+            entry["Provider"].as_str(),
+            Some(standard.provider),
+            "case {case:?}: expected Provider {:?}, got {entry}",
+            standard.provider
+        );
+
+        for abbreviation in ABBREVIATED_NAME_FORMS {
+            assert!(
+                !case.contains(abbreviation),
+                "case {case:?}: the published catalog spells a standard out, so a name \
+                 carrying {abbreviation:?} is an emulator-only form"
+            );
+        }
+
+        let description = entry["Description"].as_str().unwrap_or_default();
+        assert!(
+            description.contains(standard.description_mentions),
+            "case {case:?}: the description must be this standard's, so it names \
+             {:?}, got {description:?}",
+            standard.description_mentions
+        );
+        // The published catalog's typography: its one possessive uses U+2019, and no
+        // entry carries a straightened ASCII apostrophe in its place.
+        assert!(
+            !description.contains('\''),
+            "case {case:?}: the published catalog uses U+2019, not an ASCII \
+             apostrophe, got {description:?}"
+        );
+    }
+
+    for (case, text) in VERBATIM_DESCRIPTIONS {
+        let entry = entry_named(&body, case)
+            .unwrap_or_else(|| panic!("case {case:?}: the catalog must report this standard"));
+        assert_eq!(
+            entry["Description"].as_str(),
+            Some(text),
+            "case {case:?}: expected the published description verbatim, got {entry}"
+        );
+    }
+}
+
+/// RULE: the catalog's `StandardsArn` is the standard's identity across the service,
+/// so the subscription the hub-scoped standards operations report for an enabled
+/// standard carries exactly the ARN the catalog publishes for it — the ARN a client
+/// reads out of the catalog is the one it sees come back.
+///
+/// The table spans both standards `EnableSecurityHub` enables by default, which
+/// between them cover both published ARN forms (the per-Region `standards/` form and
+/// the one legacy partition-wide `ruleset/` form); the catalog entries that are not
+/// enabled by default must not be reported as enabled.
+///
+/// (`BatchEnableStandards` is still scaffolded in this crate — it answers 501 — so
+/// enabling an arbitrary catalog entry is covered by that operation's own issue;
+/// what this asserts is that the catalog and the enabled-standards view agree on a
+/// standard's identity.)
+#[tokio::test]
+async fn an_enabled_standard_is_reported_under_the_arn_the_catalog_publishes() {
+    let region = "eu-west-2";
+    let harness = Harness::subscribed(region).await;
+    let (status, body) = harness.describe_standards("").await;
+    assert_eq!(status, 200, "expected 200, got {status} with {body}");
+
+    let (status, listed) = harness.call("POST", "/standards/get", Some(json!({}))).await;
+    assert_eq!(
+        status, 200,
+        "GetEnabledStandards must succeed, got {status} with {listed}"
+    );
+    let enabled_arns: Vec<String> = listed["StandardsSubscriptions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|subscription| {
+            subscription["StandardsArn"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+
+    for standard in &PUBLISHED_CATALOG {
+        let case = standard.name;
+        let entry = entry_named(&body, case)
+            .unwrap_or_else(|| panic!("case {case:?}: the catalog must report this standard"));
+        let published_arn = entry["StandardsArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: every entry carries an ARN: {entry}"))
+            .to_string();
+        let enabled_by_default = entry["EnabledByDefault"].as_bool().unwrap_or(false);
+        assert_eq!(
+            enabled_arns.contains(&published_arn),
+            enabled_by_default,
+            "case {case:?}: a standard is enabled on a fresh hub exactly when the \
+             catalog reports EnabledByDefault, got EnabledByDefault={enabled_by_default} \
+             and enabled {enabled_arns:?}"
+        );
+    }
+}
+
 /// RULE: the catalog is service metadata — every entry carries a non-empty name and
 /// description (`NonEmptyString`, `@pattern("\\S")`), a provider the model defines,
 /// and an ARN unique across the catalog.
