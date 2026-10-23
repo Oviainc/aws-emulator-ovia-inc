@@ -31,6 +31,8 @@ mod config_remediation_configurations;
 mod config_retention_configuration_lifecycle;
 #[path = "all/config_rule_evaluation_status.rs"]
 mod config_rule_evaluation_status;
+#[path = "all/config_service_linked_recorder.rs"]
+mod config_service_linked_recorder;
 #[path = "all/config_setup_and_rule_loop.rs"]
 mod config_setup_and_rule_loop;
 #[path = "all/config_tagging.rs"]

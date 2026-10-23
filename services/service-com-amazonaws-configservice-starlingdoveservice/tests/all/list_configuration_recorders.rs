@@ -15,11 +15,12 @@
 //! `ValidationException`.
 //!
 //! `PutConfigurationRecorder` creates the ONE customer managed recorder an account can
-//! have per Region, and the operations that create SERVICE-LINKED recorders
-//! (`PutServiceLinkedConfigurationRecorder`,
-//! `PutThirdPartyServiceLinkedConfigurationRecorder`) are still scaffolds, so the cases
-//! that need several recorders seed them in the shared engine the router hands the
-//! handlers, the way the handlers reach it. The round-trip case goes through the API.
+//! have per Region, and `PutServiceLinkedConfigurationRecorder` creates one
+//! service-linked recorder per linked service (while
+//! `PutThirdPartyServiceLinkedConfigurationRecorder` is still a scaffold), so the cases
+//! that need several recorders of a given shape seed them in the shared engine the
+//! router hands the handlers, the way the handlers reach it. The round-trip case goes
+//! through the API.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_configservice_starlingdoveservice::state::{

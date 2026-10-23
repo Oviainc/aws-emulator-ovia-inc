@@ -234,11 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `ServicePrincipal` selects service-linked recorders, a class this emulator's
-        // `PutConfigurationRecorder` does not create; it narrows the list rather than
-        // naming one recorder, so while `PutServiceLinkedConfigurationRecorder` is
-        // unimplemented the answer is an empty list — "no recorder is linked to that
-        // service", not "no such recorder".
+        // `ServicePrincipal` selects the service-linked recorders
+        // `PutServiceLinkedConfigurationRecorder` creates; it narrows the list rather
+        // than naming one recorder, so a service nothing is linked to gets an empty
+        // list — "no recorder is linked to that service", not "no such recorder".
         if let Some(service_principal) = input.service_principal.as_deref() {
             let linked: Vec<&str> = store
                 .recorders

@@ -312,9 +312,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // One customer managed configuration recorder per account per Region — the
-        // limit the refusal's message states.
+        // limit the refusal's message states. The quota is on the recorders this
+        // account creates itself, so the service-linked recorders
+        // `PutServiceLinkedConfigurationRecorder` creates do not count against it.
+        let customer_managed = store
+            .recorders
+            .values()
+            .filter(|recorder| recorder.service_principal.is_none())
+            .count();
         if !store.recorders.contains_key(&name)
-            && store.recorders.len() >= crate::state::CUSTOMER_MANAGED_RECORDERS_QUOTA
+            && customer_managed >= crate::state::CUSTOMER_MANAGED_RECORDERS_QUOTA
         {
             return Err(
                 PutConfigurationRecorderErrorModeled::MaxNumberOfConfigurationRecordersExceededException(

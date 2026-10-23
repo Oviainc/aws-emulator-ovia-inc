@@ -271,6 +271,23 @@ pub const CONNECTORS_QUOTA: usize = 100;
 /// (see [`max_configuration_recorders_message`]).
 pub const CUSTOMER_MANAGED_RECORDERS_QUOTA: usize = 1;
 
+/// The most SERVICE-LINKED configuration recorders this account and Region can hold,
+/// after which `PutServiceLinkedConfigurationRecorder` refuses a new one with
+/// `LimitExceededException` (which the model documents for exactly that API: "this
+/// exception is thrown if the number of service-linked roles in the account exceeds
+/// the limit"), stated by [`service_linked_recorders_quota_message`].
+///
+/// The model carries no number for this quota, so the limit is CHOSEN — the same way
+/// [`CONNECTORS_QUOTA`] is: it is [`LIST_CONFIGURATION_RECORDERS_PAGE_SIZE`], the most
+/// recorder summaries one `ListConfigurationRecorders` page can carry, so every
+/// service-linked recorder the store holds stays reportable. A recorder's name is
+/// derived from the `ServicePrincipal` the request carries, so without this bound a
+/// caller could grow the store by inventing service principals; Config documents its
+/// recorder quotas per account per Region and one engine's store stands for ONE
+/// account in ONE Region, so — like [`CONFIG_RULES_QUOTA`] — it is enforced over the
+/// whole store rather than per Region string a caller invents.
+pub const SERVICE_LINKED_RECORDERS_QUOTA: usize = LIST_CONFIGURATION_RECORDERS_PAGE_SIZE;
+
 /// The most configuration aggregators this account and Region can hold, after which
 /// `PutConfigurationAggregator` refuses a new one with `LimitExceededException`
 /// (`LimitExceededException`: "For PutConfigurationAggregator API, this exception is
@@ -607,6 +624,31 @@ impl RecorderStatusEntry {
             arn: arn.to_string(),
             recording: false,
             ..Self::default()
+        }
+    }
+
+    /// A status record for a recorder that is ALREADY recording at `started_at`,
+    /// because the service it is linked to turned it on when it created it: the
+    /// caller cannot start or stop a service-linked configuration recorder
+    /// (`UnmodifiableEntityException`: "For StartConfigurationRecorder and
+    /// StopConfigurationRecorder ... these operations do not affect service-linked
+    /// configuration recorders"), and the linked service holds it in use
+    /// (`ConflictException`, for `DeleteServiceLinkedConfigurationRecorder`: "you
+    /// cannot delete the service-linked recorder because it is currently in use by
+    /// the linked Amazon Web Services service").
+    ///
+    /// Like a start the caller asked for, the recording event is `Pending` until the
+    /// clock makes the move to `Success` due; [`Self::settle`] materialises it.
+    pub fn started(name: &str, arn: &str, started_at: SystemTime) -> Self {
+        Self {
+            name: name.to_string(),
+            arn: arn.to_string(),
+            recording: true,
+            last_start_time: Some(started_at),
+            last_stop_time: None,
+            last_status: Some(RECORDER_STATUS_PENDING.to_string()),
+            last_status_change_time: Some(started_at),
+            status_settles_at: Some(started_at + RECORDER_STATUS_SETTLE_AFTER),
         }
     }
 
@@ -1530,12 +1572,18 @@ impl AggregationAuthorizationEntry {
 /// Per-service state for com-amazonaws-configservice-starlingdoveservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
-    /// Customer managed configuration recorders, keyed by name. Config allows one
-    /// per account per Region, so this holds at most one entry: one engine's store
-    /// stands for one account in one Region, and the per-Region quotas below are
-    /// enforced over the whole store.
+    /// Every configuration recorder of this account and Region, keyed by name: the
+    /// customer managed one `PutConfigurationRecorder` creates and the service-linked
+    /// ones `PutServiceLinkedConfigurationRecorder` creates, which carry a
+    /// `service_principal`.
+    ///
+    /// BOUNDED at [`CUSTOMER_MANAGED_RECORDERS_QUOTA`] customer managed entries plus
+    /// [`SERVICE_LINKED_RECORDERS_QUOTA`] service-linked ones — one engine's store
+    /// stands for one account in one Region, and both per-Region quotas are enforced
+    /// over the whole store, so no sequence of calls can grow this map further.
     pub recorders: HashMap<String, RecorderEntry>,
-    /// The status record of each recorder, keyed by recorder name.
+    /// The status record of each recorder, keyed by recorder name. Holds at most one
+    /// entry per recorder in [`Self::recorders`], so the same bound holds.
     pub recorder_status: HashMap<String, RecorderStatusEntry>,
     /// Delivery channels, keyed by name. Config allows one per account per Region.
     pub delivery_channels: HashMap<String, DeliveryChannelEntry>,
@@ -1814,6 +1862,139 @@ fn splitmix64(seq: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
+}
+
+/// The DNS suffix every Amazon Web Services service principal ends with, which is
+/// what makes a value a service principal rather than an arbitrary string the
+/// modelled `ServicePrincipal` pattern (`^[\w+=,.@-]+$`, which also admits `@`, `+`,
+/// `=` and `,`) would accept.
+pub const SERVICE_PRINCIPAL_SUFFIX: &str = ".amazonaws.com";
+
+/// Config's own service principal, which is also the path segment IAM files Config's
+/// service-linked role under.
+pub const CONFIG_SERVICE_PRINCIPAL: &str = "config.amazonaws.com";
+
+/// The IAM service-linked role Config creates in the account the first time a
+/// service-linked configuration recorder is created, and the role every
+/// service-linked configuration recorder then records with
+/// (`PutServiceLinkedConfigurationRecorder`: "This API creates a service-linked role
+/// AWSServiceRoleForConfig in your account. The service-linked role is created only
+/// when the role does not exist in your account").
+pub const CONFIG_SERVICE_LINKED_ROLE_NAME: &str = "AWSServiceRoleForConfig";
+
+/// The ARN of [`CONFIG_SERVICE_LINKED_ROLE_NAME`]:
+/// `arn:aws:iam::<account>:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig`,
+/// the path IAM gives a service-linked role. IAM is global, so the ARN carries no
+/// Region.
+///
+/// The role is created once per account and reused, so every service-linked
+/// configuration recorder of one account records with the SAME role ARN.
+pub fn config_service_linked_role_arn() -> String {
+    ::emulator_server::emulator_arn(
+        "iam",
+        "",
+        &format!(
+            "role/aws-service-role/{CONFIG_SERVICE_PRINCIPAL}/{CONFIG_SERVICE_LINKED_ROLE_NAME}"
+        ),
+    )
+}
+
+/// The name Config assigns the service-linked configuration recorder of
+/// `service_principal`, or `None` when the value names no Amazon Web Services service
+/// principal.
+///
+/// The name is NOT chosen by the caller: Config assigns one carrying the reserved
+/// prefix ([`SERVICE_LINKED_RECORDER_NAME_PREFIX`];
+/// `PutServiceLinkedConfigurationRecorderResponse$Name`: "Config automatically
+/// assigns a name that has the prefix \"AWSConfigurationRecorderFor\" to the new
+/// service-linked configuration recorder"). The model documents no further structure,
+/// so the suffix is DERIVED FROM THE REQUEST and from nothing else: the leading DNS
+/// label of the service principal — the service's own name, the part that
+/// distinguishes `ssm.amazonaws.com` from `securityhub.amazonaws.com` — with its
+/// `-`/`_`-separated words upper-camel-cased, so one service principal always gets
+/// one name and two different services never share one.
+///
+/// A value that is no service principal gets no name: it must end in
+/// [`SERVICE_PRINCIPAL_SUFFIX`] and every label before that must be a DNS label.
+pub fn service_linked_recorder_name(service_principal: &str) -> Option<String> {
+    let host = service_principal.strip_suffix(SERVICE_PRINCIPAL_SUFFIX)?;
+    if host.is_empty() || host.split('.').any(|label| !is_dns_label(label)) {
+        return None;
+    }
+    let service = host.split('.').next()?;
+    let suffix: String = service
+        .split(['-', '_'])
+        .filter(|word| !word.is_empty())
+        .map(capitalise)
+        .collect();
+    if suffix.is_empty() {
+        return None;
+    }
+    Some(format!("{SERVICE_LINKED_RECORDER_NAME_PREFIX}{suffix}"))
+}
+
+/// Whether `label` is one DNS label of a service principal: ASCII alphanumerics,
+/// `-` and `_`, neither empty nor hyphen-bounded.
+fn is_dns_label(label: &str) -> bool {
+    !label.is_empty()
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// `word` with its first character upper-cased and the rest left as it came.
+fn capitalise(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+    }
+}
+
+/// How Config words `ValidationException` for a request whose `ServicePrincipal`
+/// names no Amazon Web Services service (`ValidationException`: "You have provided a
+/// service principal for service-linked configuration recorder that is not valid").
+///
+/// BUILT FROM THE REQUEST — it quotes the value the caller sent and names the member
+/// to fix — so every operation that takes a service principal refuses it the same
+/// way.
+pub fn invalid_service_principal_message(service_principal: &str) -> String {
+    format!(
+        "The ServicePrincipal '{service_principal}' provided in the request is not a valid \
+         service principal for a service-linked configuration recorder."
+    )
+}
+
+/// How Config words `ConflictException` when the account already holds a
+/// service-linked configuration recorder for the service a request names
+/// (`ConflictException`: "For PutServiceLinkedConfigurationRecorder, you cannot
+/// create a service-linked recorder because a service-linked recorder already exists
+/// for the specified service").
+///
+/// BUILT FROM THE REQUEST, for the same reason as
+/// [`invalid_service_principal_message`].
+pub fn service_linked_recorder_conflict_message(service_principal: &str) -> String {
+    format!(
+        "A service-linked configuration recorder already exists for the service principal \
+         '{service_principal}'."
+    )
+}
+
+/// How Config words `LimitExceededException` when creating one more service-linked
+/// configuration recorder would take the account past
+/// [`SERVICE_LINKED_RECORDERS_QUOTA`].
+///
+/// The message states THE SERVICE'S OWN LIMIT, not anything from the request — the
+/// same shape as [`max_configuration_recorders_message`] — so it is the same sentence
+/// however the caller reached the limit.
+pub fn service_linked_recorders_quota_message() -> String {
+    format!(
+        "Failed to create a service-linked configuration recorder because this account \
+         already holds the maximum of {SERVICE_LINKED_RECORDERS_QUOTA} service-linked \
+         configuration recorder(s) in this region"
+    )
 }
 
 /// The ARN resource type of a connector, as Config spells it in the ARNs it mints.
