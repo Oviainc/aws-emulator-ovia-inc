@@ -318,9 +318,10 @@ async fn a_role_that_still_holds_a_policy_is_not_deleted() {
 #[tokio::test]
 async fn a_service_linked_role_is_not_deleted_by_its_account() {
     // (the service principal, the optional CustomSuffix, the role name the create
-    // derives) — the derivation this crate's `tests/all/service_linked_roles.rs`
-    // pins, written out so this suite asserts against a name rather than restating
-    // the rule.
+    // names) — the naming this crate's `tests/all/service_linked_roles.rs` pins
+    // (AWS's published name for the service, or the derived fallback when AWS
+    // publishes none), written out so this suite asserts against a name rather than
+    // restating the rule.
     let cases: [(&str, Option<&str>, &str); 4] = [
         (
             "networkmonitor.amazonaws.com",
@@ -330,14 +331,18 @@ async fn a_service_linked_role_is_not_deleted_by_its_account() {
         (
             "ops.apigateway.amazonaws.com",
             None,
-            "AWSServiceRoleForOps",
+            "AWSServiceRoleForAPIGateway",
         ),
         (
             "autoscaling.amazonaws.com",
             Some("debug"),
-            "AWSServiceRoleForAutoscaling_debug",
+            "AWSServiceRoleForAutoScaling_debug",
         ),
-        ("Spot.amazonaws.com", None, "AWSServiceRoleForSpot"),
+        (
+            "Mediaconvert.amazonaws.com",
+            None,
+            "AWSServiceRoleForMediaconvert",
+        ),
     ];
 
     for (principal, suffix, role_name) in cases {
@@ -354,7 +359,7 @@ async fn a_service_linked_role_is_not_deleted_by_its_account() {
         assert_eq!(
             element(&created, "RoleName"),
             role_name,
-            "case {principal:?}: expected the derived role name, got {created}"
+            "case {principal:?}: expected the role name the create names, got {created}"
         );
         let role_id = element(&created, "RoleId");
 

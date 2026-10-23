@@ -15,3 +15,5 @@
 mod application_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_message_rendering.rs"]
+mod validation_message_rendering;
