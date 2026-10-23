@@ -78,8 +78,7 @@ pub(crate) fn password_of_length(length: usize) -> String {
 
 /// `CreateUser` with the full-access string and one password.
 ///
-/// `pub(crate)` so the sibling suites create their users through the SAME call rather
-/// than each spelling out an `AuthenticationMode`.
+/// `pub(crate)` so the sibling suites create their users through the SAME call rather\n/// than each spelling out an `AuthenticationMode`.
 pub(crate) async fn create_user(router: &MultiServiceRouter, name: &str) -> Value {
     ok(
         router,
