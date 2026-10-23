@@ -1,15 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Search
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Search`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Search::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers a search over the documents `UploadDocuments` put in the addressed
+//! domain's index: it parses `q` with the requested query parser, filters with
+//! `fq`, orders by `sort`, pages with `start`/`size` or `cursor`, and computes the
+//! requested `facet`, `stats` and `highlight` information from the documents that
+//! matched. The query language, matching and computations live in
+//! [`crate::state::query`]; a request this endpoint cannot evaluate earns the
+//! modelled `SearchException`.
+//!
+//! The modelled `partial` flag is deliberately NOT modelled: it asks the service
+//! to answer from the partitions that are reachable when some are not, and this
+//! index is one in-process map that is either there or not — there is no
+//! partition to be unavailable and so nothing for the flag to change. It is
+//! accepted (the model gives it a default of false) and has no effect, rather
+//! than being answered with a percent-searched value nothing measured.
+//!
+//! PAGING AND `hits.start`: `start`/`size` paging reports the offset the page
+//! begins at, because that is the offset the REQUEST named. Cursor paging reports
+//! 0, because a cursor's resume point is the token's own meaning and CloudSearch's
+//! cursor paging reports no hit offset: a cursor-paged response's `start` is not
+//! the index of its first hit and must not be read as one. The token that resumes
+//! after the page is in `hits.cursor`, and the END of a cursor walk is an EMPTY
+//! `hit[]`, not a changed token: past the last hit there is nothing further to
+//! resume at, so the response hands back the cursor it was given.
+//!
+//! `size` OF 0: the modelled default is 0 and cannot be told apart from an absent
+//! parameter on the wire, and the Search API documents "Default: 10", so 0 is
+//! served as that documented default page. The bootstrap issue's wording — that
+//! `size=0` should mean "counts only" — is therefore DECLINED: an AWS client that
+//! sends no `size` sends 0, and answering it with no hits would leave the common
+//! request with an empty page. A caller that wants counts only asks for them, with
+//! `return=_no_fields` or by reading `hits.found` (and `facets`/`stats`, which are
+//! computed over the whole result set, not over the page).
 //!
 //! ## Shape of an operation
 //!
@@ -246,18 +270,321 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Search` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Search"))
+        use crate::state::query;
+
+        let started = std::time::Instant::now();
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| search_error("The search index is unavailable for this endpoint."))?;
+        let domain = crate::state::domain_key(ctx.parts());
+
+        // Expressions are numeric formulas the service evaluates over a hit; this
+        // endpoint does not evaluate them, so a request that asks for one is
+        // refused rather than answered with the expression silently dropped.
+        if input.expr.as_deref().is_some_and(|expr| !expr.trim().is_empty()) {
+            return Err(search_error(
+                "The expr parameter is not supported by this endpoint.",
+            ));
+        }
+
+        // ---- the query -----------------------------------------------------
+        let parser = query::Parser::from_wire(input.query_parser.as_deref()).map_err(search_error)?;
+        let options = query::parse_query_options(input.query_options.as_deref())
+            .map_err(search_error)?;
+        let matcher = query::parse_query(parser, &input.query, &options).map_err(search_error)?;
+        // "The filterQuery parameter supports the full structured query syntax."
+        let filter = input
+            .filter_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|fq| !fq.is_empty())
+            .map(query::parse_filter_query)
+            .transpose()
+            .map_err(search_error)?;
+
+        // ---- paging --------------------------------------------------------
+        // "You can specify either the start or cursor parameter in a request;
+        // they are mutually exclusive."
+        let cursor = input
+            .cursor
+            .as_deref()
+            .map(str::trim)
+            .filter(|cursor| !cursor.is_empty());
+        if cursor.is_some() && input.start != 0 {
+            return Err(search_error(
+                "The cursor and start parameters are mutually exclusive; specify only one.",
+            ));
+        }
+        let start = match cursor {
+            Some(cursor) => {
+                let offset = query::parse_cursor(cursor).map_err(search_error)?;
+                // A cursor resumes PAST the documented paging depth — that is what
+                // it is for — but never past the largest index a domain can hold,
+                // so a token naming an offset no hit can sit at is refused rather
+                // than walked.
+                if offset > crate::state::MAX_DOCUMENTS_PER_DOMAIN {
+                    return Err(search_error(format!(
+                        "The cursor resumes at hit {offset}, past the {} documents a \
+                         domain holds.",
+                        crate::state::MAX_DOCUMENTS_PER_DOMAIN
+                    )));
+                }
+                offset
+            }
+            None => usize::try_from(input.start).map_err(|_| {
+                search_error(format!(
+                    "Invalid start value {}; start must be a non-negative integer.",
+                    input.start
+                ))
+            })?,
+        };
+        let size = match input.size {
+            // The modelled default of 0 cannot be told apart from an absent
+            // parameter, and the API documents a default page size of 10.
+            0 => crate::state::DEFAULT_PAGE_SIZE,
+            size if size > 0 => usize::try_from(size).unwrap_or(usize::MAX),
+            size => {
+                return Err(search_error(format!(
+                    "Invalid size value {size}; size must be a non-negative integer."
+                )))
+            }
+        };
+        // The page is what this call BUILDS — a `Hit` per document, with its
+        // projected fields and highlights — so its width is bounded by the
+        // documented paging depth rather than by whatever the caller asks for,
+        // and so is the hit the page ends at. Past that depth CloudSearch itself
+        // requires a cursor, which resumes from a token this endpoint minted and
+        // so cannot be used to ask for a wider page either.
+        if size > query::MAX_PAGE_DEPTH {
+            return Err(search_error(format!(
+                "Invalid size value {size}; a page holds at most {} hits.",
+                query::MAX_PAGE_DEPTH
+            )));
+        }
+        if cursor.is_none() && start.saturating_add(size) > query::MAX_PAGE_DEPTH {
+            return Err(search_error(format!(
+                "start {start} and size {size} reach past hit {}; use a cursor to \
+                 page further into the result set.",
+                query::MAX_PAGE_DEPTH
+            )));
+        }
+
+        // ---- what to return ------------------------------------------------
+        let sort = match input.sort.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(sort) => query::parse_sort(sort).map_err(search_error)?,
+            None => query::default_sort(),
+        };
+        let facets = match input.facet.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(spec) => query::parse_facets(spec).map_err(search_error)?,
+            None => Vec::new(),
+        };
+        let stats_fields = match input.stats.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(spec) => query::parse_stats(spec).map_err(search_error)?,
+            None => Vec::new(),
+        };
+        let highlights = match input
+            .highlight
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(spec) => query::parse_highlights(spec).map_err(search_error)?,
+            None => Vec::new(),
+        };
+        let returned = query::parse_return(input.r#return.as_deref()).map_err(search_error)?;
+
+        // ---- match, order, page --------------------------------------------
+        // The index is read under the lock and matched outside it, so a long scan
+        // never holds the store.
+        let documents = state.lock().snapshot(&domain);
+        // The work the scan may spend is bounded, and the loop yields so a
+        // cancellation or a request timeout can land on an otherwise synchronous
+        // CPU-bound walk of the index.
+        let mut budget = query::Budget::new();
+        let mut matched: Vec<query::ScoredHit> = Vec::new();
+        for (scanned, document) in documents.into_iter().enumerate() {
+            if scanned % query::SCAN_YIELD_INTERVAL == 0 {
+                tokio::task::yield_now().await;
+            }
+            // Each document's values are tokenized ONCE, however many terms the
+            // query looks for.
+            let hit = query::Indexed::new(document);
+            let (hit_matched, score) = matcher
+                .evaluate_hit(&hit, &mut budget)
+                .map_err(search_error)?;
+            if !hit_matched {
+                continue;
+            }
+            if let Some(filter) = filter.as_ref() {
+                if !filter.matches(&hit, &mut budget).map_err(search_error)? {
+                    continue;
+                }
+            }
+            matched.push((hit.into_document(), score));
+        }
+        // How each sort field compares is decided once, from the whole result
+        // set, so the comparator below is a total order; the reads it makes and
+        // the comparisons the sort will make are charged to the same budget.
+        tokio::task::yield_now().await;
+        let order = query::SortOrder::new(sort, &matched, &mut budget).map_err(search_error)?;
+        matched.sort_by(|left, right| order.compare(left, right));
+
+        let found = i64::try_from(matched.len()).unwrap_or(i64::MAX);
+        let terms = matcher.terms();
+        // Building the page highlights each hit, which reads its text again, so
+        // it is charged to the same budget and yields on the same interval.
+        let mut page: Vec<Hit> = Vec::new();
+        for (built, (document, score)) in matched.iter().skip(start).take(size).enumerate() {
+            if built % query::SCAN_YIELD_INTERVAL == 0 {
+                tokio::task::yield_now().await;
+            }
+            page.push(build_hit(
+                document,
+                *score,
+                &returned,
+                &highlights,
+                &terms,
+                &mut budget,
+            )?);
+        }
+        let next_offset = start.saturating_add(page.len());
+
+        let hits = Hits {
+            found,
+            // The offset this page begins at: the `start` the request sent, or 0
+            // for a cursor-paged one. A cursor's resume offset is the TOKEN's
+            // own meaning, which the response does not expose — CloudSearch's
+            // cursor paging reports no hit offset — so it is not echoed here.
+            start: if cursor.is_none() {
+                i64::try_from(start).unwrap_or(i64::MAX)
+            } else {
+                0
+            },
+            // A cursor-paged request gets the token that resumes after this page.
+            cursor: cursor.map(|_| query::encode_cursor(next_offset)),
+            hit: Some(page),
+        };
+
+        // Each requested facet and statistic is another pass over the documents
+        // that matched, so each is charged to the request's budget and yields
+        // between fields.
+        let mut computed_facets: std::collections::HashMap<String, BucketInfo> =
+            std::collections::HashMap::new();
+        for request in &facets {
+            tokio::task::yield_now().await;
+            let buckets = query::compute_facet(request, &matched, &mut budget)
+                .map_err(search_error)?
+                .into_iter()
+                .map(|(value, count)| Bucket {
+                    value: Some(value),
+                    count,
+                })
+                .collect();
+            computed_facets.insert(
+                request.field.clone(),
+                BucketInfo {
+                    buckets: Some(buckets),
+                },
+            );
+        }
+        let mut computed_stats: std::collections::HashMap<String, FieldStats> =
+            std::collections::HashMap::new();
+        for field in &stats_fields {
+            tokio::task::yield_now().await;
+            let computed =
+                query::compute_stats(field, &matched, &mut budget).map_err(search_error)?;
+            computed_stats.insert(
+                field.clone(),
+                FieldStats {
+                    min: computed.min,
+                    max: computed.max,
+                    count: computed.count,
+                    missing: computed.missing,
+                    sum: computed.sum,
+                    sum_of_squares: computed.sum_of_squares,
+                    mean: computed.mean,
+                    stddev: computed.stddev,
+                },
+            );
+        }
+
+        Ok(SearchOutput {
+            status: Some(SearchStatus {
+                timems: crate::state::elapsed_ms(started),
+                rid: Some(crate::state::new_rid()),
+            }),
+            hits: Some(hits),
+            facets: (!computed_facets.is_empty()).then_some(computed_facets),
+            stats: (!computed_stats.is_empty()).then_some(computed_stats),
+        })
     }
+}
+
+/// One hit of the page: its id, the fields the request asked for, and the
+/// highlights computed for it.
+fn build_hit(
+    document: &crate::state::Document,
+    score: f64,
+    returned: &crate::state::query::ReturnSpec,
+    highlights: &[crate::state::query::HighlightRequest],
+    terms: &[String],
+    budget: &mut crate::state::query::Budget,
+) -> Result<Hit, SearchError> {
+    use crate::state::query::ReturnSpec;
+
+    let fields = match returned {
+        ReturnSpec::NoFields => None,
+        ReturnSpec::AllFields => {
+            // The default projection copies every stored field of the hit, so it
+            // is charged like the named one.
+            let mut all = std::collections::HashMap::new();
+            for (name, values) in &document.fields {
+                budget.charge_scan(values).map_err(search_error)?;
+                all.insert(name.clone(), values.clone());
+            }
+            Some(all)
+        }
+        ReturnSpec::Named(names) => {
+            let mut selected = std::collections::HashMap::new();
+            for name in names {
+                if name == crate::state::query::SCORE_FIELD {
+                    selected.insert(name.clone(), vec![format_score(score)]);
+                } else if let Some(values) = document.fields.get(name) {
+                    // Projecting a named field reads and copies that field of
+                    // every hit, so it is charged like every other phase that
+                    // reads a document.
+                    budget.charge_scan(values).map_err(search_error)?;
+                    selected.insert(name.clone(), values.clone());
+                }
+            }
+            Some(selected)
+        }
+    };
+    let mut highlighted: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for request in highlights {
+        let text = crate::state::query::compute_highlight(request, document, terms, budget)
+            .map_err(search_error)?;
+        if let Some(text) = text {
+            highlighted.insert(request.field.clone(), text);
+        }
+    }
+    Ok(Hit {
+        id: Some(document.id.clone()),
+        fields,
+        exprs: None,
+        highlights: (!highlighted.is_empty()).then_some(highlighted),
+    })
+}
+
+/// A relevance score as `return=_score` renders it.
+fn format_score(score: f64) -> String {
+    format!("{score:.3}")
+}
+
+/// The modelled refusal (HTTP 400) for a search request this endpoint rejects.
+fn search_error(message: impl Into<String>) -> SearchError {
+    SearchErrorModeled::SearchException(SearchException {
+        message: Some(message.into()),
+    })
+    .into()
 }

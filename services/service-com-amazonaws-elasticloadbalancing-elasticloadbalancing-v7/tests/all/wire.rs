@@ -81,7 +81,27 @@ pub(crate) async fn call(
     action: &str,
     params: &[(String, String)],
 ) -> Wire {
-    let mut body = format!("Action={}&Version={API_VERSION}", form_encode(action));
+    call_at_version(router, region, action, Some(API_VERSION), params).await
+}
+
+/// POST one awsQuery action at the API version its envelope names — or with no `Version`
+/// field at all when `version` is `None`.
+///
+/// The version is the other half of an awsQuery routing key, and this endpoint serves two
+/// API versions out of two models (`src/service/api_version.rs`), so a suite that pins
+/// which model answers varies it. [`call`] is this call at this model's own version, which
+/// is what every other suite sends.
+pub(crate) async fn call_at_version(
+    router: &MultiServiceRouter,
+    region: &str,
+    action: &str,
+    version: Option<&str>,
+    params: &[(String, String)],
+) -> Wire {
+    let mut body = format!("Action={}", form_encode(action));
+    if let Some(version) = version {
+        body.push_str(&format!("&Version={}", form_encode(version)));
+    }
     for (key, value) in params {
         body.push('&');
         body.push_str(&form_encode(key));

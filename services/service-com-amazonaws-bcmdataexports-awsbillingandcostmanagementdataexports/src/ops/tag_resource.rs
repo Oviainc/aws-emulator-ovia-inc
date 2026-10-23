@@ -154,9 +154,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // Authorization comes first: the model declares `AccessDeniedException` (403) for
+        // this operation, and AWS refuses a caller whose identity holds no permission for
+        // it before anything is read or written. See `crate::state::authorization`.
+        crate::state::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::TAG_RESOURCE,
+            &input.resource_arn,
+        )
+        .map_err(TagResourceErrorModeled::AccessDeniedException)?;
+
         // The request is read before the resource is looked up: a list that cannot be
         // read as a tag set at all is a bad request whatever ARN it was sent to.
         let submitted = crate::state::tag_map(input.resource_tags)
+            .map_err(TagResourceErrorModeled::ValidationException)?;
+
+        // The ARN's ACCOUNT is validated BEFORE the store is consulted, for the reason
+        // `list_tags_for_resource` states: an ARN naming another account is unusable
+        // whatever this account holds, so it is a `ValidationException` (400) and not a
+        // `ResourceNotFoundException`, and the answer must not depend on a lookup AWS
+        // never performs.
+        crate::state::validate_taggable_resource_arn(&input.resource_arn)
             .map_err(TagResourceErrorModeled::ValidationException)?;
 
         let mut store = state.lock();

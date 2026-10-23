@@ -165,6 +165,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // Every modelled constraint on this input is checked HERE rather than at the
+        // framework boundary, so a refusal is this service's own `ValidationException`
+        // with its required `reason` and a `fieldList`. See `crate::state::validation`.
+        // It runs before the store is reached, so caller-sized validation never holds
+        // the shared state's lock.
+        crate::state::validation::get_token_balance_input(&input)
+            .map_err(GetTokenBalanceErrorModeled::ValidationException)?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetTokenBalanceErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
@@ -180,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.at_blockchain_instant.as_ref(),
             )
             .map_err(|failure| match failure {
-                crate::state::BalanceFailure::Unidentified(error) => {
+                crate::state::BalanceFailure::Invalid(error) => {
                     GetTokenBalanceErrorModeled::ValidationException(error)
                 }
                 crate::state::BalanceFailure::NotFound(error) => {

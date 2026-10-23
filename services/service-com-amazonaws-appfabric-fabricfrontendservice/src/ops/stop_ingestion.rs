@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopIngestion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopIngestion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Moves one stored ingestion from `enabled` to `disabled` and PERSISTS the
+//! move: `GetIngestion` and `ListIngestions` then report `disabled`, because
+//! they read the same record this call wrote. The output shape is empty, so the
+//! state is the whole of what this call reports.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopIngestion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The transition is owed to THIS call rather than to the clock — an ingestion
+//! stays in the state the last call put it in — so nothing is timed here.
+//!
+//! Two refusals, both modelled: an identifier naming no stored ingestion of the
+//! named bundle is HTTP 404 `ResourceNotFoundException`, and an ingestion that
+//! is NOT `enabled` has no `enabled` → `disabled` move to make, which is the
+//! HTTP 409 `ConflictException` this operation models (`StartIngestion` is the
+//! inverse transition and the way back).
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +153,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopIngestion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopIngestionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopIngestion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StopIngestionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AppFabric emulator could not reach its state store".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(bundle) = store.resolve_bundle_mut(&input.app_bundle_identifier) else {
+            return Err(StopIngestionErrorModeled::ResourceNotFoundException(
+                crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
+            )
+            .into());
+        };
+        // The ingestion this call TARGETS: an identifier naming none is the
+        // not-found this operation models, which leaves the bundle untouched.
+        let Some(ingestion) = bundle.resolve_ingestion_mut(&input.ingestion_identifier) else {
+            return Err(StopIngestionErrorModeled::ResourceNotFoundException(
+                crate::state::ingestion_not_found(&input.ingestion_identifier),
+            )
+            .into());
+        };
+
+        // Only an `enabled` ingestion has a stop to make. Anything else is the
+        // modelled conflict, and nothing is written.
+        if ingestion.state != crate::state::INGESTION_STATE_ENABLED {
+            let conflict = crate::state::ingestion_state_conflict(
+                &ingestion.arn,
+                &ingestion.state,
+                crate::state::INGESTION_STATE_ENABLED,
+            );
+            return Err(StopIngestionErrorModeled::ConflictException(conflict).into());
+        }
+
+        ingestion.state = crate::state::INGESTION_STATE_DISABLED.to_string();
+        ingestion.updated_at = ::std::time::SystemTime::now();
+        let id = ingestion.id.clone();
+        crate::state::audit_resource_change(ctx.parts(), Self::NAME, "Ingestion", &id, "disabled");
+        Ok(StopIngestionOutput {})
     }
 }

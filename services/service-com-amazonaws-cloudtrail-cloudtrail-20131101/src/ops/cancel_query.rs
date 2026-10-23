@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Cancels a CloudTrail Lake query: the stored query the request names moves to
+//! `CANCELLED` unless it has already terminated, and the response reports the stored
+//! status. Everything it decides comes from the event data store and query registries
+//! in [`crate::state`].
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules it applies, each grounded in this service's Smithy model (reproduced in
+//! the modeled contract below), and the same ones `DescribeQuery` resolves a query
+//! with:
+//!
+//! * `EventDataStore` is deprecated ("no longer required by `CancelQueryRequest`") but
+//!   still resolved FIRST when given — as a store ARN or the ID suffix of one — so an
+//!   unreadable value is `EventDataStoreARNInvalidException` and a readable one naming
+//!   no store in the Region it addresses is `EventDataStoreNotFoundException`, before
+//!   the query id is looked at;
+//! * a query runs IN an event data store, so a Region — or the account
+//!   `EventDataStoreOwnerAccountId` names — holding no store refuses the call with
+//!   `EventDataStoreNotFoundException` whatever query id it carries;
+//! * a store awaiting deletion serves no query (`InactiveEventDataStoreException`), and
+//!   a query whose store the registry no longer holds resolves no store at all;
+//! * the query id names a query within the Region it ran in and the store it ran on,
+//!   and one that matches none is `QueryIdNotFoundException`;
+//! * a run already in a terminated state is `InactiveQueryException`, and nothing
+//!   about it changes;
+//! * otherwise the cancellation is recorded and the STORED record is reported, so this
+//!   response and every later read of the query agree.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +199,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelQuery"))
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CancelQueryErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "CancelQuery needs the CloudTrail Lake query registry, which this \
+                         engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // An event data store NAMED in the request is resolved first — the member is
+        // deprecated here ("EventDataStore is no longer required by
+        // CancelQueryRequest"), but a store that cannot be read or found is still what
+        // the caller is told about, before the query id is looked at.
+        let named_store = match input.event_data_store.as_deref() {
+            None => None,
+            Some(identifier) => {
+                let record = store
+                    .event_data_store(identifier, &region)
+                    .map_err(|rejection| {
+                        CancelQueryErrorModeled::EventDataStoreARNInvalidException(
+                            EventDataStoreARNInvalidException {
+                                message: Some(rejection.message(&region)),
+                            },
+                        )
+                    })?
+                    .ok_or_else(event_data_store_not_found)?;
+                if !record.status.is_queryable() {
+                    return Err(inactive_event_data_store(&record.id, record.status));
+                }
+                // Owned values, so the immutable borrow of the store ends here and the
+                // cancellation below can take the mutable one.
+                Some((record.id.clone(), record.owner().to_string()))
+            }
+        };
+        let named_store_id = named_store.as_ref().map(|(id, _)| id.clone());
+
+        // A query runs IN an event data store, so the store resolves before the query
+        // id: the one the request names, or — the member being deprecated here — one of
+        // the addressed account's stores in this Region.
+        // `EventDataStoreOwnerAccountId` names the account that owns it, for a query run
+        // against a store shared from another account. A request that resolves no store
+        // names nothing that could hold the query it asks about.
+        let owner = input.event_data_store_owner_account_id.as_deref();
+        let store_resolved = match (named_store.as_ref(), owner) {
+            (Some((_, store_owner)), Some(owner)) => store_owner == owner,
+            (Some(_), None) => true,
+            (None, Some(owner)) => store.has_event_data_store_owned_by(&region, owner),
+            (None, None) => store.has_event_data_store_in(&region),
+        };
+        if !store_resolved {
+            return Err(event_data_store_not_found());
+        }
+
+        // "The ID of the query that you want to cancel is also required": the query id
+        // selects the query, within the Region it ran in and the store it ran on.
+        let query = store
+            .query(&input.query_id, &region, named_store_id.as_deref())
+            .ok_or_else(|| query_not_found("QueryId", &input.query_id))?;
+        let ran_on = query.event_data_store_id.clone();
+        let status = query.status;
+
+        // The store the resolved query actually RAN on is the one the call is really
+        // addressing, so the two rules the named-store path applies hold for it too: a
+        // query whose store the registry no longer holds resolves no store at all, a
+        // cross-account request has to name that store's owner, and a store awaiting
+        // deletion serves no query.
+        let Some(ran_on_store) = store.event_data_stores.get(&ran_on) else {
+            return Err(event_data_store_not_found());
+        };
+        if ran_on_store.region != region {
+            return Err(event_data_store_not_found());
+        }
+        if owner.is_some_and(|owner| ran_on_store.owner() != owner) {
+            return Err(event_data_store_not_found());
+        }
+        if !ran_on_store.status.is_queryable() {
+            return Err(inactive_event_data_store(
+                &ran_on_store.id,
+                ran_on_store.status,
+            ));
+        }
+
+        // "Cancels a query if the query is not in a terminated state, such as
+        // CANCELLED, FAILED, TIMED_OUT, or FINISHED": a run that has already stopped
+        // moving cannot be cancelled, and nothing about it changes.
+        if status.is_terminal() {
+            return Err(CancelQueryErrorModeled::InactiveQueryException(
+                InactiveQueryException {
+                    message: Some(format!(
+                        "The query {} is in the {} state and cannot be canceled.",
+                        input.query_id,
+                        status.as_wire()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Record the cancellation — "when you run CancelQuery, the query status might
+        // show as CANCELLED even if the operation is not yet finished" — then report the
+        // STORED record, so this response and every later read of the query agree. The
+        // record resolved above is reached again for the write, under the one lock this
+        // handler holds; a miss is answered, never panicked on.
+        let cancelled = store
+            .queries
+            .get_mut(&input.query_id)
+            .ok_or_else(|| query_not_found("QueryId", &input.query_id))?;
+        cancelled.status = crate::state::QueryState::Cancelled;
+
+        Ok(CancelQueryOutput {
+            query_id: cancelled.query_id.clone(),
+            query_status: cancelled.status.as_wire().to_string(),
+            event_data_store_owner_account_id: cancelled
+                .event_data_store_owner_account_id
+                .clone(),
+        })
     }
+}
+
+/// The HTTP status this service answers a not-found refusal with.
+///
+/// The model annotates `EventDataStoreNotFoundException` and
+/// `QueryIdNotFoundException` `@httpError(404)`, but CloudTrail answers 400 for them
+/// on the wire: the recorded response for this very operation is `HTTP 400` with
+/// `__type` `EventDataStoreNotFoundException` and `Message` "The event data store was
+/// not found.". The error CODE is the model's; only the status is stated here, through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`] — the same way
+/// `DescribeQuery` states it.
+const NOT_FOUND_STATUS: u16 = 400;
+
+/// Refuse the request because no event data store resolved.
+fn event_data_store_not_found() -> CancelQueryError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        CancelQueryErrorModeled::EventDataStoreNotFoundException(
+            EventDataStoreNotFoundException {
+                message: Some(crate::state::EVENT_DATA_STORE_NOT_FOUND_MESSAGE.to_string()),
+            },
+        ),
+        NOT_FOUND_STATUS,
+    )
+}
+
+/// Refuse the request because the query id matched no query it could resolve.
+///
+/// The text names the member the caller supplied and its value, the way the service
+/// words it: "The QueryId value <id> does not exist or is not in the same region."
+fn query_not_found(member: &str, value: &str) -> CancelQueryError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        CancelQueryErrorModeled::QueryIdNotFoundException(QueryIdNotFoundException {
+            message: Some(crate::state::query_not_found_message(member, value)),
+        }),
+        NOT_FOUND_STATUS,
+    )
+}
+
+/// Refuse the request because the event data store the call resolved does not serve
+/// queries: `InactiveEventDataStoreException` ("The event data store is inactive").
+fn inactive_event_data_store(
+    id: &str,
+    status: crate::state::EventDataStoreState,
+) -> CancelQueryError {
+    CancelQueryErrorModeled::InactiveEventDataStoreException(InactiveEventDataStoreException {
+        message: Some(format!(
+            "The event data store {id} is {} and does not serve queries.",
+            status.as_wire()
+        )),
+    })
+    .into()
 }

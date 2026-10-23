@@ -28,7 +28,9 @@
 //!   the segment after the LAST dot of the target rather than after the first.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   wording. THIS service rewords ONE class: a tag key or value outside its modelled
+//!   length, which CloudTrail answers as `InvalidTagParameterException` rather than as
+//!   a generic `ValidationException`. See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -44,7 +46,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -57,6 +59,26 @@ use std::sync::Arc;
 /// in `tests/all/target_prefix_dispatch.rs`.
 #[cfg(test)]
 mod rpc_target;
+
+/// The part of a tag a constraint-violation path names — `key` or `value` — or `None`
+/// for a path that does not walk into a tag at all.
+///
+/// The validating walk spells a path in lowerCamel, with a `<1-based-index>.member`
+/// step from a list into one of its elements, so the value of the second tag of a
+/// tagging request's `TagsList` is `tagsList.2.member.value`, and a key in
+/// `CreateChannel`'s `Tags` is `tags.1.member.key`. Those two member names are every
+/// tag list this service's model declares.
+fn tag_member(path: &str) -> Option<&'static str> {
+    let collection = path.split('.').next()?;
+    if !matches!(collection, "tagsList" | "tags") {
+        return None;
+    }
+    match path.rsplit('.').next()? {
+        "key" => Some("key"),
+        "value" => Some("value"),
+        _ => None,
+    }
+}
 
 /// The `com-amazonaws-cloudtrail-cloudtrail-20131101` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -139,17 +161,32 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // CloudTrail does not answer a tag outside the modelled `TagKey` / `TagValue`
+        // length with the framework's generic `ValidationException`: a tag key or
+        // value outside its bound is `InvalidTagParameterException`, the shape the
+        // model declares for "the specified tag key or values are not valid", worded
+        // from the bound the value broke. The recorded corpus pins it — `AddTags` with
+        // an over-long tag value answers HTTP 400 `InvalidTagParameterException`
+        // "Tag value length cannot be more than 256 characters." — and the rule holds
+        // for every operation that takes a tag, not only the tagging pair.
+        //
+        // Every OTHER refusal keeps the framework's wording, which is what this
+        // service was recorded answering elsewhere (a `resourceArn` outside its
+        // pattern reads "1 validation error detected: Value at 'resourceArn' failed to
+        // satisfy constraint: …").
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        violations.iter().find_map(|violation| {
+            let ViolationKind::MaxLength(max) = violation.kind else {
+                return None;
+            };
+            let part = tag_member(&violation.path)?;
+            Some(Refused {
+                code: "InvalidTagParameterException".to_string(),
+                message: format!("Tag {part} length cannot be more than {max} characters."),
+            })
+        })
     }
 
     fn override_routing_error(

@@ -169,6 +169,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // Authorization comes first: the model declares `AccessDeniedException` (403) for
+        // this operation, and AWS refuses a caller whose identity holds no permission for
+        // it before anything is read or written — so a refused caller learns nothing about
+        // this account's exports, not even whether its request would have been valid. The
+        // resource an export creation acts on is the export the request names.
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let arn = crate::state::export_arn(&region, &input.export.name);
+        crate::state::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::CREATE_EXPORT,
+            &arn,
+        )
+        .map_err(CreateExportErrorModeled::AccessDeniedException)?;
+
         // "Each tag consists of a key and a value, and each key must be unique for the
         // resource" (the modelled doc for `ResourceTags`), so a request carrying one key
         // twice names two values for one tag and cannot be satisfied. The same reading of
@@ -177,8 +192,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags = crate::state::tag_map(input.resource_tags.unwrap_or_default())
             .map_err(CreateExportErrorModeled::ValidationException)?;
 
-        let region = crate::state::request_region(&ctx.parts().headers);
-        let arn = crate::state::export_arn(&region, &input.export.name);
+        // "The QueryStatement is an SQL statement. Data Exports only supports a limited
+        // subset of the SQL syntax. … To view the available tables and columns, see the
+        // Data Exports table dictionary" (the modelled doc for `Export`, quoted above):
+        // a query naming a table this service does not publish can never be served, so it
+        // is refused rather than persisted. See `crate::state::query`.
+        crate::state::validate_data_query(&input.export.data_query, false).map_err(
+            |refusal| match refusal {
+                crate::state::QueryRefusal::Invalid(invalid) => {
+                    CreateExportErrorModeled::ValidationException(invalid)
+                }
+                // This process could not read the statement: a server fault, never
+                // reported as a bad request.
+                crate::state::QueryRefusal::Internal(fault) => {
+                    CreateExportErrorModeled::InternalServerException(fault)
+                }
+            },
+        )?;
+
         let created_at = crate::state::now();
 
         let mut store = state.lock();

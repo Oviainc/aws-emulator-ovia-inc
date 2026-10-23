@@ -68,10 +68,10 @@ pub const ACTIVATION_DELAY_MILLIS: i64 = 500;
 /// The return window a purchased Savings Plan has.
 ///
 /// AWS documents it ("Returning a Savings Plan", AWS Savings Plans User Guide:
-/// a Savings Plan can be returned *within one hour of purchase*), so the value
-/// is the service's, not ours, and it is what `SavingsPlan.returnableUntil`
-/// reports.
-pub const RETURN_WINDOW_MILLIS: i64 = 60 * 60 * 1000;
+/// "you can return a Savings Plan that you purchased in the last 7 days (168
+/// hours)"), so the value is the service's, not ours, and it is what
+/// `SavingsPlan.returnableUntil` reports.
+pub const RETURN_WINDOW_MILLIS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 /// Wall-clock now, in milliseconds since the Unix epoch.
 ///
@@ -88,12 +88,36 @@ pub fn now_millis() -> i64 {
         .unwrap_or_default()
 }
 
+/// How many fractional digits a rendered time carries: milliseconds.
+pub const TIME_FRACTION_DIGITS: usize = 3;
+
 /// Render epoch milliseconds the way this service renders a time in a `String`
-/// member (`start`, `end`, `returnableUntil`): RFC 3339 / ISO 8601 in UTC.
+/// member (`start`, `end`, `returnableUntil`): RFC 3339 / ISO 8601 in UTC, at
+/// FIXED WIDTH with exactly [`TIME_FRACTION_DIGITS`] fractional digits.
+///
+/// The width is part of the value. `SavingsPlan.start`/`end`/`returnableUntil`
+/// target `String`, not `timestamp`, so the service — not the client's
+/// serializer — chooses the spelling, and `aws_smithy_types`' RFC-3339 writer
+/// omits the fractional part entirely on a whole second. A variable-width
+/// rendering makes a parser configured for millisecond precision fail, and
+/// makes two instants of one record sort differently as strings than in time
+/// (`...:52Z` sorts AFTER `...:52.100Z`). Fixed width keeps lexicographic and
+/// chronological order the same.
 pub fn format_millis(millis: i64) -> String {
-    ::aws_smithy_types::DateTime::from_millis(millis)
+    let whole_seconds = millis.div_euclid(1000);
+    let fraction = millis.rem_euclid(1000);
+    let rendered = ::aws_smithy_types::DateTime::from_secs(whole_seconds)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_default()
+        // A whole-second instant always renders; the fallback keeps this
+        // total rather than turning a clock oddity into a 500.
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+    match rendered.strip_suffix('Z') {
+        Some(seconds) => format!(
+            "{seconds}.{fraction:0width$}Z",
+            width = TIME_FRACTION_DIGITS
+        ),
+        None => rendered,
+    }
 }
 
 /// Read a time a request carries back to epoch milliseconds, so a filter on an
@@ -145,14 +169,24 @@ pub fn check_purchase_time(purchase_millis: i64, now_millis: i64) -> Result<(), 
 // Amounts
 // ---------------------------------------------------------------------------
 
-/// The scale an `Amount` is held at: hundred-thousandths, so every value the
-/// service accepts is an exact integer and no rounding creeps into a stored
-/// amount. This is the precision the documented rule allows ("no more than five
-/// digits after the decimal point").
-pub const AMOUNT_SCALE: i128 = 100_000;
+/// How many fractional digits a rendered `Amount` carries.
+///
+/// `Amount` targets `string` in the model, so the rendering IS the wire value:
+/// a client that compares, displays or hashes it sees exactly these digits,
+/// rather than a number it is free to reformat. This service renders every
+/// `Amount` at this one fixed scale — eight fractional digits, the scale AWS
+/// bills Savings Plans commitments and payments at — so no amount is ever
+/// reported in two spellings.
+pub const AMOUNT_WIRE_DIGITS: usize = 8;
 
-/// The most digits an `Amount` may carry after the decimal point: "You cannot
-/// specify more than five digits after the decimal point".
+/// The scale an `Amount` is held at: the wire scale, so every value the service
+/// accepts is an exact integer, no rounding creeps into a stored amount, and
+/// the stored value and the rendered one are the same number.
+pub const AMOUNT_SCALE: i128 = 100_000_000;
+
+/// The most digits an `Amount` a REQUEST carries may have after the decimal
+/// point: "You cannot specify more than five digits after the decimal point".
+/// The service's own rendering is wider (see [`AMOUNT_WIRE_DIGITS`]).
 pub const MAX_AMOUNT_DIGITS: usize = 5;
 
 /// The smallest hourly commitment `CreateSavingsPlan` accepts, from the
@@ -168,6 +202,19 @@ pub const MAX_COMMITMENT_UNITS: i128 = 1_000_000 * AMOUNT_SCALE;
 /// `Amount` is an unconstrained string in the model, so the shape of the value
 /// is the handler's to enforce.
 pub fn parse_amount(member: &str, value: &str) -> Result<i128, String> {
+    parse_amount_with_digits(member, value, MAX_AMOUNT_DIGITS)
+}
+
+/// Read an amount the way a FILTER value is read: at the full wire scale, since
+/// the value a client filters with is the one this service rendered for it
+/// ([`AMOUNT_WIRE_DIGITS`] fractional digits), which is wider than the
+/// [`MAX_AMOUNT_DIGITS`] a request may SPECIFY.
+pub fn parse_amount_at_wire_scale(value: &str) -> Option<i128> {
+    parse_amount_with_digits("amount", value, AMOUNT_WIRE_DIGITS).ok()
+}
+
+/// [`parse_amount`], with the number of fractional digits the caller admits.
+fn parse_amount_with_digits(member: &str, value: &str, max_digits: usize) -> Result<i128, String> {
     let trimmed = value.trim();
     let invalid = || format!("{member} must be a non-negative decimal amount, got '{value}'");
     let (whole, fraction) = match trimmed.split_once('.') {
@@ -178,16 +225,16 @@ pub fn parse_amount(member: &str, value: &str) -> Result<i128, String> {
     if !digits(whole) || (trimmed.contains('.') && !digits(fraction)) {
         return Err(invalid());
     }
-    if fraction.len() > MAX_AMOUNT_DIGITS {
+    if fraction.len() > max_digits {
         return Err(format!(
-            "{member} cannot specify more than {MAX_AMOUNT_DIGITS} digits after the decimal point, got '{value}'"
+            "{member} cannot specify more than {max_digits} digits after the decimal point, got '{value}'"
         ));
     }
     let whole: i128 = whole.parse().map_err(|_| invalid())?;
     let mut units = whole.checked_mul(AMOUNT_SCALE).ok_or_else(invalid)?;
     if !fraction.is_empty() {
-        // Right-pad to the full scale, so ".1" and ".10000" are one value.
-        let padded = format!("{fraction:0<width$}", width = MAX_AMOUNT_DIGITS);
+        // Right-pad to the held scale, so ".1" and ".10000000" are one value.
+        let padded = format!("{fraction:0<width$}", width = AMOUNT_WIRE_DIGITS);
         units = units
             .checked_add(padded.parse::<i128>().map_err(|_| invalid())?)
             .ok_or_else(invalid)?;
@@ -210,20 +257,19 @@ pub fn parse_commitment(value: &str) -> Result<i128, String> {
     Ok(units)
 }
 
-/// Render [`AMOUNT_SCALE`] units as an `Amount`: trailing zeros dropped, always
-/// with a decimal point.
+/// Render [`AMOUNT_SCALE`] units as an `Amount`: FIXED WIDTH, always with a
+/// decimal point and exactly [`AMOUNT_WIRE_DIGITS`] fractional digits.
+///
+/// Trailing zeros are significant here, not noise: see [`AMOUNT_WIRE_DIGITS`].
 pub fn format_amount(units: i128) -> String {
     let sign = if units < 0 { "-" } else { "" };
     let units = units.abs();
-    let mut fraction = format!(
-        "{:0width$}",
+    format!(
+        "{sign}{}.{:0width$}",
+        units / AMOUNT_SCALE,
         units % AMOUNT_SCALE,
-        width = MAX_AMOUNT_DIGITS
-    );
-    while fraction.len() > 1 && fraction.ends_with('0') {
-        fraction.pop();
-    }
-    format!("{sign}{}.{fraction}", units / AMOUNT_SCALE)
+        width = AMOUNT_WIRE_DIGITS
+    )
 }
 
 /// Round `units` up to a whole amount (no fractional part).
@@ -645,20 +691,44 @@ pub struct SavingsPlanRecord {
     pub payment_option: String,
     pub product_types: Vec<String>,
     pub currency: String,
-    pub commitment: String,
-    pub upfront_payment_amount: String,
-    pub recurring_payment_amount: String,
+    /// The hourly commitment, in [`AMOUNT_SCALE`] units. Held as a NUMBER, not
+    /// as the string it is rendered to, so one amount has exactly one spelling
+    /// on the wire ([`format_amount`]) and a filter on it compares numbers.
+    pub commitment_units: i128,
+    /// The up-front payment, in [`AMOUNT_SCALE`] units.
+    pub upfront_payment_units: i128,
+    /// The recurring hourly payment, in [`AMOUNT_SCALE`] units.
+    pub recurring_payment_units: i128,
     pub term_duration_in_seconds: i64,
     pub tags: BTreeMap<String, String>,
 }
 
 impl SavingsPlanRecord {
-    /// Whether a return can still be requested for this plan: it must be in a
-    /// paid-for state and still inside its one-hour window.
+    /// Whether a return can be requested for this plan RIGHT NOW: it must have
+    /// started and been paid for, and still be inside its return window.
+    ///
+    /// A plan that has not started yet (`queued`) is not returned but cancelled,
+    /// through `DeleteQueuedSavingsPlan`, so it is not returnable here however
+    /// open its window is.
     pub fn is_returnable(&self, now_millis: i64) -> bool {
         matches!(
             self.state.as_str(),
             STATE_PAYMENT_PENDING | STATE_ACTIVE
+        ) && now_millis <= self.return_window_closes_millis()
+    }
+
+    /// Whether this plan still HAS a return window: its state has not foreclosed
+    /// a return (it has not been returned, cancelled or retired) and the window
+    /// has not run out.
+    ///
+    /// Wider than [`Self::is_returnable`] by one state: a plan that has not
+    /// started yet still has the window its start opens, which is what
+    /// `returnableUntil` reports even though a return cannot be requested until
+    /// the plan starts.
+    pub fn has_return_window(&self, now_millis: i64) -> bool {
+        matches!(
+            self.state.as_str(),
+            STATE_QUEUED | STATE_PAYMENT_PENDING | STATE_ACTIVE
         ) && now_millis <= self.return_window_closes_millis()
     }
 
@@ -671,8 +741,12 @@ impl SavingsPlanRecord {
     /// `returnableUntil`: "the time until when a return for the Savings Plan can
     /// be requested. If the Savings Plan is not returnable, the field reflects
     /// the Savings Plans start time."
+    ///
+    /// Reported from [`Self::has_return_window`], not from
+    /// [`Self::is_returnable`]: the member is the instant the window CLOSES,
+    /// which a plan whose term has not begun still has.
     pub fn returnable_until_millis(&self, now_millis: i64) -> i64 {
-        if self.is_returnable(now_millis) {
+        if self.has_return_window(now_millis) {
             self.return_window_closes_millis()
         } else {
             self.start_millis
@@ -705,11 +779,19 @@ impl SavingsPlanRecord {
             "ec2-instance-family" | "instance-family" => {
                 (self.ec2_instance_family.clone(), FilterKind::Text)
             }
-            "commitment" => (Some(self.commitment.clone()), FilterKind::Number),
-            "upfront" => (Some(self.upfront_payment_amount.clone()), FilterKind::Number),
+            "commitment" => (
+                Some(format_amount(self.commitment_units)),
+                FilterKind::Number(self.commitment_units),
+            ),
+            "upfront" => (
+                Some(format_amount(self.upfront_payment_units)),
+                FilterKind::Number(self.upfront_payment_units),
+            ),
             "term" => (
                 Some(self.term_duration_in_seconds.to_string()),
-                FilterKind::Number,
+                FilterKind::Number(
+                    i128::from(self.term_duration_in_seconds).saturating_mul(AMOUNT_SCALE),
+                ),
             ),
             "savings-plan-type" => (Some(self.savings_plan_type.clone()), FilterKind::Text),
             "payment-option" => (Some(self.payment_option.clone()), FilterKind::Text),
@@ -733,13 +815,9 @@ impl SavingsPlanRecord {
                 }
                 match kind {
                     FilterKind::Text => false,
-                    FilterKind::Number => match (
-                        parse_amount(name, value).ok(),
-                        parse_amount(name, &field).ok(),
-                    ) {
-                        (Some(left), Some(right)) => left == right,
-                        _ => false,
-                    },
+                    FilterKind::Number(units) => {
+                        parse_amount_at_wire_scale(value) == Some(units)
+                    }
                     FilterKind::Instant(millis) => parse_millis(value) == Some(millis),
                 }
             }),
@@ -752,8 +830,9 @@ impl SavingsPlanRecord {
 enum FilterKind {
     /// Compared as text, the way the model's enum-valued members are.
     Text,
-    /// Compared as a number, so two spellings of one amount are one value.
-    Number,
+    /// Compared as a number (the member's value in [`AMOUNT_SCALE`] units), so
+    /// two spellings of one amount are one value.
+    Number(i128),
     /// Compared as an instant (epoch millis), for the same reason.
     Instant(i64),
 }
@@ -923,9 +1002,9 @@ impl ComAmazonawsSavingsplansAwssavingsplanState {
 pub fn purchase(
     offering: &Offering,
     savings_plan_id: String,
-    commitment: &str,
-    upfront_payment_amount: i128,
-    recurring_payment_amount: i128,
+    commitment_units: i128,
+    upfront_payment_units: i128,
+    recurring_payment_units: i128,
     purchase_millis: i64,
     now_millis: i64,
     tags: BTreeMap<String, String>,
@@ -960,9 +1039,9 @@ pub fn purchase(
         payment_option: offering.payment_option.clone(),
         product_types: offering.product_types.clone(),
         currency: offering.currency.clone(),
-        commitment: commitment.to_string(),
-        upfront_payment_amount: format_amount(upfront_payment_amount),
-        recurring_payment_amount: format_amount(recurring_payment_amount),
+        commitment_units,
+        upfront_payment_units,
+        recurring_payment_units,
         term_duration_in_seconds: offering.duration_seconds,
         tags,
     }

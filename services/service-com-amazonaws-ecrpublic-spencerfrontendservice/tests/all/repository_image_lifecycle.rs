@@ -507,8 +507,9 @@ struct ManifestCase {
 
 /// Manifests spanning what a pushed document can be: an OCI image manifest carrying both
 /// media types, a Docker manifest list carrying only its own, a JSON document carrying
-/// neither, a document that is not JSON at all, and one large enough that its byte length
-/// is not its character count by accident.
+/// neither, a JSON array rather than an object, and one large enough that its byte length
+/// is not its character count by accident. (A body that is not JSON at all is refused
+/// rather than stored — see `tests/all/json_document_members.rs`.)
 fn manifest_cases() -> Vec<ManifestCase> {
     vec![
         ManifestCase {
@@ -549,8 +550,8 @@ fn manifest_cases() -> Vec<ManifestCase> {
             image_size: None,
         },
         ManifestCase {
-            case: "not a json document",
-            manifest: "this is not a manifest".to_string(),
+            case: "a json array rather than an object",
+            manifest: json!([{"schemaVersion": 2}]).to_string(),
             manifest_media_type: None,
             artifact_media_type: None,
             image_size: None,

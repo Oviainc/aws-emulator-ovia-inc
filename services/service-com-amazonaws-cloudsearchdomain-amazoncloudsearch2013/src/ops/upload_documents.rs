@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UploadDocuments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UploadDocuments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UploadDocuments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies an SDF document batch to the addressed domain's index: an `add` entry
+//! inserts or replaces the document under its id, a `delete` entry removes it.
+//! The response counts what was applied and reports what the document service
+//! ignored; a batch that breaks a documented rule earns the modelled
+//! `DocumentServiceException`. The batch formats live in [`crate::state::sdf`].
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +156,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UploadDocuments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UploadDocumentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UploadDocuments"))
+        let domain = crate::state::domain_key(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit_batch(ctx.parts(), &domain, "unavailable", 0, 0);
+            document_service_error("The document service is unavailable for this endpoint.")
+        })?;
+
+        // Parse the whole batch BEFORE applying any of it: a batch is refused or
+        // applied as a unit, so a malformed entry cannot leave half an upload in
+        // the index.
+        let batch = crate::state::sdf::parse(&input.content_type, &input.documents).map_err(
+            |message| {
+                crate::state::audit_batch(ctx.parts(), &domain, "rejected", 0, 0);
+                document_service_error(message)
+            },
+        )?;
+
+        // The whole batch is applied as a unit, and refused as a unit when it
+        // would push the store past its ceilings.
+        let applied = state
+            .lock()
+            .apply(&domain, batch.entries)
+            .map_err(|message| {
+                crate::state::audit_batch(ctx.parts(), &domain, "rejected", 0, 0);
+                document_service_error(message)
+            })?;
+        // One record per state change, carrying who asked and what changed.
+        crate::state::audit_batch(
+            ctx.parts(),
+            &domain,
+            UPLOAD_SUCCESS_STATUS,
+            applied.adds,
+            applied.deletes,
+        );
+
+        let warnings: Vec<DocumentServiceWarning> = batch
+            .warnings
+            .into_iter()
+            .map(|message| DocumentServiceWarning {
+                message: Some(message),
+            })
+            .collect();
+        Ok(UploadDocumentsOutput {
+            status: Some(UPLOAD_SUCCESS_STATUS.to_string()),
+            adds: applied.adds,
+            deletes: applied.deletes,
+            warnings: (!warnings.is_empty()).then_some(warnings),
+        })
     }
+}
+
+/// The `status` of a batch the document service accepted. The modelled
+/// `DocumentServiceException` documents the other value, `error`, which the
+/// refusal below carries.
+const UPLOAD_SUCCESS_STATUS: &str = "success";
+
+/// The modelled refusal (HTTP 400) for a batch the document service rejects.
+fn document_service_error(message: impl Into<String>) -> UploadDocumentsError {
+    UploadDocumentsErrorModeled::DocumentServiceException(DocumentServiceException {
+        status: Some("error".to_string()),
+        message: Some(message.into()),
+    })
+    .into()
 }

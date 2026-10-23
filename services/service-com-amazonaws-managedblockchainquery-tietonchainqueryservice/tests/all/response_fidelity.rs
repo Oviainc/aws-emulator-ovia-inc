@@ -32,7 +32,10 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use service_com_amazonaws_managedblockchainquery_tietonchainqueryservice::state::derived;
 
-use crate::chain_query_slice::{drain, error_code, unseeded_bitcoin_address, Emulator};
+use crate::chain_query_slice::{
+    drain, error_code, refusal_explanation, unseeded_bitcoin_address, Emulator,
+    GENERIC_VALIDATION_MESSAGE,
+};
 
 /// Every response member of this service that carries a `ChainAddress`:
 /// `OwnerIdentifier$address`, `ContractIdentifier$contractAddress` /
@@ -47,10 +50,8 @@ const CHAIN_ADDRESS_MEMBERS: [&str; 5] = [
     "to",
 ];
 
-/// The top-level `message` of every refusal on a rule the model cannot express, and the
-/// modelled `ValidationExceptionReason` beside it.
-const GENERIC_VALIDATION_MESSAGE: &str = "One or more parameter values were invalid.";
-/// See [`GENERIC_VALIDATION_MESSAGE`]; `fieldValidationFailed` is a
+/// The modelled `ValidationExceptionReason` beside the generic top-level message
+/// (`crate::chain_query_slice::GENERIC_VALIDATION_MESSAGE`): `fieldValidationFailed` is a
 /// `ValidationExceptionReason` value.
 const FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 
@@ -639,9 +640,15 @@ async fn a_batch_error_item_reports_the_status_and_the_item_that_failed() {
                 "case {case}: errorType is the modelled ErrorType of the exception, \
                  got {entry:?}"
             );
+            // `errorMessage` is what the single read SAID about this item. A
+            // `BatchGetTokenBalanceErrorItem` models ONE message and no `fieldList`, so
+            // for a refusal whose top-level `message` is this service's generic sentinel
+            // — the shape a rule the model cannot express is reported in, with the
+            // detail in `fieldList` — the item states that detail; otherwise it states
+            // the message itself.
             assert_eq!(
-                entry["errorMessage"].as_str(),
-                single["message"].as_str(),
+                entry["errorMessage"].as_str().map(str::to_string),
+                Some(refusal_explanation(&single)),
                 "case {case}: errorMessage is what the single read said, got {entry:?}"
             );
 

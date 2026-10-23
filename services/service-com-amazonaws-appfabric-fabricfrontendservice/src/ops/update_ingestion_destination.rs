@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(bundle_key) = store.bundle_key(&input.app_bundle_identifier) else {
             return Err(
                 UpdateIngestionDestinationErrorModeled::ResourceNotFoundException(
-                    crate::state::app_bundle_not_found(&input.app_bundle_identifier),
+                    crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
                 )
                 .into(),
             );

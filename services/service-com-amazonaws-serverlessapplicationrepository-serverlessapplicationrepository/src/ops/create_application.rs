@@ -261,6 +261,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(|refusal| bad_request(refusal.message()))?;
 
         let region = crate::state::request_region(ctx);
+        // The endpoint this request arrived on: the host a locator minted for an inline
+        // body announces, because that locator has to be one the caller can follow back
+        // here (`crate::state::minted_artifact_url`).
+        let host = crate::state::request_host(ctx, &region);
         let application_id = crate::state::application_arn(&region, &input.name);
         let name_key = crate::state::name_key(&region, &input.name);
 
@@ -298,6 +302,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             license_url: crate::state::resolve_artifact_url(
                 input.license_body.as_ref(),
                 input.license_url.as_ref(),
+                &host,
                 &region,
                 &input.name,
                 None,
@@ -307,6 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             readme_url: crate::state::resolve_artifact_url(
                 input.readme_body.as_ref(),
                 input.readme_url.as_ref(),
+                &host,
                 &region,
                 &input.name,
                 None,
@@ -337,6 +343,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 template_url: crate::state::resolve_artifact_url(
                     input.template_body.as_ref(),
                     input.template_url.as_ref(),
+                    &host,
                     &region,
                     &input.name,
                     Some(&semantic_version),
@@ -344,6 +351,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .unwrap_or_else(|| {
                     crate::state::minted_artifact_url(
+                        &host,
                         &region,
                         &input.name,
                         Some(&semantic_version),

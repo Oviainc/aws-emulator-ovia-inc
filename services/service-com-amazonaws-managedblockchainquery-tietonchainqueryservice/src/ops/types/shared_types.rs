@@ -11,7 +11,17 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-managedblockchainquery-tietonchainqueryservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchainquery#TokenIdentifier")]
+// Every member below whose target shape carries a modelled constraint names that
+// member in `skip_validation`. That keeps the constraint traits off the generated
+// member schema, so the framework's boundary walk does NOT refuse the value with its
+// synthetic `ValidationException` (which carries no `reason` and no `fieldList`, and
+// quotes a `@pattern` with the model's anchors); the HANDLER checks it instead and
+// answers with this service's own modelled shape. The check lives in
+// `crate::state::validation`, one call per member listed here.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.managedblockchainquery#TokenIdentifier",
+    skip_validation = ["network", "contractAddress", "tokenId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct TokenIdentifier {
     pub network: String,
@@ -19,7 +29,10 @@ pub struct TokenIdentifier {
     pub token_id: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchainquery#OwnerIdentifier")]
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.managedblockchainquery#OwnerIdentifier",
+    skip_validation = ["address"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct OwnerIdentifier {
     pub address: String,
@@ -86,14 +99,20 @@ pub struct ValidationExceptionField {
     pub message: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchainquery#ContractIdentifier")]
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.managedblockchainquery#ContractIdentifier",
+    skip_validation = ["network", "contractAddress"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ContractIdentifier {
     pub network: String,
     pub contract_address: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchainquery#ConfirmationStatusFilter")]
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.managedblockchainquery#ConfirmationStatusFilter",
+    skip_validation = ["include"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ConfirmationStatusFilter {
     pub include: Vec<String>,

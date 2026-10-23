@@ -199,10 +199,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListTagsForResourceOutput {
             resource_arn: Some(input.resource_arn.clone()),
-            // `TagList` is modelled `length {min 1, max 200}`, so a resource with no
-            // tags is reported by LEAVING the member out rather than by an empty list
-            // the model does not allow.
-            tags: (!tags.is_empty()).then(|| tags.clone()),
+            // The tag set of a resource this account holds is ALWAYS reported, empty
+            // or not: `Tags` is what says "these are the tags" and an empty array is
+            // what says "this resource carries none" — a member left out would be
+            // indistinguishable from "unknown", and a client that iterates the list
+            // without a null check breaks on a resource whose last tag was removed.
+            // `TagList`'s `length {min 1, max 200}` bounds the list a REQUEST may
+            // carry (`TagResource`/`CreateVocabulary` input, where the boundary
+            // validator enforces it); it does not turn an empty reported set into an
+            // absent member.
+            tags: Some(tags.clone()),
         })
     }
 }

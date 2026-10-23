@@ -139,6 +139,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx);
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateApplicationError::internal_failure("the Elastic Beanstalk store is unavailable")
         })?;
@@ -168,14 +169,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "The ServiceRole property is required the first time that you provide
-        // a VersionLifecycleConfig for the application in one of the supporting
-        // calls (CreateApplication or UpdateApplicationResourceLifecycle)." A
-        // new application has no stored role, so the request must carry one.
+        // "ServiceRole: The ARN of an IAM service role that Elastic Beanstalk has
+        // permission to assume", "required the first time that you provide a
+        // VersionLifecycleConfig for the application in one of the supporting
+        // calls (CreateApplication or UpdateApplicationResourceLifecycle)". A new
+        // application carries no role yet, so the request's own member is the only
+        // source — and a request this member cannot serve is refused on the member,
+        // naming it and the constraint its value failed. The same check
+        // `UpdateApplicationResourceLifecycle` makes, from the one place that
+        // states it.
         if let Some(requested) = input.resource_lifecycle_config.as_ref() {
-            if crate::state::version_lifecycle_service_role_missing(None, requested) {
+            if crate::state::service_role_unusable(None, requested) {
                 return Err(CreateApplicationError::invalid_parameter_value(
-                    "The ServiceRole property is required the first time that you provide a VersionLifecycleConfig for an application.",
+                    crate::state::invalid_parameter_message(
+                        "ServiceRole",
+                        crate::state::IAM_ROLE_ARN_REQUIREMENT,
+                    ),
                 ));
             }
         }

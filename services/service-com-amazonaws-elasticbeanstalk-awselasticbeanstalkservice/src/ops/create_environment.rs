@@ -3,7 +3,10 @@
 //! @op CreateEnvironment
 //! Implemented: stores the environment the request asks for, in the `Launching` status a
 //! newly created environment reports, and answers with the `EnvironmentDescription` built
-//! from what was stored. A CNAME prefix the caller supplies has to be one a host name
+//! from what was stored. The request has to name where the environment's configuration
+//! comes from — a configuration template, a solution stack or a custom platform version —
+//! and that absent-parameter check runs before any resource the request names is looked
+//! up. A CNAME prefix the caller supplies has to be one a host name
 //! label can carry and must not already be held by a live environment — the same rule
 //! `CheckDNSAvailability` reports on. This is the ONLY file to touch for this operation.
 //!
@@ -238,6 +241,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx);
+
+        // A parameter this request needs but did not supply is answered BEFORE any
+        // resource the request names is resolved: an absent input is a statement about
+        // the REQUEST, which does not depend on what this account holds, so it cannot
+        // be reported as a problem with a resource (and a caller told its application
+        // is at fault would never find the input defect). Both checks below therefore
+        // precede the application lookup.
+
+        // An environment's configuration comes from exactly one of three places: a
+        // configuration template ("The name of the Elastic Beanstalk configuration
+        // template to use with the environment"), a solution stack ("Elastic Beanstalk
+        // sets the configuration values to the default values associated with the
+        // specified solution stack") or a custom platform version (`PlatformArn`). A
+        // request that names NONE of them says nothing about what to launch, and is
+        // refused with the code and the sentence the service answers that absence with.
+        if input.template_name.is_none()
+            && input.solution_stack_name.is_none()
+            && input.platform_arn.is_none()
+        {
+            return Err(CreateEnvironmentError::missing_parameter(
+                "You must specify either Configuration Template name or Solution Stack name.",
+            ));
+        }
+
+        // `GroupName` names an environment through an environment manifest
+        // (env.yaml) in the source bundle, which this emulator never reads, so an
+        // environment it cannot name is refused rather than invented.
+        let Some(environment_name) = input.environment_name.clone() else {
+            return Err(CreateEnvironmentError::missing_required_parameter(
+                "Must specify an EnvironmentName.",
+            ));
+        };
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateEnvironmentError::internal_failure("the Elastic Beanstalk store is unavailable")
         })?;
@@ -254,15 +290,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.application_name
             )));
         }
-
-        // `GroupName` names an environment through an environment manifest
-        // (env.yaml) in the source bundle, which this emulator never reads, so an
-        // environment it cannot name is refused rather than invented.
-        let Some(environment_name) = input.environment_name.clone() else {
-            return Err(CreateEnvironmentError::missing_required_parameter(
-                "Must specify an EnvironmentName.",
-            ));
-        };
 
         // "This name must be unique within a region in your account. If the
         // specified name already exists in the region, Elastic Beanstalk returns

@@ -15,9 +15,10 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    AppBundle, AppBundleSummary, ConflictException, Destination, DestinationConfiguration,
-    Ingestion, IngestionDestination, IngestionSummary, ProcessingConfiguration,
-    ResourceNotFoundException, ServiceQuotaExceededException, Tag, ValidationException,
+    AppAuthorization, AppAuthorizationSummary, AppBundle, AppBundleSummary, ConflictException,
+    Credential, Destination, DestinationConfiguration, Ingestion, IngestionDestination,
+    IngestionDestinationSummary, IngestionSummary, ProcessingConfiguration,
+    ResourceNotFoundException, ServiceQuotaExceededException, Tag, Tenant, ValidationException,
     ValidationExceptionField,
 };
 
@@ -58,6 +59,51 @@ pub const MAX_INGESTIONS_PER_APP_BUNDLE: usize = 1_000;
 /// The same guard for the ingestion destinations one ingestion may hold.
 pub const MAX_DESTINATIONS_PER_INGESTION: usize = 1_000;
 
+/// The same guard for the app authorizations one app bundle may hold.
+pub const MAX_APP_AUTHORIZATIONS_PER_APP_BUNDLE: usize = 1_000;
+
+/// The state an app authorization is created in, from the model's
+/// `AppAuthorizationStatus` enum (`APP_AUTHORIZATION_STATUS_VALUES`), whose own
+/// documentation states it: "`PendingConnect`: The initial state of the app
+/// authorization. The app authorization is created but not yet connected."
+pub const APP_AUTHORIZATION_STATUS_PENDING_CONNECT: &str = "PendingConnect";
+
+/// The state `ConnectAppAuthorization` moves an authorization to, from the same
+/// enum: "`Connected`: The app authorization is connected to the application,
+/// and is ready to be used."
+pub const APP_AUTHORIZATION_STATUS_CONNECTED: &str = "Connected";
+
+/// The user persona every app authorization carries, from the model's doc on
+/// `AppAuthorization$persona`: "This field should always be `admin`." One of the
+/// model's `Persona` values (`PERSONA_VALUES`).
+pub const APP_AUTHORIZATION_PERSONA_ADMIN: &str = "admin";
+
+/// The applications AppFabric supports, as the model's own documentation of
+/// `app` lists them (`CreateAppAuthorization$app` and `CreateIngestion$app`:
+/// "Valid values are: SLACK ASANA JIRA M365 M365AUDITLOGS ZOOM ZENDESK OKTA
+/// GOOGLE DROPBOX SMARTSHEET CISCO"). The member targets `String255` with no
+/// `@enum`, so this set is NOT boundary-validated: a handler that mints a
+/// resource for an application checks it ([`app_not_supported`]).
+pub const SUPPORTED_APPS: &[&str] = &[
+    "SLACK",
+    "ASANA",
+    "JIRA",
+    "M365",
+    "M365AUDITLOGS",
+    "ZOOM",
+    "ZENDESK",
+    "OKTA",
+    "GOOGLE",
+    "DROPBOX",
+    "SMARTSHEET",
+    "CISCO",
+];
+
+/// Whether `app` names an application AppFabric supports — see [`SUPPORTED_APPS`].
+pub fn is_supported_app(app: &str) -> bool {
+    SUPPORTED_APPS.contains(&app)
+}
+
 /// The number of tags ONE resource may hold.
 ///
 /// Not a resource guard but the model's own bound: a `TagList` is
@@ -86,6 +132,12 @@ pub struct AppBundleRecord {
     /// position that survives a deletion.
     pub sequence: u64,
     pub ingestions: HashMap<String, IngestionRecord>,
+    /// This bundle's app authorizations, keyed by bare UUID:
+    /// `CreateAppAuthorization` writes them and `ConnectAppAuthorization` moves
+    /// their status. An ingestion depends on one of them (see
+    /// [`AppBundleRecord::connected_authorization`]), so they are stored under
+    /// the same bundle record the ingestions are.
+    pub app_authorizations: HashMap<String, AppAuthorizationRecord>,
 }
 
 impl AppBundleRecord {
@@ -125,6 +177,127 @@ impl AppBundleRecord {
         let mut ingestions: Vec<&IngestionRecord> = self.ingestions.values().collect();
         ingestions.sort_by_key(|ingestion| ingestion.sequence);
         ingestions
+    }
+
+    /// The app authorization `identifier` names within this bundle, by ARN or
+    /// bare UUID — the same two forms every other `Identifier` accepts.
+    pub fn resolve_app_authorization(&self, identifier: &str) -> Option<&AppAuthorizationRecord> {
+        match app_authorization_key(self, identifier) {
+            Some(key) => self.app_authorizations.get(&key),
+            None => None,
+        }
+    }
+
+    /// The same app authorization, for mutation.
+    pub fn resolve_app_authorization_mut(
+        &mut self,
+        identifier: &str,
+    ) -> Option<&mut AppAuthorizationRecord> {
+        match app_authorization_key(self, identifier) {
+            Some(key) => self.app_authorizations.get_mut(&key),
+            None => None,
+        }
+    }
+
+    /// This bundle's app authorizations in creation order.
+    pub fn app_authorizations_in_order(&self) -> Vec<&AppAuthorizationRecord> {
+        let mut authorizations: Vec<&AppAuthorizationRecord> =
+            self.app_authorizations.values().collect();
+        authorizations.sort_by_key(|authorization| authorization.sequence);
+        authorizations
+    }
+
+    /// This bundle's app authorization for one (application, tenant) pair, if it
+    /// holds one.
+    ///
+    /// The pair is what identifies an authorization inside a bundle: AppFabric
+    /// holds at most one authorization per (bundle, app, tenant) triple, so this
+    /// is both the uniqueness check `CreateAppAuthorization` takes before it
+    /// inserts and the dependency lookup an ingestion is validated against.
+    pub fn authorization_for(&self, app: &str, tenant: &str) -> Option<&AppAuthorizationRecord> {
+        self.app_authorizations
+            .values()
+            .find(|authorization| authorization.app == app && authorization.tenant_identifier == tenant)
+    }
+
+    /// The same authorization, but only once it has completed the connect
+    /// handshake — the state an ingestion of that (app, tenant) pair requires.
+    pub fn connected_authorization(
+        &self,
+        app: &str,
+        tenant: &str,
+    ) -> Option<&AppAuthorizationRecord> {
+        self.authorization_for(app, tenant)
+            .filter(|authorization| authorization.status == APP_AUTHORIZATION_STATUS_CONNECTED)
+    }
+}
+
+/// An app authorization, as `CreateAppAuthorization` stored it and
+/// `ConnectAppAuthorization` last moved it.
+///
+/// The CREDENTIAL the create call carried is deliberately NOT part of the
+/// record: no modelled response reports it back (`AppAuthorization` has no
+/// credential member, and both credential shapes are `@sensitive`), so the only
+/// thing any later read needs is WHICH kind of credential was supplied — which
+/// is what [`AppAuthorizationRecord::credential_kind`] holds.
+#[derive(Debug, Clone)]
+pub struct AppAuthorizationRecord {
+    pub id: String,
+    pub arn: String,
+    pub app_bundle_arn: String,
+    pub app: String,
+    pub tenant_identifier: String,
+    pub tenant_display_name: String,
+    pub auth_type: String,
+    /// The union member the caller set on `credential` (`oauth2Credential` or
+    /// `apiKeyCredential`) — never the secret inside it.
+    pub credential_kind: String,
+    pub status: String,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    pub tags: Vec<Tag>,
+    pub sequence: u64,
+}
+
+impl AppAuthorizationRecord {
+    /// The modelled `Tenant` this authorization was created for.
+    pub fn to_tenant(&self) -> Tenant {
+        Tenant {
+            tenant_identifier: self.tenant_identifier.clone(),
+            tenant_display_name: self.tenant_display_name.clone(),
+        }
+    }
+
+    /// The modelled `AppAuthorization` for this record.
+    pub fn to_app_authorization(&self) -> AppAuthorization {
+        AppAuthorization {
+            app_authorization_arn: self.arn.clone(),
+            app_bundle_arn: self.app_bundle_arn.clone(),
+            app: self.app.clone(),
+            tenant: self.to_tenant(),
+            auth_type: self.auth_type.clone(),
+            status: self.status.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
+            persona: Some(APP_AUTHORIZATION_PERSONA_ADMIN.to_string()),
+            // `authUrl` is the application's own OAuth page. This emulator makes
+            // no outbound connection and serves no application, so there is no
+            // such URL to report; the member is optional and stays absent rather
+            // than carrying a URL nothing is served at.
+            auth_url: None,
+        }
+    }
+
+    /// The modelled `AppAuthorizationSummary` for this record.
+    pub fn to_summary(&self) -> AppAuthorizationSummary {
+        AppAuthorizationSummary {
+            app_authorization_arn: self.arn.clone(),
+            app_bundle_arn: self.app_bundle_arn.clone(),
+            app: self.app.clone(),
+            tenant: self.to_tenant(),
+            status: self.status.clone(),
+            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
+        }
     }
 }
 
@@ -232,6 +405,14 @@ impl IngestionDestinationRecord {
             status_reason: self.status_reason.clone(),
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
             updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+        }
+    }
+
+    /// The modelled `IngestionDestinationSummary` for this record, which the
+    /// model gives one member: the destination's ARN.
+    pub fn to_summary(&self) -> IngestionDestinationSummary {
+        IngestionDestinationSummary {
+            arn: self.arn.clone(),
         }
     }
 }
@@ -353,6 +534,14 @@ impl ComAmazonawsAppfabricFabricfrontendserviceState {
                     bundle: bundle.id.clone(),
                 });
             }
+            for authorization in bundle.app_authorizations.values() {
+                if authorization.arn == arn {
+                    return Some(TagTarget::AppAuthorization {
+                        bundle: bundle.id.clone(),
+                        authorization: authorization.id.clone(),
+                    });
+                }
+            }
             for ingestion in bundle.ingestions.values() {
                 if ingestion.arn == arn {
                     return Some(TagTarget::Ingestion {
@@ -398,6 +587,15 @@ impl ComAmazonawsAppfabricFabricfrontendserviceState {
                 .destinations
                 .get(destination)
                 .map(|destination| &destination.tags),
+            TagTarget::AppAuthorization {
+                bundle,
+                authorization,
+            } => self
+                .app_bundles
+                .get(bundle)?
+                .app_authorizations
+                .get(authorization)
+                .map(|authorization| &authorization.tags),
         }
     }
 
@@ -426,6 +624,15 @@ impl ComAmazonawsAppfabricFabricfrontendserviceState {
                 .destinations
                 .get_mut(destination)
                 .map(|destination| &mut destination.tags),
+            TagTarget::AppAuthorization {
+                bundle,
+                authorization,
+            } => self
+                .app_bundles
+                .get_mut(bundle)?
+                .app_authorizations
+                .get_mut(authorization)
+                .map(|authorization| &mut authorization.tags),
         }
     }
 }
@@ -450,6 +657,10 @@ pub enum TagTarget {
         ingestion: String,
         destination: String,
     },
+    AppAuthorization {
+        bundle: String,
+        authorization: String,
+    },
 }
 
 impl TagTarget {
@@ -459,6 +670,7 @@ impl TagTarget {
             Self::AppBundle { .. } => "AppBundle",
             Self::Ingestion { .. } => "Ingestion",
             Self::IngestionDestination { .. } => "IngestionDestination",
+            Self::AppAuthorization { .. } => "AppAuthorization",
         }
     }
 
@@ -468,6 +680,7 @@ impl TagTarget {
             Self::AppBundle { bundle } => bundle,
             Self::Ingestion { ingestion, .. } => ingestion,
             Self::IngestionDestination { destination, .. } => destination,
+            Self::AppAuthorization { authorization, .. } => authorization,
         }
     }
 }
@@ -520,6 +733,24 @@ pub fn destination_key(ingestion: &IngestionRecord, identifier: &str) -> Option<
     } else {
         ingestion
             .destinations
+            .contains_key(identifier)
+            .then(|| identifier.to_string())
+    }
+}
+
+/// The store key of the app authorization `identifier` names inside `bundle`,
+/// by ARN or bare UUID — the same two forms every other `Identifier` in this
+/// service accepts.
+pub fn app_authorization_key(bundle: &AppBundleRecord, identifier: &str) -> Option<String> {
+    if is_arn(identifier) {
+        bundle
+            .app_authorizations
+            .values()
+            .find(|authorization| authorization.arn == identifier)
+            .map(|authorization| authorization.id.clone())
+    } else {
+        bundle
+            .app_authorizations
             .contains_key(identifier)
             .then(|| identifier.to_string())
     }
@@ -790,6 +1021,19 @@ pub fn ingestion_listing(bundle_id: &str) -> String {
     format!("ingestions-{bundle_id}")
 }
 
+/// The [`encode_page_token`] listing name of `ListIngestionDestinations` for ONE
+/// ingestion, for the same reason: a position in one ingestion's destinations is
+/// not a position in another's.
+pub fn ingestion_destination_listing(ingestion_id: &str) -> String {
+    format!("ingestiondestinations-{ingestion_id}")
+}
+
+/// The [`encode_page_token`] listing name of `ListAppAuthorizations` for ONE
+/// bundle.
+pub fn app_authorization_listing(bundle_id: &str) -> String {
+    format!("appauthorizations-{bundle_id}")
+}
+
 /// A modelled `ValidationException` refusing the call because the STORED
 /// resource is not in the state the operation documents as its precondition.
 ///
@@ -817,21 +1061,55 @@ pub fn field_validation_failed(member: &str, message: &str) -> ValidationExcepti
     }
 }
 
-/// A modelled `ResourceNotFoundException` for an app bundle the store does not hold.
+/// A modelled `ResourceNotFoundException` for an app bundle the store does not
+/// hold, as a REPORTING operation (`GetAppBundle`, `ListIngestions`,
+/// `GetAppAuthorization`, …) states it.
+///
+/// The message is a CONSTANT: AppFabric's not-found text names the KIND of
+/// resource and the path that refused, and never interpolates the identifier the
+/// caller supplied — two reads of two different bundles are refused with the
+/// same sentence. The identifier still travels in the modelled `resourceId`
+/// member, which is where a client reads it from.
 pub fn app_bundle_not_found(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("App bundle {identifier} was not found."),
+        message: "The app bundle ID was not found.".to_string(),
         resource_id: identifier.to_string(),
         resource_type: "AppBundle".to_string(),
     }
 }
 
-/// A modelled `ResourceNotFoundException` for an ingestion the store does not hold.
+/// The same refusal on a MUTATION path (`CreateAppAuthorization`,
+/// `CreateIngestion`, `StopIngestion`, …), which AppFabric words differently:
+/// a write names the bundle it writes INTO, so the refusal reports that
+/// identifier as not valid rather than reporting a read that found nothing.
+/// Same status (404) and same code as [`app_bundle_not_found`]; the two
+/// sentences are what distinguishes the two paths, and neither carries the
+/// caller's identifier.
+pub fn app_bundle_id_not_valid(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: "The specified app bundle ID is not valid".to_string(),
+        resource_id: identifier.to_string(),
+        resource_type: "AppBundle".to_string(),
+    }
+}
+
+/// A modelled `ResourceNotFoundException` for an ingestion the store does not
+/// hold — a constant sentence, for the reason [`app_bundle_not_found`] states.
 pub fn ingestion_not_found(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("Ingestion {identifier} was not found."),
+        message: "The specified ingestion does not exist".to_string(),
         resource_id: identifier.to_string(),
         resource_type: "Ingestion".to_string(),
+    }
+}
+
+/// A modelled `ResourceNotFoundException` for an app authorization the store
+/// does not hold — a constant sentence, for the same reason.
+pub fn app_authorization_not_found(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: "The specified app authorization does not exist".to_string(),
+        resource_id: identifier.to_string(),
+        resource_type: "AppAuthorization".to_string(),
     }
 }
 
@@ -869,16 +1147,136 @@ pub fn ingestion_destination_does_not_exist() -> ValidationException {
     )
 }
 
+/// The union member a `Credential` carries — never the secret inside it.
+///
+/// A credential is `@sensitive` on both arms and no modelled response reports it
+/// back, so this is the whole of what an authorization record keeps of it: which
+/// KIND of credential the caller supplied.
+pub fn credential_kind(credential: &Credential) -> &'static str {
+    match credential {
+        Credential::oauth2Credential(_) => "oauth2Credential",
+        Credential::apiKeyCredential(_) => "apiKeyCredential",
+    }
+}
+
+/// The credential kind one `authType` requires.
+///
+/// The model documents the pairing on `credential`: "Specify credentials that
+/// match the authorization type for your request. For example, if the
+/// authorization type for your request is OAuth2 (oauth2), then you should
+/// provide only the OAuth2 credentials." `AuthType` is closed by the model
+/// (`AUTH_TYPE_VALUES` = `apiKey` | `oauth2`) and the boundary validator has
+/// already refused anything else, so the `oauth2` arm is the only remaining
+/// alternative to `apiKey`.
+pub fn credential_kind_for_auth_type(auth_type: &str) -> &'static str {
+    if auth_type == "apiKey" {
+        "apiKeyCredential"
+    } else {
+        "oauth2Credential"
+    }
+}
+
+/// A modelled `ValidationException` refusing a `credential` that is not the kind
+/// the request's `authType` uses — see [`credential_kind_for_auth_type`].
+pub fn credential_does_not_match_auth_type(auth_type: &str) -> ValidationException {
+    field_validation_failed(
+        "credential",
+        &format!(
+            "credential must be a {} for authType {auth_type}",
+            credential_kind_for_auth_type(auth_type)
+        ),
+    )
+}
+
+/// A modelled `ConflictException` for an ingestion whose stored `state` forbids
+/// the transition the call asks for.
+///
+/// `StartIngestion` and `StopIngestion` each move an ingestion one way between
+/// the model's two `IngestionState` values, so a call that finds it already in
+/// the state it would move it to has no transition to make: that is the conflict
+/// both operations model ("the request has created a conflict, check the request
+/// parameters and try again"). The message is built from the request's target
+/// and the stored state, which is what tells a caller why.
+pub fn ingestion_state_conflict(arn: &str, held: &str, required: &str) -> ConflictException {
+    ConflictException {
+        message: format!("The ingestion is {held}; this request requires it to be {required}"),
+        resource_id: arn.to_string(),
+        resource_type: "Ingestion".to_string(),
+    }
+}
+
+/// A modelled `ValidationException` refusing a connect call that carries no
+/// `authRequest` for an authorization whose `authType` requires one.
+///
+/// The model states the condition on the member: `authRequest` "is required if
+/// the app authorization for the request is configured with an OAuth2 (oauth2)
+/// authorization type".
+pub fn auth_request_required(auth_type: &str) -> ValidationException {
+    field_validation_failed(
+        "authRequest",
+        &format!("authRequest is required for an app authorization with authType {auth_type}"),
+    )
+}
+
+/// A modelled `ValidationException` refusing an ingestion of an (application,
+/// tenant) pair the app bundle holds no CONNECTED app authorization for.
+///
+/// `status` is the state of the authorization the bundle does hold for that
+/// pair, or `None` when it holds none at all; the message is built from the
+/// request and from that stored state, which is what tells a caller whether it
+/// still has to create the authorization or only to connect it.
+pub fn app_authorization_not_connected(app: &str, status: Option<&str>) -> ValidationException {
+    precondition_not_met(match status {
+        Some(status) => format!(
+            "The app authorization for app {app} and the specified tenant is {status}, \
+             not {APP_AUTHORIZATION_STATUS_CONNECTED}"
+        ),
+        None => format!(
+            "No app authorization exists for app {app} and the specified tenant; \
+             create one and connect it before creating an ingestion"
+        ),
+    })
+}
+
+/// A modelled `ValidationException` refusing an `app` outside the set of
+/// applications AppFabric supports ([`SUPPORTED_APPS`]).
+///
+/// The model types `app` as a plain `String255` with no `@enum`, so the
+/// boundary validator cannot refuse it: the check is the server's, and its
+/// message is BUILT FROM THE REQUEST — it names the application that was asked
+/// for, which is the only way a caller can tell which of its values was wrong.
+pub fn app_not_supported(app: &str) -> ValidationException {
+    field_validation_failed("app", &format!("app {app} is not supported"))
+}
+
+/// A modelled `ConflictException` for a create call that would be the SECOND app
+/// authorization of one (app bundle, app, tenant) triple.
+///
+/// AppFabric holds at most one authorization per triple, so the second create
+/// — whether it follows the first or races it — is the conflict
+/// `ConflictException` states ("the request has created a conflict, check the
+/// request parameters and try again").
+pub fn app_authorization_already_exists(arn: &str) -> ConflictException {
+    ConflictException {
+        message: "An app authorization already exists for this application and tenant".to_string(),
+        resource_id: arn.to_string(),
+        resource_type: "AppAuthorization".to_string(),
+    }
+}
+
 /// A modelled `ResourceNotFoundException` for a tagging call whose `resourceArn`
 /// names no resource this store holds.
 ///
-/// The ARN is the only identifier the caller gave, so it is also the
-/// `resourceId`; the `resourceType` is read out of the ARN itself (see
-/// [`arn_resource_type`]) because an ARN naming nothing has no record to read a
-/// kind from.
+/// The message is the constant the model documents the shape with ("The
+/// specified resource does not exist."), for the reason
+/// [`app_bundle_not_found`] states: AppFabric's not-found text does not echo the
+/// identifier the caller supplied. The ARN is the only identifier the caller
+/// gave, so it is the `resourceId`; the `resourceType` is read out of the ARN
+/// itself (see [`arn_resource_type`]) because an ARN naming nothing has no
+/// record to read a kind from.
 pub fn tagged_resource_not_found(arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("Resource {arn} was not found."),
+        message: "The specified resource does not exist.".to_string(),
         resource_id: arn.to_string(),
         resource_type: arn_resource_type(arn).to_string(),
     }

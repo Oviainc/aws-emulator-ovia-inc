@@ -264,7 +264,9 @@ async fn a_created_parameter_group_is_reported_by_a_later_describe() {
         );
     }
 
-    // And the unfiltered listing is every stored group, in name order.
+    // And the unfiltered listing is every stored group, in name order — the groups
+    // these cases created AND the AWS-owned default group of every family, which the
+    // account already had.
     let listed = ok(&router, "DescribeParameterGroups", &json!({}), "all").await;
     let expected = expected_listing(&CASES.iter().map(|case| case.name).collect::<Vec<_>>());
     assert_eq!(

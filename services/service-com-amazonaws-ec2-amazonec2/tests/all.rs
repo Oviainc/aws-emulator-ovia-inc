@@ -50,12 +50,16 @@ mod fast_launch_images;
 mod get_password_data;
 #[path = "all/images.rs"]
 mod images;
+#[path = "all/import_image_tasks.rs"]
+mod import_image_tasks;
 #[path = "all/instance_lifecycle.rs"]
 mod instance_lifecycle;
 #[path = "all/instance_type_offerings.rs"]
 mod instance_type_offerings;
 #[path = "all/launch_templates.rs"]
 mod launch_templates;
+#[path = "all/local_gateway_route_table_virtual_interface_group_associations.rs"]
+mod local_gateway_route_table_virtual_interface_group_associations;
 #[path = "all/mac_dedicated_hosts.rs"]
 mod mac_dedicated_hosts;
 #[path = "all/modify_subnet_attribute.rs"]

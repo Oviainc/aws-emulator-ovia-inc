@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ConnectAppAuthorization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ConnectAppAuthorization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Completes the connect handshake of a STORED app authorization and persists
+//! the result: the authorization it names moves to `Connected`, and the summary
+//! this call returns is read back out of the record it just wrote, so
+//! `GetAppAuthorization` and `ListAppAuthorizations` report the same state.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ConnectAppAuthorization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the step AppFabric's resource chain puts between creating an
+//! authorization and ingesting with it (authorize → connect → ingest), so it is
+//! what makes an authorization usable by `CreateIngestion`. The transition is
+//! owed to THIS call, not to the clock: an authorization stays `PendingConnect`
+//! until a caller connects it.
+//!
+//! No credential material is read or stored: the `authRequest` the OAuth2 flow
+//! carries is `@sensitive`, and the only thing this handler takes from it is
+//! whether it was supplied at all, which is what the model requires for an
+//! `oauth2` authorization.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +161,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ConnectAppAuthorization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ConnectAppAuthorizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ConnectAppAuthorization"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ConnectAppAuthorizationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the AppFabric emulator could not reach its state store"
+                            .to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        let Some(bundle) = store.resolve_bundle_mut(&input.app_bundle_identifier) else {
+            return Err(
+                ConnectAppAuthorizationErrorModeled::ResourceNotFoundException(
+                    crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
+                )
+                .into(),
+            );
+        };
+        let Some(authorization) =
+            bundle.resolve_app_authorization_mut(&input.app_authorization_identifier)
+        else {
+            return Err(
+                ConnectAppAuthorizationErrorModeled::ResourceNotFoundException(
+                    crate::state::app_authorization_not_found(
+                        &input.app_authorization_identifier,
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        // `authRequest` is "required if the app authorization for the request is
+        // configured with an OAuth2 (oauth2) authorization type" — a condition
+        // on the STORED record, so the boundary validator (which sees only the
+        // request) cannot check it.
+        if authorization.auth_type == "oauth2" && input.auth_request.is_none() {
+            return Err(ConnectAppAuthorizationErrorModeled::ValidationException(
+                crate::state::auth_request_required(&authorization.auth_type),
+            )
+            .into());
+        }
+
+        // The handshake this emulator can complete: the authorization becomes
+        // usable, which is the state the rest of the chain depends on. Connecting
+        // one that is already `Connected` is the same write, so a retry is
+        // answered the same way rather than refused.
+        authorization.status = crate::state::APP_AUTHORIZATION_STATUS_CONNECTED.to_string();
+        authorization.updated_at = ::std::time::SystemTime::now();
+        let id = authorization.id.clone();
+        // Read the response back out of the record this call just wrote.
+        let app_authorization_summary = authorization.to_summary();
+        crate::state::audit_resource_change(
+            ctx.parts(),
+            Self::NAME,
+            "AppAuthorization",
+            &id,
+            "connected",
+        );
+        Ok(ConnectAppAuthorizationOutput {
+            app_authorization_summary,
+        })
     }
 }

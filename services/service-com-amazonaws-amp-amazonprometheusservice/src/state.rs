@@ -102,11 +102,16 @@ pub const METRIC_NAME_LABEL: &str = "__name__";
 /// states the lifecycle rule this crate enforces: `CREATING` — "Logging configuration
 /// is being created. Update/Deletion is disallowed until logging configuration is
 /// ACTIVE and workspace status is ACTIVE."; `ACTIVE` — "Logging configuration has been
-/// created/updated." (`crate::ops::types::LOGGING_CONFIGURATION_STATUS_CODE_VALUES`
-/// carries the full list.)
+/// created/updated."; `UPDATING` — "Logging configuration is being updated.
+/// Update/Deletion is disallowed until logging configuration is ACTIVE and workspace
+/// status is ACTIVE." (`crate::ops::types::LOGGING_CONFIGURATION_STATUS_CODE_VALUES`
+/// carries the full list, including the two failure codes nothing here reaches: this
+/// emulator runs no vended-log delivery that could fail.)
 pub const LOGGING_STATUS_CREATING: &str = "CREATING";
 /// See [`LOGGING_STATUS_CREATING`].
 pub const LOGGING_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`LOGGING_STATUS_CREATING`].
+pub const LOGGING_STATUS_UPDATING: &str = "UPDATING";
 
 /// The `resourceType` the modelled `ResourceNotFoundException` reports for a workspace's
 /// rules-and-alerting logging configuration. The member is a free-form `String`
@@ -536,7 +541,8 @@ impl Default for WorkspaceConfiguration {
 pub struct LoggingConfiguration {
     /// The CloudWatch log group the vended log data is published to.
     pub log_group_arn: String,
-    /// One of [`LOGGING_STATUS_CREATING`], [`LOGGING_STATUS_ACTIVE`].
+    /// One of [`LOGGING_STATUS_CREATING`], [`LOGGING_STATUS_ACTIVE`],
+    /// [`LOGGING_STATUS_UPDATING`].
     pub status_code: String,
     /// `LoggingConfigurationStatus$statusReason` — "If failed, the reason for the
     /// failure", so `None` while nothing has failed.
@@ -546,11 +552,17 @@ pub struct LoggingConfiguration {
     /// it or last updated what it points at — not by the clock moving its status on.
     pub modified_at: SystemTime,
     /// When the clock owes this configuration's move out of a transient status
-    /// (`CREATING` -> `ACTIVE`), if one is pending.
+    /// (`CREATING`/`UPDATING` -> `ACTIVE`), if one is pending.
     pub transition_due: Option<SystemTime>,
-    /// The `clientToken` of the call that created it, so replaying that exact call is
-    /// idempotent rather than a second create.
+    /// The `clientToken` of the call that created it, never overwritten — so replaying
+    /// that exact create still answers from the stored record after later updates, which
+    /// is what `@idempotencyToken` asks for.
     pub client_token: Option<String>,
+    /// The `clientToken` of the call that last UPDATED it. Replaying that exact token is
+    /// the SAME request, so `UpdateLoggingConfiguration` answers from the stored record
+    /// instead of applying the change twice. Kept apart from [`Self::client_token`] for
+    /// the same reason `QueryLoggingConfiguration` keeps its create token apart.
+    pub update_token: Option<String>,
 }
 
 impl LoggingConfiguration {
@@ -808,6 +820,18 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
     pub fn workspace_id_of_arn(&self, resource_arn: &str) -> Option<String> {
         self.arn_index.get(resource_arn).cloned()
     }
+}
+
+/// Whether a workspace and its rules-and-alerting logging configuration are in the state
+/// the modelled `LoggingConfigurationStatusCode` requires before an update or a deletion
+/// may act on that configuration.
+///
+/// Every entry of that enum documents the same rule: "Update/Deletion is disallowed until
+/// logging configuration is ACTIVE and workspace status is ACTIVE." Takes the two statuses
+/// rather than the workspace, so a caller that has already answered the missing-resource
+/// case reports the pair it refused on.
+pub fn logging_mutation_allowed(workspace_status: &str, logging_status: &str) -> bool {
+    workspace_status == STATUS_ACTIVE && logging_status == LOGGING_STATUS_ACTIVE
 }
 
 /// Whether a workspace and its attached policy are in the state the modelled

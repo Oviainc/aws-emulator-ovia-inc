@@ -403,14 +403,15 @@ async fn a_vocabulary_being_processed_cannot_be_deleted() {
         .call("GetVocabulary", json!({"VocabularyName": "pending-delete"}))
         .await
         .refused("read a deleted vocabulary", 400, "BadRequestException");
-    transcribe
-        .call("DeleteVocabulary", json!({"VocabularyName": "never-created"}))
-        .await
-        .refused(
-            "delete a vocabulary that does not exist",
-            400,
-            "BadRequestException",
-        );
+    // A delete is IDEMPOTENT: a name this account holds no vocabulary under answers
+    // the same empty success, not a refusal — `crate::vocabulary_delete_and_tag_sets`
+    // spans that class, this row keeps the lifecycle honest about it.
+    crate::vocabulary_delete_and_tag_sets::succeeded(
+        &transcribe
+            .call("DeleteVocabulary", json!({"VocabularyName": "never-created"}))
+            .await,
+        "delete a vocabulary that does not exist",
+    );
 }
 
 /// `UpdateVocabulary` replaces the stored terms and puts the vocabulary back into
@@ -797,6 +798,14 @@ async fn the_vocabulary_filter_family_round_trips() {
             .call("GetVocabularyFilter", json!({"VocabularyFilterName": name}))
             .await
             .refused(case, 400, "BadRequestException");
+        // The same delete, run again now that the filter is gone, is the same empty
+        // success: a delete of something already absent is not an error.
+        crate::vocabulary_delete_and_tag_sets::succeeded(
+            &transcribe
+                .call("DeleteVocabularyFilter", json!({"VocabularyFilterName": name}))
+                .await,
+            case,
+        );
     }
 }
 
@@ -857,15 +866,17 @@ async fn tags_round_trip_on_each_taggable_resource() {
     ];
 
     for (case, resource_arn) in &rows {
-        // An untagged resource reports no tag set rather than an empty one, which
-        // `TagList`'s `length {min 1}` does not allow.
+        // A resource that carries no tags reports an EMPTY tag set: `Tags` is the
+        // answer to "which tags does this resource have", so it is present whether or
+        // not the set holds anything.
         let empty = transcribe
             .call("ListTagsForResource", json!({"ResourceArn": resource_arn}))
             .await;
         empty.ok(case);
-        assert!(
-            empty.body.get("Tags").is_none(),
-            "case {case:?}: an untagged resource must report no Tags member, got {:?}",
+        assert_eq!(
+            empty.body.get("Tags"),
+            Some(&json!([])),
+            "case {case:?}: an untagged resource must report an empty Tags list, got {:?}",
             empty.body
         );
 

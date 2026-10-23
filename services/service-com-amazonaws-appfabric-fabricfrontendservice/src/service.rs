@@ -41,9 +41,68 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service answers an input-constraint violation with: the
+/// modelled `ValidationException` (`@httpError 400`,
+/// `com.amazonaws.appfabric#ValidationException`), which is also the code the
+/// framework's own refusal renderer picks. Restated here because
+/// `override_refusal` replaces the code and the message together, and a message
+/// without its matching code is worse than leaving both alone.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// How AppFabric states a violation of a NUMERIC bound (`@range`): the input
+/// position that failed and the bound it failed, and NOT the number that was
+/// submitted there.
+///
+/// Every other violation class keeps the clause the framework builds
+/// ([`Violation::message`]), which opens `Value '<submitted>' at …`: the value
+/// is part of those messages, and this service has no evidence that AppFabric
+/// withholds it there.
+const RANGE_SUBJECT: &str = "Value at";
+
+/// Render one constraint violation the way this service states it.
+///
+/// A `@range` violation is reworded to withhold the submitted number; anything
+/// else is the framework's own clause, so one wording change cannot drift the
+/// rest.
+fn constraint_clause(violation: &Violation) -> String {
+    match &violation.kind {
+        ViolationKind::MinValue(min) => format!(
+            "{RANGE_SUBJECT} '{}' failed to satisfy constraint: \
+             Member must have value greater than or equal to {min}",
+            violation.path
+        ),
+        ViolationKind::MaxValue(max) => format!(
+            "{RANGE_SUBJECT} '{}' failed to satisfy constraint: \
+             Member must have value less than or equal to {max}",
+            violation.path
+        ),
+        _ => violation.message(),
+    }
+}
+
+/// The `ValidationException` message for a refusal: the AWS envelope
+/// (`N validation error(s) detected: `) over one clause per violation, in the
+/// order the validating walk found them — the same envelope the framework
+/// renders (`aws_smithy_schema_server::constraints::envelope`), so only the
+/// reworded clause differs.
+///
+/// `None` declines the refusal (no violations to state), which keeps the
+/// framework's own wording.
+fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations.iter().map(constraint_clause).collect();
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
 
 /// The `com-amazonaws-appfabric-fabricfrontendservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +157,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // AppFabric states a violation of a numeric `@range` bound against the
+        // input POSITION and the bound only — `Value at 'maxResults' failed to
+        // satisfy constraint: Member must have value less than or equal to 100`
+        // — so the number a caller submitted is not reflected back. Every other
+        // violation class keeps the framework's clause, and the code stays the
+        // modelled `ValidationException` (HTTP 400), which is what the framework
+        // would have answered; only the wording changes.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: constraint_envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

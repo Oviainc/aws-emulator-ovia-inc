@@ -156,18 +156,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let updated_at = crate::state::now();
 
-        let mut store = state.lock();
-        let stored = store.exports.get_mut(&input.export_arn).ok_or_else(|| {
-            UpdateExportErrorModeled::ResourceNotFoundException(crate::state::export_not_found(
-                &input.export_arn,
-            ))
-        })?;
+        // FIRST critical section: resolve the export and read the one stored value this
+        // request is checked against. The lock is released before the submitted
+        // definition is read, so no caller-supplied SQL is ever parsed while the store is
+        // held and one caller's statement cannot stall another's request.
+        let stored_name = {
+            let store = state.lock();
+            store
+                .exports
+                .get(&input.export_arn)
+                .ok_or_else(|| {
+                    UpdateExportErrorModeled::ResourceNotFoundException(
+                        crate::state::export_not_found(&input.export_arn),
+                    )
+                })?
+                .export
+                .name
+                .clone()
+        };
 
-        if input.export.name != stored.export.name {
+        if input.export.name != stored_name {
             return Err(UpdateExportErrorModeled::ValidationException(ValidationException {
                 message: format!(
                     "Export.Name is {}, but the export {} is named {}; an export name cannot be changed.",
-                    input.export.name, input.export_arn, stored.export.name
+                    input.export.name, input.export_arn, stored_name
                 ),
                 reason: Some("fieldValidationFailed".to_string()),
                 fields: Some(vec![ValidationExceptionField {
@@ -178,6 +190,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+
+        // "Updates an existing data export by overwriting all export parameters. All
+        // export parameters must be specified in the UpdateExport request" (smithy_query
+        // operation `UpdateExport`): the submitted query is validated against the table
+        // catalog, and because the update REPLACES the definition rather than merging into
+        // it, each named table that publishes table properties must restate its
+        // `TableConfigurations` entry. See `crate::state::query`.
+        crate::state::validate_data_query(&input.export.data_query, true).map_err(
+            |refusal| match refusal {
+                crate::state::QueryRefusal::Invalid(invalid) => {
+                    UpdateExportErrorModeled::ValidationException(invalid)
+                }
+                // This process could not read the statement: a server fault, never
+                // reported as a bad request.
+                crate::state::QueryRefusal::Internal(fault) => {
+                    UpdateExportErrorModeled::InternalServerException(fault)
+                }
+            },
+        )?;
+
+        // SECOND critical section: the mutation. The export is resolved again, because a
+        // `DeleteExport` may have removed it while the definition above was being read.
+        let mut store = state.lock();
+        let stored = store.exports.get_mut(&input.export_arn).ok_or_else(|| {
+            UpdateExportErrorModeled::ResourceNotFoundException(crate::state::export_not_found(
+                &input.export_arn,
+            ))
+        })?;
 
         // "Updates an existing data export by overwriting all export parameters": every
         // settable parameter takes the submitted value, including an absent Description,

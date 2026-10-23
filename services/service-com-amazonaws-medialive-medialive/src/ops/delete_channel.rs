@@ -194,14 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // A channel is deleted once it has stopped: deleting a creating,
-        // starting, running, stopping or already-deleting channel is a conflict.
+        // starting, running, stopping or already-deleting channel is a conflict,
+        // reported with the fixed message that class carries.
         if !channel.is_deletable() {
             return Err(DeleteChannelErrorModeled::ConflictException(ConflictException {
-                message: Some(crate::state::not_idle_message(
-                    "Channel",
-                    &channel.id,
-                    &channel.state,
-                )),
+                message: Some(crate::state::CHANNEL_NOT_STOPPED_MESSAGE.to_string()),
             })
             .into());
         }

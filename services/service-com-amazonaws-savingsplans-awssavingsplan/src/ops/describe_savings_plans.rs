@@ -214,7 +214,7 @@ fn admits(input: &DescribeSavingsPlansInput, plan: &crate::state::SavingsPlanRec
 
 /// Project a stored plan onto the wire shape, as of `now_millis`.
 fn project(plan: &crate::state::SavingsPlanRecord, now_millis: i64) -> SavingsPlan {
-    use crate::state::format_millis;
+    use crate::state::{format_amount, format_millis};
 
     SavingsPlan {
         offering_id: Some(plan.offering_id.clone()),
@@ -230,9 +230,9 @@ fn project(plan: &crate::state::SavingsPlanRecord, now_millis: i64) -> SavingsPl
         payment_option: Some(plan.payment_option.clone()),
         product_types: Some(plan.product_types.clone()),
         currency: Some(plan.currency.clone()),
-        commitment: Some(plan.commitment.clone()),
-        upfront_payment_amount: Some(plan.upfront_payment_amount.clone()),
-        recurring_payment_amount: Some(plan.recurring_payment_amount.clone()),
+        commitment: Some(format_amount(plan.commitment_units)),
+        upfront_payment_amount: Some(format_amount(plan.upfront_payment_units)),
+        recurring_payment_amount: Some(format_amount(plan.recurring_payment_units)),
         term_duration_in_seconds: plan.term_duration_in_seconds,
         tags: Some(plan.tags.clone().into_iter().collect()),
         returnable_until: Some(format_millis(plan.returnable_until_millis(now_millis))),

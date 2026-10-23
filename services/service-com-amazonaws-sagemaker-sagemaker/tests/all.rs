@@ -25,6 +25,8 @@ mod artifact_lineage;
 mod batch_transform_jobs;
 #[path = "all/code_repositories.rs"]
 mod code_repositories;
+#[path = "all/code_repository_deletion.rs"]
+mod code_repository_deletion;
 #[path = "all/custom_images.rs"]
 mod custom_images;
 #[path = "all/endpoint_config_deletion.rs"]
@@ -47,6 +49,8 @@ mod lineage_action_lifecycle;
 mod lineage_associations;
 #[path = "all/lineage_context_lifecycle.rs"]
 mod lineage_context_lifecycle;
+#[path = "all/list_artifacts.rs"]
+mod list_artifacts;
 #[path = "all/list_endpoints.rs"]
 mod list_endpoints;
 #[path = "all/list_model_packages.rs"]

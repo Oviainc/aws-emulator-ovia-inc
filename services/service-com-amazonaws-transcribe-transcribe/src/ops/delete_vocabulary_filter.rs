@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVocabularyFilter
-//! Deletes a stored custom vocabulary filter (see
-//! [`DeleteVocabularyFilter::handle`]).
+//! Deletes a stored custom vocabulary filter, answering the same empty success for a
+//! name this account holds no filter under (see [`DeleteVocabularyFilter::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -182,29 +182,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // A custom vocabulary filter has no `VocabularyState` in the model, so it is
-        // never in a non-terminal state and the only refusal is "no such filter".
-        if store
+        // never in a non-terminal state and nothing refuses this delete: as for the
+        // vocabulary family, a name this account holds no filter under leaves nothing
+        // to do and answers this operation's ordinary empty success. The delete is
+        // IDEMPOTENT, so a teardown that runs twice succeeds both times — which is why
+        // this path does NOT take the service's absent-resource branch
+        // (`crate::state::not_found_message` over `BadRequestException`, which every
+        // READING operation here answers).
+        let removed = store
             .vocabulary_filters
             .remove(&input.vocabulary_filter_name)
-            .is_none()
-        {
-            return Err(DeleteVocabularyFilterErrorModeled::BadRequestException(
-                BadRequestException {
-                    // "This can occur when the entity you're trying to delete doesn't
-                    // exist" (`BadRequestException`'s own documentation), which is the
-                    // error this service reports a resource it does not hold with.
-                    message: Some(crate::state::not_found_message(
-                        crate::state::KIND_VOCABULARY_FILTER,
-                    )),
-                },
-            )
-            .into());
-        }
+            .is_some();
 
         ::tracing::info!(
             operation = "DeleteVocabularyFilter",
             filter = %input.vocabulary_filter_name,
-            "custom vocabulary filter deleted"
+            removed,
+            "custom vocabulary filter delete served"
         );
         Ok(DeleteVocabularyFilterOutput)
     }

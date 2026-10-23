@@ -164,7 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateApplicationErrorModeled::InternalServerErrorException(
                 crate::state::internal_server_error("the service state is unavailable"),
@@ -226,10 +225,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if input.readme_body.is_some() || input.readme_url.is_some() {
             // The readme is stored as the caller's link, or as the locator minted for a
-            // body supplied inline — the same resolution the create performs.
+            // body supplied inline — the same resolution the create performs, announcing
+            // the endpoint THIS request arrived on so the locator is one the caller can
+            // follow back here.
+            let host = crate::state::request_host(ctx, &application.region);
             let readme_url = crate::state::resolve_artifact_url(
                 input.readme_body.as_ref(),
                 input.readme_url.as_ref(),
+                &host,
                 &application.region,
                 &application.name,
                 None,

@@ -283,6 +283,25 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             .count()
     }
 
+    /// Would a detector created through `region`'s endpoint partition the detector
+    /// store into one Region more than it will hold
+    /// ([`MAX_DETECTOR_REGIONS`])?
+    ///
+    /// "One detector per account per Region" bounds each PARTITION to a single
+    /// detector, but the Region is read from the request's credential scope
+    /// ([`request_region`]), so the caller chooses the partition KEY too: without
+    /// this, a caller signing for invented Region names could make the store retain
+    /// one detector — and everything it owns — per distinct Region string. A Region
+    /// the store already holds a detector for is never refused by it, so this bound
+    /// is invisible to a caller using the Regions AWS runs.
+    pub fn detector_regions_exhausted(&self, region: &str) -> bool {
+        let mut regions: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for detector in self.detectors.values() {
+            regions.insert(detector.region.as_str());
+        }
+        !regions.contains(region) && regions.len() >= MAX_DETECTOR_REGIONS
+    }
+
     /// Would a plan created through `region`'s endpoint partition this store into
     /// one Region more than it will hold
     /// ([`MAX_MALWARE_PROTECTION_PLAN_REGIONS`])?
@@ -606,6 +625,34 @@ pub fn not_owned_message(member: &str) -> String {
     )
 }
 
+/// How many Regions this store will hold detectors for.
+///
+/// "You can have only one detector per account per Region"
+/// (`smithy_query(query="doc",shape="CreateDetector")`) bounds one PARTITION of
+/// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::detectors`] to a single
+/// detector, but the partition key is the Region read from the request's credential
+/// scope ([`request_region`]), so the caller chooses it: without a ceiling on the
+/// number of partitions, a caller inventing Region names could make the process
+/// retain one detector per distinct Region string — and each detector carries up to
+/// [`MAX_MEMBERS_PER_DETECTOR`] members, [`MAX_FILTERS_PER_ACCOUNT_PER_REGION`]
+/// filters and [`IP_SETS_PER_DETECTOR`] IPSets. Together with the one-per-Region
+/// rule this is what makes the detector map finite whatever a caller sends.
+///
+/// AWS runs orders of magnitude fewer Regions than this, so a request signed for a
+/// real Region never meets it; a caller inventing Region names does. Emulator-chosen,
+/// like [`MAX_MALWARE_PROTECTION_PLAN_REGIONS`], which bounds the plan store the same
+/// way, and deliberately set ABOVE [`MAX_CLIENT_TOKENS`] so the two detector guards
+/// compose rather than mask one another: the idempotency index evicts its oldest
+/// mapping while the detector map is still partitioning, so neither bound hides the
+/// other. Enforced by `CreateDetector` before it writes.
+pub const MAX_DETECTOR_REGIONS: usize = 2 * MAX_CLIENT_TOKENS;
+
+/// The message a create that would partition the detector store into one Region
+/// more than [`MAX_DETECTOR_REGIONS`] is refused with. The caller's Region is not
+/// quoted back, as with every other rejection here.
+pub const DETECTOR_REGION_LIMIT_MESSAGE: &str =
+    "The request is rejected because the maximum number of detectors has been reached.";
+
 /// The message a second `CreateDetector` is refused with. "You can have only one
 /// detector per account per Region"
 /// (`smithy_query(query="doc",shape="CreateDetector")`); the Region is the one the
@@ -853,9 +900,10 @@ pub const MALWARE_PROTECTION_PLAN_QUOTA_EXCEEDED_MESSAGE: &str =
 /// request signed for a real Region never meets it; a caller inventing Region
 /// names does. Emulator-chosen, like the per-Region quota.
 ///
-/// The detector-rooted store answers the same hazard its own way, which this does
-/// not change: its idempotency index is bounded by [`MAX_CLIENT_TOKENS`] with
-/// eviction, and a detector is one per Region.
+/// The detector-rooted store answers the same hazard the same way, which this does
+/// not change: [`MAX_DETECTOR_REGIONS`] bounds how many Regions it partitions into,
+/// a detector is one per Region, and its idempotency index is bounded by
+/// [`MAX_CLIENT_TOKENS`] with eviction.
 pub const MAX_MALWARE_PROTECTION_PLAN_REGIONS: usize = 50;
 
 /// The most Malware Protection plans this store will ever hold: the per-Region
@@ -1360,6 +1408,15 @@ impl Detector {
             .collect()
     }
 
+    /// The names of the filters this detector holds, in filter-name order.
+    ///
+    /// The order is TOTAL — a filter name is unique within a detector, because it
+    /// is the key the filters are stored under — which is what makes a page token
+    /// mean the same thing on the call that hands it back.
+    pub fn filter_names(&self) -> Vec<String> {
+        self.filters.keys().cloned().collect()
+    }
+
     /// How many investigations this detector holds that were initiated at or after
     /// `since`, in epoch milliseconds.
     pub fn investigations_started_since(&self, since: i64) -> usize {
@@ -1743,9 +1800,9 @@ impl InvestigationRecord {
     }
 }
 
-/// A saved finding filter. `CreateFilter` writes it, `GetFilter` reports it and
-/// `DeleteDetector`'s cascade drops it with its detector; `ListFilters` /
-/// `UpdateFilter` / `DeleteFilter` are still scaffolded.
+/// A saved finding filter. `CreateFilter` writes it, `GetFilter` reports it,
+/// `ListFilters` names it and `DeleteDetector`'s cascade drops it with its
+/// detector; `UpdateFilter` / `DeleteFilter` are still scaffolded.
 #[derive(Debug, Clone, Default)]
 pub struct FilterRecord {
     pub name: String,

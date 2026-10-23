@@ -91,14 +91,14 @@ fn refused(
         // "Must be the ARN of an Elastic Beanstalk resource."
         crate::state::ResourceArnRefusal::NotThisService => {
             ListTagsForResourceError::invalid_parameter_value(format!(
-                "Resource ARN {resource_arn} is not an Elastic Beanstalk resource ARN."
+                "Resource ARN '{resource_arn}' is not an Elastic Beanstalk resource ARN."
             ))
         }
         crate::state::ResourceArnRefusal::UnsupportedType => {
             ListTagsForResourceErrorModeled::ResourceTypeNotSupportedException(
                 ResourceTypeNotSupportedException {
                     message: Some(format!(
-                        "The type of the resource ARN {resource_arn} is not supported for tagging."
+                        "The type of the resource ARN '{resource_arn}' is not supported for tagging."
                     )),
                 },
             )
@@ -106,7 +106,7 @@ fn refused(
         }
         crate::state::ResourceArnRefusal::NotFound => {
             ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("Resource not found for ARN {resource_arn}.")),
+                message: Some(format!("Resource not found for ARN '{resource_arn}'.")),
             })
             .into()
         }

@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAppAuthorization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAppAuthorization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints an app authorization UNDER an app bundle and PERSISTS it there: the
+//! response is built from the stored record (see
+//! [`crate::state::AppAuthorizationRecord::to_app_authorization`]), so
+//! `GetAppAuthorization` and `ListAppAuthorizations` answer from the same bytes
+//! this call wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAppAuthorization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three rules this handler owns beyond persisting the record:
+//!
+//! * `app` must name an application AppFabric supports
+//!   ([`crate::state::SUPPORTED_APPS`]) — the model types it as a plain
+//!   `String255`, so the boundary validator cannot refuse it;
+//! * `credential` must match `authType`, which the model's own documentation of
+//!   the member requires ("Specify credentials that match the authorization type
+//!   for your request");
+//! * a bundle holds AT MOST ONE authorization per (`app`, `tenant`) pair, and
+//!   the check is taken under the SAME state lock as the insert, so concurrent
+//!   racers for one pair produce exactly one winner and modelled conflicts.
+//!
+//! A new authorization is `PendingConnect`; `ConnectAppAuthorization` is what
+//! moves it to `Connected`, so the clock owes no transition here.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +187,204 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAppAuthorization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAppAuthorizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAppAuthorization"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAppAuthorizationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AppFabric emulator could not reach its state store".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // `authType` is closed by the model (`AUTH_TYPE_VALUES`), so the
+        // boundary validator has already refused anything outside it; `app` is
+        // not, so the supported-application set is checked here.
+        if !crate::state::is_supported_app(&input.app) {
+            return Err(CreateAppAuthorizationErrorModeled::ValidationException(
+                crate::state::app_not_supported(&input.app),
+            )
+            .into());
+        }
+
+        // The credential must be the one the chosen authorization type uses.
+        // Only the KIND is read: the secret inside it is never stored, logged or
+        // reported back.
+        let credential_kind = crate::state::credential_kind(&input.credential);
+        if credential_kind != crate::state::credential_kind_for_auth_type(&input.auth_type) {
+            return Err(CreateAppAuthorizationErrorModeled::ValidationException(
+                crate::state::credential_does_not_match_auth_type(&input.auth_type),
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+
+        // ONE lock for the whole decision: the uniqueness check below and the
+        // insert that follows it are taken without releasing it, so two
+        // concurrent calls for the same (bundle, app, tenant) triple cannot both
+        // observe "no authorization yet" and both insert.
+        let mut store = state.lock();
+        let Some(bundle_key) = store.bundle_key(&input.app_bundle_identifier) else {
+            return Err(CreateAppAuthorizationErrorModeled::ResourceNotFoundException(
+                crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
+            )
+            .into());
+        };
+        let Some(app_bundle_arn) = store
+            .app_bundles
+            .get(&bundle_key)
+            .map(|bundle| bundle.arn.clone())
+        else {
+            return Err(CreateAppAuthorizationErrorModeled::ResourceNotFoundException(
+                crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
+            )
+            .into());
+        };
+
+        // The PARENT and every member that identifies the authorization go into
+        // the fingerprint: the same token for another bundle, application or
+        // tenant is a different request rather than a retry of this one. The
+        // credential's KIND is part of it; its secret is not.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                ("appBundleArn", app_bundle_arn.as_str()),
+                ("app", input.app.as_str()),
+                ("tenantIdentifier", input.tenant.tenant_identifier.as_str()),
+                (
+                    "tenantDisplayName",
+                    input.tenant.tenant_display_name.as_str(),
+                ),
+                ("authType", input.auth_type.as_str()),
+                ("credentialKind", credential_kind),
+            ],
+            input.tags.as_deref(),
+        );
+
+        // @idempotencyToken: the same token replays the authorization the first
+        // call created; the same token with different parameters is the conflict
+        // AWS documents as IdempotentParameterMismatch.
+        if let Some(token) = input.client_token.as_deref() {
+            let key = crate::state::client_token_key(Self::NAME, token);
+            if let Some(spent) = store.client_tokens.get(&key).cloned() {
+                if spent.fingerprint != fingerprint {
+                    return Err(CreateAppAuthorizationErrorModeled::ConflictException(
+                        crate::state::idempotent_parameter_mismatch(token, "AppAuthorization"),
+                    )
+                    .into());
+                }
+                let replayed = store
+                    .app_bundles
+                    .get(&bundle_key)
+                    .and_then(|bundle| bundle.resolve_app_authorization(&spent.arn))
+                    .map(crate::state::AppAuthorizationRecord::to_app_authorization);
+                if let Some(app_authorization) = replayed {
+                    return Ok(CreateAppAuthorizationOutput { app_authorization });
+                }
+                // The replayed authorization was deleted since; the token is
+                // spent on nothing, so this call creates a new one.
+                store.client_tokens.remove(&key);
+            }
+        }
+
+        // At most ONE authorization per (bundle, app, tenant) triple. A second
+        // create for a triple the bundle already holds — a retry without a
+        // token, or the loser of a race — is the modelled conflict, and the
+        // winner's ARN is what the refusal names.
+        if let Some(held) = store
+            .app_bundles
+            .get(&bundle_key)
+            .and_then(|bundle| {
+                bundle.authorization_for(&input.app, &input.tenant.tenant_identifier)
+            })
+            .map(|authorization| authorization.arn.clone())
+        {
+            return Err(CreateAppAuthorizationErrorModeled::ConflictException(
+                crate::state::app_authorization_already_exists(&held),
+            )
+            .into());
+        }
+
+        let sequence = store.next_sequence();
+        let created_at = ::std::time::SystemTime::now();
+        let id = crate::state::new_uuid();
+        // An authorization's ARN nests under the bundle that owns it, the way
+        // AppFabric's own resource chain nests them.
+        let arn = crate::state::appfabric_arn(
+            &region,
+            &format!("appbundle/{bundle_key}/appauthorization/{id}"),
+        );
+        let Some(bundle) = store.app_bundles.get_mut(&bundle_key) else {
+            return Err(CreateAppAuthorizationErrorModeled::ResourceNotFoundException(
+                crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
+            )
+            .into());
+        };
+        // A RESOURCE GUARD on the store, answered with the quota error this
+        // operation models. Checked AFTER the idempotent replay above, so a
+        // retry of an authorization that already exists is never refused by it.
+        if bundle.app_authorizations.len() >= crate::state::MAX_APP_AUTHORIZATIONS_PER_APP_BUNDLE {
+            return Err(
+                CreateAppAuthorizationErrorModeled::ServiceQuotaExceededException(
+                    crate::state::quota_exceeded(
+                        &app_bundle_arn,
+                        "AppAuthorization",
+                        "AppAuthorizationsPerAppBundle",
+                        crate::state::MAX_APP_AUTHORIZATIONS_PER_APP_BUNDLE,
+                    ),
+                )
+                .into(),
+            );
+        }
+        let record = crate::state::AppAuthorizationRecord {
+            id: id.clone(),
+            arn: arn.clone(),
+            app_bundle_arn: app_bundle_arn.clone(),
+            app: input.app,
+            tenant_identifier: input.tenant.tenant_identifier,
+            tenant_display_name: input.tenant.tenant_display_name,
+            auth_type: input.auth_type,
+            credential_kind: credential_kind.to_string(),
+            // The initial state the model documents: "PendingConnect: The app
+            // authorization is created but not yet connected."
+            status: crate::state::APP_AUTHORIZATION_STATUS_PENDING_CONNECT.to_string(),
+            created_at,
+            updated_at: created_at,
+            tags: input.tags.unwrap_or_default(),
+            sequence,
+        };
+        bundle.app_authorizations.insert(id.clone(), record);
+        // Read the response back out of the store, so what the caller sees is
+        // exactly what a later Get or List will see.
+        let stored = bundle
+            .app_authorizations
+            .get(&id)
+            .map(crate::state::AppAuthorizationRecord::to_app_authorization);
+
+        if let Some(token) = input.client_token.as_deref() {
+            store.remember_client_token(
+                crate::state::client_token_key(Self::NAME, token),
+                arn,
+                fingerprint,
+            );
+        }
+
+        let Some(app_authorization) = stored else {
+            return Err(CreateAppAuthorizationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the created app authorization could not be read back".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        crate::state::audit_resource_change(
+            ctx.parts(),
+            Self::NAME,
+            "AppAuthorization",
+            &id,
+            "created",
+        );
+        Ok(CreateAppAuthorizationOutput { app_authorization })
     }
 }

@@ -242,8 +242,11 @@ async fn image_size_in_bytes_totals_the_layer_blobs_the_manifest_references() {
             expected: None,
         },
         SizeCase {
-            case: "a document that is not json",
-            manifest: "not a manifest at all".to_string(),
+            // A JSON document that references neither layers nor manifests states the
+            // size of nothing. (A body that is not JSON at all never reaches this
+            // question: `PutImage` refuses it — see `tests/all/json_document_members.rs`.)
+            case: "a json document that references nothing",
+            manifest: json!({"schemaVersion": 2, "note": "not a manifest at all"}).to_string(),
             expected: None,
         },
     ];

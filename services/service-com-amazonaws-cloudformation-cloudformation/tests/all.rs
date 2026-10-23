@@ -41,3 +41,5 @@ mod state_roundtrip;
 mod template_outputs;
 #[path = "all/unprovisioned_resources.rs"]
 mod unprovisioned_resources;
+#[path = "all/validate_template.rs"]
+mod validate_template;

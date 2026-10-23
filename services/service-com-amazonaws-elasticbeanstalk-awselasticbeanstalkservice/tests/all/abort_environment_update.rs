@@ -26,7 +26,7 @@
 
 use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
 
-use crate::lifecycle::{Emulator, PAST_DUE};
+use crate::lifecycle::{Emulator, PAST_DUE, SOLUTION_STACK};
 
 /// The `EnvironmentStatus` the real service reports while a configuration
 /// update or an application-version deployment is in flight: "Updating:
@@ -88,6 +88,7 @@ async fn ready_environment(emulator: &Emulator, application: &str, environment: 
             &[
                 ("ApplicationName", application),
                 ("EnvironmentName", environment),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
             ],
         )
         .await;
@@ -289,6 +290,7 @@ async fn an_abort_with_nothing_to_cancel_is_refused_with_the_services_own_error_
                 &[
                     ("ApplicationName", "refusals"),
                     ("EnvironmentName", environment),
+                    ("SolutionStackName", SOLUTION_STACK.as_str()),
                 ],
             )
             .await;
@@ -328,6 +330,7 @@ async fn an_abort_with_nothing_to_cancel_is_refused_with_the_services_own_error_
             &[
                 ("ApplicationName", "refusals"),
                 ("EnvironmentName", "launch-env"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
             ],
         )
         .await;

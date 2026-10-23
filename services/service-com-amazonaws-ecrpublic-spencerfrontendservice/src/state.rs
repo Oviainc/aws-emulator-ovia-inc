@@ -14,7 +14,9 @@
 //!   `SetRepositoryPolicy` writes and `GetRepositoryPolicy` / `DeleteRepositoryPolicy`
 //!   read back;
 //! * the `sha256:` manifest digest ([`manifest_digest`]) that `PutImage` keys an image
-//!   by and `DescribeImages` / `BatchDeleteImage` resolve against;
+//!   by and `DescribeImages` / `BatchDeleteImage` resolve against, and the JSON-document
+//!   check ([`json_document`]) every member the model documents as JSON passes before it
+//!   is stored;
 //! * what a manifest references ([`manifest_content`]), which is what an image's
 //!   reported size is computed over ([`StoredRepository::refresh_image_sizes`]);
 //! * the opaque pagination token ([`encode_page_token`] / [`decode_page_token`]) that
@@ -573,6 +575,28 @@ impl ComAmazonawsEcrpublicSpencerfrontendserviceState {
         registry_id == self.registry_id || registry_id == self.registry_alias
     }
 
+    /// What `RepositoryNotFoundException` states for a name this registry does not hold:
+    /// the name asked for and the registry it was looked for in, which is the pair the
+    /// modelled description names ("Check the spelling of the specified repository and
+    /// ensure that you're performing operations on the correct registry").
+    pub fn repository_not_found_message(&self, repository_name: &str) -> String {
+        format!(
+            "The repository with name '{repository_name}' does not exist in the registry \
+             with id '{}'",
+            self.registry_id
+        )
+    }
+
+    /// What to tell a caller whose `registryId` names some other registry: this emulator
+    /// serves exactly one, so a request for another names a parameter it cannot satisfy.
+    pub fn foreign_registry_message(&self) -> String {
+        format!(
+            "Invalid parameter at 'registryId' failed to satisfy constraint: 'Member must \
+             name the public registry of this account ({})'",
+            self.registry_id
+        )
+    }
+
     /// The repository a `resourceArn` names, or why nothing stored answers to it.
     ///
     /// The ARN is parsed by [`parse_repository_arn`] and then resolved against this
@@ -696,6 +720,24 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// manifest", so it is computed over the manifest bytes exactly as pushed.
 pub fn manifest_digest(manifest: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(manifest.as_bytes()))
+}
+
+/// The document a member whose content the model documents as JSON carries — an image
+/// manifest (`ImageManifest`: "The image manifest that corresponds to the image to be
+/// uploaded"), a repository policy (`RepositoryPolicyText`: "The policy text will be in
+/// JSON format") — parsed BEFORE anything is stored.
+///
+/// `Err` carries the `InvalidParameterException` message ECR Public fills from the
+/// request for a body that is not parseable JSON: the member at fault and the rule it
+/// failed, and never the rejected body itself (a manifest is modelled up to 4 MiB).
+/// `member` is the member as the service names it in that message.
+pub fn json_document(member: &str, text: &str) -> Result<::serde_json::Value, String> {
+    ::serde_json::from_str(text).map_err(|_| {
+        format!(
+            "Invalid parameter at '{member}' failed to satisfy constraint: \
+             'Invalid JSON syntax'"
+        )
+    })
 }
 
 /// What content a stored manifest document references.

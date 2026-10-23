@@ -166,12 +166,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            ListTransactionEventsErrorModeled::InternalServerException(
-                crate::state::store_unavailable(),
-            )
-        })?;
-        let state = state.lock();
+        // Every modelled constraint on this input is checked HERE rather than at the
+        // framework boundary, so a refusal is this service's own `ValidationException`
+        // with its required `reason` and a `fieldList`. See `crate::state::validation`.
+        // It runs before the store is reached, so caller-sized validation never holds
+        // the shared state's lock.
+        crate::state::validation::list_transaction_events_input(&input)
+            .map_err(ListTransactionEventsErrorModeled::ValidationException)?;
 
         // The same rule `GetTransaction` applies: exactly one of
         // `transactionHash`/`transactionId`, and `transactionId` only on the Bitcoin
@@ -182,6 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.transaction_id.as_deref(),
         )
         .map_err(ListTransactionEventsErrorModeled::ValidationException)?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTransactionEventsErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let state = state.lock();
 
         // The event's position within the transaction is what identifies it: an event
         // has no identifier of its own, and the order is the emission order the ledger
@@ -196,10 +204,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|(position, event)| (position.to_string(), event))
             .collect();
 
+        // `maxResults` carries `@range(min: 1, max: 250)`, refused above by
+        // `validation::list_transaction_events_input`, and `state::page` clamps whatever
+        // reaches it to `state::MAX_PAGE_SIZE` (250), so one page is bounded by the
+        // model and never by the request.
         let page = crate::state::page(all, input.max_results, input.next_token.as_deref())
-            .map_err(|error| {
+            .map_err(|_| {
                 ListTransactionEventsErrorModeled::ValidationException(
-                    crate::state::invalid_page_token(&error),
+                    crate::state::invalid_page_token(),
                 )
             })?;
 

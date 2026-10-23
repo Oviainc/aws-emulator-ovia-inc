@@ -12,7 +12,7 @@
 //! the one `lifecycle.rs` already owns in this same test binary, so this suite
 //! adds no second copy of it.
 
-use crate::lifecycle::{Emulator, PAST_DUE, TEST_REGION};
+use crate::lifecycle::{Emulator, PAST_DUE, SOLUTION_STACK, TEST_REGION};
 
 /// The zone every environment URL sits in, as `state::environment_cname` builds it.
 fn fully_qualified(prefix: &str, region: &str) -> String {
@@ -52,6 +52,7 @@ async fn availability_is_derived_from_the_prefix_and_the_live_environments() {
             &[
                 ("ApplicationName", "dns"),
                 ("EnvironmentName", "held-env"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
                 ("CNAMEPrefix", "held-prefix"),
             ],
         )
@@ -246,6 +247,7 @@ async fn checking_a_prefix_neither_reserves_nor_releases_it() {
             &[
                 ("ApplicationName", "dns"),
                 ("EnvironmentName", "pure-env"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
                 ("CNAMEPrefix", prefix),
             ],
         )
@@ -336,6 +338,7 @@ async fn create_environment_holds_the_same_cname_rule() {
             &[
                 ("ApplicationName", "dns"),
                 ("EnvironmentName", "taken-env"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
                 ("CNAMEPrefix", "taken-prefix"),
             ],
         )
@@ -363,6 +366,7 @@ async fn create_environment_holds_the_same_cname_rule() {
                 &[
                     ("ApplicationName", "dns"),
                     ("EnvironmentName", environment_name.as_str()),
+                    ("SolutionStackName", SOLUTION_STACK.as_str()),
                     ("CNAMEPrefix", prefix),
                 ],
             )
@@ -397,6 +401,7 @@ async fn create_environment_holds_the_same_cname_rule() {
             &[
                 ("ApplicationName", "dns"),
                 ("EnvironmentName", "taken-env-elsewhere"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
                 ("CNAMEPrefix", "taken-prefix"),
             ],
         )

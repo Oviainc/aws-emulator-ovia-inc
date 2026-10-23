@@ -15,8 +15,7 @@
 //! repository holds — and every row's expectation is BUILT from that row's own request
 //! rather than copied from a recording.
 //!
-//! The wire plumbing is the lifecycle suite's shared harness
-//! (`tests/all/repository_image_lifecycle.rs`).
+//! The wire plumbing is the crate's shared harness (`tests/all/harness.rs`).
 
 use serde_json::{json, Value};
 

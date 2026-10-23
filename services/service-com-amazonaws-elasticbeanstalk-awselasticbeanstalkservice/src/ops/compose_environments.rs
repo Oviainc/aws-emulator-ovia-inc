@@ -8,7 +8,10 @@
 //! env.yaml"). This emulator stores a source bundle as the S3 reference the caller passed
 //! and never reads its content, so no manifest exists to name an environment from, and the
 //! request is refused with the service's `MissingParameter` instead of composing an
-//! environment whose name was invented. This is the ONLY file to touch for this operation.
+//! environment whose name was invented. The application the request names is resolved
+//! FIRST, so a name no application exists under is reported as that rather than as a
+//! defect in a source bundle of an application the caller never created. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,16 +156,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = (ctx, &self.engine);
+        let _ = ctx;
 
         // "Takes a list of version labels that specify application source
         // bundles for each of the environments to create or update." Without one
-        // there is no environment to compose at all.
+        // there is no environment to compose at all. An absent parameter is a
+        // statement about the REQUEST, so it is answered before anything the
+        // request names is resolved.
         let version_labels = input.version_labels.clone().unwrap_or_default();
         if version_labels.is_empty() {
             return Err(ComposeEnvironmentsError::missing_parameter(
                 "Specify at least one VersionLabel: each one names the source bundle of an environment to compose.",
             ));
+        }
+
+        // "ApplicationName: The name of the application to which the specified
+        // source bundles belong." That application is the PARENT of everything
+        // this call then resolves — the versions the labels name, the group's
+        // environments — so a name no application exists under is refused here,
+        // before any precondition that depends on what those children carry. A
+        // caller told about a manifest defect would go looking in a source bundle
+        // of an application it never created.
+        //
+        // The member is OPTIONAL in the model: the environment manifest in the
+        // source bundle can name the application itself. A request that supplies
+        // none therefore names no application to resolve, and the refusal below —
+        // that the manifest this emulator cannot read is where that name would
+        // have come from — is the accurate statement for it.
+        if let Some(application_name) = input.application_name.as_ref() {
+            let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+                ComposeEnvironmentsError::internal_failure(
+                    "the Elastic Beanstalk store is unavailable",
+                )
+            })?;
+            let store = state.lock();
+            if !store.applications.contains_key(application_name) {
+                // The code is the one the service's recorded refusal of this
+                // precondition carries — the same generic query code this
+                // operation answers its other unsatisfiable preconditions with —
+                // rather than one inferred from the sentence.
+                return Err(ComposeEnvironmentsError::missing_parameter(
+                    "Application could not be found",
+                ));
+            }
         }
 
         // "Each source bundle must include an environment manifest that
@@ -174,11 +210,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `SourceBundle` as the `S3Location` the caller passed; nothing reads the
         // object). So the environment name, its solution stack and its links are
         // all absent, and every validation that comes after resolving them —
-        // which application the versions belong to, which environments the group
-        // already has, the environment quota — is unreachable. Refusing names
-        // what is missing; composing would have to invent an environment name,
-        // and reporting an environment nothing created would be worse than the
-        // refusal.
+        // which environments the group already has, the environment quota — is
+        // unreachable. Refusing names what is missing; composing would have to
+        // invent an environment name, and reporting an environment nothing
+        // created would be worse than the refusal.
         Err(ComposeEnvironmentsError::missing_parameter(format!(
             "The environment manifest (env.yaml) naming the environment to compose is not available from the source bundle of version label '{}'.",
             version_labels.join("', '")

@@ -180,11 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(repository) = store.repositories.get(&input.repository_name) else {
             return Err(DeleteRepositoryErrorModeled::RepositoryNotFoundException(
                 RepositoryNotFoundException {
-                    message: Some(format!(
-                        "The repository with name '{}' does not exist in the registry with id \
-                         '{registry_id}'",
-                        input.repository_name
-                    )),
+                    message: Some(store.repository_not_found_message(&input.repository_name)),
                 },
             )
             .into());

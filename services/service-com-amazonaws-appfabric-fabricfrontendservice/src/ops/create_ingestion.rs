@@ -8,6 +8,12 @@
 //! starts `disabled` — `StartIngestion` is what enables it, so the clock owes no
 //! transition here.
 //!
+//! An ingestion also has a DEPENDENCY: it reads one application's data for one
+//! tenant, so the bundle must already hold an app authorization for that
+//! (`app`, `tenantId`) pair that has completed the connect handshake
+//! (`Connected`). A pair with no such authorization is refused with the modelled
+//! `ValidationException` and nothing is written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -195,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(bundle_key) = store.bundle_key(&input.app_bundle_identifier) else {
             return Err(CreateIngestionErrorModeled::ResourceNotFoundException(
-                crate::state::app_bundle_not_found(&input.app_bundle_identifier),
+                crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
             )
             .into());
         };
@@ -205,10 +211,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|bundle| bundle.arn.clone())
         else {
             return Err(CreateIngestionErrorModeled::ResourceNotFoundException(
-                crate::state::app_bundle_not_found(&input.app_bundle_identifier),
+                crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
             )
             .into());
         };
+
+        // `app` is a plain `String255` in the model (no `@enum`), so the
+        // boundary validator cannot refuse an application AppFabric does not
+        // support: the set is the server's to check, and it is the same set
+        // `CreateAppAuthorization` checks.
+        if !crate::state::is_supported_app(&input.app) {
+            return Err(CreateIngestionErrorModeled::ValidationException(
+                crate::state::app_not_supported(&input.app),
+            )
+            .into());
+        }
+
+        // AppFabric's resource chain is authorize → connect → ingest: an
+        // ingestion reads one application's data for one tenant, which it can
+        // only do through an app authorization of that (app, tenant) pair that
+        // has completed the connect handshake. A pair the bundle holds no
+        // CONNECTED authorization for — whether it holds none at all or one
+        // still `PendingConnect` — cannot be ingested, and the refusal is the
+        // modelled `ValidationException` (HTTP 400): the request names a
+        // dependency that is not satisfied, so nothing is written.
+        let authorization_state = store
+            .app_bundles
+            .get(&bundle_key)
+            .and_then(|bundle| bundle.authorization_for(&input.app, &input.tenant_id))
+            .map(|authorization| authorization.status.clone());
+        if authorization_state.as_deref() != Some(crate::state::APP_AUTHORIZATION_STATUS_CONNECTED) {
+            return Err(CreateIngestionErrorModeled::ValidationException(
+                crate::state::app_authorization_not_connected(
+                    &input.app,
+                    authorization_state.as_deref(),
+                ),
+            )
+            .into());
+        }
 
         // The PARENT is one of this request's parameters, so it belongs in the
         // fingerprint: the same token under a different bundle is a different
@@ -254,7 +294,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = crate::state::new_uuid();
         let Some(bundle) = store.app_bundles.get_mut(&bundle_key) else {
             return Err(CreateIngestionErrorModeled::ResourceNotFoundException(
-                crate::state::app_bundle_not_found(&input.app_bundle_identifier),
+                crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
             )
             .into());
         };

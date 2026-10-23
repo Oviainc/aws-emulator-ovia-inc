@@ -63,9 +63,10 @@ use std::sync::Arc;
 /// Classic model. That is not a lost operation for this one: an awsQuery envelope names
 /// the API version it is for, so the Classic front door serves a `Version=2015-12-01`
 /// request from THIS model, over the one shared engine (see that crate's
-/// `src/service/api_version.rs`) — which is how AWS resolves the two APIs on their shared
-/// endpoint too. So an AWS SDK ELBv2 client, which signs `elasticloadbalancing`, reaches
-/// these operations exactly as it does against AWS.
+/// `src/service/api_version.rs`, which holds this model's own `EmulatedService` and hands
+/// the request to the operation this model's routing table names) — which is how AWS
+/// resolves the two APIs on their shared endpoint too. So an AWS SDK ELBv2 client, which
+/// signs `elasticloadbalancing`, reaches these operations exactly as it does against AWS.
 ///
 /// This key is what addresses this model DIRECTLY, without the shared front door: the
 /// prefix derived from its own `sdkId`, as a credential scope or a host label. The

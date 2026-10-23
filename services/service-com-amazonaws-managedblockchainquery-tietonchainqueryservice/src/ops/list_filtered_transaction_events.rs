@@ -194,6 +194,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // Every modelled constraint on this input is checked HERE rather than at the
+        // framework boundary (the members carry `skip_validation` in `src/ops/types/`,
+        // because this service answers a constraint failure with its OWN
+        // `ValidationException` — see `crate::state::validation`). The model's own rules
+        // are checked first, as AWS's validation framework checks them; the operation's
+        // own follow, and the store is reached only once both have passed, so
+        // caller-sized validation never holds the shared state's lock.
+        crate::state::validation::list_filtered_transaction_events_input(&input)
+            .map_err(ListFilteredTransactionEventsErrorModeled::ValidationException)?;
 
         // One `fieldList` entry per field whose value this operation refuses, all of
         // them accumulated before anything is answered: `ValidationException$fieldList`
@@ -207,8 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // address on the blockchain. This operation is only supported on the Bitcoin
         // networks", and `network` documents "Valid Values: BITCOIN_MAINNET |
         // BITCOIN_TESTNET". The member targets a plain `String` rather than the
-        // `QueryNetwork` enum, so the boundary validator admits any value and the
-        // operation's own value set has to be checked here.
+        // `QueryNetwork` enum, so the model declares no value set for it and the
+        // operation's own has to be checked here — before any work, so a request naming
+        // a network this operation does not serve is refused rather than answered from
+        // (or about) a ledger it would never read.
         if !crate::state::is_bitcoin(&input.network) {
             fields.push(crate::state::validation_field(
                 "network",
@@ -218,7 +229,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `AddressIdentifierFilter$transactionEventToAddress` is
         // `@length(min: 1, max: 1)`, so the filter names exactly ONE address, "the
-        // container for the recipient address of the transaction".
+        // container for the recipient address of the transaction". The modelled bound is
+        // already checked above; this is what binds that one address.
         let addresses = input
             .address_identifier_filter
             .transaction_event_to_address
@@ -370,10 +382,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             matching.reverse();
         }
 
+        // `maxResults` carries `@range(min: 1, max: 250)`, refused above by
+        // `validation::list_filtered_transaction_events_input`, and `state::page` clamps
+        // whatever reaches it to `state::MAX_PAGE_SIZE` (250), so one page is bounded by
+        // the model and never by the request.
         let page = crate::state::page(matching, input.max_results, input.next_token.as_deref())
-            .map_err(|error| {
+            .map_err(|_| {
                 ListFilteredTransactionEventsErrorModeled::ValidationException(
-                    crate::state::invalid_page_token(&error),
+                    crate::state::invalid_page_token(),
                 )
             })?;
 

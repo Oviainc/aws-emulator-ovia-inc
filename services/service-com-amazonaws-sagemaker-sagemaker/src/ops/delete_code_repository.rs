@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCodeRepository
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCodeRepository`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCodeRepository::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the Git repository `crate::state` holds under its
+//! `CodeRepositoryName`, so a later `DescribeCodeRepository` no longer finds it, the name
+//! is free for another `CreateCodeRepository` and the store's quota slot is released. A
+//! name no repository holds is refused rather than answered 200. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +141,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCodeRepository` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCodeRepositoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let arn = crate::state::resource_arn(
+            &crate::state::request_region(ctx),
+            "code-repository",
+            &input.code_repository_name,
+        );
+
+        // The repository record is the whole resource: it "persists independently from the
+        // lifecycle of any notebook instances it is associated with" (the
+        // `CreateCodeRepository` doc), so removing that one entry is the whole delete —
+        // no other store holds a copy, and a notebook instance that names this repository
+        // keeps naming it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCodeRepository"))
+        // This operation models no errors, so a name nothing created is refused through
+        // the service-common 400 `ValidationException`, naming the ARN it could not
+        // resolve exactly as the sibling reader does. A 200 for a name that was never
+        // there would tell the caller a repository it never created had been deleted.
+        let mut store = state.lock();
+        if store
+            .code_repositories
+            .remove(&input.code_repository_name)
+            .is_none()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Cannot find CodeRepository: {arn}"
+            )));
+        }
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(DeleteCodeRepositoryOutput)
     }
 }

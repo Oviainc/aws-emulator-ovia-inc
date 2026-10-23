@@ -62,6 +62,25 @@ impl Answer {
     }
 }
 
+/// One answer from the artifact document plane: a download, not a modelled call, so what
+/// it carries is a status, a media type, a length and BYTES rather than a JSON envelope.
+pub(crate) struct Fetched {
+    pub(crate) status: u16,
+    pub(crate) content_type: String,
+    pub(crate) content_length: Option<usize>,
+    pub(crate) body: String,
+}
+
+/// An absolute URL split into its authority and its path (with any query kept on the
+/// path), as a client sends them: the authority as `Host`, the path as the request target.
+fn split_url(url: &str) -> (&str, &str) {
+    let after_scheme = url.split_once("://").map_or(url, |(_scheme, rest)| rest);
+    match after_scheme.find('/') {
+        Some(path_start) => after_scheme.split_at(path_start),
+        None => (after_scheme, "/"),
+    }
+}
+
 impl Repo {
     pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -73,11 +92,28 @@ impl Repo {
     }
 
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Answer {
+        self.call_from_host(method, path, body, None).await
+    }
+
+    /// [`Repo::call`], from a client that reached the emulator at `host`.
+    ///
+    /// The host matters to one thing only, and it is a published one: an address this
+    /// service announces for an artifact a publisher supplied INLINE has to be an address
+    /// the caller can follow back here, so it is built from the endpoint the publishing
+    /// request arrived at. `None` sends no `Host` header at all, which is what every
+    /// other suite's calls do.
+    pub(crate) async fn call_from_host(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        host: Option<&str>,
+    ) -> Answer {
         let payload = match body {
             Some(value) => bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize")),
             None => bytes::Bytes::new(),
         };
-        let request = http::Request::builder()
+        let mut request = http::Request::builder()
             .method(method)
             .uri(path)
             // The credential scope's service field is what the router routes on, and its
@@ -87,9 +123,59 @@ impl Repo {
                 "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/us-west-2/serverlessrepo/\
                  aws4_request, SignedHeaders=host, Signature=deadbeef",
             )
-            .header("content-type", "application/json")
-            .body(payload)
+            .header("content-type", "application/json");
+        if let Some(host) = host {
+            request = request.header("host", host);
+        }
+        let request = request.body(payload).expect("a valid request");
+        self.answer(request).await
+    }
+
+    /// Follow a published artifact URL the way a client that was handed one does: a plain
+    /// `GET` (or `HEAD`) of the whole URL, carrying NO credential scope of its own — a
+    /// published object URL is followed unsigned — with the URL's own host as `Host`.
+    ///
+    /// `signed` adds the same SigV4 credential scope a client's other calls carry, for
+    /// the caller that re-uses its routing headers on the fetch: the artifact is served
+    /// either way, because the announced address is served by this service whether the
+    /// request routes to it by host or by path.
+    pub(crate) async fn follow(&self, method: &str, url: &str, signed: bool) -> Fetched {
+        let (host, path) = split_url(url);
+        let mut request = http::Request::builder().method(method).uri(path);
+        if !host.is_empty() {
+            request = request.header("host", host);
+        }
+        if signed {
+            request = request.header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/us-west-2/serverlessrepo/\
+                 aws4_request, SignedHeaders=host, Signature=deadbeef",
+            );
+        }
+        let request = request
+            .body(bytes::Bytes::new())
             .expect("a valid request");
+        let response = self.router.dispatch(request).await;
+        Fetched {
+            status: response.status().as_u16(),
+            content_type: response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+            content_length: response
+                .headers()
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok()),
+            body: String::from_utf8_lossy(response.body()).to_string(),
+        }
+    }
+
+    /// One dispatched request, as the status and the JSON body every modelled call of
+    /// this service answers with.
+    async fn answer(&self, request: http::Request<bytes::Bytes>) -> Answer {
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
         let raw = response.body().to_vec();

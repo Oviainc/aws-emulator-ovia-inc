@@ -82,6 +82,10 @@ pub mod provisioning;
 /// declares.
 pub mod template;
 
+/// One entry per resource type this emulator really creates: which service owns it, and
+/// the create and delete calls that make its resources exist.
+mod provisioner;
+
 /// The extension registry: the registered and activated extensions this account and
 /// Region holds, and the versions of each.
 pub mod registry;
@@ -415,6 +419,9 @@ pub struct StoredEvent {
 #[derive(Debug, Clone)]
 pub struct PendingStatus {
     pub status: String,
+    /// The `StackStatusReason` that status carries, for an operation that is headed for a
+    /// FAILED one: a failure has to say what failed, and a success states no reason.
+    pub status_reason: Option<String>,
     pub due_at: SystemTime,
     pub operation_id: Option<String>,
     pub client_request_token: Option<String>,
@@ -584,7 +591,7 @@ impl StoredStack {
         // "Default: A value of the appropriate type for the template to use if no value
         // is specified when a stack is created" — the request's values win over the
         // template's declared defaults.
-        let mut parameters = declared.parameter_defaults.clone();
+        let mut parameters = declared.parameter_defaults();
         for parameter in &self.parameters {
             parameters.insert(parameter.key.clone(), parameter.value.clone());
         }
@@ -597,12 +604,13 @@ impl StoredStack {
         // evaluated out of it, so the total work one request can ask for is bounded.
         let mut budget = template::Budget::new();
         let no_resources = BTreeMap::new();
+        let parameter_types = declared.parameter_types();
         // The deployment's scope with no resource resolved yet, which is what
         // `provision` turns into the stack's resources.
         let scope = template::Scope {
             stack,
             parameters: &parameters,
-            parameter_types: &declared.parameter_types,
+            parameter_types: &parameter_types,
             resources: &no_resources,
             mappings: &declared.mappings,
             conditions: &declared.conditions,
@@ -719,7 +727,7 @@ impl StoredStack {
         }
         let pending = self.pending.take().expect("checked just above");
         self.status = pending.status;
-        self.status_reason = None;
+        self.status_reason = pending.status_reason.clone();
         if self.status == status::DELETE_COMPLETE {
             self.deletion_time = Some(pending.due_at);
             // The deletion completed, so every resource of the stack was deleted as of
@@ -740,10 +748,11 @@ impl StoredStack {
             self.outputs = deployed.outputs;
         }
         let status = self.status.clone();
+        let reason = pending.status_reason;
         self.record_event(
             pending.due_at,
             &status,
-            None,
+            reason,
             pending.operation_id,
             pending.client_request_token,
         );
@@ -782,6 +791,7 @@ impl StoredStack {
         );
         self.pending = Some(PendingStatus {
             status: settles_to.to_string(),
+            status_reason: None,
             due_at: now + STATUS_TRANSITION_DELAY,
             operation_id,
             client_request_token,
@@ -1453,7 +1463,7 @@ pub fn parameters_in_force(
     supplied: Vec<StoredParameter>,
 ) -> Vec<StoredParameter> {
     let declared = template::parse(template_body)
-        .map(|parsed| parsed.parameter_defaults)
+        .map(|parsed| parsed.parameter_defaults())
         .unwrap_or_default();
     let supplied_by_key: ::std::collections::HashMap<&str, &StoredParameter> = supplied
         .iter()
