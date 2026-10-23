@@ -388,7 +388,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if let Some(duplicate) = first_duplicate_tag_key(&tags) {
+        if let Some(duplicate) = crate::state::first_duplicate_tag_key(&tags) {
             return Err(CreateTrailErrorModeled::InvalidTagParameterException(
                 InvalidTagParameterException {
                     message: Some(format!(
@@ -503,13 +503,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The first tag key that appears more than once in `tags`, if any.
-///
-/// `InvalidTagParameterException` covers duplicate tags, and a tag set is a map on
-/// the wire even though the model carries it as a list.
-fn first_duplicate_tag_key(tags: &[Tag]) -> Option<&str> {
-    let mut seen = ::std::collections::BTreeSet::new();
-    tags.iter()
-        .find(|tag| !seen.insert(tag.key.as_str()))
-        .map(|tag| tag.key.as_str())
-}
