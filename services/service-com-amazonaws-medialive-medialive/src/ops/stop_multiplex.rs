@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopMultiplex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopMultiplex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopMultiplex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the stop is a transition on the stored multiplex (the `multiplexes`
+//! slice of [`crate::state`]) — it moves a RUNNING multiplex into `STOPPING` and owes
+//! the stopped `IDLE`, and every value the response carries is read back out of that
+//! stored record, never built from the request in flight. A multiplex that is not
+//! running is left exactly as it stands and reported there: this operation "has no
+//! effect" on one, as its modelled contract below documents, so a stop is a no-op
+//! rather than a refusal. An id no multiplex of the account has is refused with
+//! `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +162,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopMultiplex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopMultiplexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopMultiplex"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Transitions the clock had already made due were owed whether or not
+        // this stop ran, so they are materialised before anything is read: a
+        // multiplex whose `STARTING` span has passed is `RUNNING`, and that is
+        // the state this stop acts on.
+        state.settle(now);
+
+        // The state a stop acts on and the transition are one step in the state
+        // slice, so this handler cannot read it and stop past it.
+        state
+            .stop_multiplex(&input.multiplex_id, now)
+            .map_err(|refusal| refused(refusal, &input.multiplex_id))?;
+
+        let multiplex = state
+            .multiplex_description(&input.multiplex_id)
+            .ok_or_else(unavailable)?;
+
+        Ok(crate::state::multiplex_description_output!(
+            StopMultiplexOutput,
+            multiplex
+        ))
     }
+}
+
+/// Turn a store refusal into this operation's own modelled error.
+///
+/// A multiplex the account does not hold is a 404, carrying the same wording
+/// every reader of this service uses for a resource that is not there. It is the
+/// only refusal a stop has: a multiplex that is not running is a no-op rather
+/// than a conflict, which is what this operation documents.
+fn refused(refusal: crate::state::MultiplexStopRefusal, multiplex_id: &str) -> StopMultiplexError {
+    match refusal {
+        crate::state::MultiplexStopRefusal::NotFound => {
+            StopMultiplexErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("Multiplex", multiplex_id)),
+            })
+        }
+    }
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no multiplex store to stop a multiplex in. A modelled server
+/// error, never a fresh engine (which would drop the transition on return).
+fn unavailable() -> StopMultiplexError {
+    StopMultiplexErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

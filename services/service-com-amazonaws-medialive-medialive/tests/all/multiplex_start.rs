@@ -21,18 +21,20 @@ use crate::wire::{call, error_code, error_message, medialive};
 /// How many availability zones every multiplex here is created in — the two
 /// `CreateMultiplexRequest$AvailabilityZones` documents ("You must specify
 /// exactly two"), which is also the number of pipelines a RUNNING multiplex
-/// reports as healthy, one per zone.
-const ZONES: i64 = 2;
+/// reports as healthy, one per zone. Shared with the multiplex STOP suite, which
+/// asserts the same count on the multiplex it stops.
+pub(crate) const ZONES: i64 = 2;
 
 /// `StartMultiplex`'s binding (`smithy_query(query="operation",
 /// operation="StartMultiplex")`: `POST /prod/multiplexes/{MultiplexId}/start`,
-/// success 202).
-async fn start_multiplex(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+/// success 202). Shared with the multiplex STOP suite, which starts a multiplex
+/// to have one running to stop.
+pub(crate) async fn start_multiplex(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "POST", &format!("{MULTIPLEXES}/{id}/start"), None).await
 }
 
 /// A multiplex created under `name` with `multiplex_settings`, as its minted id.
-async fn multiplex_with_settings(
+pub(crate) async fn multiplex_with_settings(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -49,7 +51,7 @@ async fn multiplex_with_settings(
 
 /// Create `count` programs in `multiplex_id`, each with its own name and its own
 /// `ProgramNumber`, asserting every create succeeded.
-async fn add_programs(router: &MultiServiceRouter, case: &str, multiplex_id: &str, count: i64) {
+pub(crate) async fn add_programs(router: &MultiServiceRouter, case: &str, multiplex_id: &str, count: i64) {
     for index in 0..count {
         let name = format!("program-{index}");
         let (status, program) = create_program(
