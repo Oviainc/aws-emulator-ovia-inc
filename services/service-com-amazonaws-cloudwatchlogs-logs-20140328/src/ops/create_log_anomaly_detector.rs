@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLogAnomalyDetector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLogAnomalyDetector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: stores one anomaly detector over the single log group it was asked to
+//! watch and hands back the ARN it minted for it, or refuses a request that names more
+//! than one log group, something that is not a log group ARN, or a log group this account
+//! does not hold in this region — and refuses a create that would grow the account's
+//! detector store past the emulator's own ceiling. This is the ONLY file to touch for this
+//! operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateLogAnomalyDetector::handle`] with real behaviour and
@@ -187,18 +190,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLogAnomalyDetector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLogAnomalyDetectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLogAnomalyDetector"))
+        let region = crate::state::request_region(ctx.parts());
+
+        let invalid = |message: String| {
+            CreateLogAnomalyDetectorError::from(
+                CreateLogAnomalyDetectorErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        // A member this operation parses as an ARN and was handed something that is not one
+        // is refused before anything is looked up, with the service's validation-error
+        // message naming the member and the value it could not parse.
+        for arn in &input.log_group_arn_list {
+            if let Some(message) = crate::state::unparsable_arn_message("logGroupArnList", arn) {
+                return Err(invalid(message));
+            }
+        }
+
+        // "An array containing the ARN of the log group that this anomaly detector will
+        // watch. You can specify only one log group ARN": the list is required, so a request
+        // that names no log group names nothing to watch, and one that names several asks
+        // for a detector this operation does not create.
+        if input.log_group_arn_list.len() != crate::state::ANOMALY_DETECTOR_LOG_GROUPS {
+            return Err(invalid(format!(
+                "logGroupArnList must contain exactly {} log group ARN, got {}",
+                crate::state::ANOMALY_DETECTOR_LOG_GROUPS,
+                input.log_group_arn_list.len()
+            )));
+        }
+
+        // The ARNs parse, so this is a refusal of the resource they name rather than of
+        // their form: a detector watches log groups, so a well-formed ARN of any other kind
+        // names nothing it can watch.
+        if let Some(arn) = input
+            .log_group_arn_list
+            .iter()
+            .find(|arn| !crate::state::is_log_group_arn(arn))
+        {
+            return Err(invalid(format!(
+                "logGroupArnList must contain log group ARNs, got '{arn}'"
+            )));
+        }
+
+        // The filter pattern limits "the anomaly detection model to examine only log events
+        // that match the pattern you specify here", in the filter-pattern syntax every
+        // other pattern member carries, so it is parsed at configuration time rather than
+        // left to silently match nothing once the detector runs.
+        if let Some(pattern) = input.filter_pattern.as_deref() {
+            if let Err(message) = crate::state::validate_filter_pattern(pattern) {
+                return Err(invalid(message));
+            }
+        }
+
+        // "You can associate as many as 50 tags with a CloudWatch Logs resource" — the
+        // per-resource tag quota every resource of this service is held to, counted on what
+        // this detector would end up holding. The modelled `Tags` map is `@length(max: 50)`
+        // as well, so this refuses nothing the boundary already does; it is here so the
+        // stored set cannot grow past the quota if a later call adds to it.
+        if input
+            .tags
+            .as_ref()
+            .is_some_and(|tags| tags.len() > crate::state::MAX_TAGS_PER_RESOURCE)
+        {
+            return Err(invalid(format!(
+                "a resource can have no more than {} tags",
+                crate::state::MAX_TAGS_PER_RESOURCE
+            )));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateLogAnomalyDetectorError::from(
+                CreateLogAnomalyDetectorErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // A detector "regularly scans one or more log groups", named here by their ARNs, so
+        // there is nothing for it to scan until the log group the request named exists. The
+        // ARN names a region and an account as well as a name, so an ARN naming another
+        // region's or another account's log group names a resource this account does not
+        // hold here, even when a stored group happens to share its name.
+        if input.log_group_arn_list.iter().any(|arn| {
+            let name = crate::state::log_group_name_from_identifier(arn);
+            !store.log_groups.contains_key(name)
+                || *arn != crate::state::log_group_arn(&region, name, false)
+        }) {
+            return Err(
+                CreateLogAnomalyDetectorErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message("log group")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Nothing expires a detector, so the account's store is held to the emulator's own
+        // ceiling: a create that would grow it past that is refused with the
+        // `LimitExceededException` this operation models, rather than growing the store on
+        // request. Every accepted create adds a detector (it mints a fresh ARN rather than
+        // overwriting one), so the check is on the count the store already holds.
+        if store.anomaly_detectors.len() >= crate::state::MAX_ANOMALY_DETECTORS {
+            return Err(CreateLogAnomalyDetectorErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the maximum of {} log anomaly detectors per account has been reached",
+                        crate::state::MAX_ANOMALY_DETECTORS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The ARN is MINTED here, not taken from the caller: it identifies the detector this
+        // call creates, and the counter behind it never hands the same one out twice.
+        let id = crate::state::mint_anomaly_detector_id(store.take_anomaly_detector_seq());
+        let arn = crate::state::anomaly_detector_arn(&region, &id);
+
+        let mut detector = crate::state::AnomalyDetectorRecord::new(
+            &arn,
+            input.log_group_arn_list.clone(),
+            crate::state::now_ms(),
+        );
+        detector.detector_name = input.detector_name.clone();
+        detector.evaluation_frequency = input.evaluation_frequency.clone();
+        detector.filter_pattern = input.filter_pattern.clone();
+        detector.kms_key_id = input.kms_key_id.clone();
+        detector.anomaly_visibility_time = input.anomaly_visibility_time;
+        if let Some(tags) = &input.tags {
+            detector.tags = tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+        }
+        store.anomaly_detectors.insert(arn.clone(), detector);
+
+        Ok(CreateLogAnomalyDetectorOutput {
+            anomaly_detector_arn: Some(arn),
+        })
     }
 }

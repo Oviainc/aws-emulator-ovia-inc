@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLogAnomalyDetector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLogAnomalyDetector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: reports the stored anomaly detector the request's ARN names — every
+//! member of the model's `AnomalyDetector` shape this operation echoes — or refuses an ARN
+//! the account holds no detector under. This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`GetLogAnomalyDetector::handle`] with real behaviour and
@@ -170,17 +170,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLogAnomalyDetector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLogAnomalyDetectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLogAnomalyDetector"))
+        // request metadata, which this reporting operation needs none of.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetLogAnomalyDetectorError::from(
+                GetLogAnomalyDetectorErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // A detector initializes and trains on its own, so the status this read reports is
+        // the one the clock has ALREADY made due — materialised here rather than moved on
+        // because something looked.
+        store.materialize_due_anomaly_detector_transitions(crate::state::now_ms());
+
+        let Some(detector) = store.anomaly_detectors.get(&input.anomaly_detector_arn) else {
+            return Err(
+                GetLogAnomalyDetectorErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            "anomaly detector",
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every member is read off the stored record, so this reports the detector as it
+        // was created and last updated and nothing the request carried.
+        let reported = detector.reported();
+        Ok(GetLogAnomalyDetectorOutput {
+            detector_name: reported.detector_name,
+            log_group_arn_list: reported.log_group_arn_list,
+            evaluation_frequency: reported.evaluation_frequency,
+            filter_pattern: reported.filter_pattern,
+            anomaly_detector_status: reported.anomaly_detector_status,
+            kms_key_id: reported.kms_key_id,
+            creation_time_stamp: reported.creation_time_stamp,
+            last_modified_time_stamp: reported.last_modified_time_stamp,
+            anomaly_visibility_time: reported.anomaly_visibility_time,
+        })
     }
 }
