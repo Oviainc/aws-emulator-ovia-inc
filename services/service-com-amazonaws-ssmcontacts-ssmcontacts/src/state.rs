@@ -28,7 +28,7 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     Contact, ContactChannel, ContactChannelAddress, DescribeEngagementOutput, Engagement, Plan,
-    Tag,
+    RecurrenceSettings, Rotation, Tag,
 };
 
 /// What `CreateContact` persists, and what `GetContact`/`ListContacts` rebuild their
@@ -45,10 +45,16 @@ pub struct ContactRecord {
     pub contact_type: String,
     /// The engagement plan exactly as created — stages, rotation ids, or neither.
     pub plan: Plan,
-    /// The tags `CreateContact` attached. No reader yet (`ListTagsForResource` is still a
-    /// stub), but the create is the only call that can carry them, so they are persisted
-    /// rather than dropped.
+    /// The tags attached to this contact — by `CreateContact`, and afterwards by
+    /// `TagResource`/`UntagResource`. `ListTagsForResource` reports exactly this list.
     pub tags: Vec<Tag>,
+    /// The resource policy `PutContactPolicy` attached, when one has been, and what
+    /// `GetContactPolicy` reports.
+    ///
+    /// The policy lives ON the contact rather than in a map beside it, so deleting the
+    /// contact drops its policy with it instead of leaving a resident entry keyed by an
+    /// ARN that now names nothing.
+    pub policy: Option<String>,
     pub created_at: SystemTime,
 }
 
@@ -72,6 +78,16 @@ pub struct ContactChannelRecord {
     /// Insertion order, so `ListContactChannels` can be stable even though the map is
     /// keyed by ARN.
     pub sequence: u64,
+    /// The activation code outstanding for this channel: the one Incident Manager last
+    /// delivered TO the channel (at creation unless activation was deferred, and again on
+    /// every `SendActivationCode`), which `ActivateContactChannel` checks the caller's
+    /// `ActivationCode` against.
+    ///
+    /// AWS delivers the code out of band — to the email address or phone number the
+    /// channel names — so it is never put on the wire, and this emulator has no out-of-band
+    /// carrier: the store IS the channel's mailbox. `None` means no code has been delivered
+    /// yet, so there is nothing a caller could present.
+    pub activation_code: Option<String>,
     pub created_at: SystemTime,
 }
 
@@ -95,6 +111,30 @@ pub struct AccountReplicationSet {
     /// Whether the set has finished replicating. Only an ACTIVE set opens the contact data
     /// plane; a set still being created or deleted does not.
     pub active: bool,
+}
+
+/// What `CreateRotation` persists, and what `ListRotations` rebuilds its summaries from.
+#[derive(Debug, Clone)]
+pub struct RotationRecord {
+    /// The minted `RotationArn`, which is also this record's key in [`rotations`].
+    ///
+    /// [`rotations`]: ComAmazonawsSsmcontactsSsmcontactsState::rotations
+    pub arn: String,
+    pub name: String,
+    /// The contacts on the rotation team, in the order the create listed them — "the order
+    /// in which you list the contacts is their shift order in the rotation schedule".
+    pub contact_ids: Vec<String>,
+    /// When the rotation becomes active, when the create named a time.
+    pub start_time: Option<::aws_smithy_types::DateTime>,
+    pub time_zone_id: String,
+    /// The recurrence exactly as created.
+    pub recurrence: RecurrenceSettings,
+    /// The tags attached to this rotation — by `CreateRotation`, and afterwards by
+    /// `TagResource`/`UntagResource`.
+    pub tags: Vec<Tag>,
+    /// Insertion order, so a caller can tell which of two rotations the store minted first.
+    pub sequence: u64,
+    pub created_at: SystemTime,
 }
 
 /// An engagement as it is persisted: the message `StartEngagement` sent to a contact or
@@ -151,6 +191,16 @@ pub struct ComAmazonawsSsmcontactsSsmcontactsState {
     /// channels created with the same name under the same contact are still two
     /// resources with two ARNs.
     pub channels_created: u64,
+    /// On-call rotations, keyed by `RotationArn`.
+    pub rotations: BTreeMap<String, RotationRecord>,
+    /// How many rotations this store has ever minted. Feeds [`RotationRecord::sequence`]
+    /// and the rotation ARN's opaque id, so two rotations created with the same `Name` —
+    /// which the model permits, declaring no conflict error for `CreateRotation` — are
+    /// still two resources with two ARNs.
+    pub rotations_created: u64,
+    /// How many activation codes this store has ever delivered. Feeds the code's opaque
+    /// derivation, so a channel's second code differs from its first.
+    pub activation_codes_issued: u64,
     /// Engagements, keyed by `EngagementArn`. `StartEngagement` inserts, `StopEngagement`
     /// stops and `DescribeEngagement` reports; nothing in this service removes one, since
     /// the model has no delete for an engagement.
@@ -207,6 +257,20 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
         Err(ACCOUNT_NOT_FOUND_MESSAGE.to_string())
     }
 
+    /// The same account-level precondition, refused with the message that names the ARN the
+    /// request supplied instead of the account.
+    ///
+    /// An operation whose whole subject is one resource ARN reports the precondition as
+    /// that ARN being unresolvable: with no replication set the account has no home region
+    /// for the resource, so the ARN resolves to nothing. The message is built FROM THE
+    /// REQUEST, which is what makes its wording a requirement rather than an example.
+    pub fn require_active_replication_set_for(&self, arn: &str) -> Result<(), String> {
+        if self.active_replication_set().is_some() {
+            return Ok(());
+        }
+        Err(invalid_resource_arn_message(arn))
+    }
+
     /// The ARNs of the channels that belong to `contact_arn`, in creation order.
     pub fn channel_arns_of(&self, contact_arn: &str) -> Vec<String> {
         let mut channels: Vec<&ContactChannelRecord> = self
@@ -231,7 +295,10 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
         let arn = self
             .idempotency_tokens
             .get(&(operation.to_string(), token.to_string()))?;
-        if self.contacts.contains_key(arn) || self.contact_channels.contains_key(arn) {
+        if self.contacts.contains_key(arn)
+            || self.contact_channels.contains_key(arn)
+            || self.rotations.contains_key(arn)
+        {
             return Some(arn.clone());
         }
         None
@@ -281,6 +348,53 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
         self.idempotency_tokens.retain(|key, _| !stale.contains(key));
         self.idempotency_order.retain(|key| !stale.contains(key));
     }
+
+    /// Deliver a fresh activation code TO the contact channel `channel_arn` names, and
+    /// answer it.
+    ///
+    /// This is the emulator's stand-in for the out-of-band delivery AWS performs (an email
+    /// or a text message to the channel's own address): the code is written to the channel
+    /// record — the channel's mailbox — and never put on the wire, exactly as AWS never
+    /// returns it. Each delivery supersedes the previous one, so only the latest code
+    /// activates the channel.
+    ///
+    /// Answers `None` when `channel_arn` names no stored channel, so a caller cannot mint a
+    /// code for a resource that does not exist.
+    pub fn deliver_activation_code(&mut self, channel_arn: &str) -> Option<String> {
+        if !self.contact_channels.contains_key(channel_arn) {
+            return None;
+        }
+        let sequence = self.activation_codes_issued;
+        self.activation_codes_issued = self.activation_codes_issued.saturating_add(1);
+        let code = activation_code(channel_arn, sequence);
+        let channel = self.contact_channels.get_mut(channel_arn)?;
+        channel.activation_code = Some(code.clone());
+        Some(code)
+    }
+
+    /// The tag list of the taggable resource `arn` names, when the store holds it.
+    ///
+    /// Contacts (and escalation plans) and rotations are the resources this service's
+    /// `Tags` members hang off — `CreateContact` and `CreateRotation` are the only inputs
+    /// that carry a `TagsList` — so a `ResourceARN` naming anything else names no taggable
+    /// resource.
+    pub fn tags_of(&self, arn: &str) -> Option<&Vec<Tag>> {
+        match self.contacts.get(arn) {
+            Some(contact) => Some(&contact.tags),
+            None => self.rotations.get(arn).map(|rotation| &rotation.tags),
+        }
+    }
+
+    /// [`tags_of`](Self::tags_of), for the operations that write the list back.
+    pub fn tags_mut(&mut self, arn: &str) -> Option<&mut Vec<Tag>> {
+        match self.contacts.get_mut(arn) {
+            Some(contact) => Some(&mut contact.tags),
+            None => self
+                .rotations
+                .get_mut(arn)
+                .map(|rotation| &mut rotation.tags),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +412,17 @@ pub const MAX_CONTACTS: usize = 10_000;
 
 /// The same bound for contact channels. See [`MAX_CONTACTS`].
 pub const MAX_CONTACT_CHANNELS: usize = 50_000;
+
+/// The same bound for on-call rotations, answered with the modelled
+/// `ServiceQuotaExceededException` `CreateRotation` declares. See [`MAX_CONTACTS`].
+pub const MAX_ROTATIONS: usize = 10_000;
+
+/// How many tags one resource holds.
+///
+/// This is the MODEL's bound, not the emulator's: `TagsList` — the shape both
+/// `TagResource`'s input and `ListTagsForResource`'s output target — declares `length`
+/// 0..50, so a resource carrying more tags than this could not be reported at all.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// How many `(operation, IdempotencyToken)` entries the replay ledger holds before the
 /// OLDEST is evicted to make room.
@@ -349,19 +474,48 @@ pub fn contact_arn(region: &str, alias: &str) -> String {
 /// identity plus the store's own creation counter: deterministic for a given sequence of
 /// calls, and distinct for every channel the store mints.
 pub fn contact_channel_arn(region: &str, alias: &str, name: &str, sequence: u64) -> String {
-    let digest = opaque_id(&["contact-channel", alias, name, &sequence.to_string()].join("\u{1f}"));
-    let id = format!(
+    let id = opaque_uuid(&["contact-channel", alias, name, &sequence.to_string()].join("\u{1f}"));
+    ::emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("contact-channel/{alias}/{id}"),
+    )
+}
+
+/// A rotation's ARN: `arn:aws:ssm-contacts:<region>:<account>:rotation/<id>`.
+///
+/// `Name` is NOT the resource name: the model declares no conflict error for
+/// `CreateRotation`, so two rotations may carry the same name and each still needs its own
+/// ARN. The id is derived from the name plus the store's own creation counter, exactly as a
+/// channel's is.
+pub fn rotation_arn(region: &str, name: &str, sequence: u64) -> String {
+    let id = opaque_uuid(&["rotation", name, &sequence.to_string()].join("\u{1f}"));
+    ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("rotation/{id}"))
+}
+
+/// The activation code delivered to a contact channel on its `sequence`-th delivery.
+///
+/// Derived from the channel's ARN and the store's delivery counter, so it is reproducible
+/// for a given sequence of calls and a channel's successive codes differ. Six decimal
+/// digits, which is inside the modelled `ActivationCode` (`length` 6..10, `pattern`
+/// `^[0-9]*$`).
+fn activation_code(channel_arn: &str, sequence: u64) -> String {
+    let digest = opaque_id(&["activation-code", channel_arn, &sequence.to_string()].join("\u{1f}"));
+    let value = u32::from_str_radix(&digest[..8], 16).unwrap_or_default() % 1_000_000;
+    format!("{value:06}")
+}
+
+/// The first 32 hex characters of `seed`'s digest, grouped as a UUID (8-4-4-4-12) — the
+/// shape of the opaque id AWS puts in a generated resource name.
+fn opaque_uuid(seed: &str) -> String {
+    let digest = opaque_id(seed);
+    format!(
         "{}-{}-{}-{}-{}",
         &digest[0..8],
         &digest[8..12],
         &digest[12..16],
         &digest[16..20],
         &digest[20..32],
-    );
-    ::emulator_server::emulator_arn(
-        ARN_NAMESPACE,
-        region,
-        &format!("contact-channel/{alias}/{id}"),
     )
 }
 
@@ -397,6 +551,21 @@ pub fn contact_channel_summary(record: &ContactChannelRecord) -> ContactChannel 
         r#type: Some(record.channel_type.clone()),
         delivery_address: record.delivery_address.clone(),
         activation_status: record.activation_status.clone(),
+    }
+}
+
+/// The `Rotation` summary `ListRotations` returns for a stored record.
+///
+/// Every member the modelled `Rotation` carries is rebuilt from what the create persisted;
+/// the tags are not among them, so they are reached through `ListTagsForResource`.
+pub fn rotation_summary(record: &RotationRecord) -> Rotation {
+    Rotation {
+        rotation_arn: record.arn.clone(),
+        name: record.name.clone(),
+        contact_ids: Some(record.contact_ids.clone()),
+        start_time: record.start_time,
+        time_zone_id: Some(record.time_zone_id.clone()),
+        recurrence: Some(record.recurrence.clone()),
     }
 }
 
@@ -488,6 +657,9 @@ pub const TOKEN_SCOPE_CONTACTS: &str = "contacts";
 /// The `NextToken` scope `ListContactChannels` issues and accepts.
 pub const TOKEN_SCOPE_CONTACT_CHANNELS: &str = "contact-channels";
 
+/// The `NextToken` scope `ListRotations` issues and accepts.
+pub const TOKEN_SCOPE_ROTATIONS: &str = "rotations";
+
 /// The `NextToken` scope `ListEngagements` issues and accepts.
 pub const TOKEN_SCOPE_ENGAGEMENTS: &str = "engagements";
 
@@ -530,6 +702,49 @@ pub fn invalid_next_token_message(token: &str) -> String {
 /// member of the request, because no member is at fault.
 pub const ACCOUNT_NOT_FOUND_MESSAGE: &str =
     "Invalid value provided - Account not found for the request";
+
+/// The message an operation whose subject is one resource ARN refuses that ARN with when it
+/// cannot be resolved — which, without an active replication set, is every ARN.
+///
+/// Built from the request, so the ARN it names is the one the caller supplied.
+pub fn invalid_resource_arn_message(arn: &str) -> String {
+    format!("Invalid value provided - Invalid resource Arn {arn}")
+}
+
+/// `Ok` with `key`'s value when `tag` carries a key, else the `ValidationException` message
+/// saying so.
+///
+/// The modelled `Tag` makes both members optional, but a tag with no `Key` names nothing to
+/// store, read back or remove, so it is refused rather than persisted.
+pub fn require_tag_key(tag: &Tag) -> Result<&str, String> {
+    match tag.key.as_deref().filter(|key| !key.is_empty()) {
+        Some(key) => Ok(key),
+        None => Err("Value at 'tags' failed to satisfy constraint: \
+                     Member must carry a non-empty Key"
+            .to_string()),
+    }
+}
+
+/// Merge `incoming` into `existing`: a key already present takes the incoming value, a key
+/// not present is appended.
+///
+/// Tag keys are unique per resource, so this is a PATCH by key rather than an append: the
+/// order the resource's keys were first set in is kept, which is what makes
+/// `ListTagsForResource` stable across repeated writes.
+pub fn merge_tags(existing: &mut Vec<Tag>, incoming: &[Tag]) {
+    for tag in incoming {
+        let Some(key) = tag.key.as_deref() else {
+            continue;
+        };
+        match existing
+            .iter_mut()
+            .find(|stored| stored.key.as_deref() == Some(key))
+        {
+            Some(stored) => stored.value = tag.value.clone(),
+            None => existing.push(tag.clone()),
+        }
+    }
+}
 
 /// `Ok` when `value` is one of `allowed`, else the `ValidationException` message naming the
 /// member, the offending value and the permitted set.

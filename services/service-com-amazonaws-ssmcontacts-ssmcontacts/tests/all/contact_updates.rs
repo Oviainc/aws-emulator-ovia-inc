@@ -36,8 +36,9 @@ use crate::contact_lifecycle::{error_code, parse, Emulator, ACCOUNT, REGION};
 /// the store is the only place an onboarded account can come from — which is exactly what
 /// the handler reads.
 ///
-/// `pub(crate)` because the engagement suite gates on the same account precondition and
-/// reads it from the same store.
+/// `pub(crate)` because every data-plane suite needs the same fixture — the engagement
+/// suite and the gated-operation suite both gate on this one account precondition and read
+/// it from the same store — so it is written once here.
 pub(crate) fn set_replication_set(
     emulator: &Emulator,
     replication_set: Option<AccountReplicationSet>,
