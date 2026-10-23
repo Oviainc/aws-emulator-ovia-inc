@@ -31,19 +31,29 @@
 //! rule is not fanned out — it names its source regions and its destination in its
 //! own body — but it does carry the instant its provisioning comes due, which is
 //! where the `Provisioning` -> `Healthy` `RuleHealth` a read reports comes from.
+//!
+//! The service's **S3 Table integration** is the one resource here a caller does not
+//! name: `CreateS3TableIntegration` carries only an encryption configuration, a role
+//! ARN and tags, so the service mints the integration's id, keys the record by
+//! `(region, id)` and hands back the ARN that id goes into — the only handle
+//! `GetS3TableIntegration` and `DeleteS3TableIntegration` take. No instant is stored
+//! on it: the modelled `IntegrationStatus` carries no transient creating value, only
+//! `ACTIVE` and `DELETING`, so a created integration is in service from the instant
+//! the create returns and the clock owes it no transition.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    CentralizationRule, CentralizationRuleSummary, RegionStatus, TelemetryPipeline,
+    CentralizationRule, CentralizationRuleSummary, Encryption, RegionStatus, TelemetryPipeline,
     TelemetryPipelineConfiguration, TelemetryPipelineStatusReason, TelemetryRule,
     TelemetryRuleSummary, ACTION_VALUES, DELETION_PROTECTION_VALUES, DESTINATION_TYPE_VALUES,
     ENCRYPTED_LOG_GROUP_STRATEGY_VALUES, ENCRYPTION_CONFLICT_RESOLUTION_STRATEGY_VALUES,
     ENCRYPTION_SCOPE_VALUES, ENCRYPTION_STRATEGY_VALUES, FILTER_BEHAVIOR_VALUES,
     FILTER_REQUIREMENT_VALUES, LOG_TYPE_VALUES, MSK_ENHANCED_MONITORING_LEVEL_VALUES,
-    OUTPUT_FORMAT_VALUES, RESOURCE_TYPE_VALUES, TAG_CONFLICT_RESOLUTION_STRATEGY_VALUES,
-    TELEMETRY_SOURCE_TYPE_VALUES, TELEMETRY_TYPE_VALUES, W_A_F_LOG_TYPE_VALUES,
+    OUTPUT_FORMAT_VALUES, RESOURCE_TYPE_VALUES, S_S_E_ALGORITHM_VALUES,
+    TAG_CONFLICT_RESOLUTION_STRATEGY_VALUES, TELEMETRY_SOURCE_TYPE_VALUES, TELEMETRY_TYPE_VALUES,
+    W_A_F_LOG_TYPE_VALUES,
 };
 
 /// The ARN service namespace for this service (`arnNamespace` / sigv4 name
@@ -155,6 +165,60 @@ pub const PIPELINE_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// The `ResourceType` this service names a pipeline by in a modelled error.
 pub const PIPELINE_RESOURCE_TYPE: &str = "telemetry-pipeline";
+
+/// The resource portion an S3 Table integration's ARN carries before its id, so an
+/// ARN reads
+/// `arn:aws:observabilityadmin:<region>:<account>:s3-table-integration/<id>`.
+///
+/// `CreateS3TableIntegration` takes no caller-supplied name — only an `Encryption`
+/// configuration, a `RoleArn` and `Tags` — so the id is minted by the service
+/// ([`new_s3_table_integration_id`]) and the ARN it goes into is the only handle a
+/// caller ever has on the integration: `GetS3TableIntegration` and
+/// `DeleteS3TableIntegration` both take `Arn`.
+pub const S3_TABLE_INTEGRATION_ARN_RESOURCE_PREFIX: &str = "s3-table-integration/";
+
+/// The `ResourceType` this service names an S3 Table integration by in a modelled
+/// error.
+pub const S3_TABLE_INTEGRATION_RESOURCE_TYPE: &str = "s3-table-integration";
+
+/// `IntegrationStatus` of an S3 Table integration that is in service. One of
+/// `IntegrationStatus`' own two values (`INTEGRATION_STATUS_VALUES`).
+///
+/// The modelled enum carries NO transient creating value — only `ACTIVE` and
+/// `DELETING` — so a created integration is in service from the instant the create
+/// returns, and no clock transition is owed on it.
+pub const INTEGRATION_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The service namespace of the S3 Tables table bucket an integration delivers
+/// into, as reported by `GetS3TableIntegration$DestinationTableBucketArn`.
+pub const TABLE_BUCKET_ARN_SERVICE: &str = "s3tables";
+
+/// The resource portion a table bucket's ARN carries before its name, so the ARN
+/// reads `arn:aws:s3tables:<region>:<account>:bucket/<name>`.
+pub const TABLE_BUCKET_ARN_RESOURCE_PREFIX: &str = "bucket/";
+
+/// The name prefix of the table bucket an integration's create NAMES. The bucket is
+/// the integration's own, so its name carries the integration id and two integrations
+/// never share one.
+pub const TABLE_BUCKET_NAME_PREFIX: &str = "aws-cloudwatch-telemetry-";
+
+/// The `SSEAlgorithm` value that encrypts with a KMS key; the other one (`AES256`) is
+/// S3 managed encryption and takes none.
+pub const SSE_ALGORITHM_KMS: &str = "aws:kms";
+
+/// The most S3 Table integrations a caller may hold in ONE region.
+///
+/// Emulator resource guard, NOT an AWS quota: this service publishes no integration
+/// quota. [`MAX_STORED_S3_TABLE_INTEGRATION_RECORDS`] is the store-wide cap that
+/// dominates it, for the same reason it does for the pipelines above — the region a
+/// record is keyed by comes from the caller's own credential scope. A create past
+/// either cap is refused with the modelled `ServiceQuotaExceededException` before a
+/// record is allocated.
+pub const MAX_S3_TABLE_INTEGRATIONS: usize = 50;
+
+/// The most S3 Table integration records this emulator will hold ACROSS every
+/// region. Emulator resource guard, NOT an AWS quota.
+pub const MAX_STORED_S3_TABLE_INTEGRATION_RECORDS: usize = 500;
 
 /// How long after a `StartTelemetryEvaluation` / `StopTelemetryEvaluation` the
 /// telemetry-config feature of one region reaches its terminal status.
@@ -414,6 +478,63 @@ impl StoredTelemetryPipeline {
     }
 }
 
+/// A stored S3 Table integration's key: the region it lives in, then the id this
+/// service minted for it. The region is part of the key for the same reason it is
+/// part of every other key here — it comes from the caller's own credential scope,
+/// and an integration is reachable only from the region it was created in.
+pub type S3TableIntegrationKey = (String, String);
+
+/// One stored S3 Table integration: the CloudWatch -> S3 Tables analytics
+/// integration a `CreateS3TableIntegration` established.
+#[derive(Debug, Clone, Default)]
+pub struct StoredS3TableIntegration {
+    /// The service-minted id the integration's ARN carries.
+    pub id: String,
+    pub region: String,
+    /// `arn:aws:observabilityadmin:<region>:<account>:s3-table-integration/<id>`.
+    pub arn: String,
+    /// `RoleArn` exactly as the caller supplied it: the IAM role the integration
+    /// assumes to reach the destination table bucket.
+    pub role_arn: String,
+    /// `Encryption$SseAlgorithm` as supplied — one of `SSEAlgorithm`'s own values.
+    pub sse_algorithm: String,
+    /// `Encryption$KmsKeyArn` as supplied, which only a KMS-encrypted integration
+    /// carries.
+    pub kms_key_arn: Option<String>,
+    /// The table bucket this integration delivers into, named by the create
+    /// ([`table_bucket_arn`]) because the caller names none. REPORTED-ONLY: no bucket
+    /// is created behind it — see [`table_bucket_arn`] for why.
+    pub destination_table_bucket_arn: String,
+    /// `CreatedTimeStamp`, in epoch milliseconds.
+    pub created_timestamp_ms: i64,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl StoredS3TableIntegration {
+    /// This record's store key.
+    pub fn key(&self) -> S3TableIntegrationKey {
+        (self.region.clone(), self.id.clone())
+    }
+
+    /// This integration's `IntegrationStatus`.
+    ///
+    /// Always [`INTEGRATION_STATUS_ACTIVE`]: the modelled enum's only other value is
+    /// `DELETING`, which belongs to an integration a `DeleteS3TableIntegration` has
+    /// been called for, and a stored record is one no delete has retired.
+    pub fn status(&self) -> &'static str {
+        INTEGRATION_STATUS_ACTIVE
+    }
+
+    /// This record's encryption configuration, as the modelled `Encryption` a read
+    /// reports.
+    pub fn encryption(&self) -> Encryption {
+        Encryption {
+            sse_algorithm: self.sse_algorithm.clone(),
+            kms_key_arn: self.kms_key_arn.clone(),
+        }
+    }
+}
+
 /// Which way the last `Start`/`Stop` moved a telemetry-config feature, and so which
 /// pair of the modelled `Status` values that region reports either side of the
 /// instant that call comes due.
@@ -644,6 +765,14 @@ pub struct ComAmazonawsObservabilityadminObservabilityadminState {
     /// Pipeline ARN -> store key, so a `PipelineIdentifier` resolves as an ARN as
     /// well as as a bare name — the two forms its documentation names.
     pub pipeline_arn_index: BTreeMap<String, PipelineKey>,
+    /// Every stored S3 Table integration, keyed by `(region, id)`. Ordering by
+    /// region then id is what gives `ListS3TableIntegrations` a stable page
+    /// sequence.
+    pub s3_table_integrations: BTreeMap<S3TableIntegrationKey, StoredS3TableIntegration>,
+    /// Integration ARN -> store key. The ARN is the ONLY handle the model gives a
+    /// caller on an integration (`GetS3TableIntegration$Arn`,
+    /// `DeleteS3TableIntegration$Arn`), so this is how a request resolves one.
+    pub s3_table_integration_arn_index: BTreeMap<String, S3TableIntegrationKey>,
     /// The account's telemetry-config feature, keyed by region: the region a
     /// `StartTelemetryEvaluation` was signed for, plus every spoke region its
     /// multi-region scope named.
@@ -995,6 +1124,68 @@ impl ComAmazonawsObservabilityadminObservabilityadminState {
         self.pipeline_arn_index
             .insert(record.arn.clone(), record.key());
         self.telemetry_pipelines.insert(record.key(), record);
+    }
+
+    /// The key of the S3 Table integration `arn` names for a caller signed for
+    /// `region`.
+    ///
+    /// The ARN must match a stored ARN in EVERY field and name an integration in the
+    /// caller's own region, so an ARN for another partition, region or account
+    /// resolves to nothing rather than to the integration that shares its id.
+    pub fn resolve_s3_table_integration_key(
+        &self,
+        region: &str,
+        arn: &str,
+    ) -> Option<S3TableIntegrationKey> {
+        self.s3_table_integration_arn_index
+            .get(arn)
+            .filter(|(integration_region, _)| integration_region == region)
+            .cloned()
+    }
+
+    /// The S3 Table integration `arn` names in `region`.
+    pub fn s3_table_integration(
+        &self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&StoredS3TableIntegration> {
+        let key = self.resolve_s3_table_integration_key(region, arn)?;
+        self.s3_table_integrations.get(&key)
+    }
+
+    /// How many S3 Table integrations `region` holds, which is what
+    /// [`MAX_S3_TABLE_INTEGRATIONS`] bounds.
+    pub fn s3_table_integration_count(&self, region: &str) -> usize {
+        self.s3_table_integrations
+            .keys()
+            .filter(|(integration_region, _)| integration_region == region)
+            .count()
+    }
+
+    /// How many S3 Table integration records the store holds in total, across every
+    /// region, which is what [`MAX_STORED_S3_TABLE_INTEGRATION_RECORDS`] bounds.
+    pub fn s3_table_integration_record_count(&self) -> usize {
+        self.s3_table_integrations.len()
+    }
+
+    /// Whether storing `records` more integrations would take the store past
+    /// [`MAX_STORED_S3_TABLE_INTEGRATION_RECORDS`]. A write path asks this BEFORE it
+    /// allocates, so the refusal costs nothing.
+    pub fn would_exceed_s3_table_integration_store(&self, records: usize) -> bool {
+        self.s3_table_integration_record_count()
+            .saturating_add(records)
+            > MAX_STORED_S3_TABLE_INTEGRATION_RECORDS
+    }
+
+    /// Store an S3 Table integration record and index it by ARN.
+    ///
+    /// The key is `(region, id)` and the id is freshly minted per create
+    /// ([`new_s3_table_integration_id`]), so an insert never lands on an occupied
+    /// key.
+    pub fn insert_s3_table_integration(&mut self, record: StoredS3TableIntegration) {
+        self.s3_table_integration_arn_index
+            .insert(record.arn.clone(), record.key());
+        self.s3_table_integrations.insert(record.key(), record);
     }
 
     /// The telemetry-config feature records of `scope`.
@@ -1696,6 +1887,97 @@ pub fn pipeline_arn(region: &str, name: &str) -> String {
         region,
         &format!("{PIPELINE_ARN_RESOURCE_PREFIX}{name}"),
     )
+}
+
+/// The ARN of the S3 Table integration `id` in `region`.
+pub fn s3_table_integration_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{S3_TABLE_INTEGRATION_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The ARN of the S3 Tables table bucket the integration `id` in `region` delivers
+/// into.
+///
+/// The caller names no bucket, so this service names the integration's own and reports
+/// it as `DestinationTableBucketArn`; the name carries the integration id, so it is
+/// unique per integration and a later read of the same integration reports the same
+/// bucket.
+///
+/// REPORTED-ONLY: no bucket is created in the `s3tables` emulator behind this ARN, so
+/// a caller cannot follow it into that service and find one. The bucket is that
+/// service's resource, its `CreateTableBucket` is a scaffold stub with its own issue,
+/// and this service owns no part of its state — so this ARN names where the
+/// integration's data WOULD land, which is all `GetS3TableIntegration` reports about
+/// it. Nothing here claims the bucket exists.
+pub fn table_bucket_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        TABLE_BUCKET_ARN_SERVICE,
+        region,
+        &format!("{TABLE_BUCKET_ARN_RESOURCE_PREFIX}{TABLE_BUCKET_NAME_PREFIX}{id}"),
+    )
+}
+
+/// A newly minted S3 Table integration id.
+///
+/// `CreateS3TableIntegration` carries no caller-supplied identifier, so the service
+/// mints one per create and the integration's ARN is what the caller holds it by. The
+/// id is opaque — the model gives it no form of its own — and the entropy is a random
+/// v4 UUID's, reached through `emulator_telemetry`'s `BatchId::random()` constructor
+/// (`uuid::Uuid::new_v4().as_hyphenated()` verbatim,
+/// `vendor/emulator-telemetry/src/types.rs`), because `emulator-telemetry` is already
+/// one of this crate's dependencies, so nothing new enters the workspace lockfile.
+/// Only the generator is borrowed; the newtype's telemetry meaning is dropped here.
+pub fn new_s3_table_integration_id() -> String {
+    ::emulator_telemetry::BatchId::random().as_str().to_string()
+}
+
+/// Why `encryption` and `role_arn` are not an S3 Table integration this service will
+/// store, or `None` when they are fine.
+///
+/// The modelled constraints — both members' presence, `ResourceArn`'s 1..1011 length
+/// and its `^arn:aws…` pattern — are refused by the centralized walk before a handler
+/// runs. What is left is what the model STATES but cannot express as a constraint:
+///
+/// 1. `SseAlgorithm` carries one of `SSEAlgorithm`'s own values — the
+///    `S_S_E_ALGORITHM_VALUES` catalog is exactly what
+///    `smithy_query(query="shape",shape="SSEAlgorithm")` reports;
+/// 2. `KmsKeyArn` belongs to the KMS algorithm alone. It is "the ARN of the KMS key
+///    used for encryption when using customer-managed keys", and `AES256` is S3
+///    managed encryption, which takes no key — so a request that names `AES256` AND a
+///    key cannot be served as asked. A request that names `aws:kms` and NO key is
+///    accepted: the member is modelled optional and its documentation ties it to
+///    customer-managed keys, so omitting it is "encrypt with KMS under the Amazon Web
+///    Services managed key", not an incomplete request.
+///
+/// `RoleArn` and `KmsKeyArn` are not read beyond that. Both target `ResourceArn`,
+/// whose modelled `@pattern` the centralized walk already enforces, and this operation
+/// RESOLVES neither — it stores both verbatim and reports them back — so there is
+/// nothing here that could tell a role this emulator would assume from one it would
+/// not. A service that does resolve a caller-supplied role before writing reads it
+/// through `service_common::iam_role` instead of judging the text.
+///
+/// Every operation that stores or updates an integration applies this one function,
+/// rendering the refusal as its own modelled `ValidationException`.
+pub fn s3_table_integration_rejection(encryption: &Encryption, role_arn: &str) -> Option<String> {
+    let _ = role_arn;
+    enum_rejection(
+        "Encryption.SseAlgorithm",
+        Some(encryption.sse_algorithm.as_str()),
+        S_S_E_ALGORITHM_VALUES,
+    )
+    .or_else(|| {
+        encryption.kms_key_arn.as_deref()?;
+        (encryption.sse_algorithm != SSE_ALGORITHM_KMS).then(|| {
+            format!(
+                "Encryption.KmsKeyArn is only valid with Encryption.SseAlgorithm \
+                 '{SSE_ALGORITHM_KMS}', got '{}'",
+                encryption.sse_algorithm
+            )
+        })
+    })
 }
 
 /// The ARN of the organization centralization rule `name` created in `region`.

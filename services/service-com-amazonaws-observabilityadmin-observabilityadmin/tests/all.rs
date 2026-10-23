@@ -14,6 +14,9 @@
 #[path = "all/centralization_rules.rs"]
 mod centralization_rules;
 
+#[path = "all/s3_table_integrations.rs"]
+mod s3_table_integrations;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
