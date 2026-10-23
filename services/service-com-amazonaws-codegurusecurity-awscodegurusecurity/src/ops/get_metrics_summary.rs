@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMetricsSummary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMetricsSummary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMetricsSummary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Aggregates the account's stored findings into the one-day metrics summary, reading
+//! the SAME findings store `GetFindings` and `BatchGetFindings` page. Reporting only,
+//! apart from materialising the run-state transitions the clock already owes
+//! (`state::settle_due_runs`), exactly as the other readers of this store do.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +124,84 @@ impl<Eng> GetMetricsSummary<Eng> {
     }
 }
 
+/// How many finding categories the summary reports: "the top 5 finding categories with
+/// the most findings" (`MetricsSummary$categoriesWithMostFindings`), which the modelled
+/// `CategoriesWithMostFindings` list also bounds (`length: max 5`).
+pub const CATEGORIES_WITH_MOST_FINDINGS: usize = 5;
+
+/// How many scans each scan ranking reports: "the top 3 scans with the most number of
+/// open findings" (`MetricsSummary$scansWithMostOpenFindings`), which the modelled
+/// `ScansWithMostOpenFindings` / `ScansWithMostOpenCriticalFindings` lists also bound
+/// (`length: max 3`).
+pub const SCANS_WITH_MOST_OPEN_FINDINGS: usize = 3;
+
+/// The open-finding counts of one day, accumulated over the findings store.
+#[derive(Debug, Default)]
+struct OpenFindingMetrics {
+    /// One count per `Severity` value, keyed by the value as the model spells it. A
+    /// finding whose severity is absent or is not a modelled value lands in no bucket,
+    /// so it is counted per scan and per category but under no severity.
+    per_severity: std::collections::BTreeMap<&'static str, i64>,
+    /// Open findings per category: "A finding category is determined by the detector
+    /// that detected the finding" (`CategoryWithFindingNum$categoryName`), so the key
+    /// is the finding's `detectorName`. A finding that records none belongs to no
+    /// category.
+    per_category: std::collections::BTreeMap<String, i64>,
+    /// Open findings per scan, keyed by the `scanName` the finding is stored under.
+    per_scan: std::collections::BTreeMap<String, i64>,
+    /// Open findings of `Critical` severity per scan.
+    critical_per_scan: std::collections::BTreeMap<String, i64>,
+}
+
+/// The bucket of `FindingMetricsValuePerSeverity` a finding's `severity` is counted in,
+/// or `None` when the finding records no modelled severity.
+fn severity_bucket(severity: Option<&str>) -> Option<&'static str> {
+    match severity? {
+        crate::state::SEVERITY_INFO => Some(crate::state::SEVERITY_INFO),
+        crate::state::SEVERITY_LOW => Some(crate::state::SEVERITY_LOW),
+        crate::state::SEVERITY_MEDIUM => Some(crate::state::SEVERITY_MEDIUM),
+        crate::state::SEVERITY_HIGH => Some(crate::state::SEVERITY_HIGH),
+        crate::state::SEVERITY_CRITICAL => Some(crate::state::SEVERITY_CRITICAL),
+        _ => None,
+    }
+}
+
+/// `FindingMetricsValuePerSeverity` for `counts`: every severity is reported, and a
+/// severity nothing was counted for reports `0` rather than being left absent — zero
+/// open findings of a severity is a measurement, not a missing one.
+fn per_severity_value(
+    counts: &std::collections::BTreeMap<&'static str, i64>,
+) -> FindingMetricsValuePerSeverity {
+    let count_of = |severity: &'static str| Some(counts.get(severity).copied().unwrap_or(0) as f64);
+    FindingMetricsValuePerSeverity {
+        info: count_of(crate::state::SEVERITY_INFO),
+        low: count_of(crate::state::SEVERITY_LOW),
+        medium: count_of(crate::state::SEVERITY_MEDIUM),
+        high: count_of(crate::state::SEVERITY_HIGH),
+        critical: count_of(crate::state::SEVERITY_CRITICAL),
+    }
+}
+
+/// The `limit` highest counts of `counts`, most findings first.
+///
+/// Only a name with findings is ranked: a scan or a category with no open finding is
+/// not one of those "with the most". Equal counts are ordered by name, so two reads of
+/// one store report one order (the model names no tie-break, and a reporting operation
+/// must answer the same question the same way).
+fn top_counts(
+    counts: &std::collections::BTreeMap<String, i64>,
+    limit: usize,
+) -> Vec<(String, i32)> {
+    let mut ranked: Vec<(&String, &i64)> =
+        counts.iter().filter(|(_, count)| **count > 0).collect();
+    ranked.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+    ranked.truncate(limit);
+    ranked
+        .into_iter()
+        .map(|(name, count)| (name.clone(), i32::try_from(*count).unwrap_or(i32::MAX)))
+        .collect()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for GetMetricsSummary<Eng>
 {
@@ -145,18 +219,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMetricsSummary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMetricsSummaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Request metadata cannot change what an account-wide summary reports.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetMetricsSummaryErrorModeled::InternalServerException(
+                InternalServerException {
+                    error: Some("state unavailable".to_string()),
+                    message: Some(
+                        "the CodeGuru Security store is not reachable from this engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "The date you want to retrieve summary metrics from, rounded to the nearest
+        // day" (`GetMetricsSummaryRequest$date`): the summary is a whole-day bucket, so
+        // the requested instant selects the UTC day it falls in, and the metrics are
+        // those of the account AS OF the end of that day ("A summary of metrics for an
+        // account as of a specified date", `MetricsSummary`). The reported `date` is
+        // that day, not the instant the request happened to name.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMetricsSummary"))
+        // The date is NOT range-checked: the model's "must be within the past two
+        // years" describes the window CodeGuru Security keeps metrics for, and the
+        // service answers 200 for a date outside it — an older date simply precedes
+        // every finding the account has, so its counts are zero.
+        let requested_millis = crate::state::from_timestamp(&input.date);
+        let day_start_millis = crate::state::start_of_utc_day_millis(requested_millis);
+        let as_of_millis = crate::state::end_of_utc_day_millis(requested_millis);
+
+        let mut store = state.lock();
+        // The only write: the run transitions the clock had already made due, which
+        // every reader of this store materialises so a run is reported in the state it
+        // was owed even if nobody polled when it fell due.
+        store.settle_due_runs(crate::state::now_millis());
+
+        let mut metrics = OpenFindingMetrics::default();
+        for ((scan_name, _finding_id), finding) in &store.findings {
+            // A finding created after the day asked about did not exist as of that
+            // date, so it is not in this summary. A finding that records no creation
+            // instant cannot be placed after the date, so it counts.
+            let created_at_millis = finding.created_at.as_ref().map(crate::state::from_timestamp);
+            if created_at_millis.is_some_and(|created| created > as_of_millis) {
+                continue;
+            }
+            // "The number of open findings of each severity"
+            // (`MetricsSummary$openFindings`) — a closed finding is in none of these
+            // metrics. Only a finding's current status is stored, so that is the status
+            // the summary reads.
+            if finding.status.as_deref() != Some(crate::state::STATUS_OPEN) {
+                continue;
+            }
+
+            *metrics.per_scan.entry(scan_name.clone()).or_insert(0) += 1;
+            if let Some(severity) = severity_bucket(finding.severity.as_deref()) {
+                *metrics.per_severity.entry(severity).or_insert(0) += 1;
+                if severity == crate::state::SEVERITY_CRITICAL {
+                    *metrics
+                        .critical_per_scan
+                        .entry(scan_name.clone())
+                        .or_insert(0) += 1;
+                }
+            }
+            if let Some(category) = finding.detector_name.as_deref() {
+                *metrics
+                    .per_category
+                    .entry(category.to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+
+        let categories = top_counts(&metrics.per_category, CATEGORIES_WITH_MOST_FINDINGS)
+            .into_iter()
+            .map(|(category_name, finding_number)| CategoryWithFindingNum {
+                category_name: Some(category_name),
+                finding_number: Some(finding_number),
+            })
+            .collect();
+        let scan_ranking = |counts: &std::collections::BTreeMap<String, i64>| {
+            top_counts(counts, SCANS_WITH_MOST_OPEN_FINDINGS)
+                .into_iter()
+                .map(|(scan_name, finding_number)| ScanNameWithFindingNum {
+                    scan_name: Some(scan_name),
+                    finding_number: Some(finding_number),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        Ok(GetMetricsSummaryOutput {
+            metrics_summary: Some(MetricsSummary {
+                date: Some(crate::state::to_timestamp(day_start_millis)),
+                open_findings: Some(per_severity_value(&metrics.per_severity)),
+                categories_with_most_findings: Some(categories),
+                scans_with_most_open_findings: Some(scan_ranking(&metrics.per_scan)),
+                scans_with_most_open_critical_findings: Some(scan_ranking(
+                    &metrics.critical_per_scan,
+                )),
+            }),
+        })
     }
 }
