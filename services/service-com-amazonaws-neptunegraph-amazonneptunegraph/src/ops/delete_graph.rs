@@ -206,10 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        // `skipSnapshot` is required and is honoured by not taking one: this slice of
-        // the emulator implements no snapshots, and `CreateGraphSnapshot` (still
-        // scaffolded) owns that behaviour, so a `skipSnapshot=false` delete is refused
-        // rather than silently losing the final snapshot the caller asked for.
+        // `skipSnapshot` is required and is honoured by not taking one. A
+        // `skipSnapshot=false` delete asks for a FINAL snapshot, whose name the
+        // request does not carry and whose generated name is not a rule this emulator
+        // can ground, so it is refused rather than silently losing the snapshot the
+        // caller asked for. `CreateGraphSnapshot` (implemented) owns an explicitly
+        // named snapshot.
         if !input.skip_snapshot {
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "DeleteGraph with skipSnapshot=false (a final snapshot)",

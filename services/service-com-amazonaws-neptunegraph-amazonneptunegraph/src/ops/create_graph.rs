@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let region = request_region(ctx);
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
 
         // Nothing caller-sized reaches the store unchecked — the bound on what one
@@ -317,42 +317,12 @@ const DEFAULT_REPLICA_COUNT: i32 = 1;
 /// engine cannot compile its leading negative lookahead.
 const GRAPH_NAME_PATTERN: &str = "^(?!g-)[a-z][a-z0-9]*(-[a-z0-9]+)*$";
 
-/// The region this request was signed for — the region that names the graph's ARN and
-/// endpoint. Falls back to the emulator-wide default region when the request carries no
-/// SigV4 credential scope (request authentication may be off).
-fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
-    emulator_server::sigv4_credential_scope(&ctx.parts().headers)
-        .map_or_else(|| "us-east-1".to_string(), |scope| scope.region)
-}
-
 /// Whether `name` satisfies the modelled `GraphName` pattern
-/// `^(?!g-)[a-z][a-z0-9]*(-[a-z0-9]+)*$`, read literally: no `g-` prefix, a lowercase
-/// letter first, then lowercase letters, digits and single interior hyphens, and no
-/// trailing hyphen.
+/// `^(?!g-)[a-z][a-z0-9]*(-[a-z0-9]+)*$`: the shared resource-name rule in
+/// `crate::state`, with `g-` as the prefix this name may not take (`SnapshotName`
+/// spells the same expression against `gs-`).
 fn graph_name_is_well_formed(name: &str) -> bool {
-    if name.starts_with("g-") {
-        return false;
-    }
-    let mut chars = name.chars();
-    if !chars.next().is_some_and(|c| c.is_ascii_lowercase()) {
-        return false;
-    }
-    let mut after_hyphen = false;
-    for c in chars {
-        if c == '-' {
-            // `(-[a-z0-9]+)*` requires at least one alphanumeric between hyphens.
-            if after_hyphen {
-                return false;
-            }
-            after_hyphen = true;
-        } else if c.is_ascii_lowercase() || c.is_ascii_digit() {
-            after_hyphen = false;
-        } else {
-            return false;
-        }
-    }
-    // A trailing hyphen would leave the last group empty.
-    !after_hyphen
+    crate::state::resource_name_is_well_formed(name, "g-")
 }
 
 #[cfg(test)]
