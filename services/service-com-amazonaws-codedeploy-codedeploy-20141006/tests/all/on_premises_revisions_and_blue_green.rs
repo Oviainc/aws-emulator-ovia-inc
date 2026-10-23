@@ -1333,6 +1333,23 @@ async fn skipping_the_termination_wait_is_refused_where_it_does_not_apply() {
         "case {malformed:?}: expected InvalidDeploymentIdException, got {code}"
     );
 
+    // An id outside CodeDeploy's `d-` + uppercase-alphanumeric format is refused
+    // for its FORMAT, before the deployment is looked up: that is what
+    // `InvalidDeploymentIdException` ("At least one of the deployment IDs was
+    // specified in an invalid format") distinguishes from an unknown id, and every
+    // operation of this service taking a deployment id shares that one check.
+    let code = emulator
+        .refused(
+            "malformed deploymentId",
+            "SkipWaitTimeForInstanceTermination",
+            json!({"deploymentId": "not-a-deployment-id"}),
+        )
+        .await;
+    assert_eq!(
+        code, "InvalidDeploymentIdException",
+        "case malformed deploymentId: expected InvalidDeploymentIdException, got {code}"
+    );
+
     // An in-place deployment has no original environment to terminate. The call
     // is made straight after the deployment is created, while it is still
     // running.

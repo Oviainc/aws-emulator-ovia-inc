@@ -1106,6 +1106,36 @@ async fn a_deployment_needs_an_application_a_group_and_a_revision() {
             "case {unknown}: expected DeploymentDoesNotExistException, got {status} {body:?}"
         );
     }
+
+    // An id that is not in CodeDeploy's deployment-id format at all is refused
+    // for its FORMAT, before the deployment is looked up — so a caller can tell
+    // "you asked for something that cannot be a deployment id" from "that
+    // deployment does not exist". Rows differ along how the id leaves the
+    // format: prose, the wrong prefix, the wrong alphabet, nothing after the
+    // prefix.
+    for malformed in [
+        "not-a-deployment-id",
+        "x-ABCDEFGHI",
+        "d-abcdefghi",
+        "d-ABCDEFGH!",
+        "d-",
+    ] {
+        let (status, body) = emulator
+            .call("GetDeployment", json!({"deploymentId": malformed}))
+            .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidDeploymentIdException"),
+            "case {malformed}: expected InvalidDeploymentIdException, got {status} {body:?}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(
+                format!("Specified DeploymentId is not in the valid format: {malformed}").as_str()
+            ),
+            "case {malformed}: expected the clause naming the id, got {body:?}"
+        );
+    }
 }
 
 /// RULE: `ListDeployments` answers the stored deployment ids newest first,

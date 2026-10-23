@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutLifecycleEventHookExecutionStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutLifecycleEventHookExecutionStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutLifecycleEventHookExecutionStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the result a Lambda validation function reports for one of a deployment's
+//! lifecycle event hooks. This is the ONLY file to touch for this operation.
+//!
+//! The deployment is addressed by its id, the hook execution by the execution id the
+//! lifecycle event carried, and the reported result is persisted on that deployment:
+//! a `Failed` result fails the deployment the hook was validating.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +170,233 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutLifecycleEventHookExecutionStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutLifecycleEventHookExecutionStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutLifecycleEventHookExecutionStatus"))
+        let _ = ctx;
+        // `deploymentId` carries neither `@required` nor a modelled length, so an
+        // absent or blank one reaches the handler and is what
+        // `DeploymentIdRequiredException` is for. Anything that is not in
+        // CodeDeploy's deployment-id format is refused BEFORE the deployment is
+        // looked for, so a malformed id is never reported as merely unknown.
+        let deployment_id = input.deployment_id.unwrap_or_default();
+        if deployment_id.trim().is_empty() {
+            return Err(
+                PutLifecycleEventHookExecutionStatusErrorModeled::DeploymentIdRequiredException(
+                    DeploymentIdRequiredException {
+                        message: Some("The deployment ID was not specified".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        if !crate::state::deployment_id_is_well_formed(&deployment_id) {
+            return Err(
+                PutLifecycleEventHookExecutionStatusErrorModeled::InvalidDeploymentIdException(
+                    InvalidDeploymentIdException {
+                        message: Some(crate::state::malformed_deployment_id_message(
+                            &deployment_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let status = input.status.unwrap_or_default();
+        let hook_execution_id = input.lifecycle_event_hook_execution_id.unwrap_or_default();
+
+        let outcome = crate::state::with_state(&*self.engine, |state| {
+            let Some(deployment) = state.deployments.get(&deployment_id) else {
+                return Err(
+                    PutLifecycleEventHookExecutionStatusErrorModeled::DeploymentDoesNotExistException(
+                        DeploymentDoesNotExistException {
+                            message: Some(format!("No deployment found for ID {deployment_id}")),
+                        },
+                    ),
+                );
+            };
+            // Only a deployment whose lifecycle hooks are Lambda validation
+            // functions has a validation result to report.
+            let Some(hooks) = platform_hooks(&deployment.compute_platform) else {
+                return Err(
+                    PutLifecycleEventHookExecutionStatusErrorModeled::UnsupportedActionForDeploymentTypeException(
+                        UnsupportedActionForDeploymentTypeException {
+                            message: Some(format!(
+                                "A lifecycle event hook execution status can only be reported \
+                                 for a deployment on the Lambda or ECS compute platform; \
+                                 deployment {deployment_id} uses the {} compute platform",
+                                deployment.compute_platform
+                            )),
+                        },
+                    ),
+                );
+            };
+            // A validation function reports a RESULT, so only the two terminal
+            // lifecycle statuses are reportable.
+            if status != crate::state::LIFECYCLE_EVENT_STATUS_SUCCEEDED
+                && status != crate::state::LIFECYCLE_EVENT_STATUS_FAILED
+            {
+                let reported = if status.trim().is_empty() {
+                    "<not specified>"
+                } else {
+                    status.as_str()
+                };
+                return Err(
+                    PutLifecycleEventHookExecutionStatusErrorModeled::InvalidLifecycleEventHookExecutionStatusException(
+                        InvalidLifecycleEventHookExecutionStatusException {
+                            message: Some(format!(
+                                "The lifecycle event hook execution status {reported} is \
+                                 invalid: it should be {} or {}",
+                                crate::state::LIFECYCLE_EVENT_STATUS_SUCCEEDED,
+                                crate::state::LIFECYCLE_EVENT_STATUS_FAILED,
+                            )),
+                        },
+                    ),
+                );
+            }
+            // The execution id is the hook execution's identity, so a request
+            // carrying none names no hook execution at all.
+            if hook_execution_id.trim().is_empty() {
+                return Err(
+                    PutLifecycleEventHookExecutionStatusErrorModeled::InvalidLifecycleEventHookExecutionIdException(
+                        InvalidLifecycleEventHookExecutionIdException {
+                            message: Some(
+                                "The lifecycle event hook execution ID was not specified"
+                                    .to_string(),
+                            ),
+                        },
+                    ),
+                );
+            }
+            // A hook execution that already reported its result cannot report a
+            // second one: its lifecycle event completed with that result. This is
+            // judged on the id the request carried, before anything about how far
+            // the deployment itself has got.
+            let already_reported = deployment
+                .lifecycle_hook_executions
+                .iter()
+                .any(|execution| {
+                    execution.lifecycle_event_hook_execution_id == hook_execution_id
+                });
+            if already_reported {
+                return Err(
+                    PutLifecycleEventHookExecutionStatusErrorModeled::LifecycleEventAlreadyCompletedException(
+                        LifecycleEventAlreadyCompletedException {
+                            message: Some(format!(
+                                "The lifecycle event of deployment {deployment_id} reported by \
+                                 hook execution {hook_execution_id} has already completed"
+                            )),
+                        },
+                    ),
+                );
+            }
+            // A deployment has one hook execution per lifecycle hook its compute
+            // platform runs, so an id past that count names no hook execution of
+            // this deployment. Each accepted report takes the next of those hooks,
+            // in the order the platform runs them.
+            let Some(lifecycle_event_name) = hooks.get(deployment.lifecycle_hook_executions.len())
+            else {
+                return Err(
+                    PutLifecycleEventHookExecutionStatusErrorModeled::InvalidLifecycleEventHookExecutionIdException(
+                        InvalidLifecycleEventHookExecutionIdException {
+                            message: Some(format!(
+                                "The lifecycle event hook execution ID {hook_execution_id} is \
+                                 invalid: deployment {deployment_id} has no further lifecycle \
+                                 event hook executions"
+                            )),
+                        },
+                    ),
+                );
+            };
+            // Every lifecycle event of a deployment that already reached a
+            // terminal status completed with it, so there is no result left to
+            // report against it. `with_state` has brought the record up to the
+            // instants the clock owed it first, so this reads the status a reader
+            // would see at this same instant.
+            if crate::state::deployment_is_terminal(&deployment.status) {
+                return Err(
+                    PutLifecycleEventHookExecutionStatusErrorModeled::LifecycleEventAlreadyCompletedException(
+                        LifecycleEventAlreadyCompletedException {
+                            message: Some(format!(
+                                "The lifecycle events of deployment {deployment_id} have already \
+                                 completed with it"
+                            )),
+                        },
+                    ),
+                );
+            }
+
+            let now_ms = crate::state::now_ms();
+            let lifecycle_event_name = (*lifecycle_event_name).to_string();
+            // Re-borrowed mutably only once every refusal above has been answered,
+            // so a refused request writes nothing. The record was just read under
+            // this same lock, so a store that no longer holds it is a broken
+            // invariant rather than something to report success for.
+            let deployment = state
+                .deployments
+                .get_mut(&deployment_id)
+                .expect("the deployment was read under this same lock");
+            deployment
+                .lifecycle_hook_executions
+                .push(crate::state::LifecycleEventHookExecution {
+                    lifecycle_event_hook_execution_id: hook_execution_id.clone(),
+                    lifecycle_event_name: lifecycle_event_name.clone(),
+                    status: status.clone(),
+                    update_time_ms: now_ms,
+                });
+            // A validation function that reports `Failed` fails the deployment it
+            // was validating, which CodeDeploy reports as a hook execution
+            // failure.
+            if status == crate::state::LIFECYCLE_EVENT_STATUS_FAILED {
+                let _settled = state.settle_deployment(
+                    &deployment_id,
+                    crate::state::DEPLOYMENT_STATUS_FAILED,
+                    Some(ErrorInformation {
+                        code: Some(crate::state::ERROR_CODE_HOOK_EXECUTION_FAILURE.to_string()),
+                        message: Some(format!(
+                            "The {lifecycle_event_name} lifecycle event hook execution \
+                             {hook_execution_id} reported {}",
+                            crate::state::LIFECYCLE_EVENT_STATUS_FAILED
+                        )),
+                    }),
+                    now_ms,
+                );
+                // The record was read and written under this same lock, so the
+                // store cannot have lost it in between.
+                debug_assert!(_settled, "the deployment was read under this same lock");
+            }
+            Ok(hook_execution_id)
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        Ok(PutLifecycleEventHookExecutionStatusOutput {
+            lifecycle_event_hook_execution_id: Some(outcome?),
+        })
+    }
+}
+
+/// The lifecycle hooks a Lambda validation function reports on, per compute
+/// platform, from this operation's own documentation: "For Lambda deployments,
+/// the available lifecycle hooks are BeforeAllowTraffic and AfterAllowTraffic.
+/// For Amazon ECS deployments, the available lifecycle hooks are BeforeInstall,
+/// AfterInstall, AfterAllowTestTraffic, BeforeAllowTraffic, and
+/// AfterAllowTraffic."
+/// (`smithy_query(query="doc",shape="PutLifecycleEventHookExecutionStatus")`).
+///
+/// `None` for every other compute platform: EC2/on-premises lifecycle events are
+/// run by the CodeDeploy agent rather than by a Lambda validation function, which
+/// is what `UnsupportedActionForDeploymentTypeException` answers. How many hooks
+/// a platform has is also how many hook executions one deployment can ever have.
+fn platform_hooks(compute_platform: &str) -> Option<&'static [&'static str]> {
+    match compute_platform {
+        "Lambda" => Some(&["BeforeAllowTraffic", "AfterAllowTraffic"]),
+        "ECS" => Some(&[
+            "BeforeInstall",
+            "AfterInstall",
+            "AfterAllowTestTraffic",
+            "BeforeAllowTraffic",
+            "AfterAllowTraffic",
+        ]),
+        _ => None,
     }
 }

@@ -43,12 +43,27 @@ pub const DEPLOYMENT_STATUS_IN_PROGRESS: &str = "InProgress";
 /// See [`DEPLOYMENT_STATUS_CREATED`].
 pub const DEPLOYMENT_STATUS_SUCCEEDED: &str = "Succeeded";
 /// See [`DEPLOYMENT_STATUS_CREATED`]. The terminal status of a deployment whose
-/// deployment group resolved no target to deploy to; see
-/// [`deployment_target_count`].
+/// deployment group resolved no target to deploy to (see
+/// [`deployment_target_count`]), and the one a deployment reaches when something
+/// that is part of it failed — a lifecycle event hook reporting a failed
+/// validation, say.
 pub const DEPLOYMENT_STATUS_FAILED: &str = "Failed";
 /// See [`DEPLOYMENT_STATUS_CREATED`]: the status a deployment a caller stopped
 /// holds.
 pub const DEPLOYMENT_STATUS_STOPPED: &str = "Stopped";
+
+/// The two `LifecycleEventStatus` values a validation function may report
+/// (`smithy_query(query="shape",shape="LifecycleEventStatus")` carries six:
+/// Pending | InProgress | Succeeded | Failed | Skipped | Unknown — and
+/// `PutLifecycleEventHookExecutionStatus`'s own documentation says "only
+/// Succeeded and Failed can be passed successfully in your API call").
+pub const LIFECYCLE_EVENT_STATUS_SUCCEEDED: &str = "Succeeded";
+/// See [`LIFECYCLE_EVENT_STATUS_SUCCEEDED`].
+pub const LIFECYCLE_EVENT_STATUS_FAILED: &str = "Failed";
+
+/// The `ErrorCode` CodeDeploy reports on a deployment a lifecycle event hook
+/// failed (`smithy_query(query="shape",shape="ErrorCode")`).
+pub const ERROR_CODE_HOOK_EXECUTION_FAILURE: &str = "HOOK_EXECUTION_FAILURE";
 
 /// Whether `status` is one a deployment never leaves.
 ///
@@ -472,6 +487,12 @@ pub struct Deployment {
     pub starts_at_ms: i64,
     /// See [`Deployment::starts_at_ms`].
     pub completes_at_ms: i64,
+    /// Why this deployment failed, when it did, as CodeDeploy reports it on
+    /// `DeploymentInfo.errorInformation`.
+    pub error_information: Option<crate::ops::types::ErrorInformation>,
+    /// The results reported for this deployment's lifecycle event hooks, in the
+    /// order they were reported.
+    pub lifecycle_hook_executions: Vec<LifecycleEventHookExecution>,
     /// How many deployment targets the deployment group resolved for this
     /// deployment, which is what decides its terminal status; see
     /// [`deployment_target_count`] and [`terminal_status`].
@@ -494,6 +515,24 @@ pub struct Deployment {
     /// Whether the termination wait has started, materialised by the clock; see
     /// [`ComAmazonawsCodedeployCodedeploy20141006State::advance_clock`].
     pub instance_termination_wait_time_started: bool,
+}
+
+/// The result a validation function reported for one of a deployment's
+/// lifecycle event hooks, through `PutLifecycleEventHookExecutionStatus`.
+///
+/// The execution id is the hook execution's IDENTITY: CodeDeploy hands it to the
+/// validation function in the lifecycle event, and the function reports back
+/// under it, so a second report under the same id is a second report of the same
+/// lifecycle event.
+#[derive(Debug, Clone)]
+pub struct LifecycleEventHookExecution {
+    pub lifecycle_event_hook_execution_id: String,
+    /// Which of the deployment's lifecycle hooks this execution reported for, in
+    /// the order its compute platform runs them.
+    pub lifecycle_event_name: String,
+    /// A `LifecycleEventStatus`: see [`LIFECYCLE_EVENT_STATUS_SUCCEEDED`].
+    pub status: String,
+    pub update_time_ms: i64,
 }
 
 impl Deployment {
@@ -805,6 +844,32 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
             self.deployments.remove(&oldest);
             self.pending_deployments.retain(|pending| pending != &oldest);
         }
+    }
+
+    /// Settle `deployment_id` in the terminal `status` at `now_ms`, with the
+    /// error information CodeDeploy reports for it, and answer whether the
+    /// deployment was there to settle.
+    ///
+    /// A deployment the clock had not yet started also gets the start it was
+    /// owed, and drops out of the set the clock still owes a transition, so
+    /// nothing can later overwrite the terminal status written here.
+    pub fn settle_deployment(
+        &mut self,
+        deployment_id: &str,
+        status: &str,
+        error_information: Option<crate::ops::types::ErrorInformation>,
+        now_ms: i64,
+    ) -> bool {
+        let Some(deployment) = self.deployments.get_mut(deployment_id) else {
+            return false;
+        };
+        deployment.status = status.to_string();
+        deployment.start_time_ms = Some(deployment.start_time_ms.unwrap_or(now_ms));
+        deployment.complete_time_ms = Some(now_ms);
+        deployment.error_information = error_information;
+        self.pending_deployments
+            .retain(|pending| pending != deployment_id);
+        true
     }
 
     /// The instance `iam_arn` currently backs, if any.
@@ -1507,12 +1572,17 @@ pub fn deployment_info(deployment: &Deployment) -> crate::ops::types::Deployment
 
 /// Why a failed deployment failed, as the modelled `ErrorInformation`.
 ///
-/// DERIVED from the deployment's own record — the terminal status the clock gave
-/// it and the targets its group resolved — rather than stored a second time
-/// where it could disagree with the status beside it.
+/// A failure the service RECORDED on the deployment — a lifecycle event hook
+/// reporting a failed validation, say — is reported as it was recorded; anything
+/// else is DERIVED from the deployment's own record (the terminal status the
+/// clock gave it and the targets its group resolved) rather than stored a second
+/// time where it could disagree with the status beside it.
 fn deployment_error_information(
     deployment: &Deployment,
 ) -> Option<crate::ops::types::ErrorInformation> {
+    if let Some(recorded) = deployment.error_information.clone() {
+        return Some(recorded);
+    }
     (deployment.status == DEPLOYMENT_STATUS_FAILED && deployment.target_count == 0).then(|| {
         crate::ops::types::ErrorInformation {
             code: Some(ERROR_CODE_NO_INSTANCES.to_string()),
