@@ -186,14 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(scenario) = state.bill_scenario(&input.identifier) else {
             return Err(GetBillScenarioErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "No bill scenario found with identifier {}",
-                        input.identifier
-                    ),
-                    resource_id: input.identifier.clone(),
-                    resource_type: "BillScenario".to_string(),
-                },
+                crate::state::bill_scenario_not_found(&input.identifier),
             )
             .into());
         };
