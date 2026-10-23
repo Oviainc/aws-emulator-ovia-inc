@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDeploymentStrategy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDeploymentStrategy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDeploymentStrategy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one deployment strategy: one this account created, or one of AppConfig's
+//! predefined `AppConfig.*` strategies, which are deployable without a
+//! `CreateDeploymentStrategy` call. Reads only — nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -157,20 +152,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDeploymentStrategy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDeploymentStrategyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDeploymentStrategy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDeploymentStrategyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // `resolve_strategy` answers for a strategy this account created and for
+        // AppConfig's predefined ones alike, which is what the member's own pattern
+        // allows this id to name.
+        let Some(strategy) = store.resolve_strategy(&input.deployment_strategy_id) else {
+            return Err(GetDeploymentStrategyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No deployment strategy with id {} exists.",
+                        input.deployment_strategy_id
+                    )),
+                    resource_name: Some(input.deployment_strategy_id),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetDeploymentStrategyOutput {
+            id: Some(strategy.id),
+            name: Some(strategy.name),
+            description: strategy.description,
+            deployment_duration_in_minutes: strategy.deployment_duration_in_minutes,
+            growth_type: Some(strategy.growth_type),
+            growth_factor: Some(strategy.growth_factor),
+            final_bake_time_in_minutes: strategy.final_bake_time_in_minutes,
+            replicate_to: Some(strategy.replicate_to),
+        })
     }
 }
