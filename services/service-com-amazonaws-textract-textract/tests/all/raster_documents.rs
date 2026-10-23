@@ -37,7 +37,7 @@ const PITCH: usize = 12;
 
 /// How a page is drawn. Each knob is one axis the recognition rule must hold along.
 #[derive(Debug, Clone, Copy)]
-struct Paper {
+pub(crate) struct Paper {
     /// Pixels per font pixel: the size the text is rendered at.
     scale: usize,
     /// Blank pixels around the text block.
@@ -54,7 +54,7 @@ struct Paper {
 }
 
 impl Paper {
-    const fn plain() -> Self {
+    pub(crate) const fn plain() -> Self {
         Self {
             scale: 2,
             margin: 6,
@@ -70,7 +70,7 @@ impl Paper {
 ///
 /// `font8x8::legacy::BASIC_LEGACY` is the same public-domain font the recogniser's
 /// templates come from: one byte per row, bit 0 the leftmost pixel.
-fn render(lines: &[&str], paper: Paper) -> GrayImage {
+pub(crate) fn render(lines: &[&str], paper: Paper) -> GrayImage {
     let columns = lines.iter().map(|line| line.chars().count()).max().unwrap_or(0);
     let width = (paper.margin * 2 + columns * CELL * paper.scale).max(1) as u32;
     let height = (paper.margin * 2 + lines.len() * PITCH * paper.scale).max(1) as u32;
@@ -118,7 +118,7 @@ fn encode(page: &GrayImage, format: ImageFormat) -> Vec<u8> {
     out.into_inner()
 }
 
-fn raster_document(page: &GrayImage, format: ImageFormat) -> Value {
+pub(crate) fn raster_document(page: &GrayImage, format: ImageFormat) -> Value {
     json!({ "Bytes": aws_smithy_types::base64::encode(encode(page, format)) })
 }
 
