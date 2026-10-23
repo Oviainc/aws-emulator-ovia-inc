@@ -136,10 +136,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{
-            format_millis, STATE_QUEUED, STATE_QUEUED_DELETED, STATE_RETURNED,
-            RETURN_WINDOW_MILLIS,
-        };
+        use crate::state::{format_millis, STATE_RETURNED, RETURN_WINDOW_MILLIS};
         let now = crate::state::now_millis();
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ReturnSavingsPlanErrorModeled::InternalServerException(InternalServerException {
@@ -178,13 +175,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // A purchase that has not been paid for yet is simply cancelled; a paid
-        // one is returned, and only inside its return window. Anything else has
-        // already left the states a return is accepted from, so a second return
-        // is refused rather than quietly succeeding.
-        if plan.state == STATE_QUEUED {
-            plan.state = STATE_QUEUED_DELETED.to_string();
-        } else if plan.is_returnable(now) {
+        // A return is accepted only from a plan that has STARTED and been paid
+        // for, and only inside its return window. A plan whose term has not
+        // begun (`queued`) is cancelled through `DeleteQueuedSavingsPlan`, not
+        // returned; anything else has already left the states a return is
+        // accepted from, so a second return is refused rather than quietly
+        // succeeding.
+        if plan.is_returnable(now) {
             plan.state = STATE_RETURNED.to_string();
         } else if matches!(
             plan.state.as_str(),
@@ -198,9 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 RETURN_WINDOW_MILLIS
             )));
         } else {
+            // The refusal names the state it refused, so the one sentence
+            // covers every state a return is not accepted from.
             return Err(validation(format!(
-                "Savings Plan '{}' is in state '{}' and cannot be returned",
-                input.savings_plan_id, plan.state
+                "Savings Plans in {} state cannot be returned.",
+                plan.state
             )));
         }
 
