@@ -17,6 +17,8 @@ mod access_entries;
 mod access_entry_listing;
 #[path = "all/access_policy_catalog.rs"]
 mod access_policy_catalog;
+#[path = "all/addon_lifecycle.rs"]
+mod addon_lifecycle;
 #[path = "all/cancel_update.rs"]
 mod cancel_update;
 #[path = "all/capability_lifecycle.rs"]

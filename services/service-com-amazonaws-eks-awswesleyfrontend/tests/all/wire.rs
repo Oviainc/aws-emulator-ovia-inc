@@ -29,6 +29,10 @@ impl Answer {
     pub fn association(&self) -> &serde_json::Value {
         &self.body["association"]
     }
+
+    pub fn addon(&self) -> &serde_json::Value {
+        &self.body["addon"]
+    }
 }
 
 /// The emulator under test: one shared engine, one service, authentication off so a

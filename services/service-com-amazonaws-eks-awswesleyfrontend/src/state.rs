@@ -14,6 +14,11 @@
 //! `platformVersion`) are optional on the record, because a connected cluster
 //! reports none of them — it reports [`ClusterRecord::connector_config`] instead.
 //!
+//! It also holds the add-on slice: `CreateAddon` writes an [`AddonRecord`] here
+//! and `DescribeAddon` reads it back. An add-on lives INSIDE a cluster, so its
+//! key carries the cluster's key and `DeleteCluster` drops the add-ons of the
+//! cluster it removes.
+//!
 //! It also holds the managed-capability slice that hangs off a cluster:
 //! `CreateCapability` writes a [`CapabilityRecord`], and `DescribeCapability`,
 //! `ListCapabilities` and `DeleteCapability` compute their responses from it.
@@ -56,9 +61,9 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AccessConfigResponse, AccessEntry, AccessScope, AssociatedAccessPolicy, Cancellation,
-    Capability, CapabilityConfigurationResponse, CapabilityHealth, CapabilityIssue,
-    CapabilitySummary,
+    AccessConfigResponse, AccessEntry, AccessScope, Addon, AddonHealth,
+    AddonNamespaceConfigResponse, AssociatedAccessPolicy, Cancellation, Capability,
+    CapabilityConfigurationResponse, CapabilityHealth, CapabilityIssue, CapabilitySummary,
     Certificate, Cluster, ClusterVersionInformation, ComputeConfigResponse,
     ConnectorConfigResponse,
     ControlPlaneScalingConfig, EncryptionConfig, Identity, KubeApiServerConfigResponse,
@@ -485,6 +490,18 @@ pub fn parse_iam_principal_arn(arn: &str) -> Option<IamPrincipalArn<'_>> {
 /// record's whole life. It is computed once, when the entry is created, and stored
 /// on the record; no read recomputes it.
 pub fn derive_access_entry_id(seed: &str) -> String {
+    derive_uuid_from_seed(seed)
+}
+
+/// A UUID-shaped identifier derived from `seed`: the first 16 bytes of its
+/// SHA-256, rendered by [`hyphenate_uuid`].
+///
+/// The ONE derivation for every identifier of this service that is UUID-shaped
+/// AND derived from what identifies its resource (an access entry's triple, an
+/// add-on's key), so those identifiers cannot drift apart in how they are built.
+/// An identifier that must be fresh per instance is minted instead (see
+/// [`new_update_id`]).
+fn derive_uuid_from_seed(seed: &str) -> String {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&Sha256::digest(seed.as_bytes())[..16]);
     // The same `8-4-4-4-12` renderer the minted ids use, so every UUID-shaped
@@ -1088,6 +1105,151 @@ impl ClusterRecord {
     }
 }
 
+/// The `AddonStatus` members this slice uses. The model's enum
+/// (`smithy_query query="shape" shape="AddonStatus"`) is
+/// `CREATING | ACTIVE | CREATE_FAILED | UPDATING | DELETING | DELETE_FAILED |
+/// DEGRADED | UPDATE_FAILED`; `Addon$status` carries that enum, and this slice
+/// stores the wire token.
+pub const ADDON_STATUS_CREATING: &str = "CREATING";
+/// See [`ADDON_STATUS_CREATING`].
+///
+/// Deliberately its own constant rather than the cluster slice's
+/// [`STATUS_ACTIVE`]: `AddonStatus` and `ClusterStatus` are different enums that
+/// only happen to share this token (the add-on enum has `DEGRADED` and
+/// `UPDATE_FAILED`, the cluster enum has `PENDING`), so a change to one must not
+/// silently change the other.
+pub const ADDON_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// How long a newly created add-on reports `CREATING` before the clock owes it
+/// `ACTIVE`.
+///
+/// `CreateAddon` publishes no duration for the install, so this span is CHOSEN
+/// rather than cited — the same reasoning as [`CLUSTER_ACTIVATION_DELAY`]: long
+/// enough that a caller which describes the add-on straight after creating it
+/// still observes `CREATING`, short enough to be worth waiting for. The due
+/// instant is stored on the record; nothing sleeps for it.
+pub const ADDON_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The `owner` a created add-on reports.
+///
+/// This emulator installs only Amazon EKS-managed add-ons — it holds no
+/// Marketplace subscription and mints no `marketplaceInformation` — and an
+/// EKS-managed add-on is owned by `aws` and published by `eks`, which is what
+/// `DescribeAddonVersions` reports for them.
+pub const ADDON_OWNER_AWS: &str = "aws";
+/// See [`ADDON_OWNER_AWS`].
+pub const ADDON_PUBLISHER_EKS: &str = "eks";
+
+/// The Kubernetes namespace an add-on is installed into when the request names
+/// none.
+///
+/// `CreateAddon$namespaceConfig` is "The namespace configuration for the addon.
+/// If specified, this will override the DEFAULT namespace for the addon", and an
+/// Amazon EKS-managed add-on's default namespace is `kube-system` — the
+/// namespace the EKS User Guide documents every managed add-on's workloads
+/// (`vpc-cni`, `coredns`, `kube-proxy` and the rest) as running in. The resolved
+/// namespace is stored on the record, so `Addon$namespaceConfig` ("the Kubernetes
+/// namespace where the addon is installed") reports where the add-on actually
+/// went, and the EKS Pod Identity associations the add-on owns are created for
+/// service accounts in that namespace.
+pub const ADDON_DEFAULT_NAMESPACE: &str = "kube-system";
+
+/// The number of add-ons one cluster holds before `CreateAddon` refuses another.
+///
+/// AWS publishes no "add-ons per cluster" quota, so this ceiling is CHOSEN: it
+/// is what bounds the store, since add-on names are caller-supplied and
+/// repeated creates would otherwise let one cluster retain an unbounded number
+/// of records. It is generous next to the handful of add-ons a real cluster
+/// runs, and `MAX_STORED_CLUSTERS` bounds how many clusters can hold that many.
+pub const MAX_ADDONS_PER_CLUSTER: usize = 100;
+
+/// One add-on of one cluster, as this service stores it.
+///
+/// Everything an `Addon` reports is held here — including the server-generated
+/// parts (`addonArn`, `createdAt`, `modifiedAt`, the assigned version and the
+/// ARNs of the EKS Pod Identity associations the add-on owns) — so a later read
+/// returns exactly what `CreateAddon` wrote rather than recomputing anything.
+#[derive(Debug, Clone)]
+pub struct AddonRecord {
+    pub cluster_name: String,
+    pub addon_name: String,
+    pub arn: String,
+    pub addon_version: String,
+    pub status: String,
+    pub created_at: SystemTime,
+    pub modified_at: SystemTime,
+    /// When set, the instant at which the clock owes this add-on the move from
+    /// `CREATING` to `ACTIVE`. Cleared once the move is materialised.
+    pub active_at: Option<SystemTime>,
+    pub service_account_role_arn: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    pub configuration_values: Option<String>,
+    /// The ARNs of the EKS Pod Identity associations this add-on owns — the
+    /// associations `CreateAddon` created for the `podIdentityAssociations` the
+    /// request asked for, each one a record of its own in
+    /// [`ComAmazonawsEksAwswesleyfrontendState::pod_identity_associations`]
+    /// carrying this add-on's ARN as its `ownerArn`.
+    pub pod_identity_association_arns: Vec<String>,
+    /// The Kubernetes namespace this add-on is installed into: the one the
+    /// request's `namespaceConfig` named, or [`ADDON_DEFAULT_NAMESPACE`].
+    pub namespace: String,
+    pub publisher: String,
+    pub owner: String,
+    pub client_request_token: Option<String>,
+}
+
+impl AddonRecord {
+    /// Materialise the status move the clock already owes at `now`.
+    ///
+    /// As on [`ClusterRecord::materialize_due_transitions`], the move was due at
+    /// `active_at` whether or not anybody called, so applying it on read does
+    /// not change what a later caller sees.
+    pub fn materialize_due_transitions(&mut self, now: SystemTime) {
+        if self.active_at.is_some_and(|due| now >= due) {
+            self.status = ADDON_STATUS_ACTIVE.to_string();
+            self.active_at = None;
+        }
+    }
+
+    /// This record as the modelled `Addon` shape.
+    pub fn to_addon(&self) -> Addon {
+        Addon {
+            addon_name: Some(self.addon_name.clone()),
+            cluster_name: Some(self.cluster_name.clone()),
+            status: Some(self.status.clone()),
+            addon_version: Some(self.addon_version.clone()),
+            // The add-on runs nowhere in this emulator, so nothing can go wrong
+            // with it: the health object is reported with an EMPTY issue list,
+            // which is what a healthy add-on reports, rather than left unset.
+            health: Some(AddonHealth {
+                issues: Some(Vec::new()),
+            }),
+            addon_arn: Some(self.arn.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            service_account_role_arn: self.service_account_role_arn.clone(),
+            tags: Some(
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            publisher: Some(self.publisher.clone()),
+            owner: Some(self.owner.clone()),
+            configuration_values: self.configuration_values.clone(),
+            pod_identity_associations: (!self.pod_identity_association_arns.is_empty())
+                .then(|| self.pod_identity_association_arns.clone()),
+            namespace_config: Some(AddonNamespaceConfigResponse {
+                namespace: Some(self.namespace.clone()),
+            }),
+            // Left unset: `marketplaceInformation` describes an add-on bought
+            // through the Amazon Web Services Marketplace, and this emulator
+            // installs only EKS-managed add-ons ([`ADDON_OWNER_AWS`]).
+            marketplace_information: None,
+        }
+    }
+}
+
 /// One managed capability of one cluster, as this service stores it.
 ///
 /// Everything a [`Capability`] reports is held here — including the
@@ -1369,6 +1531,12 @@ pub struct PodIdentityAssociationRecord {
     /// retry only of the call that sent it, so reusing a create's token on an
     /// update can never swallow the update's change.
     pub update_request_token: Option<String>,
+    /// The ARN of the Amazon EKS add-on that owns this association, when an
+    /// add-on created it: "If defined, the EKS Pod Identity association is owned
+    /// by an Amazon EKS add-on" (`PodIdentityAssociation$ownerArn`). An
+    /// association created through `CreatePodIdentityAssociation` is owned by the
+    /// caller and carries none.
+    pub owner_arn: Option<String>,
 }
 
 impl PodIdentityAssociationRecord {
@@ -1391,8 +1559,9 @@ impl PodIdentityAssociationRecord {
             modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
             // "If defined, the EKS Pod Identity association is owned by an Amazon
             // EKS add-on" — an association created through this API is owned by
-            // the caller, so it reports no owner.
-            owner_arn: None,
+            // the caller, so it reports no owner; one an add-on created carries
+            // that add-on's ARN.
+            owner_arn: self.owner_arn.clone(),
             disable_session_tags: self.disable_session_tags,
             target_role_arn: self.target_role_arn.clone(),
             external_id: self.external_id.clone(),
@@ -1416,7 +1585,7 @@ impl PodIdentityAssociationRecord {
             association_arn: Some(self.association_arn.clone()),
             association_id: Some(self.association_id.clone()),
             // As on the full association: only an Amazon EKS add-on owns one.
-            owner_arn: None,
+            owner_arn: self.owner_arn.clone(),
         }
     }
 }
@@ -1597,6 +1766,20 @@ pub fn derive_association_id(seed: &str) -> String {
     format!("{ASSOCIATION_ID_PREFIX}{body}")
 }
 
+/// An EKS Pod Identity association's ARN, in the form EKS publishes:
+/// `arn:aws:eks:<region>:<account>:podidentityassociation/<cluster>/<association id>`.
+///
+/// The ONE place this layout is written, so the handler that creates an
+/// association directly and the one that creates associations for an add-on
+/// cannot drift apart.
+pub fn derive_association_arn(region: &str, cluster_name: &str, association_id: &str) -> String {
+    ::engine::emulator_arn(
+        "eks",
+        region,
+        &format!("podidentityassociation/{cluster_name}/{association_id}"),
+    )
+}
+
 /// The `externalId` an association that names a `targetRoleArn` carries.
 ///
 /// Derived from the association's own ARN — which already carries the account,
@@ -1698,6 +1881,20 @@ pub struct ComAmazonawsEksAwswesleyfrontendState {
     /// call name a cluster in any region. It holds exactly one entry per stored
     /// cluster, so [`MAX_STORED_CLUSTERS`] bounds it too.
     pub arn_index: BTreeMap<String, (String, String)>,
+    /// Add-ons by `(region, cluster name, add-on name)`.
+    ///
+    /// An add-on is a resource INSIDE one cluster — `CreateAddon`'s `clusterName`
+    /// is an `@httpLabel` on `/clusters/{clusterName}/addons` and one add-on name
+    /// installs at most once per cluster — so the key is the cluster's own
+    /// `(region, name)` key plus the add-on name. A `BTreeMap` so a listing walks
+    /// one cluster's add-ons in a stable, sorted order. Its size is bounded by
+    /// [`MAX_ADDONS_PER_CLUSTER`] per cluster, which `CreateAddon` enforces,
+    /// times the [`MAX_STORED_CLUSTERS`] clusters the store holds.
+    ///
+    /// Add-on ARNs are deliberately NOT in [`Self::arn_index`]: that index is
+    /// what the tag operations resolve a CLUSTER from, and tagging an add-on
+    /// through its own ARN is the tag slice's own gap, not this one's.
+    pub addons: BTreeMap<(String, String, String), AddonRecord>,
     /// Managed capabilities by `(region, cluster name, capability name)`.
     ///
     /// A capability name is unique within its CLUSTER ("The name must be unique
@@ -1750,6 +1947,7 @@ impl Default for ComAmazonawsEksAwswesleyfrontendState {
         Self {
             clusters: BTreeMap::new(),
             arn_index: BTreeMap::new(),
+            addons: BTreeMap::new(),
             capabilities: BTreeMap::new(),
             pod_identity_associations: BTreeMap::new(),
             minted_associations: 0,
@@ -1776,9 +1974,41 @@ impl ComAmazonawsEksAwswesleyfrontendState {
         for cluster in self.clusters.values_mut() {
             cluster.materialize_due_transitions(now);
         }
+        for addon in self.addons.values_mut() {
+            addon.materialize_due_transitions(now);
+        }
         for capability in self.capabilities.values_mut() {
             capability.materialize_due_transitions(now);
         }
+    }
+
+    /// The names of the add-ons installed on one cluster, in sorted order.
+    ///
+    /// The map is keyed `(region, cluster, addon)`, so its iteration order
+    /// already sorts each cluster's add-on names; this only drops the other
+    /// clusters.
+    pub fn addon_names_in<'a>(
+        &'a self,
+        region: &'a str,
+        cluster_name: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.addons
+            .keys()
+            .filter(move |(key_region, key_cluster, _)| {
+                key_region == region && key_cluster == cluster_name
+            })
+            .map(|(_, _, addon_name)| addon_name.as_str())
+    }
+
+    /// Drop every add-on installed on one cluster.
+    ///
+    /// An add-on only exists inside its cluster, so whatever removes the cluster
+    /// removes its add-ons with it — otherwise a cluster created again under the
+    /// same name would inherit the add-ons of the one that is gone.
+    pub fn remove_cluster_addons(&mut self, region: &str, cluster_name: &str) {
+        self.addons.retain(|(key_region, key_cluster, _), _| {
+            key_region != region || key_cluster != cluster_name
+        });
     }
 
     /// The next value to mix into a minted update id, counted from this store's
@@ -2097,6 +2327,90 @@ pub fn derive_certificate_authority_data(subject: &str) -> String {
          -----END CERTIFICATE-----\n"
     );
     ::aws_smithy_types::base64::encode(placeholder)
+}
+
+/// The identifier EKS puts in the last segment of an add-on's ARN
+/// (`arn:aws:eks:<region>:<account>:addon/<cluster>/<add-on>/<id>`), in the
+/// 8-4-4-4-12 hex form AWS prints it in ([`hyphenate_uuid`], the one renderer
+/// for this service's UUID-shaped identifiers).
+///
+/// Derived from the add-on's own key — region, cluster and add-on name — so it
+/// is distinct per add-on and stable for the record's whole life. It is computed
+/// once, when the add-on is created, and stored on the record; no read
+/// recomputes it.
+pub fn derive_addon_resource_id(region: &str, cluster_name: &str, addon_name: &str) -> String {
+    derive_uuid_from_seed(&format!("{region}/{cluster_name}/{addon_name}"))
+}
+
+/// The add-on's ARN, in the form EKS publishes:
+/// `arn:aws:eks:<region>:<account>:addon/<cluster>/<add-on>/<resource id>`.
+pub fn derive_addon_arn(
+    region: &str,
+    cluster_name: &str,
+    addon_name: &str,
+    resource_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        "eks",
+        region,
+        &format!("addon/{cluster_name}/{addon_name}/{resource_id}"),
+    )
+}
+
+/// The version `CreateAddon` assigns when the caller names none.
+///
+/// "The version of the add-on. The version must match one of the versions
+/// returned by `DescribeAddonVersions`" (`CreateAddon$addonVersion`) — and when
+/// the member is absent the real service installs the default version for the
+/// cluster's Kubernetes version. `DescribeAddonVersions` is still a scaffold in
+/// this emulator (its own gap issue,
+/// `issues/.../eks-describeaddonversions-stub.md`), so there is no catalog to
+/// pick that version from: this builds a version in the `vX.Y.Z-eksbuild.N` form
+/// every EKS add-on version takes, out of the cluster's own Kubernetes version,
+/// so a cluster on one Kubernetes version always reports the same default and
+/// the value a caller reads back is the one the record was created with.
+///
+/// It is a CHOSEN default, not a real one: a real add-on's version tracks the
+/// ADD-ON, not the control plane (`vpc-cni` on a 1.31 cluster is a `v1.19.x`
+/// build), and nothing here can know it. When the version catalog lands, the
+/// default must come from it and this function must go, so the two cannot
+/// disagree.
+pub fn derive_default_addon_version(kubernetes_version: &str) -> String {
+    let mut parts = kubernetes_version
+        .split('.')
+        .filter(|part| !part.is_empty());
+    let major = parts.next().unwrap_or("1");
+    let minor = parts.next().unwrap_or("0");
+    let patch = parts.next().unwrap_or("0");
+    format!("v{major}.{minor}.{patch}-eksbuild.1")
+}
+
+/// Whether `name` has the FORM an Amazon EKS add-on name takes: a non-empty
+/// string of ASCII alphanumerics, `-`, `.` and `_`.
+///
+/// `CreateAddon$addonName` targets a plain `String` with no `length` or
+/// `pattern` trait (`smithy_query query="operation" operation="CreateAddon"`),
+/// so the boundary validator accepts anything — including the empty string —
+/// and this is the check that refuses a value no add-on name can be. It is a
+/// FORM check, not a catalog check: "the name must match one of the names
+/// returned by `DescribeAddonVersions`", and that operation is still a scaffold
+/// here (its own gap issue), so this emulator holds no catalog to match
+/// against, and a hand-written subset of it would refuse add-ons the real
+/// service accepts. The character set is the one every published add-on name
+/// uses, EKS-managed (`vpc-cni`) and Marketplace (`<publisher>_<product>`)
+/// alike.
+///
+/// The LENGTH ceiling is [`MAX_KUBERNETES_NAME_LEN`], the DNS-1123 subdomain
+/// limit this module already bounds Kubernetes names by: an add-on name names
+/// the Kubernetes workloads the add-on installs, it becomes part of this store's
+/// key and of the add-on's ARN, and no published add-on name comes near it — so
+/// a name past it names no add-on the real service would accept either.
+pub fn is_addon_name_shaped(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= MAX_KUBERNETES_NAME_LEN
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
 }
 
 /// The digest one registration's server-generated values are derived from.
