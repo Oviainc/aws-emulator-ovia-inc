@@ -1360,6 +1360,10 @@ pub const MAX_LIST_PAGE_SIZE: usize = 50;
 /// by another listing cannot resume this one. See [`paginate`].
 pub const LISTING_CONFIGURATION_PROFILES: &str = "ListConfigurationProfiles";
 
+/// The `kind` a `ListEnvironments` cursor is stamped with, so a token minted by another
+/// listing cannot resume this one. See [`paginate`].
+pub const LISTING_ENVIRONMENTS: &str = "ListEnvironments";
+
 /// One page of a list operation: the items on it, and the token that resumes the walk
 /// after them (`None` on the last page).
 #[derive(Debug)]
