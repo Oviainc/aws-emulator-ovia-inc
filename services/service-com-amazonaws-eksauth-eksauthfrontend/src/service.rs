@@ -40,10 +40,140 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The error shape every input-constraint refusal of this service is stated as.
+///
+/// From the model (`smithy_query(query="operation",
+/// operation="AssumeRoleForPodIdentity")`): the operation's errors are
+/// `AccessDeniedException`, `ExpiredTokenException`, `InternalServerException`,
+/// `InvalidParameterException` (400), `InvalidRequestException`, `InvalidTokenException`,
+/// `ResourceNotFoundException`, `ServiceUnavailableException` and `ThrottlingException`.
+/// There is no `ValidationException`, so the framework's default code — and
+/// `service_common::validation_message::aws_validation_refusal`, which words a refusal for
+/// the services that DO model it — names a shape no client of this service can
+/// deserialize. That is why this file words the refusal itself rather than delegating the
+/// whole body to that helper.
+const INVALID_PARAMETER: &str = "InvalidParameterException";
+
+/// The input members this service's model marks `@sensitive`, as dotted validation
+/// paths.
+///
+/// From `smithy_query(query="shape", shape="AssumeRoleForPodIdentityRequest")`: `token`
+/// targets `JwtToken`, which carries `@sensitive`; no other input member or target does.
+/// A refusal naming one of these states the constraint it broke WITHOUT the value, the
+/// way the service does — an error body is logged by whoever reads it, and the value
+/// here is a credential.
+const SENSITIVE_INPUT_PATHS: &[&str] = &["token"];
+
+/// How this service states one constraint violation.
+///
+/// The clause is the framework's own ([`Violation::message`]), so the envelope's member
+/// paths and every requirement have one source and cannot drift per service. Two things
+/// are chosen here, and both are what `services/common/src/validation.rs` names as the
+/// per-service halves of this rendering:
+///
+/// * a `@pattern` requirement states the expression UNANCHORED ([`unanchored`]). A
+///   constraint pattern applies to the whole value by definition, so the `^`/`$` the
+///   model wraps it in state nothing the clause does not already say, and this service's
+///   recorded answer for a member modelled
+///   `^[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+$` is the expression between
+///   them;
+/// * a `@sensitive` member's value is WITHHELD: the clause is rendered from a violation
+///   carrying no value at all, so no part of the value can reach the message whatever the
+///   value contains, and the framework's "Value null at '<member>'" — which would state a
+///   null the request did not send — becomes "Value at '<member>'". An absent member has
+///   no value to withhold and keeps the framework's own wording.
+fn stated(violation: &Violation) -> String {
+    let withheld = violation.value.is_some() && is_sensitive(&violation.path);
+    let restated = Violation {
+        path: violation.path.clone(),
+        kind: match &violation.kind {
+            ViolationKind::Pattern(pattern) => ViolationKind::Pattern(unanchored(pattern)),
+            other => other.clone(),
+        },
+        value: if withheld {
+            None
+        } else {
+            violation.value.clone()
+        },
+    };
+    let clause = restated.message();
+    if !withheld {
+        return clause;
+    }
+    match clause.strip_prefix(VALUE_NULL_AT) {
+        Some(rest) => format!("{VALUE_AT}{rest}"),
+        // The framework worded a value-less clause some other way; it cannot carry the
+        // withheld value (none was attached), so it stands as it is.
+        None => clause,
+    }
+}
+
+/// How the framework opens a clause whose violation carries no value, and how this
+/// service opens one whose value it withheld.
+const VALUE_NULL_AT: &str = "Value null at '";
+const VALUE_AT: &str = "Value at '";
+
+/// `regex` with the pair of whole-value anchors the model wraps a `@pattern` in removed.
+///
+/// The pair is dropped POSITIONALLY and only when BOTH ends carry one: a `^` alone, or a
+/// `$` alone, is an expression anchored at one end — a different expression, not an
+/// anchored spelling of this one — and a `$` preceded by an odd run of backslashes is an
+/// escaped dollar rather than an anchor. The CHECK always runs the model's pattern as
+/// written; only this rendering drops the pair.
+///
+/// TODO: duplicate of `services/common/src/validation.rs::unanchored`; delete when that
+/// module's migration lands.
+fn unanchored(regex: &str) -> String {
+    let Some(body) = regex.strip_prefix('^') else {
+        return regex.to_string();
+    };
+    match body.strip_suffix('$') {
+        Some(inner) if !ends_with_escape(inner) => inner.to_string(),
+        _ => regex.to_string(),
+    }
+}
+
+/// Whether `text` ends in an escape — an odd number of trailing backslashes, so the
+/// character that followed them was escaped.
+fn ends_with_escape(text: &str) -> bool {
+    text.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1
+}
+
+/// Whether `path` names a `@sensitive` member, or anything inside one.
+fn is_sensitive(path: &str) -> bool {
+    SENSITIVE_INPUT_PATHS.iter().any(|sensitive| {
+        path == *sensitive
+            || path
+                .strip_prefix(*sensitive)
+                .is_some_and(|rest| rest.starts_with('.'))
+    })
+}
+
+/// Wrap stated clauses in the envelope this service's refusals carry — `None` when there
+/// is nothing to state, so the caller keeps the framework's own wording.
+///
+/// `aws_smithy_schema_server::envelope` renders this same envelope and is the source of
+/// the wording, but it cannot render these clauses: it takes `Violation`s, and a clause
+/// whose `@sensitive` value is withheld has no `Violation` that produces it (a violation
+/// with no value states "Value null at"). `services/common/src/validation.rs` names the
+/// envelope a service dialect for that reason.
+fn validation_envelope(clauses: &[String]) -> Option<String> {
+    match clauses {
+        [] => None,
+        [only] => Some(format!("1 validation error detected: {only}")),
+        many => Some(format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        )),
+    }
+}
 
 /// The `com-amazonaws-eksauth-eksauthfrontend` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +228,36 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // EVERY input-constraint refusal of this service is its own modeled
+        // `InvalidParameterException` (400), whose shape the model documents as "The
+        // specified parameter is invalid. Review the available parameters for the API
+        // request." The framework's default names `ValidationException`, which this
+        // service's model does not declare at all, so a client cannot catch it.
+        //
+        // The MESSAGE is not that documentation sentence: a constraint refusal of this
+        // service is recorded answering the clause envelope built from the request —
+        // `1 validation error detected: Value at 'token' failed to satisfy constraint:
+        // Member must satisfy regular expression pattern: …` — which names the member
+        // and the constraint so a caller can fix the request from it. The shape's doc
+        // text is what the shape MEANS; the envelope is what this operation answers with.
+        // Both the code and the message are replaced together, because a client branches
+        // on the code.
+        match refusal {
+            Refusal::Invalid(violations) => {
+                let clauses: Vec<String> = violations.iter().map(stated).collect();
+                // Nothing to state: keep the framework's wording rather than
+                // answering with an empty envelope.
+                Some(Refused {
+                    code: INVALID_PARAMETER.to_string(),
+                    message: validation_envelope(&clauses)?,
+                })
+            }
+            // Authentication is the emulator's own concern, and its 403 is not one of
+            // this service's modeled parameter errors.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
