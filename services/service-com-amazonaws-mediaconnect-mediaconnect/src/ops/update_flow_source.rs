@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFlowSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFlowSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies the settings the request carries to ONE stored source of an existing flow and
+//! answers with that stored record read back, so DescribeFlow reports exactly what this
+//! operation wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFlowSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation is a PARTIAL update (`@idempotent`, every input member but `FlowArn` and
+//! `SourceArn` optional): a member the request carries replaces that setting on the stored
+//! source and a member it omits leaves the stored setting untouched — the same rule
+//! UpdateFlowOutput applies to an output and UpdateFlow to a flow's own settings. The
+//! members that belong to the source's `Transport` (its protocol, the bitrate, latency and
+//! sync-buffer members, the sender and SRT-listener members, the stream id and the NDI
+//! source settings) are merged into the transport the source holds, `Decryption` arrives as
+//! the request-only `UpdateEncryption` wrapper and is merged member by member into the
+//! source's `Encryption`, and `GatewayBridgeSource` arrives as the request-only
+//! `UpdateGatewayBridgeSourceRequest` and is merged the same way.
+//!
+//! The source is addressed by its own minted `SourceArn` WITHIN the flow the request
+//! names, exactly as RemoveFlowSource addresses one: an ARN no source of that flow carries
+//! — including one RemoveFlowSource has already detached — resolves nothing and is refused
+//! with the modelled `NotFoundException`.
+//!
+//! `RouterIntegrationState` is stored as the request configured it and reported through
+//! [`crate::state::reported_router_integration_state`], the one place a stored record
+//! becomes the state a source reports, so a source whose requests never mentioned router
+//! integration still reports the disabled state.
 //!
 //! ## Shape of an operation
 //!
@@ -136,6 +151,158 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> UpdateFlowSourceError {
+    UpdateFlowSourceErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
+/// in the request does not exist in the system" — the flow or the source `identifier`
+/// addressed, in this service's not-found envelope ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> UpdateFlowSourceError {
+    UpdateFlowSourceErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
+
+/// The server-side refusal this operation answers when the store cannot be reached, or
+/// when a record it just read cannot be read back (HTTP 500).
+fn internal_error(message: &str) -> UpdateFlowSourceError {
+    UpdateFlowSourceErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: message.to_string(),
+    })
+    .into()
+}
+
+/// Whether the request carries any member that belongs to the source's `Transport`.
+///
+/// A request that touches none of them leaves the stored transport exactly as it is —
+/// including a source that has none — so the merge below runs only for a request that
+/// does.
+fn touches_transport(input: &UpdateFlowSourceInput) -> bool {
+    input.protocol.is_some()
+        || input.max_bitrate.is_some()
+        || input.max_latency.is_some()
+        || input.max_sync_buffer.is_some()
+        || input.min_latency.is_some()
+        || input.sender_control_port.is_some()
+        || input.sender_ip_address.is_some()
+        || input.source_listener_address.is_some()
+        || input.source_listener_port.is_some()
+        || input.stream_id.is_some()
+        || input.ndi_source_settings.is_some()
+}
+
+/// The NDI source settings the transport holds after `update` is applied to `stored`.
+///
+/// "When you update the NDI source, include only the members you want to change.
+/// MediaConnect leaves the members that you don't specify unchanged."
+/// (`smithy_query(query="shape",shape="NdiSourceSettings")`) — so this is the same
+/// member-wise merge the rest of the operation performs, one level down.
+fn merged_ndi_source_settings(
+    stored: Option<&NdiSourceSettings>,
+    update: &NdiSourceSettings,
+) -> NdiSourceSettings {
+    let mut merged = stored.cloned().unwrap_or_default();
+    if let Some(source_name) = update.source_name.clone() {
+        merged.source_name = Some(source_name);
+    }
+    if let Some(audio_reference_level) = update.audio_reference_level {
+        merged.audio_reference_level = Some(audio_reference_level);
+    }
+    merged
+}
+
+/// The transport the source holds after this request is applied to `stored`, or `None`
+/// when the request would leave a transport with no protocol.
+///
+/// The transport members are individually optional on the request, so this is a
+/// member-wise merge like UpdateFlowOutput's: a member the request carries replaces its
+/// counterpart, one it omits keeps the stored value. `Transport$Protocol` is REQUIRED
+/// (`smithy_query(query="shape",shape="Transport")`), so a source that holds no transport
+/// yet can only be given one by a request that names the protocol — hence the `None`,
+/// which the caller refuses with the operation's own client error.
+///
+/// `MaxBitrate` is resolved through [`crate::state::assigned_source_max_bitrate`], the one
+/// place this crate turns a requested bitrate into the one a source reports, so a source
+/// whose protocol moves onto a smoothing protocol reports the same bitrate it would have
+/// been created with.
+fn merged_transport(stored: Option<&Transport>, input: &UpdateFlowSourceInput) -> Option<Transport> {
+    let protocol = input
+        .protocol
+        .clone()
+        .or_else(|| stored.map(|transport| transport.protocol.clone()))?;
+    let mut merged = stored.cloned().unwrap_or_default();
+    merged.protocol = protocol;
+    merged.max_bitrate = crate::state::assigned_source_max_bitrate(
+        &merged.protocol,
+        input.max_bitrate.or(merged.max_bitrate),
+    );
+    if let Some(max_latency) = input.max_latency {
+        merged.max_latency = Some(max_latency);
+    }
+    if let Some(max_sync_buffer) = input.max_sync_buffer {
+        merged.max_sync_buffer = Some(max_sync_buffer);
+    }
+    if let Some(min_latency) = input.min_latency {
+        merged.min_latency = Some(min_latency);
+    }
+    if let Some(sender_control_port) = input.sender_control_port {
+        merged.sender_control_port = Some(sender_control_port);
+    }
+    if let Some(sender_ip_address) = input.sender_ip_address.clone() {
+        merged.sender_ip_address = Some(sender_ip_address);
+    }
+    if let Some(source_listener_address) = input.source_listener_address.clone() {
+        merged.source_listener_address = Some(source_listener_address);
+    }
+    if let Some(source_listener_port) = input.source_listener_port {
+        merged.source_listener_port = Some(source_listener_port);
+    }
+    if let Some(stream_id) = input.stream_id.clone() {
+        merged.stream_id = Some(stream_id);
+    }
+    if let Some(update) = input.ndi_source_settings.as_ref() {
+        merged.ndi_source_settings = Some(merged_ndi_source_settings(
+            merged.ndi_source_settings.as_ref(),
+            update,
+        ));
+    }
+    Some(merged)
+}
+
+/// The bridge source the source holds after `update` is applied to `stored`, or `None`
+/// when the request would leave a bridge source with no bridge ARN.
+///
+/// `UpdateGatewayBridgeSourceRequest` mirrors `GatewayBridgeSource` member for member with
+/// every member optional, so this is the same member-wise merge as [`merged_transport`].
+/// `GatewayBridgeSource$BridgeArn` is REQUIRED
+/// (`smithy_query(query="shape",shape="GatewayBridgeSource")`) while the request member is
+/// not, so a source that is not fed by a bridge yet can only be given a bridge source by a
+/// request that names the bridge — hence the `None`.
+fn merged_gateway_bridge_source(
+    stored: Option<&GatewayBridgeSource>,
+    update: &UpdateGatewayBridgeSourceRequest,
+) -> Option<GatewayBridgeSource> {
+    let bridge_arn = update
+        .bridge_arn
+        .clone()
+        .or_else(|| stored.map(|bridge| bridge.bridge_arn.clone()))?;
+    let mut merged = stored.cloned().unwrap_or_default();
+    merged.bridge_arn = bridge_arn;
+    if let Some(attachment) = update.vpc_interface_attachment.clone() {
+        merged.vpc_interface_attachment = Some(attachment);
+    }
+    Some(merged)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -209,18 +376,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFlowSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFlowSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFlowSource"))
+        // Nothing in this operation's answer depends on request metadata: every setting
+        // comes off `input`, the source's identity was minted when it was added, and the
+        // response is the stored record read back.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error("the mediaconnect flow store is unavailable"));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write this operation owes beyond the request: a status change the
+        // clock already made due is materialised before the flow is read or written.
+        store.settle_due_transitions(now);
+
+        // The source updated is the one of THIS flow's sources that carries the requested
+        // ARN — the flow first, so a flow the store does not hold is answered for the flow
+        // it named rather than for the source. A source RemoveFlowSource has detached is
+        // no longer one of the flow's sources, so its ARN resolves nothing here.
+        let Some(flow) = store.flows.get(&input.flow_arn) else {
+            return Err(not_found(&input.flow_arn));
+        };
+        let Some(position) = flow
+            .sources
+            .iter()
+            .position(|source| source.source_arn == input.source_arn)
+        else {
+            return Err(not_found(&input.source_arn));
+        };
+        // The stored record as it stands, so the merges below can be validated before
+        // anything is written: a refused request must leave the source exactly as it was.
+        let mut updated = flow.sources[position].clone();
+
+        // What each setting becomes once this request is applied: the request's value
+        // where it carries one, the stored value where it does not.
+        if let Some(description) = input.description.clone() {
+            updated.description = Some(description);
+        }
+        if let Some(ingest_port) = input.ingest_port {
+            updated.ingest_port = Some(ingest_port);
+        }
+        if let Some(whitelist_cidr) = input.whitelist_cidr.clone() {
+            updated.whitelist_cidr = Some(whitelist_cidr);
+        }
+        if let Some(entitlement_arn) = input.entitlement_arn.clone() {
+            updated.entitlement_arn = Some(entitlement_arn);
+        }
+        if let Some(vpc_interface_name) = input.vpc_interface_name.clone() {
+            updated.vpc_interface_name = Some(vpc_interface_name);
+        }
+        // `SenderIpAddress` and `SenderControlPort` are members of `Source` AND of its
+        // `Transport`, and the add path writes both from one request member, so an update
+        // moves both together too.
+        if let Some(sender_ip_address) = input.sender_ip_address.clone() {
+            updated.sender_ip_address = Some(sender_ip_address);
+        }
+        if let Some(sender_control_port) = input.sender_control_port {
+            updated.sender_control_port = Some(sender_control_port);
+        }
+        // "Indicates whether to enable or disable router integration for this flow
+        // source", and the transit decryption that goes with it: both are stored as the
+        // request configured them, exactly as the add path stores them, and reported
+        // through `crate::state::reported_router_integration_state`.
+        if let Some(router_integration_state) = input.router_integration_state.clone() {
+            updated.router_integration_state = Some(router_integration_state);
+        }
+        if let Some(transit_decryption) = input.router_integration_transit_decryption.clone() {
+            updated.router_integration_transit_decryption = Some(transit_decryption);
+        }
+        if let Some(update) = input.decryption.as_ref() {
+            let Some(decryption) = crate::state::merged_encryption(updated.decryption.as_ref(), update)
+            else {
+                return Err(bad_request(
+                    "Decryption.RoleArn is required to decrypt a source that carries no \
+                     decryption yet: it is the ARN of the role the service assumes to reach \
+                     the key.",
+                ));
+            };
+            updated.decryption = Some(decryption);
+        }
+        if let Some(update) = input.gateway_bridge_source.as_ref() {
+            let Some(bridge_source) =
+                merged_gateway_bridge_source(updated.gateway_bridge_source.as_ref(), update)
+            else {
+                return Err(bad_request(
+                    "GatewayBridgeSource.BridgeArn is required to feed a source from a bridge \
+                     that is not fed by one yet: it is the ARN of the bridge feeding this flow.",
+                ));
+            };
+            updated.gateway_bridge_source = Some(bridge_source);
+        }
+        if touches_transport(&input) {
+            let Some(transport) = merged_transport(updated.transport.as_ref(), &input) else {
+                return Err(bad_request(
+                    "Protocol is required to give a source a transport: a source that has no \
+                     transport yet cannot be given transport settings without one.",
+                ));
+            };
+            updated.transport = Some(transport);
+        }
+        // "The media stream that is associated with the source, and the parameters for
+        // that association": the member carries the WHOLE association list, so the list in
+        // the request becomes the source's, materialised the one way this crate
+        // materialises that request shape. A request that carries an empty list
+        // disassociates every media stream from the source.
+        let media_stream_source_configurations = input
+            .media_stream_source_configurations
+            .as_ref()
+            .map(|requests| (requests.clone(), store.next_suffix()));
+        if let Some((requests, suffix)) = media_stream_source_configurations {
+            updated.media_stream_source_configurations = (!requests.is_empty()).then(|| {
+                crate::state::materialise_media_stream_source_configurations(&requests, suffix)
+            });
+        }
+
+        // Nothing above wrote anything, so a refused request leaves the flow as it was.
+        // From here the merged record replaces the stored one, under the same store lock
+        // this call has held throughout.
+        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
+            return Err(internal_error(
+                "the flow could not be read back while its source was updated",
+            ));
+        };
+        let Some(stored) = flow.sources.get_mut(position) else {
+            return Err(internal_error(
+                "the source could not be read back while it was updated",
+            ));
+        };
+        *stored = updated;
+
+        // "The details of the sources that are assigned to the flow" — read back out of
+        // the STORE, never echoed from the request, so the response is what DescribeFlow
+        // will report. The source's name and ARN are its identity and no input member
+        // names either, so an update never moves them; the flow's status is left to the
+        // clock, exactly as UpdateFlow leaves it.
+        Ok(UpdateFlowSourceOutput {
+            flow_arn: Some(flow.flow_arn.clone()),
+            source: Some(flow.sources[position].to_source()),
+        })
     }
 }
