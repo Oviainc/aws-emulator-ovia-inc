@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPoliciesStats
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPoliciesStats`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPoliciesStats::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: counts the policies and configurations this account has stored in
+//! [`crate::state`] — one counter per policy/configuration TYPE, as the response shape
+//! models it — and reports their sum as `TotalPolicyCount`. A pure read: it writes
+//! nothing, so two calls with no write between them answer the same numbers.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +136,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPoliciesStats` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPoliciesStatsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPoliciesStats"))
+        use crate::state::AuditOutcome;
+
+        // `GetPoliciesStatsRequest` models no members: the statistics are account-wide, so
+        // there is nothing in the request to read.
+        let _ = input;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::StoreUnreachable, None);
+            return Err(GetPoliciesStatsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Every counter is a COUNT of the records this service stores, so a create is
+        // visible in the next call's numbers and a delete is visible by its absence. The
+        // response models one counter per type value, so each counter counts exactly its
+        // own type: a configuration of a type the response models no counter for is not
+        // reported under another type's counter.
+        let (
+            data_policy_count,
+            encryption_policy_count,
+            network_policy_count,
+            saml_config_count,
+            retention_policy_count,
+        ) = {
+            let store = state.lock();
+            (
+                counter(store.access_policy_count_of(crate::state::ACCESS_POLICY_DATA)),
+                counter(store.security_policy_count(crate::state::SECURITY_POLICY_ENCRYPTION)),
+                counter(store.security_policy_count(crate::state::SECURITY_POLICY_NETWORK)),
+                counter(store.security_config_count(crate::state::SECURITY_CONFIG_SAML)),
+                counter(store.lifecycle_policy_count_of(crate::state::LIFECYCLE_POLICY_RETENTION)),
+            )
+        };
+
+        // `TotalPolicyCount` is "the total number of OpenSearch Serverless security
+        // policies and configurations in your account", which is the sum of the counters
+        // reported beside it — so the total can never disagree with its own parts.
+        let total_policy_count = data_policy_count
+            .saturating_add(encryption_policy_count)
+            .saturating_add(network_policy_count)
+            .saturating_add(saml_config_count)
+            .saturating_add(retention_policy_count);
+
+        crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyRead, None);
+        Ok(GetPoliciesStatsOutput {
+            access_policy_stats: Some(AccessPolicyStats {
+                data_policy_count: Some(data_policy_count),
+            }),
+            security_policy_stats: Some(SecurityPolicyStats {
+                encryption_policy_count: Some(encryption_policy_count),
+                network_policy_count: Some(network_policy_count),
+            }),
+            security_config_stats: Some(SecurityConfigStats {
+                saml_config_count: Some(saml_config_count),
+            }),
+            lifecycle_policy_stats: Some(LifecyclePolicyStats {
+                retention_policy_count: Some(retention_policy_count),
+            }),
+            total_policy_count: Some(total_policy_count),
+        })
     }
+}
+
+/// One counter, as the `Long` the response models it with. Every count is bounded by its
+/// resource's own account quota, so the conversion cannot actually saturate; it saturates
+/// rather than panicking because a statistic is never worth failing a read over.
+fn counter(count: usize) -> i64 {
+    i64::try_from(count).unwrap_or(i64::MAX)
 }

@@ -29,6 +29,8 @@ mod list_sandboxes_for_project_paging;
 mod project_build_batch_lifecycle;
 #[path = "all/project_build_lifecycle.rs"]
 mod project_build_lifecycle;
+#[path = "all/project_visibility.rs"]
+mod project_visibility;
 #[path = "all/report_group_lifecycle.rs"]
 mod report_group_lifecycle;
 #[path = "all/report_group_reads.rs"]

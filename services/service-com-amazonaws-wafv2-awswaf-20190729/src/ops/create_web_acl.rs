@@ -292,6 +292,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A rule group can only be referenced by a rule's own top-level statement,
+        // which is judged before any reference is resolved.
+        if let Some(reason) = crate::state::misplaced_rule_group_reference(
+            input.rules.as_deref().unwrap_or_default(),
+            true,
+        ) {
+            return Err(CreateWebACLErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_RULE_GROUP_REFERENCE_STATEMENT,
+                    "Rules",
+                    &reason,
+                ),
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateWebACLErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {
@@ -355,7 +371,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = crate::state::new_uuid();
         let lock_token = crate::state::new_uuid();
-        let arn = crate::state::resource_arn(&input.scope, &region, "webacl", &input.name, &id);
+        // Read out of state before the web ACL is built, so the derived `Capacity`
+        // can price every rule-group reference the stored tree carries.
+        let rule_group_capacities = state.rule_group_capacities(&input.scope);
+        let arn = crate::state::resource_arn(
+            &input.scope,
+            &region,
+            crate::state::WEB_ACL_ARN_KIND,
+            &input.name,
+            &id,
+        );
         let mut web_acl = WebACL {
             name: input.name.clone(),
             id: id.clone(),
@@ -374,7 +399,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pre_process_firewall_manager_rule_groups: None,
             post_process_firewall_manager_rule_groups: None,
             managed_by_firewall_manager: false,
-            label_namespace: Some(crate::state::web_acl_label_namespace(&input.name)),
+            label_namespace: Some(crate::state::label_namespace(
+                crate::state::WEB_ACL_ARN_KIND,
+                &input.name,
+            )),
             custom_response_bodies: input.custom_response_bodies.clone(),
             captcha_config: input.captcha_config.clone(),
             challenge_config: input.challenge_config.clone(),
@@ -385,7 +413,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             application_config: input.application_config.clone(),
             monetization_config: input.monetization_config.clone(),
         };
-        crate::state::apply_web_acl_defaults(&mut web_acl);
+        crate::state::apply_web_acl_defaults(&mut web_acl, &rule_group_capacities);
         let summary = WebACLSummary {
             name: Some(web_acl.name.clone()),
             id: Some(web_acl.id.clone()),

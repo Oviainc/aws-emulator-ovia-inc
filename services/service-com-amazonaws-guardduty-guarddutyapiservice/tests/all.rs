@@ -43,3 +43,5 @@ mod request_region_partition_bounds;
 mod sample_finding_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/threat_intel_sets.rs"]
+mod threat_intel_sets;

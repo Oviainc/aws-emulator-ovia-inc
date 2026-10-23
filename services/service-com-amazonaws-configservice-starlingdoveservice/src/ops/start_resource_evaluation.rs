@@ -8,8 +8,9 @@
 //!
 //! The evaluation's OUTCOME is NOT decided here: deciding it means running every
 //! proactive Config rule against the resource details, which this emulator has no rule
-//! engine for, so `GetResourceEvaluationSummary` stays scaffolded and nothing
-//! synthesises a compliance or a status for an execution nothing ran.
+//! engine for, so `GetResourceEvaluationSummary` derives the status and the compliance
+//! it reports from the rules in state and from the clock, and nothing synthesises a
+//! verdict for rule logic nothing ran.
 //!
 //! ## Shape of an operation
 //!
