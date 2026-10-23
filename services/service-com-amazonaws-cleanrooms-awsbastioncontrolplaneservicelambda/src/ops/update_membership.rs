@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.memberships.get(&membership_id).cloned() else {
             return Err(UpdateMembershipErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("membership {membership_id} not found"),
+                    message: st::membership_not_found_message(&membership_id, &caller),
                     resource_id: membership_id,
                     resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
                 },

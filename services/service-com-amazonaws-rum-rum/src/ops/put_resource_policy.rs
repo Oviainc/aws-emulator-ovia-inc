@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
+//!
 //! Attaches (or replaces) the ONE resource-based policy an app monitor may carry, over
 //! the [`crate::state::ResourcePolicyRecord`] held on that monitor's stored record, so
-//! `GetResourcePolicy` and `DeleteResourcePolicy` read exactly what this call wrote.
+//! `GetResourcePolicy` and `DeleteResourcePolicy` read exactly what this call wrote — and
+//! so does the authorization evaluation every later call runs
+//! ([`crate::state::authorization`]): a grant put here takes effect immediately and a
+//! policy replaced here stops granting immediately.
 //!
 //! ## Shape of an operation
 //!
@@ -165,9 +169,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A policy is written into this service's own state and reported back from it;
-        // nothing here depends on the request's metadata.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutResourcePolicyErrorModeled::InternalServerException(
                 InternalServerException {
@@ -178,10 +179,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let mut store = state.lock();
         // The policy belongs to one app monitor (the `@httpLabel` `Name`), so a name no
         // stored monitor holds — never created, or already deleted — has nothing to
-        // attach a policy to.
+        // attach a policy to. Resolved under a SHORT read lock, together with the policy
+        // in force, because what comes next is the authorization decision, which reads
+        // the IAM and STS stores and needs no lock of this service's.
+        let (resource_arn, held_policy) = {
+            let store = state.lock();
+            let Some(record) = store.app_monitors.get(&input.name) else {
+                return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.name),
+                )
+                .into());
+            };
+            (record.arn.clone(), record.resource_policy_document())
+        };
+        // May this caller write THIS app monitor's policy? The policy in force is part of
+        // the decision exactly as it is for every other operation: a policy may itself
+        // grant `rum:PutResourcePolicy`.
+        if let Err(denial) = crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::PUT_RESOURCE_POLICY,
+            &resource_arn,
+            held_policy.as_deref(),
+            &[],
+        ) {
+            return Err(PutResourcePolicyErrorModeled::AccessDeniedException(
+                crate::state::access_denied(&denial),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // The monitor is resolved again under the write lock: the decision above held no
+        // lock, so a concurrent `DeleteAppMonitor` may have removed it in between.
         if !store.app_monitors.contains_key(&input.name) {
             return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
                 crate::state::app_monitor_not_found(&input.name),

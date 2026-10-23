@@ -19,6 +19,8 @@ mod cleanrooms_configured_table;
 mod cleanrooms_created_resource_defaults;
 #[path = "all/cleanrooms_privacy_budget_template.rs"]
 mod cleanrooms_privacy_budget_template;
+#[path = "all/cleanrooms_refusal_classification.rs"]
+mod cleanrooms_refusal_classification;
 #[path = "all/membership_updates.rs"]
 mod membership_updates;
 #[path = "all/protected_queries.rs"]
