@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEngagement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEngagement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEngagement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored engagement the request's `EngagementId` names — the message
+//! `StartEngagement` sent, when it started, and the `StopTime` `StopEngagement` recorded
+//! if it has been stopped. A read: it writes nothing.
+//!
+//! Like every SSM Contacts data-plane call that resolves a resource it is refused with the
+//! modelled `ValidationException` (HTTP 400) while the account has no ACTIVE Incident
+//! Manager replication set
+//! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]),
+//! BEFORE the engagement is looked up; an `EngagementId` the store does not hold is the
+//! modelled `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +175,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEngagement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEngagementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEngagement"))
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeEngagementErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let state = state.lock();
+
+        // The account gate comes FIRST, before `EngagementId` is resolved, so a
+        // non-onboarded account is refused identically whether or not its engagement
+        // exists.
+        state
+            .require_active_replication_set()
+            .map_err(account_precondition_failed)?;
+
+        let Some(engagement) = state.engagements.get(&input.engagement_id) else {
+            return Err(DescribeEngagementErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Engagement {} not found", input.engagement_id),
+                    resource_id: input.engagement_id.clone(),
+                    resource_type: ENGAGEMENT_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        Ok(crate::state::engagement_details(engagement))
     }
+}
+
+/// The `resourceType` this operation's not-found error names, spelled as the contact
+/// handlers spell theirs.
+const ENGAGEMENT_RESOURCE_TYPE: &str = "engagement";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` because the failure is not a member-level one, and `fields` is
+/// present but EMPTY for the same reason — no field of the request is at fault. The same
+/// shape `UpdateContact` answers this precondition with.
+fn account_precondition_failed(message: String) -> DescribeEngagementError {
+    DescribeEngagementErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
 }
