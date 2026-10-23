@@ -1,0 +1,303 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! How this service reports a COLLECTION input member that is outside the
+//! `@length` bound the model declares for it — the batched and transactional
+//! caps a client retries against.
+//!
+//! One rule, over a TABLE of inputs rather than one recorded request: a
+//! collection input member whose element or entry count falls outside its
+//! modelled `@length` bound is refused with HTTP 400 `ValidationException`
+//! whose message is the `<N> validation error(s) detected: ` envelope over one
+//! clause per violated member, and that clause states exactly three facts — the
+//! member's dotted input path as the model spells it on the wire, that the
+//! member failed a constraint, and the BOUND it broke. It states nothing the
+//! emulator computed about the request: not the element count, not a byte
+//! total, not the operation that refused it. At the bound the request is not
+//! refused as a constraint violation at all.
+//!
+//! The rows differ along what the rule generalises over: the operation
+//! (transactional read, transactional write, batched read, batched write), the
+//! collection's kind (a list of structures, a list of maps, a map of lists), the
+//! bound that was broken (the `@length` maximum and the `@length` minimum), the
+//! published bound's value (100 and 25), the member's depth in the request (a
+//! top-level member and a list nested under a map entry the CALLER keyed), the
+//! shape of the elements (a `Get`, a `Put`, a `Delete`, a mix of two actions),
+//! and how far past the bound the request went (one past it, and half again as
+//! many) — each bound tested AT the bound and one past it.
+//!
+//! Every bound named in a row comes from the Smithy model, through
+//! `smithy_query(query="shape", shape="…")`: `TransactGetItemList` and
+//! `TransactWriteItemList` are `@length{min:1,max:100}`, `KeyList` and
+//! `BatchGetRequestMap` are `@length{min:1,max:100}`, and
+//! `BatchWriteItemRequestMap` and `WriteRequests` are `@length{min:1,max:25}`.
+
+use serde_json::{json, Value};
+
+use crate::emulator::{call, emulator, error_code, message};
+use crate::table_items::create_active_table;
+
+/// The table every row addresses: one hash key, so a `Key` is one attribute.
+const TABLE: &str = "Music";
+
+/// The requirement phrase AWS states for a `@length` maximum of `max`.
+fn at_most(max: usize) -> String {
+    format!("Member must have length less than or equal to {max}")
+}
+
+/// The requirement phrase AWS states for a `@length` minimum of `min`.
+fn at_least(min: usize) -> String {
+    format!("Member must have length greater than or equal to {min}")
+}
+
+/// The whole message a single violated member earns: the envelope over one
+/// clause naming `path` and `requirement`, with no value echoed.
+fn report(path: &str, requirement: &str) -> String {
+    format!(
+        "1 validation error detected: Value at '{path}' failed to satisfy constraint: \
+         {requirement}"
+    )
+}
+
+/// `count` `TransactGetItems` entries, each a `Get` of a distinct primary key.
+fn transact_gets(count: usize) -> Vec<Value> {
+    (0..count)
+        .map(|index| json!({"Get": {"TableName": TABLE, "Key": key(index)}}))
+        .collect()
+}
+
+/// `count` `TransactWriteItems` entries, each a `Put` of a distinct item.
+fn transact_puts(count: usize) -> Vec<Value> {
+    (0..count)
+        .map(|index| json!({"Put": {"TableName": TABLE, "Item": key(index)}}))
+        .collect()
+}
+
+/// `count` `TransactWriteItems` entries, each a `Delete` of a distinct key.
+fn transact_deletes(count: usize) -> Vec<Value> {
+    (0..count)
+        .map(|index| json!({"Delete": {"TableName": TABLE, "Key": key(index)}}))
+        .collect()
+}
+
+/// `count` `TransactWriteItems` entries alternating `Put` and `Delete`, so the
+/// clause cannot depend on which action the elements carry.
+fn transact_mixed(count: usize) -> Vec<Value> {
+    (0..count)
+        .map(|index| {
+            if index % 2 == 0 {
+                json!({"Put": {"TableName": TABLE, "Item": key(index)}})
+            } else {
+                json!({"Delete": {"TableName": TABLE, "Key": key(index)}})
+            }
+        })
+        .collect()
+}
+
+/// `count` distinct primary keys for that table.
+fn keys(count: usize) -> Vec<Value> {
+    (0..count).map(key).collect()
+}
+
+/// `count` `BatchWriteItem` write requests for that table.
+fn write_requests(count: usize) -> Vec<Value> {
+    (0..count)
+        .map(|index| json!({"PutRequest": {"Item": key(index)}}))
+        .collect()
+}
+
+/// A `BatchWriteItem` request map keyed by `count` distinct table names, each
+/// carrying one write request.
+fn write_request_tables(count: usize) -> Value {
+    Value::Object(
+        (0..count)
+            .map(|index| {
+                (
+                    format!("{TABLE}{index:02}"),
+                    json!([{"PutRequest": {"Item": key(index)}}]),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// A request map naming the one table above: `{ "<table>": <value> }`. Built
+/// here rather than inside `json!` so the table name stays the one constant.
+fn for_table(value: Value) -> Value {
+    Value::Object([(TABLE.to_string(), value)].into_iter().collect())
+}
+
+/// The primary key of item `index`.
+fn key(index: usize) -> Value {
+    json!({"Artist": {"S": format!("a{index}")}})
+}
+
+/// Nothing the emulator computed about the request may reach a caller through a
+/// constraint clause: an element or entry count, a byte total, or the name of
+/// the operation that refused it.
+const INTERNAL_DETAIL: [&str; 8] = [
+    "101 items",
+    "150 items",
+    "26 items",
+    "26 entries",
+    " bytes",
+    "emulator",
+    "TransactGetItems",
+    "BatchWriteItem",
+];
+
+#[tokio::test]
+async fn a_collection_outside_its_modelled_length_bound_is_reported_against_that_bound() {
+    let router = emulator();
+    create_active_table(&router, TABLE, &[("Artist", "HASH", "S")]).await;
+
+    // Each row: the case, the operation, the request, and the WHOLE message the
+    // refusal must carry.
+    let cases: Vec<(&str, &str, Value, String)> = vec![
+        (
+            "a transactional read one past the 100-item cap",
+            "TransactGetItems",
+            json!({"TransactItems": transact_gets(101)}),
+            report("TransactItems", &at_most(100)),
+        ),
+        (
+            "a transactional read half again past the same cap states the same bound",
+            "TransactGetItems",
+            json!({"TransactItems": transact_gets(150)}),
+            report("TransactItems", &at_most(100)),
+        ),
+        (
+            "an empty transactional read, one below the same member's minimum",
+            "TransactGetItems",
+            json!({"TransactItems": []}),
+            report("TransactItems", &at_least(1)),
+        ),
+        (
+            "a transactional write of puts one past the 100-item cap",
+            "TransactWriteItems",
+            json!({"TransactItems": transact_puts(101)}),
+            report("TransactItems", &at_most(100)),
+        ),
+        (
+            "a transactional write of deletes one past the same cap",
+            "TransactWriteItems",
+            json!({"TransactItems": transact_deletes(101)}),
+            report("TransactItems", &at_most(100)),
+        ),
+        (
+            "a transactional write mixing two actions, half again past the cap",
+            "TransactWriteItems",
+            json!({"TransactItems": transact_mixed(150)}),
+            report("TransactItems", &at_most(100)),
+        ),
+        (
+            "an empty transactional write, one below the same member's minimum",
+            "TransactWriteItems",
+            json!({"TransactItems": []}),
+            report("TransactItems", &at_least(1)),
+        ),
+        (
+            "a batched read's key list one past the 100-key cap, under the caller's own key",
+            "BatchGetItem",
+            json!({"RequestItems": for_table(json!({"Keys": keys(101)}))}),
+            report(&format!("RequestItems.{TABLE}.member.Keys"), &at_most(100)),
+        ),
+        (
+            "an empty key list, one below that nested member's minimum",
+            "BatchGetItem",
+            json!({"RequestItems": for_table(json!({"Keys": []}))}),
+            report(&format!("RequestItems.{TABLE}.member.Keys"), &at_least(1)),
+        ),
+        (
+            "a batched read naming no table at all, one below the map's own minimum",
+            "BatchGetItem",
+            json!({"RequestItems": {}}),
+            report("RequestItems", &at_least(1)),
+        ),
+        (
+            "a batched write one past the 25-table cap",
+            "BatchWriteItem",
+            json!({"RequestItems": write_request_tables(26)}),
+            report("RequestItems", &at_most(25)),
+        ),
+        (
+            "a batched write naming no table at all, one below the same map's minimum",
+            "BatchWriteItem",
+            json!({"RequestItems": {}}),
+            report("RequestItems", &at_least(1)),
+        ),
+    ];
+
+    for (case, operation, request, expected) in cases {
+        let (status, body) = call(&router, operation, request.clone()).await;
+        let (code, stated) = (error_code(&body), message(&body));
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?} ({operation}): expected 400 ValidationException, got {status} {code} \
+             with {stated:?}"
+        );
+        assert_eq!(
+            stated, expected,
+            "case {case:?} ({operation}): expected the message {expected:?}, got {stated:?}"
+        );
+        for leaked in INTERNAL_DETAIL {
+            assert!(
+                !stated.contains(leaked),
+                "case {case:?} ({operation}): the clause must not state {leaked:?}, got {stated:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_collection_at_its_modelled_bound_is_not_refused_as_a_constraint_violation() {
+    let router = emulator();
+    create_active_table(&router, TABLE, &[("Artist", "HASH", "S")]).await;
+
+    // The same members, filled to exactly the published bound: whatever each
+    // operation answers (these four are not implemented yet, so they answer the
+    // scaffold's 501), none of them may be refused as a constraint violation —
+    // which is what makes the rows above the bound and not an off-by-one.
+    let cases: Vec<(&str, &str, Value)> = vec![
+        (
+            "a transactional read filled to the 100-item cap",
+            "TransactGetItems",
+            json!({"TransactItems": transact_gets(100)}),
+        ),
+        (
+            "a transactional read of one item, at the same member's minimum",
+            "TransactGetItems",
+            json!({"TransactItems": transact_gets(1)}),
+        ),
+        (
+            "a transactional write filled to the 100-item cap",
+            "TransactWriteItems",
+            json!({"TransactItems": transact_puts(100)}),
+        ),
+        (
+            "a batched read's key list filled to the 100-key cap",
+            "BatchGetItem",
+            json!({"RequestItems": for_table(json!({"Keys": keys(100)}))}),
+        ),
+        (
+            "a batched write filled to the 25-table cap",
+            "BatchWriteItem",
+            json!({"RequestItems": write_request_tables(25)}),
+        ),
+        (
+            "a batched write of 25 requests for one table, at the list's own cap",
+            "BatchWriteItem",
+            json!({"RequestItems": for_table(json!(write_requests(25)))}),
+        ),
+    ];
+
+    for (case, operation, request) in cases {
+        let (status, body) = call(&router, operation, request).await;
+        let (code, stated) = (error_code(&body), message(&body));
+        assert!(
+            !(code == "ValidationException" && stated.contains("failed to satisfy constraint")),
+            "case {case:?} ({operation}): a collection at its published bound is not a \
+             constraint violation, got {status} {code} with {stated:?}"
+        );
+    }
+}

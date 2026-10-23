@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_addressed_tag_refusals.rs"]
 mod arn_addressed_tag_refusals;
+#[path = "all/collection_cap_constraint_reports.rs"]
+mod collection_cap_constraint_reports;
 #[path = "all/emulator.rs"]
 mod emulator;
 #[path = "all/global_secondary_indexes.rs"]
