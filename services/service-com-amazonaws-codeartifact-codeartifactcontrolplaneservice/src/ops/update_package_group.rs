@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePackageGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePackageGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePackageGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the metadata of one package group and COMMITS it to the stored record, so the
+//! answer this call gives and every later `DescribePackageGroup` are the same projection of
+//! one record:
+//!
+//! * the addressed domain and package group are resolved first; a `packageGroup` that is
+//!   not a path from the domain root is `ValidationException` (400) — the same refusal
+//!   `CreatePackageGroup` and `DescribePackageGroup` give it — and a group the domain does
+//!   not hold is `ResourceNotFoundException` (404). Neither writes anything;
+//! * a member the request CARRIES replaces the stored one (`contactInfo`, `description`),
+//!   and a member it OMITS is left exactly as it was: the members are documented as what to
+//!   change, so this is a partial update, not a whole-record replacement. An empty string
+//!   is a value the caller sent, so it is stored;
+//! * the group's origin configuration is NOT this operation's input —
+//!   `UpdatePackageGroupOriginConfiguration` owns it — so it is untouched here, and the
+//!   `originConfiguration` and `parent` this answer reports stay derived from the hierarchy
+//!   the group is part of at this call.
 //!
 //! ## Shape of an operation
 //!
@@ -161,20 +169,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePackageGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePackageGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePackageGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdatePackageGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A `packageGroup` that is not a path from the domain root is not an identifier any
+        // package group can have, so it is refused on the INPUT rather than resolved to a
+        // lookup that is bound to miss — the same refusal every other operation taking a
+        // `packageGroup` gives it. Checked before the store is read.
+        if let Some(refusal) = crate::state::package_group_pattern_refusal(&input.package_group) {
+            return Err(UpdatePackageGroupErrorModeled::ValidationException(refusal).into());
+        }
+
+        let mut store = state.lock();
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(UpdatePackageGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::domain_not_found_message(
+                        &input.domain,
+                        input.domain_owner.as_deref(),
+                    ),
+                    resource_id: Some(input.domain.clone()),
+                    resource_type: Some("domain".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `resourceType` is unset: `ResourceType` models only `domain`, `repository`,
+        // `package`, `package-version` and `asset`, so there is no enum value for a package
+        // group to report.
+        let Some(group) = domain.package_groups.get_mut(&input.package_group) else {
+            return Err(UpdatePackageGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::package_group_not_found_message(
+                        &input.domain,
+                        input.domain_owner.as_deref(),
+                        &input.package_group,
+                    ),
+                    resource_id: Some(input.package_group.clone()),
+                    resource_type: None,
+                },
+            )
+            .into());
+        };
+
+        // The write. A member the request carries is COMMITTED to the record (an empty
+        // string included — it is a value the caller sent); a member it omits is not a
+        // value, so the stored one stands.
+        if let Some(contact_info) = &input.contact_info {
+            group.contact_info = Some(contact_info.clone());
+        }
+        if let Some(description) = &input.description {
+            group.description = Some(description.clone());
+        }
+
+        // Projected AFTER the write, so the answer is the record a later
+        // `DescribePackageGroup` reads — including the derived `parent` and effective modes,
+        // resolved against the hierarchy as it stands at this call.
+        let Some(description) = domain.package_group_description(&input.package_group) else {
+            return Err(UpdatePackageGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!(
+                        "package group '{}' was updated but cannot be read back",
+                        input.package_group
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(UpdatePackageGroupOutput {
+            package_group: Some(description),
+        })
     }
 }

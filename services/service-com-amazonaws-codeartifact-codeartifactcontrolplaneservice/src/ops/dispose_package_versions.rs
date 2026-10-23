@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisposePackageVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisposePackageVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisposePackageVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Disposes the versions the caller's `versions` list names, on the package its
+//! `(format, namespace, package)` triple names, inside one repository: "Deletes the assets
+//! in package versions and sets the package versions' status to Disposed".
+//!
+//! * the addressed domain, repository and package are resolved first; one this caller does
+//!   not hold is `ResourceNotFoundException` (404), so a request that names no package is
+//!   refused rather than reported as a list of per-version failures;
+//! * each named version is decided on its own and reported in ONE of the two modelled
+//!   maps, because this operation answers 200 with a per-version outcome rather than
+//!   failing the call: a version the package does not hold is `NOT_FOUND`, a version whose
+//!   status is not the `expectedStatus` the caller pinned is `MISMATCHED_STATUS`, and a
+//!   version whose revision is not the one `versionRevisions` pinned is
+//!   `MISMATCHED_REVISION`;
+//! * every other named version has its ASSETS DELETED and its status moved to `Disposed`,
+//!   committed to the store: the version record stays ("To view information about a disposed
+//!   package version, use DescribePackageVersion"), so a later read reports it with status
+//!   `Disposed` and no assets, and the domain's derived `assetSizeBytes` drops by what those
+//!   assets held. That is also why the status is terminal — "a disposed package version
+//!   cannot be restored in your repository because its assets are deleted" — which
+//!   `UpdatePackageVersionsStatus` enforces.
 //!
 //! ## Shape of an operation
 //!
@@ -184,20 +196,174 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisposePackageVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisposePackageVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisposePackageVersions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DisposePackageVersionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(not_found(
+                crate::state::domain_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                ),
+                &input.domain,
+                "domain",
+            ));
+        };
+        let Some(repository) = domain.repositories.get_mut(&input.repository) else {
+            return Err(not_found(
+                crate::state::repository_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                    &input.repository,
+                ),
+                &input.repository,
+                "repository",
+            ));
+        };
+
+        // A package is addressed by its whole (format, namespace, name) triple, the same
+        // key `DescribePackage` resolves.
+        let key =
+            crate::state::package_key(&input.format, input.namespace.as_deref(), &input.package);
+        let Some(package) = repository.packages.get_mut(&key) else {
+            return Err(not_found(
+                crate::state::package_not_found_message(&input.package, &input.repository),
+                &input.package,
+                "package",
+            ));
+        };
+
+        let mut successful: ::std::collections::HashMap<String, SuccessfulPackageVersionInfo> =
+            ::std::collections::HashMap::new();
+        let mut failed: ::std::collections::HashMap<String, PackageVersionError> =
+            ::std::collections::HashMap::new();
+
+        let revisions = input.version_revisions.unwrap_or_default();
+
+        for version in &input.versions {
+            // Both answers are MAPS keyed by version, so a list that repeats a version
+            // carries one outcome for it: the first decision stands, and the repeat is not
+            // re-decided against the store the first one already changed.
+            if successful.contains_key(version) || failed.contains_key(version) {
+                continue;
+            }
+
+            let Some(stored) = package.versions.get_mut(version) else {
+                failed.insert(
+                    version.clone(),
+                    version_error(
+                        PACKAGE_VERSION_ERROR_NOT_FOUND,
+                        crate::state::package_version_not_found_message(
+                            &input.package,
+                            version,
+                            &input.repository,
+                        ),
+                    ),
+                );
+                continue;
+            };
+
+            // `expectedStatus` is the caller's precondition on the version they are
+            // disposing: a version in another status is left exactly as it was and reported
+            // as the mismatch, assets included.
+            if let Some(expected) = &input.expected_status {
+                if &stored.status != expected {
+                    failed.insert(
+                        version.clone(),
+                        version_error(
+                            PACKAGE_VERSION_ERROR_MISMATCHED_STATUS,
+                            format!(
+                                "Package version {} {} is {}, not the expected status {}.",
+                                input.package, version, stored.status, expected
+                            ),
+                        ),
+                    );
+                    continue;
+                }
+            }
+
+            // `versionRevisions` is the same kind of precondition on the version's
+            // CONTENT: an entry for this version pins the revision the caller last saw.
+            if let Some(expected) = revisions.get(version) {
+                let held = stored.revision();
+                if &held != expected {
+                    failed.insert(
+                        version.clone(),
+                        version_error(
+                            PACKAGE_VERSION_ERROR_MISMATCHED_REVISION,
+                            format!(
+                                "Package version {} {} is at revision {}, not the expected revision {}.",
+                                input.package, version, held, expected
+                            ),
+                        ),
+                    );
+                    continue;
+                }
+            }
+
+            // The write: the assets go and the status moves. Both are committed to the
+            // stored version, so `DescribePackageVersion` reports a disposed version with
+            // no assets from here on, and the domain's derived `assetSizeBytes` — summed
+            // from the assets themselves — drops by what they held.
+            stored.assets.clear();
+            stored.status = crate::state::PACKAGE_VERSION_STATUS_DISPOSED.to_string();
+            successful.insert(
+                version.clone(),
+                SuccessfulPackageVersionInfo {
+                    // Read AFTER the write: a version's revision identifies its content, and
+                    // this call changed both the assets and the status.
+                    revision: Some(stored.revision()),
+                    status: Some(stored.status.clone()),
+                },
+            );
+        }
+
+        Ok(DisposePackageVersionsOutput {
+            successful_versions: Some(successful),
+            failed_versions: Some(failed),
+        })
     }
+}
+
+/// `PackageVersionErrorCode$NOT_FOUND`: the package holds no version of that name.
+const PACKAGE_VERSION_ERROR_NOT_FOUND: &str = "NOT_FOUND";
+
+/// `PackageVersionErrorCode$MISMATCHED_STATUS`: the version is not in the status the
+/// caller's `expectedStatus` pinned.
+const PACKAGE_VERSION_ERROR_MISMATCHED_STATUS: &str = "MISMATCHED_STATUS";
+
+/// `PackageVersionErrorCode$MISMATCHED_REVISION`: the version is not at the revision the
+/// caller's `versionRevisions` entry pinned.
+const PACKAGE_VERSION_ERROR_MISMATCHED_REVISION: &str = "MISMATCHED_REVISION";
+
+/// One entry of the `failedVersions` map: the modelled error code and why.
+fn version_error(error_code: &str, error_message: String) -> PackageVersionError {
+    PackageVersionError {
+        error_code: Some(error_code.to_string()),
+        error_message: Some(error_message),
+    }
+}
+
+/// A `ResourceNotFoundException` (404) naming the resource that was addressed, so a caller
+/// can tell an unknown domain from an unknown repository or package.
+fn not_found(
+    message: String,
+    resource_id: &str,
+    resource_type: &str,
+) -> DisposePackageVersionsError {
+    DisposePackageVersionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
 }

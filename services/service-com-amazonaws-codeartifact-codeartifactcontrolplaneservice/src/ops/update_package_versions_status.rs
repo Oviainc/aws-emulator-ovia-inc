@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePackageVersionsStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePackageVersionsStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePackageVersionsStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the status of the versions the caller's `versions` list names, on the package its
+//! `(format, namespace, package)` triple names, inside one repository, and COMMITS each
+//! move to the stored version:
+//!
+//! * `targetStatus` must be a status this operation moves a version TO — `Archived`,
+//!   `Published` or `Unlisted` ("To set the status of a package version to Disposed, use
+//!   DisposePackageVersions"). `PackageVersionStatus` models six values, so one of the
+//!   other three is `ValidationException` (400) naming the member, not a status change;
+//! * the addressed domain, repository and package are resolved next; one this caller does
+//!   not hold is `ResourceNotFoundException` (404), so a request that names no package is
+//!   refused rather than reported as a list of per-version failures;
+//! * each named version is decided on its own and reported in ONE of the two modelled
+//!   maps, because this operation answers 200 with a per-version outcome rather than
+//!   failing the call: a version the package does not hold is `NOT_FOUND`, a version whose
+//!   status is not the `expectedStatus` the caller pinned is `MISMATCHED_STATUS`, a version
+//!   whose revision is not the one the caller's `versionRevisions` entry pinned is
+//!   `MISMATCHED_REVISION`, a version that was DISPOSED is `NOT_ALLOWED` (its assets are
+//!   deleted, so "a disposed package version cannot be restored"), and every other named
+//!   version is moved to `targetStatus`;
+//! * the move is committed to the store, so `DescribePackageVersion` reports the new status
+//!   from the very next call, and the `revision` reported beside it is the one the UPDATED
+//!   version has — a version's revision identifies its content, and its status is part of
+//!   that content.
 //!
 //! ## Shape of an operation
 //!
@@ -186,20 +201,231 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePackageVersionsStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePackageVersionsStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePackageVersionsStatus"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdatePackageVersionsStatusErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the CodeArtifact store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `targetStatus` is modelled as the whole `PackageVersionStatus` enum, so the
+        // boundary validator admits all six values; only three of them are a status THIS
+        // operation moves a version to (`crate::state::UPDATABLE_PACKAGE_VERSION_STATUSES`,
+        // which quotes the operation's own documentation). The rest are reachable only
+        // through the operation that owns each, so naming one is a bad request — stated in
+        // the same constraint-violation envelope the boundary states a modelled constraint
+        // in, naming the member and the requirement it failed.
+        if !crate::state::UPDATABLE_PACKAGE_VERSION_STATUSES.contains(&input.target_status.as_str())
+        {
+            return Err(
+                UpdatePackageVersionsStatusErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::constraint_violation_message(
+                            "targetStatus",
+                            &input.target_status,
+                            &format!(
+                                "Member must satisfy enum value set: [{}]",
+                                crate::state::UPDATABLE_PACKAGE_VERSION_STATUSES.join(", ")
+                            ),
+                        ),
+                        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(not_found(
+                crate::state::domain_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                ),
+                &input.domain,
+                "domain",
+            ));
+        };
+        let Some(repository) = domain.repositories.get_mut(&input.repository) else {
+            return Err(not_found(
+                crate::state::repository_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                    &input.repository,
+                ),
+                &input.repository,
+                "repository",
+            ));
+        };
+
+        // A package is addressed by its whole (format, namespace, name) triple, the same
+        // key `DescribePackage` resolves: a request naming the right package name under a
+        // different format or namespace addresses a DIFFERENT package, and that one is not
+        // found.
+        let key =
+            crate::state::package_key(&input.format, input.namespace.as_deref(), &input.package);
+        let Some(package) = repository.packages.get_mut(&key) else {
+            return Err(not_found(
+                crate::state::package_not_found_message(&input.package, &input.repository),
+                &input.package,
+                "package",
+            ));
+        };
+
+        let mut successful: ::std::collections::HashMap<String, SuccessfulPackageVersionInfo> =
+            ::std::collections::HashMap::new();
+        let mut failed: ::std::collections::HashMap<String, PackageVersionError> =
+            ::std::collections::HashMap::new();
+
+        let revisions = input.version_revisions.unwrap_or_default();
+
+        for version in &input.versions {
+            // Both answers are MAPS keyed by version, so a list that repeats a version
+            // carries one outcome for it: the first decision stands, and the repeat is not
+            // re-decided against the store the first one already changed.
+            if successful.contains_key(version) || failed.contains_key(version) {
+                continue;
+            }
+
+            let Some(stored) = package.versions.get_mut(version) else {
+                failed.insert(
+                    version.clone(),
+                    version_error(
+                        PACKAGE_VERSION_ERROR_NOT_FOUND,
+                        crate::state::package_version_not_found_message(
+                            &input.package,
+                            version,
+                            &input.repository,
+                        ),
+                    ),
+                );
+                continue;
+            };
+
+            // A DISPOSED version is terminal: "a disposed package version cannot be
+            // restored in your repository because its assets are deleted"
+            // (`DisposePackageVersions`), so no status move can bring one back. Reported as
+            // the per-version `NOT_ALLOWED` rather than refusing the whole call, because
+            // every other named version is still decided on its own.
+            if stored.status == crate::state::PACKAGE_VERSION_STATUS_DISPOSED {
+                failed.insert(
+                    version.clone(),
+                    version_error(
+                        PACKAGE_VERSION_ERROR_NOT_ALLOWED,
+                        format!(
+                            "Package version {} {} is {}; its assets are deleted, so its status cannot be changed.",
+                            input.package,
+                            version,
+                            crate::state::PACKAGE_VERSION_STATUS_DISPOSED
+                        ),
+                    ),
+                );
+                continue;
+            }
+
+            // `expectedStatus` is the caller's precondition: "the package version's status
+            // is updated only if its status at the time UpdatePackageVersionsStatus is
+            // called matches expectedStatus". A version in another status is left exactly
+            // as it was and reported as the mismatch.
+            if let Some(expected) = &input.expected_status {
+                if &stored.status != expected {
+                    failed.insert(
+                        version.clone(),
+                        version_error(
+                            PACKAGE_VERSION_ERROR_MISMATCHED_STATUS,
+                            format!(
+                                "Package version {} {} is {}, not the expected status {}.",
+                                input.package, version, stored.status, expected
+                            ),
+                        ),
+                    );
+                    continue;
+                }
+            }
+
+            // `versionRevisions` is the same kind of precondition on the version's
+            // CONTENT: an entry for this version pins the revision the caller last saw, so
+            // a version whose content moved since is left alone and reported as the
+            // revision mismatch.
+            if let Some(expected) = revisions.get(version) {
+                let held = stored.revision();
+                if &held != expected {
+                    failed.insert(
+                        version.clone(),
+                        version_error(
+                            PACKAGE_VERSION_ERROR_MISMATCHED_REVISION,
+                            format!(
+                                "Package version {} {} is at revision {}, not the expected revision {}.",
+                                input.package, version, held, expected
+                            ),
+                        ),
+                    );
+                    continue;
+                }
+            }
+
+            // The write: the new status is COMMITTED to the stored version, so
+            // `DescribePackageVersion` and `ListPackageVersions` report it from here on.
+            stored.status = input.target_status.clone();
+            successful.insert(
+                version.clone(),
+                SuccessfulPackageVersionInfo {
+                    // Read AFTER the write: a version's revision identifies its content,
+                    // and its status is part of that content, so the revision this answer
+                    // reports is the one a read of the updated version reports.
+                    revision: Some(stored.revision()),
+                    status: Some(stored.status.clone()),
+                },
+            );
+        }
+
+        Ok(UpdatePackageVersionsStatusOutput {
+            successful_versions: Some(successful),
+            failed_versions: Some(failed),
+        })
     }
+}
+
+/// `PackageVersionErrorCode$NOT_FOUND`: the package holds no version of that name.
+const PACKAGE_VERSION_ERROR_NOT_FOUND: &str = "NOT_FOUND";
+
+/// `PackageVersionErrorCode$MISMATCHED_STATUS`: the version is not in the status the
+/// caller's `expectedStatus` pinned.
+const PACKAGE_VERSION_ERROR_MISMATCHED_STATUS: &str = "MISMATCHED_STATUS";
+
+/// `PackageVersionErrorCode$MISMATCHED_REVISION`: the version is not at the revision the
+/// caller's `versionRevisions` entry pinned.
+const PACKAGE_VERSION_ERROR_MISMATCHED_REVISION: &str = "MISMATCHED_REVISION";
+
+/// `PackageVersionErrorCode$NOT_ALLOWED`: the move this call asks for is not one the
+/// version can make — a disposed version, whose assets are gone.
+const PACKAGE_VERSION_ERROR_NOT_ALLOWED: &str = "NOT_ALLOWED";
+
+/// One entry of the `failedVersions` map: the modelled error code and why.
+fn version_error(error_code: &str, error_message: String) -> PackageVersionError {
+    PackageVersionError {
+        error_code: Some(error_code.to_string()),
+        error_message: Some(error_message),
+    }
+}
+
+/// A `ResourceNotFoundException` (404) naming the resource that was addressed, so a caller
+/// can tell an unknown domain from an unknown repository or package.
+fn not_found(
+    message: String,
+    resource_id: &str,
+    resource_type: &str,
+) -> UpdatePackageVersionsStatusError {
+    UpdatePackageVersionsStatusErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
 }

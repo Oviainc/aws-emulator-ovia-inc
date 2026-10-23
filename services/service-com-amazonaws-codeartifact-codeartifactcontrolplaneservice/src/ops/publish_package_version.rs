@@ -379,8 +379,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // A package record this publish CREATES carries the origin controls CodeArtifact
+        // sets for a package that came to exist by a direct publish — publishing allowed,
+        // upstream ingestion BLOCKED (`crate::state::Package::published`). A publish into a
+        // package the repository already holds leaves its configuration alone: the controls
+        // are chosen from how the package was created, and this one already exists.
         let package = repository.packages.entry(key).or_insert_with(|| {
-            crate::state::Package::new(&input.format, input.namespace.as_deref(), &input.package)
+            crate::state::Package::published(
+                &input.format,
+                input.namespace.as_deref(),
+                &input.package,
+            )
         });
 
         // `unfinished` keeps the version open for more assets; omitting it (or sending

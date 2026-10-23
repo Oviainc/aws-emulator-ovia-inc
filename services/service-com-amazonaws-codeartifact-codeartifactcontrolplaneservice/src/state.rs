@@ -217,6 +217,36 @@ pub const PACKAGE_VERSION_STATUS_PUBLISHED: &str = "Published";
 /// `unfinished` flag keeps a publish in.
 pub const PACKAGE_VERSION_STATUS_UNFINISHED: &str = "Unfinished";
 
+/// `PackageVersionStatus` of a version that `UpdatePackageVersionsStatus` retired: an
+/// archived version is still held, so it can be moved back to `Published` ("If you want to
+/// remove a package version from your repository and be able to restore it later, set its
+/// status to Archived" — `DeletePackageVersions`' own documentation).
+pub const PACKAGE_VERSION_STATUS_ARCHIVED: &str = "Archived";
+
+/// `PackageVersionStatus` of a version that is held and resolvable but kept out of the
+/// listings — the third status `UpdatePackageVersionsStatus` can move a version to.
+pub const PACKAGE_VERSION_STATUS_UNLISTED: &str = "Unlisted";
+
+/// The statuses `UpdatePackageVersionsStatus` can move a version TO.
+///
+/// Source: that operation's own documentation — "Using UpdatePackageVersionsStatus, you can
+/// update the status of package versions to Archived, Published, or Unlisted. To set the
+/// status of a package version to Disposed, use DisposePackageVersions." `PackageVersionStatus`
+/// itself models six values, so the three it does NOT list here (`Disposed`, `Deleted`,
+/// `Unfinished`) are reachable only through the operation that owns each of them, and a
+/// `targetStatus` naming one is a bad REQUEST rather than a status change.
+pub const UPDATABLE_PACKAGE_VERSION_STATUSES: &[&str] = &[
+    PACKAGE_VERSION_STATUS_ARCHIVED,
+    PACKAGE_VERSION_STATUS_PUBLISHED,
+    PACKAGE_VERSION_STATUS_UNLISTED,
+];
+
+/// `PackageVersionStatus` of a version `DisposePackageVersions` disposed: its assets are
+/// deleted and the version record stays, which is why the status is terminal — "a disposed
+/// package version cannot be restored in your repository because its assets are deleted"
+/// (`DisposePackageVersions`' own documentation).
+pub const PACKAGE_VERSION_STATUS_DISPOSED: &str = "Disposed";
+
 /// `PackageVersionStatus` of a version a delete removed, which is what
 /// `DeletePackageVersions` reports for every version it deleted ("The status of every
 /// successful version will be `Deleted`" — `DeletePackageVersionsResult$successfulVersions`).
@@ -1205,10 +1235,12 @@ pub struct Package {
 }
 
 impl Package {
-    /// A package created by a direct publish: CodeArtifact gives a package that was
-    /// published into a repository the default origin configuration, which allows both
-    /// further publishes and upstream fetches until an explicit
-    /// `PutPackageOriginConfiguration` narrows it.
+    /// A package record created by something OTHER than a direct publish, carrying the
+    /// unrestricted origin configuration: both publishing into it and ingesting a version
+    /// into it from elsewhere are allowed until a `PutPackageOriginConfiguration` narrows
+    /// it. This is the record `PutPackageOriginConfiguration` creates for a package the
+    /// repository does not hold (its restrictions are then overwritten with the ones the
+    /// caller asked for) and the record a copy creates in the destination repository.
     pub fn new(format: &str, namespace: Option<&str>, name: &str) -> Self {
         Self {
             format: format.to_string(),
@@ -1219,6 +1251,28 @@ impl Package {
                 upstream: ORIGIN_RESTRICTION_ALLOW.to_string(),
             },
             versions: BTreeMap::new(),
+        }
+    }
+
+    /// A package record created because a caller PUBLISHED a version directly into the
+    /// repository: publishing stays allowed and upstream ingestion is blocked.
+    ///
+    /// CodeArtifact sets a package's origin controls when it creates the package, from HOW
+    /// the package came to exist: a package created by publishing a version directly gets
+    /// `publish: ALLOW` with `upstream: BLOCK`, which is what the controls are for — a
+    /// package name that exists in a repository because someone published it there must not
+    /// also be resolvable from an upstream or external source (the dependency-substitution
+    /// defence). `PutPackageOriginConfiguration` is what moves it afterwards.
+    ///
+    /// Only the CREATE path chooses this: a publish into a package the repository already
+    /// holds leaves that package's configuration exactly as it is.
+    pub fn published(format: &str, namespace: Option<&str>, name: &str) -> Self {
+        Self {
+            origin_restrictions: PackageOriginRestrictions {
+                publish: ORIGIN_RESTRICTION_ALLOW.to_string(),
+                upstream: ORIGIN_RESTRICTION_BLOCK.to_string(),
+            },
+            ..Self::new(format, namespace, name)
         }
     }
 

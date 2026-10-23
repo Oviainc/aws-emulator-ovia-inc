@@ -55,3 +55,5 @@ mod removals_and_copies;
 mod package_version_description;
 #[path = "all/policy_document_rendering.rs"]
 mod policy_document_rendering;
+#[path = "all/update_operations_persist.rs"]
+mod update_operations_persist;
