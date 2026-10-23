@@ -1974,10 +1974,10 @@ async fn instance_filters_select_by_every_documented_name() {
         },
         FilterCase {
             // `CreateDBInstance` resolves `DBClusterIdentifier` against this service's DB
-            // cluster records before admitting the instance, and this service holds none
-            // (every operation that could create a cluster is still a scaffolded 501), so
-            // no instance here belongs to a cluster and this filter selects nothing. The
-            // refusal itself is pinned in `docdb_query_surface`.
+            // cluster records before admitting the instance, and no `CreateDBCluster` ran
+            // in THIS test, so no instance here belongs to a cluster and this filter
+            // selects nothing. A cluster's members are pinned in `db_clusters`, and the
+            // refusal for an identifier that resolves to nothing in `docdb_query_surface`.
             case: "by cluster",
             name: "db-cluster-id",
             value: "emu-cluster".to_string(),

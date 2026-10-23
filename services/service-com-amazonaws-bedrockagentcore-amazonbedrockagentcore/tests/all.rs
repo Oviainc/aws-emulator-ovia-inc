@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/memory_events.rs"]
 mod memory_events;
+#[path = "all/service_claim.rs"]
+mod service_claim;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
