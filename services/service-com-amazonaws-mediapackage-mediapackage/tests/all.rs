@@ -13,12 +13,16 @@
 // points it into `tests/all/`.
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
+#[path = "all/empty_response_framing.rs"]
+mod empty_response_framing;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/harvest_job_rejections.rs"]
 mod harvest_job_rejections;
 #[path = "all/harvest_jobs.rs"]
 mod harvest_jobs;
+#[path = "all/harvest_startover.rs"]
+mod harvest_startover;
 #[path = "all/ingest_credentials.rs"]
 mod ingest_credentials;
 #[path = "all/mutation_persistence.rs"]
