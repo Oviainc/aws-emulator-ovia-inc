@@ -33,6 +33,8 @@ mod iso8601_timestamps;
 mod json_refusal_diagnostics;
 #[path = "all/malformed_content_and_policy_deletion.rs"]
 mod malformed_content_and_policy_deletion;
+#[path = "all/published_document_bytes.rs"]
+mod published_document_bytes;
 #[path = "all/registry_schema_lifecycle.rs"]
 mod registry_schema_lifecycle;
 #[path = "all/resource_policy.rs"]

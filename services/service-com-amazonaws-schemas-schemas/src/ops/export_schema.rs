@@ -76,7 +76,7 @@ use super::types::*;
 // documents these constants describe (the event envelope and the component refs that
 // point at it) and this operation converts them, so one definition keeps the writer
 // and the reader from drifting apart.
-use crate::state::{JSON_SCHEMA_DRAFT4_URI, OPENAPI_COMPONENT_REF};
+use crate::state::{JsonNode, JSON_SCHEMA_DRAFT4_URI, OPENAPI_COMPONENT_REF};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -275,57 +275,70 @@ const DRAFT4_DEFINITION_REF: &str = "#/definitions/";
 /// * the root carries draft-04's `$schema` and the source document's `info.title`, so
 ///   the translation says which event it describes.
 ///
+/// The MEMBER ORDER of the rendered document is part of it — `Content` is text a client
+/// caches, diffs and hashes — so both levels of it are rendered deliberately, through
+/// [`JsonNode`]: the root opens with `$schema`, then the `title`, then the
+/// `definitions`, and every definition is rendered in NAME order, which is the order
+/// the draft-04 export publishes a schema's keywords and property names in
+/// (`properties` before `required` before `type`).
+///
+/// Neither order may be left to the map a document passes through.
+/// [`serde_json::Map`] is sorted or insertion-ordered depending on whether anything in
+/// the BUILD asks for its `preserve_order` feature — a workspace-wide switch, so a
+/// document composed through [`serde_json::Value`] does not even render the same way in
+/// two builds of this emulator, let alone the way the export is published.
+///
 /// `None` when `openapi` is not a JSON document carrying an object at
 /// `components.schemas`: there is nothing to convert.
 fn to_json_schema_draft4(openapi: &str) -> Option<String> {
     let document: ::serde_json::Value = ::serde_json::from_str(openapi).ok()?;
     let components = document.get("components")?.get("schemas")?.as_object()?;
 
-    let definitions: ::serde_json::Map<String, ::serde_json::Value> = components
-        .iter()
-        .map(|(name, schema)| (name.clone(), to_draft4(schema)))
-        .collect();
-
-    let mut root = ::serde_json::Map::new();
-    root.insert(
-        "$schema".to_string(),
-        ::serde_json::Value::String(JSON_SCHEMA_DRAFT4_URI.to_string()),
+    let definitions: Vec<(String, JsonNode)> = in_name_order(
+        components
+            .iter()
+            .map(|(name, schema)| (name.clone(), to_draft4(schema)))
+            .collect(),
     );
+
+    let mut root: Vec<(String, JsonNode)> =
+        vec![("$schema".to_string(), JsonNode::text(JSON_SCHEMA_DRAFT4_URI))];
     if let Some(title) = document
         .get("info")
         .and_then(|info| info.get("title"))
         .and_then(::serde_json::Value::as_str)
     {
-        root.insert(
-            "title".to_string(),
-            ::serde_json::Value::String(title.to_string()),
-        );
+        root.push(("title".to_string(), JsonNode::text(title)));
     }
-    root.insert(
-        "definitions".to_string(),
-        ::serde_json::Value::Object(definitions),
-    );
-    ::serde_json::to_string(&::serde_json::Value::Object(root)).ok()
+    root.push(("definitions".to_string(), JsonNode::Object(definitions)));
+    Some(JsonNode::Object(root).to_json())
+}
+
+/// `members` in the order the draft-04 export renders an object's members: by name.
+fn in_name_order(mut members: Vec<(String, JsonNode)>) -> Vec<(String, JsonNode)> {
+    members.sort_by(|(left, _), (right, _)| left.cmp(right));
+    members
 }
 
 /// Translate one OpenAPI 3 schema value into the draft-4 value that says the same
 /// thing, recursively: `$ref`s follow the components this conversion moved into
 /// `definitions`, and `nullable` becomes a type union. Everything else is left as it
-/// stands — the two drafts share it.
+/// stands — the two drafts share it — and the members are rendered in name order, as the
+/// published export renders them.
 ///
 /// A `$ref` to anything other than a component of this document (an external document,
 /// say) is left alone: it names nothing this conversion moved.
-fn to_draft4(value: &::serde_json::Value) -> ::serde_json::Value {
+fn to_draft4(value: &::serde_json::Value) -> JsonNode {
     let ::serde_json::Value::Object(members) = value else {
         return match value {
             ::serde_json::Value::Array(items) => {
-                ::serde_json::Value::Array(items.iter().map(to_draft4).collect())
+                JsonNode::List(items.iter().map(to_draft4).collect())
             }
-            other => other.clone(),
+            other => JsonNode::from_value(other),
         };
     };
 
-    let mut translated: ::serde_json::Map<String, ::serde_json::Value> = ::serde_json::Map::new();
+    let mut translated: Vec<(String, JsonNode)> = Vec::with_capacity(members.len());
     let nullable = members.get(OPENAPI_NULLABLE) == Some(&::serde_json::Value::Bool(true));
     for (key, member) in members {
         // `nullable` is an OpenAPI 3.0 keyword with no draft-04 counterpart: what it
@@ -339,25 +352,28 @@ fn to_draft4(value: &::serde_json::Value) -> ::serde_json::Value {
                 .as_str()
                 .and_then(|target| target.strip_prefix(OPENAPI_COMPONENT_REF))
             {
-                translated.insert(
+                translated.push((
                     key.clone(),
-                    ::serde_json::Value::String(format!("{DRAFT4_DEFINITION_REF}{name}")),
-                );
+                    JsonNode::Text(format!("{DRAFT4_DEFINITION_REF}{name}")),
+                ));
                 continue;
             }
         }
         if key == "type" && nullable {
             if let Some(declared) = member.as_str() {
-                translated.insert(
+                translated.push((
                     key.clone(),
-                    ::serde_json::json!([declared, DRAFT4_NULL_TYPE]),
-                );
+                    JsonNode::List(vec![
+                        JsonNode::text(declared),
+                        JsonNode::text(DRAFT4_NULL_TYPE),
+                    ]),
+                ));
                 continue;
             }
         }
-        translated.insert(key.clone(), to_draft4(member));
+        translated.push((key.clone(), to_draft4(member)));
     }
-    ::serde_json::Value::Object(translated)
+    JsonNode::Object(in_name_order(translated))
 }
 
 /// The OpenAPI 3.0 keyword that says a member may be null — see [`to_draft4`].
@@ -421,6 +437,46 @@ mod tests {
             "every component is a definition and none is promoted to the root, \
              got {converted:?}"
         );
+    }
+
+    /// The conversion renders the document as the draft-04 export is published: the
+    /// dialect first, then the source document's title, then the definitions — and every
+    /// schema in it in name order, which a sorted root could not express.
+    #[test]
+    fn the_export_opens_with_the_dialect_then_the_title_then_the_definitions() {
+        // Rows: a document with a title and one without (the title is the only optional
+        // root member), and one whose components are written out of name order.
+        let cases = [
+            (
+                "titled",
+                r#"{"info":{"title":"Order Placed published by my.orders"},
+                    "components":{"schemas":{"B":{"type":"object"},"A":{"type":"string"}}}}"#,
+                concat!(
+                    r#"{"$schema":"http://json-schema.org/draft-04/schema#","#,
+                    r#""title":"Order Placed published by my.orders","#,
+                    r#""definitions":{"A":{"type":"string"},"B":{"type":"object"}}}"#
+                ),
+            ),
+            (
+                "untitled",
+                r#"{"components":{"schemas":{"Solo":{"properties":{"b":{"type":"string"},
+                    "a":{"type":"string"}},"type":"object"}}}}"#,
+                concat!(
+                    r#"{"$schema":"http://json-schema.org/draft-04/schema#","#,
+                    r#""definitions":{"Solo":{"properties":{"a":{"type":"string"},"#,
+                    r#""b":{"type":"string"}},"type":"object"}}}"#
+                ),
+            ),
+        ];
+
+        for (case, openapi, expected) in cases {
+            let converted = to_json_schema_draft4(openapi)
+                .unwrap_or_else(|| panic!("case {case:?}: the document converts"));
+            assert_eq!(
+                converted, expected,
+                "case {case:?}: expected {expected}, got {converted}"
+            );
+        }
     }
 
     /// Rows: documents with one component, with co-equal components, and documents
