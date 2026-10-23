@@ -216,6 +216,12 @@ fn finding(record: &crate::state::FindingRecord) -> Finding {
             event_last_seen: Some(crate::state::iso8601(record.updated_at_millis)),
             resource_role: Some(record.resource_role.clone()),
             service_name: Some(GUARDDUTY_SERVICE_NAME.to_string()),
+            // "Feedback that was submitted about the finding"
+            // (`smithy_query(shape="Service")`) — what `UpdateFindingsFeedback`
+            // last recorded for this finding, absent while none has been
+            // submitted. The `Comments` of that submission are `@sensitive` and
+            // the shape carries no member for them, so they are not reported.
+            user_feedback: record.user_feedback.clone(),
             // GuardDuty marks a generated sample this way, which is how a client
             // tells a sample finding from a real detection: `AdditionalInfo.Value`
             // is a JSON DOCUMENT string ("the value of the additional

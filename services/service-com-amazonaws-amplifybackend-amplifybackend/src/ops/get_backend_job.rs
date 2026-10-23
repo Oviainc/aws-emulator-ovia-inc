@@ -3,7 +3,10 @@
 //! @op GetBackendJob
 //!
 //! Reads back the job a mutating call recorded, by (AppId, BackendEnvironmentName,
-//! JobId); an id this app never minted answers `NotFoundException` (404). Jobs outlive
+//! JobId); an id this app never minted answers `NotFoundException` (404). An `AppId`
+//! that identifies no registered Amplify app is refused with HTTP 400
+//! `ValidationException` before any lookup ([`crate::state::require_registered_app`]).
+//! Jobs outlive
 //! the environment they ran against, so a lookup after `DeleteBackend` still resolves.
 //!
 //! Reporting, with ONE write: it materialises the completion the clock already made
@@ -158,6 +161,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::store_unavailable(),
             ))
         })?;
+
+        // The app-identity gate, BEFORE any per-resource lookup: a well-formed app id
+        // that identifies no registered Amplify app is a client-input error (400
+        // `ValidationException`), not a missing backend.
+        crate::state::require_registered_app(&*self.engine, &input.app_id)?;
 
         let now = std::time::SystemTime::now();
         let mut store = state.lock();

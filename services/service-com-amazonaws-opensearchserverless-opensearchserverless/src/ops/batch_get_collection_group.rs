@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetCollectionGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetCollectionGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetCollectionGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: answers each requested collection group id or name from [`crate::state`],
+//! reporting a stored group as a `CollectionGroupDetail` — with `numberOfCollections`
+//! counted over the collections that name it — and an unknown one as the modelled
+//! `NOT_FOUND` error detail. `ids` and `names` in the same request, or neither, are a
+//! `ValidationException`. This operation only READS: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +141,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetCollectionGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetCollectionGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetCollectionGroup"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchGetCollectionGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // From `ids`' and `names`' own documentation: "You can't provide names and IDs in
+        // the same request" — and a request that names neither selects no collection
+        // group at all, so neither combination is servable.
+        let refusal = match (input.ids.as_deref(), input.names.as_deref()) {
+            (Some(_), Some(_)) => Some("ids and names cannot be provided in the same request"),
+            (None, None) => Some("one of ids or names must be provided"),
+            _ => None,
+        };
+        if let Some(message) = refusal {
+            return Err(BatchGetCollectionGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let store = state.lock();
+
+        let mut details: Vec<CollectionGroupDetail> = Vec::new();
+        let mut errors: Vec<CollectionGroupErrorDetail> = Vec::new();
+
+        // Each requested key is answered in request order, either as a detail built from
+        // the stored record — with `numberOfCollections` counted from the collections that
+        // name the group — or as the `NOT_FOUND` error detail the model documents.
+        let detail_of = |record: &crate::state::CollectionGroupRecord| {
+            let collections = store.collections_in_group(&record.name);
+            record.detail(i32::try_from(collections).unwrap_or(i32::MAX))
+        };
+        for id in input.ids.unwrap_or_default() {
+            match store.collection_groups.get(&id) {
+                Some(record) => details.push(detail_of(record)),
+                None => errors.push(crate::state::collection_group_error_for_id(&id)),
+            }
+        }
+        for name in input.names.unwrap_or_default() {
+            match store.collection_group_by_name(&name) {
+                Some(record) => details.push(detail_of(record)),
+                None => errors.push(crate::state::collection_group_error_for_name(&name)),
+            }
+        }
+
+        Ok(BatchGetCollectionGroupOutput {
+            collection_group_details: Some(details),
+            collection_group_error_details: Some(errors),
+        })
     }
 }

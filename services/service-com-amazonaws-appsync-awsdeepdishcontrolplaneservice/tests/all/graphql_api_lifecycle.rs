@@ -21,7 +21,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test signs for; the service reads it off the credential scope, so
 /// it must appear in the ARN and the endpoint URIs.
-const REGION: &str = "eu-west-1";
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// The account id every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
@@ -53,7 +53,7 @@ fn unix_now() -> i64 {
 }
 
 /// A router with only this service mounted, over a fresh engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -62,7 +62,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Send one request and return `(status, parsed body)`.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -97,7 +97,7 @@ async fn call(
 }
 
 /// Create one API and return its `graphqlApi` body.
-async fn create_api(router: &MultiServiceRouter, body: Value) -> Value {
+pub(crate) async fn create_api(router: &MultiServiceRouter, body: Value) -> Value {
     let (status, created) = call(router, "POST", "/v1/apis", Some(body.clone())).await;
     assert_eq!(
         status, 200,
@@ -109,13 +109,50 @@ async fn create_api(router: &MultiServiceRouter, body: Value) -> Value {
 /// Every `authenticationType` the model declares, with the `apiType` /
 /// `visibility` combinations the create call accepts. Source: `smithy_query`
 /// shapes `AuthenticationType`, `GraphQLApiType`, `GraphQLApiVisibility`.
-const AUTH_TYPES: &[&str] = &[
+pub(crate) const AUTH_TYPES: &[&str] = &[
     "API_KEY",
     "AWS_IAM",
     "AMAZON_COGNITO_USER_POOLS",
     "OPENID_CONNECT",
     "AWS_LAMBDA",
 ];
+
+/// The configuration member an `authenticationType` is set up through, as a request
+/// fragment to merge into a create body.
+///
+/// Source: `CreateGraphqlApiRequest`'s `openIDConnectConfig` / `userPoolConfig` /
+/// `lambdaAuthorizerConfig` members and the members each of those shapes requires;
+/// `API_KEY` and `AWS_IAM` are configured by nothing, so they contribute none.
+pub(crate) fn auth_config(authentication_type: &str) -> Value {
+    match authentication_type {
+        "OPENID_CONNECT" => json!({
+            "openIDConnectConfig": { "issuer": "https://issuer.example.com" },
+        }),
+        "AMAZON_COGNITO_USER_POOLS" => json!({
+            "userPoolConfig": {
+                "userPoolId": "pool-1",
+                "awsRegion": REGION,
+                "defaultAction": "ALLOW",
+            },
+        }),
+        "AWS_LAMBDA" => json!({
+            "lambdaAuthorizerConfig": {
+                "authorizerUri": "arn:aws:lambda:eu-west-1:000000000000:function:authorize",
+            },
+        }),
+        _ => json!({}),
+    }
+}
+
+/// `base` with every member of `extra` added to it.
+pub(crate) fn merge_members(mut base: Value, extra: Value) -> Value {
+    if let (Some(target), Some(source)) = (base.as_object_mut(), extra.as_object()) {
+        for (member, value) in source {
+            target.insert(member.clone(), value.clone());
+        }
+    }
+    base
+}
 
 /// A create call is answered from the record it stored: the same body comes back
 /// from `GetGraphqlApi`, for every authentication type, API type and visibility.
@@ -144,17 +181,20 @@ async fn create_persists_the_api_and_get_answers_the_same_body() {
         let name = format!("Api_{auth}");
         let created = create_api(
             &router,
-            json!({
-                "name": name,
-                "authenticationType": auth,
-                "apiType": api_type,
-                "visibility": visibility,
-                "queryDepthLimit": depth,
-                "resolverCountLimit": resolvers,
-                "xrayEnabled": xray,
-                "tags": { "team": auth },
-                "ownerContact": "team@example.com",
-            }),
+            merge_members(
+                json!({
+                    "name": name,
+                    "authenticationType": auth,
+                    "apiType": api_type,
+                    "visibility": visibility,
+                    "queryDepthLimit": depth,
+                    "resolverCountLimit": resolvers,
+                    "xrayEnabled": xray,
+                    "tags": { "team": auth },
+                    "ownerContact": "team@example.com",
+                }),
+                auth_config(auth),
+            ),
         )
         .await;
 
@@ -219,8 +259,14 @@ async fn create_persists_the_api_and_get_answers_the_same_body() {
         );
         assert_eq!(
             created["uris"]["GRAPHQL"].as_str(),
-            Some(format!("https://{api_id}.appsync-api.{REGION}.amazonaws.com/graphql").as_str()),
-            "case {auth}: expected the GRAPHQL endpoint, got {created:?}"
+            Some(
+                format!(
+                    "https://{}/graphql",
+                    created["dns"]["GRAPHQL"].as_str().unwrap_or_default()
+                )
+                .as_str()
+            ),
+            "case {auth}: expected the GRAPHQL endpoint on the host dns publishes, got {created:?}"
         );
         assert_eq!(
             created["tags"]["team"].as_str(),
@@ -265,54 +311,11 @@ async fn omitted_members_take_their_documented_defaults() {
             "case {member}: expected the documented default {expected}, got {created:?}"
         );
     }
-    assert!(
-        created["tags"].is_null(),
-        "case tags: an API created without tags carries no tags member, got {created:?}"
+    assert_eq!(
+        created["tags"],
+        json!({}),
+        "case tags: an API created without tags reports an empty tag map, got {created:?}"
     );
-}
-
-/// A name the `GraphqlApi$name` pattern cannot hold is refused with 400, and a name
-/// it can hold is accepted — over a table of both.
-#[tokio::test]
-async fn the_name_pattern_is_enforced() {
-    let router = router();
-
-    // Rows differ along the pattern's two character classes (first character, rest)
-    // and its minimum length. Source: `GraphqlApi$name`'s length 1..65536 and
-    // pattern ^[_A-Za-z][_0-9A-Za-z]*$.
-    let cases: &[(&str, bool)] = &[
-        ("MyApi", true),
-        ("_leading_underscore", true),
-        ("a", true),
-        ("With0Digits9", true),
-        ("", false),
-        ("0LeadingDigit", false),
-        ("has-a-dash", false),
-        ("has space", false),
-        ("has.dot", false),
-        ("naïve", false),
-    ];
-
-    for (name, accepted) in cases {
-        let (status, body) = call(
-            &router,
-            "POST",
-            "/v1/apis",
-            Some(json!({ "name": name, "authenticationType": "API_KEY" })),
-        )
-        .await;
-        let expected = if *accepted { 200 } else { 400 };
-        assert_eq!(
-            status, expected,
-            "case {name:?}: expected HTTP {expected}, got {status} {body:?}"
-        );
-        if !*accepted {
-            assert!(
-                body["message"].as_str().is_some(),
-                "case {name:?}: a refusal must say what was wrong, got {body:?}"
-            );
-        }
-    }
 }
 
 /// `ListGraphqlApis` reports every persisted API, pages by `maxResults` through

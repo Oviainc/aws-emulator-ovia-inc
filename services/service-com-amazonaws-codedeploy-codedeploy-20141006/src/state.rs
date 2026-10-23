@@ -241,6 +241,16 @@ pub const MAX_APPLICATIONS: usize = 1_000;
 /// See [`MAX_APPLICATIONS`].
 pub const MAX_DEPLOYMENT_GROUPS_PER_APPLICATION: usize = 1_000;
 
+/// How many deployment configurations one account's store holds, counting the
+/// `CodeDeployDefault.*` built-ins.
+///
+/// CodeDeploy's published quotas state no number this emulator can cite for
+/// deployment configurations, so this bound is CHOSEN. It is enforced because it
+/// is what keeps the store from growing without limit on repeated
+/// `CreateDeploymentConfig` calls, and the model declares the error for it
+/// (`DeploymentConfigLimitExceededException`).
+pub const MAX_DEPLOYMENT_CONFIGS: usize = 1_000;
+
 /// How many deployments of history the store keeps.
 ///
 /// CodeDeploy publishes no quota for retained deployment history and does not

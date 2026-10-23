@@ -140,7 +140,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store's ARN key carries.
         let arn = crate::state::resource_arn(
             &crate::state::request_region(ctx),
-            "action",
+            crate::state::ACTION_KIND,
             &input.action_name,
         );
 

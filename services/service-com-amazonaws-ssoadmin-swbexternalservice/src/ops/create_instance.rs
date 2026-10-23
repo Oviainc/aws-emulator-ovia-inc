@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates the ONE instance of IAM Identity Center an account may hold, and
+//! refuses the request when the account already holds one. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation's own documentation is the whole rule: "You can create only one instance
+//! per account and across all Amazon Web Services Regions", and the request "is rejected
+//! if … An instance already exists in the same account" — which is the modelled
+//! `ServiceQuotaExceededException` (HTTP 402), the permitted number of instances being
+//! one. `ClientToken` is `@idempotencyToken`, so a retry carrying the token of the call
+//! that DID create the instance answers with that instance instead of the refusal, and
+//! the same token with different parameters is the modelled `ConflictException` (409).
+//!
+//! What it creates is an ACCOUNT instance (`crate::state::InstanceType::Account`): the
+//! operation is documented as creating an instance "for a standalone Amazon Web Services
+//! account that is not managed by Organizations". Such an instance serves no permission
+//! sets, which is what `DescribeInstance$PermissionSetsEnabled` reports of it.
+//!
+//! A created instance starts `CREATE_IN_PROGRESS` and becomes `ACTIVE` when the clock
+//! makes that due (`crate::state::INSTANCE_ACTIVATION_SPAN`), so a caller that reads it
+//! straight back observes the transient status the model's `InstanceStatus` enum
+//! declares; nothing sleeps for it.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +184,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInstance"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateInstanceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        // A create is a WRITE, so it also materialises what the clock already owes: an
+        // instance whose activation instant has passed is ACTIVE before this call looks
+        // at it.
+        store.materialize_due(now);
+
+        // `ClientToken` is `@idempotencyToken`: a retry of the call that created the
+        // instance must answer with that instance, not with a refusal. "Passing the same
+        // value to a later call to an operation requires that you also pass the same
+        // value for all other parameters", so the same token with a different request is
+        // a conflict rather than a second answer.
+        if let Some(client_token) = input.client_token.as_deref() {
+            if let Some(existing) = store.instance_by_client_token(client_token) {
+                let same_request = existing.name == input.name
+                    && tags_match(&existing.tags, input.tags.as_deref().unwrap_or(&[]));
+                if !same_request {
+                    return Err(CreateInstanceErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(crate::state::CLIENT_TOKEN_MISMATCH_MESSAGE.to_string()),
+                        },
+                    )
+                    .into());
+                }
+                return Ok(CreateInstanceOutput {
+                    instance_arn: Some(existing.instance_arn.clone()),
+                });
+            }
+        }
+
+        // One instance per account, across all Regions: with one already held there is
+        // no second to create, and the existing instance is left exactly as it was.
+        if !store.instances.is_empty() {
+            return Err(CreateInstanceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(crate::state::INSTANCE_QUOTA_EXCEEDED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let instance_id = crate::state::mint_instance_id();
+        let identity_store_id = crate::state::mint_identity_store_id();
+        let mut instance = crate::state::Instance::creating(
+            &instance_id,
+            &identity_store_id,
+            // What this operation creates: the instance of a standalone account.
+            crate::state::InstanceType::Account,
+            input.name,
+            now,
+        );
+        instance.client_token = input.client_token;
+        instance.tags = input.tags.unwrap_or_default();
+        // A freshly minted id cannot already be stored; checking before the insert means
+        // a collision is reported rather than silently replacing another instance.
+        if store.instances.contains_key(&instance.instance_arn) {
+            return Err(CreateInstanceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the minted InstanceArn collided with a stored one".to_string()),
+                },
+            )
+            .into());
+        }
+        let instance_arn = instance.instance_arn.clone();
+        store.instances.insert(instance_arn.clone(), instance);
+        // Answer from the STORED record, so this response cannot disagree with what the
+        // next `ListInstances` / `DescribeInstance` reads.
+        let stored = store.instance(&instance_arn).ok_or_else(|| {
+            CreateInstanceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the stored instance could not be read".to_string()),
+            })
+        })?;
+        Ok(CreateInstanceOutput {
+            instance_arn: Some(stored.instance_arn.clone()),
+        })
     }
+}
+
+/// Whether two tag sets are the same set of (key, value) pairs, order disregarded — the
+/// comparison the `ClientToken` idempotency check needs over `Tags`, which the model
+/// carries as a list but AWS treats as a set keyed by `Key`.
+fn tags_match(stored: &[Tag], requested: &[Tag]) -> bool {
+    if stored.len() != requested.len() {
+        return false;
+    }
+    requested.iter().all(|wanted| {
+        stored
+            .iter()
+            .any(|tag| tag.key == wanted.key && tag.value == wanted.value)
+    })
 }

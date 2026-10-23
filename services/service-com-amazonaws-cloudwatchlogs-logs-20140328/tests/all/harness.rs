@@ -81,6 +81,26 @@ impl Logs {
         error_code(&parsed)
     }
 
+    /// Call one operation that must be refused as a client error, returning its wire
+    /// error code AND the message it reports — for a refusal whose message the service
+    /// builds from the request, so the message carries the rule.
+    pub async fn refusal(&self, operation: &str, body: &Value) -> (String, String) {
+        let (status, parsed) = self.call(operation, body).await;
+        assert_eq!(
+            status, 400,
+            "{operation} {body}: expected HTTP 400, got {status} {parsed}"
+        );
+        let message = parsed
+            .get("message")
+            .or_else(|| parsed.get("Message"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!("{operation} {body}: a refusal carries a message, got {parsed}")
+            })
+            .to_string();
+        (error_code(&parsed), message)
+    }
+
     /// The one log group the service reports under `identifier` (a name or either ARN
     /// form), or `None` once it is gone. Every suite that reads a log group's state back
     /// goes through this, so what it asserts is what a client can observe.
@@ -139,4 +159,38 @@ pub fn now_ms() -> i64 {
             .as_millis(),
     )
     .expect("the epoch milliseconds fit in an i64")
+}
+
+/// An in-window base timestamp: one hour before the ingestion clock. `PutLogEvents`
+/// admits each event against a clock-relative ingestion window (14 days in the past to
+/// 2 hours in the future), so a suite whose subject is NOT that window stamps its events
+/// from this base plus a small offset and stays comfortably inside it. The window itself
+/// is the subject of `tests/all/ingestion_window.rs`.
+pub fn base_ms() -> i64 {
+    now_ms() - 60 * 60 * 1_000
+}
+
+/// A log group plus one stream, both created, with a retention in days when one is
+/// given. The whole of this target's core loop starts from this pair, so it lives here
+/// rather than once per suite.
+pub async fn group_with_stream(
+    logs: &Logs,
+    group: &str,
+    stream: &str,
+    retention_in_days: Option<i64>,
+) {
+    logs.ok("CreateLogGroup", &serde_json::json!({"logGroupName": group}))
+        .await;
+    if let Some(days) = retention_in_days {
+        logs.ok(
+            "PutRetentionPolicy",
+            &serde_json::json!({"logGroupName": group, "retentionInDays": days}),
+        )
+        .await;
+    }
+    logs.ok(
+        "CreateLogStream",
+        &serde_json::json!({"logGroupName": group, "logStreamName": stream}),
+    )
+    .await;
 }

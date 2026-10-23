@@ -196,20 +196,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `CreateGraphqlApiRequest$name` targets a plain string, so the boundary
-        // validator never applies `GraphqlApi$name`'s own `length`/`pattern`
-        // constraints — but that is the shape every later read answers with, so a
-        // name it cannot hold is refused here instead of being stored.
-        if !is_resource_name(&input.name) {
+        // An authentication type that carries settings is configured by its own
+        // member, so a request that selects such a type without supplying that
+        // member is not well formed and is refused with `BadRequestException`. The
+        // rule holds for the API's own `authenticationType` and, independently, for
+        // every `additionalAuthenticationProviders` entry — which the refusal names
+        // by its 1-based position, the only way a caller can tell them apart.
+        if let Some(config) = missing_auth_config(
+            Some(input.authentication_type.as_str()),
+            input.open_id_connect_config.is_some(),
+            input.user_pool_config.is_some(),
+            input.lambda_authorizer_config.is_some(),
+        ) {
             return Err(CreateGraphqlApiErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "name must be 1-{RESOURCE_NAME_MAX_LEN} characters matching \
-                     {RESOURCE_NAME_RULE}, got \"{}\"",
-                    input.name
-                )),
+                message: Some(api_level_missing_config_message(config)),
                 ..Default::default()
             })
             .into());
+        }
+        for (position, provider) in input
+            .additional_authentication_providers
+            .iter()
+            .flatten()
+            .enumerate()
+        {
+            if let Some(config) = missing_auth_config(
+                provider.authentication_type.as_deref(),
+                provider.open_id_connect_config.is_some(),
+                provider.user_pool_config.is_some(),
+                provider.lambda_authorizer_config.is_some(),
+            ) {
+                return Err(CreateGraphqlApiErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(format!(
+                        "{config} is missing for additional authentication provider {}",
+                        position + 1
+                    )),
+                    ..Default::default()
+                })
+                .into());
+            }
+        }
+
+        // An authentication type identifies ONE way of authenticating the API, so
+        // the API cannot name it twice: an additional provider repeating the API's
+        // own type, or a type an earlier provider already named, is refused.
+        let mut specified = vec![input.authentication_type.clone()];
+        for (position, provider) in input
+            .additional_authentication_providers
+            .iter()
+            .flatten()
+            .enumerate()
+        {
+            let Some(authentication_type) = provider.authentication_type.clone() else {
+                continue;
+            };
+            if specified.contains(&authentication_type) {
+                return Err(CreateGraphqlApiErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(format!(
+                        "Authentication type {authentication_type} for additional \
+                         authentication provider {} already specified on the API. It can only \
+                         be specified once.",
+                        position + 1
+                    )),
+                    ..Default::default()
+                })
+                .into());
+            }
+            specified.push(authentication_type);
+        }
+
+        // An OIDC provider is identified by its issuer, which "must exactly match
+        // the value of `iss` in the ID token" — an absolute URL. A value that is
+        // not one cannot identify a provider, so the request is refused. The rule
+        // holds for the API's own configuration and for every additional
+        // provider's.
+        for config in input
+            .open_id_connect_config
+            .iter()
+            .chain(
+                input
+                    .additional_authentication_providers
+                    .iter()
+                    .flatten()
+                    .filter_map(|provider| provider.open_id_connect_config.as_ref()),
+            )
+        {
+            if !is_absolute_url(&config.issuer) {
+                return Err(CreateGraphqlApiErrorModeled::BadRequestException(BadRequestException {
+                    message: Some("Issuer is not a valid URL".to_string()),
+                    ..Default::default()
+                })
+                .into());
+            }
         }
 
         // `ownerContact` "accepts any string input with a length of 0 - 256
@@ -254,12 +332,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         while guard.graphql_apis.contains_key(&api_id) {
             api_id = guard.mint_id();
         }
+        // The endpoints are published on a host label of their own, minted the same
+        // way and independently of the `apiId`: an AppSync endpoint hostname cannot
+        // be derived from the API's id.
+        let mut host_label = guard.mint_id();
+        while host_label == api_id {
+            host_label = guard.mint_id();
+        }
         let seq = guard.next_seq();
 
         let record = crate::state::GraphqlApiRecord {
             seq,
             arn: ::engine::emulator_arn(ARN_SERVICE, &region, &format!("apis/{api_id}")),
-            uris: api_uris(&api_id, &region),
+            dns: api_dns(&host_label, &region),
             api_id: api_id.clone(),
             name: input.name,
             authentication_type: input.authentication_type,
@@ -309,13 +394,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The ARN namespace (and endpoint prefix) this service's resources carry.
 const ARN_SERVICE: &str = "appsync";
 
-/// `GraphqlApi$name`'s modelled pattern, quoted in a refusal so the caller can fix the
-/// request from the message alone.
-const RESOURCE_NAME_RULE: &str = "^[_A-Za-z][_0-9A-Za-z]*$";
-
-/// `GraphqlApi$name`'s modelled maximum length.
-const RESOURCE_NAME_MAX_LEN: usize = 65_536;
-
 /// `ownerContact`'s documented maximum length: "This field accepts any string input
 /// with a length of 0 - 256 characters."
 const OWNER_CONTACT_MAX_LEN: usize = 256;
@@ -333,34 +411,84 @@ const DEFAULT_VISIBILITY: &str = "GLOBAL";
 /// The model's documented value for `introspectionConfig` when the request omits it.
 const DEFAULT_INTROSPECTION_CONFIG: &str = "ENABLED";
 
-/// Whether `name` satisfies `GraphqlApi$name`'s modelled `length` (1..65536) and
-/// `pattern` (`^[_A-Za-z][_0-9A-Za-z]*$`).
+/// The configuration `authentication_type` is set up through and the request did
+/// not carry, or `None` when it carried it (or the type needs none at all:
+/// `API_KEY` and `AWS_IAM` are configured by nothing).
 ///
-/// Hand-written rather than taken from a regex crate because the pattern is a
-/// two-class character test, not a general expression: a leading ASCII letter or
-/// underscore, then letters, digits or underscores.
-fn is_resource_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if name.chars().count() > RESOURCE_NAME_MAX_LEN {
-        return false;
+/// Source: the per-type configuration members of `CreateGraphqlApiRequest` and of
+/// `AdditionalAuthenticationProvider` — `openIDConnectConfig` ("The OIDC
+/// configuration"), `userPoolConfig` ("The Amazon Cognito user pool
+/// configuration") and `lambdaAuthorizerConfig` ("Configuration for Lambda function
+/// authorization").
+///
+/// Takes the three presence flags rather than the structures themselves because the
+/// API-level and the per-provider user-pool configurations are modelled with
+/// different shapes (`UserPoolConfig` vs `CognitoUserPoolConfig`) while the rule
+/// over them is one.
+fn missing_auth_config(
+    authentication_type: Option<&str>,
+    open_id_connect_config: bool,
+    user_pool_config: bool,
+    lambda_authorizer_config: bool,
+) -> Option<&'static str> {
+    match authentication_type? {
+        "OPENID_CONNECT" if !open_id_connect_config => Some(OPEN_ID_CONNECT_CONFIG),
+        "AMAZON_COGNITO_USER_POOLS" if !user_pool_config => Some(USER_POOL_CONFIG),
+        "AWS_LAMBDA" if !lambda_authorizer_config => Some(LAMBDA_AUTHORIZER_CONFIG),
+        _ => None,
     }
-    (first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// The endpoints AppSync publishes for a GraphQL API, keyed as it keys them.
-fn api_uris(api_id: &str, region: &str) -> std::collections::BTreeMap<String, String> {
+/// The name a refusal names the OIDC configuration by.
+const OPEN_ID_CONNECT_CONFIG: &str = "OpenID Connect Config";
+
+/// The name a refusal names the Cognito user pool configuration by.
+const USER_POOL_CONFIG: &str = "User Pool Config";
+
+/// The name a refusal names the Lambda authorizer configuration by.
+const LAMBDA_AUTHORIZER_CONFIG: &str = "Lambda Authorizer Config";
+
+/// How the service states the absence of the API's OWN authentication
+/// configuration, per configuration.
+///
+/// The service does not word these from one template: the recorded refusals state
+/// the OIDC configuration's absence as "OpenID Connect Config missing" and the
+/// Cognito user pool's as "User Pool Config is empty", so each is stated as the
+/// service states it rather than derived from the other. No recording covers the
+/// Lambda authorizer configuration, so its absence is worded the way the
+/// per-provider refusal words a missing configuration, and the requirement that
+/// wording answers is the 400 and `BadRequestException` rather than the text.
+fn api_level_missing_config_message(config: &str) -> String {
+    match config {
+        OPEN_ID_CONNECT_CONFIG => format!("{OPEN_ID_CONNECT_CONFIG} missing"),
+        USER_POOL_CONFIG => format!("{USER_POOL_CONFIG} is empty"),
+        other => format!("{other} is missing"),
+    }
+}
+
+/// Whether `candidate` is an absolute URL, as an OIDC issuer has to be.
+///
+/// Parsed with the `url` crate (WHATWG URL), so the judgement is a real parse
+/// rather than a string test: a relative reference, a bare host or a value with no
+/// scheme is not one. A scheme-relative or opaque URL (`mailto:…`) carries no host,
+/// which an issuer an ID token is checked against must have.
+fn is_absolute_url(candidate: &str) -> bool {
+    ::url::Url::parse(candidate).is_ok_and(|parsed| parsed.has_host())
+}
+
+/// The DNS records AppSync publishes for a GraphQL API: one hostname per endpoint,
+/// keyed as it keys them, both on the API's own endpoint host label.
+/// `GraphqlApi$uris` is derived from these (see [`crate::state`]), so the two
+/// members always name the same hosts.
+fn api_dns(host_label: &str, region: &str) -> std::collections::BTreeMap<String, String> {
     std::collections::BTreeMap::from([
         (
-            "GRAPHQL".to_string(),
-            format!("https://{api_id}.appsync-api.{region}.amazonaws.com/graphql"),
+            crate::state::GRAPHQL_ENDPOINT.to_string(),
+            format!("{host_label}.appsync-api.{region}.amazonaws.com"),
         ),
         (
-            "REALTIME".to_string(),
-            format!("wss://{api_id}.appsync-realtime-api.{region}.amazonaws.com/graphql"),
+            crate::state::REALTIME_ENDPOINT.to_string(),
+            format!("{host_label}.appsync-realtime-api.{region}.amazonaws.com"),
         ),
     ])
 }

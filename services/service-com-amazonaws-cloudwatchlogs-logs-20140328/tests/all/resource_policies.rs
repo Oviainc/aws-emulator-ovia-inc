@@ -774,6 +774,28 @@ async fn put_refuses_requests_it_cannot_store() {
         "case unknown log group: a policy cannot be attached to a group that does not exist"
     );
 
+    // A `resourceArn` that is not an ARN at all is refused with the service's
+    // request-derived validation-error message, naming the member and the value it could
+    // not parse — the same rule every ARN member of this service is held to. A
+    // well-formed ARN of the wrong kind reports the kind instead (the rows above).
+    for not_an_arn in ["not-an-arn", "logs.amazonaws.com", "arn:aws:logs"] {
+        let (code, message) = logs
+            .refusal(
+                "PutResourcePolicy",
+                &json!({"policyName": "p", "policyDocument": document, "resourceArn": not_an_arn}),
+            )
+            .await;
+        assert_eq!(
+            code, "InvalidParameterException",
+            "case resourceArn {not_an_arn}: a value that is not an ARN is refused, got {code} {message}"
+        );
+        assert_eq!(
+            message,
+            format!("1 validation error detected: Unable to parse resourceArn {not_an_arn}"),
+            "case resourceArn {not_an_arn}: the refusal names the member and the value, got {message}"
+        );
+    }
+
     // `policyScope` only takes the two values the model's `PolicyScope` enum declares,
     // so the boundary validator refuses any other before a handler sees it.
     assert_eq!(

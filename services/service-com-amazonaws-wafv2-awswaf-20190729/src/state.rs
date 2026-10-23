@@ -13,10 +13,18 @@
 //! (its scope, its optimistic-lock token and its tags) sits beside it.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
+
+use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+use ::aws_smithy_schema_server::constraints::{
+    validate, ElementConstraintsTrait, LengthTrait, PatternTrait, Violation,
+};
 
 use crate::ops::types::{
     IPSet, Rule, Statement, Tag, WAFAssociatedItemException, WAFDuplicateItemException,
-    WAFLimitsExceededException, WAFNonexistentItemException, WAFOptimisticLockException, WebACL,
+    WAFInvalidParameterException, WAFLimitsExceededException, WAFNonexistentItemException,
+    WAFOptimisticLockException, WebACL,
 };
 
 /// The `Scope` values the model declares
@@ -175,6 +183,21 @@ pub enum ResourceRef {
         /// The IP set's id.
         id: String,
     },
+    /// A rule group, by `(Scope, Id)`.
+    ///
+    /// Nothing is indexed under this variant yet: rule groups have no store,
+    /// because `CreateRuleGroup` is still a scaffolded 501 tracked as its own gap
+    /// issue. It is named here because the index resolves an ARN to its resource
+    /// KIND, and `rulegroup` is one of the kinds a wafv2 ARN can carry — so a
+    /// reference to one resolves to nothing rather than being mistaken for a
+    /// resource of another kind. See
+    /// [`ComAmazonawsWafv2Awswaf20190729State::holds_rule_group`].
+    RuleGroup {
+        /// The scope the rule group lives in.
+        scope: String,
+        /// The rule group's id.
+        id: String,
+    },
 }
 
 /// Per-service state for com-amazonaws-wafv2-awswaf-20190729. A handler reaches it through [`service_state`].
@@ -318,6 +341,27 @@ impl ComAmazonawsWafv2Awswaf20190729State {
             pending.extend(nested_statements(statement));
         }
         None
+    }
+
+    /// `true` when `arn` names a rule group this service holds.
+    ///
+    /// WAF resolves a published version's `AssociatedRuleGroupArn` against the
+    /// vendor's own rule groups, so this is what
+    /// `PutManagedRuleSetVersions` consults before it judges anything else about
+    /// the request. The ARN must be a well-formed wafv2 ARN whose resource kind is
+    /// `rulegroup` AND be indexed as one: an ARN of another kind, or one naming a
+    /// rule group that was never created, resolves to nothing.
+    ///
+    /// Rule groups have no store yet — `CreateRuleGroup` is a scaffolded 501,
+    /// tracked as its own gap issue — so nothing is indexed under a `rulegroup`
+    /// ARN today and every such reference is unresolvable. That is the same stance
+    /// [`Self::unresolvable_rule_reference`] already takes for a
+    /// `RuleGroupReferenceStatement`: a reference WAF cannot resolve is refused
+    /// rather than stored as though it were live. The resolution is read from the
+    /// index, so it starts answering `true` the moment rule groups are stored.
+    pub fn holds_rule_group(&self, arn: &str) -> bool {
+        arn_resource_kind(arn) == Some(RULE_GROUP_ARN_KIND)
+            && matches!(self.arn_index.get(arn), Some(ResourceRef::RuleGroup { .. }))
     }
 
     /// The live web ACL whose rule tree references `ip_set_arn`, if any.
@@ -743,4 +787,368 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsWafv2Awswaf20190729State>)
+}
+
+// ===========================================================================
+// The WAFv2 request-validation layer
+// ===========================================================================
+//
+// Two facts about how WAF refuses a bad parameter live here, and both are about
+// the ANSWER rather than about the checking:
+//
+//   * WAF answers with its OWN modelled `WAFInvalidParameterException`, which the
+//     model gives `Field`, `Parameter` and `Reason` members beside the message —
+//     so a client can read WHICH input to correct instead of parsing prose.
+//     [`invalid_parameter_exception`] builds it, and composes the message from
+//     exactly those three the way WAF does.
+//   * WAF resolves what a request REFERENCES before it judges the syntax of the
+//     request's other members, and it reports a collection whose ELEMENTS are at
+//     fault against the collection member's own path. Neither is something the
+//     request boundary can do for a handler: the boundary runs every modelled
+//     constraint first, and words an element failure at the element's indexed
+//     path. An operation therefore hands the members concerned over with
+//     `skip_validation` on its input struct (see `src/ops/types/`) and checks them
+//     here, at the point in its own sequence where WAF checks them.
+//
+// NOTHING about constraint CHECKING is re-implemented. The constraints a member's
+// `skip_validation` strips off its generated member schema are RE-DECLARED below
+// in the framework's own representation — a [`TraitMap`] of
+// `LengthTrait`/`PatternTrait`/`ElementConstraintsTrait`, the exact form
+// `vendor/smithy-macros` would have attached — hung on a member schema of the same
+// name, and the check itself is
+// [`::aws_smithy_schema_server::constraints::validate`], the SAME walk the
+// boundary runs. So the clause, the elision of a long value, the violation cap and
+// the lowerCamel path stay the framework's, and a member refused here reads
+// identically to one refused at the boundary.
+
+/// The `ParameterExceptionField` value naming a resource ARN
+/// (`smithy_query(query="shape",shape="ParameterExceptionField")` lists
+/// `RESOURCE_ARN` among its values).
+pub const FIELD_RESOURCE_ARN: &str = "RESOURCE_ARN";
+
+/// The `ParameterExceptionField` value naming a web ACL. See
+/// [`FIELD_RESOURCE_ARN`].
+pub const FIELD_WEB_ACL: &str = "WEB_ACL";
+
+/// The `ParameterExceptionField` value naming a `Scope`. See
+/// [`FIELD_RESOURCE_ARN`].
+pub const FIELD_SCOPE_VALUE: &str = "SCOPE_VALUE";
+
+/// The `ParameterExceptionField` value naming a rule statement. See
+/// [`FIELD_RESOURCE_ARN`].
+pub const FIELD_STATEMENT: &str = "STATEMENT";
+
+/// The `ParameterExceptionField` value naming an IP address. See
+/// [`FIELD_RESOURCE_ARN`].
+pub const FIELD_IP_ADDRESS: &str = "IP_ADDRESS";
+
+/// The `ParameterExceptionField` value naming a per-call entity limit. See
+/// [`FIELD_RESOURCE_ARN`].
+pub const FIELD_ENTITY_LIMIT: &str = "ENTITY_LIMIT";
+
+/// The `ErrorReason` WAF carries for an ARN it will not accept, as the recorded
+/// WAF responses show it.
+///
+/// One sentence for the whole class — an ARN that is malformed, and an ARN that is
+/// well formed but names nothing WAF can use for this parameter — because that is
+/// what WAF answers for both: the `Parameter` member carries the rejected value,
+/// so the reason does not have to distinguish them.
+pub const ARN_NOT_VALID_REASON: &str = "The ARN isn't valid. A valid ARN begins with arn: \
+     and includes other information separated by colons or slashes.";
+
+/// The resource-kind segment a rule group's ARN carries
+/// (`arn:…:wafv2:…:<global|regional>/rulegroup/<name>/<id>`, the form
+/// [`resource_arn`] mints).
+pub const RULE_GROUP_ARN_KIND: &str = "rulegroup";
+
+/// `WAFInvalidParameterException` as WAF returns it: the structured `Field`,
+/// `Parameter` and `Reason` the model gives this one exception, and the message
+/// WAF composes from exactly those three.
+///
+/// This is the one WAFv2 exception whose body describes the CALL (see the note
+/// above the constant sentences at the top of this module): `Field` is "the
+/// settings where the invalid parameter was found", `Parameter` is "the invalid
+/// parameter that resulted in the exception" and `Reason` is "additional
+/// information about the exception" (each member's own doc). The message is built
+/// from the response's own three members and carries nothing else from the
+/// request, so every refusal of this type reads alike whatever tripped it.
+pub fn invalid_parameter_exception(
+    field: &str,
+    parameter: &str,
+    reason: &str,
+) -> WAFInvalidParameterException {
+    WAFInvalidParameterException {
+        message: Some(format!(
+            "Error reason: {reason}, field: {field}, parameter: {parameter}"
+        )),
+        field: Some(field.to_string()),
+        parameter: Some(parameter.to_string()),
+        reason: Some(reason.to_string()),
+    }
+}
+
+/// [`invalid_parameter_exception`] for an ARN WAF will not accept: `Field`
+/// [`FIELD_RESOURCE_ARN`], `Parameter` the rejected ARN and `Reason`
+/// [`ARN_NOT_VALID_REASON`].
+pub fn invalid_arn_exception(arn: &str) -> WAFInvalidParameterException {
+    invalid_parameter_exception(FIELD_RESOURCE_ARN, arn, ARN_NOT_VALID_REASON)
+}
+
+/// The resource-kind segment of a wafv2 resource ARN (`webacl`, `ipset`,
+/// `rulegroup`, …), or `None` when `value` is not one at all.
+///
+/// The ARN layout is the one [`is_wafv2_resource_arn`] pins:
+/// `arn:<partition>:wafv2:<region>:<account>:<global|regional>/<kind>/<name>/<id>`,
+/// so the kind is the second slash-separated segment of the resource part.
+pub fn arn_resource_kind(value: &str) -> Option<&str> {
+    if !is_wafv2_resource_arn(value) {
+        return None;
+    }
+    value.split(':').nth(5)?.split('/').nth(1)
+}
+
+/// This service's Smithy namespace, for the shadow member schemas below.
+const NAMESPACE: &str = "com.amazonaws.wafv2";
+
+/// `^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$` — the `@pattern` shared by
+/// `LockToken` and `EntityId`
+/// (`smithy_query(query="shape",shape="LockToken,EntityId")`), the form
+/// [`new_uuid`] mints.
+const UUID_PATTERN: &str = r"^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$";
+
+/// `^[\w\.\-/]+$` — `TokenDomain`'s `@pattern`
+/// (`smithy_query(query="shape",shape="TokenDomain")`).
+const TOKEN_DOMAIN_PATTERN: &str = r"^[\w\.\-/]+$";
+
+/// `LockToken`: `@length(1..36)` plus [`UUID_PATTERN`].
+static LOCK_TOKEN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(36))));
+    traits.insert(Box::new(PatternTrait::new(UUID_PATTERN)));
+    traits
+});
+
+/// `TokenDomain`: `@length(1..253)` plus [`TOKEN_DOMAIN_PATTERN`].
+static TOKEN_DOMAIN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(253))));
+    traits.insert(Box::new(PatternTrait::new(TOKEN_DOMAIN_PATTERN)));
+    traits
+});
+
+/// `APIKeyTokenDomains`: `@length(min 1)` ELEMENTS, with `TokenDomain`'s own
+/// constraints carried for each element exactly as codegen carries them
+/// (`smithy_query(query="shape",shape="APIKeyTokenDomains")`).
+static TOKEN_DOMAINS_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), None)));
+    traits.insert(Box::new(ElementConstraintsTrait::new(&TOKEN_DOMAIN_TRAITS)));
+    traits
+});
+
+/// `LockToken`, as every operation that takes an optimistic-lock token declares
+/// it. The walk reads only a member schema's NAME (for the violation path) and its
+/// trait map, so one declaration serves every such operation.
+pub static M_LOCK_TOKEN: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.wafv2#ConstrainedInput$LockToken",
+        NAMESPACE,
+        "LockToken",
+    ),
+    ShapeType::String,
+    "LockToken",
+    0,
+)
+.with_traits(&LOCK_TOKEN_TRAITS);
+
+/// `TokenDomains`, which targets `APIKeyTokenDomains`.
+pub static M_TOKEN_DOMAINS: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.wafv2#ConstrainedInput$TokenDomains",
+        NAMESPACE,
+        "TokenDomains",
+    ),
+    ShapeType::List,
+    "TokenDomains",
+    1,
+)
+.with_traits(&TOKEN_DOMAINS_TRAITS);
+
+/// `TokenDomain`'s constraints as the aggregated clause lists them — every
+/// constraint of the element shape, in one set, whichever of them an element
+/// failed.
+///
+/// Spelled out because the framework's `Violation::requirement` wording is not
+/// public: each sentence here is that function's own
+/// (`Member must have length less than or equal to …`,
+/// `Member must satisfy regular expression pattern: …`) and each bound is
+/// `TokenDomain`'s, declared once in [`TOKEN_DOMAIN_TRAITS`] above. The ORDER is
+/// the order WAF's request validator lists them: the length ceiling, the length
+/// floor, then the pattern.
+pub const TOKEN_DOMAIN_CONSTRAINTS: &[&str] = &[
+    "Member must have length less than or equal to 253",
+    "Member must have length greater than or equal to 1",
+    r"Member must satisfy regular expression pattern: ^[\w\.\-/]+$",
+];
+
+/// The root of the shadow input the walk is driven over. Its member list is empty
+/// on purpose: the walk visits what [`ConstrainedMembers`] WRITES, which is
+/// whichever members the calling operation handed over, and a root struct schema
+/// carries no member name so it contributes no path segment.
+static CONSTRAINED_INPUT_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "com.amazonaws.wafv2#ConstrainedInput",
+        NAMESPACE,
+        "ConstrainedInput",
+    ),
+    ShapeType::Structure,
+    &[],
+);
+
+/// One value handed to the validating walk, written the way the codec writes that
+/// shape so the walk builds the same path and runs the same checks.
+pub enum ConstrainedValue<'a> {
+    /// A string leaf.
+    Text(&'a str),
+    /// A list of strings; the walk names each element `<member>.<n>.member`.
+    Texts(&'a [String]),
+}
+
+/// The members of ONE request whose constraints their operation handed over,
+/// written for [`::aws_smithy_schema_server::constraints::validate`].
+pub struct ConstrainedMembers<'a> {
+    members: &'a [(&'static Schema, ConstrainedValue<'a>)],
+}
+
+impl SerializableStruct for ConstrainedMembers<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        for (schema, value) in self.members {
+            match value {
+                // A scalar list element is written against the COLLECTION member
+                // schema, which is what `vendor/smithy-macros` emits and what lets
+                // the walk tell the collection's element-count bound from the
+                // elements' own bounds (the latter travel in
+                // `ElementConstraintsTrait`).
+                ConstrainedValue::Text(text) => s.write_string(schema, text)?,
+                ConstrainedValue::Texts(texts) => s.write_list(schema, &|sl| {
+                    for text in texts.iter() {
+                        sl.write_string(schema, text)?;
+                    }
+                    Ok(())
+                })?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Run the framework's own constraint walk over the members an operation handed
+/// over, and report every violation it found.
+pub fn validate_members(members: &[(&'static Schema, ConstrainedValue<'_>)]) -> Vec<Violation> {
+    validate(&ConstrainedMembers { members }, &CONSTRAINED_INPUT_SCHEMA)
+}
+
+/// The framework's own `ValidationException` envelope for `violations`, so a
+/// member refused by a handler reads exactly like one refused at the boundary.
+pub fn constraint_envelope(violations: &[Violation]) -> String {
+    ::aws_smithy_schema_server::envelope(violations)
+        .unwrap_or_else(|| "invalid request".to_string())
+}
+
+/// The envelope WAF's request validator answers for a collection of scalars,
+/// given the violations the framework walk found in it — or `None` when it found
+/// none.
+///
+/// WAF reports an ELEMENT that fails the element shape's own constraints against
+/// the COLLECTION member's path, with the value rendered as the whole list and
+/// every constraint of the element shape listed in one bracketed set: ONE clause
+/// for the member, however many elements failed and however many constraints each
+/// failed. A violation of the collection ITSELF — its element-count `@length` — is
+/// a different constraint about a different value, so it keeps the framework's own
+/// clause.
+///
+/// `member_path` is the collection member's path as the envelope names it (use
+/// [`member_path`]), `elements` is the list as the request sent it, and
+/// `element_constraints` is the element shape's constraint set (e.g.
+/// [`TOKEN_DOMAIN_CONSTRAINTS`]).
+pub fn collection_constraint_envelope(
+    member_path: &str,
+    elements: &[String],
+    element_constraints: &[&str],
+    violations: &[Violation],
+) -> Option<String> {
+    // The value every clause about this member echoes: the list, the way WAF
+    // renders one.
+    let rendered = format!("[{}]", echoed(&elements.join(", ")));
+    let element_prefix = format!("{member_path}.");
+    let mut clauses: Vec<String> = Vec::new();
+    let mut element_clause_emitted = false;
+    for violation in violations {
+        // The collection ITSELF (its element-count `@length`): the framework's own
+        // requirement wording, restated against the list as the value — the walk
+        // renders a count there (`3 items`), and WAF renders the list.
+        if violation.path == member_path {
+            clauses.push(
+                Violation {
+                    path: violation.path.clone(),
+                    kind: violation.kind.clone(),
+                    value: Some(rendered.clone()),
+                }
+                .message(),
+            );
+            continue;
+        }
+        if !violation.path.starts_with(&element_prefix) {
+            clauses.push(violation.message());
+            continue;
+        }
+        // Every element failure of this member collapses into the one clause, so
+        // it is emitted at the FIRST of them and skipped thereafter.
+        if element_clause_emitted {
+            continue;
+        }
+        element_clause_emitted = true;
+        clauses.push(format!(
+            "Value '{rendered}' at '{member_path}' failed to satisfy constraint: \
+             Member must satisfy constraint: [{}]",
+            element_constraints.join(", ")
+        ));
+    }
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
+
+/// A member's path as a validation clause names it: the Smithy member name in
+/// lowerCamel.
+///
+/// Delegates to the framework, which owns that casing rule, so a clause a handler
+/// writes cannot spell a position differently from one the boundary writes.
+pub fn member_path(smithy_name: &str) -> String {
+    ::aws_smithy_schema_server::constraints::path::member(smithy_name)
+}
+
+/// The rejected value as it appears in a clause: itself when short, a
+/// character-boundary-safe prefix with an elision when not.
+///
+/// The cap and its rendering are the framework's own (its `MAX_ECHOED_VALUE`, 256
+/// bytes), re-stated here only because that helper is private. A caller controls
+/// the length of what a clause echoes, so an unelided echo turns a large request
+/// into an arbitrarily large response. It is applied to the RENDERING only: every
+/// check runs on the value the caller actually sent.
+fn echoed(value: &str) -> String {
+    const MAX_ECHOED_VALUE: usize = 256;
+    if value.len() <= MAX_ECHOED_VALUE {
+        return value.to_string();
+    }
+    let mut end = MAX_ECHOED_VALUE;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [{} bytes]", &value[..end], value.len())
 }

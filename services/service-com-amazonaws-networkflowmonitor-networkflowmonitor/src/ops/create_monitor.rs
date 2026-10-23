@@ -256,6 +256,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A monitor's resource lists are sets keyed by `type` + `identifier`, so a
+        // create stores the request's lists as sets too: a duplicated entry is
+        // stored once, and the record holds the same thing whether it was created
+        // that way or grown there by `UpdateMonitor`.
+        let local_resources = crate::state::deduped_resources(&input.local_resources);
+        let remote_resources = crate::state::deduped_resources(
+            input.remote_resources.as_deref().unwrap_or_default(),
+        );
+
+        // Neither resource list carries a `@length`, so the boundary validator caps
+        // neither: a monitor this emulator cannot hold is refused here, with the
+        // same ceiling `UpdateMonitor` enforces, so the cap cannot be sidestepped by
+        // creating the oversized monitor instead of growing it.
+        for (member, named) in [
+            ("localResources", local_resources.len()),
+            ("remoteResources", remote_resources.len()),
+        ] {
+            if named > crate::state::MAX_MONITOR_RESOURCES {
+                return Err(CreateMonitorErrorModeled::ValidationException(
+                    crate::state::field_validation(
+                        member,
+                        crate::state::too_many_resources(named),
+                    ),
+                )
+                .into());
+            }
+        }
+
         let monitor_name = input.monitor_name;
         let monitor_arn =
             crate::state::resource_arn(&region, crate::state::MONITOR_RESOURCE, &monitor_name);
@@ -266,14 +294,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // monitor reports it until the clock owes it ACTIVE.
             monitor_status: crate::state::MonitorStatus::Pending,
             scope_arn: input.scope_arn,
-            local_resources: input.local_resources,
+            local_resources,
             // `remoteResources` is optional on the way in and `@required` on the way
             // out: a monitor created without any has none, not a missing member.
-            remote_resources: input.remote_resources.unwrap_or_default(),
+            remote_resources,
             tags: crate::state::tags_of(input.tags.as_ref()),
             created_at: now,
             modified_at: now,
             active_at: now + crate::state::PROVISIONING_DELAY,
+            // No update has been applied to a monitor this call is minting.
+            update_tokens: ::std::collections::VecDeque::new(),
         };
 
         state.arn_index.insert(

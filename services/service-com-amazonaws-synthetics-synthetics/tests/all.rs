@@ -15,6 +15,8 @@
 mod canary_lifecycle;
 #[path = "all/group_lifecycle.rs"]
 mod group_lifecycle;
+#[path = "all/group_membership.rs"]
+mod group_membership;
 #[path = "all/input_validation.rs"]
 mod input_validation;
 #[path = "all/missing_resource_errors.rs"]

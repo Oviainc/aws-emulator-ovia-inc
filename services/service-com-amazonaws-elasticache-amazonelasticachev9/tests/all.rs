@@ -19,8 +19,12 @@ mod cache_engine_versions;
 mod cache_parameter_groups;
 #[path = "all/rbac_users.rs"]
 mod rbac_users;
+#[path = "all/reserved_cache_nodes.rs"]
+mod reserved_cache_nodes;
 #[path = "all/reserved_cache_nodes_offerings.rs"]
 mod reserved_cache_nodes_offerings;
+#[path = "all/serverless_cache_describe.rs"]
+mod serverless_cache_describe;
 #[path = "all/service_updates.rs"]
 mod service_updates;
 #[path = "all/serverless_cache_lifecycle.rs"]

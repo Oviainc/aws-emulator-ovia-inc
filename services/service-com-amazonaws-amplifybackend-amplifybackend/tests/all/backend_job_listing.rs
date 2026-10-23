@@ -748,10 +748,12 @@ async fn a_next_token_it_did_not_issue_is_refused() {
     }
 }
 
-/// Listing the jobs of an app no backend was ever created for is the modelled
-/// `NotFoundException` (404), naming the resource type — not an empty 200.
+/// Listing the jobs of an app this service holds no app record for is the app-identity
+/// refusal — HTTP 400 with the error code `ValidationException`, not a missing resource
+/// and not an empty 200. The whole gate, over every app-addressing operation, is
+/// `app_registration_gate.rs`.
 #[tokio::test]
-async fn listing_an_unknown_app_is_a_modelled_not_found() {
+async fn listing_an_unregistered_app_is_a_validation_exception() {
     let router = router();
     let (status, body) = call(
         &router,
@@ -761,20 +763,20 @@ async fn listing_an_unknown_app_is_a_modelled_not_found() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "case \"unknown app\": expected 404, got {status} {body}"
+        status, 400,
+        "case \"unregistered app\": expected 400, got {status} {body}"
     );
     let code = body
         .get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default();
     assert!(
-        code.ends_with("NotFoundException"),
-        "case \"unknown app\": expected NotFoundException, got {code:?} in {body}"
+        code.ends_with("ValidationException"),
+        "case \"unregistered app\": expected ValidationException, got {code:?} in {body}"
     );
     assert_eq!(
-        field(&body, "resourceType"),
-        "backend",
-        "case \"unknown app\": the refusal names the resource type, got {body}"
+        field(&body, "code"),
+        "ValidationException",
+        "case \"unregistered app\": the body carries the error code, got {body}"
     );
 }

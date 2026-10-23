@@ -193,7 +193,9 @@ const ERROR_CASES: &[ErrorCase] = &[
     ErrorCase {
         case: "scaffolded operation, which answers the 501 channel",
         version: API_VERSION,
-        action: "DescribeDBClusters",
+        // `DescribeDBClusterEndpoints` is still a stub (`DescribeDBClusters`, which stood
+        // here before, reports the clusters `CreateDBCluster` stores).
+        action: "DescribeDBClusterEndpoints",
         params: &[],
         status: 501,
         code: "NotImplemented",

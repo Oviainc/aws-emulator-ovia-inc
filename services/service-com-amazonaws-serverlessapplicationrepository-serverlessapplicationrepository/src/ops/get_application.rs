@@ -174,9 +174,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(not_found(
                         crate::state::ErrorCode::VersionNotFound,
-                        format!(
-                            "Version {semantic_version} could not be found for application {}.",
-                            input.application_id
+                        // The wording lives in `state` so every operation that resolves a
+                        // version refuses an absent one identically.
+                        crate::state::version_not_found_message(
+                            &input.application_id,
+                            semantic_version,
                         ),
                     ))
                 }

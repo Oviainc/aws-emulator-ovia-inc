@@ -25,6 +25,8 @@ mod state_roundtrip;
 mod tag_resource;
 #[path = "all/tagging.rs"]
 mod tagging;
+#[path = "all/tagging_and_test_harness.rs"]
+mod tagging_and_test_harness;
 #[path = "all/test_mapping.rs"]
 mod test_mapping;
 #[path = "all/transformer_lifecycle.rs"]

@@ -192,8 +192,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The record carries its own run history, so dropping it drops both.
+        // The record carries its own run history, so dropping it drops both. The canary's
+        // group memberships go with it as well: an association names a canary, and this
+        // one no longer exists.
+        let arn = canary.arn();
         guard.canaries.remove(&input.name);
+        guard.forget_resource(&arn);
         Ok(DeleteCanaryOutput {})
     }
 }

@@ -232,6 +232,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Every rule group the policy document references must exist, and must be
+        // of the kind the reference list is for: `InvalidRequestException` covers a
+        // request whose "ARN ... corresponds to a resource that isn't valid in the
+        // context of the request". This runs in the same critical section the record
+        // is inserted in, so a resolved reference cannot go stale before the policy
+        // lands, and it runs for a dry run too — checking "whether the request can
+        // run successfully" is exactly what a caller pre-flights an ARN with.
+        if let Some(breach) = state.policy_reference_breach(&input.firewall_policy) {
+            return Err(
+                CreateFirewallPolicyErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(breach),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let now = ::std::time::SystemTime::now();
         let record = crate::state::FirewallPolicyRecord {
             policy_arn: crate::state::firewall_policy_arn(&region, &input.firewall_policy_name),

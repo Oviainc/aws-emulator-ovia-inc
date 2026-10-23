@@ -24,12 +24,13 @@ tracing = { workspace = true }
 # The codec behind this service's opaque `nextToken` (see `state::page_token`):
 # a maintained encoder rather than a hand-rolled one.
 hex = { workspace = true }
+# The digest behind a remembered `clientToken`'s change fingerprint (see
+# `state::update_fingerprint`): a maintained hash rather than a hand-rolled one,
+# so what the store retains per token is a fixed number of bytes.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
 
 [lints]
 workspace = true

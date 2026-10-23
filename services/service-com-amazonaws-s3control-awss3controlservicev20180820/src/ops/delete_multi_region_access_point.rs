@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMultiRegionAccessPoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMultiRegionAccessPoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMultiRegionAccessPoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the Multi-Region Access Point this account holds under the name the
+//! request names into `DELETING` and records the asynchronous request that did
+//! it; the clock — not a later call — is what releases the record once
+//! [`crate::state::MULTI_REGION_ACCESS_POINT_SETTLE_AFTER`] has elapsed. The
+//! buckets the access point fronted are left alone, which is what the model
+//! documents.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +147,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMultiRegionAccessPoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMultiRegionAccessPointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMultiRegionAccessPoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        let region = crate::state::signing_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let request_token_arn = crate::state::async_request_token_arn(
+            &region,
+            crate::state::ASYNC_VERB_DELETE,
+            &input.account_id,
+            &input.client_token,
+            &crate::state::delete_details_fingerprint(&input.details),
+        );
+
+        let mut store = state.lock();
+        store.settle_multi_region_access_points(now);
+
+        let request_key = (input.account_id.clone(), request_token_arn.clone());
+        if store.async_requests.contains_key(&request_key) {
+            // This exact request was already accepted: `ClientToken` is an
+            // `@idempotencyToken`, so the retry is handed the token the first
+            // call returned rather than starting a second removal — or being
+            // refused once the first one released the record.
+            return Ok(DeleteMultiRegionAccessPointOutput {
+                request_token_arn: Some(request_token_arn),
+            });
+        }
+
+        let key = (input.account_id.clone(), input.details.name.clone());
+        let Some(record) = store.multi_region_access_points.get_mut(&key) else {
+            return Err(crate::state::no_such_multi_region_access_point(
+                &input.details.name,
+            ));
+        };
+
+        // A delete of an access point already on its way out tracks the removal
+        // that is already due rather than pushing it further away, so a caller
+        // cannot keep a record alive by deleting it again.
+        let due_at = match record.status_due_at {
+            Some(due) if record.status == crate::state::STATUS_DELETING => due,
+            _ => now + crate::state::MULTI_REGION_ACCESS_POINT_SETTLE_AFTER,
+        };
+        record.status =
+            crate::state::multi_region_access_point_status(crate::state::STATUS_DELETING);
+        record.status_due_at = Some(due_at);
+        let regions: Vec<String> = record
+            .regions
+            .iter()
+            .filter_map(|report| report.region.clone())
+            .collect();
+
+        store.record_async_request(crate::state::AsyncRequestRecord {
+            request_token_arn: request_token_arn.clone(),
+            account_id: input.account_id.clone(),
+            operation: crate::state::async_operation_name("DeleteMultiRegionAccessPoint"),
+            creation_time: ::aws_smithy_types::DateTime::from(now),
+            request_parameters: AsyncRequestParameters {
+                create_multi_region_access_point_request: None,
+                delete_multi_region_access_point_request: Some(input.details.clone()),
+                put_multi_region_access_point_policy_request: None,
+            },
+            regions,
+            due_at,
+        });
+
+        Ok(DeleteMultiRegionAccessPointOutput {
+            request_token_arn: Some(request_token_arn),
+        })
     }
 }

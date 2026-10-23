@@ -44,7 +44,7 @@ use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state
 /// `POST /lenses/{LensAlias}/versions`, the wire form of `CreateLensVersion`. The alias
 /// is percent-encoded because a custom lens is named by its ARN, which carries `:` and
 /// `/` inside ONE path segment.
-async fn create_version(
+pub(crate) async fn create_version(
     client: &Client,
     alias: &str,
     version: &str,

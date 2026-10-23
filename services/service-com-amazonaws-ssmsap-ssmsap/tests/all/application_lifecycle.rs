@@ -41,7 +41,7 @@ fn settle_wait() -> Duration {
 /// One response, reduced to what the assertions read.
 ///
 /// `pub(crate)` because the suites of this target share one harness: the
-/// validation-message suite drives the same wire through the same
+/// validation-message suites drive the same wire through the same
 /// [`Emulator::send`].
 #[derive(Debug)]
 pub(crate) struct Reply {
@@ -59,7 +59,7 @@ impl Reply {
 
     /// A member of the response body, treating JSON `null` as absent the way an
     /// omitted optional member is.
-    fn member(&self, name: &str) -> Option<&Value> {
+    pub(crate) fn member(&self, name: &str) -> Option<&Value> {
         self.body.get(name).filter(|value| !value.is_null())
     }
 

@@ -29,6 +29,32 @@ pub use service_common::iot_job_executions::{
     NEXT_JOB_ID, PENDING_STATUSES, STATUS_IN_PROGRESS, STATUS_QUEUED,
 };
 
+/// The shared index of which IoT COMMANDS exist, which `StartCommandExecution`
+/// validates its `commandArn` against before enqueuing anything.
+///
+/// Re-exported here for the same reason the job-execution store above is: commands
+/// are owned by the IoT control plane (`iot:CreateCommand`, still a scaffold), the
+/// engine keys state by TYPE, and a store two service crates share has to be
+/// declared in a crate they both depend on. See `service_common::iot_commands`.
+pub use ::service_common::iot_commands;
+
+/// The command index in the shared engine: call it with a handler's
+/// `&*self.engine`, exactly as [`service_state`] is called for this service's own
+/// store.
+///
+/// The accessor lives here rather than in the shared crate so that crate needs no
+/// dependency on the engine; the TYPE is shared, so this service and the IoT
+/// control plane that writes it reach ONE index. Same contract as
+/// [`service_state`]: answer `None` with a modelled server error, never with a
+/// fresh engine, or the handler validates against a store nobody else can see.
+pub fn command_registry<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<iot_commands::IotCommandRegistry>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<iot_commands::IotCommandRegistry>)
+}
+
 /// This service's state, under the name the generated `src/lib.rs` re-exports: the
 /// shared job-execution store itself.
 ///

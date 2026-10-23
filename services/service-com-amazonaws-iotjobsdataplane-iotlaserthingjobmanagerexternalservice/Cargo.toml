@@ -21,8 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# The IoT job-execution store, shared with the IoT control plane that creates an
-# execution when a job targets a thing (`services/common`).
+# `service-common` carries both IoT stores this crate reaches: the job-execution
+# store it shares with the IoT control plane (which creates an execution when a job
+# targets a thing), and `iot_commands`, the index of which commands exist that
+# `StartCommandExecution` validates `commandArn` against.
 service-common = { path = "../common" }
 # Digest behind the minted executionId and the clientToken idempotency fingerprint.
 sha2 = { workspace = true }

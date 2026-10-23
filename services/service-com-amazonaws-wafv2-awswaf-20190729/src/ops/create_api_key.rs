@@ -5,6 +5,14 @@
 //! asserts NOTHING about `CreateAPIKey`'s real behaviour. Implement it here — this is
 //! the ONLY file to touch for this operation.
 //!
+//! It does, however, REFUSE a request WAF would refuse, before reaching that 501:
+//! `TokenDomains` is checked here rather than at the request boundary
+//! (`skip_validation` on the input struct, see `super::types::create_api_key_types`)
+//! so an element that fails `TokenDomain`'s constraints is reported the way WAF
+//! reports it — against the LIST member's path, with the value rendered as the whole
+//! list and every constraint of the element shape in one set. A refusal is not an
+//! implementation, so the marker above stays until the operation itself is written.
+//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateAPIKey::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -165,18 +173,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAPIKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAPIKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
+        // A validation-only pass: nothing here reaches the store, and `ctx` carries
+        // only request metadata, which this pass does not need.
+        let _ = (ctx, &self.engine);
+
+        // `TokenDomains`' modelled constraints, which this operation took over from
+        // the boundary so the refusal is worded the way WAF words a collection whose
+        // ELEMENTS are at fault (`skip_validation` on `CreateAPIKeyInput`): one
+        // clause at the list member's own path, the value rendered as the whole list,
+        // and every constraint of `TokenDomain` in one bracketed set.
+        let violations = crate::state::validate_members(&[(
+            &crate::state::M_TOKEN_DOMAINS,
+            crate::state::ConstrainedValue::Texts(&input.token_domains),
+        )]);
+        if let Some(message) = crate::state::collection_constraint_envelope(
+            &crate::state::member_path("TokenDomains"),
+            &input.token_domains,
+            crate::state::TOKEN_DOMAIN_CONSTRAINTS,
+            &violations,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // A well-formed request still reaches the 501: minting an API key is not
+        // implemented yet, which is why the SCAFFOLDED marker at the top of this file
+        // stays. Refusing a bad request is not implementing the operation — and
+        // answering 501 for one would claim "nobody has written this yet" about a
+        // request that can never succeed.
         Err(crate::scaffolded::Scaffolded::not_implemented("CreateAPIKey"))
     }
 }

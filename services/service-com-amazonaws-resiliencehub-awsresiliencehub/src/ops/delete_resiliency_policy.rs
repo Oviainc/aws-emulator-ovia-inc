@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResiliencyPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResiliencyPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResiliencyPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored resiliency policy from
+//! [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState`], so a following
+//! `DescribeResiliencyPolicy` is a 404 — but only while no stored application still
+//! names it, because a reference that cannot be resolved is not a state this service
+//! lets a caller create (`CreateApp`/`UpdateApp` already refuse a dangling
+//! `policyArn`). A policy an application still references is refused with the
+//! modelled 409 `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +165,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResiliencyPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResiliencyPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResiliencyPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        let mut store = state.lock();
+
+        // The policy has to exist to be deleted. Deleting a resiliency policy is
+        // destructive and not idempotent — exactly as `DeleteApp` treats an
+        // application — so the second delete of one ARN finds nothing to delete, and
+        // the `clientToken` only de-duplicates a retry of the same call racing the
+        // first, a window this single store has none of.
+        if !store.policies.contains_key(&input.policy_arn) {
+            return Err(policy_not_found(&input.policy_arn));
+        }
+
+        // A stored application that still names this policy would be left pointing at
+        // a policy `DescribeResiliencyPolicy` cannot find — the very state `CreateApp`
+        // and `UpdateApp` refuse to create. So the reference, not the delete, decides:
+        // while one exists the policy stays.
+        if let Some(app_arn) = first_app_referencing(&store, &input.policy_arn) {
+            return Err(still_referenced(&input.policy_arn, &app_arn));
+        }
+
+        store.policies.remove(&input.policy_arn);
+        // Release what the create allocated: the idempotency token that recorded this
+        // policy, so a create/delete workload cannot grow the token store.
+        store.forget_idempotency_tokens_for(&input.policy_arn);
+
+        Ok(DeleteResiliencyPolicyOutput {
+            policy_arn: input.policy_arn,
+        })
     }
+}
+
+/// The ARN of a stored application whose `policyArn` is `policy_arn` — the
+/// lexicographically smallest one when several are, so the refusal a request earns
+/// does not depend on hash order.
+fn first_app_referencing(
+    store: &crate::state::ComAmazonawsResiliencehubAwsresiliencehubState,
+    policy_arn: &str,
+) -> Option<String> {
+    store
+        .apps
+        .values()
+        .filter(|app| app.policy_arn.as_deref() == Some(policy_arn))
+        .map(|app| app.app_arn.clone())
+        .min()
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> DeleteResiliencyPolicyError {
+    DeleteResiliencyPolicyErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for a `policyArn` that was never created, or was
+/// already deleted.
+fn policy_not_found(policy_arn: &str) -> DeleteResiliencyPolicyError {
+    DeleteResiliencyPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("resiliency policy {policy_arn} does not exist")),
+        resource_id: Some(policy_arn.to_string()),
+        resource_type: Some("ResiliencyPolicy".to_string()),
+    })
+    .into()
+}
+
+/// A 409 `ConflictException` for a policy a stored application still names, pointing
+/// at the application that blocks the delete.
+fn still_referenced(policy_arn: &str, app_arn: &str) -> DeleteResiliencyPolicyError {
+    DeleteResiliencyPolicyErrorModeled::ConflictException(ConflictException {
+        message: Some(format!(
+            "resiliency policy {policy_arn} is still used by application {app_arn}; \
+             point that application at another policy or delete it first"
+        )),
+        resource_id: Some(policy_arn.to_string()),
+        resource_type: Some("ResiliencyPolicy".to_string()),
+    })
+    .into()
 }

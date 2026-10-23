@@ -1,17 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutLogEvents
-//! Implemented: appends the batch's events to the named stream in the shared store,
-//! stamping each with an ingestion time, and mints the stream's next sequence token.
-//! This is the ONLY file to touch for this operation.
+//! Implemented: admits each event of the batch against the clock-relative ingestion
+//! window, appends only the admitted ones to the named stream in the shared store,
+//! stamping each with an ingestion time, reports the refused ones in
+//! `rejectedLogEventsInfo`, and mints the stream's next sequence token. This is the ONLY
+//! file to touch for this operation.
+//!
+//! THE INGESTION WINDOW is per event, not per batch: an event more than
+//! [`MAX_EVENT_FUTURE_MS`] in the future, older than [`MAX_EVENT_AGE_MS`], or preceding
+//! the log group's retention period is not stored — so it is not readable, does not move
+//! the stream's event-time summary and does not count towards the log group's
+//! `storedBytes` — and the batch's remaining events are processed as usual.
 //!
 //! EMULATOR POLICY, stated here because it is visible to a client: a log stream holds at
 //! most [`crate::state::MAX_STREAM_EVENTS`] events and [`crate::state::MAX_STREAM_BYTES`]
-//! of message bytes. A batch is always accepted, and the OLDEST events are discarded to
-//! stay inside that ceiling — the same thing a caller observes when the real service
-//! deletes events that have passed a log group's retention period, except that the
-//! ceiling here is a size rather than an age, because this emulator holds its state in
-//! memory. Only the discarded events become unreadable; nothing else about the call
+//! of message bytes. Every admitted event is accepted, and the OLDEST events are
+//! discarded to stay inside that ceiling — the same thing a caller observes when the real
+//! service deletes events that have passed a log group's retention period, except that
+//! the ceiling here is a size rather than an age, because this emulator holds its state
+//! in memory. Only the discarded events become unreadable; nothing else about the call
 //! changes, and a log group's `storedBytes` always reports what is still held.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
@@ -172,6 +180,70 @@ const MAX_BATCH_BYTES: i64 = 1_048_576;
 /// The largest single event: "Each log event can be no larger than 1 MB."
 const MAX_EVENT_BYTES: i64 = 1_048_576;
 
+/// Milliseconds in one day, the unit a log group's `retentionInDays` is expressed in.
+const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
+
+/// How far into the past an event's timestamp may reach and still be ingested, from this
+/// operation's documented batch constraints: "Events older than 14 days or preceding the
+/// log group's retention period are rejected while processing remaining valid events."
+const MAX_EVENT_AGE_MS: i64 = 14 * MILLIS_PER_DAY;
+
+/// How far into the future an event's timestamp may reach and still be ingested, from
+/// this operation's documented batch constraints: "Events more than 2 hours in the future
+/// are rejected while processing remaining valid events."
+const MAX_EVENT_FUTURE_MS: i64 = 2 * 60 * 60 * 1_000;
+
+/// What the ingestion window says about one event of a batch.
+///
+/// The window is clock-relative, so it is decided once per batch against the single
+/// ingestion instant the whole batch is stamped with. Each refusal maps to one member of
+/// the modelled `RejectedLogEventsInfo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Older than the ingestion horizon ([`MAX_EVENT_AGE_MS`]) —
+    /// `tooOldLogEventEndIndex`.
+    TooOld,
+    /// Inside the ingestion horizon, but before the log group's retention period —
+    /// `expiredLogEventEndIndex`.
+    Expired,
+    /// Inside the window: stored, readable, and counted in `storedBytes`.
+    Accepted,
+    /// Further ahead of the clock than [`MAX_EVENT_FUTURE_MS`] —
+    /// `tooNewLogEventStartIndex`.
+    TooNew,
+}
+
+/// Admit one event against the ingestion window of a log group whose retention is
+/// `retention_in_days` (`None` for a group that never expires its events).
+fn admit(timestamp: i64, now: i64, retention_in_days: Option<i32>) -> Admission {
+    if timestamp > now.saturating_add(MAX_EVENT_FUTURE_MS) {
+        return Admission::TooNew;
+    }
+    // The age horizon is checked BEFORE the retention period because it is the
+    // service-wide bound on how old an ingested event may be; a retention period only
+    // narrows it further. So an event older than the horizon is `TooOld` whatever the
+    // group's retention is, and `Expired` is reserved for the events the retention
+    // period alone refuses.
+    if timestamp < now.saturating_sub(MAX_EVENT_AGE_MS) {
+        return Admission::TooOld;
+    }
+    // A retention period shorter than the ingestion horizon is the binding one: an event
+    // that precedes it would be deleted the moment it landed, so it is not ingested.
+    let before_retention = retention_in_days.is_some_and(|days| {
+        timestamp < now.saturating_sub(i64::from(days).saturating_mul(MILLIS_PER_DAY))
+    });
+    if before_retention {
+        Admission::Expired
+    } else {
+        Admission::Accepted
+    }
+}
+
+/// An index of the input batch as `RejectedLogEventsInfo` reports it.
+fn log_event_index(index: usize) -> i32 {
+    i32::try_from(index).unwrap_or(i32::MAX)
+}
+
 /// The `PutLogEvents` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -241,30 +313,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Resolve the target BEFORE anything else: an unknown group or stream is the
         // more specific client error, and resolution must not consume ingestion
-        // sequence numbers.
-        match store
-            .log_groups
-            .get(&input.log_group_name)
-            .map(|group| group.streams.contains_key(&input.log_stream_name))
-        {
+        // sequence numbers. The group's retention period is read here too, because it is
+        // one half of the ingestion window applied below.
+        let retention_in_days = match store.log_groups.get(&input.log_group_name) {
             None => {
                 return Err(PutLogEventsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some("The specified log group does not exist".to_string()),
+                        message: Some("The specified log group does not exist.".to_string()),
                     },
                 )
                 .into())
             }
-            Some(false) => {
+            Some(group) if !group.streams.contains_key(&input.log_stream_name) => {
                 return Err(PutLogEventsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some("The specified log stream does not exist".to_string()),
+                        message: Some("The specified log stream does not exist.".to_string()),
                     },
                 )
                 .into())
             }
-            Some(true) => {}
-        }
+            Some(group) => group.retention_in_days,
+        };
 
         // The documented batch constraints, which bound what one request may store:
         // "The maximum batch size is 1,048,576 bytes. This size is calculated as the sum
@@ -291,25 +360,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "The log events in the batch must be in chronological order by their
         // timestamp." The model's own doc is explicit that a batch out of order fails,
-        // so the batch is refused rather than quietly reordered.
-        if let Some(index) = input
+        // so the batch is refused rather than quietly reordered. The wording is the one
+        // CloudWatch Logs answers this condition with: a constant sentence about the
+        // request as a whole, naming no event of it.
+        if input
             .log_events
             .windows(2)
-            .position(|pair| pair[0].timestamp > pair[1].timestamp)
+            .any(|pair| pair[0].timestamp > pair[1].timestamp)
         {
-            return Err(invalid(format!(
-                "logEvents.{} has a timestamp earlier than logEvents.{index}; the log events in a batch must be in chronological order",
-                index + 1
-            )));
+            return Err(invalid(
+                "Log events in a single PutLogEvents request must be in chronological order."
+                    .to_string(),
+            ));
         }
 
-        // One ingestion instant for the whole batch, and one sequence number per event
-        // taken from the store's monotonic counter: the counter is what totally orders
-        // events that share a timestamp and what the pagination cursors resume from.
+        // One ingestion instant for the whole batch: it is both the stamp every stored
+        // event carries and the clock the ingestion window is measured against, so one
+        // request admits its events against one instant.
         let ingestion_time = crate::state::now_ms();
+        let admissions: Vec<Admission> = input
+            .log_events
+            .iter()
+            .map(|event| admit(event.timestamp, ingestion_time, retention_in_days))
+            .collect();
+        // The boundary indexes the model documents: "the index of the last log event that
+        // is too old" (exclusive), the same for the expired run, and "the index of the
+        // first log event that is too new" (inclusive). Each is read off the admissions
+        // themselves rather than assuming where in the batch a class can fall.
+        let too_old_log_event_end_index = admissions
+            .iter()
+            .rposition(|admission| *admission == Admission::TooOld)
+            .map(|index| log_event_index(index + 1));
+        let expired_log_event_end_index = admissions
+            .iter()
+            .rposition(|admission| *admission == Admission::Expired)
+            .map(|index| log_event_index(index + 1));
+        let too_new_log_event_start_index = admissions
+            .iter()
+            .position(|admission| *admission == Admission::TooNew)
+            .map(log_event_index);
+        // "The rejected events" — reported only when the batch actually had some, so a
+        // fully accepted batch carries no `rejectedLogEventsInfo` at all.
+        let rejected_log_events_info = (too_old_log_event_end_index.is_some()
+            || expired_log_event_end_index.is_some()
+            || too_new_log_event_start_index.is_some())
+        .then_some(RejectedLogEventsInfo {
+            too_new_log_event_start_index,
+            too_old_log_event_end_index,
+            expired_log_event_end_index,
+        });
+
+        // Only the admitted events are stored, each taking one sequence number from the
+        // store's monotonic counter: the counter is what totally orders events that share
+        // a timestamp and what the pagination cursors resume from. A refused event
+        // consumes nothing, so it leaves no trace a reader could observe.
         let mut batch: Vec<crate::state::StoredEvent> =
             Vec::with_capacity(input.log_events.len());
-        for event in &input.log_events {
+        for (event, admission) in input.log_events.iter().zip(&admissions) {
+            if *admission != Admission::Accepted {
+                continue;
+            }
             let ingestion_seq = store.take_ingestion_seq();
             batch.push(crate::state::StoredEvent {
                 timestamp: event.timestamp,
@@ -318,6 +428,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ingestion_seq,
             });
         }
+        let accepted_any = !batch.is_empty();
         let added_bytes: i64 = batch
             .iter()
             .map(crate::state::StoredEvent::stored_bytes)
@@ -331,7 +442,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = store.log_groups.get_mut(&input.log_group_name) else {
             return Err(PutLogEventsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some("The specified log group does not exist".to_string()),
+                    message: Some("The specified log group does not exist.".to_string()),
                 },
             )
             .into());
@@ -339,7 +450,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stream) = group.streams.get_mut(&input.log_stream_name) else {
             return Err(PutLogEventsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some("The specified log stream does not exist".to_string()),
+                    message: Some("The specified log stream does not exist.".to_string()),
                 },
             )
             .into());
@@ -362,7 +473,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // events, so repeated writes cannot grow the store without bound.
         let discarded_bytes = stream.enforce_storage_ceiling();
         stream.refresh_event_times();
-        stream.last_ingestion_time = Some(ingestion_time);
+        // `lastIngestionTime` is "the time of the most recent log event ingested": a call
+        // that ingested nothing did not move it.
+        if accepted_any {
+            stream.last_ingestion_time = Some(ingestion_time);
+        }
         stream.upload_sequence_token = Some(next_sequence_token.clone());
         // The group's `storedBytes` reports what is held: this batch's bytes, less what
         // the ceiling discarded. Written in one step, after the stream is settled, so no
@@ -375,11 +490,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(PutLogEventsOutput {
             next_sequence_token: Some(next_sequence_token),
-            // No event is rejected: `rejectedLogEventsInfo` reports events outside the
-            // clock-relative age windows (older than 14 days, more than 2 hours in the
-            // future), which this slice does not apply — so every accepted event is
-            // stored and readable, and none is reported as rejected.
-            rejected_log_events_info: None,
+            rejected_log_events_info,
             rejected_entity_info: None,
         })
     }

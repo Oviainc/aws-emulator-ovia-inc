@@ -1,15 +1,43 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLenses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLenses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The available lenses: the AWS-official lens this emulator ships, and the custom
+//! lenses `ImportLens` imported into this store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLenses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules this handler follows, and where each comes from:
+//!
+//! * The catalog is the AWS-official lens whose content this emulator ships
+//!   (`crate::state::FRAMEWORK_LENS_QUESTIONS`, summarised by
+//!   `crate::state::framework_lens_summary`) plus every custom lens the store holds.
+//!   Nothing here is hardcoded per request: the custom entries are the lens store's own
+//!   records, projected by `crate::state::LensRecord::to_summary`.
+//! * `LensType` and `LensName` select by the summary's own type and full name; a request
+//!   that names neither asks for every lens.
+//! * `LensStatus` selects by publication state, the state a summary reports as its own
+//!   `LensStatus`: `DRAFT` for a lens whose content no version has been published from,
+//!   `PUBLISHED` for one a version exists of, `ALL` for both — and a request that names
+//!   none asks for no filtering, so it gets every lens, draft ones included (see
+//!   `crate::state::LENS_STATUS_TYPE_ALL`).
+//! * The page is cut to `MaxResults` and resumed from `NextToken`, the opaque cursor
+//!   `crate::state::encode_lens_next_token` issues.
+//!
+//! This is a REPORTING operation: it writes nothing. Where the clock decides something —
+//! which content an imported lens is described by, once an import in flight lands — the
+//! stored instant is compared with the clock on every read instead.
+//!
+//! Deliberately NOT emulated here, so the silence is not read as an enforced allow:
+//!
+//! * Authorization and throttling. The emulator verifies the signature at the boundary and
+//!   attributes every request to its one account ([`::engine::emulator_account_id`]), so
+//!   there is no second principal to deny and no request budget to exceed; the modelled
+//!   `AccessDeniedException` and `ThrottlingException` are therefore unreachable from this
+//!   handler, which fails only on an unavailable store (500) or an undecodable cursor
+//!   (400).
+//! * Regional scoping of the lens store. The request's Region is used for the
+//!   AWS-official lens's ARN, the one member here that varies by Region; the custom lenses
+//!   are reported whatever Region the request names, each carrying the ARN of the Region it
+//!   was imported in. The store `ImportLens` writes is not partitioned by Region, so this
+//!   handler has nothing to scope by.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +179,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLenses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLensesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLenses"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListLensesErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool lens store is unavailable".to_string(),
+            })
+        })?;
+
+        // `MaxResults` is modelled `@range(min: 1, max: 50)`; a request that omits it asks
+        // for a full page, so the modelled maximum is the default.
+        let page_size = crate::state::page_size(input.max_results);
+
+        // An opaque token this service did not issue is a bad request, not an empty page.
+        // Classified `CANNOT_PARSE` like every other cursor in this service: a caller
+        // cannot correct a token it did not compose, only start the pagination again.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_lens_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListLensesErrorModeled::ValidationException(
+                        crate::state::cannot_parse_exception(
+                            crate::state::NEXT_TOKEN_MEMBER,
+                            crate::state::INVALID_NEXT_TOKEN_MESSAGE,
+                        ),
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+
+        // The lenses available to the caller: the AWS-official lens whose content this
+        // emulator ships, plus every custom lens the store holds. A lens exists from the
+        // moment `ImportLens` accepts it — that call answers its ARN — so it is listed
+        // from then on, described by the document that import carried; what the import's
+        // instant gates is the CONTENT a read of the lens returns.
+        let mut catalog: Vec<CatalogEntry> = Vec::with_capacity(store.lenses.len() + 1);
+        catalog.push(CatalogEntry {
+            key: crate::state::lens_catalog_key(
+                crate::state::LENS_TYPE_AWS_OFFICIAL,
+                crate::state::FRAMEWORK_LENS_ALIAS,
+            ),
+            summary: crate::state::framework_lens_summary(&region),
+        });
+        for record in store.lenses.values() {
+            if let Some(summary) = record.to_summary(now) {
+                catalog.push(CatalogEntry {
+                    key: crate::state::lens_catalog_key(record.lens_type(), &record.lens_id),
+                    summary,
+                });
+            }
+        }
+        // The catalog's own total order, so paging over it serves every lens exactly once
+        // however the lens store happens to be laid out.
+        catalog.sort_by(|left, right| left.key.cmp(&right.key));
+
+        // "The status of lenses to be returned" — a request that names none asks for no
+        // filtering by status, which is what `LENS_STATUS_TYPE_ALL` documents.
+        let wanted_status = input
+            .lens_status
+            .as_deref()
+            .unwrap_or(crate::state::LENS_STATUS_TYPE_ALL);
+
+        let matching: Vec<&CatalogEntry> = catalog
+            .iter()
+            // The cursor is start-EXCLUSIVE: the page resumes just past the last key
+            // already served.
+            .filter(|entry| {
+                cursor
+                    .as_deref()
+                    .is_none_or(|resume| entry.key.as_str() > resume)
+            })
+            .filter(|entry| {
+                // "The type of lenses to be returned": a request that names none asks for
+                // every type, the only reading `LensType` allows — it publishes no `ALL`.
+                input
+                    .lens_type
+                    .as_deref()
+                    .is_none_or(|wanted| entry.summary.lens_type.as_deref() == Some(wanted))
+            })
+            .filter(|entry| {
+                // `LensName` is "The full name of the lens", so it selects the lens that
+                // carries that name rather than matching part of one.
+                input
+                    .lens_name
+                    .as_deref()
+                    .is_none_or(|wanted| entry.summary.lens_name.as_deref() == Some(wanted))
+            })
+            .filter(|entry| match wanted_status {
+                // `DRAFT` and `PUBLISHED` are the publication states a summary reports as
+                // its own `LensStatus`, so the filter selects on the member it is named
+                // after.
+                crate::state::LENS_STATUS_TYPE_DRAFT => {
+                    entry.summary.lens_status.as_deref() == Some(crate::state::LENS_STATUS_DRAFT)
+                }
+                crate::state::LENS_STATUS_TYPE_PUBLISHED => {
+                    entry.summary.lens_status.as_deref()
+                        == Some(crate::state::LENS_STATUS_PUBLISHED)
+                }
+                // `ALL`, and nothing else reaches here: `LensStatusType` publishes exactly
+                // three members and the boundary refuses any other value before this
+                // handler runs.
+                _ => true,
+            })
+            .collect();
+
+        let page = &matching[..matching.len().min(page_size)];
+        let next_token = match page.last() {
+            Some(entry) if matching.len() > page.len() => {
+                Some(crate::state::encode_lens_next_token(&entry.key))
+            }
+            _ => None,
+        };
+
+        Ok(ListLensesOutput {
+            lens_summaries: Some(page.iter().map(|entry| entry.summary.clone()).collect()),
+            next_token,
+        })
     }
+}
+
+/// One lens of the catalog this operation pages over: its `LensSummary` and the key that
+/// orders it (and that a `NextToken` carries).
+#[derive(Debug)]
+struct CatalogEntry {
+    key: String,
+    summary: LensSummary,
 }

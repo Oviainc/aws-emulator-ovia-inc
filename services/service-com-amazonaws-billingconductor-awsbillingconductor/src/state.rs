@@ -160,6 +160,34 @@ pub fn is_aws_managed_pricing_plan(arn: &str) -> bool {
         .any(|id| arn == *id || arn == aws_managed_pricing_plan_arn(id))
 }
 
+/// The account every request to this emulator is made by.
+///
+/// Every generated emulator presents the one canonical account id
+/// ([`engine::emulator_account_id`]); it is never derived from the caller's access
+/// key. This is the account the authorization gate below judges, and the account id
+/// the denial names.
+pub fn caller_account_id() -> &'static str {
+    ::engine::emulator_account_id()
+}
+
+/// The modelled `AccessDeniedException` (`@httpError 403`) AWS answers a
+/// billing-conductor call made by an account that is not the organization's payer
+/// (management) account with.
+///
+/// The text is built FROM THE REQUEST — the calling account id and the operation name
+/// — which is the construction the real service uses; the account id in a recording is
+/// environment-specific and an example only. It is deliberately NOT the generic IAM
+/// "no identity-based policy allows" wording: that is how a caller tells a per-account
+/// entitlement gate from a missing permission.
+pub fn not_payer_account(operation: &str) -> crate::ops::types::AccessDeniedException {
+    crate::ops::types::AccessDeniedException {
+        message: format!(
+            "Account {} is not authorized to call {operation}. Only payer account is authorized",
+            caller_account_id()
+        ),
+    }
+}
+
 /// The pricing rule type whose rates come from tiers rather than from a
 /// percentage modifier. The other values of `PricingRuleType`
 /// (`MARKUP`, `DISCOUNT`) price by `ModifierPercentage`.
@@ -486,7 +514,8 @@ impl CustomLineItemRecord {
 ///   group.
 /// * a resource's `tags` map is part of its record, so it is reclaimed with the
 ///   resource and bounded by [`MAX_TAGS_PER_RESOURCE`] — a `TagResource` whose merge
-///   would take one past that cap is refused rather than stored.
+///   would take one past that cap is refused rather than stored. That cap bounds the
+///   `ListTagsForResource` response too, since the response IS the stored map.
 ///
 /// A read never writes. The response side is capped too: every page is at most
 /// the request's `MaxResults`, or [`DEFAULT_PAGE_SIZE`] when it names none.
@@ -530,6 +559,20 @@ pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     idempotency_order: VecDeque<String>,
     /// Monotonic source of the alphanumeric resource ids the ARN patterns require.
     id_counter: u64,
+    /// The account that is the PAYER (management) account of the organization this
+    /// store records, if any.
+    ///
+    /// Billing Conductor is a payer-account-only API: its control plane is authorized
+    /// for the payer account of the consolidated billing family alone, and every other
+    /// caller is refused `AccessDeniedException` (see
+    /// [`Self::is_payer_account`] and [`not_payer_account`]). This emulator presents one
+    /// account ([`caller_account_id`]) and emulates no Organizations control plane, so
+    /// there is no organization and no payer account to record: the field holds `None`
+    /// and the emulated account is a standalone, non-payer account — the caller every
+    /// recorded Billing Conductor response was taken from. A test (or a future
+    /// Organizations surface) designates a payer account by setting it, which is the
+    /// only way the control plane becomes reachable.
+    pub payer_account_id: Option<String>,
 }
 
 impl ComAmazonawsBillingconductorAwsbillingconductorState {
@@ -756,13 +799,23 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             .filter(|existing| *existing != group_arn)
     }
 
+    /// Whether `account_id` is the payer (management) account of the organization this
+    /// store records.
+    ///
+    /// False whenever no payer account is recorded, which is the store's default (see
+    /// [`Self::payer_account_id`]): the Billing Conductor control plane is then
+    /// available to nobody, exactly as it is to an account that is not a payer.
+    pub fn is_payer_account(&self, account_id: &str) -> bool {
+        self.payer_account_id.as_deref() == Some(account_id)
+    }
+
     /// The tags stored for the resource a tagging `ResourceArn` names, or `None` when
     /// this service holds no such resource — the decision every tagging operation's
     /// not-found answer is made from.
     ///
     /// Tags live ON the resource record (the same map `CreateBillingGroup` /
-    /// `CreatePricingPlan` persisted their `Tags` into), so there is one copy of a
-    /// resource's tags and a delete reclaims them with the resource.
+    /// `CreatePricingPlan` / `CreatePricingRule` persisted their `Tags` into), so there
+    /// is one copy of a resource's tags and a delete reclaims them with the resource.
     pub fn resource_tags(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
         let resource = parse_taggable_arn(resource_arn)?;
         match resource.kind {
@@ -774,10 +827,14 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
                 .pricing_plans
                 .get(&resource.arn)
                 .map(|record| &record.tags),
-            // Nothing in this slice persists a pricing rule or a custom line item
-            // (`CreatePricingRule` and `CreateCustomLineItem` are still scaffolds), so
-            // no ARN of either kind names a resource that exists yet.
-            TaggableResourceKind::PricingRule | TaggableResourceKind::CustomLineItem => None,
+            TaggableResourceKind::PricingRule => self
+                .pricing_rules
+                .get(&resource.arn)
+                .map(|record| &record.tags),
+            // Nothing in this slice persists a custom line item
+            // (`CreateCustomLineItem` is still a scaffold), so no ARN of that kind names
+            // a resource that exists yet.
+            TaggableResourceKind::CustomLineItem => None,
         }
     }
 
@@ -796,7 +853,11 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
                 .pricing_plans
                 .get_mut(&resource.arn)
                 .map(|record| &mut record.tags),
-            TaggableResourceKind::PricingRule | TaggableResourceKind::CustomLineItem => None,
+            TaggableResourceKind::PricingRule => self
+                .pricing_rules
+                .get_mut(&resource.arn)
+                .map(|record| &mut record.tags),
+            TaggableResourceKind::CustomLineItem => None,
         }
     }
 }
@@ -1119,4 +1180,17 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsBillingconductorAwsbillingconductorState>)
+}
+
+/// The authorization decision for one call of this service's payer-gated surface: whether
+/// the caller IS the payer account this store records.
+///
+/// A READ — it takes the store's lock to compare one account id and writes nothing, so a
+/// denied request changes nothing a later caller sees.
+///
+/// Fails CLOSED: a store this process cannot reach records no payer account, and an
+/// authorization check that cannot run must not admit the request. The refusal itself is
+/// [`not_payer_account`].
+pub fn caller_is_payer_account<Eng: Send + Sync + 'static>(engine: &Eng) -> bool {
+    service_state(engine).is_some_and(|state| state.lock().is_payer_account(caller_account_id()))
 }

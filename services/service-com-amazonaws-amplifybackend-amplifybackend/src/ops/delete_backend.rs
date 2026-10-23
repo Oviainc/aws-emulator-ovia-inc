@@ -5,7 +5,9 @@
 //! Removes the named backend environment — and with it every auth, API and storage
 //! resource created inside it — and records an async job for the call. The app's JOBS
 //! are retained, so a `GetBackendJob` for this or an earlier job still resolves. A
-//! missing app or environment answers `NotFoundException` (404).
+//! missing app or environment answers `NotFoundException` (404) — unless the `AppId`
+//! identifies no registered Amplify app at all, which is refused with HTTP 400
+//! `ValidationException` before any lookup ([`crate::state::require_registered_app`]).
 //!
 //! ## Shape of an operation
 //!
@@ -152,6 +154,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::store_unavailable(),
             ))
         })?;
+
+        // The app-identity gate, BEFORE any per-resource lookup: a well-formed app id
+        // that identifies no registered Amplify app is a client-input error (400
+        // `ValidationException`), not a missing backend.
+        crate::state::require_registered_app(&*self.engine, &input.app_id)?;
 
         let now = std::time::SystemTime::now();
         let mut store = state.lock();

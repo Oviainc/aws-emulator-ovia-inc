@@ -9,9 +9,13 @@
 //! shapes. It lives here, not in one handler, because seven operations apply the same
 //! rules and two copies of them would drift.
 //!
-//! It owns the CloudTrail Lake **dashboard** registry on the same terms: a dashboard
-//! identifier is a bare name or a dashboard ARN, the refresh-schedule and widget
-//! rules are the ones the model documents, and both are applied by every dashboard
+//! It owns the CloudTrail Lake registries on the same terms. An event data store
+//! and the queries run against it are named by a dozen operations (`StartQuery`,
+//! `DescribeQuery`, `CancelQuery`, `ListQueries`, `GetQueryResults`, the event
+//! data store lifecycle), each of which has to resolve the same identifier forms
+//! — an ARN or the bare id suffix of one — the same way. A dashboard identifier
+//! is a bare name or a dashboard ARN, the refresh-schedule and widget rules are
+//! the ones the model documents, and both are applied by every dashboard
 //! operation rather than copied into each.
 
 use std::collections::BTreeMap;
@@ -372,11 +376,298 @@ pub fn first_duplicate_tag_key(tags: &[Tag]) -> Option<&str> {
 /// `ListTrails` report and the order `ListTrails` pages through.
 pub type TrailKey = (String, String);
 
+/// The refusal text for `EventDataStoreNotFoundException`.
+///
+/// It names no value from the request because the service's own text does not: the
+/// store the caller asked for is exactly what could not be found.
+pub const EVENT_DATA_STORE_NOT_FOUND_MESSAGE: &str = "The event data store was not found.";
+
+/// The refusal text for `QueryIdNotFoundException`: it names the member the
+/// request supplied and its value, the way the service words it — "The QueryId
+/// value <id> does not exist or is not in the same region."
+pub fn query_not_found_message(member: &str, value: &str) -> String {
+    format!("The {member} value {value} does not exist or is not in the same region.")
+}
+
+/// The resource prefix of an event data store ARN:
+/// `arn:aws:cloudtrail:<region>:<account>:eventdatastore/<id>`.
+const EVENT_DATA_STORE_RESOURCE_PREFIX: &str = "eventdatastore/";
+
+/// The status of an event data store: one variant per value of the model's
+/// `EventDataStoreStatus` enum (`ops::types::EVENT_DATA_STORE_STATUS_VALUES`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum EventDataStoreState {
+    Created,
+    #[default]
+    Enabled,
+    PendingDeletion,
+    StartingIngestion,
+    StoppingIngestion,
+    StoppedIngestion,
+}
+
+impl EventDataStoreState {
+    /// The value this state carries on the wire.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Created => "CREATED",
+            Self::Enabled => "ENABLED",
+            Self::PendingDeletion => "PENDING_DELETION",
+            Self::StartingIngestion => "STARTING_INGESTION",
+            Self::StoppingIngestion => "STOPPING_INGESTION",
+            Self::StoppedIngestion => "STOPPED_INGESTION",
+        }
+    }
+
+    /// Whether a query operation may name this store.
+    ///
+    /// A store awaiting deletion holds no queryable lake any more, which is what
+    /// the modelled `InactiveEventDataStoreException` ("The event data store is
+    /// inactive") reports. A store that has stopped ingesting new events still
+    /// serves queries over what it already holds, so only `PENDING_DELETION` is
+    /// inactive for this purpose.
+    pub fn is_queryable(self) -> bool {
+        !matches!(self, Self::PendingDeletion)
+    }
+}
+
+/// One persisted CloudTrail Lake event data store.
+///
+/// The ARN is not stored: it is a function of the Region and the id
+/// ([`event_data_store_arn`]), so deriving it keeps one source of truth.
+#[derive(Debug, Default, Clone)]
+pub struct EventDataStoreRecord {
+    /// The ARN's resource suffix — the identifier every operation accepts in
+    /// place of the full ARN.
+    pub id: String,
+    pub name: String,
+    /// The Region the store lives in; it is reachable only from there.
+    pub region: String,
+    pub status: EventDataStoreState,
+    /// The account the store belongs to, or `None` for the emulator's own
+    /// account. A cross-account query echoes it back as
+    /// `EventDataStoreOwnerAccountId`.
+    pub owner_account_id: Option<String>,
+    pub created_at: Option<SystemTime>,
+}
+
+impl EventDataStoreRecord {
+    /// The account that owns this store: the one it was created for, defaulting
+    /// to the emulator's own account.
+    pub fn owner(&self) -> &str {
+        match self.owner_account_id.as_deref() {
+            Some(account_id) => account_id,
+            None => ::engine::emulator_account_id(),
+        }
+    }
+}
+
+/// A Lake query's lifecycle state: one variant per value of the model's
+/// `QueryStatus` enum (`ops::types::QUERY_STATUS_VALUES`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum QueryState {
+    #[default]
+    Queued,
+    Running,
+    Finished,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+impl QueryState {
+    /// The value this state carries on the wire.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Queued => "QUEUED",
+            Self::Running => "RUNNING",
+            Self::Finished => "FINISHED",
+            Self::Failed => "FAILED",
+            Self::Cancelled => "CANCELLED",
+            Self::TimedOut => "TIMED_OUT",
+        }
+    }
+
+    /// Whether the run has stopped moving: no later call changes this state.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Finished | Self::Failed | Self::Cancelled | Self::TimedOut
+        )
+    }
+}
+
+/// Where a query's results were delivered.
+///
+/// The URI and the delivery status are one value because the model reports them
+/// as a pair — "If the query results were delivered to an S3 bucket, the response
+/// also provides the S3 URI and the delivery status" — so neither can be stored
+/// without the other.
+#[derive(Debug, Clone)]
+pub struct QueryDelivery {
+    pub s3_uri: String,
+    /// One of the model's `DeliveryStatus` values
+    /// (`ops::types::DELIVERY_STATUS_VALUES`).
+    pub status: String,
+}
+
+/// What a query run accumulated, as `DescribeQuery` reports it.
+#[derive(Debug, Default, Clone)]
+pub struct QueryStatisticsRecord {
+    pub events_matched: i64,
+    pub events_scanned: i64,
+    pub bytes_scanned: i64,
+    /// `None` until the run ends: a run time exists only once there is a run to
+    /// have taken it.
+    pub execution_time_in_millis: Option<i32>,
+}
+
+/// One persisted Lake query — everything `StartQuery` was given plus what the run
+/// produced, which is what `DescribeQuery` reports.
+#[derive(Debug, Default, Clone)]
+pub struct QueryRecord {
+    pub query_id: String,
+    /// The id of the event data store the query ran on.
+    pub event_data_store_id: String,
+    /// The Region the query ran in; it is reachable only from there.
+    pub region: String,
+    pub query_string: String,
+    /// The query template alias this run was started under, if any.
+    pub query_alias: Option<String>,
+    /// The dashboard refresh this run belongs to, if any.
+    pub refresh_id: Option<String>,
+    /// The natural-language prompt a generated query came from, if any.
+    pub prompt: Option<String>,
+    pub status: QueryState,
+    pub statistics: QueryStatisticsRecord,
+    pub delivery: Option<QueryDelivery>,
+    /// Why the run failed; set only by a run that ended in failure.
+    pub error_message: Option<String>,
+    /// The account owning the event data store, for a cross-account query.
+    pub event_data_store_owner_account_id: Option<String>,
+    /// When `StartQuery` minted the query: the `CreationTime` of the statistics
+    /// `DescribeQuery` reports.
+    pub created_at: Option<SystemTime>,
+}
+
+impl QueryRecord {
+    /// Whether a call made in `region` naming `event_data_store_id` (when it names
+    /// one) addresses this query.
+    pub fn addressed_by(&self, region: &str, event_data_store_id: Option<&str>) -> bool {
+        self.region == region
+            && event_data_store_id.is_none_or(|store| self.event_data_store_id == store)
+    }
+}
+
+/// Why a caller-supplied event data store identifier could not be read at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventDataStoreRejection {
+    /// Shaped like an ARN but not an event data store ARN ⇒
+    /// `EventDataStoreARNInvalidException` (HTTP 400).
+    InvalidArn(String),
+}
+
+impl EventDataStoreRejection {
+    /// The refusal text: built from the request, naming the value and the rule it
+    /// broke, so a caller can fix the request from it alone.
+    pub fn message(self) -> String {
+        match self {
+            Self::InvalidArn(message) => message,
+        }
+    }
+}
+
+/// A caller-supplied event data store identifier, in either of the two forms the
+/// model documents: "The ARN (or the ID suffix of the ARN) of an event data store".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventDataStoreIdentifier {
+    /// The store id — the ARN's resource suffix.
+    pub id: String,
+    /// The Region the ARN pins the store to; `None` for a bare id, which names a
+    /// store in the caller's own Region.
+    pub region: Option<String>,
+}
+
+/// The ARN of the event data store `id` in `region`.
+pub fn event_data_store_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        SERVICE_NAMESPACE,
+        region,
+        &format!("{EVENT_DATA_STORE_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// Read a caller-supplied event data store identifier as either an event data
+/// store ARN or the bare id suffix of one.
+///
+/// A value carrying a `:` is read as an ARN — so a malformed ARN is refused as one
+/// rather than taken for an id — and anything else as a bare id.
+pub fn parse_event_data_store_identifier(
+    value: &str,
+) -> Result<EventDataStoreIdentifier, EventDataStoreRejection> {
+    if !value.contains(':') {
+        // The id suffix form, with or without the `eventdatastore/` resource
+        // prefix the full ARN carries.
+        let id = value
+            .strip_prefix(EVENT_DATA_STORE_RESOURCE_PREFIX)
+            .unwrap_or(value);
+        if id.is_empty() {
+            return Err(EventDataStoreRejection::InvalidArn(
+                event_data_store_arn_rejection(value),
+            ));
+        }
+        return Ok(EventDataStoreIdentifier {
+            id: id.to_string(),
+            region: None,
+        });
+    }
+
+    let fields: Vec<&str> = value.split(':').collect();
+    let [arn, partition, service, region, account, resource] = fields.as_slice() else {
+        return Err(EventDataStoreRejection::InvalidArn(
+            event_data_store_arn_rejection(value),
+        ));
+    };
+    let id = resource.strip_prefix(EVENT_DATA_STORE_RESOURCE_PREFIX);
+    match id {
+        Some(id)
+            if *arn == "arn"
+                && !partition.is_empty()
+                && *service == SERVICE_NAMESPACE
+                && !region.is_empty()
+                && !account.is_empty()
+                && !id.is_empty() =>
+        {
+            Ok(EventDataStoreIdentifier {
+                id: id.to_string(),
+                region: Some((*region).to_string()),
+            })
+        }
+        _ => Err(EventDataStoreRejection::InvalidArn(
+            event_data_store_arn_rejection(value),
+        )),
+    }
+}
+
+/// The text an unreadable event data store identifier is refused with.
+fn event_data_store_arn_rejection(value: &str) -> String {
+    format!(
+        "'{value}' is not a valid event data store ARN: the format of an event data store \
+         ARN is arn:aws:cloudtrail:<region>:<account-id>:eventdatastore/<event-data-store-id>, \
+         or the event data store id alone"
+    )
+}
+
 /// Per-service state for com-amazonaws-cloudtrail-cloudtrail-20131101. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudtrailCloudtrail20131101State {
     /// Every trail in the account, keyed by [`TrailKey`].
     pub trails: BTreeMap<TrailKey, TrailRecord>,
+    /// Every CloudTrail Lake event data store, keyed by its id (the resource
+    /// suffix of its ARN), which is unique across Regions.
+    pub event_data_stores: BTreeMap<String, EventDataStoreRecord>,
+    /// Every Lake query run, keyed by its query id.
+    pub queries: BTreeMap<String, QueryRecord>,
     /// Every CloudTrail Lake dashboard in the account, keyed by [`DashboardKey`].
     pub dashboards: BTreeMap<DashboardKey, DashboardRecord>,
 }
@@ -460,6 +751,78 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
                 None => TrailForMutation::Absent,
             }),
         }
+    }
+
+    /// Whether this Region holds any event data store at all — what a request
+    /// that names none resolves against.
+    pub fn has_event_data_store_in(&self, region: &str) -> bool {
+        self.event_data_stores
+            .values()
+            .any(|record| record.region == region)
+    }
+
+    /// Whether this Region holds an event data store owned by `account_id` —
+    /// what a request naming an `EventDataStoreOwnerAccountId` resolves against.
+    pub fn has_event_data_store_owned_by(&self, region: &str, account_id: &str) -> bool {
+        self.event_data_stores
+            .values()
+            .any(|record| record.region == region && record.owner() == account_id)
+    }
+
+    /// Resolve a caller-supplied event data store identifier (an ARN or the bare
+    /// id suffix of one) to a stored event data store.
+    ///
+    /// `Err` is an unreadable identifier (refuse with
+    /// `EventDataStoreARNInvalidException`), `Ok(None)` a readable one naming no
+    /// store in the Region it addresses (`EventDataStoreNotFoundException`): a
+    /// store is reachable only from the Region it lives in, whether it is named by
+    /// a bare id (the caller's Region) or by an ARN (the ARN's Region).
+    pub fn event_data_store(
+        &self,
+        identifier: &str,
+        request_region: &str,
+    ) -> Result<Option<&EventDataStoreRecord>, EventDataStoreRejection> {
+        let parsed = parse_event_data_store_identifier(identifier)?;
+        let addressed = parsed.region.as_deref().unwrap_or(request_region);
+        Ok(self
+            .event_data_stores
+            .get(&parsed.id)
+            .filter(|record| record.region == addressed))
+    }
+
+    /// The query `query_id` names, as a call made in `request_region` and naming
+    /// `event_data_store_id` (when it names one) addresses it.
+    pub fn query(
+        &self,
+        query_id: &str,
+        request_region: &str,
+        event_data_store_id: Option<&str>,
+    ) -> Option<&QueryRecord> {
+        self.queries
+            .get(query_id)
+            .filter(|record| record.addressed_by(request_region, event_data_store_id))
+    }
+
+    /// The LAST query run for `alias` — what `DescribeQuery` reports when it is
+    /// given a `QueryAlias` instead of a `QueryId` — narrowed to one dashboard
+    /// refresh when `refresh_id` is given.
+    ///
+    /// "Last" is by creation time, so the newest run of the template wins.
+    pub fn last_query_for_alias(
+        &self,
+        alias: &str,
+        refresh_id: Option<&str>,
+        request_region: &str,
+        event_data_store_id: Option<&str>,
+    ) -> Option<&QueryRecord> {
+        self.queries
+            .values()
+            .filter(|record| record.addressed_by(request_region, event_data_store_id))
+            .filter(|record| record.query_alias.as_deref() == Some(alias))
+            .filter(|record| {
+                refresh_id.is_none_or(|refresh| record.refresh_id.as_deref() == Some(refresh))
+            })
+            .max_by_key(|record| record.created_at)
     }
 }
 

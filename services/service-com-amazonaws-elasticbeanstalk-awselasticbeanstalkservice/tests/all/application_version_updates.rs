@@ -21,6 +21,18 @@ use crate::lifecycle::{account, Emulator, TEST_REGION};
 /// `Description` targets `Description` with `length { min: 0, max: 200 }`).
 const DESCRIPTION_MAX_LEN: usize = 200;
 
+/// `serialized` (an ISO 8601 timestamp the emulator answered) as the instant it
+/// denotes, so two timestamps are compared as instants rather than as strings.
+fn instant(serialized: &str, case: &str) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from_str(
+        serialized,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .unwrap_or_else(|error| {
+        panic!("case {case:?}: {serialized:?} must be an ISO 8601 timestamp: {error}")
+    })
+}
+
 /// One row of the description-update rule: what the version was created with,
 /// what the update supplies, and what the record must then report.
 struct DescriptionCase {
@@ -207,8 +219,11 @@ async fn an_update_writes_only_the_properties_the_request_supplies() {
         let date_updated = updated
             .expect("ApplicationVersion/DateUpdated", case.label)
             .to_string();
+        // Compared as INSTANTS, not as strings: the serialized fractional second
+        // drops trailing zeroes, so "…45.2581Z" and "…45.258199Z" do not order
+        // lexicographically the way the instants they denote do.
         assert!(
-            date_updated >= date_created,
+            instant(&date_updated, case.label) >= instant(&date_created, case.label),
             "case {:?}: expected DateUpdated at or after DateCreated {date_created:?}, \
              got {date_updated:?}",
             case.label

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::job_lifecycle::error_code;
+use crate::job_lifecycle::{error_code, error_message};
 
 /// A SigV4 `Authorization` naming this service's signing name (`batch`) — how
 /// the router picks the service — and the region in its credential scope, which
@@ -84,15 +84,6 @@ async fn register(router: &MultiServiceRouter, body: &str) -> (u16, Value) {
 
 async fn describe(router: &MultiServiceRouter, body: &str) -> (u16, Value) {
     call(router, "/v1/describejobdefinitions", body).await
-}
-
-/// The `message` of an error response.
-fn error_message(body: &Value) -> String {
-    body.get("message")
-        .or_else(|| body.get("Message"))
-        .and_then(Value::as_str)
-        .unwrap_or("<none>")
-        .to_string()
 }
 
 fn string_at(body: &Value, member: &str) -> String {

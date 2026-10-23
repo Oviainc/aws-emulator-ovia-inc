@@ -268,17 +268,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         if !crate::state::is_known_scope(&input.scope) {
             return Err(CreateWebACLErrorModeled::WAFInvalidParameterException(
-                WAFInvalidParameterException {
-                    message: Some(format!(
-                        "Scope {:?} is not one of CLOUDFRONT or REGIONAL",
-                        input.scope
-                    )),
-                    field: Some("SCOPE_VALUE".to_string()),
-                    parameter: Some(input.scope.clone()),
-                    reason: Some(
-                        "the scope names the namespace the web ACL lives in".to_string(),
-                    ),
-                },
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_SCOPE_VALUE,
+                    &input.scope,
+                    "the scope names the namespace the web ACL lives in, and is one of CLOUDFRONT or REGIONAL",
+                ),
             )
             .into());
         }
@@ -289,12 +283,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::validate_statement_nesting(input.rules.as_deref().unwrap_or_default())
         {
             return Err(CreateWebACLErrorModeled::WAFInvalidParameterException(
-                WAFInvalidParameterException {
-                    message: Some(reason.clone()),
-                    field: Some("STATEMENT".to_string()),
-                    parameter: Some("Rules".to_string()),
-                    reason: Some(reason),
-                },
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_STATEMENT,
+                    "Rules",
+                    &reason,
+                ),
             )
             .into());
         }

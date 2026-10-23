@@ -134,8 +134,11 @@ pub const MAX_LEXICONS: usize = 100;
 ///
 /// Amazon Polly's published service quotas for lexicons ("Quotas in Amazon Polly")
 /// cap a lexeme at 100 characters, which is the quota
-/// `MaxLexemeLengthExceededException` reports ("The maximum size of the lexeme would
-/// be exceeded by this operation"). It applies to the REPLACEMENT a lexeme defines —
+/// `MaxLexemeLengthExceededException` reports (the model documents that shape as "The
+/// maximum size of the lexeme would be exceeded by this operation"; the sentence the
+/// service puts on the wire for the code is
+/// [`crate::service::errors::MAX_LEXEME_LENGTH_EXCEEDED`]).
+/// It applies to the REPLACEMENT a lexeme defines —
 /// its `<alias>` or `<phoneme>` — which is the part Amazon Polly substitutes while
 /// speaking; the `<grapheme>` being matched is bounded by
 /// [`MAX_LEXICON_CHARACTERS`] along with the rest of the document.

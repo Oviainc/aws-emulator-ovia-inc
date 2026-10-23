@@ -42,10 +42,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    Certificate, CertificateDetails, DBClusterParameterGroup, DBInstance, DBParameterGroupStatus,
-    DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup, DomainMembership, Endpoint,
-    EventCategoriesMap, EventSubscription, GlobalCluster, GlobalClusterMember, Option2,
-    OptionGroup, OptionGroupMembership, OptionSetting, Parameter, PendingModifiedValues, Subnet,
+    Certificate, CertificateDetails, ClusterPendingModifiedValues, DBCluster, DBClusterMember,
+    DBClusterOptionGroupStatus, DBClusterParameterGroup, DBClusterRole, DBInstance,
+    DBParameterGroupStatus, DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup,
+    DomainMembership, Endpoint, EventCategoriesMap, EventSubscription, GlobalCluster,
+    GlobalClusterMember, Option2, OptionGroup, OptionGroupMembership, OptionSetting, Parameter,
+    PendingModifiedValues, ScalingConfigurationInfo, ServerlessV2ScalingConfigurationInfo, Subnet,
     Tag, VpcSecurityGroupMembership,
 };
 
@@ -149,6 +151,24 @@ pub const EVENT_SUBSCRIPTION_QUOTA_PER_REGION: usize = 20;
 /// map this bounds: a global cluster is account-scoped and carries no region.
 pub const GLOBAL_CLUSTER_QUOTA_PER_ACCOUNT: usize = 5;
 
+/// How many DB clusters one region may hold: Amazon RDS's published default quota ("DB
+/// clusters": 40 per Region). Reaching it is the modelled `DBClusterQuotaExceededFault` —
+/// "The user attempted to create a new DB cluster and the user has already reached the
+/// maximum allowed DB cluster quota".
+pub const DB_CLUSTER_QUOTA_PER_REGION: usize = 40;
+
+/// The status a DB cluster reports from the create that was accepted for it until the
+/// clock makes its transition to [`DB_CLUSTER_STATUS_AVAILABLE`] due.
+///
+/// `CreateDBCluster` "creates a new Amazon Aurora DB cluster" and answers before the
+/// cluster is usable, which is why the transition below is owed at all; the value is the
+/// `creating` status RDS reports for a cluster it is still provisioning, as
+/// `DBCluster$Status` ("the current state of this DB cluster") carries it.
+pub const DB_CLUSTER_STATUS_CREATING: &str = "creating";
+
+/// The status a DB cluster reports once it is usable, as `DBCluster$Status` carries it.
+pub const DB_CLUSTER_STATUS_AVAILABLE: &str = "available";
+
 /// The status an event notification subscription reports once it is set up and
 /// delivering, from `EventSubscription$Status`'s published list ("creating | modifying |
 /// deleting | active | no-permission | topic-not-exist").
@@ -185,6 +205,11 @@ pub const STORAGE_ENCRYPTION_TYPE_SSE_RDS: &str = "sse-rds";
 /// "`sse-kms` - The global database cluster is encrypted using a customer managed KMS key
 /// or Amazon Web Services managed KMS key."
 pub const STORAGE_ENCRYPTION_TYPE_SSE_KMS: &str = "sse-kms";
+
+/// `DBCluster$StorageEncryptionType` for a cluster whose data at rest is not encrypted at
+/// all: "`none` - The DB cluster is not encrypted." Aurora storage is always encrypted, so
+/// only a Multi-AZ DB cluster created without `StorageEncrypted` reports it.
+pub const STORAGE_ENCRYPTION_TYPE_NONE: &str = "none";
 
 /// The lifecycle types a global database cluster may be enrolled in, as
 /// `CreateGlobalClusterMessage$EngineLifecycleSupport` publishes them ("Valid Values:
@@ -338,6 +363,217 @@ pub const DB_INSTANCE_ENGINES: [&str; 25] = [
 /// service, so its engine is as published as the ones above.
 pub const SIBLING_CONTROL_PLANE_ENGINES: [&str; 2] = ["docdb", "neptune"];
 
+/// The engines a DB CLUSTER can run, as `CreateDBClusterMessage$Engine` lists them
+/// (`smithy_query(query="doc",shape="CreateDBClusterMessage",member="Engine")`: "Valid
+/// Values: aurora-mysql aurora-postgresql mysql postgres neptune"). It is a different,
+/// much shorter list than [`DB_INSTANCE_ENGINES`] — only the engines that have a cluster
+/// form — which is why `CreateDBCluster` resolves its `Engine` against this one.
+///
+/// `docdb` joins them for the same reason it joins [`SIBLING_CONTROL_PLANE_ENGINES`]: this
+/// front door serves the Amazon DocumentDB control plane too, and
+/// `com.amazonaws.docdb#CreateDBClusterMessage$Engine` publishes "Valid values: docdb".
+pub const DB_CLUSTER_ENGINES: [&str; 6] = [
+    "aurora-mysql",
+    "aurora-postgresql",
+    "docdb",
+    "mysql",
+    "neptune",
+    "postgres",
+];
+
+/// Refuse an `Engine` outside the value list `CreateDBClusterMessage$Engine` publishes
+/// ([`DB_CLUSTER_ENGINES`]).
+pub fn check_db_cluster_engine(engine: &str) -> Result<(), String> {
+    if DB_CLUSTER_ENGINES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(engine))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "Invalid DB engine: {engine} is not one of {}",
+        DB_CLUSTER_ENGINES.join(", ")
+    ))
+}
+
+/// Whether a cluster of `engine` is a MULTI-AZ DB CLUSTER rather than an Aurora-style one.
+///
+/// `CreateDBCluster` documents two cluster TYPES and gates most of its members on which
+/// one is being created ("Valid for Cluster Type: Aurora DB clusters only", "This setting
+/// is required to create a Multi-AZ DB cluster"). The type follows from the engine: the
+/// Aurora engines — and the `docdb` and `neptune` engines of the two sibling control
+/// planes this front door serves, whose clusters are Aurora-style too — are Aurora DB
+/// clusters, while the RDS engines that have a cluster form (`mysql`, `postgres`) are
+/// Multi-AZ DB clusters, "Multi-AZ deployments with two readable standby DB instances".
+pub fn is_multi_az_db_cluster(engine: &str) -> bool {
+    !is_aurora(engine)
+        && !SIBLING_CONTROL_PLANE_ENGINES
+            .iter()
+            .any(|sibling| sibling.eq_ignore_ascii_case(engine))
+}
+
+/// The longest `DBClusterIdentifier` a cluster of `engine` may carry.
+///
+/// `DBClusterIdentifier`: "Must contain from 1 to 63 (for Aurora DB clusters) or 1 to 52
+/// (for Multi-AZ DB clusters) letters, numbers, or hyphens."
+pub fn db_cluster_identifier_max_len(engine: &str) -> usize {
+    if is_multi_az_db_cluster(engine) {
+        52
+    } else {
+        63
+    }
+}
+
+/// The storage types a cluster of `engine` may be created with, as
+/// `CreateDBClusterMessage$StorageType` publishes them ("Aurora DB clusters - aurora |
+/// aurora-iopt1", "Multi-AZ DB clusters - io1 | io2 | gp3").
+pub fn db_cluster_storage_types(engine: &str) -> &'static [&'static str] {
+    if is_multi_az_db_cluster(engine) {
+        &["io1", "io2", "gp3"]
+    } else {
+        &[AURORA_DEFAULT_STORAGE_TYPE, "aurora-iopt1"]
+    }
+}
+
+/// The storage type an Aurora DB cluster gets when the request names none
+/// (`StorageType` "Default: Aurora DB clusters - `aurora`").
+///
+/// It is also the one value the member documents as NOT reported back: "When you create an
+/// Aurora DB cluster with the storage type set to `aurora-iopt1`, the storage type is
+/// returned in the response. The storage type isn't returned when you set it to
+/// `aurora`."
+pub const AURORA_DEFAULT_STORAGE_TYPE: &str = "aurora";
+
+/// The engine modes a DB cluster may be created in, as
+/// `CreateDBClusterMessage$EngineMode` publishes them: "The DB engine mode of the DB
+/// cluster, either `provisioned` or `serverless`."
+pub const DB_CLUSTER_ENGINE_MODES: [&str; 2] = [DEFAULT_DB_CLUSTER_ENGINE_MODE, "serverless"];
+
+/// The engine mode a DB cluster created without one runs in.
+///
+/// `EngineMode` names two values and says the `serverless` one "only applies for Aurora
+/// Serverless v1 DB clusters. Aurora Serverless v2 DB clusters use the `provisioned`
+/// engine mode" — so a cluster the request named no mode for is a provisioned one, which
+/// is also the mode every version of this service's engine-version catalogue publishes.
+pub const DEFAULT_DB_CLUSTER_ENGINE_MODE: &str = "provisioned";
+
+/// The scalability mode an Aurora DB cluster created without one runs in
+/// (`ClusterScalabilityType`: "When set to `standard` (the default), the cluster uses
+/// normal DB instance creation").
+pub const DEFAULT_CLUSTER_SCALABILITY_TYPE: &str = "standard";
+
+/// `DBCluster$LocalWriteForwardingStatus` for a cluster that forwards writes from a reader
+/// to its writer, and for one that does not — the two settled values of the published
+/// `LocalWriteForwardingStatus` list ("enabled | disabled | enabling | disabling |
+/// requested"), which is what `CreateDBCluster$EnableLocalWriteForwarding` selects between.
+pub const LOCAL_WRITE_FORWARDING_ENABLED: &str = "enabled";
+
+/// See [`LOCAL_WRITE_FORWARDING_ENABLED`].
+pub const LOCAL_WRITE_FORWARDING_DISABLED: &str = "disabled";
+
+/// The status an IAM role associated with a DB cluster reports once the association is in
+/// place, as `DBClusterRole$Status` publishes it ("ACTIVE | PENDING | INVALID").
+pub const DB_CLUSTER_ROLE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// Refuse a `MasterUsername` outside the constraints its member documents: "Must be 1 to
+/// 16 letters or numbers. First character must be a letter."
+///
+/// The third documented constraint — "Can't be a reserved word for the chosen database
+/// engine" — is NOT enforced: the reserved words are each engine's own SQL keyword list,
+/// which this service does not hold, and refusing a name no published list carries would
+/// refuse names AWS accepts.
+pub fn check_master_username(value: &str) -> Result<(), String> {
+    if !value.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "MasterUsername must be 1 to 16 letters or numbers; got '{value}'"
+        ));
+    }
+    let length = value.chars().count();
+    if length == 0 || length > MAX_MASTER_USERNAME_LEN {
+        return Err(format!(
+            "MasterUsername must be 1 to {MAX_MASTER_USERNAME_LEN} letters or numbers; \
+             got {length} characters"
+        ));
+    }
+    if !value
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        return Err(format!(
+            "the first character of MasterUsername must be a letter; got '{value}'"
+        ));
+    }
+    Ok(())
+}
+
+/// The longest `MasterUsername` a DB cluster accepts ("Must be 1 to 16 letters or
+/// numbers").
+pub const MAX_MASTER_USERNAME_LEN: usize = 16;
+
+/// The longest `RoleArn` an `AssociatedRoles` entry may carry: the bound the member's own
+/// `@length` publishes (`DBClusterAssociatedRole$RoleArn`, 20..2048). The boundary
+/// validator refuses a longer one before a handler runs; a handler that STORES the value
+/// bounds it again where it enters the store, so the stored size is bounded locally rather
+/// than only upstream.
+pub const MAX_IAM_ROLE_ARN_LEN: usize = 2048;
+
+/// Refuse a `MasterUserPassword` outside the constraints its member documents: "Must
+/// contain from 8 to 41 characters. Can contain any printable ASCII character except \"/\",
+/// \"\"\", or \"@\"."
+///
+/// The password itself is never stored or reported — the member is `@sensitive` and RDS
+/// reports no member carrying it — so this is the only place it is looked at at all.
+pub fn check_master_user_password(value: &str) -> Result<(), String> {
+    let length = value.chars().count();
+    if !MASTER_USER_PASSWORD_LEN.contains(&length) {
+        return Err(format!(
+            "MasterUserPassword must contain from {} to {} characters; got {length}",
+            MASTER_USER_PASSWORD_LEN.start(),
+            MASTER_USER_PASSWORD_LEN.end()
+        ));
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_graphic() && !matches!(c, '/' | '"' | '@'))
+    {
+        return Err(
+            "MasterUserPassword can contain any printable ASCII character except '/', '\"' \
+             or '@'"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// How long a `MasterUserPassword` may be ("Must contain from 8 to 41 characters").
+pub const MASTER_USER_PASSWORD_LEN: std::ops::RangeInclusive<usize> = 8..=41;
+
+/// The `BackupRetentionPeriod` a DB cluster accepts ("Constraints: Must be a value from 1
+/// to 35") — a different lower bound than a DB instance's
+/// [`BACKUP_RETENTION_RANGE`], whose own member documents "0 to 35".
+pub const CLUSTER_BACKUP_RETENTION_RANGE: std::ops::RangeInclusive<i32> = 1..=35;
+
+/// The `BacktrackWindow` an Aurora MySQL DB cluster accepts, in seconds ("If specified,
+/// this value must be set to a number from 0 to 259,200 (72 hours)"). Zero disables
+/// backtracking, which is also the documented default.
+pub const BACKTRACK_WINDOW_RANGE: std::ops::RangeInclusive<i64> = 0..=259_200;
+
+/// How long an Aurora Serverless v2 DB instance may be idle before Aurora pauses it
+/// (`ServerlessV2ScalingConfiguration$SecondsUntilAutoPause`: "Specify a value between 300
+/// seconds (five minutes) and 86,400 seconds (one day)").
+pub const SECONDS_UNTIL_AUTO_PAUSE_RANGE: std::ops::RangeInclusive<i32> = 300..=86_400;
+
+/// The `PerformanceInsightsRetentionPeriod` the `advanced` Database Insights mode requires
+/// (`DatabaseInsightsMode`: "If you set this value to advanced, you must also set the
+/// PerformanceInsightsEnabled parameter to true and the
+/// PerformanceInsightsRetentionPeriod parameter to 465").
+pub const ADVANCED_INSIGHTS_RETENTION_PERIOD: i32 = 465;
+
+/// The `DatabaseInsightsMode` that requires Performance Insights and the 465-day retention
+/// period above.
+pub const DATABASE_INSIGHTS_MODE_ADVANCED: &str = "advanced";
+
 /// Refuse an `Engine` outside the value list its member publishes
 /// ([`DB_INSTANCE_ENGINES`], plus the sibling control planes'
 /// [`SIBLING_CONTROL_PLANE_ENGINES`]). A value that is not an engine names no database
@@ -469,6 +705,15 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     pub db_instances: BTreeMap<RegionalKey, DbInstanceRecord>,
     /// DB snapshots by `(region, DBSnapshotIdentifier)`. Ordered, for the same reason.
     pub db_snapshots: BTreeMap<RegionalKey, DbSnapshotRecord>,
+    /// DB clusters by `(region, DBClusterIdentifier)` — the identifier always stored
+    /// lowercased, as the model documents. Ordered, so `DescribeDBClusters` pages
+    /// deterministically within a region.
+    ///
+    /// `CreateDBCluster` inserts here — bounded by [`DB_CLUSTER_QUOTA_PER_REGION`] per
+    /// region and by [`MAX_REGIONS`] regions — and this is also what a request that
+    /// REFERENCES a cluster (`CreateDBInstance$DBClusterIdentifier`) is resolved against,
+    /// so an instance can only join a cluster some create really stored.
+    pub db_clusters: BTreeMap<RegionalKey, DbClusterRecord>,
     /// Cluster parameter groups by `(region, DBClusterParameterGroupName)` — the name
     /// always stored lowercased, as the model documents. Ordered, so
     /// `DescribeDBClusterParameterGroups` pages deterministically within a region.
@@ -576,9 +821,105 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                 gone.push(key.clone());
             }
         }
-        for key in gone {
+        for key in gone.drain(..) {
             self.db_snapshots.remove(&key);
         }
+        for (key, cluster) in self
+            .db_clusters
+            .range_mut((region.to_string(), String::new())..)
+        {
+            if key.0 != region {
+                break;
+            }
+            if cluster.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone {
+            self.db_clusters.remove(&key);
+        }
+    }
+
+    /// The DB clusters stored in `region`, in identifier order.
+    pub fn clusters_in(&self, region: &str) -> Vec<&DbClusterRecord> {
+        range_in(&self.db_clusters, region)
+    }
+
+    /// The DB cluster `named` resolves to in `region`, or `None` when nothing of that name
+    /// exists — what a request that NAMES a DB cluster is resolved against.
+    ///
+    /// `named` is "the user-supplied DB cluster identifier or the Amazon Resource Name
+    /// (ARN) of the DB cluster", and "this parameter isn't case-sensitive": both forms are
+    /// folded to the identifier the store is keyed by before the lookup, so the two name
+    /// one and the same cluster.
+    pub fn resolve_db_cluster(&self, region: &str, named: &str) -> Option<&DbClusterRecord> {
+        let identifier = db_cluster_identifier_of(named).to_ascii_lowercase();
+        self.db_clusters.get(&(region.to_string(), identifier))
+    }
+
+    /// What a DB cluster reports about the records AROUND it — see [`ClusterMembership`].
+    fn cluster_membership(&self, record: &DbClusterRecord) -> ClusterMembership {
+        // The member DB instances, earliest-created first: the cluster's writer is the
+        // instance that was created in it first, and every later one is a reader.
+        let mut members: Vec<&DbInstanceRecord> = self
+            .instances_in(&record.region)
+            .into_iter()
+            .filter(|instance| {
+                instance
+                    .db_cluster_identifier
+                    .as_ref()
+                    .is_some_and(|named| named.eq_ignore_ascii_case(&record.identifier))
+            })
+            .collect();
+        members.sort_by(|left, right| {
+            left.instance_create_time
+                .as_secs_f64()
+                .total_cmp(&right.instance_create_time.as_secs_f64())
+                .then_with(|| left.identifier.cmp(&right.identifier))
+        });
+        ClusterMembership {
+            // "Indicates whether the DB cluster has instances in multiple Availability
+            // Zones" — read off the zones its members are actually in, so it cannot
+            // disagree with them.
+            multi_az: members
+                .iter()
+                .map(|instance| instance.availability_zone.as_str())
+                .collect::<BTreeSet<&str>>()
+                .len()
+                > 1,
+            members: members
+                .iter()
+                .enumerate()
+                .map(|(position, instance)| DBClusterMember {
+                    db_instance_identifier: Some(instance.identifier.clone()),
+                    is_cluster_writer: Some(position == 0),
+                    db_cluster_parameter_group_status: Some(MEMBERSHIP_IN_SYNC.to_string()),
+                    // `PromotionTier` is a property of the MEMBER instance that no
+                    // implemented operation stores, so it is left out rather than invented.
+                    ..DBClusterMember::default()
+                })
+                .collect(),
+            // "Contains one or more identifiers of the read replicas associated with this
+            // DB cluster": the clusters in this region whose replication source is this
+            // one, read from those records rather than copied onto this one.
+            read_replica_identifiers: self
+                .clusters_in(&record.region)
+                .into_iter()
+                .filter(|other| {
+                    other
+                        .replication_source_arn
+                        .as_ref()
+                        .is_some_and(|source| *source == record.arn())
+                })
+                .map(|other| other.identifier.clone())
+                .collect(),
+        }
+    }
+
+    /// Project a stored DB cluster onto the modelled `DBCluster` output shape, with the
+    /// members and read replicas read from the records that carry them.
+    pub fn cluster_to_wire(&self, record: &DbClusterRecord) -> DBCluster {
+        record.to_wire(&self.cluster_membership(record))
     }
 
     /// The DB instances stored in `region`, in identifier order.
@@ -667,6 +1008,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .db_instances
             .keys()
             .chain(self.db_snapshots.keys())
+            .chain(self.db_clusters.keys())
             .chain(self.db_cluster_parameter_groups.keys())
             .chain(self.event_subscriptions.keys())
             .chain(self.option_groups.keys())
@@ -1000,6 +1342,362 @@ impl DbInstanceRecord {
             is_storage_config_upgrade_available: Some(false),
             engine_lifecycle_support: Some(self.engine_lifecycle_support.clone()),
             ..DBInstance::default()
+        }
+    }
+}
+
+/// What a DB cluster reports about the records AROUND it.
+///
+/// A cluster's members and read replicas are other records — the DB instances that name
+/// it and the clusters that replicate from it — so they are READ from those records when
+/// the cluster is projected, never copied onto the cluster record: a copy would still
+/// claim a member after the instance was deleted. Built by
+/// [`ComAmazonawsRdsAmazonrdsv19State::cluster_to_wire`], which is the only way a handler
+/// projects a cluster.
+#[derive(Debug, Default)]
+pub struct ClusterMembership {
+    /// `DBClusterMembers`: the DB instances that make up the cluster, writer first.
+    pub members: Vec<DBClusterMember>,
+    /// `ReadReplicaIdentifiers`: the clusters whose replication source is this one.
+    pub read_replica_identifiers: Vec<String>,
+    /// `MultiAZ`: whether the member instances sit in more than one Availability Zone.
+    pub multi_az: bool,
+}
+
+/// A stored DB cluster: everything the service persists about it.
+///
+/// As with a DB instance record, the ARN, the two cluster endpoints and the hosted zone
+/// id are NOT stored as text: each is a function of the stored region, identifier and
+/// minted endpoint host, so none of them can be left naming an identifier the cluster no
+/// longer has. The cluster's members are not stored either — see [`ClusterMembership`].
+#[derive(Debug, Clone)]
+pub struct DbClusterRecord {
+    /// `DBClusterIdentifier`, stored lowercased: "this parameter is stored as a lowercase
+    /// string".
+    pub identifier: String,
+    /// The region the cluster was created in; the scope of its ARN and endpoints.
+    pub region: String,
+    /// `DbClusterResourceId`: the immutable, server-minted id.
+    pub resource_id: String,
+    /// The server-assigned middle label of the cluster endpoint DNS names, minted once.
+    pub endpoint_host: String,
+    /// `Status`.
+    pub status: String,
+    /// The transition the clock owes this cluster, if any.
+    pub pending_status: Option<PendingStatus>,
+    /// `Engine`.
+    pub engine: String,
+    /// `EngineVersion`: the version the cluster RUNS, resolved against the engine-version
+    /// catalogue rather than the string the request carried.
+    pub engine_version: Option<String>,
+    /// `EngineMode`.
+    pub engine_mode: String,
+    /// `DatabaseName`.
+    pub database_name: Option<String>,
+    /// `MasterUsername`. The password is never stored: the member is `@sensitive` and RDS
+    /// reports nothing carrying it.
+    pub master_username: Option<String>,
+    /// `Port`: the port the instances in the cluster accept connections on.
+    pub port: i32,
+    /// `AvailabilityZones`: where instances in the cluster can be created.
+    pub availability_zones: Vec<String>,
+    /// `BackupRetentionPeriod`.
+    pub backup_retention_period: i32,
+    /// `PreferredBackupWindow`.
+    pub preferred_backup_window: String,
+    /// `PreferredMaintenanceWindow`.
+    pub preferred_maintenance_window: String,
+    /// `DBClusterParameterGroup`: the group the request named, or the default group of the
+    /// engine version the cluster was created with; `None` where this service publishes no
+    /// version for the engine at all, so there is no family to name a default group after.
+    pub db_cluster_parameter_group_name: Option<String>,
+    /// `DBSubnetGroup`: the subnet group the cluster was created in, resolved in the store
+    /// before the cluster was stored.
+    pub db_subnet_group_name: Option<String>,
+    /// The option group the request named, reported as the cluster's one option group
+    /// membership.
+    pub option_group_name: Option<String>,
+    /// `CharacterSetName`.
+    pub character_set_name: Option<String>,
+    /// `VpcSecurityGroups`: the EC2 VPC security group ids the request named.
+    pub vpc_security_group_ids: Vec<String>,
+    /// `StorageEncrypted`.
+    pub storage_encrypted: bool,
+    /// `KmsKeyId`.
+    pub kms_key_id: Option<String>,
+    /// The storage type the cluster was created with, or `None` for an Aurora cluster on
+    /// the default [`AURORA_DEFAULT_STORAGE_TYPE`], which the member documents as not
+    /// reported.
+    pub storage_type: Option<String>,
+    /// `Iops`.
+    pub iops: Option<i32>,
+    /// `AllocatedStorage`.
+    pub allocated_storage: Option<i32>,
+    /// `DBClusterInstanceClass`, for a Multi-AZ DB cluster.
+    pub db_cluster_instance_class: Option<String>,
+    /// `PubliclyAccessible`, for a Multi-AZ DB cluster; `None` for an Aurora cluster,
+    /// whose member is "only for Multi-AZ DB clusters".
+    pub publicly_accessible: Option<bool>,
+    /// `AutoMinorVersionUpgrade`.
+    pub auto_minor_version_upgrade: bool,
+    /// `DeletionProtection`.
+    pub deletion_protection: bool,
+    /// `CopyTagsToSnapshot`.
+    pub copy_tags_to_snapshot: bool,
+    /// `HttpEndpointEnabled`: whether the RDS Data API endpoint is on for this cluster.
+    pub http_endpoint_enabled: bool,
+    /// `IAMDatabaseAuthenticationEnabled`.
+    pub iam_database_authentication_enabled: bool,
+    /// `BacktrackWindow`, in seconds; zero disables backtracking.
+    pub backtrack_window: i64,
+    /// `EnabledCloudwatchLogsExports`.
+    pub enabled_cloudwatch_logs_exports: Vec<String>,
+    /// `NetworkType`, for an Aurora cluster; `None` for a Multi-AZ DB cluster, whose
+    /// member is "only for Aurora DB clusters".
+    pub network_type: Option<String>,
+    /// `MonitoringInterval`.
+    pub monitoring_interval: i32,
+    /// `MonitoringRoleArn`.
+    pub monitoring_role_arn: Option<String>,
+    /// `DatabaseInsightsMode`.
+    pub database_insights_mode: String,
+    /// `PerformanceInsightsEnabled`.
+    pub performance_insights_enabled: bool,
+    /// `PerformanceInsightsKMSKeyId`.
+    pub performance_insights_kms_key_id: Option<String>,
+    /// `PerformanceInsightsRetentionPeriod`.
+    pub performance_insights_retention_period: Option<i32>,
+    /// `ServerlessV2ScalingConfiguration`: the Aurora Serverless v2 capacity range the
+    /// request named, resolved against the capacity range its engine version publishes.
+    pub serverless_v2_scaling: Option<ServerlessV2ScalingConfigurationInfo>,
+    /// `ScalingConfigurationInfo`: the Aurora Serverless v1 scaling configuration the
+    /// request named, for a cluster in the `serverless` engine mode.
+    pub scaling_configuration: Option<ScalingConfigurationInfo>,
+    /// `AssociatedRoles`: the IAM roles the request associated with the cluster.
+    pub associated_roles: Vec<DBClusterRole>,
+    /// `Domain` and `DomainIAMRoleName`, reported as the cluster's one domain membership.
+    pub domain: Option<String>,
+    /// See [`Self::domain`].
+    pub domain_iam_role_name: Option<String>,
+    /// `GlobalClusterIdentifier`: the global database this cluster is a member of, resolved
+    /// in the store before the cluster was stored.
+    pub global_cluster_identifier: Option<String>,
+    /// `ReplicationSourceIdentifier`: the ARN of the cluster or instance this cluster
+    /// replicates from, resolved in the store before the cluster was stored.
+    pub replication_source_arn: Option<String>,
+    /// The CA the cluster's server certificate is issued under.
+    pub ca_certificate_identifier: String,
+    /// `EngineLifecycleSupport`.
+    pub engine_lifecycle_support: String,
+    /// `ClusterScalabilityType`.
+    pub cluster_scalability_type: String,
+    /// `DBSystemId`: "reserved for future use".
+    pub db_system_id: Option<String>,
+    /// Whether `EnableLocalWriteForwarding` turned in-cluster write forwarding on.
+    pub local_write_forwarding_enabled: bool,
+    /// Whether `EnableGlobalWriteForwarding` asked for write forwarding to a global
+    /// database's primary.
+    pub global_write_forwarding_requested: bool,
+    /// `ClusterCreateTime`.
+    pub cluster_create_time: ::aws_smithy_types::DateTime,
+    /// `TagList`.
+    pub tags: Vec<Tag>,
+}
+
+impl DbClusterRecord {
+    /// Apply a change whose due instant has passed. Returns whether the record is now
+    /// gone, so the caller drops it from the store — the same contract as
+    /// [`DbInstanceRecord::settle`].
+    fn settle(&mut self, now: Instant) -> bool {
+        if self.pending_status.as_ref().is_some_and(|p| now >= p.due_at) {
+            let pending = self.pending_status.take().expect("checked just above");
+            match pending.change {
+                PendingChange::Status(status) => self.status = status,
+                PendingChange::Removal => return true,
+            }
+        }
+        false
+    }
+
+    /// `arn:aws:rds:<region>:<account>:cluster:<identifier>`, from the stored region and
+    /// the cluster's current identifier.
+    pub fn arn(&self) -> String {
+        db_cluster_arn(&self.region, &self.identifier)
+    }
+
+    /// The cluster endpoint: "the connection endpoint for the primary instance of the DB
+    /// cluster", whose published form is
+    /// `<identifier>.cluster-<server-assigned label>.<region>.rds.amazonaws.com` (Amazon
+    /// Aurora User Guide, "Amazon Aurora connection management").
+    pub fn endpoint(&self) -> String {
+        format!(
+            "{}.cluster-{}.{}.rds.amazonaws.com",
+            self.identifier, self.endpoint_host, self.region
+        )
+    }
+
+    /// The reader endpoint, which "load-balances connections across the Aurora Replicas
+    /// that are available in a DB cluster": the same form as [`Self::endpoint`] with the
+    /// published `cluster-ro-` label.
+    pub fn reader_endpoint(&self) -> String {
+        format!(
+            "{}.cluster-ro-{}.{}.rds.amazonaws.com",
+            self.identifier, self.endpoint_host, self.region
+        )
+    }
+
+    /// When the server certificate issued at creation expires:
+    /// [`SERVER_CERTIFICATE_VALIDITY`] after the cluster was created, a function of the
+    /// stored creation time so the two cannot drift.
+    pub fn certificate_valid_till(&self) -> ::aws_smithy_types::DateTime {
+        ::aws_smithy_types::DateTime::from_secs_f64(
+            self.cluster_create_time.as_secs_f64() + SERVER_CERTIFICATE_VALIDITY.as_secs_f64(),
+        )
+    }
+
+    /// `StorageEncryptionType`: "the type of encryption used to protect data at rest in
+    /// the DB cluster".
+    ///
+    /// `sse-kms` when the request asked for encryption — "encrypted using a customer
+    /// managed KMS key or Amazon Web Services managed KMS key". Otherwise it depends on
+    /// the cluster type: Aurora storage is encrypted at rest either way, so an Aurora
+    /// cluster reports `sse-rds`, "encrypted using an Amazon Web Services owned KMS key"
+    /// (the member's own note: "If the DB cluster is encrypted with an Amazon Web Services
+    /// owned key, this value is false and StorageEncryptionType is sse-rds"), while a
+    /// Multi-AZ DB cluster created without encryption is not encrypted at all and reports
+    /// `none`.
+    pub fn storage_encryption_type(&self) -> &'static str {
+        if self.storage_encrypted {
+            STORAGE_ENCRYPTION_TYPE_SSE_KMS
+        } else if is_multi_az_db_cluster(&self.engine) {
+            STORAGE_ENCRYPTION_TYPE_NONE
+        } else {
+            STORAGE_ENCRYPTION_TYPE_SSE_RDS
+        }
+    }
+
+    /// Project the stored record onto the modelled `DBCluster` output shape.
+    ///
+    /// Every member RDS reports for a cluster it holds is projected from the stored record
+    /// or from the records `membership` was read out of; a member this service has no
+    /// state for at all (the restorable-time window, the progress percentage, the clone
+    /// group, the backtrack change-record count) is LEFT OUT rather than invented, while a
+    /// list it does have state for is reported empty, which is what RDS reports for a
+    /// cluster that has none of those associations.
+    pub fn to_wire(&self, membership: &ClusterMembership) -> DBCluster {
+        DBCluster {
+            db_cluster_identifier: Some(self.identifier.clone()),
+            db_cluster_arn: Some(self.arn()),
+            db_cluster_resource_id: Some(self.resource_id.clone()),
+            status: Some(self.status.clone()),
+            engine: Some(self.engine.clone()),
+            engine_version: self.engine_version.clone(),
+            engine_mode: Some(self.engine_mode.clone()),
+            database_name: self.database_name.clone(),
+            master_username: self.master_username.clone(),
+            port: Some(self.port),
+            endpoint: Some(self.endpoint()),
+            reader_endpoint: Some(self.reader_endpoint()),
+            // Only `CreateDBClusterEndpoint` adds a custom endpoint, and it is still a
+            // stub, so no cluster this service holds has one.
+            custom_endpoints: Some(Vec::new()),
+            hosted_zone_id: hosted_zone_id(&self.region).map(str::to_string),
+            availability_zones: Some(self.availability_zones.clone()),
+            backup_retention_period: Some(self.backup_retention_period),
+            preferred_backup_window: Some(self.preferred_backup_window.clone()),
+            preferred_maintenance_window: Some(self.preferred_maintenance_window.clone()),
+            db_cluster_parameter_group: self.db_cluster_parameter_group_name.clone(),
+            db_subnet_group: self.db_subnet_group_name.clone(),
+            character_set_name: self.character_set_name.clone(),
+            db_cluster_option_group_memberships: Some(
+                self.option_group_name
+                    .iter()
+                    .map(|name| DBClusterOptionGroupStatus {
+                        db_cluster_option_group_name: Some(name.clone()),
+                        status: Some(MEMBERSHIP_IN_SYNC.to_string()),
+                    })
+                    .collect(),
+            ),
+            vpc_security_groups: Some(
+                self.vpc_security_group_ids
+                    .iter()
+                    .map(|id| VpcSecurityGroupMembership {
+                        vpc_security_group_id: Some(id.clone()),
+                        status: Some(MEMBERSHIP_ACTIVE.to_string()),
+                    })
+                    .collect(),
+            ),
+            storage_encrypted: Some(self.storage_encrypted),
+            storage_encryption_type: Some(self.storage_encryption_type().to_string()),
+            kms_key_id: self.kms_key_id.clone(),
+            storage_type: self.storage_type.clone(),
+            iops: self.iops,
+            allocated_storage: self.allocated_storage,
+            db_cluster_instance_class: self.db_cluster_instance_class.clone(),
+            publicly_accessible: self.publicly_accessible,
+            auto_minor_version_upgrade: Some(self.auto_minor_version_upgrade),
+            deletion_protection: Some(self.deletion_protection),
+            copy_tags_to_snapshot: Some(self.copy_tags_to_snapshot),
+            http_endpoint_enabled: Some(self.http_endpoint_enabled),
+            iam_database_authentication_enabled: Some(self.iam_database_authentication_enabled),
+            backtrack_window: Some(self.backtrack_window),
+            enabled_cloudwatch_logs_exports: Some(self.enabled_cloudwatch_logs_exports.clone()),
+            network_type: self.network_type.clone(),
+            monitoring_interval: Some(self.monitoring_interval),
+            monitoring_role_arn: self.monitoring_role_arn.clone(),
+            database_insights_mode: Some(self.database_insights_mode.clone()),
+            performance_insights_enabled: Some(self.performance_insights_enabled),
+            performance_insights_kms_key_id: self.performance_insights_kms_key_id.clone(),
+            performance_insights_retention_period: self.performance_insights_retention_period,
+            serverless_v2_scaling_configuration: self.serverless_v2_scaling.clone(),
+            scaling_configuration_info: self.scaling_configuration.clone(),
+            associated_roles: Some(self.associated_roles.clone()),
+            domain_memberships: Some(
+                self.domain
+                    .iter()
+                    .map(|domain| DomainMembership {
+                        domain: Some(domain.clone()),
+                        status: Some("joined".to_string()),
+                        iam_role_name: self.domain_iam_role_name.clone(),
+                        ..DomainMembership::default()
+                    })
+                    .collect(),
+            ),
+            global_cluster_identifier: self.global_cluster_identifier.clone(),
+            global_write_forwarding_requested: Some(self.global_write_forwarding_requested),
+            local_write_forwarding_status: Some(
+                if self.local_write_forwarding_enabled {
+                    LOCAL_WRITE_FORWARDING_ENABLED
+                } else {
+                    LOCAL_WRITE_FORWARDING_DISABLED
+                }
+                .to_string(),
+            ),
+            replication_source_identifier: self.replication_source_arn.clone(),
+            read_replica_identifiers: Some(membership.read_replica_identifiers.clone()),
+            db_cluster_members: Some(membership.members.clone()),
+            multi_az: Some(membership.multi_az),
+            certificate_details: Some(CertificateDetails {
+                ca_identifier: Some(self.ca_certificate_identifier.clone()),
+                valid_till: Some(self.certificate_valid_till()),
+            }),
+            cluster_create_time: Some(self.cluster_create_time),
+            cluster_scalability_type: Some(self.cluster_scalability_type.clone()),
+            engine_lifecycle_support: Some(self.engine_lifecycle_support.clone()),
+            db_system_id: self.db_system_id.clone(),
+            upgrade_rollout_order: Some(DEFAULT_UPGRADE_ROLLOUT_ORDER.to_string()),
+            // `StartActivityStream` is still a stub, so no cluster this service holds has
+            // a database activity stream running.
+            activity_stream_status: Some(ACTIVITY_STREAM_STOPPED.to_string()),
+            // "Indicates whether the DB cluster is a clone of a DB cluster owned by a
+            // different Amazon Web Services account": nothing here clones one.
+            cross_account_clone: Some(false),
+            tag_list: Some(self.tags.clone()),
+            // Every change this service accepts for a cluster is applied to the stored
+            // record at once, so no change is ever pending: the element is reported EMPTY,
+            // which says exactly that, rather than omitted.
+            pending_modified_values: Some(ClusterPendingModifiedValues::default()),
+            ..DBCluster::default()
         }
     }
 }
@@ -1891,6 +2589,27 @@ pub fn db_instance_arn(region: &str, identifier: &str) -> String {
     emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("db:{identifier}"))
 }
 
+/// `arn:aws:rds:<region>:<account>:cluster:<identifier>` — the ARN form RDS gives a DB
+/// cluster, which is also what `DescribeDBClusters$DBClusterIdentifier` and the
+/// `db-cluster-id` filter accept in place of the identifier.
+pub fn db_cluster_arn(region: &str, identifier: &str) -> String {
+    emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("cluster:{identifier}"))
+}
+
+/// The DB cluster identifier `named` carries: `named` itself, or the resource part of it
+/// when it is a DB cluster ARN.
+///
+/// Several members accept either form — "the user-supplied DB cluster identifier or the
+/// Amazon Resource Name (ARN) of the DB cluster" — so both are folded to the identifier
+/// the store is keyed by. A value that is an ARN of something else keeps its last segment,
+/// which names no cluster and so resolves to nothing.
+pub fn db_cluster_identifier_of(named: &str) -> &str {
+    match named.strip_prefix("arn:") {
+        None => named,
+        Some(rest) => rest.rsplit(':').next().unwrap_or(named),
+    }
+}
+
 /// The id one response reports as its own: the value of the `<RequestId>` element an
 /// awsQuery `<ErrorResponse>` envelope carries, the counterpart of the
 /// `ResponseMetadata/RequestId` the framework's success renderer writes.
@@ -1980,6 +2699,15 @@ pub fn mint_endpoint_host(mint: u64) -> String {
 /// `cluster-` plus 26 characters of the same server-minted alphabet
 /// [`mint_dbi_resource_id`] draws on, and never reused.
 pub fn mint_global_cluster_resource_id(mint: u64) -> String {
+    format!("cluster-{}", base36(mint, 26))
+}
+
+/// The immutable resource id RDS reports as `DbClusterResourceId`: "the Amazon Web
+/// Services Region-unique, immutable identifier for the DB cluster", of the same
+/// `cluster-` plus 26 server-minted characters form as
+/// [`mint_global_cluster_resource_id`]. Both draw on the one store-wide counter, so no two
+/// resources of this service can be minted the same id.
+pub fn mint_db_cluster_resource_id(mint: u64) -> String {
     format!("cluster-{}", base36(mint, 26))
 }
 
@@ -2082,6 +2810,20 @@ pub const DEFAULT_DATABASE_INSIGHTS_MODE: &str = "standard";
 /// IPv4 protocol or the IPv4 and the IPv6 protocols (`DUAL`)", so IPv4 only unless the
 /// request asks for both.
 pub const DEFAULT_NETWORK_TYPE: &str = "IPV4";
+
+/// The network types a resource of this service may be created with, as
+/// `CreateDBClusterMessage$NetworkType` publishes them ("Valid Values: IPV4 | DUAL"), the
+/// first being the default [`DEFAULT_NETWORK_TYPE`].
+pub const NETWORK_TYPES: [&str; 2] = [DEFAULT_NETWORK_TYPE, "DUAL"];
+
+/// How many entries one of the lists `CreateDBCluster` STORES may carry
+/// (`AvailabilityZones`, `EnableCloudwatchLogsExports`).
+///
+/// Emulator resource guard, not an AWS quota: neither member publishes a bound and both
+/// are stored, so the growth site carries a cap — the same reason [`MAX_FILTER_TERMS`]
+/// caps a describe's filter terms. Generous next to the three Availability Zones an Aurora
+/// cluster spans and the handful of log types each engine publishes.
+pub const MAX_CLUSTER_LIST_ENTRIES: usize = 32;
 
 /// Where automated backups and manual snapshots are stored when the request names no
 /// `BackupTarget`: "Valid Values: local (Dedicated Local Zone) outposts (Amazon Web

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -215,18 +206,174 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRuleGroup"))
+        // An update mints no ARN, so it reads nothing off the request's credential
+        // scope: the rule group it edits is the one already stored.
+        let _ = ctx;
+
+        // "You must provide either this rule group setting or a Rules setting, but
+        // not both" (`UpdateRuleGroupRequest$RuleGroup`). A request that gives
+        // NEITHER edits no rules, which is how a caller changes only the description
+        // or the encryption settings.
+        if input.rule_group.is_some() && input.rules.is_some() {
+            return Err(invalid_request(
+                "You must provide either the RuleGroup or the Rules setting, but not both.",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateRuleGroupErrorModeled::InternalServerError(InternalServerError {
+                    message: Some("the rule group store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        let key = state
+            .resolve_rule_group_request(
+                input.rule_group_name.as_deref(),
+                input.r#type.as_deref(),
+                input.rule_group_arn.as_deref(),
+            )
+            .map_err(update_rule_group_error)?;
+        let Some(stored) = state.rule_groups.get(&key) else {
+            return Err(
+                UpdateRuleGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!("Rule group {key} does not exist.")),
+                })
+                .into(),
+            );
+        };
+        // "Network Firewall uses the token to ensure that the rule group hasn't
+        // changed since you last retrieved it. If it has changed, the operation fails
+        // with an InvalidTokenException" (`UpdateRuleGroupRequest$UpdateToken`).
+        if input.update_token != stored.update_token {
+            return Err(
+                UpdateRuleGroupErrorModeled::InvalidTokenException(InvalidTokenException {
+                    message: Some(
+                        "The UpdateToken you provided is stale; retrieve the rule group again \
+                         to get a current one."
+                            .to_string(),
+                    ),
+                })
+                .into(),
+            );
+        }
+        // A rule group's `Type` and `Capacity` are fixed at creation ("You can't
+        // change the name of a rule group after you create it", "Rule group capacity
+        // is fixed at creation"), so both come from the record and not the request.
+        let mut record = stored.clone();
+
+        // The document the update lands. `Rules` is "a string containing STATEFUL
+        // rule group rules specifications in Suricata flat format" and the response
+        // "returns a RuleGroup object that Network Firewall has populated from your
+        // string", so a `Rules` update stores the document that string defines — the
+        // same projection `CreateRuleGroup` makes of it.
+        if let Some(rules) = input.rules {
+            if record.rule_group_type == crate::state::RULE_GROUP_STATELESS {
+                return Err(invalid_request(
+                    "The Rules setting carries stateful rule group rules in Suricata flat \
+                     format, so it cannot define a STATELESS rule group.",
+                ));
+            }
+            record.rule_group = RuleGroup {
+                rules_source: RulesSource {
+                    rules_string: Some(rules),
+                    ..RulesSource::default()
+                },
+                ..RuleGroup::default()
+            };
+        } else if let Some(rule_group) = input.rule_group {
+            record.rule_group = rule_group;
+        }
+
+        if let Some(breach) =
+            crate::state::rule_group_document_breach(&record.rule_group_type, &record.rule_group)
+        {
+            return Err(invalid_request(&breach));
+        }
+        // "When you update a rule group, you are limited to this capacity ... You
+        // can't change or exceed this capacity when you update the rule group"
+        // (`CreateRuleGroupRequest$Capacity`).
+        let consumed = crate::state::required_capacity(&record.rule_group_type, &record.rule_group);
+        if consumed > record.capacity {
+            return Err(invalid_request(&format!(
+                "The rules in RulesSource.{} require {consumed} capacity units, which exceeds \
+                 the rule group's capacity of {}.",
+                crate::state::rules_source_member(&record.rule_group),
+                record.capacity
+            )));
+        }
+
+        // Every other member the request carries replaces what was stored; one it
+        // omits leaves that part of the rule group as the last write left it, which
+        // is what makes the documented "retrieve the current RuleGroup object, update
+        // the object as needed, and then provide the updated object" cycle change
+        // only what the caller edited.
+        if input.description.is_some() {
+            record.description = input.description;
+        }
+        if input.encryption_configuration.is_some() {
+            record.encryption_configuration = Some(
+                crate::state::effective_encryption_configuration(input.encryption_configuration),
+            );
+        }
+        if input.source_metadata.is_some() {
+            record.source_metadata = input.source_metadata;
+        }
+        if input.summary_configuration.is_some() {
+            record.summary_configuration = input.summary_configuration;
+        }
+        // The token "marks the state of the rule group resource at the time of the
+        // request", so a write that changes the resource mints a new one and the
+        // caller's old token no longer unlocks it.
+        record.update_token = crate::state::new_uuid();
+        record.last_modified_time = ::std::time::SystemTime::now();
+
+        let mut output = UpdateRuleGroupOutput {
+            update_token: record.update_token.clone(),
+            rule_group_response: record.to_response(),
+        };
+        let analyzed = (input.analyze_rule_group
+            && record.rule_group_type == crate::state::RULE_GROUP_STATELESS)
+            .then(|| record.rule_group.clone());
+
+        // `DryRun` asks the service to "check whether the request can run
+        // successfully, but doesn't actually make the requested changes": every
+        // refusal above has already run, and nothing is stored.
+        if !input.dry_run {
+            state.rule_groups.insert(key, record);
+        }
+        // The analyzer reads the new rules and writes nothing, so it runs with the
+        // store released: one caller's analysis never holds the lock every other
+        // request to this service needs.
+        drop(state);
+
+        if let Some(document) = analyzed {
+            output.rule_group_response.analysis_results =
+                Some(crate::state::analyze_stateless_rule_group(&document));
+        }
+        Ok(output)
     }
 }
+
+/// Refuse a request this operation models `InvalidRequestException` for: "The
+/// operation failed because of a problem with your request."
+fn invalid_request(message: &str) -> UpdateRuleGroupError {
+    UpdateRuleGroupErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+crate::state::impl_resolve_error!(
+    update_lookup_error -> UpdateRuleGroupError, UpdateRuleGroupErrorModeled,
+    resource = "rule group", plural = "rule groups",
+    name_member = "RuleGroupName", arn_member = "RuleGroupArn"
+);
+
+crate::state::impl_rule_group_lookup_error!(
+    update_rule_group_error -> UpdateRuleGroupError, UpdateRuleGroupErrorModeled,
+    resolve = update_lookup_error
+);

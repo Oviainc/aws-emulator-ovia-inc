@@ -263,3 +263,132 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `@pattern` this service's model declares, paired with the expression a
+    /// requirement must name: the modelled spelling with its OUTER anchors removed.
+    /// Source: `smithy_query(query="shape", shape="AppRegistryArn,ApplicationId,\
+    /// ComponentId,DatabaseId,NextToken,OperationId,SAPInstanceNumber,SID,SsmSapArn,\
+    /// TagKey", model_path="services/service-com-amazonaws-ssmsap-ssmsap/smithy-model/\
+    /// com-amazonaws-ssmsap-ssmsap.json")`.
+    const MODELLED_PATTERNS: &[(&str, &str, &str)] = &[
+        ("ApplicationId", r"^[\w\d\.-]+$", r"[\w\d\.-]+"),
+        ("ComponentId", r"^[\w\d-]+$", r"[\w\d-]+"),
+        (
+            "AppRegistryArn",
+            r"^arn:aws:servicecatalog:[a-z0-9:\/-]+$",
+            r"arn:aws:servicecatalog:[a-z0-9:\/-]+",
+        ),
+        ("NextToken", r"^.{16,2048}$", r".{16,2048}"),
+        (
+            "OperationId",
+            r"^[{]?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}[}]?$",
+            r"[{]?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}[}]?",
+        ),
+        ("SID", r"^[A-Z][A-Z0-9]{2}$", r"[A-Z][A-Z0-9]{2}"),
+        ("SAPInstanceNumber", r"^[0-9]{2}$", r"[0-9]{2}"),
+        (
+            "TagKey",
+            r"^(?!aws:)[a-zA-Z+-=._:/]+$",
+            r"(?!aws:)[a-zA-Z+-=._:/]+",
+        ),
+        // `DatabaseId` spells only the end anchor, which is still an outer one.
+        ("DatabaseId", r"[\w\d]+$", r"[\w\d]+"),
+        // Only the OUTER anchors go: the `$` and `^` either side of `SsmSapArn`'s
+        // alternation belong to its branches, so they are part of the expression.
+        (
+            "SsmSapArn",
+            r"^arn:(.+:){2,4}.+$|^arn:(.+:){1,3}.+\/.+$",
+            r"arn:(.+:){2,4}.+$|^arn:(.+:){1,3}.+\/.+",
+        ),
+    ];
+
+    #[test]
+    fn every_modelled_pattern_is_reported_without_its_outer_anchors() {
+        for (shape, modelled, expected) in MODELLED_PATTERNS {
+            let reported = unanchored(modelled);
+            assert_eq!(
+                reported, *expected,
+                "case {shape:?}: expected the requirement to name {expected:?}, got \
+                 {reported:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_escaped_trailing_dollar_is_a_literal_and_stays() {
+        // A `$` preceded by an odd number of backslashes is a dollar sign inside the
+        // expression rather than the end anchor; one past an even number is the anchor.
+        let cases: &[(&str, &str)] = &[
+            (r"^cost\$", r"cost\$"),
+            (r"^cost\$$", r"cost\$"),
+            (r"^cost\\$", r"cost\\"),
+            ("^$", ""),
+        ];
+        for (modelled, expected) in cases {
+            let reported = unanchored(modelled);
+            assert_eq!(
+                reported, *expected,
+                "case {modelled:?}: expected {expected:?}, got {reported:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_pattern_requirement_differs_from_the_frameworks_own_wording() {
+        let pattern = Violation {
+            path: "applicationId".to_string(),
+            kind: ViolationKind::Pattern(r"^[\w\d\.-]+$".to_string()),
+            value: Some("bad app id!".to_string()),
+        };
+        let stated = constraint_envelope(std::slice::from_ref(&pattern))
+            .expect("one clause is stated");
+        assert_eq!(
+            stated,
+            "1 validation error detected: Value 'bad app id!' at 'applicationId' failed \
+             to satisfy constraint: Member must satisfy regular expression pattern: \
+             [\\w\\d\\.-]+",
+            "case \"a pattern clause\": got {stated:?}"
+        );
+
+        // Every other class keeps the sentence the framework (and AWS) states, which
+        // `Violation::message` renders.
+        for kind in [
+            ViolationKind::MissingRequiredMember,
+            ViolationKind::MinLength(1),
+            ViolationKind::MaxLength(60),
+            ViolationKind::MinValue("1".to_string()),
+            ViolationKind::MaxValue("50".to_string()),
+            ViolationKind::UniqueItems,
+        ] {
+            let violation = Violation {
+                path: "applicationId".to_string(),
+                kind: kind.clone(),
+                value: match kind {
+                    ViolationKind::MissingRequiredMember => None,
+                    _ => Some("x".to_string()),
+                },
+            };
+            let stated = constraint_envelope(std::slice::from_ref(&violation))
+                .expect("one clause is stated");
+            let framework =
+                aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(
+                    &violation,
+                ))
+                .expect("the framework states it");
+            assert_eq!(
+                stated, framework,
+                "case {kind:?}: expected the framework's own wording {framework:?}, got \
+                 {stated:?}"
+            );
+        }
+
+        assert!(
+            constraint_envelope(&[]).is_none(),
+            "case \"no violations\": there is nothing to state"
+        );
+    }
+}

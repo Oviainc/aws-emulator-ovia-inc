@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyVolumes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyVolumes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a point-in-time COPY of a stored EBS volume, persists it in
+//! [`crate::state`] beside the volume it was copied from and answers with the STORED
+//! record. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyVolumes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The copy is a volume in its own right — a fresh id, ARN and create time, the source's
+//! Availability Zone ("within the same Availability Zone"), and `SourceVolumeId` naming
+//! what it was copied from — so `DescribeVolumes` reports it exactly as it reports a
+//! `CreateVolume` volume, and the clock, not a caller, moves it from `creating` to
+//! `available`.
+//!
+//! The parameter rules are the ones the model documents for the volume copy's TYPE, which
+//! are the same per-type tables `CreateVolume` validates against ([`crate::state`]'s
+//! `VOLUME_SIZE_RANGES`, `VOLUME_IOPS_RANGES`, `GP3_THROUGHPUT_RANGE`), plus the one rule
+//! that only a copy has: "The size must be equal to or greater than the size of the source
+//! volume" (`CopyVolumesRequest$Size`).
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +177,346 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyVolumes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyVolumesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyVolumes"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            request_region, require_known_volume, require_service_state, system_time_to_date_time,
+            tag_list, validate_tag_size, volume_iops_range, volume_limit_exceeded,
+            volume_payload_bytes, volume_size_range, VolumeRecord, VolumeView, DEFAULT_GP3_IOPS,
+            DEFAULT_GP3_THROUGHPUT, DEFAULT_VOLUME_TYPE, GP3_THROUGHPUT_RANGE,
+            MAX_CLIENT_TOKEN_CHARS, MAX_KMS_KEY_ID_CHARS, MAX_STORED_BYTES, MAX_STORED_VOLUMES,
+            MAX_TAGS_PER_RESOURCE, PROVISIONED_IOPS_VOLUME_TYPES, THROUGHPUT_VOLUME_TYPE,
+            TRANSITION_DELAY, VOLUME_TAGGABLE_RESOURCE,
+        };
+
+        let region = request_region(ctx.parts());
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let now = ::std::time::Instant::now();
+
+        // "The ID of the source EBS volume to copy" (`CopyVolumesRequest$SourceVolumeId`):
+        // an id that is not shaped like a volume id is answered as malformed, and a
+        // well-formed one the account holds no volume for as not found — the ONE ordering
+        // this crate keeps for a volume id a request names.
+        require_known_volume(&store, &input.source_volume_id)?;
+        let source = store
+            .volumes
+            .get(&input.source_volume_id)
+            .cloned()
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the volume '{}' could not be read back",
+                    input.source_volume_id
+                ))
+            })?;
+        let Some(source_size) = source.view.size else {
+            return Err(Scaffolded::internal_error(format!(
+                "the volume '{}' is stored without a size",
+                input.source_volume_id
+            )));
+        };
+
+        // "The volume type for the volume copy. If not specified, the volume type defaults
+        // to gp2" (`CopyVolumesRequest$VolumeType`) — the same default `CreateVolume`
+        // applies, and the modelled enum has already refused any other spelling, so a type
+        // with no published size range here can only be one the table has yet to learn.
+        let volume_type = input
+            .volume_type
+            .clone()
+            .unwrap_or_else(|| DEFAULT_VOLUME_TYPE.to_string());
+        let Some((size_min, size_max)) = volume_size_range(&volume_type) else {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{volume_type}' for volumeType"
+            )));
+        };
+
+        // "The size of the volume copy, in GiBs. The size must be equal to or greater than
+        // the size of the source volume. If not specified, the size defaults to the size of
+        // the source volume" (`CopyVolumesRequest$Size`). The copy's own type bounds it from
+        // both ends, exactly as a created volume's does; the source's size raises its floor,
+        // because a copy that cannot hold the source's data is not a copy of it.
+        let size = input.size.unwrap_or(source_size);
+        if size < size_min || size > size_max {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{size}' for size. \
+                 A {volume_type} volume holds from {size_min} to {size_max} GiB"
+            )));
+        }
+        if size < source_size {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{size}' for size. \
+                 The size must be equal to or greater than the size of the source volume, \
+                 which is {source_size} GiB"
+            )));
+        }
+
+        // "Required for io1 and io2 volumes. Optional for gp3 volumes. Omit for all other
+        // volume types" (`CopyVolumesRequest$Iops`), with the per-type ranges this crate
+        // keeps beside that sentence — the copy's type, not the source's, is what provisions
+        // IOPS.
+        let iops_range = volume_iops_range(&volume_type);
+        let iops = match (input.iops, iops_range) {
+            (Some(iops), Some((min, max))) if iops < min || iops > max => {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{iops}' for iops. \
+                     A {volume_type} volume provisions from {min} to {max} IOPS"
+                )));
+            }
+            (Some(iops), Some(_)) => Some(iops),
+            (Some(iops), None) => {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{iops}' for iops. \
+                     A {volume_type} volume does not provision IOPS"
+                )));
+            }
+            (None, _) if PROVISIONED_IOPS_VOLUME_TYPES.contains(&volume_type.as_str()) => {
+                return Err(Scaffolded::missing_parameter(format!(
+                    "iops is required for a {volume_type} volume"
+                )));
+            }
+            // "gp3: 3,000 (default)"; every other type provisions none.
+            (None, Some(_)) => Some(DEFAULT_GP3_IOPS),
+            (None, None) => None,
+        };
+
+        // "Supported for gp3 volumes only. Omit for all other volume types. Valid Range:
+        // 125 - 2000 MiB/s" (`CopyVolumesRequest$Throughput`).
+        let (throughput_min, throughput_max) = GP3_THROUGHPUT_RANGE;
+        let throughput = match input.throughput {
+            Some(_) if volume_type != THROUGHPUT_VOLUME_TYPE => {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "throughput is supported for {THROUGHPUT_VOLUME_TYPE} volumes only, \
+                     not for a {volume_type} volume"
+                )));
+            }
+            Some(throughput) if throughput < throughput_min || throughput > throughput_max => {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{throughput}' for throughput. \
+                     A {THROUGHPUT_VOLUME_TYPE} volume provisions from {throughput_min} to \
+                     {throughput_max} MiB/s"
+                )));
+            }
+            Some(throughput) => Some(throughput),
+            None if volume_type == THROUGHPUT_VOLUME_TYPE => Some(DEFAULT_GP3_THROUGHPUT),
+            None => None,
+        };
+
+        // "Supported with io1 and io2 volumes only"
+        // (`CopyVolumesRequest$MultiAttachEnabled`).
+        let multi_attach_enabled = input.multi_attach_enabled.unwrap_or(false);
+        if multi_attach_enabled && !PROVISIONED_IOPS_VOLUME_TYPES.contains(&volume_type.as_str()) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "multiAttachEnabled is supported with {} volumes only, \
+                 not with a {volume_type} volume",
+                PROVISIONED_IOPS_VOLUME_TYPES.join(" and ")
+            )));
+        }
+
+        // "If the source volume is encrypted, the service always encrypts the copy
+        // regardless of this value. Set to true to encrypt a copy of an unencrypted source
+        // volume" (`CopyVolumesRequest$Encrypted`): the copy is encrypted when the request
+        // asks for it OR the source already is.
+        let encrypted = input.encrypted == Some(true) || source.view.encrypted == Some(true);
+        // "If KmsKeyId is specified, the encrypted state must be true"
+        // (`CreateVolumeRequest$KmsKeyId`) — a key only names how the copy is encrypted, so
+        // naming one for a copy that is not encrypted at all cannot be honoured.
+        if input.kms_key_id.is_some() && !encrypted {
+            return Err(Scaffolded::invalid_parameter_value(
+                "kmsKeyId may be specified only when the volume copy is encrypted",
+            ));
+        }
+        // "If you set Encrypted to true but do not specify KmsKeyId, the service uses the
+        // default KMS key for EBS encryption in your account" — this emulator models no KMS
+        // keys, so an unnamed default key is reported as no key, the way `CreateVolume`
+        // reports it. An encrypted source whose key the request does not override keeps
+        // being encrypted under that key.
+        let kms_key_id = input
+            .kms_key_id
+            .clone()
+            .or_else(|| source.view.kms_key_id.clone().filter(|_| encrypted));
+
+        // "The tags to apply to the volume copy during creation"
+        // (`CopyVolumesRequest$TagSpecifications`): the copy is the only resource this call
+        // creates, so a specification naming any other resource type is refused rather than
+        // accepted and discarded. The source's tags are NOT copied — the request says which
+        // tags the copy carries.
+        let mut tags: ::std::collections::BTreeMap<String, String> =
+            ::std::collections::BTreeMap::new();
+        for specification in input.tag_specifications.iter().flatten() {
+            match specification.resource_type.as_deref() {
+                Some(VOLUME_TAGGABLE_RESOURCE) | None => {}
+                Some(resource_type) => {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{resource_type}' for resourceType. \
+                         CopyVolumes tags the '{VOLUME_TAGGABLE_RESOURCE}' it creates"
+                    )));
+                }
+            }
+            for tag in specification.tags.iter().flatten() {
+                let key = tag.key.clone().unwrap_or_default();
+                let value = tag.value.clone().unwrap_or_default();
+                validate_tag_size(&key, &value)?;
+                tags.insert(key, value);
+            }
+        }
+        if tags.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "A volume carries at most {MAX_TAGS_PER_RESOURCE} tags, not {}",
+                tags.len()
+            )));
+        }
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+        // The model declares no `@length` on `KmsKeyId`, so the handler is the only place
+        // the bound AWS KMS publishes for a key identifier can be enforced — the same bound
+        // `CreateVolume` holds its own `KmsKeyId` to.
+        if input
+            .kms_key_id
+            .as_ref()
+            .is_some_and(|key_id| key_id.chars().count() > MAX_KMS_KEY_ID_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "kmsKeyId accepts at most {MAX_KMS_KEY_ID_CHARS} characters"
+            )));
+        }
+
+        // The caller-chosen bytes this copy would retain for the process's lifetime, counted
+        // by the ONE definition of that charge `CreateVolume` uses.
+        let payload_bytes = volume_payload_bytes(
+            &tag_list(&tags),
+            kms_key_id.as_deref(),
+            input.client_token.as_deref(),
+        );
+
+        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`CopyVolumesRequest$ClientToken`) — one token names
+        // the one volume it minted, so a replay reports that volume and creates nothing.
+        // The token map is the volume store's, so a token is unique across every path that
+        // mints a volume, not just across this one.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.volume_client_tokens.get(token).cloned());
+
+        if replayed.is_none() && store.volumes.len() >= MAX_STORED_VOLUMES {
+            return Err(volume_limit_exceeded(format!(
+                "This emulator holds {MAX_STORED_VOLUMES} EBS volumes, \
+                 which is as many as it stores"
+            )));
+        }
+        // A replay stores nothing, so it is charged nothing and clears this gate; a fresh
+        // copy is refused rather than overshooting the store's byte budget.
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(volume_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        if let Some(volume_id) = replayed {
+            return store
+                .volumes
+                .get(&volume_id)
+                .map(|record| CopyVolumesOutput {
+                    volumes: Some(vec![record.view_at(now)]),
+                })
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "a client token names volume '{volume_id}', which is not stored"
+                    ))
+                });
+        }
+
+        let volume_id = store.next_id("vol");
+        let record = VolumeRecord {
+            view: VolumeView {
+                volume_id: Some(volume_id.clone()),
+                volume_arn: Some(::engine::emulator_arn(
+                    "ec2",
+                    &region,
+                    &format!("volume/{volume_id}"),
+                )),
+                owner_id: Some(::engine::emulator_account_id().to_string()),
+                // "Creates a ... copy of an existing Amazon EBS volume within the same
+                // Availability Zone" (`CopyVolumes`): the copy's zone is the source's, not
+                // one the request chose — the request has no member for it.
+                availability_zone: source.view.availability_zone.clone(),
+                availability_zone_id: source.view.availability_zone_id.clone(),
+                create_time: Some(system_time_to_date_time(::std::time::SystemTime::now())),
+                size: Some(size),
+                volume_type: Some(volume_type),
+                iops,
+                throughput,
+                multi_attach_enabled: Some(multi_attach_enabled),
+                encrypted: Some(encrypted),
+                kms_key_id,
+                tags: Some(tag_list(&tags)),
+                // A fresh copy is attached to nothing; `AttachVolume` is the operation that
+                // would add an attachment, and it is still a stub.
+                attachments: Some(Vec::new()),
+                // "The ID of the source volume from which the volume copy was created. Only
+                // for volume copies" (`Volume$SourceVolumeId`).
+                source_volume_id: Some(input.source_volume_id.clone()),
+                // The copy was made from a volume, not restored from a snapshot — so there
+                // is no snapshot behind it and nothing was fast-restored.
+                snapshot_id: None,
+                fast_restored: Some(false),
+                // "Reserved for future use" (`Volume$SseType`).
+                sse_type: None,
+                // "Reserved for internal use": this volume is the caller's, not a
+                // service's, so no managing operator.
+                operator: None,
+                // An Outpost volume is one created on an Outpost, which this emulator has
+                // none of.
+                outpost_arn: None,
+                // "If no volume initialization rate was specified, the value is null"
+                // (`Volume$VolumeInitializationRate`); `CopyVolumes` has no member for one.
+                volume_initialization_rate: None,
+                // Derived from `available_at` on every read.
+                state: None,
+            },
+            // "The volume copy can be attached to an Amazon EC2 instance once it reaches
+            // the available state" (`CopyVolumes`): the copy is handed back `creating` and
+            // reaches `available` without anyone asking, over the same clock-owed span a
+            // created volume takes.
+            available_at: now + TRANSITION_DELAY,
+        };
+        if let Some(token) = input.client_token.clone() {
+            store.volume_client_tokens.insert(token, volume_id.clone());
+        }
+        // The bytes this record and its token retain are charged against the store's budget
+        // at the insert, so no path can store them uncharged.
+        store.add_stored_bytes(payload_bytes);
+        store.volumes.insert(volume_id.clone(), record);
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // DescribeVolumes will see rather than the request object.
+        store
+            .volumes
+            .get(&volume_id)
+            .map(|record| CopyVolumesOutput {
+                volumes: Some(vec![record.view_at(now)]),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created volume copy '{volume_id}' could not be read back"
+                ))
+            })
     }
 }

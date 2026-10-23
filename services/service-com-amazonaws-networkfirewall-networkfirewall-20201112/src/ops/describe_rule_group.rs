@@ -184,29 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A rule group's name is unique only within its type, so `Type` "is required
         // for requests that do not include the RuleGroupARN"
-        // (`DescribeRuleGroupRequest$Type`).
-        let resource_path = match (input.rule_group_name.as_deref(), input.r#type.as_deref()) {
-            (Some(name), Some(group_type)) => {
-                Some(crate::state::rule_group_resource_path(group_type, name))
-            }
-            (Some(_), None) if input.rule_group_arn.is_none() => {
-                return Err(DescribeRuleGroupErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(
-                            "Type is required for requests that do not include the RuleGroupArn."
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into())
-            }
-            // With an ARN in hand the name adds nothing the ARN does not already
-            // carry, so a typeless name is resolved through the ARN.
-            (_, _) => None,
-        };
+        // (`DescribeRuleGroupRequest$Type`) — the store resolves the whole triple.
         let key = state
-            .resolve_rule_group(resource_path.as_deref(), input.rule_group_arn.as_deref())
-            .map_err(describe_lookup_error)?;
+            .resolve_rule_group_request(
+                input.rule_group_name.as_deref(),
+                input.r#type.as_deref(),
+                input.rule_group_arn.as_deref(),
+            )
+            .map_err(describe_rule_group_error)?;
         let record = state.rule_groups.get(&key).cloned().ok_or_else(|| {
             DescribeRuleGroupError::from(
                 DescribeRuleGroupErrorModeled::ResourceNotFoundException(
@@ -216,18 +201,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        // A name given WITHOUT a type was resolved through the ARN, so the two are
-        // still checked against each other here rather than the name being ignored.
-        if resource_path.is_none()
-            && input
-                .rule_group_name
-                .as_deref()
-                .is_some_and(|name| name != record.rule_group_name)
-        {
-            return Err(describe_lookup_error(
-                crate::state::ResolveError::Mismatch,
-            ));
-        }
         // Everything below reads the record this request took a copy of, so the lock
         // is released before the response — and before the analyzer — is built: a read
         // never holds the store while it works.
@@ -256,4 +229,9 @@ crate::state::impl_resolve_error!(
     describe_lookup_error -> DescribeRuleGroupError, DescribeRuleGroupErrorModeled,
     resource = "rule group", plural = "rule groups",
     name_member = "RuleGroupName", arn_member = "RuleGroupArn"
+);
+
+crate::state::impl_rule_group_lookup_error!(
+    describe_rule_group_error -> DescribeRuleGroupError, DescribeRuleGroupErrorModeled,
+    resolve = describe_lookup_error
 );

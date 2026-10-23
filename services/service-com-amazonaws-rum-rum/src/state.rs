@@ -3,13 +3,14 @@
 //! Engine state for the com-amazonaws-rum-rum service.
 //!
 //! The app monitor is this service's primary resource: `CreateAppMonitor`,
-//! `GetAppMonitor`, `ListAppMonitors`, `UpdateAppMonitor`, `DeleteAppMonitor` and the
-//! data-plane `PutRumEvents` all read and write the ONE [`AppMonitorRecord`] map held
-//! here, so every one of them answers from persisted state rather than from its own
-//! request. The helpers beside the map (id minting, the derived ARN and CloudWatch Logs
-//! group name, the documented defaults, the record -> wire-shape projections and the
-//! error builders) live here for the same reason: six operation files share them, and a
-//! second copy of any of them would let two operations disagree about one resource.
+//! `GetAppMonitor`, `ListAppMonitors`, `UpdateAppMonitor`, `DeleteAppMonitor`,
+//! `ListTagsForResource` and the data-plane `PutRumEvents` all read and write the ONE
+//! [`AppMonitorRecord`] map held here, so every one of them answers from persisted state
+//! rather than from its own request. The helpers beside the map (id minting, the derived
+//! ARN and CloudWatch Logs group name, the `ResourceArn` -> monitor resolution, the
+//! documented defaults, the record -> wire-shape projections and the error builders) live
+//! here for the same reason: every operation file shares them, and a second copy of any
+//! of them would let two operations disagree about one resource.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -257,11 +258,12 @@ pub struct AppMonitorRecord {
     /// The minted `AppMonitorId`: a UUID, as `AppMonitorId`'s 36-character pattern asks.
     pub id: String,
     /// `arn:aws:rum:<region>:<account>:appmonitor/<name>`, derived once at create time.
-    /// It is the identity the tagging operations name a resource by: `UntagResource`
-    /// resolves a `ResourceArn` against this ONE stored value (see
-    /// [`ComAmazonawsRumRumState::app_monitor_by_arn_mut`]) rather than minting its own,
+    /// It is the identity the tagging operations name a resource by: `ListTagsForResource`
+    /// and `UntagResource` resolve a `ResourceArn` against this ONE stored value (see
+    /// [`ComAmazonawsRumRumState::app_monitor_by_arn`] /
+    /// [`ComAmazonawsRumRumState::app_monitor_by_arn_mut`]) rather than minting their own,
     /// so a tag call and a read of the monitor cannot disagree about which resource is
-    /// meant. (`TagResource` and `ListTagsForResource` are still scaffolded.)
+    /// meant. (`TagResource` is still scaffolded.)
     pub arn: String,
     pub domain: Option<String>,
     pub domain_list: Option<Vec<String>>,
@@ -280,8 +282,9 @@ pub struct AppMonitorRecord {
     pub custom_events: CustomEvents,
     pub deobfuscation_configuration: Option<DeobfuscationConfiguration>,
     /// This monitor's tags: the map `CreateAppMonitor` seeds and `UntagResource` removes
-    /// keys from, and what `GetAppMonitor` reports as `AppMonitor$Tags`. A `BTreeMap` so
-    /// a read reports them in one stable order.
+    /// keys from, what `GetAppMonitor` reports as `AppMonitor$Tags` and what
+    /// `ListTagsForResource` reports as its own `Tags`. A `BTreeMap` so the stored record
+    /// iterates in one stable key order.
     pub tags: BTreeMap<String, String>,
     /// Events delivered by `PutRumEvents`, oldest first. Bounded by
     /// [`MAX_EVENTS_PER_APP_MONITOR`]; append through [`Self::record_events`].
@@ -308,6 +311,17 @@ impl AppMonitorRecord {
             .then(|| format!("{CW_LOG_GROUP_PREFIX}{}", self.name))
     }
 
+    /// This monitor's tags as the model's `TagMap` — the ONE projection every operation
+    /// that reports tags (`GetAppMonitor` inside `AppMonitor$Tags`,
+    /// `ListTagsForResource` as its own `Tags` member) goes through, so two readers
+    /// cannot report one monitor's tags differently.
+    pub fn tag_map(&self) -> HashMap<String, String> {
+        self.tags
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
     /// Project the stored record onto the model's `AppMonitor` shape — the one
     /// conversion `GetAppMonitor` goes through, so what a read reports is exactly what
     /// the create and the updates wrote.
@@ -319,12 +333,7 @@ impl AppMonitorRecord {
             id: Some(self.id.clone()),
             created: Some(self.created.clone()),
             last_modified: Some(self.last_modified.clone()),
-            tags: Some(
-                self.tags
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect::<HashMap<String, String>>(),
-            ),
+            tags: Some(self.tag_map()),
             state: Some(self.state.clone()),
             app_monitor_configuration: Some(self.app_monitor_configuration.clone()),
             data_storage: Some(DataStorage {
@@ -495,6 +504,16 @@ impl ComAmazonawsRumRumState {
         self.app_monitors
             .values_mut()
             .find(|record| record.arn == arn)
+    }
+
+    /// The stored monitor whose ARN is exactly `arn`, for a caller that only REPORTS it
+    /// (`ListTagsForResource`).
+    ///
+    /// The same identity comparison as [`Self::app_monitor_by_arn_mut`] — the two differ
+    /// only in mutability, so a tag read and a tag write can never disagree about which
+    /// resource one `ResourceArn` names.
+    pub fn app_monitor_by_arn(&self, arn: &str) -> Option<&AppMonitorRecord> {
+        self.app_monitors.values().find(|record| record.arn == arn)
     }
 }
 

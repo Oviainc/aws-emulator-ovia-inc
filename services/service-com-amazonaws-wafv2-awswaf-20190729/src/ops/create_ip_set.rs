@@ -191,17 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request metadata.
         if !crate::state::is_known_scope(&input.scope) {
             return Err(CreateIPSetErrorModeled::WAFInvalidParameterException(
-                WAFInvalidParameterException {
-                    message: Some(format!(
-                        "Scope {:?} is not one of CLOUDFRONT or REGIONAL",
-                        input.scope
-                    )),
-                    field: Some("SCOPE_VALUE".to_string()),
-                    parameter: Some(input.scope.clone()),
-                    reason: Some(
-                        "the scope names the namespace the IP set lives in".to_string(),
-                    ),
-                },
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_SCOPE_VALUE,
+                    &input.scope,
+                    "the scope names the namespace the IP set lives in, and is one of CLOUDFRONT or REGIONAL",
+                ),
             )
             .into());
         }
@@ -220,12 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for address in &input.addresses {
             if let Err(reason) = crate::state::validate_cidr(address, &input.ip_address_version) {
                 return Err(CreateIPSetErrorModeled::WAFInvalidParameterException(
-                    WAFInvalidParameterException {
-                        message: Some(reason.clone()),
-                        field: Some("IP_ADDRESS".to_string()),
-                        parameter: Some(address.clone()),
-                        reason: Some(reason),
-                    },
+                    crate::state::invalid_parameter_exception(
+                        crate::state::FIELD_IP_ADDRESS,
+                        address,
+                        &reason,
+                    ),
                 )
                 .into());
             }

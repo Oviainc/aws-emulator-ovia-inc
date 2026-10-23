@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assign one or more tags to a CodeGuru Profiler resource. The only resource this
+//! API addresses by ARN is a profiling group, so `resourceArn` resolves to a stored
+//! group and the request's tags are merged into the ONE tag map every other operation
+//! reports (`ListTagsForResource`, `DescribeProfilingGroup`, `ListProfilingGroups`).
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +135,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Nothing here reads the request's metadata: the ARN the caller supplies
+        // carries the Region and account the resource lives in, and it is matched
+        // against the ARN this service stored for the group.
+        let _ = ctx;
+
+        // The front door first. A tag write carrying no tag at all is refused by the
+        // REST layer AHEAD of the application code, with that layer's own code and
+        // sentence (HTTP 400 `BadRequestException`) and before any lookup — so an empty
+        // `tags` on an ARN that names nothing is still this refusal, not a 404. The
+        // model declares no length bound on `TagsMap`, so the boundary validator cannot
+        // see this rule; the recorded refusal of this operation is what states it.
+        if input.tags.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::bad_request_body());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the profiling-group store is unavailable".to_string(),
+            })
+        })?;
+
+        // An ARN that names no profiling group of this service addresses nothing this
+        // API can tag, which is a bad INPUT rather than a missing resource.
+        let name = crate::state::profiling_group_name_from_arn(&input.resource_arn)
+            .ok_or_else(|| {
+                TagResourceErrorModeled::ValidationException(ValidationException {
+                    message: crate::state::resource_arn_validation_message(&input.resource_arn),
+                })
+            })?;
+
+        // Every tag in the request is inside AWS's published tagging limits before any
+        // of them is stored: the count, and each key's and value's length. The model
+        // constrains none of them, so this is the only place they hold.
+        crate::state::validate_tags("tags", &input.tags).map_err(|message| {
+            TagResourceErrorModeled::ValidationException(ValidationException { message })
+        })?;
+
+        let mut guard = state.lock();
+        let group = guard.group_by_arn_mut(&input.resource_arn).ok_or_else(|| {
+            TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::group_not_found_message(name),
+            })
+        })?;
+
+        // What the merge would LEAVE on the resource is what the per-resource limit
+        // bounds, so it is computed and refused before anything is written: a request
+        // that would carry the group past the limit changes nothing. Re-tagging a key
+        // the group already holds never grows the map, so it is always inside it.
+        let resulting = crate::state::merged_tag_count(&group.tags, &input.tags);
+        if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::too_many_tags_message("tags", resulting),
+                },
+            )
+            .into());
+        }
+
+        // A tag write is a MERGE on the stored map: a key the request carries takes the
+        // request's value (so tagging an existing key re-tags it), and every key the
+        // request does not name keeps the value it had. `updatedAt` is left alone: it
+        // reports when the GROUP's configuration last changed, which tagging is not.
+        for (key, value) in &input.tags {
+            group.tags.insert(key.clone(), value.clone());
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

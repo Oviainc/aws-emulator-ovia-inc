@@ -11,6 +11,11 @@
 //! newest first, and cut into pages of at most `MaxResults` records with an opaque
 //! `NextToken` that resumes immediately after the record the previous page ended on.
 //!
+//! An `AppId` that identifies no registered Amplify app is refused with HTTP 400
+//! `ValidationException` before any lookup ([`crate::state::require_registered_app`]); a
+//! job id, environment or filter that selects nothing answers an empty page, and the
+//! `NotFoundException` below the gate is the defensive arm of the same app lookup.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -160,6 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::store_unavailable(),
             ))
         })?;
+
+        // The app-identity gate, BEFORE any per-resource lookup: a well-formed app id
+        // that identifies no registered Amplify app is a client-input error (400
+        // `ValidationException`), not a missing backend.
+        crate::state::require_registered_app(&*self.engine, &input.app_id)?;
 
         // `MaxResults` is modelled `@range{min:1,max:25}`, so the runtime has already
         // refused anything outside that span: reaching here, the value is a usable page

@@ -15,11 +15,11 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AddMediaStreamRequest, AddOutputRequest, DestinationConfiguration, EncodingConfig,
-    EncodingParameters, Encryption, Entitlement, FailoverConfig, Flow, FlowTransitEncryption, Fmtp,
+    EncodingParameters, Encryption, Entitlement, FailoverConfig, Flow, FlowTransitEncryption,
     Gateway, GatewayNetwork, GrantEntitlementRequest, Interface, ListedFlow, ListedGateway,
-    Maintenance, MediaStream, MediaStreamAttributes, MediaStreamOutputConfiguration,
-    MediaStreamOutputConfigurationRequest, MonitoringConfig, NdiConfig, Output, SetSourceRequest,
-    Source, Transport, VpcInterface, VpcInterfaceAttachment,
+    Maintenance, MediaStream, MediaStreamAttributes, MediaStreamAttributesRequest,
+    MediaStreamOutputConfiguration, MediaStreamOutputConfigurationRequest, MonitoringConfig,
+    NdiConfig, Output, SetSourceRequest, Source, Transport, VpcInterface, VpcInterfaceAttachment,
 };
 
 /// The `Status` enum the model declares for a flow
@@ -758,6 +758,67 @@ pub fn next_media_stream_fmt(existing: &[StoredMediaStream]) -> i32 {
     fmt
 }
 
+/// The sample rate a media stream of `media_stream_type` reports when no request has
+/// named one, or `None` when the type has no single documented rate.
+///
+/// `AddMediaStreamRequest$ClockRate` documents "If the media stream type is video or
+/// ancillary data, set this value to 90000. If the media stream type is audio, set this
+/// value to either 48000 or 96000" — so video and ancillary data have one rate to fall
+/// back on ([`VIDEO_CLOCK_RATE_HZ`]) and audio has none. The rule is stated once here so
+/// every operation that stores a media stream's type (CreateFlow and AddFlowMediaStreams,
+/// which add one; UpdateFlowMediaStream, which can change its type) resolves the same
+/// fallback.
+pub fn default_clock_rate(media_stream_type: &str) -> Option<i32> {
+    matches!(
+        media_stream_type,
+        MEDIA_STREAM_TYPE_VIDEO | MEDIA_STREAM_TYPE_ANCILLARY_DATA
+    )
+    .then_some(VIDEO_CLOCK_RATE_HZ)
+}
+
+/// The `MediaStreamAttributes` a media stream holds once the request shape `request` is
+/// applied to the attributes `stored` it holds now (`None` when it holds none).
+///
+/// `MediaStreamAttributesRequest` and `FmtpRequest` mirror `MediaStreamAttributes` and
+/// `Fmtp` member for member with every member optional, so this is the member-wise merge
+/// this crate applies to every request shape of that form: a member the request carries
+/// replaces its counterpart, one it omits keeps the stored value. `MediaStreamAttributes$Fmtp`
+/// is REQUIRED (`smithy_query(query="shape",shape="MediaStreamAttributes")`), so a stream
+/// given attributes by a request that names no `Fmtp` reports an empty one rather than none.
+pub fn merged_media_stream_attributes(
+    stored: Option<&MediaStreamAttributes>,
+    request: &MediaStreamAttributesRequest,
+) -> MediaStreamAttributes {
+    let mut merged = stored.cloned().unwrap_or_default();
+    if let Some(lang) = request.lang.clone() {
+        merged.lang = Some(lang);
+    }
+    if let Some(fmtp) = request.fmtp.as_ref() {
+        if let Some(channel_order) = fmtp.channel_order.clone() {
+            merged.fmtp.channel_order = Some(channel_order);
+        }
+        if let Some(colorimetry) = fmtp.colorimetry.clone() {
+            merged.fmtp.colorimetry = Some(colorimetry);
+        }
+        if let Some(exact_framerate) = fmtp.exact_framerate.clone() {
+            merged.fmtp.exact_framerate = Some(exact_framerate);
+        }
+        if let Some(par) = fmtp.par.clone() {
+            merged.fmtp.par = Some(par);
+        }
+        if let Some(range) = fmtp.range.clone() {
+            merged.fmtp.range = Some(range);
+        }
+        if let Some(scan_mode) = fmtp.scan_mode.clone() {
+            merged.fmtp.scan_mode = Some(scan_mode);
+        }
+        if let Some(tcs) = fmtp.tcs.clone() {
+            merged.fmtp.tcs = Some(tcs);
+        }
+    }
+    merged
+}
+
 /// Materialise one `AddMediaStreamRequest` into the media stream a flow keeps, with the
 /// payload type `fmt` the service assigned it (see [`next_media_stream_fmt`]).
 ///
@@ -771,34 +832,15 @@ pub fn materialise_media_stream(request: &AddMediaStreamRequest, fmt: i32) -> St
             media_stream_id: request.media_stream_id,
             media_stream_name: request.media_stream_name.clone(),
             media_stream_type: request.media_stream_type.clone(),
-            clock_rate: request.clock_rate.or_else(|| {
-                matches!(
-                    request.media_stream_type.as_str(),
-                    MEDIA_STREAM_TYPE_VIDEO | MEDIA_STREAM_TYPE_ANCILLARY_DATA
-                )
-                .then_some(VIDEO_CLOCK_RATE_HZ)
-            }),
+            clock_rate: request
+                .clock_rate
+                .or_else(|| default_clock_rate(&request.media_stream_type)),
             description: request.description.clone(),
             video_format: request.video_format.clone(),
             attributes: request
                 .attributes
                 .as_ref()
-                .map(|attributes| MediaStreamAttributes {
-                    lang: attributes.lang.clone(),
-                    fmtp: attributes
-                        .fmtp
-                        .as_ref()
-                        .map(|fmtp| Fmtp {
-                            channel_order: fmtp.channel_order.clone(),
-                            colorimetry: fmtp.colorimetry.clone(),
-                            exact_framerate: fmtp.exact_framerate.clone(),
-                            par: fmtp.par.clone(),
-                            range: fmtp.range.clone(),
-                            scan_mode: fmtp.scan_mode.clone(),
-                            tcs: fmtp.tcs.clone(),
-                        })
-                        .unwrap_or_default(),
-                }),
+                .map(|attributes| merged_media_stream_attributes(None, attributes)),
         },
         tags: request
             .media_stream_tags

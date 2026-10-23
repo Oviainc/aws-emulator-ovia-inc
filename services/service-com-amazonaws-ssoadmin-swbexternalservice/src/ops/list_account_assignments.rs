@@ -188,6 +188,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let ordered: Vec<(String, AccountAssignment)> = {
             let store = state.lock();
+            // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup:
+            // account assignments are a feature of an organization instance, so on an
+            // account instance none can ever exist and the enumeration is refused
+            // rather than answered empty. An ARN this account holds no instance for is
+            // NOT this refusal — it falls through to the 404 below.
+            if store.permission_set_surface_withdrawn(&input.instance_arn) {
+                return Err(ListAccountAssignmentsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                        ),
+                        // The model's `ValidationExceptionReason` enum carries only KMS
+                        // key states, none of which this refusal is.
+                        reason: None,
+                    },
+                )
+                .into());
+            }
             if store.instance(&input.instance_arn).is_none() {
                 return Err(ListAccountAssignmentsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

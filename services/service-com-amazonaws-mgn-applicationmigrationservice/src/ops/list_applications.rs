@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         if !store.is_initialized(&account) {
             return Err(ListApplicationsErrorModeled::UninitializedAccountException(
-                crate::state::uninitialized_account(&account),
+                crate::state::uninitialized_account(),
             )
             .into());
         }

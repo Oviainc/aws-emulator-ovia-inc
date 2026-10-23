@@ -28,6 +28,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use aws_smithy_schema_server::constraints::path;
+use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
@@ -662,6 +664,92 @@ pub fn canonical_filter(filter: &BTreeMap<String, BTreeSet<String>>) -> String {
         .join(";")
 }
 
+/// The shape name of the modelled 403 error every operation of this service declares:
+/// `AccessDeniedException` (`@error("client")`, `@httpError(403)`, required `Message` with
+/// `jsonName: "message"`).
+///
+/// A refusal taken before any handler ran is rendered by the framework, which names its
+/// own `AccessDenied`. `restJson1` resolves the error SHAPE from that name, so this
+/// service answers a pre-dispatch 403 with the shape its model declares instead — see
+/// `EmulatedService::override_refusal`.
+pub const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
+
+/// The message of a pre-dispatch 403: the documented text of `AccessDeniedException`
+/// ("You do not have sufficient access to perform this action." —
+/// `smithy_query(query="doc", shape="AccessDeniedException")`) followed by what the caller
+/// must present, which the framework's own wording carried and the shape's documentation
+/// does not.
+///
+/// [`Refusal::Unauthenticated`] carries no detail — an absent signature, a scope naming
+/// another service and a signature that does not verify all arrive the same way — so the
+/// message states the requirement only and diagnoses nothing it cannot observe.
+pub const ACCESS_DENIED_MESSAGE: &str = "You do not have sufficient access to perform this \
+     action. Sign the request with the emulator credentials, using SigV4 \
+     (AWS4-HMAC-SHA256).";
+
+/// How long a rejected value may be when a message echoes it back.
+///
+/// The framework caps its own echoed values at 256 bytes, on a char boundary, because a
+/// caller controls the length and a message interpolates it as-is: an uncapped echo turns
+/// one request into an arbitrarily long response. The cap is not exported (its `echoed`
+/// helper is private to `aws_smithy_schema_server::constraints`), so it is restated here
+/// with the same bound and the same rendering.
+const MAX_ECHOED_VALUE: usize = 256;
+
+/// A rejected value as it appears in a MESSAGE: itself when short, a char-boundary-safe
+/// prefix with an elision when not. RENDERING ONLY — every check runs on the original.
+fn echoed(value: &str) -> String {
+    if value.len() <= MAX_ECHOED_VALUE {
+        return value.to_string();
+    }
+    let mut end = MAX_ECHOED_VALUE;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [{} bytes]", &value[..end], value.len())
+}
+
+/// The modelled `ValidationException` message for one constraint a request failed, in the
+/// AWS validation envelope.
+///
+/// A constraint the MODEL declares is checked by the framework's validating walk before a
+/// handler runs, and these operations check the rest (an effective value set documented
+/// per operation, a bound a handler owns). Both must read alike, so this builds the
+/// message the same way: `aws_smithy_schema_server`'s one sentence builder
+/// ([`Violation::message`] via [`envelope`]) — `1 validation error detected: Value
+/// '<value>' at '<member>' failed to satisfy constraint: <requirement>`. A caller
+/// therefore cannot tell which layer refused a value, and the offending member and the
+/// constraint it failed are always named.
+pub fn constraint_message(member: &str, value: Option<&str>, kind: ViolationKind) -> String {
+    let violation = Violation {
+        path: member.to_string(),
+        kind,
+        value: value.map(echoed),
+    };
+    envelope(std::slice::from_ref(&violation)).unwrap_or_else(|| violation.message())
+}
+
+/// The enum constraint of a member whose value set is `allowed`.
+fn enum_constraint(allowed: &[&str]) -> ViolationKind {
+    ViolationKind::EnumValue(allowed.iter().map(|value| (*value).to_string()).collect())
+}
+
+/// The wire path of a Smithy member, as the AWS validation envelope spells it: every
+/// segment of a dotted member path in lowerCamel, joined by the framework's own path
+/// helpers — so `AllocationTypes` is reported at `allocationTypes` and
+/// `GranularityConfiguration.FiscalYearStartMonth` at
+/// `granularityConfiguration.fiscalYearStartMonth`.
+pub fn member_path(member: &str) -> String {
+    let segments: Vec<String> = member.split('.').map(path::member).collect();
+    path::join(&segments)
+}
+
+/// The wire path of the `position`-th element (1-based) of a list member, as the framework
+/// spells a collection step: `allocationTypes.1.member`.
+pub fn element_path(member: &str, position: usize) -> String {
+    path::join(&[member_path(member), path::element(position)])
+}
+
 /// `TimePeriod` as (start, end) epoch seconds.
 ///
 /// `Start` is inclusive and `End` exclusive, so an empty or inverted range selects nothing
@@ -679,17 +767,24 @@ pub fn validate_time_period(time_period: &TimePeriod) -> Result<(i64, i64), Stri
 }
 
 /// The values of one enum-valued list member, de-duplicated and in request order.
+///
+/// `member` is the Smithy member path of the LIST (`AllocationTypes`, `GroupBy`,
+/// `Dimensions`, `EmissionsTypes`). A value outside `allowed` is refused with the enum
+/// constraint of the list's member, reported at the element's own path — the spelling the
+/// framework's validating walk uses for the same class (`allocationTypes.1.member`), so a
+/// caller cannot tell which layer refused the value.
 pub fn validate_enum_list(
     member: &str,
     values: &[String],
     allowed: &[&str],
 ) -> Result<Vec<String>, String> {
     let mut accepted: Vec<String> = Vec::new();
-    for value in values {
+    for (position, value) in values.iter().enumerate() {
         if !allowed.contains(&value.as_str()) {
-            return Err(format!(
-                "{member} contains an unsupported value '{value}'; supported values are [{}]",
-                allowed.join(", ")
+            return Err(constraint_message(
+                &element_path(member, position + 1),
+                Some(value),
+                enum_constraint(allowed),
             ));
         }
         if !accepted.contains(value) {
@@ -706,21 +801,18 @@ pub fn validate_enum_list(
 /// here was really asked for and no value is normalised: the only outcomes are the value
 /// itself or a refusal.
 ///
-/// `supported` is the set THIS operation supports, which is not always every modelled value:
-/// a modelled granularity the operation does not support is refused with the modelled
-/// `ValidationException` rather than answered with a plausible row.
+/// `supported` is the set THIS operation supports, which is not always every modelled
+/// value: a modelled granularity the operation does not support is refused with the
+/// modelled `ValidationException` rather than answered with a plausible row. The refusal
+/// names the set this operation accepts — the effective value set of the member here —
+/// so one check covers both an unmodelled value and a modelled one this operation does
+/// not serve.
 pub fn validate_granularity(granularity: &str, supported: &[&str]) -> Result<String, String> {
-    if !TIME_GRANULARITY_VALUES.contains(&granularity) {
-        return Err(format!(
-            "Granularity '{granularity}' is not a supported value; supported values are [{}]",
-            TIME_GRANULARITY_VALUES.join(", ")
-        ));
-    }
     if !supported.contains(&granularity) {
-        return Err(format!(
-            "Granularity '{granularity}' is not supported by this operation; supported values \
-             are [{}]",
-            supported.join(", ")
+        return Err(constraint_message(
+            &member_path("Granularity"),
+            Some(granularity),
+            enum_constraint(supported),
         ));
     }
     Ok(granularity.to_string())
@@ -731,14 +823,30 @@ pub fn validate_granularity(granularity: &str, supported: &[&str]) -> Result<Str
 /// A request that omits `MaxResults` arrives carrying the modelled `@default` of
 /// [`DEFAULT_MAX_RESULTS`], so every value reaching here was really asked for.
 pub fn validate_max_results(max_results: i32) -> Result<usize, String> {
-    if !MAX_RESULTS_RANGE.contains(&max_results) {
-        return Err(format!(
-            "MaxResults must be between {} and {}; got {max_results}",
-            MAX_RESULTS_RANGE.start(),
-            MAX_RESULTS_RANGE.end()
+    let member = member_path("MaxResults");
+    let shown = max_results.to_string();
+    if max_results < *MAX_RESULTS_RANGE.start() {
+        return Err(constraint_message(
+            &member,
+            Some(&shown),
+            ViolationKind::MinValue(MAX_RESULTS_RANGE.start().to_string()),
         ));
     }
-    usize::try_from(max_results).map_err(|_| "MaxResults must be a positive integer".to_string())
+    if max_results > *MAX_RESULTS_RANGE.end() {
+        return Err(constraint_message(
+            &member,
+            Some(&shown),
+            ViolationKind::MaxValue(MAX_RESULTS_RANGE.end().to_string()),
+        ));
+    }
+    // The two checks above leave the value inside `MAX_RESULTS_RANGE`, so the conversion
+    // cannot fail; the assertion makes a bound that ever moved below zero fail loudly in a
+    // debug build (every test runs one) instead of quietly serving another page size.
+    debug_assert!(
+        MAX_RESULTS_RANGE.contains(&max_results),
+        "MaxResults {max_results} passed both bound checks but is outside the modelled range"
+    );
+    Ok(usize::try_from(max_results).unwrap_or(1))
 }
 
 /// The fiscal year's first month, refusing a value outside the modelled range.
@@ -747,16 +855,29 @@ pub fn validate_max_results(max_results: i32) -> Result<usize, String> {
 /// carrying the modelled `@default` of [`DEFAULT_FISCAL_YEAR_START_MONTH`], so a value
 /// outside the range is one a caller really sent and is refused rather than normalised.
 pub fn validate_fiscal_year_start_month(month: i32) -> Result<u8, String> {
-    if !FISCAL_YEAR_START_MONTH_RANGE.contains(&month) {
-        return Err(format!(
-            "GranularityConfiguration.FiscalYearStartMonth must be between {} and {}; got {month}",
-            FISCAL_YEAR_START_MONTH_RANGE.start(),
-            FISCAL_YEAR_START_MONTH_RANGE.end()
+    let member = member_path("GranularityConfiguration.FiscalYearStartMonth");
+    let shown = month.to_string();
+    if month < *FISCAL_YEAR_START_MONTH_RANGE.start() {
+        return Err(constraint_message(
+            &member,
+            Some(&shown),
+            ViolationKind::MinValue(FISCAL_YEAR_START_MONTH_RANGE.start().to_string()),
         ));
     }
-    u8::try_from(month).map_err(|_| {
-        "GranularityConfiguration.FiscalYearStartMonth must be a month number".to_string()
-    })
+    if month > *FISCAL_YEAR_START_MONTH_RANGE.end() {
+        return Err(constraint_message(
+            &member,
+            Some(&shown),
+            ViolationKind::MaxValue(FISCAL_YEAR_START_MONTH_RANGE.end().to_string()),
+        ));
+    }
+    // As with `validate_max_results`: in 1..=12 after the two checks above, asserted in a
+    // debug build so a moved bound fails loudly rather than substituting a month.
+    debug_assert!(
+        FISCAL_YEAR_START_MONTH_RANGE.contains(&month),
+        "FiscalYearStartMonth {month} passed both bound checks but is outside the modelled range"
+    );
+    Ok(u8::try_from(month).unwrap_or(DEFAULT_FISCAL_YEAR_START_MONTH))
 }
 
 /// `FilterBy.Dimensions` normalised to dimension -> set of accepted values.
@@ -764,23 +885,39 @@ pub fn validate_fiscal_year_start_month(month: i32) -> Result<u8, String> {
 /// A dimension the service does not model, or one listed with no values at all (a filter no
 /// row could satisfy and that no caller can have meant), is refused rather than silently
 /// dropped or silently answered with an empty page.
+///
+/// The entries are walked in sorted key order, not in the order a `HashMap` happens to
+/// yield them, so a request naming two offending dimensions is always refused for the same
+/// one: the refusal is a function of the request, as every other answer here is.
 pub fn validate_filter(
     filter: Option<&FilterExpression>,
 ) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
     let mut normalised: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let dimensions: Option<&HashMap<String, Vec<String>>> =
         filter.and_then(|filter| filter.dimensions.as_ref());
-    for (dimension, values) in dimensions.into_iter().flatten() {
+    let mut entries: Vec<(&String, &Vec<String>)> = dimensions.into_iter().flatten().collect();
+    entries.sort_by_key(|(dimension, _)| *dimension);
+    for (dimension, values) in entries {
         if !DIMENSION_VALUES.contains(&dimension.as_str()) {
-            return Err(format!(
-                "FilterBy.Dimensions names an unsupported dimension '{dimension}'; supported \
-                 dimensions are [{}]",
-                DIMENSION_VALUES.join(", ")
+            // The map's KEY is the modelled `Dimension` enum (`DimensionListMap`), so a
+            // key outside that value set fails the same enum constraint a `GroupBy`
+            // element does. It is stated at the MAP member's own path, with the rejected
+            // key as the value: the framework's `path::entry` spelling names the step into
+            // an entry's VALUE, which is not what failed here.
+            return Err(constraint_message(
+                &member_path("FilterBy.Dimensions"),
+                Some(dimension),
+                enum_constraint(DIMENSION_VALUES),
             ));
         }
         if values.is_empty() {
+            // Not a declared constraint — the model puts no `@length` on
+            // `DimensionValueList` — but a dimension listed with no values is a filter no
+            // row can satisfy and no caller can have meant, so it is refused rather than
+            // silently dropped or answered with an empty page.
             return Err(format!(
-                "FilterBy.Dimensions['{dimension}'] must list at least one value"
+                "FilterBy.Dimensions['{}'] must list at least one value",
+                echoed(dimension)
             ));
         }
         normalised.insert(dimension.clone(), values.iter().cloned().collect());

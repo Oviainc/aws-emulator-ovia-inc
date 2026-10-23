@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConsumableResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConsumableResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConsumableResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers one consumable resource in this service's state ([`crate::state`]) and
+//! answers the name and the ARN it was stored under. The name must be unique, so a
+//! second create of a stored name is refused with the modelled `ClientException` and
+//! changes nothing; `DescribeConsumableResource` reads the record back.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConsumableResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConsumableResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(CreateConsumableResourceErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        let region = batch::request_region(ctx);
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        let name = input.consumable_resource_name;
+        // The request's own members first, so a malformed request reports the member that
+        // is wrong rather than a collision with a stored record.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConsumableResource"))
+        // A required string whose value is empty names no resource, so nothing can be
+        // stored under it or read back by it.
+        if name.is_empty() {
+            return Err(CreateConsumableResourceErrorModeled::ClientException(
+                batch::client_exception("consumableResourceName must not be empty"),
+            )
+            .into());
+        }
+        // `totalQuantity`: "Must be non-negative." The model types it as a plain `Long`,
+        // so the framework admits a negative one and the rule is applied here.
+        let total_quantity = input.total_quantity.unwrap_or_default();
+        if total_quantity < 0 {
+            return Err(CreateConsumableResourceErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "totalQuantity must be non-negative, not {total_quantity}"
+                )),
+            )
+            .into());
+        }
+        // `resourceType`: one of `REPLENISHABLE` (the default) or `NON_REPLENISHABLE`.
+        // Also a plain `String` in the model, so the list is applied here.
+        let resource_type = input
+            .resource_type
+            .unwrap_or_else(|| batch::RESOURCE_TYPE_REPLENISHABLE.to_string());
+        if !batch::CONSUMABLE_RESOURCE_TYPES.contains(&resource_type.as_str()) {
+            return Err(CreateConsumableResourceErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "resourceType {resource_type} is not one of {}",
+                    batch::CONSUMABLE_RESOURCE_TYPES.join(", ")
+                )),
+            )
+            .into());
+        }
+        // Then what the STORE says about the request: "The name of the consumable
+        // resource. Must be unique."
+        if state.consumable_resources.contains_key(&name) {
+            return Err(CreateConsumableResourceErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "Object already exists: consumable resource {name}"
+                )),
+            )
+            .into());
+        }
+        if state.consumable_resources.len() >= batch::limits::MAX_CONSUMABLE_RESOURCES {
+            return Err(CreateConsumableResourceErrorModeled::ClientException(
+                batch::client_exception(batch::quota_message(
+                    "consumable resources",
+                    batch::limits::MAX_CONSUMABLE_RESOURCES,
+                )),
+            )
+            .into());
+        }
+
+        let arn = batch::consumable_resource_arn(&region, &name);
+        let resource = batch::ConsumableResource {
+            name: name.clone(),
+            arn: arn.clone(),
+            total_quantity,
+            // Nothing holds a resource the service has only just been asked to create.
+            in_use_quantity: 0,
+            resource_type,
+            created_at: now,
+            tags: input.tags,
+        };
+        state
+            .consumable_resources_by_arn
+            .insert(arn.clone(), name.clone());
+        state.consumable_resources.insert(name.clone(), resource);
+
+        Ok(CreateConsumableResourceOutput {
+            consumable_resource_name: name,
+            consumable_resource_arn: arn,
+        })
     }
 }

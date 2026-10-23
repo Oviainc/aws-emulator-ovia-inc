@@ -121,7 +121,7 @@ pub(crate) fn error_type(body: &Value) -> String {
     body["__type"].as_str().unwrap_or_default().to_string()
 }
 
-fn expected_arn(resource: &str) -> String {
+pub(crate) fn expected_arn(resource: &str) -> String {
     format!(
         "arn:aws:codebuild:{REGION}:{}:{resource}",
         engine::EMULATOR_ACCOUNT_ID

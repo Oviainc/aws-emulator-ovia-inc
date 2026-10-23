@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation stores a DB cluster in this service's state and answers
+//! with the cluster it stored. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The record and its projection onto the modelled `DBCluster` wire shape live in
+//! [`crate::state`], shared with `DescribeDBClusters` (which reports what this stored) and
+//! with `CreateDBInstance` (which resolves a member instance's cluster against the same
+//! store).
 //!
 //! ## Shape of an operation
 //!
@@ -357,18 +355,788 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let mut input = input;
+        let region =
+            crate::state::request_region(ctx).map_err(CreateDBClusterError::validation)?;
+
+        // The cluster TYPE follows from the engine — `CreateDBCluster` documents nearly
+        // every member as "Valid for Cluster Type: Aurora DB clusters only" / "Multi-AZ DB
+        // clusters only", or as required for one of them — so the engine is resolved
+        // against the value list its member publishes before anything else is read.
+        crate::state::check_db_cluster_engine(&input.engine)
+            .map_err(CreateDBClusterError::invalid_parameter_value)?;
+        let multi_az_cluster = crate::state::is_multi_az_db_cluster(&input.engine);
+
+        // "This parameter is stored as a lowercase string" — folded before it is
+        // validated, stored or echoed, so every later lookup folds the same way. The
+        // length bound is the one its own constraints give this cluster type.
+        let identifier = input.db_cluster_identifier.to_ascii_lowercase();
+        crate::state::check_identifier(
+            "DBClusterIdentifier",
+            &identifier,
+            crate::state::db_cluster_identifier_max_len(&input.engine),
+        )
+        .map_err(CreateDBClusterError::validation)?;
+
+        // `ManageMasterUserPassword` has RDS "generate and manage the master user password
+        // in Amazon Web Services Secrets Manager" and report the secret it created as
+        // `MasterUserSecret`. This service mints no Secrets Manager secret, so there is no
+        // managed secret to report: the request is answered with the scaffold's
+        // `NotImplemented` naming the member, rather than with a cluster whose managed
+        // secret does not exist. A request that carries its own `MasterUserPassword` is
+        // served normally.
+        if input.manage_master_user_password == Some(true) {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::scaffolded::NotImplemented {
+                    message: "CreateDBCluster$ManageMasterUserPassword is not implemented in \
+                              this emulator: it has RDS generate the master user password in \
+                              Amazon Web Services Secrets Manager and report that secret as \
+                              MasterUserSecret, and this service mints no such secret. Name \
+                              MasterUserPassword instead."
+                        .to_string(),
+                },
+            ));
+        }
+
+        // `WithExpressConfiguration` creates "an Aurora DB Cluster with express
+        // configuration", which provisions the cluster's writer DB INSTANCE as part of
+        // this call. This operation stores a cluster and no instance, so a cluster created
+        // for it would come back without the writer the member asks for: it is answered the
+        // same way, naming the member.
+        if input.with_express_configuration == Some(true) {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::scaffolded::NotImplemented {
+                    message: "CreateDBCluster$WithExpressConfiguration is not implemented in \
+                              this emulator: express configuration creates the cluster's \
+                              writer DB instance as part of this call, and this operation \
+                              creates no DB instance. Create the cluster without it and add \
+                              the writer with CreateDBInstance."
+                        .to_string(),
+                },
+            ));
+        }
+
+        // Every stored list and every stored free-form value is BOUNDED before anything is
+        // resolved or stored: these members publish no bound of their own and all of them
+        // enter the store, so the caps are this emulator's.
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags).map_err(CreateDBClusterError::invalid_parameter_value)?;
+        let vpc_security_group_ids = input.vpc_security_group_ids.unwrap_or_default();
+        crate::state::check_security_group_memberships(
+            "VpcSecurityGroupIds",
+            &vpc_security_group_ids,
+        )
+        .map_err(CreateDBClusterError::invalid_parameter_value)?;
+        let availability_zones = input.availability_zones.unwrap_or_default();
+        let cloudwatch_logs_exports = input.enable_cloudwatch_logs_exports.unwrap_or_default();
+        for (member, values) in [
+            ("AvailabilityZones", &availability_zones),
+            ("EnableCloudwatchLogsExports", &cloudwatch_logs_exports),
+        ] {
+            crate::state::check_request_list_len(
+                member,
+                values.len(),
+                crate::state::MAX_CLUSTER_LIST_ENTRIES,
+            )
+            .map_err(CreateDBClusterError::invalid_parameter_value)?;
+            for value in values {
+                crate::state::check_free_form(member, value)
+                    .map_err(CreateDBClusterError::invalid_parameter_value)?;
+            }
+        }
+        // `AssociatedRoles` and both strings each entry carries are STORED, so each is
+        // bounded here, where the value enters the store, rather than relying on the
+        // model's own bounds being enforced upstream: the list's length (0..15) and
+        // `RoleArn`'s (20..2048, [`crate::state::MAX_IAM_ROLE_ARN_LEN`]) are the model's,
+        // while `FeatureName` publishes none at all and so gets this emulator's cap for a
+        // stored free-form value.
+        let associated_roles = input.associated_roles.take().unwrap_or_default();
+        crate::state::check_request_list_len(
+            "AssociatedRoles",
+            associated_roles.len(),
+            crate::state::MAX_CLUSTER_LIST_ENTRIES,
+        )
+        .map_err(CreateDBClusterError::invalid_parameter_value)?;
+        for role in &associated_roles {
+            crate::state::check_stored_text(
+                "AssociatedRoles.RoleArn",
+                &role.role_arn,
+                crate::state::MAX_IAM_ROLE_ARN_LEN,
+            )
+            .map_err(CreateDBClusterError::invalid_parameter_value)?;
+            if let Some(feature_name) = &role.feature_name {
+                crate::state::check_free_form("AssociatedRoles.FeatureName", feature_name)
+                    .map_err(CreateDBClusterError::invalid_parameter_value)?;
+            }
+        }
+        for (member, value) in [
+            ("CharacterSetName", input.character_set_name.as_deref()),
+            ("DatabaseName", input.database_name.as_deref()),
+            ("DBClusterInstanceClass", input.db_cluster_instance_class.as_deref()),
+            ("DBClusterParameterGroupName", input.db_cluster_parameter_group_name.as_deref()),
+            ("DBSystemId", input.db_system_id.as_deref()),
+            ("Domain", input.domain.as_deref()),
+            ("DomainIAMRoleName", input.domain_iam_role_name.as_deref()),
+            ("KmsKeyId", input.kms_key_id.as_deref()),
+            ("MonitoringRoleArn", input.monitoring_role_arn.as_deref()),
+            ("OptionGroupName", input.option_group_name.as_deref()),
+            ("PerformanceInsightsKMSKeyId", input.performance_insights_kms_key_id.as_deref()),
+            ("PreferredBackupWindow", input.preferred_backup_window.as_deref()),
+            ("PreferredMaintenanceWindow", input.preferred_maintenance_window.as_deref()),
+        ] {
+            if let Some(value) = value {
+                crate::state::check_free_form(member, value)
+                    .map_err(CreateDBClusterError::invalid_parameter_value)?;
+            }
+        }
+
+        // The documented constraints of the values this request carries. Each is refused
+        // with the Query API error code the real service answers it with — a value outside
+        // what a parameter accepts is `InvalidParameterValue`, parameters that cannot hold
+        // together are `InvalidParameterCombination` — never with a 501.
+        if let Some(username) = &input.master_username {
+            crate::state::check_master_username(username)
+                .map_err(CreateDBClusterError::invalid_parameter_value)?;
+        }
+        if let Some(password) = &input.master_user_password {
+            crate::state::check_master_user_password(password)
+                .map_err(CreateDBClusterError::invalid_parameter_value)?;
+        }
+        if let Some(port) = input.port {
+            if !crate::state::PORT_RANGE.contains(&port) {
+                return Err(CreateDBClusterError::invalid_parameter_value(format!(
+                    "invalid value {port} for Port: must be a value from {} to {}",
+                    crate::state::PORT_RANGE.start(),
+                    crate::state::PORT_RANGE.end()
+                )));
+            }
+        }
+        if let Some(period) = input.backup_retention_period {
+            if !crate::state::CLUSTER_BACKUP_RETENTION_RANGE.contains(&period) {
+                return Err(CreateDBClusterError::invalid_parameter_value(format!(
+                    "invalid value {period} for BackupRetentionPeriod: must be a value from \
+                     {} to {}",
+                    crate::state::CLUSTER_BACKUP_RETENTION_RANGE.start(),
+                    crate::state::CLUSTER_BACKUP_RETENTION_RANGE.end()
+                )));
+            }
+        }
+        if let Some(window) = input.backtrack_window {
+            if !crate::state::BACKTRACK_WINDOW_RANGE.contains(&window) {
+                return Err(CreateDBClusterError::invalid_parameter_value(format!(
+                    "invalid value {window} for BacktrackWindow: must be a value from {} to \
+                     {} seconds",
+                    crate::state::BACKTRACK_WINDOW_RANGE.start(),
+                    crate::state::BACKTRACK_WINDOW_RANGE.end()
+                )));
+            }
+            // "Valid for Cluster Type: Aurora MySQL DB clusters only" — backtracking is an
+            // Aurora MySQL feature, so asking for a window on any other engine names
+            // something that engine cannot do. Zero IS backtracking disabled, which every
+            // cluster can be.
+            if window != 0 && !input.engine.eq_ignore_ascii_case(AURORA_MYSQL_ENGINE) {
+                return Err(CreateDBClusterError::invalid_parameter_combination(format!(
+                    "BacktrackWindow is valid for Aurora MySQL DB clusters only: engine \
+                     {} does not support backtracking",
+                    input.engine
+                )));
+            }
+        }
+        // "Specifies whether to enable the HTTP endpoint for the DB cluster … Valid for
+        // Cluster Type: Aurora DB clusters only": the RDS Data API serves an Aurora
+        // cluster's HTTP endpoint, so no other engine has one to enable.
+        if input.enable_http_endpoint == Some(true) && !crate::state::is_aurora(&input.engine) {
+            return Err(CreateDBClusterError::invalid_parameter_combination(format!(
+                "EnableHttpEndpoint is valid for Aurora DB clusters only: engine {} \
+                 provides no HTTP endpoint (RDS Data API)",
+                input.engine
+            )));
+        }
+        if let Some(network_type) = &input.network_type {
+            // "Valid for Cluster Type: Aurora DB clusters only", "Valid Values: IPV4 |
+            // DUAL".
+            if multi_az_cluster {
+                return Err(CreateDBClusterError::invalid_parameter_combination(format!(
+                    "NetworkType is valid for Aurora DB clusters only: engine {} creates a \
+                     Multi-AZ DB cluster",
+                    input.engine
+                )));
+            }
+            if !crate::state::NETWORK_TYPES
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(network_type))
+            {
+                return Err(CreateDBClusterError::invalid_parameter_value(format!(
+                    "invalid value {network_type} for NetworkType: must be one of {}",
+                    crate::state::NETWORK_TYPES.join(" | ")
+                )));
+            }
+        }
+        if let Some(storage_type) = &input.storage_type {
+            let published = crate::state::db_cluster_storage_types(&input.engine);
+            if !published
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(storage_type))
+            {
+                return Err(CreateDBClusterErrorModeled::StorageTypeNotSupportedFault(
+                    StorageTypeNotSupportedFault {
+                        message: Some(format!(
+                            "Invalid storage type {storage_type} for engine {}: must be one \
+                             of {}",
+                            input.engine,
+                            published.join(" | ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        // The members each cluster type owns.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBCluster"))
+        // `AllocatedStorage`, `DBClusterInstanceClass` and `Iops` are each documented
+        // "Valid for Cluster Type: Multi-AZ DB clusters only" AND "This setting is required
+        // to create a Multi-AZ DB cluster", and `PubliclyAccessible` is Multi-AZ-only with a
+        // documented default of its own: one of those four on an Aurora cluster names
+        // something that cluster type does not have, and three of them missing from a
+        // Multi-AZ DB cluster is a combination the real service does not accept.
+        //
+        // `StorageType` belongs to BOTH types — "Valid for Cluster Type: Aurora DB clusters
+        // and Multi-AZ DB clusters", with its own value list per type, checked above — so it
+        // is only in the required set, never in the Aurora refusal set: an Aurora cluster on
+        // `aurora-iopt1` (Aurora I/O-Optimized) is a cluster AWS creates.
+        let multi_az_only: [(&str, bool); 4] = [
+            ("AllocatedStorage", input.allocated_storage.is_some()),
+            (
+                "DBClusterInstanceClass",
+                input.db_cluster_instance_class.is_some(),
+            ),
+            ("Iops", input.iops.is_some()),
+            ("PubliclyAccessible", input.publicly_accessible.is_some()),
+        ];
+        let multi_az_required: [(&str, bool); 4] = [
+            ("AllocatedStorage", input.allocated_storage.is_some()),
+            (
+                "DBClusterInstanceClass",
+                input.db_cluster_instance_class.is_some(),
+            ),
+            ("Iops", input.iops.is_some()),
+            ("StorageType", input.storage_type.is_some()),
+        ];
+        if multi_az_cluster {
+            let missing: Vec<&str> = multi_az_required
+                .iter()
+                .filter(|(_, named)| !named)
+                .map(|(member, _)| *member)
+                .collect();
+            if !missing.is_empty() {
+                return Err(CreateDBClusterError::invalid_parameter_combination(format!(
+                    "{} {} required to create a Multi-AZ DB cluster (engine {})",
+                    missing.join(", "),
+                    if missing.len() == 1 { "is" } else { "are" },
+                    input.engine
+                )));
+            }
+            crate::state::check_db_instance_class(
+                input
+                    .db_cluster_instance_class
+                    .as_deref()
+                    .expect("checked just above"),
+            )
+            .map_err(CreateDBClusterError::invalid_parameter_value)?;
+            // `Iops`: "Must be a multiple between .5 and 50 of the storage amount for the
+            // DB cluster."
+            let storage = input.allocated_storage.expect("checked just above");
+            let iops = input.iops.expect("checked just above");
+            let ratio = f64::from(iops) / f64::from(storage.max(1));
+            if storage <= 0 || !(IOPS_STORAGE_RATIO_MIN..=IOPS_STORAGE_RATIO_MAX).contains(&ratio) {
+                return Err(CreateDBClusterError::invalid_parameter_combination(format!(
+                    "invalid value {iops} for Iops: must be a multiple between \
+                     {IOPS_STORAGE_RATIO_MIN} and {IOPS_STORAGE_RATIO_MAX} of \
+                     AllocatedStorage ({storage})"
+                )));
+            }
+        } else if let Some(member) = multi_az_only
+            .iter()
+            .find(|(_, named)| *named)
+            .map(|(member, _)| *member)
+        {
+            return Err(CreateDBClusterError::invalid_parameter_combination(format!(
+                "{member} is valid for Multi-AZ DB clusters only: engine {} creates an \
+                 Aurora DB cluster",
+                input.engine
+            )));
+        }
+        crate::state::check_engine_lifecycle_support(
+            input
+                .engine_lifecycle_support
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT),
+        )
+        .map_err(CreateDBClusterError::invalid_parameter_value)?;
+        // `DatabaseInsightsMode`: "If you set this value to advanced, you must also set the
+        // PerformanceInsightsEnabled parameter to true and the
+        // PerformanceInsightsRetentionPeriod parameter to 465."
+        let database_insights_mode = input
+            .database_insights_mode
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_DATABASE_INSIGHTS_MODE.to_string());
+        if database_insights_mode == crate::state::DATABASE_INSIGHTS_MODE_ADVANCED
+            && (input.enable_performance_insights != Some(true)
+                || input.performance_insights_retention_period
+                    != Some(crate::state::ADVANCED_INSIGHTS_RETENTION_PERIOD))
+        {
+            return Err(CreateDBClusterError::invalid_parameter_combination(format!(
+                "DatabaseInsightsMode {} requires EnablePerformanceInsights to be true and \
+                 PerformanceInsightsRetentionPeriod to be {}",
+                crate::state::DATABASE_INSIGHTS_MODE_ADVANCED,
+                crate::state::ADVANCED_INSIGHTS_RETENTION_PERIOD
+            )));
+        }
+
+        // The version the cluster RUNS, resolved against the engine-version catalogue
+        // `DescribeDBEngineVersions` publishes — never the request's string echoed back.
+        // The resolved entry also names the DB cluster parameter group family the
+        // cluster's default parameter group is named after, and the capabilities the two
+        // scaling members below are checked against, so none of them can disagree.
+        let resolved_version = crate::ops::describe_db_engine_versions::resolve_version(
+            &input.engine,
+            input.engine_version.as_deref(),
+        )
+        .map_err(CreateDBClusterError::invalid_parameter_combination)?;
+        // `EngineMode`: "either provisioned or serverless", and which of them a cluster can
+        // run is a property of its engine VERSION — the catalogue publishes it as
+        // `SupportedEngineModes`.
+        let engine_mode = input
+            .engine_mode
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_DB_CLUSTER_ENGINE_MODE.to_string());
+        if !crate::state::DB_CLUSTER_ENGINE_MODES
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(&engine_mode))
+        {
+            return Err(CreateDBClusterError::invalid_parameter_value(format!(
+                "invalid value {engine_mode} for EngineMode: must be one of {}",
+                crate::state::DB_CLUSTER_ENGINE_MODES.join(" | ")
+            )));
+        }
+        if let Some(entry) = resolved_version {
+            if !entry
+                .profile
+                .engine_modes
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&engine_mode))
+            {
+                return Err(CreateDBClusterError::invalid_parameter_combination(format!(
+                    "engine version {} of {} does not support the {engine_mode} engine \
+                     mode: it supports {}",
+                    entry.engine_version,
+                    input.engine,
+                    entry.profile.engine_modes.join(" | ")
+                )));
+            }
+        }
+        // `ServerlessV2ScalingConfiguration`: the Aurora Serverless v2 capacity range,
+        // which only a version the catalogue publishes a Serverless v2 capacity range for
+        // can be created with — and only inside that range, in the half-step increments the
+        // member documents ("You can specify ACU values in half-step increments, such as 8,
+        // 8.5, 9, and so on").
+        let serverless_v2_scaling = match &input.serverless_v2_scaling_configuration {
+            None => None,
+            Some(asked) => {
+                let Some((min_acu, max_acu)) =
+                    resolved_version.and_then(|entry| entry.profile.serverless_v2_capacity)
+                else {
+                    return Err(CreateDBClusterError::invalid_parameter_combination(format!(
+                        "ServerlessV2ScalingConfiguration is not supported by engine {} \
+                         version {}: that version runs no Aurora Serverless v2 capacity",
+                        input.engine,
+                        input.engine_version.as_deref().unwrap_or("(default)")
+                    )));
+                };
+                for (member, value) in [
+                    ("MinCapacity", asked.min_capacity),
+                    ("MaxCapacity", asked.max_capacity),
+                ] {
+                    let Some(value) = value else { continue };
+                    if !(min_acu..=max_acu).contains(&value) {
+                        return Err(CreateDBClusterError::invalid_parameter_value(format!(
+                            "invalid value {value} for \
+                             ServerlessV2ScalingConfiguration.{member}: engine {} version \
+                             {} serves {min_acu} to {max_acu} Aurora capacity units",
+                            input.engine,
+                            input.engine_version.as_deref().unwrap_or("(default)")
+                        )));
+                    }
+                    if (value * 2.0).fract() != 0.0 {
+                        return Err(CreateDBClusterError::invalid_parameter_value(format!(
+                            "invalid value {value} for \
+                             ServerlessV2ScalingConfiguration.{member}: Aurora capacity \
+                             units are specified in half-step increments"
+                        )));
+                    }
+                }
+                if let (Some(min), Some(max)) = (asked.min_capacity, asked.max_capacity) {
+                    if min > max {
+                        return Err(CreateDBClusterError::invalid_parameter_combination(
+                            format!(
+                                "ServerlessV2ScalingConfiguration.MinCapacity ({min}) must \
+                                 not exceed MaxCapacity ({max})"
+                            ),
+                        ));
+                    }
+                }
+                if let Some(seconds) = asked.seconds_until_auto_pause {
+                    if !crate::state::SECONDS_UNTIL_AUTO_PAUSE_RANGE.contains(&seconds) {
+                        return Err(CreateDBClusterError::invalid_parameter_value(format!(
+                            "invalid value {seconds} for \
+                             ServerlessV2ScalingConfiguration.SecondsUntilAutoPause: must \
+                             be a value from {} to {} seconds",
+                            crate::state::SECONDS_UNTIL_AUTO_PAUSE_RANGE.start(),
+                            crate::state::SECONDS_UNTIL_AUTO_PAUSE_RANGE.end()
+                        )));
+                    }
+                }
+                Some(ServerlessV2ScalingConfigurationInfo {
+                    min_capacity: asked.min_capacity,
+                    max_capacity: asked.max_capacity,
+                    seconds_until_auto_pause: asked.seconds_until_auto_pause,
+                })
+            }
+        };
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated cluster.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // Every resource this request REFERENCES by name is resolved in the store before
+        // the cluster is inserted, and a name that resolves to nothing is that resource
+        // type's modelled not-found fault: a create AWS would never have accepted must
+        // leave no cluster behind for a later call to find.
+        //
+        // `DBSubnetGroupName`: "Must match the name of an existing DB subnet group." It is
+        // folded the way `CreateDBSubnetGroup` stores it.
+        let db_subnet_group_name = input
+            .db_subnet_group_name
+            .as_ref()
+            .map(|name| name.to_ascii_lowercase());
+        if let Some(name) = &db_subnet_group_name {
+            if store.resolve_db_subnet_group(&region, name).is_none() {
+                return Err(CreateDBClusterErrorModeled::DBSubnetGroupNotFoundFault(
+                    DBSubnetGroupNotFoundFault {
+                        message: Some(format!("DBSubnetGroup '{name}' not found.")),
+                    },
+                )
+                .into());
+            }
+        }
+        // `GlobalClusterIdentifier`: "the global cluster ID of an Aurora cluster that
+        // becomes the primary cluster in the new global database cluster." A global cluster
+        // is account-scoped, so it is looked up by identifier alone — and a cluster that
+        // joins one becomes a member of it, which is what `DescribeGlobalClusters` reports.
+        let global_cluster_identifier = match &input.global_cluster_identifier {
+            None => None,
+            Some(named) => {
+                let folded = named.to_ascii_lowercase();
+                if !store.global_clusters.contains_key(&folded) {
+                    return Err(CreateDBClusterErrorModeled::GlobalClusterNotFoundFault(
+                        GlobalClusterNotFoundFault {
+                            message: Some(format!("GlobalCluster {named} not found.")),
+                        },
+                    )
+                    .into());
+                }
+                Some(folded)
+            }
+        };
+        // `ReplicationSourceIdentifier`: "the Amazon Resource Name (ARN) of the source DB
+        // instance or DB cluster if this DB cluster is created as a read replica." Stored
+        // as the ARN of the record it resolves to, so the reference cannot name something
+        // this service does not hold; a value that resolves to neither is the modelled
+        // `DBClusterNotFoundFault`.
+        let replication_source_arn = match &input.replication_source_identifier {
+            None => None,
+            Some(named) => {
+                let source = store
+                    .resolve_db_cluster(&region, named)
+                    .map(crate::state::DbClusterRecord::arn)
+                    .or_else(|| {
+                        let instance = crate::state::db_cluster_identifier_of(named)
+                            .to_ascii_lowercase();
+                        store
+                            .db_instances
+                            .get(&(region.clone(), instance))
+                            .map(crate::state::DbInstanceRecord::arn)
+                    });
+                match source {
+                    Some(arn) => Some(arn),
+                    None => {
+                        return Err(CreateDBClusterErrorModeled::DBClusterNotFoundFault(
+                            DBClusterNotFoundFault {
+                                message: Some(format!(
+                                    "The source cluster could not be found or cannot be \
+                                     accessed: {named}"
+                                )),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+        // `OptionGroupName` and `DBClusterParameterGroupName` are NOT resolved the same
+        // way, and deliberately: alongside every engine major version AWS creates a DEFAULT
+        // option group and DB cluster parameter group (`default:aurora-mysql-8-0`,
+        // `default.aurora-mysql8.0`) that no request creates and this service does not
+        // hold, so refusing every name it has no record of would refuse the groups AWS
+        // itself provides. They are stored as given, as `CreateDBInstance` stores its own.
+
+        let key = (region.clone(), identifier.clone());
+        if store.db_clusters.contains_key(&key) {
+            return Err(CreateDBClusterErrorModeled::DBClusterAlreadyExistsFault(
+                DBClusterAlreadyExistsFault {
+                    message: Some(format!("DB Cluster already exists: {identifier}")),
+                },
+            )
+            .into());
+        }
+        // The region's DB cluster quota, and the number of regions this store keeps records
+        // for at all: a store that grows without bound is not what the real service does,
+        // and the modelled fault says exactly this.
+        if store.clusters_in(&region).len() >= crate::state::DB_CLUSTER_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(CreateDBClusterErrorModeled::DBClusterQuotaExceededFault(
+                DBClusterQuotaExceededFault {
+                    message: Some(format!(
+                        "the request would exceed the allowed number of DB clusters ({} per \
+                         region, in at most {} regions)",
+                        crate::state::DB_CLUSTER_QUOTA_PER_REGION,
+                        crate::state::MAX_REGIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mint = store.next_mint();
+        // The version the cluster runs, and the DB cluster parameter group family its
+        // default parameter group is named after: both come from the catalogue entry
+        // resolved above, so the two cannot disagree.
+        let engine_version = match resolved_version {
+            Some(entry) => Some(entry.engine_version.to_string()),
+            // An engine the catalogue publishes no available version for: there is nothing
+            // to resolve against, so what the request named stands.
+            None => input.engine_version.clone(),
+        };
+        let record = crate::state::DbClusterRecord {
+            identifier: identifier.clone(),
+            region: region.clone(),
+            resource_id: crate::state::mint_db_cluster_resource_id(mint),
+            endpoint_host: crate::state::mint_endpoint_host(mint),
+            // A newly created DB cluster is not yet usable: RDS answers `creating`, and the
+            // cluster reaches `available` on its own. The due instant is stored on the
+            // record, so nothing sleeps on this thread.
+            status: crate::state::DB_CLUSTER_STATUS_CREATING.to_string(),
+            pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::DB_CLUSTER_STATUS_AVAILABLE,
+            )),
+            engine: input.engine.clone(),
+            engine_version,
+            engine_mode,
+            database_name: input.database_name,
+            // `MasterUserPassword` is `@sensitive` and RDS reports no member carrying it,
+            // so it is validated above, never stored or returned. The username is.
+            master_username: input.master_username,
+            port: input
+                .port
+                .unwrap_or_else(|| crate::state::default_port(&input.engine)),
+            // "A list of Availability Zones (AZs) where you specifically want to create DB
+            // instances in the DB cluster" — a cluster the request names none for spans the
+            // zones RDS picks for it, which for both cluster types is three ("the request
+            // creates a writer and two reader DB instances for you, each in a different
+            // Availability Zone"). This emulator picks the region's first three, named the
+            // way AWS names a zone of a region.
+            availability_zones: if availability_zones.is_empty() {
+                DEFAULT_ZONE_SUFFIXES
+                    .iter()
+                    .map(|suffix| format!("{region}{suffix}"))
+                    .collect()
+            } else {
+                availability_zones
+            },
+            // `BackupRetentionPeriod`: "Default: 1".
+            backup_retention_period: input.backup_retention_period.unwrap_or(1),
+            preferred_backup_window: input
+                .preferred_backup_window
+                .unwrap_or_else(|| crate::state::DEFAULT_PREFERRED_BACKUP_WINDOW.to_string()),
+            preferred_maintenance_window: input.preferred_maintenance_window.unwrap_or_else(
+                || crate::state::DEFAULT_PREFERRED_MAINTENANCE_WINDOW.to_string(),
+            ),
+            // "If you don't specify a value, then the default DB cluster parameter group
+            // for the specified DB engine and version is used."
+            db_cluster_parameter_group_name: input.db_cluster_parameter_group_name.or_else(|| {
+                resolved_version.map(|entry| {
+                    crate::state::default_db_parameter_group_name(entry.parameter_group_family)
+                })
+            }),
+            db_subnet_group_name,
+            option_group_name: input.option_group_name,
+            character_set_name: input.character_set_name,
+            vpc_security_group_ids,
+            // `StorageEncrypted` / `DeletionProtection` / `CopyTagsToSnapshot` /
+            // `EnableHttpEndpoint` / `EnableIAMDatabaseAuthentication` /
+            // `EnablePerformanceInsights` / `EnableLocalWriteForwarding` /
+            // `EnableGlobalWriteForwarding` each turn something ON that the request asks
+            // for, so a cluster created without them has it off.
+            storage_encrypted: input.storage_encrypted.unwrap_or(false),
+            kms_key_id: input.kms_key_id,
+            // "The storage type isn't returned when you set it to `aurora`" — the Aurora
+            // default — so only a storage type the cluster was really created with is
+            // stored to be reported.
+            storage_type: input.storage_type.filter(|storage_type| {
+                multi_az_cluster
+                    || !storage_type.eq_ignore_ascii_case(crate::state::AURORA_DEFAULT_STORAGE_TYPE)
+            }),
+            iops: input.iops,
+            allocated_storage: input.allocated_storage,
+            db_cluster_instance_class: input.db_cluster_instance_class,
+            publicly_accessible: input.publicly_accessible,
+            // `AutoMinorVersionUpgrade`: "By default, minor engine upgrades are applied
+            // automatically."
+            auto_minor_version_upgrade: input.auto_minor_version_upgrade.unwrap_or(true),
+            deletion_protection: input.deletion_protection.unwrap_or(false),
+            copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
+            http_endpoint_enabled: input.enable_http_endpoint.unwrap_or(false),
+            iam_database_authentication_enabled: input
+                .enable_iam_database_authentication
+                .unwrap_or(false),
+            // `BacktrackWindow`: "Default: 0" — backtracking disabled.
+            backtrack_window: input.backtrack_window.unwrap_or(0),
+            enabled_cloudwatch_logs_exports: cloudwatch_logs_exports,
+            // "The network type is determined by the DBSubnetGroup specified for the DB
+            // cluster … Valid for Cluster Type: Aurora DB clusters only": an Aurora cluster
+            // the request named none for gets the IPv4 network every DB subnet group
+            // supports, and a Multi-AZ DB cluster reports no network type at all.
+            network_type: (!multi_az_cluster).then(|| {
+                input
+                    .network_type
+                    .unwrap_or_else(|| crate::state::DEFAULT_NETWORK_TYPE.to_string())
+            }),
+            // `MonitoringInterval`: "Default: 0" — Enhanced Monitoring off.
+            monitoring_interval: input
+                .monitoring_interval
+                .unwrap_or(crate::state::DEFAULT_MONITORING_INTERVAL),
+            monitoring_role_arn: input.monitoring_role_arn,
+            database_insights_mode,
+            performance_insights_enabled: input.enable_performance_insights.unwrap_or(false),
+            performance_insights_kms_key_id: input.performance_insights_kms_key_id,
+            performance_insights_retention_period: input.performance_insights_retention_period,
+            serverless_v2_scaling,
+            // The Aurora Serverless v1 scaling configuration, reported as the
+            // `ScalingConfigurationInfo` of a cluster in the `serverless` engine mode. Only
+            // what the request named is reported: the members it left out are RDS's own
+            // per-engine defaults, which this service has no state for.
+            scaling_configuration: input.scaling_configuration.map(|asked| {
+                ScalingConfigurationInfo {
+                    min_capacity: asked.min_capacity,
+                    max_capacity: asked.max_capacity,
+                    auto_pause: asked.auto_pause,
+                    seconds_until_auto_pause: asked.seconds_until_auto_pause,
+                    timeout_action: asked.timeout_action,
+                    seconds_before_timeout: asked.seconds_before_timeout,
+                }
+            }),
+            // "A list of Amazon Web Services Identity and Access Management (IAM) roles to
+            // associate with the DB cluster": each is in place from the create onwards, so
+            // each reports the `ACTIVE` status of an association that holds.
+            associated_roles: associated_roles
+                .into_iter()
+                .map(|role| DBClusterRole {
+                    role_arn: Some(role.role_arn),
+                    feature_name: role.feature_name,
+                    status: Some(crate::state::DB_CLUSTER_ROLE_STATUS_ACTIVE.to_string()),
+                })
+                .collect(),
+            domain: input.domain,
+            domain_iam_role_name: input.domain_iam_role_name,
+            global_cluster_identifier: global_cluster_identifier.clone(),
+            replication_source_arn,
+            ca_certificate_identifier: input.ca_certificate_identifier.unwrap_or_else(|| {
+                // No `CACertificateIdentifier`: the cluster is created under the CA that is
+                // the default for new launches in this region — the account's
+                // `ModifyCertificates` override when one is set, else the published system
+                // default.
+                store.default_ca_certificate(&region).to_string()
+            }),
+            engine_lifecycle_support: input
+                .engine_lifecycle_support
+                .unwrap_or_else(|| crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT.to_string()),
+            cluster_scalability_type: input
+                .cluster_scalability_type
+                .unwrap_or_else(|| crate::state::DEFAULT_CLUSTER_SCALABILITY_TYPE.to_string()),
+            db_system_id: input.db_system_id,
+            local_write_forwarding_enabled: input.enable_local_write_forwarding.unwrap_or(false),
+            global_write_forwarding_requested: input
+                .enable_global_write_forwarding
+                .unwrap_or(false),
+            cluster_create_time: crate::state::now_as_wire_timestamp(),
+            tags,
+        };
+
+        let db_cluster = store.cluster_to_wire(&record);
+        let resource_id = record.resource_id.clone();
+        let engine = record.engine.clone();
+        let cluster_arn = record.arn();
+        store.db_clusters.insert(key, record);
+        // A cluster that joined a global database is a MEMBER of it from now on: the
+        // global cluster's own record carries its members, so it is the record that is
+        // updated, and `DescribeGlobalClusters` reports the membership from there.
+        if let Some(global) = global_cluster_identifier
+            .as_ref()
+            .and_then(|identifier| store.global_clusters.get_mut(identifier))
+        {
+            if !global.member_cluster_arns.contains(&cluster_arn) {
+                global.member_cluster_arns.push(cluster_arn);
+            }
+        }
+        // The id just minted is recorded in the SHARED data-source directory, so a service
+        // that monitors this cluster (Performance Insights addresses a data source by its
+        // resource id) can tell that THIS service owns the id: the id's form cannot say so,
+        // because a global cluster's id has the same form. The RDS store is already locked
+        // here and the directory is taken second, the order its doc fixes.
+        if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+            directory.lock().register(
+                &resource_id,
+                ::service_common::db_data_sources::SERVICE_TYPE_RDS,
+                &engine,
+            );
+        }
+
+        Ok(CreateDBClusterOutput {
+            db_cluster: Some(db_cluster),
+        })
     }
 }
+
+/// The engine whose clusters support backtracking, the one feature of this operation that
+/// is documented for a single engine ("Valid for Cluster Type: Aurora MySQL DB clusters
+/// only").
+const AURORA_MYSQL_ENGINE: &str = "aurora-mysql";
+
+/// The Availability Zone suffixes a cluster the request named none for spans: the first
+/// three zones of its region, named `<region>a`, `<region>b`, `<region>c` the way AWS names
+/// the zones of a region (and the way `CreateDBInstance` names the one zone it picks).
+const DEFAULT_ZONE_SUFFIXES: [&str; 3] = ["a", "b", "c"];
+
+/// The lowest and highest ratio of `Iops` to `AllocatedStorage` a Multi-AZ DB cluster may
+/// be created with: `Iops` "must be a multiple between .5 and 50 of the storage amount for
+/// the DB cluster".
+const IOPS_STORAGE_RATIO_MIN: f64 = 0.5;
+
+/// See [`IOPS_STORAGE_RATIO_MIN`].
+const IOPS_STORAGE_RATIO_MAX: f64 = 50.0;

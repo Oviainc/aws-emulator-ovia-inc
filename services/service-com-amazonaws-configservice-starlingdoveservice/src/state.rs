@@ -15,13 +15,15 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AccountAggregationSource, AggregatorFilters, Compliance, ComplianceContributorCount,
-    ComplianceSummary, ConfigExportDeliveryInfo, ConfigRule, ConfigSnapshotDeliveryProperties,
-    ConfigStreamDeliveryInfo, ConfigurationAggregator, ConfigurationRecorder,
+    AccountAggregationSource, AggregationAuthorization, AggregatorFilters, Compliance,
+    ComplianceContributorCount, ComplianceSummary, ConfigExportDeliveryInfo, ConfigRule,
+    ConfigSnapshotDeliveryProperties, ConfigStreamDeliveryInfo, ConfigurationAggregator,
+    ConfigurationRecorder,
     ConfigurationRecorderStatus, ConfigurationRecorderSummary, DeliveryChannel,
     DeliveryChannelStatus, EvaluationModeConfiguration, ExclusionByResourceTypes,
-    OrganizationAggregationSource, PendingAggregationRequest, RecordingGroup, RecordingMode,
-    RecordingStrategy, ResourceIdentifier, RetentionConfiguration, Scope, Source, Tag,
+    ExecutionControls, OrganizationAggregationSource, PendingAggregationRequest, RecordingGroup,
+    RecordingMode, RecordingStrategy, RemediationConfiguration, RemediationParameterValue,
+    ResourceIdentifier, RetentionConfiguration, Scope, Source, Tag,
 };
 
 /// The ARN namespace of this service (`awsService.arnNamespace` in the model), used
@@ -201,12 +203,56 @@ pub const CONFIGURATION_AGGREGATORS_QUOTA: usize = 50;
 /// modelled `Limit` range maximum.
 pub const DESCRIBE_CONFIGURATION_AGGREGATORS_PAGE_SIZE: i32 = 100;
 
+/// How many authorizations one `DescribeAggregationAuthorizations` page carries when
+/// the request asks for no `Limit` (`DescribeAggregationAuthorizationsRequest$Limit`:
+/// "The maximum number of AggregationAuthorizations returned on each page. The default
+/// is maximum. If you specify 0, Config uses the default") — the maximum being the
+/// modelled `Limit` range maximum.
+pub const DESCRIBE_AGGREGATION_AUTHORIZATIONS_PAGE_SIZE: i32 = 100;
+
+/// The most aggregation authorizations this account and Region can hold, after which
+/// `PutAggregationAuthorization` refuses a NEW authorized pair.
+///
+/// Config publishes no quota for aggregation authorizations, so this is the EMULATOR's
+/// own bound, not a documented AWS one: the store's keys are whole-cloth caller input
+/// (an authorized account and an authorized Region), so without a cap one caller could
+/// grow it one entry per distinct pair without end. It is two orders of magnitude above
+/// the aggregator quota Config does publish, so no faithful workload meets it.
+pub const AGGREGATION_AUTHORIZATIONS_QUOTA: usize = 5_000;
+
 /// How many rules one `DescribeConfigRules` page carries.
 ///
 /// The operation models no `Limit` member, so the page size is this emulator's:
 /// it matches the `ConfigRuleNames` length maximum (0..25) the same operation
 /// declares.
 pub const DESCRIBE_CONFIG_RULES_PAGE_SIZE: usize = 25;
+
+/// The `Parameters` key naming the role Config assumes to run a remediation
+/// (`PutRemediationConfigurations`: "for automatic remediation configuration, the
+/// only valid assumeRole field value is AutomationAssumeRole and you need to provide
+/// a value for AutomationAssumeRole to remediate your resources").
+pub const AUTOMATION_ASSUME_ROLE_PARAMETER: &str = "AutomationAssumeRole";
+
+/// The other `Parameters` key a MANUAL remediation configuration may name that role
+/// with (`PutRemediationConfigurations`: "For manual remediation configuration, you
+/// need to provide a value for automationAssumeRole or use a value in the assumeRole
+/// field to remediate your resources. The SSM automation document can use either as
+/// long as it maps to a valid parameter").
+pub const ASSUME_ROLE_PARAMETER: &str = "AssumeRole";
+
+/// The `MaximumAutomaticAttempts` an automatic remediation configuration retries up
+/// to when the request names no number
+/// (`RemediationConfiguration$MaximumAutomaticAttempts`: "The maximum number of
+/// failed attempts for auto-remediation. If you do not select a number, the default
+/// is 5").
+pub const DEFAULT_MAXIMUM_AUTOMATIC_ATTEMPTS: i32 = 5;
+
+/// The `RetryAttemptSeconds` window an automatic remediation configuration retries
+/// within when the request names no number
+/// (`RemediationConfiguration$RetryAttemptSeconds`: "Time window to determine whether
+/// or not to add a remediation exception to prevent infinite remediation attempts ...
+/// If you do not select a number, the default is 60 seconds").
+pub const DEFAULT_RETRY_ATTEMPT_SECONDS: i64 = 60;
 
 /// How many resource identifiers one `ListDiscoveredResources` page carries when the
 /// request asks for no limit of its own (`ListDiscoveredResourcesRequest$limit`: "The
@@ -686,6 +732,107 @@ impl ConfigRuleEntry {
     }
 }
 
+/// One persisted remediation configuration: the remediation action Config runs for
+/// one Config rule.
+///
+/// Config holds at most one remediation configuration per Config rule — a second
+/// `PutRemediationConfigurations` for the same rule UPDATES the first, and
+/// `DeleteRemediationConfiguration` names only the rule — so the store keys them by
+/// `ConfigRuleName`.
+#[derive(Debug, Clone, Default)]
+pub struct RemediationConfigurationEntry {
+    pub config_rule_name: String,
+    /// The id Config assigned this remediation configuration when it was created. It
+    /// is part of the configuration's ARN and never changes once minted, so an update
+    /// keeps the ARN the create reported.
+    pub id: String,
+    pub arn: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub target_version: Option<String>,
+    /// The remediation parameters, keyed by parameter name. A `BTreeMap` so the
+    /// stored configuration has one stable ordering however the request spelled it.
+    pub parameters: BTreeMap<String, RemediationParameterValue>,
+    pub resource_type: Option<String>,
+    pub automatic: bool,
+    pub execution_controls: Option<ExecutionControls>,
+    pub maximum_automatic_attempts: Option<i32>,
+    pub retry_attempt_seconds: Option<i64>,
+}
+
+impl RemediationConfigurationEntry {
+    /// The remediation configuration `requested` creates, carrying the id and ARN
+    /// Config assigned it.
+    pub fn new(id: String, arn: String, requested: &RemediationConfiguration) -> Self {
+        let mut entry = Self {
+            config_rule_name: requested.config_rule_name.trim().to_string(),
+            id,
+            arn,
+            ..Self::default()
+        };
+        entry.update_from(requested);
+        entry
+    }
+
+    /// Apply `requested` to a remediation configuration that already exists, which
+    /// keeps the id and ARN minted when it was created.
+    pub fn update_from(&mut self, requested: &RemediationConfiguration) {
+        self.target_type = requested.target_type.clone();
+        self.target_id = requested.target_id.clone();
+        self.target_version = requested.target_version.clone();
+        self.parameters = requested
+            .parameters
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        self.resource_type = requested.resource_type.clone();
+        self.automatic = requested.automatic;
+        self.execution_controls = requested.execution_controls.clone();
+        // Both retry members govern AUTO-remediation, so Config's documented defaults
+        // apply to a configuration that remediates automatically; a manual
+        // configuration carries only what the request named.
+        self.maximum_automatic_attempts = requested
+            .maximum_automatic_attempts
+            .or_else(|| requested.automatic.then_some(DEFAULT_MAXIMUM_AUTOMATIC_ATTEMPTS));
+        self.retry_attempt_seconds = requested
+            .retry_attempt_seconds
+            .or_else(|| requested.automatic.then_some(DEFAULT_RETRY_ATTEMPT_SECONDS));
+    }
+
+    /// The modelled `RemediationConfiguration`, read back out of state.
+    ///
+    /// `CreatedByService` is reported ABSENT: it names the service that owns a
+    /// service-linked rule, and `PutRemediationConfigurations` "does not support
+    /// adding remediation configurations for service-linked Config Rules", so a
+    /// configuration created through that API belongs to the account, not a service.
+    pub fn to_shape(&self) -> RemediationConfiguration {
+        RemediationConfiguration {
+            config_rule_name: self.config_rule_name.clone(),
+            target_type: self.target_type.clone(),
+            target_id: self.target_id.clone(),
+            target_version: self.target_version.clone(),
+            parameters: if self.parameters.is_empty() {
+                None
+            } else {
+                Some(
+                    self.parameters
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect(),
+                )
+            },
+            resource_type: self.resource_type.clone(),
+            automatic: self.automatic,
+            execution_controls: self.execution_controls.clone(),
+            maximum_automatic_attempts: self.maximum_automatic_attempts,
+            retry_attempt_seconds: self.retry_attempt_seconds,
+            arn: Some(self.arn.clone()),
+            created_by_service: None,
+        }
+    }
+}
+
 /// One resource Config has discovered, as its configuration recorder captured it.
 ///
 /// A discovered resource SURVIVES its own deletion in Config's inventory —
@@ -839,6 +986,38 @@ impl ConfigurationAggregatorEntry {
     }
 }
 
+/// One persisted aggregation authorization.
+///
+/// An authorization is identified by the PAIR it authorizes — the aggregator account
+/// and the aggregator Region (`AggregationAuthorization`: "the authorizations granted
+/// to aggregator accounts and regions") — which is also what its ARN carries, so the
+/// pair is the key [`ComAmazonawsConfigserviceStarlingdoveserviceState::aggregation_authorizations`]
+/// holds it under.
+#[derive(Debug, Clone)]
+pub struct AggregationAuthorizationEntry {
+    pub authorized_account_id: String,
+    pub authorized_aws_region: String,
+    pub arn: String,
+    pub created_at: SystemTime,
+    /// Tags are taken at creation and not updated afterwards
+    /// (`PutAggregationAuthorization`: "Tags are added at creation and cannot be
+    /// updated with this operation ... tags will not be updated, even if they are
+    /// different. Use TagResource and UntagResource to update tags after creation").
+    pub tags: Vec<Tag>,
+}
+
+impl AggregationAuthorizationEntry {
+    /// The modelled `AggregationAuthorization`, read back out of state.
+    pub fn to_shape(&self) -> AggregationAuthorization {
+        AggregationAuthorization {
+            aggregation_authorization_arn: Some(self.arn.clone()),
+            authorized_account_id: Some(self.authorized_account_id.clone()),
+            authorized_aws_region: Some(self.authorized_aws_region.clone()),
+            creation_time: Some(timestamp(self.created_at)),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-configservice-starlingdoveservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
@@ -854,6 +1033,12 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Config rules, keyed by `ConfigRuleName`. A `BTreeMap` so `DescribeConfigRules`
     /// pages over a stable ordering and a page token survives inserts and deletes.
     pub config_rules: BTreeMap<String, ConfigRuleEntry>,
+    /// Remediation configurations, keyed by the `ConfigRuleName` they remediate —
+    /// Config holds at most one per rule.
+    pub remediation_configurations: BTreeMap<String, RemediationConfigurationEntry>,
+    /// Source of the next remediation configuration id, so every remediation
+    /// configuration Config creates here gets a distinct one.
+    pub next_remediation_configuration_seq: u64,
     /// Source of the next `ConfigRuleId` suffix, so every rule gets a distinct id.
     pub next_rule_seq: u64,
     /// Source of the next configuration recorder id, so every recorder Config
@@ -893,6 +1078,11 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Source of the next configuration aggregator id, so every aggregator gets a
     /// distinct one.
     pub next_aggregator_seq: u64,
+    /// Aggregation authorizations, keyed by
+    /// [`aggregation_authorization_key`]. A `BTreeMap` so
+    /// `DescribeAggregationAuthorizations` pages over a stable ordering and a page
+    /// token survives authorizations granted and deleted between pages.
+    pub aggregation_authorizations: BTreeMap<String, AggregationAuthorizationEntry>,
 }
 
 impl ComAmazonawsConfigserviceStarlingdoveserviceState {
@@ -1023,9 +1213,138 @@ pub fn mint_configuration_aggregator_id(seq: u64) -> String {
     format!("{AGGREGATOR_ARN_RESOURCE_TYPE}-{}", base36(splitmix64(seq), 8))
 }
 
+/// The ARN resource type of an aggregation authorization, as Config spells it in the
+/// ARNs it mints: an aggregation authorization's ARN is
+/// `arn:aws:config:<region>:<account>:aggregation-authorization/`
+/// `<authorizedAccountId>/<authorizedAwsRegion>` (the AWS Config resource ARN format
+/// for `AggregationAuthorization`).
+pub const AGGREGATION_AUTHORIZATION_ARN_RESOURCE_TYPE: &str = "aggregation-authorization";
+
+/// The ARN of the aggregation authorization granted to `authorized_account_id` in
+/// `authorized_aws_region`, held by the account and Region the request was signed for.
+///
+/// The authorized pair is what identifies the authorization, so it is what the ARN
+/// carries: nothing is minted, and the same pair always names the same ARN.
+pub fn aggregation_authorization_arn(
+    region: &str,
+    authorized_account_id: &str,
+    authorized_aws_region: &str,
+) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!(
+            "{AGGREGATION_AUTHORIZATION_ARN_RESOURCE_TYPE}/{authorized_account_id}/\
+             {authorized_aws_region}"
+        ),
+    )
+}
+
+/// The key one aggregation authorization is held under: the authorized account id and
+/// the authorized Region, in that order, so `DescribeAggregationAuthorizations` pages
+/// by account and then by Region. `AccountId`'s `^\d{12}$` pattern leaves no room for
+/// the separator in the account id, so distinct pairs give distinct keys.
+pub fn aggregation_authorization_key(
+    authorized_account_id: &str,
+    authorized_aws_region: &str,
+) -> String {
+    format!("{authorized_account_id}/{authorized_aws_region}")
+}
+
 /// The ARN of a Config rule: `arn:aws:config:<region>:<account>:config-rule/<id>`.
 pub fn config_rule_arn(region: &str, rule_id: &str) -> String {
     ::emulator_server::emulator_arn(ARN_SERVICE, region, &format!("config-rule/{rule_id}"))
+}
+
+/// The ARN resource type of a remediation configuration, as Config spells it in the
+/// ARNs it mints.
+pub const REMEDIATION_CONFIGURATION_ARN_RESOURCE_TYPE: &str = "remediation-configuration";
+
+/// The ARN of a remediation configuration:
+/// `arn:aws:config:<region>:<account>:remediation-configuration/<rule-name>/<id>`.
+/// Both the remediated rule's name and the id Config assigned the configuration are
+/// part of the ARN.
+pub fn remediation_configuration_arn(region: &str, config_rule_name: &str, id: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{REMEDIATION_CONFIGURATION_ARN_RESOURCE_TYPE}/{config_rule_name}/{id}"),
+    )
+}
+
+/// The id Config assigns the `seq`-th remediation configuration created in this
+/// emulator: sixteen base-36 characters, minted the same opaque way a configuration
+/// recorder id is (see [`mint_recorder_id`]).
+pub fn mint_remediation_configuration_id(seq: u64) -> String {
+    base36(splitmix64(seq ^ 0x5245_4d45_4449_4154), 16)
+}
+
+/// Whether `parameter` carries a value at all: a static value with at least one
+/// non-blank entry, or a dynamic (resource) value.
+fn parameter_carries_value(parameter: &RemediationParameterValue) -> bool {
+    parameter
+        .static_value
+        .as_ref()
+        .is_some_and(|static_value| {
+            static_value
+                .values
+                .iter()
+                .any(|value| !value.trim().is_empty())
+        })
+        || parameter
+            .resource_value
+            .as_ref()
+            .is_some_and(|resource_value| !resource_value.value.trim().is_empty())
+}
+
+/// The `Parameters` keys that can carry the role a remediation runs as: an AUTOMATIC
+/// configuration remediates only through [`AUTOMATION_ASSUME_ROLE_PARAMETER`] ("the
+/// only valid assumeRole field value is AutomationAssumeRole"), a MANUAL one through
+/// either key, as the SSM document's own parameter names decide.
+pub fn assume_role_parameter_names(automatic: bool) -> &'static [&'static str] {
+    if automatic {
+        &[AUTOMATION_ASSUME_ROLE_PARAMETER]
+    } else {
+        &[AUTOMATION_ASSUME_ROLE_PARAMETER, ASSUME_ROLE_PARAMETER]
+    }
+}
+
+/// Whether `requested` provides the role Config assumes to remediate a resource,
+/// under one of the keys [`assume_role_parameter_names`] accepts for it. Every
+/// remediation configuration needs one: it is what the remediation runs as.
+pub fn has_assume_role(requested: &RemediationConfiguration) -> bool {
+    let Some(parameters) = requested.parameters.as_ref() else {
+        return false;
+    };
+    assume_role_parameter_names(requested.automatic)
+        .iter()
+        .any(|name| parameters.get(*name).is_some_and(parameter_carries_value))
+}
+
+/// The name of a parameter of `requested` that does not select exactly ONE kind of
+/// value, with what is wrong with it.
+///
+/// `RemediationParameterValue` is "either a dynamic (resource) value or a static
+/// value. You must select either a dynamic value or a static value" — so a parameter
+/// that selects both, or neither, is not a value Config can resolve at remediation
+/// time. The modelled `Parameters` map is a `HashMap`, so the names are sorted before
+/// they are visited: a request with several bad parameters is then always refused for
+/// the same one.
+pub fn ill_formed_parameter(requested: &RemediationConfiguration) -> Option<(String, &'static str)> {
+    let parameters = requested.parameters.as_ref()?;
+    let mut names: Vec<&String> = parameters.keys().collect();
+    names.sort();
+    names.into_iter().find_map(|name| {
+        let parameter = parameters.get(name)?;
+        match (
+            parameter.static_value.is_some(),
+            parameter.resource_value.is_some(),
+        ) {
+            (true, true) => Some((name.clone(), "both a StaticValue and a ResourceValue")),
+            (false, false) => Some((name.clone(), "neither a StaticValue nor a ResourceValue")),
+            _ => None,
+        }
+    })
 }
 
 /// The `ConfigRuleId` for the `seq`-th rule created in this emulator:
@@ -1251,6 +1570,27 @@ pub fn no_such_config_rule_message(name: &str) -> String {
         "The ConfigRule '{name}' provided in the request is invalid. Please check the \
          configRule name."
     )
+}
+
+/// How Config words `NoSuchRemediationConfigurationException` for a request naming a
+/// Config rule that holds no remediation configuration — none at all, or none for the
+/// `resource_type` the request named.
+///
+/// The message is BUILT FROM THE REQUEST — it quotes the `ConfigRuleName` the caller
+/// sent, and the `ResourceType` when the caller named one, so the two refusals are
+/// told apart — for the case the modelled error documents ("You specified an Config
+/// rule without a remediation configuration").
+pub fn no_such_remediation_configuration_message(
+    name: &str,
+    resource_type: Option<&str>,
+) -> String {
+    match resource_type {
+        None => format!("No RemediationConfiguration for rule '{name}' exists."),
+        Some(resource_type) => format!(
+            "No RemediationConfiguration for rule '{name}' and resource type \
+             '{resource_type}' exists."
+        ),
+    }
 }
 
 /// How Config words `NoSuchRetentionConfigurationException` for a request that named

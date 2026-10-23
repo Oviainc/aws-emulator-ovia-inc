@@ -467,22 +467,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this — because an instance whose cluster does not exist is a record no later
         // describe, failover or delete could agree with.
         //
-        // This service holds NO DB cluster records: every operation that could create one
-        // — `CreateDBCluster`, `RestoreDBClusterFromSnapshot`,
-        // `RestoreDBClusterToPointInTime` — is still a scaffolded 501 (their own stub
-        // issues), so nothing can have created a cluster here and no identifier resolves
-        // to one. When one of those operations stores a cluster, this is the lookup that
-        // admits a member of it.
-        if let Some(cluster) = &input.db_cluster_identifier {
-            return Err(CreateDBInstanceErrorModeled::DBClusterNotFoundFault(
-                DBClusterNotFoundFault {
-                    message: Some(format!(
-                        "The source cluster could not be found or cannot be accessed: {cluster}"
-                    )),
-                },
-            )
-            .into());
-        }
+        // `CreateDBCluster` stores DB clusters in this same store, so the identifier is
+        // resolved against it and the instance joins the cluster it names: the cluster's
+        // own `DBClusterMembers` is read back from the instances that name it, so this
+        // reference is the only place the membership is recorded. The resolved cluster's
+        // identifier is what gets stored, not the request's spelling of it, so the two
+        // records agree whatever case the request used.
+        let db_cluster_identifier = match &input.db_cluster_identifier {
+            None => None,
+            Some(named) => match store.resolve_db_cluster(&region, named) {
+                Some(cluster) => Some(cluster.identifier.clone()),
+                None => {
+                    return Err(CreateDBInstanceErrorModeled::DBClusterNotFoundFault(
+                        DBClusterNotFoundFault {
+                            message: Some(format!(
+                                "The source cluster could not be found or cannot be \
+                                 accessed: {named}"
+                            )),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
         // The region's DB instance quota, and the number of regions this store keeps
         // records for at all: a store that grows without bound is not what the real
         // service does, and the modelled fault says exactly this.
@@ -601,7 +608,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             option_group_name,
             vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
             db_security_group_names: input.db_security_groups.unwrap_or_default(),
-            db_cluster_identifier: input.db_cluster_identifier,
+            db_cluster_identifier,
             domain: input.domain,
             ca_certificate_identifier: input.ca_certificate_identifier.unwrap_or_else(|| {
                 // No `CACertificateIdentifier`: the instance is created under the CA that

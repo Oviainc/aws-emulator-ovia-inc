@@ -45,6 +45,8 @@ mod host_keys;
 mod input_validation;
 #[path = "all/not_found_errors.rs"]
 mod not_found_errors;
+#[path = "all/profile_deletion.rs"]
+mod profile_deletion;
 #[path = "all/profile_lifecycle.rs"]
 mod profile_lifecycle;
 #[path = "all/resource_resolution_refusals.rs"]

@@ -206,14 +206,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Returns information about a specific serverless cache. If no
         // identifier is specified, then the API returns information on all the
         // serverless caches belonging to this Amazon Web Services account."
-        // Pagination does not apply to a single-resource lookup.
+        // Pagination does not apply to a single-resource lookup. The name "is
+        // stored as a lowercase string", so the lookup folds the request's case
+        // the same way the store does.
         if let Some(requested) = input.serverless_cache_name.as_deref() {
             let key = requested.to_ascii_lowercase();
             let Some(cache) = store.serverless_caches.get(&key) else {
+                // The fault names the serverless cache the request asked for,
+                // which is the only thing the service knows about a cache that
+                // does not exist: "Serverless cache with name <name> not
+                // found."
                 return Err(
                     DescribeServerlessCachesErrorModeled::ServerlessCacheNotFoundFault(
                         ServerlessCacheNotFoundFault {
-                            message: Some(format!("Serverless cache {requested} not found.")),
+                            message: Some(format!(
+                                "Serverless cache with name {requested} not found."
+                            )),
                         },
                     )
                     .into(),

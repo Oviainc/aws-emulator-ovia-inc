@@ -87,7 +87,10 @@ fn statement_id(statement: &Value) -> String {
 
 /// Whether `value` has the lowercase hyphenated uuid shape a minted `statementId`
 /// carries: five hex groups of 8-4-4-4-12.
-fn is_uuid_shaped(value: &str) -> bool {
+///
+/// `pub(crate)` because the `cloudformation_templates` suite holds the minted
+/// `TemplateId` to the same shape rather than keeping a second copy of this check.
+pub(crate) fn is_uuid_shaped(value: &str) -> bool {
     let groups: Vec<&str> = value.split('-').collect();
     groups.len() == 5
         && groups

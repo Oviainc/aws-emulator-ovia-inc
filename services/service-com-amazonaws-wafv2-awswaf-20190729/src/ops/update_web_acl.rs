@@ -303,12 +303,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::validate_statement_nesting(input.rules.as_deref().unwrap_or_default())
         {
             return Err(UpdateWebACLErrorModeled::WAFInvalidParameterException(
-                WAFInvalidParameterException {
-                    message: Some(reason.clone()),
-                    field: Some("STATEMENT".to_string()),
-                    parameter: Some("Rules".to_string()),
-                    reason: Some(reason),
-                },
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_STATEMENT,
+                    "Rules",
+                    &reason,
+                ),
             )
             .into());
         }

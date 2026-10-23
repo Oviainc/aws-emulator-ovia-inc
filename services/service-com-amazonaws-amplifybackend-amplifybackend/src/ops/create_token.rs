@@ -13,12 +13,13 @@
 //! so it is minted by the emulator's credential store
 //! ([`crate::state::mint_challenge_token`]) and never constructed here.
 //!
-//! The DECOUPLING from `CreateBackend` is deliberate, and it is why this operation never
-//! answers the modelled `NotFoundException`: an Admin UI challenge is minted for an
-//! Amplify APP, which lives in the Amplify service, while this service's `apps` map holds
-//! only the apps `CreateBackend` created a backend for. Refusing an app id absent from
-//! that map would refuse a token AWS mints. `NotFoundException` belongs to the operations
-//! that address a token that must already exist — `GetToken` and `DeleteToken`.
+//! The app itself must EXIST, though: an Admin UI challenge is minted for an Amplify
+//! APP, so an `AppId` that identifies no registered Amplify app — one Amplify's
+//! `CreateApp` minted, or one this service holds a backend for — is refused with HTTP 400
+//! `ValidationException` ([`crate::state::require_registered_app`]) and nothing is minted
+//! or stored. What this operation never answers is the modelled `NotFoundException`: that
+//! belongs to the operations addressing a token that must already exist — `GetToken` and
+//! `DeleteToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -168,6 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Err(bad_request) = crate::state::bound_identifier("appId", &input.app_id) {
             return Err(CreateTokenErrorModeled::BadRequestException(bad_request).into());
         }
+
+        // The app-identity gate, BEFORE anything is minted or stored: a challenge token
+        // authenticates into an APP, so an app id that identifies no registered Amplify
+        // app is a client-input error (400 `ValidationException`) and no token exists
+        // for it to carry.
+        crate::state::require_registered_app(&*self.engine, &input.app_id)?;
 
         // Minted by the emulator's credential store, outside the store lock: a service
         // never constructs secret material itself.

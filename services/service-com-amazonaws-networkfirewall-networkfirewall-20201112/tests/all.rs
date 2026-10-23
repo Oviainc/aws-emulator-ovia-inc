@@ -15,5 +15,7 @@
 mod firewall_lifecycle;
 #[path = "all/rule_group_lifecycle.rs"]
 mod rule_group_lifecycle;
+#[path = "all/rule_group_mutations.rs"]
+mod rule_group_mutations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

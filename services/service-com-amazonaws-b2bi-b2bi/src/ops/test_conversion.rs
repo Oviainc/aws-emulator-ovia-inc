@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TestConversion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TestConversion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! SCAFFOLDED, NOT IMPLEMENTED: the X12 EDI string this operation answers with is NOT
+//! produced — serialising a B2Bi-shaped document into an X12 interchange needs the X12
+//! segment and element dictionaries for every transaction set and version, which this
+//! emulator does not carry, so a request this handler accepts gets HTTP 501 rather than
+//! a fabricated interchange. What IS implemented is the refusal path: a `source` whose
+//! `fileContent` is not the `fileFormat` it was declared as is answered with the
+//! modelled `ValidationException` (400). Delete the marker line above once the
+//! conversion itself produces a real interchange.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TestConversion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deliberately NOT done here: validating that `target` coheres (that its conversion
+//! details suit the transaction set and version it names). That check belongs to the
+//! conversion this handler does not perform — only the X12 dictionaries it lacks could
+//! say what coheres — so a request whose `target` is unsupported reaches the same 501
+//! rather than a modelled refusal. `target.fileFormat` itself is a modelled enum
+//! (`ConversionTargetFormat`), so the boundary validator has already refused any value
+//! outside it before this handler runs.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +133,11 @@ impl From<TestConversionErrorModeled> for TestConversionError {
     }
 }
 
+/// Refuse the request with the modelled `ValidationException` (HTTP 400).
+fn invalid(message: String) -> TestConversionError {
+    TestConversionErrorModeled::ValidationException(ValidationException { message }).into()
+}
+
 /// The `TestConversion` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,18 +174,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TestConversion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TestConversionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
+        // A stateless test harness: it converts the document it is handed and reads
+        // nothing out of this service's store.
+        let _ = (ctx, &self.engine);
+        use crate::state::documents;
+
+        let InputFileSource::fileContent(content) = &input.source.input_file;
+
+        // The source document must BE the format the request says it is: this is the
+        // only thing the caller declares that the service can check against the bytes,
+        // and content that does not parse cannot be converted into anything.
+        match input.source.file_format.as_str() {
+            documents::JSON => {
+                documents::parse_json(content).map_err(|failure| {
+                    invalid(format!(
+                        "source.inputFile.fileContent is declared as {} but is not valid JSON: {}",
+                        documents::JSON, failure
+                    ))
+                })?;
+            }
+            documents::XML => {
+                documents::check_xml(content).map_err(|failure| {
+                    invalid(format!(
+                        "source.inputFile.fileContent is declared as {} but is not well-formed \
+                         XML: {}",
+                        documents::XML, failure
+                    ))
+                })?;
+            }
+            other => {
+                // `ConversionSourceFormat` is `JSON | XML`, so the boundary validator
+                // has already refused anything else; a value reaching here would be a
+                // format this handler cannot read.
+                return Err(invalid(format!(
+                    "source.fileFormat: {other} is not a source document format this service \
+                     can read"
+                )));
+            }
+        }
+
+        // The document parses, so the request is well formed — and the conversion it
+        // asks for is the part this emulator cannot perform faithfully. Answering 501
+        // here (rather than an invented `convertedFileContent`) keeps the difference
+        // between "your request is wrong" and "this emulator has not written this yet"
+        // visible to the caller.
         Err(crate::scaffolded::Scaffolded::not_implemented("TestConversion"))
     }
 }

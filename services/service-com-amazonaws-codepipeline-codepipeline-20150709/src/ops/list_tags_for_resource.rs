@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tag set of the resource an ARN names, computed from the shared store:
+//! the tags a pipeline, a custom action type or a webhook carries, whether
+//! `CreatePipeline` / `CreateCustomActionType` / `PutWebhook` applied them or a later
+//! `TagResource` merged them in, ordered by key. The ARN is resolved by the rule
+//! every ARN-addressed operation of this service shares ([`crate::state::tag_target`]),
+//! so a string that is not a `codepipeline` resource ARN is refused with
+//! `InvalidArnException` and a well-formed ARN naming no resource this service holds
+//! with `ResourceNotFoundException`.
+//!
+//! `nextToken` documents that "the `ListTagsforResource` call lists all available
+//! tags in one call and does not use pagination", and that is what a plain call does
+//! here: a resource holds at most [`crate::state::MAX_TAGS_PER_RESOURCE`] (50) tags,
+//! below `MaxResults`' modelled maximum of 100, so an unpaged call always returns the
+//! whole set. A caller that asks for a SMALLER `maxResults` is still answered
+//! honestly — the page it asked for, plus the opaque cursor the next one resumes at
+//! (`crate::state::encode_page_token`), which is the same cursor rule the service's
+//! other listings use.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +126,31 @@ impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     }
 }
 
+/// The largest page this listing serves, and the page size a request naming no
+/// `maxResults` gets: the maximum the model allows for that member (`MaxResults`,
+/// `@range(min: 1, max: 100)`). A resource holds at most
+/// [`crate::state::MAX_TAGS_PER_RESOURCE`] tags, so a call that names no
+/// `maxResults` returns every tag in one page.
+const MAX_TAGS_PER_PAGE: usize = 100;
+
+/// How this operation refuses an ARN it cannot resolve to a stored resource: each
+/// [`crate::state::TagTargetProblem`] maps to the error the model declares for it,
+/// carrying the message the shared resolver built from the request.
+fn arn_error(problem: &crate::state::TagTargetProblem) -> ListTagsForResourceError {
+    let message = Some(problem.message().to_string());
+    match problem {
+        crate::state::TagTargetProblem::InvalidArn(_) => {
+            ListTagsForResourceErrorModeled::InvalidArnException(InvalidArnException { message })
+        }
+        crate::state::TagTargetProblem::NotFound(_) => {
+            ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message,
+            })
+        }
+    }
+    .into()
+}
+
 /// The `ListTagsForResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +187,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let state = crate::state::require_state(&*self.engine)?;
+        let store = state.lock();
+
+        // The resource is resolved by the rule every ARN-addressed operation of this
+        // service shares, reached here through `resource_tags`.
+        let tags = store
+            .resource_tags(&input.resource_arn)
+            .map_err(|problem| arn_error(&problem))?;
+
+        // Where this page starts: the first tag key at or after the one the caller's
+        // cursor names (the cursor rule `state::encode_page_token` documents), else
+        // the resource's first tag key.
+        let start = match input.next_token.as_deref() {
+            None => ::std::ops::Bound::Unbounded,
+            Some(token) => {
+                let key = crate::state::decode_page_token(crate::state::CURSOR_TAG, token)
+                    .ok_or_else(|| {
+                        ListTagsForResourceError::from(
+                            ListTagsForResourceErrorModeled::InvalidNextTokenException(
+                                InvalidNextTokenException {
+                                    message: Some(
+                                        "nextToken was not issued by ListTagsForResource"
+                                            .to_string(),
+                                    ),
+                                },
+                            ),
+                        )
+                    })?;
+                ::std::ops::Bound::Included(key)
+            }
+        };
+
+        // `MaxResults` is modelled `@range(min: 1, max: 100)`, so the boundary
+        // validator is what refuses an out-of-range request before this handler runs;
+        // the clamp keeps the page bound local to the growth site, so the vector
+        // below cannot exceed it whatever reaches here.
+        let limit = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(MAX_TAGS_PER_PAGE)
+            .clamp(1, MAX_TAGS_PER_PAGE);
+
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for (key, value) in tags.range((start, ::std::ops::Bound::Unbounded)) {
+            if page.len() == limit {
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::CURSOR_TAG,
+                    key,
+                ));
+                break;
+            }
+            page.push(Tag {
+                key: key.clone(),
+                value: value.clone(),
+            });
+        }
+
+        Ok(ListTagsForResourceOutput {
+            tags: Some(page),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the lineage edge `SourceArn` -> `DestinationArn` from
+//! `crate::state`, so a later `AddAssociation` of the same pair files a fresh edge, and
+//! refuses a pair no association was added for with the modelled `ResourceNotFound`. This
+//! is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The SCAFFOLDED marker line this file used to carry is gone, because the stub census
+//! (the grep over those lines) must not count this operation as unwritten any more.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +142,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAssociation"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // An association is identified by its `(SourceArn, DestinationArn)` pair and by
+        // nothing else, so the delete addresses the store by that pair. A pair no
+        // association was added for is refused with the modelled not-found failure rather
+        // than answered 200: a caller cannot tell a 200 for a deleted edge from a 200 for
+        // an edge that never existed.
+        let key = (input.source_arn.clone(), input.destination_arn.clone());
+
+        let mut store = state.lock();
+        if store.associations.remove(&key).is_none() {
+            return Err(DeleteAssociationErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Could not find an association from \"{}\" to \"{}\".",
+                    input.source_arn, input.destination_arn
+                )),
+            })
+            .into());
+        }
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &input.destination_arn, ctx);
+        Ok(DeleteAssociationOutput {
+            source_arn: Some(input.source_arn),
+            destination_arn: Some(input.destination_arn),
+        })
     }
 }

@@ -182,10 +182,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let Some(group) = store.log_groups.get_mut(&input.log_group_name) else {
-            return Err(not_found("The specified log group does not exist"));
+            return Err(not_found("The specified log group does not exist."));
         };
         let Some(stream) = group.streams.remove(&input.log_stream_name) else {
-            return Err(not_found("The specified log stream does not exist"));
+            return Err(not_found("The specified log stream does not exist."));
         };
 
         // "permanently deletes all the archived log events associated with the log

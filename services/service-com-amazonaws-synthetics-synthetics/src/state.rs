@@ -11,7 +11,7 @@
 //! ([`StoredCanary::to_canary`]); no handler builds a `Canary` from its own request.
 
 use std::collections::hash_map::RandomState;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasher as _, Hasher as _};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -205,9 +205,13 @@ pub const CANARY_NOT_FOUND: &str = "Canary not found.";
 /// was not found and never the identifier the request asked for.
 pub const DRY_RUN_NOT_FOUND: &str = "Dry run not found.";
 
-/// `ResourceNotFoundException$Message` for a group that does not exist, by the same rule
-/// as [`CANARY_NOT_FOUND`]: the sentence names the resource KIND and never the
-/// `GroupIdentifier` the request asked for.
+/// `ResourceNotFoundException$Message` for a group that does not exist, as every group
+/// READER words it: the sentence names the resource KIND and never the `GroupIdentifier`
+/// the request asked for.
+///
+/// `AssociateResource` is the one group operation whose wording is KNOWN rather than
+/// chosen — see [`group_not_found`] — and it words the same miss differently, which is why
+/// this is a per-operation choice and not one service-wide constant.
 pub const GROUP_NOT_FOUND: &str = "Group not found.";
 
 /// The most groups this store holds, which is also the real service's quota: "You can have
@@ -233,6 +237,28 @@ pub const MAX_CANARIES: usize = 100;
 /// retention of days is no bound at all on a loop that runs for seconds, so the oldest
 /// runs beyond this many are dropped as well.
 pub const MAX_RETAINED_RUNS_PER_CANARY: usize = 100;
+
+/// `AssociateResource`'s `ResourceNotFoundException$Message` for a group that does not
+/// exist.
+///
+/// Unlike the group readers' [`GROUP_NOT_FOUND`], this wording is not chosen: the recorded
+/// service answers an `AssociateResource` whose `GroupIdentifier` it cannot resolve with
+/// `Group does not exist: <the identifier as supplied>`, naming the value in whichever of
+/// its three forms (name, ARN or id) the caller used. So for that operation the rule is the
+/// sentence plus the echoed identifier, and nothing else about the group is reported.
+pub fn group_not_found(identifier: &str) -> String {
+    format!("Group does not exist: {identifier}")
+}
+
+/// The most canaries one group can contain.
+///
+/// `CreateGroup`: "Each group can contain as many as 10 canaries."
+pub const MAX_CANARIES_PER_GROUP: usize = 10;
+
+/// The most groups one canary can be a member of.
+///
+/// `CreateGroup`: "Any single canary can be a member of up to 10 groups."
+pub const MAX_GROUPS_PER_CANARY: usize = 10;
 
 /// Seconds in the day the retention periods are counted in.
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
@@ -610,7 +636,8 @@ impl StoredCanary {
     }
 }
 
-/// One group, as this emulator persists it. Every reported field is read from here.
+/// One group, as this emulator persists it, and the canaries associated with it. Every
+/// reported field is read from here.
 ///
 /// A group is a plain container: the model gives it an id, a name, an ARN, tags and the
 /// two timestamps, and no status — `CreateGroup` returns it ready, so there is no
@@ -626,6 +653,14 @@ pub struct StoredGroup {
     pub created: SystemTime,
     pub last_modified: SystemTime,
     pub tags: BTreeMap<String, String>,
+    /// The ARNs of the canaries associated with this group, which `AssociateResource`
+    /// writes and `ListGroupResources` reports.
+    ///
+    /// A SET, because a canary is either a member or it is not — associating one twice
+    /// cannot make it a member twice — and an ordered one, because `ListGroupResources`
+    /// pages over this collection and a tokenised page boundary needs a total, stable
+    /// order.
+    pub resources: BTreeSet<String>,
 }
 
 impl StoredGroup {
@@ -663,8 +698,8 @@ pub struct ComAmazonawsSyntheticsSyntheticsState {
     pub canaries: BTreeMap<String, StoredCanary>,
     /// Groups by name. "The names for all groups in your account, across all Regions,
     /// must be unique" (`CreateGroupRequest$Name`), so the name is a key; a [`BTreeMap`]
-    /// because `ListGroups` pages over this collection and a tokenised page boundary
-    /// needs a total, stable order.
+    /// because `ListGroups` and `ListGroupResources` page over this collection and a
+    /// tokenised page boundary needs a total, stable order.
     pub groups: BTreeMap<String, StoredGroup>,
 }
 
@@ -699,6 +734,41 @@ impl ComAmazonawsSyntheticsSyntheticsState {
         self.groups
             .values()
             .find(|group| group.id == identifier)
+    }
+
+    /// The key in [`Self::groups`] a `GroupIdentifier` names, for a caller that has to
+    /// reach the record MUTABLY. One resolution rule, [`Self::group_by_identifier`]'s, so a
+    /// write cannot address a different group than a read.
+    pub fn group_key(&self, identifier: &str) -> Option<String> {
+        self.group_by_identifier(identifier)
+            .map(|group| group.name.clone())
+    }
+
+    /// The canary a `CanaryArn` names, if this store holds it.
+    ///
+    /// Keyed off the stored record's own ARN, which spells the Region the canary was
+    /// created in — so an ARN naming another Region, or another account, matches nothing.
+    /// That is also how `AssociateResource`'s "You must run this operation in the Region
+    /// where the canary exists" falls out: a canary that does not exist here is reported
+    /// as not found.
+    pub fn canary_by_arn(&self, arn: &str) -> Option<&StoredCanary> {
+        self.canaries.values().find(|canary| canary.arn() == arn)
+    }
+
+    /// How many groups the canary at `resource_arn` is currently a member of.
+    pub fn membership_count(&self, resource_arn: &str) -> usize {
+        self.groups
+            .values()
+            .filter(|group| group.resources.contains(resource_arn))
+            .count()
+    }
+
+    /// Drop `resource_arn` from every group that holds it, because the resource itself is
+    /// gone: an association can only name a canary that exists.
+    pub fn forget_resource(&mut self, resource_arn: &str) {
+        for group in self.groups.values_mut() {
+            group.resources.remove(resource_arn);
+        }
     }
 }
 

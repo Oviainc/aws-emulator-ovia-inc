@@ -200,6 +200,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Resource-scoped: the policy is the one attached to the log group the ARN
             // names, and the revision guard serializes concurrent deletes of it.
             Some(resource_arn) => {
+                // A value that is not an ARN at all is refused with the service's
+                // validation-error message naming the member and the value it could not
+                // parse; the kind check below answers a well-formed ARN of the wrong
+                // kind.
+                if let Some(message) =
+                    crate::state::unparsable_arn_message("resourceArn", resource_arn)
+                {
+                    return Err(invalid(&message));
+                }
                 if !crate::state::is_log_group_arn(resource_arn) {
                     return Err(invalid(
                         "resourceArn must be the ARN of a CloudWatch Logs log group",
@@ -208,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let group_name =
                     crate::state::log_group_name_from_identifier(resource_arn).to_string();
                 let Some(group) = store.log_groups.get_mut(&group_name) else {
-                    return Err(not_found("The specified log group does not exist"));
+                    return Err(not_found("The specified log group does not exist."));
                 };
                 let Some(policy) = group.resource_policy.as_ref() else {
                     return Err(not_found(
@@ -222,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_deref()
                     .is_some_and(|name| name != policy.policy_name)
                 {
-                    return Err(not_found("The specified resource policy does not exist"));
+                    return Err(not_found("The specified resource policy does not exist."));
                 }
                 // "Required when deleting a resource-scoped policy to prevent concurrent
                 // modifications."
@@ -267,7 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .remove(policy_name)
                     .is_none()
                 {
-                    return Err(not_found("The specified resource policy does not exist"));
+                    return Err(not_found("The specified resource policy does not exist."));
                 }
             }
         }

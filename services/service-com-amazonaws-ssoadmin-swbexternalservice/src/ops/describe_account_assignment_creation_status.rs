@@ -2,7 +2,11 @@
 
 //! @op DescribeAccountAssignmentCreationStatus
 //! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAccountAssignmentCreationStatus`'s real behaviour. Implement it here — this is
+//! asserts NOTHING about `DescribeAccountAssignmentCreationStatus`'s real behaviour —
+//! EXCEPT on an account instance of IAM Identity Center, where account assignments do
+//! not exist at all and the handler answers the modelled `ValidationException` (400)
+//! that AWS refuses the whole permission-set / account-assignment surface with.
+//! Implement the rest here — this is
 //! the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
@@ -155,9 +159,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
+        let _ = ctx;
+        // ONE answer of this operation is real: the ACCOUNT-INSTANCE restriction. Account
+        // assignments are a feature of an organization instance, so on an account
+        // instance no assignment operation can ever have run and AWS refuses this call
+        // with the modelled `ValidationException` (400) — a 501 would claim "nobody has
+        // written this yet" about a request that is permanently refused. Everything else
+        // about `DescribeAccountAssignmentCreationStatus` IS still unwritten, so it keeps
+        // the SCAFFOLDED marker and its 501 below.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAccountAssignmentCreationStatusErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        if state
+            .lock()
+            .permission_set_surface_withdrawn(&input.instance_arn)
+        {
+            return Err(
+                DescribeAccountAssignmentCreationStatusErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                        ),
+                        // The model's `ValidationExceptionReason` enum carries only KMS
+                        // key states, none of which this refusal is.
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
         // Implement `DescribeAccountAssignmentCreationStatus` here, then delete the SCAFFOLDED marker at the top of
         // this file. Return modeled failures as
         // `Err(DescribeAccountAssignmentCreationStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.

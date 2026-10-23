@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListHarvestJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListHarvestJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Pages over the stored HarvestJobs in id order, rendering each from its stored record.
+//! `IncludeChannelId` and `IncludeStatus` filter BEFORE paging, so a page is `MaxResults`
+//! MATCHING jobs and the `NextToken` points at the next matching one.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListHarvestJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only: the one write it makes is through `settle_harvest_jobs`, which
+//! materialises the status transitions the clock had already made due — which is what
+//! makes an `IncludeStatus` filter reflect the status the clock left each job in.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +154,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListHarvestJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListHarvestJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListHarvestJobs"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListHarvestJobsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the mediapackage state store is unavailable".into()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+        // Reporting only: this materialises the status transitions the clock had already
+        // made due, so the status each entry reports — and the `IncludeStatus` filter
+        // applied to it — is the one the clock decided, not one this call moved.
+        state.settle_harvest_jobs(std::time::SystemTime::now());
+
+        // An opaque token this service did not issue is refused rather than silently
+        // served as page one, which would make a paging client loop over page one.
+        let start = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(crate::state::invalid_page_token)?,
+            ),
+        };
+        let page_size = crate::state::page_size(input.max_results);
+
+        // Both filters apply BEFORE paging, so a page is `MaxResults` matching jobs and
+        // the token points at the next matching one.
+        let matching = state.harvest_jobs.values().filter(|record| {
+            input
+                .include_channel_id
+                .as_deref()
+                .is_none_or(|channel_id| record.channel_id == channel_id)
+                && input
+                    .include_status
+                    .as_deref()
+                    .is_none_or(|status| record.status == status)
+        });
+        let (keys, next_token) = crate::state::paginate(
+            matching.map(|record| record.id.as_str()),
+            start.as_deref(),
+            page_size,
+        );
+        let harvest_jobs = keys
+            .iter()
+            .filter_map(|key| state.harvest_jobs.get(*key))
+            .map(crate::state::HarvestJobRecord::to_harvest_job)
+            .collect();
+
+        Ok(ListHarvestJobsOutput {
+            harvest_jobs: Some(harvest_jobs),
+            next_token,
+        })
     }
 }

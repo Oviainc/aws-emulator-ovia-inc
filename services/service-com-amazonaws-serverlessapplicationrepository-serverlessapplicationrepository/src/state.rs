@@ -14,17 +14,22 @@
 //! paging primitives both list operations share, so the per-operation files cannot
 //! drift from each other in how they render the same stored record.
 //!
+//! A *prepared CloudFormation template* of one version lives in its own map keyed by the
+//! `TemplateId` that minted it ([`CloudFormationTemplate`]), because it is a resource with
+//! a life of its own: it is prepared from a published version and expires an hour later,
+//! and both template operations report it out of that one record.
+//!
 //! An application also carries its permission policy — the `policy_statements` list
 //! `PutApplicationPolicy` replaces and `GetApplicationPolicy` reports — so a policy is
 //! part of the application record and goes away with it. Room is still deliberately left
-//! for the operations later issues own: the state struct grows a template map for the
-//! CloudFormation template/changeset operations, which is not declared yet — the
-//! operations that would read it still answer 501.
+//! for the operations later issues own: the CloudFormation CHANGESET operations declare no
+//! state of their own here yet, and they still answer 501.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     ApplicationPolicyStatement, ApplicationSummary, BadRequestException, ConflictException,
@@ -405,6 +410,8 @@ pub enum ErrorCode {
     ApplicationAlreadyExists,
     /// The catalogue holds no application with the requested id (404).
     ApplicationNotFound,
+    /// The application carries no prepared template with the requested id (404).
+    TemplateNotFound,
     /// The application already carries the requested semantic version (409).
     VersionAlreadyExists,
     /// The application carries no such semantic version (404).
@@ -421,6 +428,7 @@ impl ErrorCode {
         match self {
             Self::ApplicationAlreadyExists => "ApplicationAlreadyExistsException",
             Self::ApplicationNotFound => "ApplicationNotFoundException",
+            Self::TemplateNotFound => "TemplateNotFoundException",
             Self::VersionAlreadyExists => "VersionAlreadyExistsException",
             Self::VersionNotFound => "VersionNotFoundException",
             Self::InvalidRequest => "InvalidRequestException",
@@ -435,7 +443,7 @@ impl ErrorCode {
     pub const fn http_status(self) -> u16 {
         match self {
             Self::ApplicationAlreadyExists | Self::VersionAlreadyExists => 409,
-            Self::ApplicationNotFound | Self::VersionNotFound => 404,
+            Self::ApplicationNotFound | Self::VersionNotFound | Self::TemplateNotFound => 404,
             Self::InvalidRequest => 400,
             Self::InternalServerError => 500,
         }
@@ -482,6 +490,14 @@ pub fn internal_server_error(message: impl Into<String>) -> InternalServerErrorE
 /// `ApplicationId` the caller asked for.
 pub fn application_not_found_message(application_id: &str) -> String {
     format!("Application with id {application_id} could not be found.")
+}
+
+/// The wording a 404 carries for a semantic version the named application does not hold,
+/// naming both members the caller asked with. Stated once here because every operation
+/// that resolves a version — GetApplication and both CloudFormation template operations —
+/// answers the same condition.
+pub fn version_not_found_message(application_id: &str, semantic_version: &str) -> String {
+    format!("Version {semantic_version} could not be found for application {application_id}.")
 }
 
 /// The documented ceiling on `Labels`: "Maximum number of labels: 10"
@@ -715,7 +731,7 @@ pub fn validate_policy_statements(
                 bounded_length("StatementId", statement_id, 1, MAX_STATEMENT_ID_LENGTH)?;
                 statement_id.to_string()
             }
-            None => new_statement_id(),
+            None => new_uuid(),
         };
         if stored.iter().any(|kept| kept.statement_id == statement_id) {
             return Err(format!(
@@ -770,12 +786,11 @@ fn is_organization_id(organization_id: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
 }
 
-/// How many statement ids this process has minted: the part of an id that makes it
-/// UNIQUE.
+/// How many ids this process has minted: the part of an id that makes it UNIQUE.
 ///
 /// A counter cannot repeat within a process, so no two ids this service hands out can
 /// collide however fast they are minted — which a clock reading alone cannot promise.
-static STATEMENT_IDS_MINTED: AtomicU64 = AtomicU64::new(0);
+static UUIDS_MINTED: AtomicU64 = AtomicU64::new(0);
 
 /// A per-process random value, the part of a minted id that makes it UNGUESSABLE.
 ///
@@ -791,19 +806,21 @@ fn process_seed() -> u64 {
     })
 }
 
-/// The `StatementId` a statement that named none is stored under: a fresh lowercase,
-/// hyphenated uuid in the version-4 layout (version nibble `4`, variant bits `10`).
+/// A fresh lowercase, hyphenated uuid in the version-4 layout (version nibble `4`,
+/// variant bits `10`): the `StatementId` a policy statement that named none is stored
+/// under, and the `TemplateId` a prepared CloudFormation template is read back by. One
+/// minter for both, so the crate has a single id-minting path.
 ///
 /// The 16 bytes are a SHA-256 digest — from the maintained `sha2` crate, not written here
 /// — of this process's random seed, the number of ids minted before this one and the
 /// current clock reading, rendered by `hex`. The counter is what makes the id unique and
 /// the seed is what makes it unguessable; digesting them is what spreads both across all
 /// 16 bytes, so an id reveals neither. It is deliberately NOT derived from the request:
-/// two identical puts mint two different ids.
-pub fn new_statement_id() -> String {
+/// two identical calls mint two different ids.
+pub fn new_uuid() -> String {
     use ::sha2::Digest as _;
 
-    let minted = STATEMENT_IDS_MINTED.fetch_add(1, Ordering::Relaxed);
+    let minted = UUIDS_MINTED.fetch_add(1, Ordering::Relaxed);
     let nanos = ::std::time::SystemTime::now()
         .duration_since(::std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos());
@@ -944,7 +961,14 @@ impl PrereleaseField {
 
 /// Now, as the model's `CreationTime` (`__string`) carries it: ISO-8601 in UTC.
 pub fn now_iso8601() -> String {
-    ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now())
+    iso8601(SystemTime::now())
+}
+
+/// `at`, as every time-valued `__string` member of this service carries it: ISO-8601 in
+/// UTC. One renderer, so a record's stored instant and the time members read off it cannot
+/// be formatted two ways.
+pub fn iso8601(at: SystemTime) -> String {
+    ::aws_smithy_types::DateTime::from(at)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
@@ -1335,6 +1359,141 @@ fn boolean_of(value: &::serde_json::Value) -> Option<bool> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Prepared CloudFormation templates.
+//
+// `CreateCloudFormationTemplate` prepares the deployable template of ONE published
+// version and hands back the id it is read by; `GetCloudFormationTemplate` reports that
+// same record. Both the status and the expiry are functions of the stored instants and
+// the clock, so neither read moves anything.
+// ---------------------------------------------------------------------------
+
+/// How long a prepared template lives: "The date and time this template expires.
+/// Templates expire 1 hour after creation."
+/// (`smithy_query(query="doc", shape="CreateCloudFormationTemplateResponse",
+/// member="ExpirationTime")`).
+pub const TEMPLATE_LIFETIME: Duration = Duration::from_secs(60 * 60);
+
+/// How long a prepared template reports [`TEMPLATE_PREPARING`] before the clock owes it
+/// [`TEMPLATE_ACTIVE`].
+///
+/// `Status` is the "Status of the template creation workflow"
+/// (`smithy_query(query="doc", shape="CreateCloudFormationTemplateResponse",
+/// member="Status")`), whose first state is `PREPARING`: the move to `ACTIVE` is owed by
+/// the clock at a fixed instant, whether or not anybody calls, never performed by a read.
+/// AWS publishes no duration for it, so this span is the emulator's own choice: non-zero,
+/// so a caller reading straight after the create still sees `PREPARING`, and short enough
+/// that the next poll of a client sees `ACTIVE`.
+pub const TEMPLATE_PREPARATION_SPAN: Duration = Duration::from_millis(500);
+
+/// The three states of the template creation workflow, as the `Status` enum declares them
+/// (`smithy_query(query="shape", shape="Status")`: PREPARING | ACTIVE | EXPIRED).
+pub const TEMPLATE_PREPARING: &str = "PREPARING";
+/// See [`TEMPLATE_PREPARING`].
+pub const TEMPLATE_ACTIVE: &str = "ACTIVE";
+/// See [`TEMPLATE_PREPARING`].
+pub const TEMPLATE_EXPIRED: &str = "EXPIRED";
+
+/// How many prepared templates this emulator retains.
+///
+/// The map grows once per `CreateCloudFormationTemplate` and no operation deletes an
+/// entry, so without a ceiling one caller can drive the emulator's heap until the host is
+/// out of memory. AWS publishes no quota for prepared templates, so this is the emulator's
+/// own bound; see
+/// [`ComAmazonawsServerlessapplicationrepositoryServerlessapplicationrepositoryState::make_room_for_template`]
+/// for what reaching it does.
+pub const MAX_STORED_TEMPLATES: usize = 1_000;
+
+/// One prepared CloudFormation template: the record `CreateCloudFormationTemplate` writes
+/// and `GetCloudFormationTemplate` reports.
+#[derive(Debug, Clone)]
+pub struct CloudFormationTemplate {
+    /// The UUID this template is read back by, and its key in
+    /// [`ComAmazonawsServerlessapplicationrepositoryServerlessapplicationrepositoryState::templates`].
+    pub template_id: String,
+    /// The `ApplicationId` of the application whose version was prepared. A template is
+    /// reached only through its own application, so this is checked on every read.
+    pub application_id: String,
+    /// The semantic version that was prepared: the one the request named, or the
+    /// application's latest when it named none.
+    pub semantic_version: String,
+    /// "A link to the template that can be used to deploy the application using AWS
+    /// CloudFormation" — the location of the template body published with that version,
+    /// which is what this prepared template serves.
+    pub template_url: String,
+    /// When this template was prepared.
+    pub created_at: SystemTime,
+    /// The instant the clock owes this template its move from `PREPARING` to `ACTIVE`:
+    /// `created_at + `[`TEMPLATE_PREPARATION_SPAN`].
+    pub active_at: SystemTime,
+    /// The instant this template expires: `created_at + `[`TEMPLATE_LIFETIME`].
+    pub expires_at: SystemTime,
+}
+
+impl CloudFormationTemplate {
+    /// The record for a template prepared at `now` from the version `template_url` was
+    /// published with. Both due instants are derived here, so no caller sets them.
+    pub fn prepared(
+        template_id: String,
+        application_id: String,
+        semantic_version: String,
+        template_url: String,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            template_id,
+            application_id,
+            semantic_version,
+            template_url,
+            created_at: now,
+            active_at: now + TEMPLATE_PREPARATION_SPAN,
+            expires_at: now + TEMPLATE_LIFETIME,
+        }
+    }
+
+    /// The status this template reports at `now`, a pure function of the stored instants:
+    /// `PREPARING` until the preparation span is up, `ACTIVE` until it expires, `EXPIRED`
+    /// after that. Nothing is written, so two reads at one instant answer identically.
+    pub fn status_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.expires_at {
+            TEMPLATE_EXPIRED
+        } else if now >= self.active_at {
+            TEMPLATE_ACTIVE
+        } else {
+            TEMPLATE_PREPARING
+        }
+    }
+
+    /// This record projected into the seven members both template operations report, so
+    /// `CreateCloudFormationTemplate` and `GetCloudFormationTemplate` cannot render one
+    /// stored template two ways.
+    pub fn report(&self, now: SystemTime) -> TemplateReport {
+        TemplateReport {
+            application_id: self.application_id.clone(),
+            creation_time: iso8601(self.created_at),
+            expiration_time: iso8601(self.expires_at),
+            semantic_version: self.semantic_version.clone(),
+            status: self.status_at(now).to_string(),
+            template_id: self.template_id.clone(),
+            template_url: self.template_url.clone(),
+        }
+    }
+}
+
+/// A prepared template as both template operations report it: the members of
+/// `CreateCloudFormationTemplateResponse`, which `GetCloudFormationTemplateResponse`
+/// declares identically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateReport {
+    pub application_id: String,
+    pub creation_time: String,
+    pub expiration_time: String,
+    pub semantic_version: String,
+    pub status: String,
+    pub template_id: String,
+    pub template_url: String,
+}
+
 /// Per-service state for com-amazonaws-serverlessapplicationrepository-serverlessapplicationrepository. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsServerlessapplicationrepositoryServerlessapplicationrepositoryState {
@@ -1344,6 +1503,50 @@ pub struct ComAmazonawsServerlessapplicationrepositoryServerlessapplicationrepos
     /// [`name_key`] -> `ApplicationId`, which is what makes a second
     /// `CreateApplication` with a name already in that region's catalogue a 409.
     pub name_index: HashMap<String, String>,
+    /// Every prepared CloudFormation template, keyed by its `TemplateId`. Bounded by
+    /// [`MAX_STORED_TEMPLATES`].
+    pub templates: BTreeMap<String, CloudFormationTemplate>,
+}
+
+impl ComAmazonawsServerlessapplicationrepositoryServerlessapplicationrepositoryState {
+    /// Make room for one more prepared template at `now`, answering whether there is any.
+    ///
+    /// No operation deletes a prepared template, so the only record whose life has already
+    /// ended is one the clock has expired: releasing the template that expired longest ago
+    /// materialises a removal that was due at its own `expires_at` whether or not anybody
+    /// called. A store at the ceiling holding nothing expired makes no room at all — the
+    /// create is refused rather than served by evicting a template another caller can
+    /// still deploy.
+    pub fn make_room_for_template(&mut self, now: SystemTime) -> bool {
+        if self.templates.len() < MAX_STORED_TEMPLATES {
+            return true;
+        }
+        let expired = self
+            .templates
+            .values()
+            .filter(|template| template.status_at(now) == TEMPLATE_EXPIRED)
+            .min_by_key(|template| template.expires_at)
+            .map(|template| template.template_id.clone());
+        match expired {
+            Some(template_id) => self.templates.remove(&template_id).is_some(),
+            None => false,
+        }
+    }
+
+    /// The prepared template `template_id` of the application `application_id`, or `None`
+    /// when the store holds no such template OR holds one prepared from a DIFFERENT
+    /// application: a template is a sub-resource of its application
+    /// (`/applications/{ApplicationId}/templates/{TemplateId}`), so one read through
+    /// another application's id is as absent as one that was never prepared.
+    pub fn template_of(
+        &self,
+        application_id: &str,
+        template_id: &str,
+    ) -> Option<&CloudFormationTemplate> {
+        self.templates
+            .get(template_id)
+            .filter(|template| template.application_id == application_id)
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

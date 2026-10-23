@@ -23,7 +23,9 @@
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_billingconductor_awsbillingconductor::EmulatedService;
+use service_com_amazonaws_billingconductor_awsbillingconductor::{
+    ComAmazonawsBillingconductorAwsbillingconductorState as BillingConductorState, EmulatedService,
+};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
@@ -44,8 +46,21 @@ struct Emulator {
 }
 
 impl Emulator {
+    /// A router over ONE shared engine, with the emulated account designated the
+    /// organization's PAYER account.
+    ///
+    /// Billing Conductor is a payer-account-only API (see the `crate::service` module
+    /// docs): its control plane is authorized for the payer account alone, and the store
+    /// records no payer account by default — so this harness designates one, which is
+    /// the world in which the associations these tests are about are reachable at all.
+    /// The denial every other caller gets is asserted in
+    /// `tests/all/payer_account_gate.rs`, over the default store.
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        engine
+            .state::<BillingConductorState>()
+            .lock()
+            .payer_account_id = Some(::engine::emulator_account_id().to_string());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(engine));
         Self { router }

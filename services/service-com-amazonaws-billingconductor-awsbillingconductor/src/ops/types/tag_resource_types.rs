@@ -11,7 +11,18 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-billingconductor-awsbillingconductor.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.billingconductor#TagResourceRequest")]
+// `skip_validation = ["ResourceArn"]`: AWS does NOT enforce this member's modelled
+// `@pattern` as a request-rejecting constraint. A recorded `TagResource` naming
+// `arn:aws:billingconductor::<account>:billinggroup/<non-numeric suffix>` — which that
+// pattern refuses — reaches resource resolution and is answered HTTP 404
+// `NotFoundException` "Resource was not found", not HTTP 400. Keeping the constraint on
+// the schema would refuse such a request before the handler could resolve it, so the
+// pattern comes off here and the handler answers from the store (see
+// `crate::ops::tag_resource`).
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.billingconductor#TagResourceRequest",
+    skip_validation = ["ResourceArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct TagResourceInput {
     pub resource_arn: String,

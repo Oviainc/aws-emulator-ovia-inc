@@ -29,7 +29,9 @@
 
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_billingconductor_awsbillingconductor::EmulatedService;
+use service_com_amazonaws_billingconductor_awsbillingconductor::{
+    ComAmazonawsBillingconductorAwsbillingconductorState as BillingConductorState, EmulatedService,
+};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
@@ -44,8 +46,21 @@ struct Emulator {
 }
 
 impl Emulator {
+    /// A router over ONE shared engine, with the emulated account designated the
+    /// organization's PAYER account.
+    ///
+    /// The resources this suite tags are created through the CONTROL PLANE, which Billing
+    /// Conductor authorizes for the payer account alone (see the `crate::service` module
+    /// docs), and the store records no payer account by default. The TAG operations
+    /// themselves are not on that gate — `tests/all/payer_account_gate.rs` asserts they
+    /// answer the same 404 over the default store — so the designation only makes the
+    /// setup reachable.
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        engine
+            .state::<BillingConductorState>()
+            .lock()
+            .payer_account_id = Some(::engine::emulator_account_id().to_string());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(engine));
         Self { router }
@@ -191,7 +206,10 @@ const LIST_TAGS_STATUS: u16 = TAGGING_STATUS;
 /// `ResourceArn` is bound to a NON-greedy `@httpLabel` (`/tags/{ResourceArn}`), so an
 /// ARN travels as ONE path segment with its `/` and `:` percent-encoded — exactly what
 /// an SDK client sends.
-fn encode_label(value: &str) -> String {
+///
+/// `pub(crate)` because `tests/all/payer_account_gate.rs` sends the same labels and the
+/// encoding rule has one home.
+pub(crate) fn encode_label(value: &str) -> String {
     value
         .chars()
         .map(|character| match character {

@@ -165,17 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         if !crate::state::is_known_scope(&input.scope) {
             return Err(ListWebACLsErrorModeled::WAFInvalidParameterException(
-                WAFInvalidParameterException {
-                    message: Some(format!(
-                        "Scope {:?} is not one of CLOUDFRONT or REGIONAL",
-                        input.scope
-                    )),
-                    field: Some("SCOPE_VALUE".to_string()),
-                    parameter: Some(input.scope.clone()),
-                    reason: Some(
-                        "the scope names the namespace the web ACLs live in".to_string(),
-                    ),
-                },
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_SCOPE_VALUE,
+                    &input.scope,
+                    "the scope names the namespace the web ACLs live in, and is one of CLOUDFRONT or REGIONAL",
+                ),
             )
             .into());
         }
@@ -212,16 +206,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(limit) if (1..=MAX_PAGE_SIZE).contains(&limit) => limit,
             Some(limit) => {
                 return Err(ListWebACLsErrorModeled::WAFInvalidParameterException(
-                    WAFInvalidParameterException {
-                        message: Some(format!(
-                            "Limit {limit} is outside the range 1 to {MAX_PAGE_SIZE}"
-                        )),
-                        field: Some("ENTITY_LIMIT".to_string()),
-                        parameter: Some(limit.to_string()),
-                        reason: Some(format!(
-                            "a page holds between 1 and {MAX_PAGE_SIZE} summaries"
-                        )),
-                    },
+                    crate::state::invalid_parameter_exception(
+                        crate::state::FIELD_ENTITY_LIMIT,
+                        &limit.to_string(),
+                        &format!("a page holds between 1 and {MAX_PAGE_SIZE} summaries"),
+                    ),
                 )
                 .into());
             }

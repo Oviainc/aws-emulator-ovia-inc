@@ -192,16 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // nothing that exists.
             if !crate::state::is_wafv2_resource_arn(arn) {
                 return Err(GetWebACLErrorModeled::WAFInvalidParameterException(
-                    WAFInvalidParameterException {
-                        message: Some(format!("{arn:?} is not a well-formed wafv2 ARN")),
-                        field: Some("RESOURCE_ARN".to_string()),
-                        parameter: Some(arn.to_string()),
-                        reason: Some(
-                            "a wafv2 ARN reads \
-                             arn:<partition>:wafv2:<region>:<account>:<global|regional>/<type>/<name>/<id>"
-                                .to_string(),
-                        ),
-                    },
+                    crate::state::invalid_arn_exception(arn),
                 )
                 .into());
             }
@@ -210,7 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     state.web_acls.get(&(scope.clone(), id.clone()))
                 }
                 // An ARN that resolves to something else is not a web ACL ARN.
-                Some(crate::state::ResourceRef::IpSet { .. }) | None => None,
+                Some(crate::state::ResourceRef::IpSet { .. })
+                | Some(crate::state::ResourceRef::RuleGroup { .. })
+                | None => None,
             }
         } else {
             match (
@@ -221,17 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (Some(scope), Some(name), Some(id)) => state.web_acl(scope, name, id),
                 _ => {
                     return Err(GetWebACLErrorModeled::WAFInvalidParameterException(
-                        WAFInvalidParameterException {
-                            message: Some(
-                                "Specify either ARN, or all of Name, Scope and Id".to_string(),
-                            ),
-                            field: Some("WEB_ACL".to_string()),
-                            parameter: Some("ARN".to_string()),
-                            reason: Some(
-                                "a web ACL is addressed by its ARN or by its name, scope and id"
-                                    .to_string(),
-                            ),
-                        },
+                        crate::state::invalid_parameter_exception(
+                            crate::state::FIELD_WEB_ACL,
+                            "ARN",
+                            "a web ACL is addressed by its ARN or by its name, scope and id",
+                        ),
                     )
                     .into());
                 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCollectionGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCollectionGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCollectionGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `CollectionGroupId`, derives the group's ARN from that id and the
+//! request's Region, stores a `CollectionGroupRecord` in [`crate::state`] under the id
+//! (indexed by name), and answers from the stored record. A second create for a name
+//! already taken is a `ConflictException`; capacity limits whose floor exceeds its own
+//! ceiling are a `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +88,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::CollectionGroupRecord;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -163,18 +161,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCollectionGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCollectionGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCollectionGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateCollectionGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        // The two enum members the boundary validator does not narrow: each is refused
+        // against the model's own value list, naming the member and the list.
+        for (member, supplied, allowed) in [
+            (
+                "standbyReplicas",
+                Some(input.standby_replicas.as_str()),
+                STANDBY_REPLICAS_VALUES,
+            ),
+            (
+                "generation",
+                input.generation.as_deref(),
+                SERVERLESS_GENERATION_VALUES,
+            ),
+        ] {
+            if let Some(value) = supplied {
+                if !allowed.contains(&value) {
+                    return Err(CreateCollectionGroupErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "{member} must be one of [{}], got {value:?}",
+                                allowed.join(", ")
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+        // The relation between a capacity floor and its own ceiling, which no single
+        // member's own `@range` can express.
+        if let Some(limits) = &input.capacity_limits {
+            if let Err(message) = crate::state::validate_capacity_limits(limits) {
+                return Err(CreateCollectionGroupErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+
+        // A replayed `clientToken` is a retry of the call that created the group, so it
+        // answers that group instead of creating or conflicting with a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(record) = store.replayed_collection_group(Self::NAME, token) {
+                return Ok(CreateCollectionGroupOutput {
+                    create_collection_group_detail: Some(record.create_detail()),
+                });
+            }
+        }
+
+        // A collection group name identifies one group in the account, so a name already
+        // taken is the conflict `ConflictException` describes: "thrown when a resource
+        // with the same name already exists or is being created".
+        if let Some(existing) = store.collection_group_by_name(&input.name) {
+            return Err(CreateCollectionGroupErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Collection group with name {} already exists with id {}",
+                        existing.name, existing.id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if store.collection_groups.len() >= crate::state::MAX_COLLECTION_GROUPS {
+            return Err(
+                CreateCollectionGroupErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "Maximum number of collection groups exceeded: {}",
+                            crate::state::MAX_COLLECTION_GROUPS
+                        ),
+                        resource_id: Some(input.name.clone()),
+                        resource_type: Some("collection-group".to_string()),
+                        service_code: crate::state::ARN_NAMESPACE.to_string(),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_collection_group_id();
+        let created_date = crate::state::now_epoch_millis();
+        let record = CollectionGroupRecord {
+            arn: crate::state::collection_group_arn(&region, &id),
+            id: id.clone(),
+            name: input.name,
+            standby_replicas: input.standby_replicas,
+            description: input.description,
+            generation: input
+                .generation
+                .unwrap_or_else(|| crate::state::SERVERLESS_GENERATION_CLASSIC.to_string()),
+            capacity_limits: input.capacity_limits,
+            tags: input.tags.unwrap_or_default(),
+            created_date,
+            last_modified_date: created_date,
+        };
+        store.insert_collection_group(record);
+        if let Some(token) = input.client_token.as_deref() {
+            store.remember_token(Self::NAME, token, &id);
+        }
+
+        // Answered from the STORED record, so the create cannot report anything a later
+        // `BatchGetCollectionGroup` would not.
+        let stored = store.collection_groups.get(&id).ok_or_else(|| {
+            CreateCollectionGroupError::from(
+                CreateCollectionGroupErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                    },
+                ),
+            )
+        })?;
+        Ok(CreateCollectionGroupOutput {
+            create_collection_group_detail: Some(stored.create_detail()),
+        })
     }
 }

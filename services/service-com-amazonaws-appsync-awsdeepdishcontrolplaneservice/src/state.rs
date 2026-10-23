@@ -44,8 +44,10 @@ pub struct GraphqlApiRecord {
     pub lambda_authorizer_config: Option<LambdaAuthorizerConfig>,
     pub additional_authentication_providers: Vec<AdditionalAuthenticationProvider>,
     pub enhanced_metrics_config: Option<EnhancedMetricsConfig>,
-    /// The API's endpoints, keyed as AppSync keys them (`GRAPHQL`, `REALTIME`).
-    pub uris: BTreeMap<String, String>,
+    /// The API's DNS records — one hostname per endpoint, keyed as AppSync keys
+    /// them (`GRAPHQL`, `REALTIME`). `uris` is derived from these, so the two
+    /// members can never disagree about where the API is served.
+    pub dns: BTreeMap<String, String>,
     pub tags: BTreeMap<String, String>,
     pub created_at: SystemTime,
     /// The API keys created under this API, keyed by key id.
@@ -66,10 +68,14 @@ impl GraphqlApiRecord {
             user_pool_config: self.user_pool_config.clone(),
             open_id_connect_config: self.open_id_connect_config.clone(),
             arn: Some(self.arn.clone()),
-            uris: Some(map_out(&self.uris)),
-            // `TagMap` is modelled with a minimum length of 1, so an API created
-            // without tags carries no `tags` member at all.
-            tags: (!self.tags.is_empty()).then(|| map_out(&self.tags)),
+            uris: Some(uris_from_dns(&self.dns)),
+            // The tag map is reported whether or not it holds tags, so a caller
+            // reads the same member on every API. `TagMap`'s modelled minimum
+            // length of 1 is not the rule for the RESPONSE: the recorded creates
+            // this projection answers carry `tags` on an API created without any
+            // (replaying them diverged at `$.graphqlApi.tags` while the member was
+            // omitted, and stopped diverging once it was reported).
+            tags: Some(map_out(&self.tags)),
             additional_authentication_providers: (!self
                 .additional_authentication_providers
                 .is_empty())
@@ -79,7 +85,9 @@ impl GraphqlApiRecord {
             // operations, still unimplemented, so nothing can have set either.
             waf_web_acl_arn: None,
             lambda_authorizer_config: self.lambda_authorizer_config.clone(),
-            dns: None,
+            // "The DNS records for the API" — the hostnames the endpoints in
+            // `uris` are served on.
+            dns: Some(map_out(&self.dns)),
             visibility: Some(self.visibility.clone()),
             api_type: Some(self.api_type.clone()),
             merged_api_execution_role_arn: self.merged_api_execution_role_arn.clone(),
@@ -249,6 +257,28 @@ where
     })
 }
 
+/// The API's endpoint URIs, built from the DNS record of each endpoint: the
+/// realtime endpoint is a WebSocket URL and every other endpoint an HTTPS one, both
+/// addressing the API's `/graphql` path on the hostname `dns` publishes.
+fn uris_from_dns(dns: &BTreeMap<String, String>) -> std::collections::HashMap<String, String> {
+    dns.iter()
+        .map(|(endpoint, host)| {
+            let scheme = if endpoint == REALTIME_ENDPOINT {
+                "wss"
+            } else {
+                "https"
+            };
+            (endpoint.clone(), format!("{scheme}://{host}/graphql"))
+        })
+        .collect()
+}
+
+/// The key AppSync gives the realtime (WebSocket) endpoint in `dns` and `uris`.
+pub const REALTIME_ENDPOINT: &str = "REALTIME";
+
+/// The key AppSync gives the GraphQL (HTTPS) endpoint in `dns` and `uris`.
+pub const GRAPHQL_ENDPOINT: &str = "GRAPHQL";
+
 /// A `BTreeMap` field as the modelled map shape (`HashMap`).
 fn map_out(map: &BTreeMap<String, String>) -> std::collections::HashMap<String, String> {
     map.iter()
@@ -273,9 +303,10 @@ fn splitmix64(state: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// `value` as 13 base-32 characters over a lowercase-alphanumeric alphabet.
+/// `value` as 13 base-32 characters over the alphabet AppSync's opaque ids are
+/// written in: RFC 4648 base-32, lowercased (`a`-`z` and `2`-`7`).
 fn base32_13(value: u64) -> String {
-    const ALPHABET: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
     (0..13)
         .map(|i| {
             let shift = 5 * (12 - i);

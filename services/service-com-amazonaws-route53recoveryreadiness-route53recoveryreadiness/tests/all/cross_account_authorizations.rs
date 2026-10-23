@@ -56,10 +56,12 @@ fn authorization_cases() -> Vec<String> {
     ]
 }
 
-/// One wire answer, reduced to what a client branches on.
+/// One wire answer, reduced to what a client branches on. `pub(crate)` so the
+/// concurrency suite in the sibling module drives the same harness rather than carrying
+/// a second copy of it.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     error_type: String,
     body: Value,
 }
@@ -69,7 +71,7 @@ impl Reply {
         self.body.get(name).filter(|v| !v.is_null())
     }
 
-    fn string(&self, name: &str) -> Option<String> {
+    pub(crate) fn string(&self, name: &str) -> Option<String> {
         self.field(name).and_then(Value::as_str).map(str::to_string)
     }
 
@@ -102,13 +104,13 @@ fn encoded_label(value: &str) -> String {
 }
 
 /// An emulator with just this service mounted on a fresh engine, driven in-process
-/// through the production router.
-struct Emulator {
+/// through the production router. `pub(crate)` for the same reason as [`Reply`].
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signatures are not what these tests are about; the router still routes by the
@@ -158,7 +160,7 @@ impl Emulator {
         }
     }
 
-    async fn create(&self, authorization: &str) -> Reply {
+    pub(crate) async fn create(&self, authorization: &str) -> Reply {
         self.send(
             "POST",
             "/crossaccountauthorizations",
@@ -257,7 +259,7 @@ impl Emulator {
     }
 
     /// Every stored authorization, over as many pages as the service needs.
-    async fn authorizations(&self, label: &str) -> Vec<String> {
+    pub(crate) async fn authorizations(&self, label: &str) -> Vec<String> {
         self.drain_pages(None, label).await
     }
 }

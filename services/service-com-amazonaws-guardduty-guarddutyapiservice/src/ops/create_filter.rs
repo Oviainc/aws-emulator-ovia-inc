@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: saves a finding filter on the detector and answers with the name it
+//! was saved under, so a later `GetFilter` reports exactly what this call stored.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +162,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFilterErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // The modelled constraints — `Name` len 3..64, `Rank` range 1..100,
+        // `Action` within `FilterAction` — are refused BEFORE this handler runs, as
+        // `BadRequestException`/400 (see `crate::service`'s refusal seam). What is
+        // left for the handler is the rule the model cannot express: the filter
+        // name's ALPHABET. "Valid characters include period (.), underscore (_),
+        // dash (-), and alphanumeric characters. A whitespace is considered to be
+        // an invalid character"
+        // (`smithy_query(query="doc",shape="CreateFilterRequest",member="Name")`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFilter"))
+        // Validated before the store is touched, so a refused request leaves no
+        // filter behind.
+        if !crate::state::is_filter_name(&input.name) {
+            return Err(bad_request(crate::state::invalid_parameter_message(
+                crate::state::CREATE_FILTER_NAME_MEMBER,
+            )));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        if state.detector_in(&region, &input.detector_id).is_none() {
+            // Classified from the REQUEST: a value that cannot be a detector id is
+            // a parameter failure, a well-formed one this account does not hold an
+            // ownership failure.
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        }
+
+        let token = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+
+        // `ClientToken` is `@idempotencyToken`: a replayed create returns the
+        // filter the first call saved rather than refusing the name it took. The
+        // token is held on the filter record, so there is one source of truth for
+        // "this create already happened".
+        if let Some(token) = token.as_deref() {
+            if let Some(saved) = state
+                .detector_in(&region, &input.detector_id)
+                .and_then(|detector| {
+                    detector
+                        .filters
+                        .values()
+                        .find(|filter| filter.client_token.as_deref() == Some(token))
+                })
+            {
+                return Ok(CreateFilterOutput {
+                    name: saved.name.clone(),
+                });
+            }
+        }
+
+        let (already_held, saved_count) = state
+            .detector_in(&region, &input.detector_id)
+            .map(|detector| {
+                (
+                    detector.filters.contains_key(&input.name),
+                    detector.filters.len(),
+                )
+            })
+            .unwrap_or((false, 0));
+        // Creating is not updating: `UpdateFilter` is the operation that changes an
+        // existing filter.
+        if already_held {
+            return Err(bad_request(crate::state::FILTER_ALREADY_EXISTS_MESSAGE));
+        }
+        if saved_count >= crate::state::MAX_FILTERS_PER_ACCOUNT_PER_REGION {
+            return Err(bad_request(crate::state::FILTER_QUOTA_EXCEEDED_MESSAGE));
+        }
+
+        let now = state.tick_millis();
+        let record = crate::state::FilterRecord {
+            name: input.name.clone(),
+            description: input.description.clone(),
+            // "Default: NOOP" when the request names no action
+            // (`smithy_query(query="doc",shape="CreateFilterRequest",member="Action")`).
+            action: Some(
+                input
+                    .action
+                    .clone()
+                    .unwrap_or_else(|| crate::state::FILTER_ACTION_NOOP.to_string()),
+            ),
+            // `Rank` is optional and GuardDuty invents none: a filter created
+            // without one reports none.
+            rank: input.rank,
+            // Stored as sent. GuardDuty's filter criterion names a far wider set of
+            // finding fields than the subset this emulator evaluates for
+            // `ListFindings`, and a saved filter is only ever read back here, so the
+            // criteria are persisted and reported rather than narrowed to what the
+            // finding matcher can evaluate.
+            finding_criteria: input.finding_criteria.clone(),
+            tags: input
+                .tags
+                .as_ref()
+                .map(|tags| {
+                    tags.iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                })
+                .unwrap_or_default(),
+            client_token: token,
+            created_at_millis: now,
+            updated_at_millis: now,
+            version: crate::state::FILTER_INITIAL_VERSION,
+        };
+
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // The detector was resolved above under the same lock, so this is
+            // unreachable; it is a modelled server fault rather than a panic.
+            return Err(CreateFilterErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let name = record.name.clone();
+        detector.filters.insert(name.clone(), record);
+
+        Ok(CreateFilterOutput { name })
     }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member.
+fn bad_request(message: impl Into<String>) -> CreateFilterError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }

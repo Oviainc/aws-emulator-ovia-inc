@@ -2,13 +2,13 @@
 
 //! Engine state for the com-amazonaws-opensearchserverless-opensearchserverless service.
 //!
-//! This holds the two resources the bootstrap slice serves — the OpenSearch Serverless
-//! **collection** and the **security policy** — plus everything more than one handler of
-//! those resources needs: the server-derived fields (collection id, ARN, the endpoints
-//! derived from the id, the epoch-millisecond timestamps), the clock-owed `CREATING ->
-//! ACTIVE` transition a just-created collection settles through, the opaque page token
-//! `ListCollections` hands out, and the `clientToken` replay index the `@idempotent`
-//! creates read.
+//! This holds the resources this slice serves — the OpenSearch Serverless
+//! **collection**, the **collection group** and the **security policy** — plus everything
+//! more than one handler of those resources needs: the server-derived fields (the minted
+//! ids, the ARNs, the endpoints derived from a collection id, the epoch-millisecond
+//! timestamps), the clock-owed `CREATING -> ACTIVE` transition a just-created collection
+//! settles through, the opaque page token `ListCollections` hands out, and the
+//! `clientToken` replay index the `@idempotent` creates read.
 //!
 //! `src/ops/mod.rs` is generated, so a helper more than one operation reaches lives here
 //! rather than in a second module under `src/ops/`.
@@ -17,8 +17,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    CollectionDetail, CollectionErrorDetail, CollectionSummary, CreateCollectionDetail,
-    DeleteCollectionDetail, FipsEndpoints, SecurityPolicyDetail, Tag, VectorOptions,
+    CapacityDetails, CollectionDetail, CollectionErrorDetail, CollectionGroupCapacityLimits,
+    CollectionGroupDetail, CollectionGroupErrorDetail, CollectionSummary, CreateCollectionDetail,
+    CreateCollectionGroupDetail, CurrentCapacity, DeleteCollectionDetail, FipsEndpoints,
+    SecurityPolicyDetail, Tag, VectorOptions,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -87,6 +89,22 @@ pub const AWS_OWNED_KEY: &str = "auto";
 pub const DELETABLE_STATUSES: [&str; 3] =
     [COLLECTION_ACTIVE, COLLECTION_FAILED, COLLECTION_UPDATE_FAILED];
 
+/// `ServerlessGeneration$CLASSIC`, the generation a collection group carries when its
+/// create request does not name one.
+///
+/// `generation` is OPTIONAL on `CreateCollectionGroupRequest` while every detail shape
+/// reports one, so a stored group always carries a generation. `ServerlessGeneration`
+/// models exactly `CLASSIC` and `NEXTGEN`, and `NEXTGEN` is the newer generation a caller
+/// opts into by naming it, so a request that names none describes a `CLASSIC` group. The
+/// VALUE is a choice this emulator makes; the fact that one is always reported is the
+/// model's.
+pub const SERVERLESS_GENERATION_CLASSIC: &str = "CLASSIC";
+
+/// `AutoscalingStatus$NO_ACTION`, the status a capacity report carries while no scaling
+/// action is in progress — the other two members are `ACTION_SCALING_UP` and
+/// `ACTION_SCALING_DOWN` (`smithy_query(query="shape", shape="AutoscalingStatus")`).
+pub const AUTOSCALING_NO_ACTION: &str = "NO_ACTION";
+
 /// The `errorCode` a `CollectionErrorDetail` carries for an id or name that names no
 /// collection, from `CollectionErrorDetail$errorCode`'s own documentation: "The error
 /// code for the request. For example, `NOT_FOUND`."
@@ -114,6 +132,16 @@ pub const MAX_COLLECTIONS: usize = 50;
 /// The account's quota for security policies of ONE type in one Region, from the same
 /// quota page: 20 encryption policies and 20 network policies per account.
 pub const MAX_SECURITY_POLICIES_PER_TYPE: usize = 20;
+
+/// The most collection groups this emulator stores for one account in one Region.
+///
+/// Emulator resource guard, NOT a quota AWS publishes: the OpenSearch Serverless quota
+/// page lists no collection-group limit, so this bound exists only to keep the store
+/// finite. It is answered with the modelled `ServiceQuotaExceededException` because that
+/// is the error `CreateCollectionGroup` declares for "more resources than the service
+/// allows", and it is set at the collection quota above so a group per collection still
+/// fits.
+pub const MAX_COLLECTION_GROUPS: usize = MAX_COLLECTIONS;
 
 /// The page bound `ListCollections` applies when the caller names none, from
 /// `ListCollectionsRequest$maxResults`' own documentation: "The maximum number of results
@@ -157,12 +185,31 @@ const ID_MULTIPLIER: u128 = 1_000_000_007;
 /// The bijection's constant term, so the first id minted is not a run of leading `a`s.
 const ID_OFFSET: u128 = 734_291;
 
+/// The `errorMessage` a `CollectionGroupErrorDetail` carries for an id or name that names
+/// no collection group, from `CollectionGroupErrorDetail$errorMessage`'s own
+/// documentation: "A description of the error. For example, `The specified Collection
+/// Group is not found.`"
+pub const ERROR_MESSAGE_GROUP_NOT_FOUND: &str = "The specified Collection Group is not found.";
+
 /// `arn:aws:aoss:<region>:<account>:collection/<id>`.
 pub fn collection_arn(region: &str, collection_id: &str) -> String {
     ::engine::emulator_arn(
         ARN_NAMESPACE,
         region,
         &format!("collection/{collection_id}"),
+    )
+}
+
+/// `arn:aws:aoss:<region>:<account>:collection-group/<id>`.
+///
+/// The resource half is the `CollectionGroup` resource's own ARN template from the model
+/// (`smithy_query(query="shape", shape="CollectionGroup")` -> `arn.template`:
+/// `collection-group/{id}`).
+pub fn collection_group_arn(region: &str, collection_group_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("collection-group/{collection_group_id}"),
     )
 }
 
@@ -355,6 +402,131 @@ impl CollectionRecord {
     }
 }
 
+/// One stored collection group. Every field a reader reports is held here, except the
+/// two a reader DERIVES from the collections beside it (`numberOfCollections` and the
+/// current capacity); see [`CollectionGroupRecord::detail`].
+#[derive(Debug, Clone)]
+pub struct CollectionGroupRecord {
+    /// The server-minted `CollectionGroupId`, which is also this record's key.
+    pub id: String,
+    pub name: String,
+    pub arn: String,
+    /// The `StandbyReplicas` wire value; `@required` on the create request, so every
+    /// stored group carries one.
+    pub standby_replicas: String,
+    pub description: Option<String>,
+    /// The `ServerlessGeneration` wire value, defaulted by
+    /// [`SERVERLESS_GENERATION_CLASSIC`] when the create request named none.
+    pub generation: String,
+    /// The limits the create (or a later update) stored; `None` while the group names no
+    /// limit of its own.
+    pub capacity_limits: Option<CollectionGroupCapacityLimits>,
+    /// The tags the create request carried. `CreateCollectionGroupDetail` and
+    /// `CollectionGroupDetail` both model `tags`, so unlike a collection a group reports
+    /// its own tags on a read.
+    pub tags: Vec<Tag>,
+    pub created_date: i64,
+    /// `lastModifiedDate`, which `UpdateCollectionGroupDetail` reports; equal to
+    /// [`created_date`](Self::created_date) until a write moves it.
+    pub last_modified_date: i64,
+}
+
+impl CollectionGroupRecord {
+    /// The `CreateCollectionGroupDetail` body for this record — the one place this crate
+    /// renders that shape.
+    pub fn create_detail(&self) -> CreateCollectionGroupDetail {
+        CreateCollectionGroupDetail {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            standby_replicas: Some(self.standby_replicas.clone()),
+            description: self.description.clone(),
+            tags: Some(self.tags.clone()),
+            created_date: Some(self.created_date),
+            capacity_limits: self.capacity_limits.clone(),
+            generation: Some(self.generation.clone()),
+        }
+    }
+
+    /// The `CollectionGroupDetail` body for this record, with the
+    /// `numberOfCollections` its reader counted from the collections beside it, so a read
+    /// cannot report a group differently from the create that stored it.
+    pub fn detail(&self, number_of_collections: i32) -> CollectionGroupDetail {
+        CollectionGroupDetail {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            standby_replicas: Some(self.standby_replicas.clone()),
+            description: self.description.clone(),
+            tags: Some(self.tags.clone()),
+            created_date: Some(self.created_date),
+            capacity_limits: self.capacity_limits.clone(),
+            current_capacity: self.current_capacity(),
+            number_of_collections: Some(number_of_collections),
+            generation: Some(self.generation.clone()),
+        }
+    }
+
+    /// The group's current search and indexing capacity.
+    ///
+    /// Nothing in this emulator runs OCUs, so the only capacity a group demonstrably
+    /// holds is the FLOOR its own stored limits name — `minSearchCapacityInOCU` and
+    /// `minIndexingCapacityInOCU` — and it holds exactly that while no autoscaling action
+    /// is in progress ([`AUTOSCALING_NO_ACTION`]). A group whose limits name no floor, or
+    /// which carries no limits at all, reports no current capacity rather than a number
+    /// nothing measured.
+    fn current_capacity(&self) -> Option<CurrentCapacity> {
+        let limits = self.capacity_limits.as_ref()?;
+        let at_floor = |floor: Option<f32>| {
+            floor.map(|capacity_in_ocu| CapacityDetails {
+                capacity_in_ocu: Some(capacity_in_ocu),
+                autoscaling_status: Some(AUTOSCALING_NO_ACTION.to_string()),
+            })
+        };
+        let search = at_floor(limits.min_search_capacity_in_ocu);
+        let indexing = at_floor(limits.min_indexing_capacity_in_ocu);
+        if search.is_none() && indexing.is_none() {
+            return None;
+        }
+        Some(CurrentCapacity { search, indexing })
+    }
+}
+
+/// Refuse `limits` whose floor exceeds its own ceiling, naming the two members and their
+/// values.
+///
+/// `CollectionGroupCapacityLimits` bounds each member on its own (`max*` is
+/// `@range(min: 1)`, `min*` is `@range(min: 0)`), which the boundary validator applies
+/// before a handler runs; what it cannot express is the relation BETWEEN the pair, so
+/// that is checked here. `Ok(())` for limits that name only one half of a pair: a floor
+/// with no ceiling, or a ceiling with no floor, contradicts nothing.
+pub fn validate_capacity_limits(limits: &CollectionGroupCapacityLimits) -> Result<(), String> {
+    for (floor_member, floor, ceiling_member, ceiling) in [
+        (
+            "minIndexingCapacityInOCU",
+            limits.min_indexing_capacity_in_ocu,
+            "maxIndexingCapacityInOCU",
+            limits.max_indexing_capacity_in_ocu,
+        ),
+        (
+            "minSearchCapacityInOCU",
+            limits.min_search_capacity_in_ocu,
+            "maxSearchCapacityInOCU",
+            limits.max_search_capacity_in_ocu,
+        ),
+    ] {
+        if let (Some(floor), Some(ceiling)) = (floor, ceiling) {
+            if floor > ceiling {
+                return Err(format!(
+                    "capacityLimits.{floor_member} ({floor}) must not exceed \
+                     capacityLimits.{ceiling_member} ({ceiling})"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One stored security policy, keyed by its `(type, name)` pair.
 #[derive(Debug, Clone)]
 pub struct SecurityPolicyRecord {
@@ -409,12 +581,37 @@ pub fn collection_error_for_name(name: &str) -> CollectionErrorDetail {
     }
 }
 
+/// A `CollectionGroupErrorDetail` for an `ids` entry that names no stored collection
+/// group.
+pub fn collection_group_error_for_id(id: &str) -> CollectionGroupErrorDetail {
+    CollectionGroupErrorDetail {
+        id: Some(id.to_string()),
+        name: None,
+        error_message: Some(ERROR_MESSAGE_GROUP_NOT_FOUND.to_string()),
+        error_code: Some(ERROR_CODE_NOT_FOUND.to_string()),
+    }
+}
+
+/// A `CollectionGroupErrorDetail` for a `names` entry that names no stored collection
+/// group.
+pub fn collection_group_error_for_name(name: &str) -> CollectionGroupErrorDetail {
+    CollectionGroupErrorDetail {
+        id: None,
+        name: Some(name.to_string()),
+        error_message: Some(ERROR_MESSAGE_GROUP_NOT_FOUND.to_string()),
+        error_code: Some(ERROR_CODE_NOT_FOUND.to_string()),
+    }
+}
+
 /// Per-service state for com-amazonaws-opensearchserverless-opensearchserverless. A handler reaches it through [`service_state`].
 ///
 /// Collections are keyed by the server-minted id, which is their identity in this API
 /// (`BatchGetCollection`/`DeleteCollection` address them by it), with a name index beside
 /// them so a name lookup and the duplicate-name check are one map probe. Both maps are
 /// `BTreeMap`s so `ListCollections` walks one deterministic order a page token can resume.
+/// Collection groups are held the same way, and a collection names the group it belongs to
+/// by NAME (`CreateCollectionRequest$collectionGroupName`), so a group's
+/// `numberOfCollections` is counted over the collections map by that name.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     /// Collections by `CollectionId`.
@@ -422,6 +619,13 @@ pub struct ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     /// `CollectionName` -> `CollectionId`, for name-addressed reads and the
     /// duplicate-name conflict check.
     pub collection_name_index: BTreeMap<String, String>,
+    /// Collection groups by `CollectionGroupId`, which is their identity in this API
+    /// (`BatchGetCollectionGroup`/`UpdateCollectionGroup`/`DeleteCollectionGroup` address
+    /// them by it).
+    pub collection_groups: BTreeMap<String, CollectionGroupRecord>,
+    /// `CollectionGroupName` -> `CollectionGroupId`, for the name-addressed reads
+    /// `BatchGetCollectionGroup` serves and the duplicate-name conflict check.
+    pub collection_group_name_index: BTreeMap<String, String>,
     /// Security policies by `(SecurityPolicyType, PolicyName)`: the pair that identifies
     /// one, since the same name may be used once per type.
     pub security_policies: BTreeMap<(String, String), SecurityPolicyRecord>,
@@ -437,8 +641,10 @@ pub struct ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     /// The order [`Self::idempotency_tokens`] was written in, so the cap evicts the
     /// oldest token first.
     idempotency_token_order: VecDeque<String>,
-    /// Drives [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::mint_collection_id`]; see [`ID_MULTIPLIER`] for how an
-    /// id is derived from it.
+    /// Drives [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::mint_collection_id`] and
+    /// [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::mint_collection_group_id`]; see [`ID_MULTIPLIER`] for how an
+    /// id is derived from it. ONE seed serves both, so a collection and a collection group
+    /// can never be minted the same id.
     pub id_seed: u64,
     /// Drives [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::next_policy_version`], so two writes in the same
     /// millisecond still mint different versions.
@@ -462,6 +668,19 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     /// The id is derived from a counter through the bijection described on
     /// [`ID_MULTIPLIER`], so it is unpredictable-looking yet never repeats.
     pub fn mint_collection_id(&mut self) -> String {
+        self.mint_id()
+    }
+
+    /// Mint a fresh `CollectionGroupId`. `CollectionGroupId` carries the same
+    /// `@length(min: 3, max: 40)` and `^[a-z0-9]{3,40}$` as `CollectionId`, so it is
+    /// minted the same way and from the same seed; see [`Self::mint_collection_id`].
+    pub fn mint_collection_group_id(&mut self) -> String {
+        self.mint_id()
+    }
+
+    /// The next id out of the bijection on [`ID_MULTIPLIER`], shared by every resource of
+    /// this service whose id shape is `^[a-z0-9]{3,40}$`.
+    fn mint_id(&mut self) -> String {
         self.id_seed = self.id_seed.wrapping_add(1);
         let mut scrambled = (u128::from(self.id_seed) * ID_MULTIPLIER + ID_OFFSET) % ID_SPACE;
         let mut id = Vec::with_capacity(ID_LEN as usize);
@@ -502,6 +721,29 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
         self.collections.insert(record.id.clone(), record);
     }
 
+    /// The collection group `name` resolves to, if one is stored under it.
+    pub fn collection_group_by_name(&self, name: &str) -> Option<&CollectionGroupRecord> {
+        let id = self.collection_group_name_index.get(name)?;
+        self.collection_groups.get(id)
+    }
+
+    /// Store `record` under its id, indexing its name.
+    pub fn insert_collection_group(&mut self, record: CollectionGroupRecord) {
+        self.collection_group_name_index
+            .insert(record.name.clone(), record.id.clone());
+        self.collection_groups.insert(record.id.clone(), record);
+    }
+
+    /// How many stored collections name the collection group `group_name` — the
+    /// `numberOfCollections` a collection-group read reports, counted from the collections
+    /// themselves rather than from a counter a create bumped.
+    pub fn collections_in_group(&self, group_name: &str) -> usize {
+        self.collections
+            .values()
+            .filter(|record| record.collection_group_name.as_deref() == Some(group_name))
+            .count()
+    }
+
     /// Remove the collection `id` names, dropping its name index entry and every
     /// idempotency token that named it with it.
     pub fn remove_collection(&mut self, id: &str) -> Option<CollectionRecord> {
@@ -535,6 +777,19 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
             .idempotency_tokens
             .get(&idempotency_key(operation, token))?;
         self.collections.get(id)
+    }
+
+    /// The collection group a replayed `clientToken` on `operation` already created, if
+    /// any; see [`Self::replayed_collection`] for why a stale token answers `None`.
+    pub fn replayed_collection_group(
+        &self,
+        operation: &str,
+        token: &str,
+    ) -> Option<&CollectionGroupRecord> {
+        let id = self
+            .idempotency_tokens
+            .get(&idempotency_key(operation, token))?;
+        self.collection_groups.get(id)
     }
 
     /// The security policy a replayed `clientToken` on `operation` already created, if

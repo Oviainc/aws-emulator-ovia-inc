@@ -12,7 +12,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{Logs, REGION};
+use crate::harness::{base_ms, group_with_stream, Logs, REGION};
 
 /// A log group class the model declares. Source: the `LogGroupClass` enum, surfaced in
 /// the crate as `LOG_GROUP_CLASS_VALUES` ("DELIVERY", "INFREQUENT_ACCESS", "STANDARD").
@@ -45,16 +45,6 @@ fn batch(events: &[(i64, &str)]) -> Value {
             .map(|(timestamp, message)| json!({"timestamp": timestamp, "message": message}))
             .collect(),
     )
-}
-
-/// A log group plus one stream, both created.
-async fn group_with_stream(logs: &Logs, group: &str, stream: &str) {
-    logs.ok("CreateLogGroup", &json!({"logGroupName": group})).await;
-    logs.ok(
-        "CreateLogStream",
-        &json!({"logGroupName": group, "logStreamName": stream}),
-    )
-    .await;
 }
 
 /// A create is readable back through `DescribeLogGroups`, with the ARNs, the class and
@@ -229,12 +219,11 @@ async fn log_group_creation_refuses_values_outside_the_documented_rules() {
 /// batches that differ in size, ordering and message content.
 #[tokio::test]
 async fn put_log_events_round_trips_through_get_log_events() {
+    // Offsets from an in-window base, so the rows differ along batch size, ordering,
+    // duplicate timestamps and message content without leaving the ingestion window.
     let cases: Vec<(&str, Vec<(i64, &str)>)> = vec![
-        ("one event", vec![(1_700_000_000_000, "hello")]),
-        (
-            "two events",
-            vec![(1_700_000_000_000, "hello"), (1_700_000_001_000, "world")],
-        ),
+        ("one event", vec![(0, "hello")]),
+        ("two events", vec![(0, "hello"), (1_000, "world")]),
         (
             "duplicate timestamps keep ingestion order",
             vec![(42, "a"), (42, "b"), (42, "c")],
@@ -243,12 +232,17 @@ async fn put_log_events_round_trips_through_get_log_events() {
             "unicode and punctuation",
             vec![(1, "héllo — ✓"), (2, "{\"json\":true}")],
         ),
-        ("epoch zero", vec![(0, "the beginning")]),
+        ("the base instant itself", vec![(0, "the beginning")]),
     ];
 
-    for (case, events) in &cases {
+    for (case, offsets) in &cases {
+        let base = base_ms();
+        let events: Vec<(i64, &str)> = offsets
+            .iter()
+            .map(|(offset, message)| (base + offset, *message))
+            .collect();
         let logs = Logs::new();
-        group_with_stream(&logs, "/aws/emulator/demo", "stream-1").await;
+        group_with_stream(&logs, "/aws/emulator/demo", "stream-1", None).await;
 
         let put = logs
             .ok(
@@ -256,10 +250,15 @@ async fn put_log_events_round_trips_through_get_log_events() {
                 &json!({
                     "logGroupName": "/aws/emulator/demo",
                     "logStreamName": "stream-1",
-                    "logEvents": batch(events),
+                    "logEvents": batch(&events),
                 }),
             )
             .await;
+        assert_eq!(
+            put.get("rejectedLogEventsInfo"),
+            None,
+            "case {case:?}: an in-window batch is fully accepted, got {put}"
+        );
         let token = put
             .get("nextSequenceToken")
             .and_then(Value::as_str)
@@ -378,7 +377,7 @@ async fn put_log_events_round_trips_through_get_log_events() {
                 &json!({
                     "logGroupName": "/aws/emulator/demo",
                     "logStreamName": "stream-1",
-                    "logEvents": batch(&[(1_900_000_000_000, "later")]),
+                    "logEvents": batch(&[(base + 7_200_000, "later")]),
                     "sequenceToken": "a token the service now ignores",
                 }),
             )
@@ -413,13 +412,14 @@ async fn put_log_events_round_trips_through_get_log_events() {
 #[tokio::test]
 async fn a_late_batch_is_merged_into_the_stream_in_timestamp_order() {
     let logs = Logs::new();
-    group_with_stream(&logs, "late", "stream").await;
+    group_with_stream(&logs, "late", "stream", None).await;
+    let base = base_ms();
 
     // Three batches: the middle one predates the first, the last straddles both.
     let batches: Vec<Vec<(i64, &str)>> = vec![
-        vec![(300, "c"), (400, "d")],
-        vec![(100, "a")],
-        vec![(200, "b"), (500, "e")],
+        vec![(base + 300, "c"), (base + 400, "d")],
+        vec![(base + 100, "a")],
+        vec![(base + 200, "b"), (base + 500, "e")],
     ];
     for (index, events) in batches.iter().enumerate() {
         logs.ok(
@@ -461,12 +461,12 @@ async fn a_late_batch_is_merged_into_the_stream_in_timestamp_order() {
     let stream = &streams["logStreams"][0];
     assert_eq!(
         stream["firstEventTimestamp"].as_i64(),
-        Some(100),
+        Some(base + 100),
         "expected the oldest merged event, got {stream}"
     );
     assert_eq!(
         stream["lastEventTimestamp"].as_i64(),
-        Some(500),
+        Some(base + 500),
         "expected the newest merged event, got {stream}"
     );
 }
@@ -476,7 +476,8 @@ async fn a_late_batch_is_merged_into_the_stream_in_timestamp_order() {
 #[tokio::test]
 async fn put_log_events_refuses_a_batch_outside_the_documented_constraints() {
     let logs = Logs::new();
-    group_with_stream(&logs, "constraints", "stream").await;
+    group_with_stream(&logs, "constraints", "stream", None).await;
+    let base = base_ms();
 
     // "Each log event can be no larger than 1 MB" and "the maximum batch size is
     // 1,048,576 bytes … the sum of all event messages in UTF-8, plus 26 bytes for each
@@ -491,7 +492,7 @@ async fn put_log_events_refuses_a_batch_outside_the_documented_constraints() {
             json!({
                 "logGroupName": "constraints",
                 "logStreamName": "stream",
-                "logEvents": batch(&[(2, "second"), (1, "first")]),
+                "logEvents": batch(&[(base + 2, "second"), (base + 1, "first")]),
             }),
         ),
         (
@@ -499,7 +500,7 @@ async fn put_log_events_refuses_a_batch_outside_the_documented_constraints() {
             json!({
                 "logGroupName": "constraints",
                 "logStreamName": "stream",
-                "logEvents": batch(&[(1, over_event.as_str())]),
+                "logEvents": batch(&[(base + 1, over_event.as_str())]),
             }),
         ),
         (
@@ -507,7 +508,7 @@ async fn put_log_events_refuses_a_batch_outside_the_documented_constraints() {
             json!({
                 "logGroupName": "constraints",
                 "logStreamName": "stream",
-                "logEvents": batch(&[(1, half_batch.as_str()), (2, half_batch.as_str())]),
+                "logEvents": batch(&[(base + 1, half_batch.as_str()), (base + 2, half_batch.as_str())]),
             }),
         ),
     ];
@@ -526,7 +527,7 @@ async fn put_log_events_refuses_a_batch_outside_the_documented_constraints() {
             &json!({
                 "logGroupName": "absent",
                 "logStreamName": "stream",
-                "logEvents": batch(&[(1, over_event.as_str())]),
+                "logEvents": batch(&[(base + 1, over_event.as_str())]),
             }),
         )
         .await;
@@ -553,7 +554,7 @@ async fn put_log_events_refuses_a_batch_outside_the_documented_constraints() {
         &json!({
             "logGroupName": "constraints",
             "logStreamName": "stream",
-            "logEvents": batch(&[(1, largest_fitting.as_str())]),
+            "logEvents": batch(&[(base + 1, largest_fitting.as_str())]),
         }),
     )
     .await;
@@ -575,14 +576,16 @@ async fn a_stream_keeps_only_what_fits_in_the_storage_ceiling() {
     const BATCH: usize = 10_000;
 
     let logs = Logs::new();
-    group_with_stream(&logs, "ceiling", "stream").await;
+    group_with_stream(&logs, "ceiling", "stream", None).await;
+    let base = base_ms();
 
     // Three full batches: 30,000 events written, 20,000 of them keepable.
     for round in 0..3_usize {
         let events: Vec<Value> = (0..BATCH)
             .map(|index| {
                 let ordinal = round * BATCH + index;
-                json!({"timestamp": 1_000 + ordinal, "message": format!("e{ordinal}")})
+                let offset = i64::try_from(ordinal).expect("a small ordinal");
+                json!({"timestamp": base + offset, "message": format!("e{ordinal}")})
             })
             .collect();
         logs.ok(
@@ -712,11 +715,12 @@ async fn get_log_events_pagination_visits_every_event_exactly_once() {
     for count in 0_usize..=5 {
         for limit in 1_usize..=3 {
             let logs = Logs::new();
-            group_with_stream(&logs, "pagination", "stream").await;
+            group_with_stream(&logs, "pagination", "stream", None).await;
+            let base = base_ms();
             let events: Vec<(i64, String)> = (0..count)
                 .map(|index| {
                     (
-                        1_700_000_000_000 + i64::try_from(index).expect("a small index") * 1_000,
+                        base + i64::try_from(index).expect("a small index") * 1_000,
                         format!("event-{index}"),
                     )
                 })
@@ -819,18 +823,24 @@ async fn get_log_events_pagination_visits_every_event_exactly_once() {
 #[tokio::test]
 async fn get_log_events_honours_the_time_window_and_which_end_it_reads_from() {
     let logs = Logs::new();
-    group_with_stream(&logs, "window", "stream").await;
+    group_with_stream(&logs, "window", "stream", None).await;
+    let base = base_ms();
     logs.ok(
         "PutLogEvents",
         &json!({
             "logGroupName": "window",
             "logStreamName": "stream",
-            "logEvents": batch(&[(10, "a"), (20, "b"), (30, "c"), (40, "d")]),
+            "logEvents": batch(&[
+                (base + 10, "a"),
+                (base + 20, "b"),
+                (base + 30, "c"),
+                (base + 40, "d"),
+            ]),
         }),
     )
     .await;
 
-    // (startTime, endTime) -> the events in the window
+    // (startTime, endTime) offsets from the base -> the events in the window
     let windows: Vec<(Option<i64>, Option<i64>, Vec<&str>)> = vec![
         (None, None, vec!["a", "b", "c", "d"]),
         (Some(20), None, vec!["b", "c", "d"]),
@@ -847,10 +857,10 @@ async fn get_log_events_honours_the_time_window_and_which_end_it_reads_from() {
             "startFromHead": true,
         });
         if let Some(start) = start {
-            request["startTime"] = json!(start);
+            request["startTime"] = json!(base + start);
         }
         if let Some(end) = end {
-            request["endTime"] = json!(end);
+            request["endTime"] = json!(base + end);
         }
         let page = logs.ok("GetLogEvents", &request).await;
         assert_eq!(
@@ -902,8 +912,8 @@ async fn get_log_events_honours_the_time_window_and_which_end_it_reads_from() {
                 "logGroupName": "window",
                 "logStreamName": "stream",
                 "startFromHead": true,
-                "startTime": 20,
-                "endTime": 40,
+                "startTime": base + 20,
+                "endTime": base + 40,
                 "limit": 1,
             }),
         )
@@ -939,7 +949,7 @@ async fn get_log_events_honours_the_time_window_and_which_end_it_reads_from() {
                 "logStreamName": "stream",
                 "startFromHead": true,
                 "nextToken": token,
-                "startTime": 0,
+                "startTime": base,
             }),
         )
         .await;
@@ -954,13 +964,13 @@ async fn get_log_events_honours_the_time_window_and_which_end_it_reads_from() {
 #[tokio::test]
 async fn a_log_group_is_reachable_by_name_and_by_either_arn_form() {
     let logs = Logs::new();
-    group_with_stream(&logs, "identifiers", "stream").await;
+    group_with_stream(&logs, "identifiers", "stream", None).await;
     logs.ok(
         "PutLogEvents",
         &json!({
             "logGroupName": "identifiers",
             "logStreamName": "stream",
-            "logEvents": batch(&[(7, "only")]),
+            "logEvents": batch(&[(base_ms() + 7, "only")]),
         }),
     )
     .await;
@@ -1029,11 +1039,12 @@ async fn describe_log_streams_orders_filters_and_pages() {
 
     // Created in an order that matches neither sort, with event times that invert the
     // name order, so each ordering is distinguishable.
+    let base = base_ms();
     let streams: Vec<(&str, Option<i64>)> = vec![
-        ("beta", Some(300)),
-        ("alpha", Some(400)),
+        ("beta", Some(base + 300)),
+        ("alpha", Some(base + 400)),
         ("delta", None),
-        ("charlie", Some(100)),
+        ("charlie", Some(base + 100)),
     ];
     for (name, last_event) in &streams {
         logs.ok(
@@ -1369,13 +1380,13 @@ async fn describe_log_groups_filters_and_pages() {
 #[tokio::test]
 async fn deleting_a_log_group_removes_everything_stored_under_it() {
     let logs = Logs::new();
-    group_with_stream(&logs, "/aws/emulator/demo", "stream-1").await;
+    group_with_stream(&logs, "/aws/emulator/demo", "stream-1", None).await;
     logs.ok(
         "PutLogEvents",
         &json!({
             "logGroupName": "/aws/emulator/demo",
             "logStreamName": "stream-1",
-            "logEvents": batch(&[(1_700_000_000_000, "hello")]),
+            "logEvents": batch(&[(base_ms(), "hello")]),
         }),
     )
     .await;
@@ -1485,7 +1496,7 @@ async fn deleting_a_log_group_removes_everything_stored_under_it() {
 #[tokio::test]
 async fn unknown_and_duplicate_resources_are_refused() {
     let logs = Logs::new();
-    group_with_stream(&logs, "present", "stream").await;
+    group_with_stream(&logs, "present", "stream", None).await;
 
     let cases: Vec<(&str, &str, Value, &str)> = vec![
         (

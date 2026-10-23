@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/invoice_profiles.rs"]
 mod invoice_profiles;
+#[path = "all/invoice_summaries.rs"]
+mod invoice_summaries;
 #[path = "all/invoice_unit_lifecycle.rs"]
 mod invoice_unit_lifecycle;
 #[path = "all/state_roundtrip.rs"]
