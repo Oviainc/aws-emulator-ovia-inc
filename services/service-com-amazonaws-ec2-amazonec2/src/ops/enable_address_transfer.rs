@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableAddressTransfer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableAddressTransfer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: starts the transfer of one of the account's Elastic IP addresses to
+//! another account and persists it in [`crate::state`], so `DescribeAddressTransfers`
+//! reports the stored offer. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableAddressTransfer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The offer stands for the documented seven days
+//! ([`crate::state::ADDRESS_TRANSFER_OFFER_WINDOW`]), which is the instant
+//! `TransferOfferExpirationTimestamp` reports; `DisableAddressTransfer` withdraws it, and
+//! the clock drops it once that window has run out.
+//!
+//! An address carries at most one transfer, and this operation is what SETS it: a call
+//! naming an address that already carries an offer replaces that offer and restarts the
+//! window, because the call states what the account wants the address's transfer to be and
+//! the model declares no error for an address that already has one
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::offer_address_transfer`]).
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +141,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableAddressTransfer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableAddressTransferErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableAddressTransfer"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            aws_account_id_is_well_formed, internal_error, require_known_address,
+            require_service_state, AWS_ACCOUNT_ID_DIGITS,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The ID of the account that you want to transfer the Elastic IP address to"
+        // (`EnableAddressTransferRequest$TransferAccountId`): an account id, which the model
+        // types as a plain `String` and so does not constrain, and never this account's own
+        // — an address cannot be transferred to the account that already owns it.
+        let transfer_account_id = input.transfer_account_id.trim();
+        if !aws_account_id_is_well_formed(transfer_account_id) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{transfer_account_id}' for transferAccountId. \
+                 It must be an Amazon Web Services account ID of {AWS_ACCOUNT_ID_DIGITS} digits"
+            )));
+        }
+        if transfer_account_id == ::engine::emulator_account_id() {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{transfer_account_id}' for transferAccountId. \
+                 An Elastic IP address cannot be transferred to the account that owns it"
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // A transfer offer this call would replace may already have expired, and an expiry
+        // was owed at its instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "The allocation ID of an Elastic IP address"
+        // (`EnableAddressTransferRequest$AllocationId`): an id that names no address of the
+        // account cannot be transferred. `require_known_address` answers
+        // `InvalidAllocationID.Malformed` for a value that is not an allocation id at all
+        // before `InvalidAllocationID.NotFound` for a well-formed one the account has no
+        // address for, the way the service orders the two.
+        let allocation_id = input.allocation_id.clone();
+        require_known_address(&store, &allocation_id)?;
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // Everything on the record is derived here rather than taken from the request: the
+        // address being transferred is read off the stored allocation, and the expiration
+        // instant comes from the documented offer window.
+        let public_ip = store
+            .addresses
+            .get(&allocation_id)
+            .and_then(|address| address.public_ip.clone());
+        store.offer_address_transfer(
+            &allocation_id,
+            public_ip.as_deref(),
+            transfer_account_id,
+            ::std::time::SystemTime::now(),
+        );
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // `DescribeAddressTransfers` will see rather than the request object.
+        let stored = store.address_transfers.get(&allocation_id).ok_or_else(|| {
+            internal_error(format!(
+                "the transfer just enabled for '{allocation_id}' could not be read back"
+            ))
+        })?;
+        Ok(EnableAddressTransferOutput {
+            address_transfer: Some(stored.transfer.clone()),
+        })
     }
 }

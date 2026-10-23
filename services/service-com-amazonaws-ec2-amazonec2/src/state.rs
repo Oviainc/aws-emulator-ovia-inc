@@ -184,6 +184,23 @@
 //! [`ComAmazonawsEc2Amazonec2State::allocation_id_associated_with_instance`] answers which
 //! address an instance holds.
 //!
+//! ## Elastic IP address transfers
+//!
+//! [`ComAmazonawsEc2Amazonec2State::address_transfers`] holds the Elastic IP address
+//! transfers the source account can see, as [`AddressTransferRecord`]s: the modelled
+//! [`AddressTransfer`] every operation that reports one answers with, plus the instant the
+//! record stops being one of that account's transfers
+//! ([`AddressTransferRecord::visible_until`]), which the shape carries no member for.
+//! Keyed by the `AllocationId` of the address being transferred, because an address has at
+//! most one transfer at a time — `EnableAddressTransfer` starts the one offer on it — which
+//! also gives the describe path one stable order to report and page over.
+//!
+//! Unlike a `pending` VPC's move, those instants are DOCUMENTED spans rather than chosen
+//! ones ([`ADDRESS_TRANSFER_OFFER_WINDOW`], [`ADDRESS_TRANSFER_ACCEPTED_VISIBILITY`]), so
+//! they are kept on the wall clock the reported timestamps are on;
+//! [`ComAmazonawsEc2Amazonec2State::expire_due_address_transfers`] drops a record whose
+//! instant has passed, from [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`].
+//!
 //! ## Dedicated Hosts
 //!
 //! [`ComAmazonawsEc2Amazonec2State::dedicated_hosts`] holds the account's Dedicated Hosts
@@ -456,8 +473,9 @@ use std::net::Ipv6Addr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    Address, ApplicationStatus, ApplicationStatusDetail, AttachVolumeOutput, AvailabilityZone,
-    AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates, ByoipCidr,
+    Address, AddressTransfer, ApplicationStatus, ApplicationStatusDetail, AttachVolumeOutput,
+    AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
+    ByoipCidr,
     CapacityBlock, ExportTask, FpgaImage, FpgaImageState, ImageUsageReport, LoadPermission,
     StorageLocation, VolumeRecycleBinInfo,
     CreateVolumeOutput, DescribeFastLaunchImagesSuccessItem, DisableFastLaunchOutput,
@@ -1261,6 +1279,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Monotonic source of the Elastic IP addresses [`Self::mint_elastic_ip`] hands out,
     /// so one allocation can never be given an address another still holds.
     next_elastic_ip: u64,
+    /// Every Elastic IP address transfer the source account can see, by the `AllocationId`
+    /// of the address being transferred — see the module docs. Ordered by that id, which is
+    /// the order `DescribeAddressTransfers` reports and pages over.
+    ///
+    /// Starts EMPTY: an account has no transfer until `EnableAddressTransfer` starts one.
+    pub address_transfers: BTreeMap<String, AddressTransferRecord>,
     /// Every transit gateway the account holds, by `TransitGatewayId`, as the modelled
     /// [`TransitGateway`] shape itself — so a member a writer sets round-trips through
     /// `DescribeTransitGateways` without a field-by-field copy. Ordered by id, which is
@@ -1441,6 +1465,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             fast_launch_images: BTreeMap::new(),
             addresses: BTreeMap::new(),
             next_elastic_ip: 0,
+            address_transfers: BTreeMap::new(),
             transit_gateways: BTreeMap::new(),
             transit_gateway_available_at: BTreeMap::new(),
             transit_gateway_route_tables: BTreeMap::new(),
@@ -2689,6 +2714,12 @@ impl ComAmazonawsEc2Amazonec2State {
             // The move is applied once; nothing is owed on this connection any more.
             false
         });
+        // An Elastic IP address transfer the clock has taken past the end of what the
+        // source account is shown: the offer expired and ownership returned to that
+        // account, or an accepted transfer's 14 days of visibility ran out. Both were due
+        // at their instant whether or not anybody called, and both are spans AWS
+        // documents, so they are read off the wall clock rather than `now`.
+        self.expire_due_address_transfers(SystemTime::now());
         self.complete_due_import_image_tasks(now);
     }
 
@@ -6316,6 +6347,45 @@ impl Default for ImageSpec {
     }
 }
 
+/// The caller-chosen bytes one stored AMI holds: its tags, and every string of the record
+/// whose LENGTH a request chose — the name (which the derived `ImageLocation` holds a
+/// second copy of), the description, the architecture, the root device name (stored on the
+/// image and on its block device mapping), the volume type, the state, the billing strings,
+/// the creation date, the owning account and its alias, the deprecation time, the public
+/// parameter name, the platform, the boot mode and the IMDS support. The ids, the snapshot
+/// and the fixed facts of an EBS-backed HVM image are derived by this module, so they are
+/// fixed-size.
+///
+/// The ONE definition of that charge, the way [`address_payload_bytes`] is for an Elastic
+/// IP address: [`ComAmazonawsEc2Amazonec2State::insert_image`] charges exactly it, so no
+/// path can store those bytes uncharged, and a writer that asks
+/// [`ComAmazonawsEc2Amazonec2State::would_exceed_stored_bytes`] first asks it with this
+/// number. A string stored twice is counted twice, because that is what the store holds.
+pub fn image_payload_bytes(spec: &ImageSpec) -> usize {
+    let optional = |value: Option<&String>| -> usize { value.map_or(0, String::len) };
+    tag_list_bytes(&spec.tags)
+        // `Image$Name`, and the `<owner>/<name>` `ImageLocation` derived from it.
+        .saturating_add(spec.name.len().saturating_mul(2))
+        .saturating_add(spec.description.len())
+        .saturating_add(spec.architecture.len())
+        // `Image$RootDeviceName`, and the block device mapping's own `DeviceName`.
+        .saturating_add(spec.root_device_name.len().saturating_mul(2))
+        .saturating_add(spec.root_volume_type.len())
+        .saturating_add(spec.state.len())
+        .saturating_add(spec.platform_details.len())
+        .saturating_add(spec.usage_operation.len())
+        .saturating_add(spec.creation_date.len())
+        // The owning account, and the `ImageLocation` prefix when no alias replaces it.
+        .saturating_add(spec.owner_id.len().saturating_mul(2))
+        // `Image$ImageOwnerAlias`, and the `ImageLocation` prefix when it is set.
+        .saturating_add(optional(spec.owner_alias.as_ref()).saturating_mul(2))
+        .saturating_add(optional(spec.deprecation_time.as_ref()))
+        .saturating_add(optional(spec.public_ssm_parameter_name.as_ref()))
+        .saturating_add(optional(spec.platform.as_ref()))
+        .saturating_add(optional(spec.boot_mode.as_ref()))
+        .saturating_add(optional(spec.imds_support.as_ref()))
+}
+
 impl ComAmazonawsEc2Amazonec2State {
     /// Whether another image fits inside the store's ceiling ([`MAX_IMAGES`]).
     ///
@@ -6332,8 +6402,14 @@ impl ComAmazonawsEc2Amazonec2State {
     /// manifest location `<owner>/<name>` the `manifest-location` filter selects on, and
     /// the fixed facts of an EBS-backed HVM machine image — so two writers cannot report
     /// the same image differently. Like [`Self::insert_vpc`], the caller-chosen bytes of
-    /// `spec.tags` are charged against the store's byte budget here.
+    /// the record are charged against the store's byte budget here, counted by the ONE
+    /// definition of that charge ([`image_payload_bytes`]) rather than by the tags alone:
+    /// a count ceiling ([`MAX_IMAGES`]) is no memory bound on its own, so every string
+    /// whose LENGTH a request chose is charged against [`MAX_STORED_BYTES`] too.
     pub fn insert_image(&mut self, spec: ImageSpec) -> String {
+        // Counted BEFORE `spec` is taken apart below, so the charge covers what the
+        // caller supplied rather than what survived into the record.
+        let payload_bytes = image_payload_bytes(&spec);
         let image_id = self.next_id("ami");
         let snapshot_id = self.next_id("snap");
         let owner = spec
@@ -6427,7 +6503,7 @@ impl ComAmazonawsEc2Amazonec2State {
             ramdisk_id: None,
             platform: spec.platform,
         };
-        self.add_stored_bytes(tag_list_bytes(image.tags.as_deref().unwrap_or_default()));
+        self.add_stored_bytes(payload_bytes);
         self.images.insert(image_id.clone(), image);
         image_id
     }
@@ -8921,6 +8997,156 @@ pub fn network_border_group_of_region(region: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Elastic IP address transfers
+// ---------------------------------------------------------------------------
+
+/// A transfer the source account has started that has neither been accepted nor expired:
+/// the `AddressTransferStatus` enum's `pending` member
+/// (`smithy_query(query="shape",shape="AddressTransferStatus")`).
+pub const ADDRESS_TRANSFER_STATUS_PENDING: &str = "pending";
+
+/// A transfer offer the source account has withdrawn: the `AddressTransferStatus` enum's
+/// `disabled` member, which is what "Disables Elastic IP address transfer"
+/// (`DisableAddressTransfer`) leaves behind.
+pub const ADDRESS_TRANSFER_STATUS_DISABLED: &str = "disabled";
+
+/// A transfer the transfer account has taken: the `AddressTransferStatus` enum's
+/// `accepted` member.
+pub const ADDRESS_TRANSFER_STATUS_ACCEPTED: &str = "accepted";
+
+/// How long a transfer offer stands before it expires on its own.
+///
+/// DOCUMENTED, not chosen: "When the source account starts the transfer, the transfer
+/// account has seven days to accept the Elastic IP address transfer … After seven days,
+/// the transfer expires and ownership of the Elastic IP address returns to the source
+/// account" (`DescribeAddressTransfers`). It is also the instant
+/// `AddressTransfer$TransferOfferExpirationTimestamp` reports.
+pub const ADDRESS_TRANSFER_OFFER_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How long an accepted transfer stays visible to the source account.
+///
+/// DOCUMENTED, not chosen: "Accepted transfers are visible to the source account for 14
+/// days after the transfers have been accepted" (`DescribeAddressTransfers`).
+pub const ADDRESS_TRANSFER_ACCEPTED_VISIBILITY: Duration =
+    Duration::from_secs(14 * 24 * 60 * 60);
+
+/// One Elastic IP address transfer the source account can see: the modelled
+/// [`AddressTransfer`] every operation that reports one answers with, plus when the record
+/// stops being one of that account's transfers — the one fact that shape carries no member
+/// for.
+///
+/// Built in exactly one place ([`ComAmazonawsEc2Amazonec2State::offer_address_transfer`]),
+/// so the instant beside the record and the timestamps on it cannot disagree.
+#[derive(Debug, Clone)]
+pub struct AddressTransferRecord {
+    /// The transfer as every operation that reports one answers with it.
+    pub transfer: AddressTransfer,
+    /// When this record stops being one of the source account's transfers: the end of the
+    /// offer window for a transfer that was never accepted, and
+    /// [`ADDRESS_TRANSFER_ACCEPTED_VISIBILITY`] after the acceptance for one that was. On
+    /// the wall clock, because both spans are documented in days and are the same instants
+    /// the record's own timestamps report.
+    pub visible_until: SystemTime,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Start the transfer of the Elastic IP address `allocation_id` to
+    /// `transfer_account_id`, as of `at`, and answer the `AllocationId` the record is keyed
+    /// by.
+    ///
+    /// "Enables Elastic IP address transfer" (`EnableAddressTransfer`): the offer is
+    /// `pending` and stands for [`ADDRESS_TRANSFER_OFFER_WINDOW`], which is the instant
+    /// `TransferOfferExpirationTimestamp` reports and the instant the record stops being
+    /// visible. An address has at most one transfer at a time, so starting one on an
+    /// address that already carries a record REPLACES it: the call says what the account
+    /// wants the address's transfer to be, and the model declares no error for an address
+    /// that already has one.
+    ///
+    /// No byte charge is made for the record: it is keyed by an id of [`Self::addresses`],
+    /// so there can be no more of them than there are stored addresses, and the only
+    /// caller-supplied value it retains is an account id, which is
+    /// [`AWS_ACCOUNT_ID_DIGITS`] digits.
+    pub fn offer_address_transfer(
+        &mut self,
+        allocation_id: &str,
+        public_ip: Option<&str>,
+        transfer_account_id: &str,
+        at: SystemTime,
+    ) -> String {
+        let expires_at = at + ADDRESS_TRANSFER_OFFER_WINDOW;
+        let record = AddressTransferRecord {
+            transfer: AddressTransfer {
+                public_ip: public_ip.map(str::to_string),
+                allocation_id: Some(allocation_id.to_string()),
+                transfer_account_id: Some(transfer_account_id.to_string()),
+                transfer_offer_expiration_timestamp: Some(system_time_to_date_time(expires_at)),
+                // Nothing has accepted the offer: "The timestamp when the Elastic IP
+                // address transfer was accepted"
+                // (`AddressTransfer$TransferOfferAcceptedTimestamp`) names no instant yet.
+                transfer_offer_accepted_timestamp: None,
+                address_transfer_status: Some(ADDRESS_TRANSFER_STATUS_PENDING.to_string()),
+            },
+            visible_until: expires_at,
+        };
+        self.address_transfers
+            .insert(allocation_id.to_string(), record);
+        allocation_id.to_string()
+    }
+
+    /// Withdraw the transfer offer on `allocation_id`, answering whether there was a
+    /// `pending` one to withdraw.
+    ///
+    /// "Disables Elastic IP address transfer" (`DisableAddressTransfer`): only a `pending`
+    /// offer can be withdrawn — an accepted transfer has already moved the address, and a
+    /// disabled one is already withdrawn — so this answers `false` for every other state
+    /// and the caller refuses the request with
+    /// [`address_transfer_not_available`]. The record keeps the expiration instant it was
+    /// offered with: withdrawing the offer does not move when the offer would have run out,
+    /// which is also when the record stops being reported.
+    pub fn withdraw_address_transfer(&mut self, allocation_id: &str) -> bool {
+        let Some(record) = self.address_transfers.get_mut(allocation_id) else {
+            return false;
+        };
+        if record.transfer.address_transfer_status.as_deref()
+            != Some(ADDRESS_TRANSFER_STATUS_PENDING)
+        {
+            return false;
+        }
+        record.transfer.address_transfer_status =
+            Some(ADDRESS_TRANSFER_STATUS_DISABLED.to_string());
+        true
+    }
+
+    /// Drop every transfer record the clock has taken past
+    /// [`AddressTransferRecord::visible_until`].
+    ///
+    /// Reached through [`Self::materialize_due_transitions`], so a reporting operation may
+    /// apply it: "After seven days, the transfer expires and ownership of the Elastic IP
+    /// address returns to the source account", and an accepted transfer is visible "for 14
+    /// days after the transfers have been accepted" (`DescribeAddressTransfers`) — each was
+    /// already owed at `now` whether or not anybody asked.
+    pub fn expire_due_address_transfers(&mut self, now: SystemTime) {
+        self.address_transfers
+            .retain(|_allocation_id, record| now < record.visible_until);
+    }
+}
+
+/// Refuse a request the Elastic IP address transfer surface has no transfer to act on:
+/// HTTP 400 `InvalidAddress.NotFound`.
+///
+/// The message is the one the real service answers there — `The Elastic IP address
+/// '<address>' does not exist or is not available.`, naming the address from the request —
+/// which is a different sentence from [`invalid_address_not_found`]'s, that one being for an
+/// address the account holds no allocation for at all.
+pub fn address_transfer_not_available<E>(address: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ADDRESS_NOT_FOUND,
+        400,
+        format!("The Elastic IP address '{address}' does not exist or is not available."),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Transit gateways
 // ---------------------------------------------------------------------------
 
@@ -10292,15 +10518,33 @@ impl TransitGatewayAttachmentView {
         }
     }
 
-    /// The caller-chosen bytes this attachment holds: its tags, the only member of any kind
-    /// that a caller sizes.
+    /// The caller-chosen bytes this attachment holds: its tags, and — for an attachment
+    /// shape that carries none — the ids of what it attaches, which a writer supplies.
+    ///
+    /// NOTHING here answers zero for a whole variant: the fixed per-record overhead
+    /// [`STORED_RECORD_OVERHEAD_BYTES`] is charged beside it by
+    /// [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway_attachment`], so no stored
+    /// attachment is free against the byte budget whatever it carries.
     fn payload_bytes(&self) -> usize {
         match self {
             Self::Vpc(attachment) => tag_list_bytes(attachment.tags.as_deref().unwrap_or_default()),
             Self::Peering(attachment) => {
                 tag_list_bytes(attachment.tags.as_deref().unwrap_or_default())
             }
-            Self::ClientVpn(_) => 0,
+            // `TransitGatewayClientVpnAttachment` models no tags, so what a writer sizes
+            // here is the Client VPN endpoint it names and the account that owns it.
+            Self::ClientVpn(attachment) => attachment
+                .client_vpn_endpoint_id
+                .as_deref()
+                .unwrap_or_default()
+                .len()
+                .saturating_add(
+                    attachment
+                        .client_vpn_owner_id
+                        .as_deref()
+                        .unwrap_or_default()
+                        .len(),
+                ),
         }
     }
 }
@@ -11627,8 +11871,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// caller — the subnet's id, the ARN built from it, the owning account, and the
     /// association id of each IPv4 CIDR block — so two writers cannot report the same
     /// secondary subnet differently. Like [`Self::insert_subnet`], the caller-chosen bytes
-    /// the record holds are charged against the store's byte budget here, so no writer can
-    /// store them uncharged, and the ceiling is checked BEFORE any id is minted, so a
+    /// the record holds are charged against the store's byte budget here — by
+    /// [`secondary_subnet_payload_bytes`], which is the one definition of that charge and
+    /// already carries the fixed per-record overhead, so a tag-free subnet is not free
+    /// against the budget either — and the ceiling is checked BEFORE any id is minted, so a
     /// refused write consumes nothing at all.
     pub fn insert_secondary_subnet(&mut self, spec: SecondarySubnetSpec) -> Option<String> {
         if !self.has_secondary_subnet_capacity() {
@@ -11662,6 +11908,9 @@ impl ComAmazonawsEc2Amazonec2State {
             state_reason: spec.state_reason,
             tags: Some(spec.tags),
         };
+        // `secondary_subnet_payload_bytes` is the ONE definition of this charge and
+        // already carries the fixed per-record overhead, so the call site adds nothing to
+        // it: a removal path gives back exactly this number.
         self.add_stored_bytes(secondary_subnet_payload_bytes(&secondary_subnet));
         self.secondary_subnets
             .insert(secondary_subnet_id.clone(), secondary_subnet);
