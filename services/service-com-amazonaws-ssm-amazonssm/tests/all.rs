@@ -17,5 +17,7 @@ mod instance_properties;
 mod managed_node_information;
 #[path = "all/parameter_store.rs"]
 mod parameter_store;
+#[path = "all/parameters_by_path.rs"]
+mod parameters_by_path;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
