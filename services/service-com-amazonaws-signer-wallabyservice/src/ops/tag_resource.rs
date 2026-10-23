@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: MERGES the request's tags into the ones the signing profile
+//! `resourceArn` names already holds — a key the request carries takes the
+//! request's value, and every key it does not name keeps the value it had. The map
+//! it writes is the one `ListTagsForResource` and `GetSigningProfile` report.
+//!
+//! A label that is not a signing-profile ARN is refused 400 `BadRequestException`;
+//! a well-formed ARN naming no stored profile is refused 404 `NotFoundException`;
+//! and a CANCELED profile cannot be tagged — the shape documents that it "also
+//! occurs when you call a tagging API on a cancelled signing profile". A refused
+//! call writes nothing.
+//!
+//! Implemented alongside `ListTagsForResource` (issue
+//! `20261023T031331Z-signer-listtagsforresource-stub`): a list of tags can only be
+//! read back from state something wrote, and this is the write.
 //!
 //! ## Shape of an operation
 //!
@@ -109,6 +115,35 @@ impl From<TagResourceErrorModeled> for TagResourceError {
     }
 }
 
+/// The modelled refusal for a `resourceArn` that reaches no signing profile.
+///
+/// The two conditions answer different modelled shapes and statuses — see
+/// [`crate::state::TaggingArnProblem`] — and each carries the `code` naming the
+/// condition.
+fn refused(problem: crate::state::TaggingArnProblem, resource_arn: &str) -> TagResourceError {
+    let message = Some(problem.message(resource_arn));
+    let code = Some(problem.error_code().to_string());
+    match problem {
+        crate::state::TaggingArnProblem::Malformed => {
+            TagResourceErrorModeled::BadRequestException(BadRequestException { message, code })
+        }
+        crate::state::TaggingArnProblem::NoSuchProfile => {
+            TagResourceErrorModeled::NotFoundException(NotFoundException { message, code })
+        }
+    }
+    .into()
+}
+
+/// A 400 `BadRequestException` carrying `message` and `code` — the shape the
+/// tagging operations refuse a bad request with.
+fn bad_request(message: String, code: String) -> TagResourceError {
+    TagResourceErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+        code: Some(code),
+    })
+    .into()
+}
+
 /// The `TagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -145,18 +180,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Nothing here reads the request's metadata: the ARN the caller supplies
+        // carries the region and account the profile lives in, and it is matched
+        // against the ARN this service stored for that profile.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the signer profile store is unavailable".to_string()),
+                    code: Some(crate::state::ERROR_CODE_INTERNAL_SERVICE_ERROR.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // AWS reserves the `aws:` prefix for its own tags, which `TagKey`'s
+        // pattern states as a negative lookahead the boundary validator cannot
+        // compile — so the request's keys are judged here, before anything is
+        // written.
+        if let Some(key) = crate::state::reserved_tag_key(input.tags.keys().map(String::as_str)) {
+            return Err(bad_request(
+                crate::state::reserved_tag_key_message(key),
+                crate::state::ERROR_CODE_BAD_REQUEST.to_string(),
+            ));
+        }
+
+        let mut store = state.lock();
+        let profile = store
+            .profile_for_tagging_mut(&input.resource_arn)
+            .map_err(|problem| refused(problem, &input.resource_arn))?;
+
+        // A canceled profile is the one status the modelled bad request names, and
+        // the gate reads the status the store holds NOW: a later
+        // `PutSigningProfile` re-versions the profile back to `Active` and then the
+        // same tag write is admitted.
+        if !profile.accepts_tag_writes() {
+            let message =
+                crate::state::tag_write_refused_message(&profile.profile_name, &profile.status);
+            let code = crate::state::profile_status_error_code(&profile.status);
+            return Err(bad_request(message, code));
+        }
+
+        // What the merge would LEAVE on the profile is what the modelled bound
+        // limits, so it is computed before anything is written: a request that
+        // would carry the profile past it changes nothing. Re-tagging a key the
+        // profile already holds never grows the map.
+        let resulting = profile
+            .tags
+            .keys()
+            .map(String::as_str)
+            .chain(input.tags.keys().map(String::as_str))
+            .collect::<::std::collections::BTreeSet<_>>()
+            .len();
+        if resulting > crate::state::MAX_TAGS_PER_PROFILE {
+            return Err(bad_request(
+                crate::state::too_many_tags_message(resulting),
+                crate::state::ERROR_CODE_BAD_REQUEST.to_string(),
+            ));
+        }
+
+        // The write itself: a MERGE, not a replacement. Nothing else on the
+        // profile moves — tagging is not a new version of it, so the version, the
+        // status and the creation time are left alone.
+        for (key, value) in &input.tags {
+            profile.tags.insert(key.clone(), value.clone());
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

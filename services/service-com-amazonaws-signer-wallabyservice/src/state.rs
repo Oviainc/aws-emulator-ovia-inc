@@ -53,6 +53,11 @@ pub const ERROR_CODE_INVALID_NEXT_TOKEN: &str = "InvalidNextToken";
 /// A request refused for the values it carried, rather than for a condition of
 /// the resource: the modelled shape's own name.
 pub const ERROR_CODE_VALIDATION: &str = "ValidationException";
+/// A tagging request refused for the values it carried — the modelled shape's own
+/// name, which is the shape the tagging operations declare for a bad request
+/// (`BadRequestException`, "The request contains invalid parameters for the ARN or
+/// tags").
+pub const ERROR_CODE_BAD_REQUEST: &str = "BadRequestException";
 /// The store could not be reached — this emulator's own fault, not the request's.
 pub const ERROR_CODE_INTERNAL_SERVICE_ERROR: &str = "InternalServiceErrorException";
 
@@ -75,6 +80,22 @@ pub const JOB_STATUS_SUCCEEDED: &str = "Succeeded";
 /// the request names no `maxResults`: `ListSigningProfilesRequest$maxResults` is
 /// modelled `@range(min: 1, max: 25)`.
 pub const PROFILE_PAGE_LIMIT: i32 = 25;
+
+/// The most tags one signing profile can hold.
+///
+/// Not a chosen number: `TagMap` — the shape `TagResource` writes and both
+/// `ListTagsForResource` and `GetSigningProfile` report — is modelled
+/// `@length(min: 1, max: 200)`
+/// (`smithy_query(query="shape", shape="TagMap")`), so a profile carrying more
+/// than 200 tags is one no read of it could report.
+pub const MAX_TAGS_PER_PROFILE: usize = 200;
+
+/// The prefix a tag key may not carry: AWS reserves `aws:` for its own tags.
+///
+/// `TagKey` is modelled `@pattern("^(?!aws:)[a-zA-Z+-=._:/]+$")`
+/// (`smithy_query(query="shape", shape="TagMap")`) — a negative lookahead, which
+/// the boundary validator's regex engine cannot express, so the rule holds here.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
 /// The `ValidityType` unit the default signature validity period is counted in,
 /// spelled as the model spells it (see
@@ -163,6 +184,18 @@ impl SigningProfileRecord {
     /// Whether this profile has been revoked.
     pub fn is_revoked(&self) -> bool {
         self.status == PROFILE_STATUS_REVOKED
+    }
+
+    /// Whether this profile's tags may still be CHANGED.
+    ///
+    /// `BadRequestException` documents the one status that forbids it: the shape
+    /// "also occurs when you call a tagging API on a cancelled signing profile"
+    /// (`smithy_query(query="shape", shape="BadRequestException")`). Nothing
+    /// documents a refusal for any other status, and a canceled profile is the
+    /// one Signer schedules for deletion, so `Active` and `Revoked` profiles
+    /// accept tag writes.
+    pub fn accepts_tag_writes(&self) -> bool {
+        self.status != PROFILE_STATUS_CANCELED
     }
 
     /// The stored tags, as the wire map — absent when there are none.
@@ -362,6 +395,34 @@ impl ComAmazonawsSignerWallabyserviceState {
         job.settle(now);
         Some(job)
     }
+
+    /// The profile a tagging call's `resourceArn` names.
+    ///
+    /// Resolution is by the ARN the profile was STORED with, so a label naming
+    /// another account's or another region's signing profile resolves to nothing
+    /// rather than to this account's profile of the same name.
+    pub fn profile_for_tagging(
+        &self,
+        resource_arn: &str,
+    ) -> Result<&SigningProfileRecord, TaggingArnProblem> {
+        let name = profile_name_in_arn(resource_arn).ok_or(TaggingArnProblem::Malformed)?;
+        self.profiles
+            .get(name)
+            .filter(|profile| profile.arn == resource_arn)
+            .ok_or(TaggingArnProblem::NoSuchProfile)
+    }
+
+    /// [`Self::profile_for_tagging`], for a call that CHANGES the profile's tags.
+    pub fn profile_for_tagging_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Result<&mut SigningProfileRecord, TaggingArnProblem> {
+        let name = profile_name_in_arn(resource_arn).ok_or(TaggingArnProblem::Malformed)?;
+        self.profiles
+            .get_mut(name)
+            .filter(|profile| profile.arn == resource_arn)
+            .ok_or(TaggingArnProblem::NoSuchProfile)
+    }
 }
 
 /// The id namespace signing-job ids are minted in.
@@ -422,6 +483,112 @@ pub fn profile_arn(profile_name: &str, region: &str) -> String {
         "signer",
         region,
         &format!("/signing-profiles/{profile_name}"),
+    )
+}
+
+/// The resource portion every signing-profile ARN carries before the name — see
+/// [`profile_arn`] for the whole form.
+const PROFILE_ARN_RESOURCE_PREFIX: &str = "/signing-profiles/";
+
+/// The profile name inside `arn`, when `arn` is a well-formed AWS Signer
+/// signing-profile ARN — `arn:<partition>:signer:<region>:<account>:/signing-profiles/<name>`,
+/// the form [`profile_arn`] builds.
+///
+/// `None` for anything else: an ARN of another service, one whose resource is not
+/// a signing profile, one carrying a profile VERSION after the name (tags belong
+/// to the profile, not to one of its versions), or a name outside
+/// [`is_profile_name`]'s alphabet. It is a judgement on the STRING alone, so it
+/// says nothing about whether such a profile exists.
+pub fn profile_name_in_arn(arn: &str) -> Option<&str> {
+    // `arn : partition : service : region : account : resource`, and the resource
+    // is the remainder because it carries `:` of its own in other ARN forms.
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    if fields.next()?.is_empty() {
+        return None;
+    }
+    if fields.next()? != "signer" {
+        return None;
+    }
+    // Region and account: present, and non-empty for a profile ARN (Signer is a
+    // regional service and a profile belongs to one account).
+    if fields.next()?.is_empty() || fields.next()?.is_empty() {
+        return None;
+    }
+    let name = fields.next()?.strip_prefix(PROFILE_ARN_RESOURCE_PREFIX)?;
+    is_profile_name(name).then_some(name)
+}
+
+/// Why a tagging call could not reach a signing profile through its
+/// `resourceArn`.
+///
+/// The two cases answer DIFFERENT modelled errors, which is why they are told
+/// apart: a label that is not a signing-profile ARN at all is a bad request
+/// (`BadRequestException`, "The request contains invalid parameters for the ARN or
+/// tags"), while a well-formed ARN naming no stored profile is a missing resource
+/// (`NotFoundException`, "The signing profile was not found").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggingArnProblem {
+    /// `resourceArn` is not a signing-profile ARN.
+    Malformed,
+    /// A signing-profile ARN, but this account holds no such profile in that
+    /// region.
+    NoSuchProfile,
+}
+
+impl TaggingArnProblem {
+    /// The `code` a client branches on — the condition that was refused.
+    pub fn error_code(self) -> &'static str {
+        match self {
+            Self::Malformed => ERROR_CODE_BAD_REQUEST,
+            Self::NoSuchProfile => ERROR_CODE_PROFILE_NOT_FOUND,
+        }
+    }
+
+    /// The prose beside the code, built from the request's own ARN.
+    pub fn message(self, resource_arn: &str) -> String {
+        match self {
+            Self::Malformed => {
+                format!("{resource_arn} is not a valid signing profile resource ARN")
+            }
+            Self::NoSuchProfile => {
+                format!("profile with arn {resource_arn} does not exists")
+            }
+        }
+    }
+}
+
+/// The first key of `keys` that carries [`RESERVED_TAG_KEY_PREFIX`], or `None`
+/// when none does.
+pub fn reserved_tag_key<'a, I>(keys: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    keys.into_iter()
+        .find(|key| key.starts_with(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The refusal prose for a tag key inside AWS's reserved namespace.
+pub fn reserved_tag_key_message(key: &str) -> String {
+    format!("tag key {key} is in the reserved prefix {RESERVED_TAG_KEY_PREFIX}")
+}
+
+/// The refusal prose for a tag write that would leave a profile holding more
+/// tags than [`MAX_TAGS_PER_PROFILE`].
+pub fn too_many_tags_message(resulting: usize) -> String {
+    format!(
+        "a signing profile holds at most {MAX_TAGS_PER_PROFILE} tags; this request would leave \
+         it holding {resulting}"
+    )
+}
+
+/// The refusal prose for a tag write on a profile whose status forbids it.
+pub fn tag_write_refused_message(profile_name: &str, status: &str) -> String {
+    format!(
+        "Signing Profile {profile_name} cannot be tagged because it is {status}. \
+         A {status} profile cannot be tagged."
     )
 }
 

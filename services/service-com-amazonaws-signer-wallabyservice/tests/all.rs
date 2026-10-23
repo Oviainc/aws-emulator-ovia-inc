@@ -17,6 +17,9 @@ mod error_responses;
 #[path = "all/profile_revocation_and_identity.rs"]
 mod profile_revocation_and_identity;
 
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
+
 #[path = "all/signing_profile_lifecycle.rs"]
 mod signing_profile_lifecycle;
 
