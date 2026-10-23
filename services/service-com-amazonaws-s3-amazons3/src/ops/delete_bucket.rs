@@ -5,7 +5,9 @@
 //!
 //! "All objects ... in the bucket must be deleted before the bucket itself can be
 //! deleted": a non-empty bucket is refused with `BucketNotEmpty` (409), which S3
-//! documents but its Smithy model declares no shape for — see `crate::scaffolded`.
+//! documents but its Smithy model declares no shape for — see `crate::scaffolded`. A
+//! bucket another emulated service provisioned as the object store of one of its own
+//! resources is refused too, with `AccessDenied` (403): that service owns its lifecycle.
 //!
 //! ## Shape of an operation
 //!
@@ -198,6 +200,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let bucket = store
             .bucket(&input.bucket)
             .ok_or(DeleteBucketErrorModeled::NoSuchBucket(NoSuchBucket {}))?;
+
+        // A bucket another emulated service provisioned as the object store of one of ITS
+        // resources (a Lightsail bucket — `Bucket::provisioned_by`) is deleted by that
+        // service, with the resource it belongs to: AWS holds such a bucket in a
+        // service-managed account, so the caller's own S3 credentials do not get to end
+        // its life, and removing it here would leave that service's control plane
+        // reporting a resource whose object store is gone. This service still SERVES its
+        // objects, which is what provisioning it is for; it just does not own it, which is
+        // what `AccessDenied` (403) says — a code the model carries no shape for.
+        if let Some(provisioned_by) = bucket.provisioned_by() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                format!(
+                    "This bucket is managed by {provisioned_by} and can only be deleted \
+                     through that service"
+                ),
+            ));
+        }
 
         // Every object must be deleted first, so a bucket that still holds one is
         // refused and keeps its objects.
