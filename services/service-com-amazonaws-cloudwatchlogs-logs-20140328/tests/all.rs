@@ -19,6 +19,8 @@ mod data_protection_policy;
 mod deletion_protection;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/import_tasks.rs"]
+mod import_tasks;
 #[path = "all/ingestion_window.rs"]
 mod ingestion_window;
 #[path = "all/log_core_loop.rs"]
