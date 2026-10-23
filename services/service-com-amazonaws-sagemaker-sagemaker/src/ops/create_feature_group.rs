@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFeatureGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFeatureGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFeatureGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers a feature group in `crate::state` under its
+//! `FeatureGroupName`, minting the `FeatureGroupArn` from the request's region, refusing
+//! a name already in use with the modelled `ResourceInUse` and a schema that cannot
+//! hold together with a 400 `ValidationException`. The group is stored `Creating` and
+//! the clock owes it `Created` (see [`crate::state::FEATURE_GROUP_CREATED_AFTER`]), which
+//! `DescribeFeatureGroup` materialises. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +200,262 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFeatureGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFeatureGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFeatureGroup"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // Every rule the model states about the schema, checked before anything is
+        // stored: a refused create leaves the state exactly as it was.
+        validate_schema(&input)?;
+
+        let region = crate::state::request_region(ctx);
+        let arn =
+            crate::state::resource_arn(&region, FEATURE_GROUP_ARN_KIND, &input.feature_group_name);
+
+        let mut store = state.lock();
+        // "The name must be unique within an Amazon Web Services Region in an Amazon Web
+        // Services account" (`FeatureGroupName`), so a name already in use is refused
+        // with the modelled in-use error and the stored group is left untouched — never
+        // overwritten, which would hand a 200 back for a group the caller did not create.
+        // Checked BEFORE the quota: a create that takes a name already taken adds no
+        // record, so the limit is not what is wrong with it.
+        if store.feature_groups.contains_key(&input.feature_group_name) {
+            return Err(CreateFeatureGroupErrorModeled::ResourceInUse(ResourceInUse {
+                // The crate's one wording for this refusal: SageMaker answers the same
+                // sentence whatever resource kind and name the caller asked for, and
+                // does not repeat the name back.
+                message: Some(crate::state::RESOURCE_IN_USE_MESSAGE.to_string()),
+            })
+            .into());
+        }
+        // The store is bounded, so a caller varying `FeatureGroupName` cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.feature_groups_below_quota() {
+            return Err(CreateFeatureGroupErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for feature groups is {}, with \
+                         current utilization of {} and a request delta of 1.",
+                        crate::state::FEATURE_GROUP_QUOTA,
+                        store.feature_groups.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        store.feature_groups.insert(
+            input.feature_group_name.clone(),
+            crate::state::FeatureGroup {
+                name: input.feature_group_name.clone(),
+                arn: arn.clone(),
+                record_identifier_feature_name: input.record_identifier_feature_name,
+                event_time_feature_name: input.event_time_feature_name,
+                feature_definitions: input.feature_definitions,
+                online_store_config: input.online_store_config,
+                offline_store_config: input.offline_store_config,
+                throughput_config: input.throughput_config,
+                role_arn: input.role_arn,
+                description: input.description,
+                tags: input.tags.unwrap_or_default(),
+                // A feature group AWS has just accepted is not provisioned yet: it is
+                // `Creating` until the clock owes it `Created`.
+                status: crate::state::FEATURE_GROUP_STATUS_CREATING.to_string(),
+                creation_time: now,
+                last_modified_time: now,
+                created_due_at: now + crate::state::FEATURE_GROUP_CREATED_AFTER,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateFeatureGroupOutput {
+            feature_group_arn: arn,
+        })
     }
+}
+
+/// The `<kind>` component of a feature group's ARN, from `FeatureGroupArn`'s pattern
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:feature-group/`).
+pub const FEATURE_GROUP_ARN_KIND: &str = "feature-group";
+
+/// The `FeatureType`s an `EventTime` feature may have: "An EventTime can be a String or
+/// Fractional" (`EventTimeFeatureName`'s doc). Both spellings are members of the model's
+/// `FeatureType` enum (`FEATURE_TYPE_VALUES`).
+const EVENT_TIME_FEATURE_TYPES: &[&str] = &["Fractional", "String"];
+
+/// The `ThroughputMode` that bills against stated capacity, as the model's
+/// `ThroughputMode` enum spells it (`THROUGHPUT_MODE_VALUES`).
+const THROUGHPUT_MODE_PROVISIONED: &str = "Provisioned";
+
+/// Refuse a request whose schema cannot hold together.
+///
+/// Every rule here is one the model states and the boundary validator cannot express:
+/// the member constraints (lengths, patterns, list sizes) are already enforced before
+/// `handle` runs, but a cross-member rule is not, and neither is an enum-typed member,
+/// which reaches a handler as a plain string.
+///
+/// All of them refuse with 400 `ValidationException` — the code the real service answers
+/// for a request it understood and will not accept. This operation's own two modelled
+/// errors each say something else (a name in use, a quota), so neither fits.
+fn validate_schema(input: &CreateFeatureGroupInput) -> Result<(), CreateFeatureGroupError> {
+    // "You must include at least one of OnlineStoreConfig and OfflineStoreConfig to
+    // create a FeatureGroup." (CreateFeatureGroup's own doc.)
+    if input.online_store_config.is_none() && input.offline_store_config.is_none() {
+        return Err(crate::scaffolded::Scaffolded::validation(
+            "You must include at least one of OnlineStoreConfig and OfflineStoreConfig \
+             to create a FeatureGroup.",
+        ));
+    }
+
+    // `RoleArn` is "the IAM execution role used to persist data into the OfflineStore if
+    // an OfflineStoreConfig is provided": with an offline store and no role there is
+    // nothing the replication could run as, so the group cannot be created.
+    if input.offline_store_config.is_some() && input.role_arn.is_none() {
+        return Err(crate::scaffolded::Scaffolded::validation(
+            "RoleArn must be provided when OfflineStoreConfig is provided: it is the IAM \
+             execution role used to persist data into the OfflineStore.",
+        ));
+    }
+
+    let mut declared: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+    for definition in &input.feature_definitions {
+        enum_member(
+            "FeatureDefinitions.FeatureType",
+            &definition.feature_type,
+            FEATURE_TYPE_VALUES,
+        )?;
+        if let Some(collection_type) = &definition.collection_type {
+            enum_member(
+                "FeatureDefinitions.CollectionType",
+                collection_type,
+                COLLECTION_TYPE_VALUES,
+            )?;
+        }
+        if crate::state::RESERVED_FEATURE_NAMES.contains(&definition.feature_name.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "FeatureDefinitions.FeatureName: '{}' is reserved by the FeatureStore and \
+                 cannot name a feature; the reserved names are {}.",
+                definition.feature_name,
+                crate::state::RESERVED_FEATURE_NAMES.join(", ")
+            )));
+        }
+        // One name per feature: the group's schema is a map from feature name to type,
+        // so a repeated name has neither a single type nor a single column in the
+        // record it describes.
+        if !declared.insert(definition.feature_name.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "FeatureDefinitions.FeatureName: '{}' is declared more than once; each \
+                 feature name must be unique within a FeatureGroup.",
+                definition.feature_name
+            )));
+        }
+    }
+
+    // "RecordIdentifierFeatureName must be one of feature definitions' names", and an
+    // `EventTime` is likewise a feature of the record, so each must name a declared one.
+    if !declared.contains(input.record_identifier_feature_name.as_str()) {
+        return Err(crate::scaffolded::Scaffolded::validation(format!(
+            "RecordIdentifierFeatureName: '{}' is not one of the FeatureDefinitions' names.",
+            input.record_identifier_feature_name
+        )));
+    }
+    let Some(event_time) = input
+        .feature_definitions
+        .iter()
+        .find(|definition| definition.feature_name == input.event_time_feature_name)
+    else {
+        return Err(crate::scaffolded::Scaffolded::validation(format!(
+            "EventTimeFeatureName: '{}' is not one of the FeatureDefinitions' names.",
+            input.event_time_feature_name
+        )));
+    };
+    // "An EventTime can be a String or Fractional" (`EventTimeFeatureName`): an
+    // `Integral` event-time feature carries no instant the FeatureStore would read.
+    if !EVENT_TIME_FEATURE_TYPES.contains(&event_time.feature_type.as_str()) {
+        return Err(crate::scaffolded::Scaffolded::validation(format!(
+            "EventTimeFeatureName: the feature '{}' is {}; an EventTime feature must be \
+             one of {}.",
+            event_time.feature_name,
+            event_time.feature_type,
+            EVENT_TIME_FEATURE_TYPES.join(", ")
+        )));
+    }
+
+    if let Some(online_store) = &input.online_store_config {
+        if let Some(storage_type) = &online_store.storage_type {
+            enum_member(
+                "OnlineStoreConfig.StorageType",
+                storage_type,
+                STORAGE_TYPE_VALUES,
+            )?;
+        }
+        if let Some(unit) = online_store
+            .ttl_duration
+            .as_ref()
+            .and_then(|ttl| ttl.unit.as_ref())
+        {
+            enum_member(
+                "OnlineStoreConfig.TtlDuration.Unit",
+                unit,
+                TTL_DURATION_UNIT_VALUES,
+            )?;
+        }
+    }
+
+    if let Some(table_format) = input
+        .offline_store_config
+        .as_ref()
+        .and_then(|offline_store| offline_store.table_format.as_ref())
+    {
+        enum_member(
+            "OfflineStoreConfig.TableFormat",
+            table_format,
+            TABLE_FORMAT_VALUES,
+        )?;
+    }
+
+    if let Some(throughput) = &input.throughput_config {
+        enum_member(
+            "ThroughputConfig.ThroughputMode",
+            &throughput.throughput_mode,
+            THROUGHPUT_MODE_VALUES,
+        )?;
+        // "With provisioned throughput mode, you specify the read and write capacity per
+        // second that you expect your application to require" (`ThroughputConfig`), so a
+        // provisioned group stating neither has no capacity to be billed for or to
+        // throttle against.
+        if throughput.throughput_mode == THROUGHPUT_MODE_PROVISIONED
+            && (throughput.provisioned_read_capacity_units.is_none()
+                || throughput.provisioned_write_capacity_units.is_none())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "ThroughputConfig: {THROUGHPUT_MODE_PROVISIONED} throughput mode requires \
+                 both ProvisionedReadCapacityUnits and ProvisionedWriteCapacityUnits."
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Refuse an enum-typed member carrying a value the model does not declare.
+///
+/// An enum reaches a handler as a plain string, and a value outside the enum changes
+/// what the operation would do (an unknown `StorageType` is not "the default tier", an
+/// unknown `ThroughputMode` is not "on demand"), so it is refused rather than read as
+/// "not the value I compare against". `declared` is always the generated `*_VALUES` list
+/// in `ops::types`, i.e. the model's own value list.
+fn enum_member(
+    member: &str,
+    value: &str,
+    declared: &[&str],
+) -> Result<(), CreateFeatureGroupError> {
+    if declared.contains(&value) {
+        return Ok(());
+    }
+    Err(crate::scaffolded::Scaffolded::validation(format!(
+        "{member}: '{value}' is not one of the accepted values; expected one of {}.",
+        declared.join(", ")
+    )))
 }
