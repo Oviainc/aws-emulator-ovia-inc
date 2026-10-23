@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGlossaryTerm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGlossaryTerm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGlossaryTerm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a business glossary term under a PERSISTED glossary of a persisted, available
+//! domain and stores it there, so `GetGlossaryTerm` answers from the stored record and
+//! the term disappears with its domain.
+//!
+//! The documented prerequisites are enforced against the store, not assumed: the domain
+//! must exist and be available, the glossary must be one of that domain's, the term name
+//! must be unique within THAT glossary, and every term a `termRelations` names must be a
+//! term stored in the same domain.
+//!
+//! `GlossaryTermStatus` has no in-progress member, so a created term is settled at once
+//! and owes the clock no transition.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +194,201 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGlossaryTerm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGlossaryTermErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGlossaryTerm"))
+        use crate::state::{
+            caller_principal, now_ms, stored_term_relations, term_usage_restrictions,
+            GlossaryTerm, IdempotencyKey, ResourceKind, DOMAIN_STATUS_AVAILABLE,
+            GLOSSARY_TERM_STATUS_ENABLED,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateGlossaryTermErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // The `@idempotencyToken`: a repeat of the SAME request returns the term the
+        // first one created, so a retry never leaves two terms behind. Resolved BEFORE
+        // the state checks below on purpose: a replay reports what the first request
+        // already created, whatever the domain has done since.
+        if let Some(existing) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.idempotent_glossary_term(&input.domain_identifier, token))
+        {
+            let restrictions = store
+                .domains
+                .get(&input.domain_identifier)
+                .and_then(|domain| term_usage_restrictions(domain, &existing.glossary_id));
+            return Ok(term_output(existing, restrictions));
+        }
+
+        // The documented prerequisites, in order. This operation DOES model
+        // `ResourceNotFoundException` (smithy_query operation="CreateGlossaryTerm"), so a
+        // domain or a glossary that is not stored is answered with that 404 rather than
+        // with the access error `CreateGlossary` has to use.
+        let domain = store
+            .live_domain(&input.domain_identifier)
+            .ok_or_else(|| {
+                CreateGlossaryTermErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: ResourceKind::Domain.not_found_message(),
+                    },
+                )
+            })?;
+        // A domain still being created cannot take a term: the request conflicts with
+        // the status the domain currently reports.
+        if domain.status != DOMAIN_STATUS_AVAILABLE {
+            return Err(CreateGlossaryTermErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Domain {} is {}, so it cannot accept a glossary term",
+                    input.domain_identifier, domain.status
+                ),
+            })
+            .into());
+        }
+        // The term is an entry of a glossary IN that domain; a glossary that is not
+        // there cannot hold one.
+        if !domain.glossaries.contains_key(&input.glossary_identifier) {
+            return Err(CreateGlossaryTermErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: ResourceKind::Glossary.not_found_message(),
+                },
+            )
+            .into());
+        }
+        // The name is unique WITHIN THE GLOSSARY, so the same name under another
+        // glossary of the same domain is a different term while a repeat under this one
+        // conflicts.
+        if let Some(clash) = domain.glossary_terms.values().find(|term| {
+            term.glossary_id == input.glossary_identifier && term.name == input.name
+        }) {
+            return Err(CreateGlossaryTermErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Glossary term {} already uses this name in glossary {}",
+                    clash.id, input.glossary_identifier
+                ),
+            })
+            .into());
+        }
+        // A relation points at ANOTHER TERM ("Terms can also have relationships with
+        // other terms", smithy_query doc operation="CreateGlossaryTerm"), so every id a
+        // `termRelations` names has to resolve to a term of this domain: a relation to
+        // something that is not a term would otherwise be reported back as one.
+        let term_relations = stored_term_relations(input.term_relations);
+        if term_relations
+            .related_term_ids()
+            .any(|related| !domain.glossary_terms.contains_key(related))
+        {
+            return Err(CreateGlossaryTermErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: ResourceKind::GlossaryTerm.not_found_message(),
+                },
+            )
+            .into());
+        }
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without limit; the refusal is the error the operation already models.
+        if domain.glossary_terms.len() >= crate::state::MAX_GLOSSARY_TERMS_PER_DOMAIN {
+            return Err(CreateGlossaryTermErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator stores at most {} glossary terms in one domain",
+                        crate::state::MAX_GLOSSARY_TERMS_PER_DOMAIN
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_id(now);
+        let term = GlossaryTerm {
+            id: id.clone(),
+            domain_id: input.domain_identifier.clone(),
+            glossary_id: input.glossary_identifier.clone(),
+            name: input.name,
+            short_description: input.short_description,
+            long_description: input.long_description,
+            // `GlossaryTermStatus` is ENABLED | DISABLED (smithy_query
+            // shape="GlossaryTermStatus") and both `CreateGlossaryTermOutput` and
+            // `GetGlossaryTermOutput` report it as REQUIRED, so a request that names no
+            // status still has one: the term it just created is usable, which is the
+            // ENABLED member.
+            status: input
+                .status
+                .unwrap_or_else(|| GLOSSARY_TERM_STATUS_ENABLED.to_string()),
+            term_relations,
+            created_by: caller_principal(ctx),
+            created_at_ms: now,
+            // Nothing has updated the term yet.
+            updated_by: None,
+            updated_at_ms: None,
+        };
+
+        // The domain was read under this same lock a few lines up, so it is still there;
+        // if it somehow were not, the term would be dropped while the response said it
+        // was created, so that impossible case is answered as a server fault rather than
+        // silently.
+        let Some(stored_domain) = store.domains.get_mut(&input.domain_identifier) else {
+            return Err(CreateGlossaryTermErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!(
+                        "Domain {} disappeared while the glossary term was being stored",
+                        input.domain_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+        // `mint_id` never repeats within one process, so this slot is vacant; were it
+        // ever not, inserting would silently replace a stored term, so that is refused
+        // loudly instead.
+        if stored_domain.glossary_terms.contains_key(&id) {
+            return Err(CreateGlossaryTermErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!("the minted glossary term id {id} is already in use"),
+                },
+            )
+            .into());
+        }
+        stored_domain.glossary_terms.insert(id.clone(), term);
+        // Built from the record that was actually stored, so a 201 can never report a
+        // term this call did not persist.
+        let restrictions = term_usage_restrictions(stored_domain, &input.glossary_identifier);
+        let output = term_output(&stored_domain.glossary_terms[&id], restrictions);
+        // Recorded AFTER the term is stored: the bound this applies releases a token
+        // whose resource is not in the store.
+        if let Some(token) = input.client_token {
+            store.record_idempotency(
+                IdempotencyKey::glossary_term(&input.domain_identifier, &token),
+                id,
+                now,
+            );
+        }
+        Ok(output)
+    }
+}
+
+/// Render a stored glossary term as this operation's response.
+///
+/// Every member is read off the stored record, so the response a retry gets (through the
+/// idempotency token) is the response the first call got. `usage_restrictions` is the
+/// owning glossary's, resolved by `crate::state::term_usage_restrictions`.
+fn term_output(
+    term: &crate::state::GlossaryTerm,
+    usage_restrictions: Option<Vec<String>>,
+) -> CreateGlossaryTermOutput {
+    CreateGlossaryTermOutput {
+        id: term.id.clone(),
+        domain_id: term.domain_id.clone(),
+        glossary_id: term.glossary_id.clone(),
+        name: term.name.clone(),
+        status: term.status.clone(),
+        short_description: term.short_description.clone(),
+        long_description: term.long_description.clone(),
+        term_relations: crate::state::term_relations_output(&term.term_relations),
+        usage_restrictions,
     }
 }

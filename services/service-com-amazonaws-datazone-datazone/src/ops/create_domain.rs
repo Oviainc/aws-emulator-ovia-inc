@@ -317,6 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             assets: std::collections::BTreeMap::new(),
             policy_grants: std::collections::BTreeMap::new(),
             glossaries: std::collections::BTreeMap::new(),
+            glossary_terms: std::collections::BTreeMap::new(),
             asset_types: std::collections::BTreeMap::new(),
             domain_units: std::collections::BTreeMap::new(),
             listings: std::collections::BTreeMap::new(),
