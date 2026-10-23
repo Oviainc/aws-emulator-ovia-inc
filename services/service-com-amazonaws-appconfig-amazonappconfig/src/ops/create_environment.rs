@@ -168,6 +168,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // Every tag key this request would store is checked through the same function
+        // `TagResource` refuses through, and before anything is written.
+        if let Some(reason) = input
+            .tags
+            .as_ref()
+            .and_then(crate::state::first_tag_key_rejection)
+        {
+            return Err(CreateEnvironmentErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(reason),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
 
         // An environment only exists under an application, so the parent is resolved

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assigns metadata to the AppConfig resource `ResourceArn` addresses: the pairs the
+//! request names are MERGED into the tag map that resource already carries, so a key the
+//! request names is set or overwritten and a key it does not name keeps the value it had.
+//! The resource is resolved out of this service's own store
+//! ([`crate::state::ComAmazonawsAppconfigAmazonappconfigState::tags_of_mut`]), and an ARN
+//! that addresses no resource this service holds is `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +70,32 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Refuse the request with this service's client-input error, `BadRequestException`
+/// (HTTP 400): "The input fails to satisfy the constraints specified by an Amazon Web
+/// Services service." `detail` states what was unacceptable.
+fn bad_request(detail: String) -> TagResourceError {
+    TagResourceErrorModeled::BadRequestException(BadRequestException {
+        message: Some(detail),
+        reason: None,
+        details: None,
+    })
+    .into()
+}
+
+/// The modelled 404 for a `ResourceArn` that addresses no resource this service holds:
+/// `ResourceNotFoundException`, "The requested resource could not be found."
+/// `ListTagsForResource` and `UntagResource` resolve the ARN through the same
+/// [`crate::state`] lookup and refuse an unresolvable one the same way.
+fn not_found(resource_arn: &str) -> TagResourceError {
+    TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "No AppConfig resource is addressed by {resource_arn}."
+        )),
+        resource_name: Some(resource_arn.to_string()),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -165,20 +189,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // The resource is resolved FIRST, so an ARN that addresses nothing answers 404
+        // whatever else the request carries — the same answer `ListTagsForResource` and
+        // `UntagResource` give for that ARN.
+        let tags = store
+            .tags_of_mut(&input.resource_arn)
+            .ok_or_else(|| not_found(&input.resource_arn))?;
+
+        // `TagMap`'s KEY constraints are not part of the schema walk, so the keys reach
+        // this handler unchecked against the bounds `TagKey` and the member's own
+        // documentation state; every key is checked BEFORE anything is written, so a
+        // refused call stores none of the pairs.
+        if let Some(reason) = crate::state::first_tag_key_rejection(&input.tags) {
+            return Err(bad_request(reason));
+        }
+
+        // The merged set is what the resource will carry, so it is the set the
+        // tags-per-resource bound applies to — a key the request re-states does not grow
+        // it. Checked before the first insert, so a refused call changes nothing.
+        let merged_entries = tags.len()
+            + input
+                .tags
+                .keys()
+                .filter(|key| !tags.contains_key(*key))
+                .count();
+        if merged_entries > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(bad_request(format!(
+                "A resource keeps at most {} tags; tagging {} with these keys would give it \
+                 {merged_entries}.",
+                crate::state::MAX_TAGS_PER_RESOURCE,
+                input.resource_arn
+            )));
+        }
+
+        // Metadata is ASSIGNED, not replaced: the named keys are added or overwritten in
+        // place and every other key the resource carries keeps the value it had.
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput)
     }
 }

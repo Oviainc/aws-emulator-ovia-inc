@@ -114,6 +114,180 @@ pub const HOSTED_LOCATION_URI: &str = "hosted";
 /// `AWS.Freeform`."
 pub const CONFIGURATION_PROFILE_TYPES: &[&str] = &["AWS.AppConfig.FeatureFlags", "AWS.Freeform"];
 
+/// This service's namespace in an ARN: the third colon-separated section of every ARN
+/// that addresses an AppConfig resource. An ARN naming any other service addresses no
+/// resource this service holds.
+pub const SERVICE_NAMESPACE: &str = "appconfig";
+
+/// The most tags ONE resource keeps, however many tag calls fill it: "You can specify a
+/// maximum of 50 tags for a resource" (`TagResource`'s own documentation,
+/// `smithy_query(query="operation",operation="TagResource")`).
+///
+/// The model bounds a single request's `TagMap` at 50 entries, which the boundary
+/// validator already enforces; this is the bound on the MERGED map the resource carries,
+/// so a sequence of tag calls cannot grow one past what a single call could set. A write
+/// past it is refused with `BadRequestException` — "the input fails to satisfy the
+/// constraints specified by an Amazon Web Services service".
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The longest tag key this service stores: "The tag key can be up to 128 characters"
+/// (`smithy_query(query="doc",shape="TagResourceRequest",member="Tags")`), which is also
+/// the length the model's own `TagKey` shape declares (`length 1..128`).
+pub const MAX_TAG_KEY_LENGTH: usize = 128;
+
+/// The longest tag value this service stores: "The tag value can be up to 256
+/// characters" (same member doc as [`MAX_TAG_KEY_LENGTH`]), which the model's `TagValue`
+/// shape declares as `length 0..256`.
+///
+/// Named here for the readers that state the bound; nothing enforces it in a handler,
+/// because the schema walk refuses a longer value with `ValidationException` BEFORE the
+/// handler runs.
+pub const MAX_TAG_VALUE_LENGTH: usize = 256;
+
+/// The key prefix AWS reserves for its own tags: a tag key "must not start with `aws:`"
+/// (same member doc as [`MAX_TAG_KEY_LENGTH`]).
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Why `key` is not a tag key this service stores, or `None` when it is.
+///
+/// This is only what the schema walk does NOT already refuse. `TagMap`'s VALUE is a
+/// constrained `TagValue` (`length 0..256`), so a value longer than
+/// [`MAX_TAG_VALUE_LENGTH`] never reaches a handler; a map KEY's constraints are not part
+/// of that walk, so `TagKey`'s own `length 1..128` is enforced here, together with the
+/// reserved prefix the member's documentation states and the model carries no trait for.
+/// The length counts CHARACTERS, as the documentation does.
+///
+/// The character set the same sentence lists (`[a-zA-Z+-=._:/]`) is NOT enforced: it omits
+/// the digits and spaces AWS's tag-naming rules allow on every taggable resource, so
+/// refusing on it would reject keys the service accepts. Every operation that writes tags
+/// — `TagResource` and the `Tags` member of each create — refuses through this one
+/// function, so the create side and the tagging side cannot drift apart.
+pub fn tag_key_rejection(key: &str) -> Option<String> {
+    if key.is_empty() {
+        return Some("A tag key must not be empty.".to_string());
+    }
+    if key.starts_with(RESERVED_TAG_KEY_PREFIX) {
+        return Some(format!(
+            "Tag key {key:?} starts with {RESERVED_TAG_KEY_PREFIX:?}, which Amazon Web \
+             Services reserves for its own tags."
+        ));
+    }
+    let key_length = key.chars().count();
+    if key_length > MAX_TAG_KEY_LENGTH {
+        return Some(format!(
+            "Tag key {key:?} is {key_length} characters long; a tag key may have at most \
+             {MAX_TAG_KEY_LENGTH} characters."
+        ));
+    }
+    None
+}
+
+/// The first key of `tags` this service will not store, as [`tag_key_rejection`] words it.
+pub fn first_tag_key_rejection(tags: &HashMap<String, String>) -> Option<String> {
+    // Sorted, so a request carrying two unacceptable keys is refused with the same
+    // wording whichever order the map happened to iterate in.
+    let mut keys: Vec<&String> = tags.keys().collect();
+    keys.sort();
+    keys.into_iter().find_map(|key| tag_key_rejection(key))
+}
+
+/// A resource one of this service's tag operations can address, as the resource portion
+/// of its ARN names it.
+///
+/// One variant per resource whose tag map this service PERSISTS. AppConfig's ARN resource
+/// portions are `/`-separated type/id pairs rooted at the owning application
+/// (`application/<id>`, `application/<id>/environment/<id>`,
+/// `application/<id>/configurationprofile/<id>`,
+/// `application/<id>/environment/<id>/deployment/<number>`), which is what
+/// [`parse_resource_arn`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedResource<'arn> {
+    /// `application/<application id>`.
+    Application { application_id: &'arn str },
+    /// `application/<application id>/environment/<environment id>`.
+    Environment {
+        application_id: &'arn str,
+        environment_id: &'arn str,
+    },
+    /// `application/<application id>/configurationprofile/<profile id>`.
+    ConfigurationProfile {
+        application_id: &'arn str,
+        configuration_profile_id: &'arn str,
+    },
+    /// `application/<application id>/environment/<environment id>/deployment/<number>`.
+    Deployment {
+        application_id: &'arn str,
+        environment_id: &'arn str,
+        deployment_number: i32,
+    },
+}
+
+/// The resource `resource_arn` addresses, or `None` when it addresses nothing whose tags
+/// this service holds.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`; the partition,
+/// region and account sections are not discriminating here (this emulator presents ONE
+/// account, [`::engine::EMULATOR_ACCOUNT_ID`], and its store is not partitioned by
+/// region), so what is read is the service namespace — which must be
+/// [`SERVICE_NAMESPACE`] — and the resource portion. An ARN naming an AppConfig resource
+/// type whose tags this service does not persist (a deployment strategy, a hosted
+/// configuration version, an extension or an extension association: no record this
+/// service stores for one carries a tag map) answers `None`, exactly as an ARN naming a
+/// resource that does not exist does.
+pub fn parse_resource_arn(resource_arn: &str) -> Option<TaggedResource<'_>> {
+    let mut sections = resource_arn.splitn(6, ':');
+    let prefix = sections.next()?;
+    let partition = sections.next()?;
+    let service = sections.next()?;
+    let _region = sections.next()?;
+    let _account = sections.next()?;
+    let resource = sections.next()?;
+    // The model's `Arn` pattern allows an empty partition, so only a non-empty one is
+    // checked against the `aws` family it constrains partitions to.
+    if prefix != "arn" || service != SERVICE_NAMESPACE {
+        return None;
+    }
+    if !partition.is_empty() && !partition.starts_with("aws") {
+        return None;
+    }
+
+    let segments: Vec<&str> = resource.split('/').collect();
+    let named = |id: &str| !id.is_empty();
+    match segments.as_slice() {
+        ["application", application_id] if named(application_id) => {
+            Some(TaggedResource::Application { application_id })
+        }
+        ["application", application_id, "environment", environment_id]
+            if named(application_id) && named(environment_id) =>
+        {
+            Some(TaggedResource::Environment {
+                application_id,
+                environment_id,
+            })
+        }
+        ["application", application_id, "configurationprofile", configuration_profile_id]
+            if named(application_id) && named(configuration_profile_id) =>
+        {
+            Some(TaggedResource::ConfigurationProfile {
+                application_id,
+                configuration_profile_id,
+            })
+        }
+        ["application", application_id, "environment", environment_id, "deployment", number]
+            if named(application_id) && named(environment_id) =>
+        {
+            Some(TaggedResource::Deployment {
+                application_id,
+                environment_id,
+                // AppConfig numbers a deployment, so a resource portion whose last
+                // segment is not a deployment number addresses no deployment.
+                deployment_number: number.parse().ok()?,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// The floor on a deployment's rollout window.
 ///
 /// `AppConfig.AllAtOnce` has a deployment duration of 0 minutes, so its rollout would
@@ -744,6 +918,103 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
     /// Bytes of hosted configuration content this service is currently holding.
     pub fn hosted_configuration_bytes(&self) -> usize {
         self.hosted_configuration_bytes
+    }
+
+    /// The tags the resource `resource_arn` addresses carries, or `None` when this
+    /// service holds no such resource.
+    ///
+    /// Every resource whose tag map this service persists already owns it — a tag is part
+    /// of the resource record a create wrote, not a separate store — so a tag call
+    /// resolves its `ResourceArn` ([`parse_resource_arn`]) and reads the map in place.
+    /// There is no second copy of a resource's tags anywhere.
+    pub fn tags_of(&self, resource_arn: &str) -> Option<&HashMap<String, String>> {
+        match parse_resource_arn(resource_arn)? {
+            TaggedResource::Application { application_id } => {
+                Some(&self.applications.get(application_id)?.tags)
+            }
+            TaggedResource::Environment {
+                application_id,
+                environment_id,
+            } => Some(
+                &self
+                    .applications
+                    .get(application_id)?
+                    .environments
+                    .get(environment_id)?
+                    .tags,
+            ),
+            TaggedResource::ConfigurationProfile {
+                application_id,
+                configuration_profile_id,
+            } => Some(
+                &self
+                    .applications
+                    .get(application_id)?
+                    .profiles
+                    .get(configuration_profile_id)?
+                    .tags,
+            ),
+            TaggedResource::Deployment {
+                application_id,
+                environment_id,
+                deployment_number,
+            } => Some(
+                &self
+                    .applications
+                    .get(application_id)?
+                    .environments
+                    .get(environment_id)?
+                    .deployments
+                    .get(&deployment_number)?
+                    .tags,
+            ),
+        }
+    }
+
+    /// The tags of the resource `resource_arn` addresses, for a tag write. Resolves
+    /// exactly the ARNs [`ComAmazonawsAppconfigAmazonappconfigState::tags_of`] resolves.
+    pub fn tags_of_mut(&mut self, resource_arn: &str) -> Option<&mut HashMap<String, String>> {
+        match parse_resource_arn(resource_arn)? {
+            TaggedResource::Application { application_id } => {
+                Some(&mut self.applications.get_mut(application_id)?.tags)
+            }
+            TaggedResource::Environment {
+                application_id,
+                environment_id,
+            } => Some(
+                &mut self
+                    .applications
+                    .get_mut(application_id)?
+                    .environments
+                    .get_mut(environment_id)?
+                    .tags,
+            ),
+            TaggedResource::ConfigurationProfile {
+                application_id,
+                configuration_profile_id,
+            } => Some(
+                &mut self
+                    .applications
+                    .get_mut(application_id)?
+                    .profiles
+                    .get_mut(configuration_profile_id)?
+                    .tags,
+            ),
+            TaggedResource::Deployment {
+                application_id,
+                environment_id,
+                deployment_number,
+            } => Some(
+                &mut self
+                    .applications
+                    .get_mut(application_id)?
+                    .environments
+                    .get_mut(environment_id)?
+                    .deployments
+                    .get_mut(&deployment_number)?
+                    .tags,
+            ),
+        }
     }
 }
 

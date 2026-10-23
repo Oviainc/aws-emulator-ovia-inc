@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/appconfig_workflow.rs"]
 mod appconfig_workflow;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_configuration_profile.rs"]

@@ -42,6 +42,8 @@ pub(crate) fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRou
 }
 
 /// A router over a fresh engine, for a suite that needs no direct state access.
+///
+/// `pub(crate)` because the other suites in this target drive the same front door.
 pub(crate) fn router() -> MultiServiceRouter {
     router_on(&Arc::new(engine::InMemoryEngine::new()))
 }
