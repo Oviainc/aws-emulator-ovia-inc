@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetManagedThingCapabilities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetManagedThingCapabilities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetManagedThingCapabilities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Projects the capability members of the record `crate::state`'s `managed_things` store
+//! holds under `Identifier` onto this operation's output shape: the `Capabilities` and
+//! `CapabilityReport` that `CreateManagedThing` / `UpdateManagedThing` last wrote, beside
+//! the record's own id. `@readonly` — a reporting operation, it never writes.
+//!
+//! The capabilities of a device are a resource of their own, so a request that names no
+//! capabilities this service holds is refused with `ResourceNotFoundException` (404) —
+//! "The specified resource does not exist" — and its reason says which of the two
+//! absences it is: the region's store holds no managed thing under `Identifier` at all
+//! (the read-path reason every read of this service shares), or the thing it holds was
+//! never given either capability member (`Managed Thing capabilities not found`, as a
+//! recorded `GetManagedThingCapabilities` of such a thing answers — never an empty 200).
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +159,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetManagedThingCapabilities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetManagedThingCapabilitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetManagedThingCapabilities"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetManagedThingCapabilitiesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the managed-thing store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let store = state.lock();
+        // A managed thing is regional: only the region that created it resolves it.
+        let region = crate::state::request_region(ctx.parts());
+        let thing = store
+            .managed_thing_in(&region, &input.identifier)
+            .ok_or_else(|| {
+                // A read reports WHICH KIND of resource was not found; the identifier
+                // the request carried is reported on `ResourceId`.
+                GetManagedThingCapabilitiesErrorModeled::ResourceNotFoundException(
+                    crate::state::managed_thing_not_found_on_read(&input.identifier),
+                )
+            })?;
+
+        // Nothing to report: this device's capabilities are not a member of the managed
+        // thing's own representation but a resource reached through it, so when neither
+        // capability member was ever written there is no such resource to answer with.
+        // That absence is a DIFFERENT one from the managed thing not existing, and this
+        // service words it so: `Managed Thing capabilities not found`.
+        if thing.capabilities.is_none() && thing.capability_report.is_none() {
+            return Err(GetManagedThingCapabilitiesErrorModeled::ResourceNotFoundException(
+                crate::state::managed_thing_capabilities_not_found(&input.identifier),
+            )
+            .into());
+        }
+
+        Ok(GetManagedThingCapabilitiesOutput {
+            managed_thing_id: Some(thing.id.clone()),
+            // Each capability member carries only what an onboarding or update call
+            // stored, so one the record was never given is reported absent rather than
+            // as an invented report.
+            capabilities: thing.capabilities.clone(),
+            capability_report: thing.capability_report.clone(),
+        })
     }
 }

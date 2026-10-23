@@ -1088,6 +1088,36 @@ pub fn managed_thing_not_found_on_read(identifier: &str) -> ResourceNotFoundExce
     }
 }
 
+/// How a read of a resource reached THROUGH a managed thing states that the managed
+/// thing exists but holds nothing of that kind: the owning resource's name in words and
+/// the kind that is missing from it.
+///
+/// Recorded on `GetManagedThingCapabilities` for a managed thing no call ever gave a
+/// capability member, as `Managed Thing capabilities not found` — a different absence
+/// from the one [`resource_not_found_message`] words, which is the managed thing itself
+/// not existing.
+pub fn sub_resource_not_found_message(resource_name: &str, sub_resource: &str) -> String {
+    format!("{resource_name} {sub_resource} not found")
+}
+
+/// The capability-report half of a managed thing, as the reason of a capability read's
+/// 404 names it ([`sub_resource_not_found_message`]).
+pub const MANAGED_THING_CAPABILITIES_SUB_RESOURCE: &str = "capabilities";
+
+/// The modelled `ResourceNotFoundException` `GetManagedThingCapabilities` answers for a
+/// managed thing that holds no capability member at all: the sub-resource reason above,
+/// plus the `ResourceId` and `ResourceType` members every 404 of this service reports
+/// the same way.
+pub fn managed_thing_capabilities_not_found(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(sub_resource_not_found_message(
+            MANAGED_THING_RESOURCE_NAME,
+            MANAGED_THING_CAPABILITIES_SUB_RESOURCE,
+        )),
+        ..resource_not_found(MANAGED_THING_RESOURCE_TYPE, identifier)
+    }
+}
+
 /// The `ResourceId` and `ResourceType` half of any resource's 404, which every path reports
 /// the same way: the identifier the request carried, and the resource's type. The reason is
 /// the caller's to fill, so this is not public — reach it through one of the

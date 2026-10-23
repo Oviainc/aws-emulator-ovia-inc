@@ -21,6 +21,8 @@ mod enum_value_set_rendering;
 mod event_log_configuration_lifecycle;
 #[path = "all/hub_configuration.rs"]
 mod hub_configuration;
+#[path = "all/managed_thing_capabilities.rs"]
+mod managed_thing_capabilities;
 #[path = "all/managed_thing_lifecycle.rs"]
 mod managed_thing_lifecycle;
 #[path = "all/managed_thing_read_side_attributes.rs"]
