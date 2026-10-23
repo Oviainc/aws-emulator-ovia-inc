@@ -35,6 +35,14 @@
 //! reason; nothing invents a result, a log tail or a duration for a function that did
 //! not run.
 //!
+//! The capacity-provider slice is the other resource this store holds, in
+//! [`ComAmazonawsLambdaAwsgirapiserviceState::capacity_providers`]: one
+//! [`CapacityProviderRecord`] per provider `CreateCapacityProvider` persisted, keyed by
+//! its name so `ListCapacityProviders` pages through them deterministically. A provider
+//! has a lifetime of its own too — it is created `Pending` and the move to `Active` is
+//! owed by the CLOCK (see [`CapacityProviderRecord::materialize`]) — and every member
+//! reported for it comes out of the record.
+//!
 //! `GetAccountSettings` reports on the same records at the account level:
 //! "Retrieves details about your account's limits and usage in an Amazon Web Services
 //! Region", so its usage is what the store holds and its unreserved concurrency is what
@@ -49,11 +57,13 @@ use base64::Engine as _;
 use sha2::Digest as _;
 
 use crate::ops::types::{
-    AccountLimit, AccountUsage, AliasRoutingConfiguration, CapacityProviderConfig, Cors,
-    CreateAliasOutput, CreateFunctionOutput, DeadLetterConfig, DurableConfig, Environment,
-    EnvironmentResponse, EphemeralStorage, FileSystemConfig, FunctionCodeLocation,
-    GetLayerVersionOutput, ImageConfig, ImageConfigResponse, Layer, LayerVersionContentOutput,
-    LoggingConfig, PutFunctionConcurrencyOutput, ResolvedS3Object, SnapStartResponse,
+    AccountLimit, AccountUsage, AliasRoutingConfiguration, CapacityProvider,
+    CapacityProviderConfig, CapacityProviderPermissionsConfig, CapacityProviderScalingConfig,
+    CapacityProviderTelemetryConfig, CapacityProviderVpcConfig, Cors, CreateAliasOutput,
+    CreateFunctionOutput, DeadLetterConfig, DurableConfig, Environment, EnvironmentResponse,
+    EphemeralStorage, FileSystemConfig, FunctionCodeLocation, GetLayerVersionOutput, ImageConfig,
+    ImageConfigResponse, InstanceRequirements, Layer, LayerVersionContentOutput, LoggingConfig,
+    PropagateTags, PutFunctionConcurrencyOutput, ResolvedS3Object, SnapStartResponse,
     TenancyConfig, TracingConfigResponse, VpcConfig, VpcConfigResponse,
 };
 
@@ -1337,6 +1347,107 @@ impl LayerRecord {
     }
 }
 
+/// `CapacityProviderState` values this slice moves a capacity provider through, from
+/// the model's `CapacityProviderState` enum (`Pending | Active | Failed | Deleting`).
+pub const CAPACITY_PROVIDER_STATE_PENDING: &str = "Pending";
+/// See [`CAPACITY_PROVIDER_STATE_PENDING`].
+pub const CAPACITY_PROVIDER_STATE_ACTIVE: &str = "Active";
+
+/// How long after `CreateCapacityProvider` the move from `Pending` to `Active` becomes
+/// due.
+///
+/// An EMULATOR-CHOSEN span (how long Lambda takes to stand the compute resources up is
+/// not in the model), deliberately non-zero for the same reason as
+/// [`ACTIVATION_DELAY`]: a caller that reads the provider straight after creating it
+/// sees the `Pending` state the create answered with. The instant it becomes due is
+/// stored on the record and nothing sleeps for it.
+pub const CAPACITY_PROVIDER_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The most capacity providers this emulator keeps.
+///
+/// An EMULATOR-CHOSEN ceiling, not an AWS quota: the store is in memory and every
+/// `CreateCapacityProvider` adds to it, so past this point the slice answers the
+/// modelled `CapacityProviderLimitExceededException` ("The maximum number of capacity
+/// providers for your account has been exceeded") rather than growing without bound.
+pub const MAX_CAPACITY_PROVIDERS: usize = 100;
+
+/// One capacity provider this emulator holds.
+///
+/// `CreateCapacityProvider` "creates a capacity provider that manages compute resources
+/// for Lambda Event Functions", so what it persists is the configuration the request
+/// described — the VPC it launches instances in, the role it manages them with, the
+/// instance requirements, the scaling configuration, the encryption key, the tag
+/// propagation and the telemetry configuration — beside the lifecycle this emulator
+/// owns. Every member `GetCapacityProvider` reports comes back out of this record (see
+/// [`CapacityProviderRecord::reported`]), so nothing of a request is echoed straight
+/// back to its caller.
+#[derive(Debug, Clone)]
+pub struct CapacityProviderRecord {
+    /// The provider's bare name, which is also the key it is stored under.
+    pub name: String,
+    /// The ARN minted for it once, at creation; see [`capacity_provider_arn`].
+    pub arn: String,
+    /// The region that ARN carries.
+    pub region: String,
+    /// `VpcConfig`: the subnets and security groups instances are launched in.
+    pub vpc_config: CapacityProviderVpcConfig,
+    /// `PermissionsConfig`: the operator role the provider manages compute with.
+    pub permissions_config: CapacityProviderPermissionsConfig,
+    /// `InstanceRequirements`, when the request stated any.
+    pub instance_requirements: Option<InstanceRequirements>,
+    /// `CapacityProviderScalingConfig`, when the request stated one.
+    pub scaling_config: Option<CapacityProviderScalingConfig>,
+    /// `KmsKeyArn`, when the request named a key.
+    pub kms_key_arn: Option<String>,
+    /// The tags associated with the provider, kept in key order.
+    pub tags: BTreeMap<String, String>,
+    /// `PropagateTags`, when the request stated it.
+    pub propagate_tags: Option<PropagateTags>,
+    /// `TelemetryConfig`, when the request stated one.
+    pub telemetry_config: Option<CapacityProviderTelemetryConfig>,
+    /// The provider's `State`, one of the model's `CapacityProviderState` values.
+    pub state: String,
+    /// When the move from `Pending` to `Active` becomes due; see
+    /// [`CapacityProviderRecord::materialize`].
+    pub active_due: SystemTime,
+    /// `LastModified`: "The date and time when the capacity provider was last
+    /// modified", in the same ISO-8601 form as every other timestamp this service
+    /// reports.
+    pub last_modified: String,
+}
+
+impl CapacityProviderRecord {
+    /// Bring this record up to whatever the clock has already made due.
+    ///
+    /// The ONLY transition it applies is the one the clock owed at `now`: a provider
+    /// whose compute resources have finished being stood up becomes `Active`. It would
+    /// have been owed at the same instant even if nobody had called, so applying it on a
+    /// read reports the truth rather than inventing a change.
+    pub fn materialize(&mut self, now: SystemTime) {
+        if self.state == CAPACITY_PROVIDER_STATE_PENDING && now >= self.active_due {
+            self.state = CAPACITY_PROVIDER_STATE_ACTIVE.to_string();
+        }
+    }
+
+    /// The `CapacityProvider` the wire reports for this record, built entirely out of
+    /// what is stored.
+    #[must_use]
+    pub fn reported(&self) -> CapacityProvider {
+        CapacityProvider {
+            capacity_provider_arn: self.arn.clone(),
+            state: self.state.clone(),
+            vpc_config: self.vpc_config.clone(),
+            permissions_config: self.permissions_config.clone(),
+            instance_requirements: self.instance_requirements.clone(),
+            capacity_provider_scaling_config: self.scaling_config.clone(),
+            kms_key_arn: self.kms_key_arn.clone(),
+            last_modified: Some(self.last_modified.clone()),
+            propagate_tags: self.propagate_tags.clone(),
+            telemetry_config: self.telemetry_config.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-lambda-awsgirapiservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsLambdaAwsgirapiserviceState {
@@ -1346,6 +1457,9 @@ pub struct ComAmazonawsLambdaAwsgirapiserviceState {
     /// Every layer this emulator holds, keyed by layer name so `ListLayers` pages
     /// through them in a stable order.
     pub layers: BTreeMap<String, LayerRecord>,
+    /// Every capacity provider this emulator holds, keyed by provider name so
+    /// `ListCapacityProviders` pages through them in a stable order.
+    pub capacity_providers: BTreeMap<String, CapacityProviderRecord>,
 }
 
 /// One entry of a `ListFunctions` page: the key it is addressed by in the flattened
@@ -1359,11 +1473,15 @@ pub struct ListedFunction {
 }
 
 impl ComAmazonawsLambdaAwsgirapiserviceState {
-    /// Bring every function up to whatever the clock has already made due; see
-    /// [`FunctionRecord::materialize`].
+    /// Bring every function and every capacity provider up to whatever the clock has
+    /// already made due; see [`FunctionRecord::materialize`] and
+    /// [`CapacityProviderRecord::materialize`].
     pub fn materialize_all(&mut self, now: SystemTime) {
         for function in self.functions.values_mut() {
             function.materialize(now);
+        }
+        for provider in self.capacity_providers.values_mut() {
+            provider.materialize(now);
         }
     }
 
@@ -1508,6 +1626,73 @@ pub fn function_arn(region: &str, name: &str) -> String {
 #[must_use]
 pub fn layer_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("layer:{name}"))
+}
+
+/// The ARN of a capacity provider:
+/// `arn:aws:lambda:<region>:<account>:capacity-provider:<name>`, as the model's
+/// `CapacityProviderArn` pattern requires.
+#[must_use]
+pub fn capacity_provider_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("capacity-provider:{name}"),
+    )
+}
+
+/// The bare provider name a `CapacityProviderName` names.
+///
+/// The model's `CapacityProviderName` pattern admits two forms — a capacity-provider ARN
+/// and a bare name — and both name the same record, so an ARN resolves here to the name
+/// it carries. `None` when the value is an `arn:`-prefixed string that is not a
+/// capacity-provider ARN of this service, which names no provider at all.
+#[must_use]
+pub fn parse_capacity_provider_name(value: &str) -> Option<String> {
+    if !value.starts_with("arn:") {
+        return (!value.is_empty()).then(|| value.to_string());
+    }
+    // arn:<partition>:lambda:<region>:<account>:capacity-provider:<name>. The resource
+    // type is required, so an ARN of another Lambda resource is not read as a provider
+    // named after its resource type.
+    let parts: Vec<&str> = value.split(':').collect();
+    if parts.len() != 7 || parts[2] != ARN_NAMESPACE || parts[5] != "capacity-provider" {
+        return None;
+    }
+    (!parts[6].is_empty()).then(|| parts[6].to_string())
+}
+
+/// The message a `CapacityProviderName` that names no provider is refused with.
+#[must_use]
+pub fn capacity_provider_name_message(value: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{value}' at 'capacityProviderName' failed to \
+         satisfy constraint: Member must satisfy one of the documented name formats (name \
+         or capacity provider ARN)"
+    )
+}
+
+/// Resolve a `CapacityProviderName` (in either of its documented forms) to one stored
+/// capacity provider.
+///
+/// The record is brought up to whatever the clock already made due before it is handed
+/// back, so every caller reports the same lifecycle state at the same instant.
+pub fn resolve_capacity_provider<'a>(
+    store: &'a mut ComAmazonawsLambdaAwsgirapiserviceState,
+    capacity_provider_name: &str,
+    region: &str,
+    now: SystemTime,
+) -> Result<&'a mut CapacityProviderRecord, ResolveFailure> {
+    let name = parse_capacity_provider_name(capacity_provider_name).ok_or_else(|| {
+        ResolveFailure::Malformed(capacity_provider_name_message(capacity_provider_name))
+    })?;
+    let Some(record) = store.capacity_providers.get_mut(&name) else {
+        return Err(ResolveFailure::NotFound(format!(
+            "Capacity provider not found: {}",
+            capacity_provider_arn(region, &name)
+        )));
+    };
+    record.materialize(now);
+    Ok(record)
 }
 
 /// The download location a layer version's `Content$Location` reports ("A link to the
@@ -1798,9 +1983,9 @@ pub fn parse_function_reference(value: &str) -> Option<FunctionReference> {
 /// The member's own pattern admits exactly five Lambda resource types
 /// (`smithy_query(query="operation", operation="ListTags")`): a function, optionally
 /// qualified by a published version or an alias, a code-signing configuration, an event
-/// source mapping, a capacity provider and a network connector. A function is the only
-/// one of them this store holds a record of, so the rest are reported by their resource
-/// type and answered as what is true of them here — a resource of that type this
+/// source mapping, a capacity provider and a network connector. A function and a capacity
+/// provider are the ones this store holds records of; the rest are reported by their
+/// resource type and answered as what is true of them here — a resource of that type this
 /// account does not have.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaggableResourceRef {
@@ -1816,6 +2001,9 @@ pub enum TaggableResourceRef {
         /// The version label or alias name qualifying it.
         qualifier: String,
     },
+    /// `…:capacity-provider:<name>` — one capacity provider, whose tag set is
+    /// [`CapacityProviderRecord::tags`].
+    CapacityProvider(String),
     /// Another Lambda resource type the pattern admits, by its ARN resource type.
     Other(String),
 }
@@ -1839,15 +2027,22 @@ pub enum TaggableResourceRef {
 ///
 /// [`TaggableResourceRef::Other`] is only a resource TYPE because this store holds no
 /// records of those types yet — whoever implements `CreateCodeSigningConfig`,
-/// `CreateEventSourceMapping`, `CreateCapacityProvider` or the network-connector
-/// operations has to carry the type's id through here and turn the tag handlers'
-/// `Other` branch into a real lookup against the new records.
+/// `CreateEventSourceMapping` or the network-connector operations has to carry the type's
+/// id through here and turn the tag handlers' `Other` branch into a real lookup against
+/// the new records, the way a capacity provider is resolved here.
 #[must_use]
 pub fn parse_taggable_resource(value: &str) -> Option<TaggableResourceRef> {
     let arn = service_common::arn::parse_of(value, ARN_NAMESPACE)?;
     let resource_type = arn.resource_type();
     if resource_type.is_empty() {
         return None;
+    }
+    // A capacity provider is named by `…:capacity-provider:<name>`, and this store holds
+    // one record per provider, so the ARN resolves to the name that record is keyed by.
+    if resource_type == "capacity-provider" {
+        return Some(TaggableResourceRef::CapacityProvider(
+            parse_capacity_provider_name(value)?,
+        ));
     }
     if resource_type != "function" {
         return Some(TaggableResourceRef::Other(resource_type.to_string()));
@@ -2019,7 +2214,7 @@ mod tests {
             ),
             (
                 "arn:aws:lambda:us-east-1:000000000000:capacity-provider:fleet-1",
-                Some(TaggableResourceRef::Other("capacity-provider".to_string())),
+                Some(TaggableResourceRef::CapacityProvider("fleet-1".to_string())),
             ),
             (
                 "arn:aws:lambda:us-east-1:000000000000:network-connector:link-1",

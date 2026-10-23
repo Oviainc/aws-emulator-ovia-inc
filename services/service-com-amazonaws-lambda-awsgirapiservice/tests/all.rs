@@ -15,6 +15,8 @@
 mod account_settings;
 #[path = "all/async_invocation.rs"]
 mod async_invocation;
+#[path = "all/capacity_providers.rs"]
+mod capacity_providers;
 #[path = "all/function_aliases.rs"]
 mod function_aliases;
 #[path = "all/function_configuration.rs"]
