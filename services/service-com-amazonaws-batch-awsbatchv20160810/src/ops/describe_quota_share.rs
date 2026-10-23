@@ -168,24 +168,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(now);
 
         // A value that is not a quota share ARN at all is its OWN refusal: it names no
-        // job queue and no share, so there is nothing to look up.
+        // job queue and no share, so there is nothing to look up. AWS states the pattern
+        // requirement alone (the recorded detail), without echoing the value.
         if batch::parse_quota_share_arn(&input.quota_share_arn).is_none() {
             return Err(DescribeQuotaShareErrorModeled::ClientException(
-                batch::client_exception_enveloped(format!(
-                    "{} is not valid, Quota Share arn should match a valid Quota Share arn \
-                     pattern arn:aws:{}:<region>:<account>:job-queue/<job-queue-name>/\
-                     quota-share/<quota-share-name>.",
-                    input.quota_share_arn,
-                    batch::ARN_SERVICE
-                )),
+                batch::client_exception_enveloped(batch::QUOTA_SHARE_ARN_NOT_VALID),
             )
             .into());
         }
         let Some(share) = state.quota_shares.get(&input.quota_share_arn) else {
+            // The resolver's refusal, in the envelope the quota-share refusals carry and
+            // terminated the way the job-queue resolver's is
+            // ([`batch::does_not_exist_message`]).
             return Err(DescribeQuotaShareErrorModeled::ClientException(
                 batch::client_exception_enveloped(format!(
-                    "{} does not exist.",
-                    input.quota_share_arn
+                    "{}.",
+                    batch::does_not_exist_message(&input.quota_share_arn)
                 )),
             )
             .into());

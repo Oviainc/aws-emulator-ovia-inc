@@ -40,6 +40,7 @@
 //! attempt or capacity usage invented for it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
@@ -123,6 +124,26 @@ pub mod limits {
     /// so a create past this answers the modelled `ClientException`. Sized like the other
     /// per-Region, name-keyed Batch resources above.
     pub const MAX_SCHEDULING_POLICIES: usize = 50;
+
+    /// Job ids ONE `DescribeJobs` call may name. AWS documents it on the member:
+    /// `DescribeJobsRequest$jobs` is "A list of up to 100 job IDs"
+    /// (`smithy_query(query="doc", shape="DescribeJobsRequest", member="jobs")`); the
+    /// model types it as a plain `StringList`, so the request validator admits any length
+    /// and the handler applies the bound.
+    pub const MAX_DESCRIBE_JOBS: usize = 100;
+}
+
+/// What AWS Batch answers a `DescribeJobs` naming more than
+/// [`limits::MAX_DESCRIBE_JOBS`] job ids with, inside its frontend envelope.
+///
+/// The spacing around the maximum is AWS's own (the recorded detail reads
+/// `Maximum number of jobs supported is  100 .`): the number is interpolated into a
+/// sentence that already carries the separators.
+pub fn describe_jobs_bound_message() -> String {
+    format!(
+        "Maximum number of jobs supported is  {} .",
+        limits::MAX_DESCRIBE_JOBS
+    )
 }
 
 /// The `ClientException` message a request past one of [`limits`] answers with.
@@ -130,16 +151,51 @@ pub fn quota_message(resource: &str, maximum: usize) -> String {
     format!("Too many {resource}: this emulator stores at most {maximum}")
 }
 
+/// What `DescribeQuotaShare` answers for a `quotaShareArn` that is not a quota-share ARN
+/// at all — the recorded detail, which states the pattern requirement without echoing the
+/// value or spelling the pattern out.
+pub const QUOTA_SHARE_ARN_NOT_VALID: &str =
+    "Quota Share arn should match a valid Quota Share arn pattern";
+
 /// What AWS Batch answers when a `Create*` names an object it already holds: the bare
 /// detail `CreateComputeEnvironment` is recorded to state for a duplicate name, with no
 /// resource name interpolated into it.
 pub const OBJECT_ALREADY_EXISTS: &str = "Object already exists";
+
+/// What `CreateComputeEnvironment` answers when an `UNMANAGED` environment is created
+/// with Fargate compute resources — the recorded detail, stated as the rule rather than
+/// naming the environment.
+///
+/// `computeResources` is "details of the compute resources MANAGED by the compute
+/// environment", and Fargate capacity exists only where Batch manages it, so the pair
+/// `UNMANAGED` + a Fargate `CRType` describes nothing this service can create.
+pub const UNMANAGED_FARGATE_NOT_CREATABLE: &str =
+    "Cannot create an UNMANAGED Fargate Compute Environment.";
+
+/// The `CRType` values whose compute resources run on Fargate, from the model's own
+/// `com.amazonaws.batch#CRType` enum (`EC2 | SPOT | FARGATE | FARGATE_SPOT |
+/// ECS_MANAGED_INSTANCES`), of which these two are the Fargate pair.
+pub const FARGATE_COMPUTE_TYPES: &[&str] = &["FARGATE", "FARGATE_SPOT"];
+
+/// Whether a compute resource of this `CRType` runs on Fargate
+/// ([`FARGATE_COMPUTE_TYPES`]).
+pub fn is_fargate_compute_type(compute_type: &str) -> bool {
+    FARGATE_COMPUTE_TYPES.contains(&compute_type)
+}
 
 /// What `CreateJobQueue` answers when its `computeEnvironmentOrder` names a compute
 /// environment it cannot attach — the bare detail AWS is recorded to state, which names
 /// the requirement rather than the environment.
 pub const COMPUTE_ENVIRONMENTS_NOT_ATTACHABLE: &str =
     "Compute Environments must be created and valid before attaching them to a job queue";
+
+/// What `CreateJobQueue`/`UpdateJobQueue` answer when a `serviceEnvironmentOrder` entry
+/// names a service environment they cannot attach — the recorded detail, which (like
+/// [`COMPUTE_ENVIRONMENTS_NOT_ATTACHABLE`], its compute-environment twin) states the
+/// precondition instead of naming the entry, so the one refusal covers an environment
+/// that was never created and one that is not valid.
+pub const SERVICE_ENVIRONMENTS_NOT_ATTACHABLE: &str =
+    "Service environments must be created and valid before attaching them to a job queue.";
 
 /// What `DescribeJobDefinitions` answers for a `nextToken` it did not issue — the bare
 /// detail AWS is recorded to state.
@@ -825,24 +881,64 @@ enum Advanced {
     Terminal,
 }
 
-/// The request id a refusal names when the response carries none.
+/// How many request ids this process has minted, so two refusals answered in the same
+/// nanosecond still name two different requests (see [`new_uuid`]).
+static MINTED_REQUEST_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// The id of the request a refusal is answering, which Batch's frontend names in the
+/// envelope it wraps a `ClientException` in ([`client_exception_message`]).
 ///
-/// Batch's frontend wraps a client-side refusal together with the id of the
-/// request it refused (see [`client_exception_message`]). This emulator's
-/// restJson1 error path returns no request id to the caller — the framework sets
-/// no request-id header on a JSON error — so there is no id to name and the
-/// segment renders this placeholder, which is what a client that reads the
-/// response's request id reports for an absent one.
-const ABSENT_REQUEST_ID: &str = "None";
+/// A request id is minted by the SERVICE, per call — nothing in the request carries one —
+/// so this emulator mints it the way it mints every other identifier ([`new_uuid`]): a
+/// fresh version-4 UUID, distinct for every refusal for the emulator's lifetime. It is a
+/// per-run value and is never derived from the request.
+pub fn new_request_id() -> String {
+    new_uuid(MINTED_REQUEST_IDS.fetch_add(1, Ordering::Relaxed))
+}
 
 /// How Batch words the `ClientException`s its frontend WRAPS: the detail of what was
-/// wrong, inside `Error executing request, Exception : <detail>, RequestId: <id>`.
+/// wrong, inside `Error executing request, Exception : <detail>, RequestId: <id>`, where
+/// the id is the one the service gave the call being refused.
 ///
 /// Only the refusals AWS is recorded to wrap are worded this way; see
 /// [`client_exception`] for the bare form and [`client_exception_enveloped`] for the
 /// wrapped one.
-pub fn client_exception_message(detail: &str) -> String {
-    format!("Error executing request, Exception : {detail}, RequestId: {ABSENT_REQUEST_ID}")
+pub fn client_exception_message(detail: &str, request_id: &str) -> String {
+    format!("Error executing request, Exception : {detail}, RequestId: {request_id}")
+}
+
+/// The sentence AWS Batch's resource resolver answers when an identifier names no stored
+/// resource: the ARN the identifier resolved to, then ` does not exist`.
+///
+/// The ARN comes from the REQUEST ([`resolved_arn`]) — the resource is not stored, so it
+/// has no ARN of its own — and nothing else is stated: the identifier the caller gave is
+/// what fills the sentence. Recorded in exactly this form for `UpdateComputeEnvironment`,
+/// `DescribeConsumableResource` and `DescribeServiceJob`; the job-queue resolver
+/// (`UpdateJobQueue`, `DeleteJobQueue`) and the quota-share one terminate the same
+/// sentence with a period, so those call sites add it.
+pub fn does_not_exist_message(arn: &str) -> String {
+    format!("{arn} does not exist")
+}
+
+/// A [`does_not_exist_message`] refusal: the modelled `ClientException` (HTTP 400) for an
+/// identifier that resolves to no stored resource.
+pub fn does_not_exist_exception(arn: &str) -> ClientException {
+    client_exception(does_not_exist_message(arn))
+}
+
+/// The ARN a "name or ARN" identifier names, whether or not anything is stored under it:
+/// the value itself when it already is an ARN, and otherwise the ARN `mint` gives that
+/// name in this request's region and account (`compute_environment_arn`, `job_queue_arn`,
+/// … — the same builders a create uses).
+///
+/// This is what a not-found refusal reports ([`does_not_exist_message`]): AWS names the
+/// ARN it resolved the identifier to, and for an identifier naming nothing that ARN can
+/// only be computed from the request.
+pub fn resolved_arn(name_or_arn: &str, mint: impl FnOnce(&str) -> String) -> String {
+    if name_or_arn.starts_with("arn:") {
+        return name_or_arn.to_string();
+    }
+    mint(name_or_arn)
 }
 
 /// Whether `value` is a name AWS Batch accepts for a resource it keys by name: a
@@ -1161,6 +1257,11 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// `entries` with every `serviceEnvironment` resolved against the stored service
     /// environments and rewritten as that environment's ARN; see
     /// [`Self::resolve_compute_environment_order`].
+    ///
+    /// An entry naming an environment this service holds nothing for, and one naming an
+    /// environment whose deletion the clock already owes (so it can never be valid
+    /// again), are the SAME refusal, and AWS states it as the precondition rather than as
+    /// the entry it was given: [`SERVICE_ENVIRONMENTS_NOT_ATTACHABLE`].
     pub fn resolve_service_environment_order(
         &self,
         entries: &[ServiceEnvironmentOrder],
@@ -1170,12 +1271,8 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             .map(|entry| {
                 let environment = self
                     .service_environment(&entry.service_environment)
-                    .ok_or_else(|| {
-                        format!(
-                            "Service environment {} does not exist",
-                            entry.service_environment
-                        )
-                    })?;
+                    .filter(|environment| environment.status != STATUS_DELETING)
+                    .ok_or_else(|| SERVICE_ENVIRONMENTS_NOT_ATTACHABLE.to_string())?;
                 Ok(ServiceEnvironmentOrder {
                     order: entry.order,
                     service_environment: environment.arn.clone(),
@@ -2036,7 +2133,7 @@ pub fn client_exception(detail: impl AsRef<str>) -> ClientException {
 /// `RegisterJobDefinition`'s missing properties object and the quota-share refusals.
 pub fn client_exception_enveloped(detail: impl AsRef<str>) -> ClientException {
     ClientException {
-        message: Some(client_exception_message(detail.as_ref())),
+        message: Some(client_exception_message(detail.as_ref(), &new_request_id())),
     }
 }
 

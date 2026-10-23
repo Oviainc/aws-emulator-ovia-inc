@@ -14,9 +14,10 @@
 //! deregister"), and a bare name — carrying no revision — names that definition's
 //! latest revision ([`crate::state::ComAmazonawsBatchAwsbatchv20160810State::job_definition_mut`]).
 //! Because the status is SET rather than toggled, repeating the call leaves the same
-//! revision `INACTIVE` and answers 200 again. A reference no stored revision answers
-//! to is refused with the modelled `ClientException` (HTTP 400), and nothing is
-//! written.
+//! revision `INACTIVE` and answers 200 again. A reference no stored revision answers to
+//! is the same success for the same reason — the post-state it asks for (no ACTIVE
+//! revision under that reference) already holds, which is how AWS is recorded answering a
+//! deregister of an absent definition — and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -162,13 +163,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to the stored record is what writes the status: there is no second lookup
         // that could miss and answer 200 having changed nothing.
         let Some(definition) = store.job_definition_mut(&input.job_definition) else {
-            return Err(DeregisterJobDefinitionErrorModeled::ClientException(
-                batch::client_exception(format!(
-                    "Job definition {} does not exist",
-                    input.job_definition
-                )),
-            )
-            .into());
+            // A reference naming no stored revision is ALREADY deregistered: the
+            // post-state this call asks for (no ACTIVE revision under that reference)
+            // already holds, so it answers its empty success body and changes nothing.
+            return Ok(DeregisterJobDefinitionOutput {});
         };
         // Deregistering does not delete the revision ("Job definitions are
         // permanently deleted after 180 days"): it SETS the status, so the revision

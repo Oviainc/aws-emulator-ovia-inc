@@ -22,7 +22,10 @@
 //!   pair, and an empty name;
 //! * a describe is a REPORTING call: two describes of the same resource answer
 //!   identically, and a describe of a resource that was never created is refused rather
-//!   than invented.
+//!   than invented;
+//! * `DeleteConsumableResource` removes the record, so a later describe of either
+//!   identifier form takes the not-found path, and repeating the delete is the same
+//!   empty success.
 
 use serde_json::{json, Value};
 
@@ -283,6 +286,87 @@ async fn creating_one_resource_leaves_every_earlier_one_readable() {
             case.label
         );
     }
+}
+
+/// RULE: `DeleteConsumableResource` removes the record, so the describe that follows
+/// takes its not-found path; and like every removal on this surface it is idempotent in
+/// its identifier.
+#[tokio::test]
+async fn a_deleted_resource_stops_being_describable_and_the_delete_repeats() {
+    let batch = Batch::new();
+    // The rows vary the identifier FORM the delete names the resource by — the two forms
+    // `consumableResource` documents ("The name or ARN of the consumable resource") — and
+    // whether the resource was ever created.
+    for (case, by_arn) in [("by name", false), ("by ARN", true)] {
+        let name = format!("deletable-{}", if by_arn { "arn" } else { "name" });
+        let created = create(
+            &batch,
+            json!({"consumableResourceName": &name, "totalQuantity": 3}),
+        )
+        .await;
+        assert_eq!(
+            created.0, 200,
+            "case delete {case}: expected the create to be accepted, got {created:?}"
+        );
+        let resource_arn = arn(&format!("consumable-resource/{name}"));
+        let reference = if by_arn { resource_arn.clone() } else { name.clone() };
+
+        // Twice: the second delete asks for a removal that already happened.
+        for attempt in 1..=2 {
+            let (status, body) = batch
+                .call(
+                    "/v1/deleteconsumableresource",
+                    json!({"consumableResource": &reference}),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case delete {case} (attempt {attempt}): expected the empty 200, \
+                 got {status} {body}"
+            );
+        }
+
+        // Both identifier forms stop resolving, and the describe reports the resolved ARN.
+        for (form, sent) in [("name", name.clone()), ("arn", resource_arn.clone())] {
+            let (status, body) = describe(&batch, &sent).await;
+            assert_eq!(
+                status, 400,
+                "case describe a deleted resource by {form} after delete {case}: \
+                 expected 400, got {status} {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ClientException",
+                "case describe a deleted resource by {form}: expected the modelled \
+                 ClientException, got {body}"
+            );
+            assert_eq!(
+                error_message(&body),
+                format!("{resource_arn} does not exist"),
+                "case describe a deleted resource by {form}: expected the resolved-ARN \
+                 sentence, got {body}"
+            );
+        }
+    }
+
+    // A delete of a name nothing was ever created under is the same empty success and
+    // creates nothing.
+    let (status, body) = batch
+        .call(
+            "/v1/deleteconsumableresource",
+            json!({"consumableResource": "never-created"}),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case delete a resource nothing created: expected the empty 200, got {status} {body}"
+    );
+    let (status, described) = describe(&batch, "never-created").await;
+    assert_eq!(
+        status, 400,
+        "case describe after deleting a resource nothing created: expected 400, \
+         got {status} {described}"
+    );
 }
 
 /// The refusals, over the SET of things a create can get wrong — and the record each one
