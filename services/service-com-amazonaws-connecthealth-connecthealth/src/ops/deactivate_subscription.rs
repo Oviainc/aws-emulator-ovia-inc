@@ -163,9 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DeactivateSubscriptionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Subscription {} was not found in domain {}",
-                        input.subscription_id, input.domain_id
+                    message: Some(crate::service::error_detail::subscription_not_found_message(
+                        &input.domain_id,
+                        &input.subscription_id,
                     )),
                 },
             )

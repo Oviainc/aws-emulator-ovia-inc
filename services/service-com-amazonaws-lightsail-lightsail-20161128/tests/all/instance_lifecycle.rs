@@ -224,7 +224,10 @@ fn is_modelled_ipv6(value: &str) -> bool {
 
 /// Whether `value` satisfies the modelled `IpAddress` pattern
 /// `^([0-9]{1,3}\.){3}[0-9]{1,3}$`.
-fn is_modelled_ipv4(value: &str) -> bool {
+///
+/// `pub(crate)` so a sibling suite in this test target checks a reported address
+/// the same way.
+pub(crate) fn is_modelled_ipv4(value: &str) -> bool {
     let groups: Vec<&str> = value.split('.').collect();
     groups.len() == 4
         && groups

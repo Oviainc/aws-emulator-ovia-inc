@@ -23,6 +23,26 @@ const BATCH_DELETE: &str = "/prod/batch/delete";
 /// family above a million (`state::FIRST_CHANNEL_ID` and its siblings).
 const UNKNOWN_ID: &str = "0000001";
 
+/// One row of the refusal table: the case, the request member the id travels
+/// in, the setup that builds the resource, the error code the entry must carry,
+/// the state the refused resource keeps (`None` when no resource has that id)
+/// and the text its `Message` must contain.
+type RefusalRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    &'static str,
+);
+
+/// The fixed message MediaLive answers a channel delete with while the channel
+/// has not stopped — the same sentence `DeleteChannel` carries for that class
+/// (see `rejection_messages`), written out here rather than read from the crate
+/// so the test pins the text instead of repeating it.
+const CHANNEL_NOT_STOPPED: &str =
+    "Cannot delete a channel that has not been stopped yet. Please stop the channel and try again.";
+
 /// `BatchDelete` with `body`, asserting the modelled 200 and returning the two
 /// result lists as `(successful, failed)`.
 async fn batch_delete(router: &MultiServiceRouter, case: &str, body: Value) -> (Vec<Value>, Vec<Value>) {
@@ -312,34 +332,78 @@ async fn every_deletable_resource_is_accepted_and_reported_in_the_state_it_reach
 /// The table spans every refusal this slice can produce, over all four request
 /// members, and the two shapes an entry takes: with the resource's ARN when the
 /// resource exists and without one when no resource has that id.
+///
+/// Each row also carries the text the entry's `Message` must contain, with
+/// `{id}` standing for the id the row requested: a refusal whose class carries a
+/// FIXED message (a channel that has not stopped) must carry exactly that
+/// sentence, and one whose message is composed from the request must name what
+/// the request named.
 #[tokio::test]
 async fn every_resource_a_delete_cannot_touch_is_reported_as_its_own_failure() {
-    // (case, request member, setup, expected code, state the resource keeps)
-    let table: [(&str, &str, &str, &str, Option<&str>); 9] = [
-        ("unknown channel", "channelIds", "none", "NotFoundException", None),
-        ("creating channel", "channelIds", "creating channel", "ConflictException", Some("CREATING")),
-        ("running channel", "channelIds", "running channel", "ConflictException", Some("RUNNING")),
-        ("unknown input", "inputIds", "none", "NotFoundException", None),
-        ("attached input", "inputIds", "attached input", "ConflictException", Some("ATTACHED")),
-        ("unknown security group", "inputSecurityGroupIds", "none", "NotFoundException", None),
+    // (case, request member, setup, expected code, state the resource keeps,
+    //  the text the message must contain)
+    let table: [RefusalRow; 9] = [
+        ("unknown channel", "channelIds", "none", "NotFoundException", None, "Channel {id} not found"),
+        (
+            "creating channel",
+            "channelIds",
+            "creating channel",
+            "ConflictException",
+            Some("CREATING"),
+            CHANNEL_NOT_STOPPED,
+        ),
+        (
+            "running channel",
+            "channelIds",
+            "running channel",
+            "ConflictException",
+            Some("RUNNING"),
+            CHANNEL_NOT_STOPPED,
+        ),
+        ("unknown input", "inputIds", "none", "NotFoundException", None, "Input {id} not found"),
+        (
+            "attached input",
+            "inputIds",
+            "attached input",
+            "ConflictException",
+            Some("ATTACHED"),
+            "Input {id} is busy, it cannot be deleted",
+        ),
+        (
+            "unknown security group",
+            "inputSecurityGroupIds",
+            "none",
+            "NotFoundException",
+            None,
+            "Input security group {id} not found",
+        ),
         (
             "security group in use",
             "inputSecurityGroupIds",
             "used security group",
             "BadRequestException",
             Some("IN_USE"),
+            "Input security group {id} is in use",
         ),
-        ("unknown multiplex", "multiplexIds", "none", "NotFoundException", None),
+        (
+            "unknown multiplex",
+            "multiplexIds",
+            "none",
+            "NotFoundException",
+            None,
+            "Multiplex {id} not found",
+        ),
         (
             "creating multiplex",
             "multiplexIds",
             "creating multiplex",
             "ConflictException",
             Some("CREATING"),
+            "Multiplex {id} is in state CREATING",
         ),
     ];
 
-    for (case, member, setup, expected_code, kept_state) in table {
+    for (case, member, setup, expected_code, kept_state, expected_message) in table {
         let router = medialive();
         let id = match setup {
             "none" => UNKNOWN_ID.to_string(),
@@ -413,9 +477,12 @@ async fn every_resource_a_delete_cannot_touch_is_reported_as_its_own_failure() {
             json!(expected_code),
             "case {case:?}: expected code {expected_code}, got {entry:?}"
         );
+        let expected_message = expected_message.replace("{id}", &id);
         assert!(
-            entry["message"].as_str().is_some_and(|text| text.contains(&id)),
-            "case {case:?}: expected a message naming the resource, got {entry:?}"
+            entry["message"]
+                .as_str()
+                .is_some_and(|text| text.contains(&expected_message)),
+            "case {case:?}: expected a message containing {expected_message:?}, got {entry:?}"
         );
 
         match kept_state {
