@@ -208,12 +208,13 @@ pub struct StoredTypeVersion {
     pub logging_config: Option<StoredLoggingConfig>,
     pub required_activated_types: Vec<StoredRequiredActivatedType>,
     /// `TimeCreated`: "when the specified private extension version was registered or
-    /// activated in your account". `None` for a version that entered the registry with no
-    /// such instant — an Amazon-Web-Services-published public extension, which this
-    /// registry has always held (see [`aws_published`]) — rather than an invented one.
+    /// activated in your account" — the instant the version entered this registry. `None`
+    /// only for a record that carries no such instant at all; the Amazon-Web-Services-
+    /// published extensions carry the instant the registry itself came into being (see
+    /// [`aws_published`]), since they have been in it for as long as it has existed.
     pub time_created: Option<SystemTime>,
-    /// `LastUpdated`: "when the specified extension version was registered". `None` on the
-    /// same records, and for the same reason, as [`Self::time_created`].
+    /// `LastUpdated`: "when the specified extension version was registered". Filled in on
+    /// the same records, and from the same instant, as [`Self::time_created`].
     pub last_updated: Option<SystemTime>,
 }
 
@@ -388,9 +389,12 @@ pub const AWS_PUBLISHED_VERSION_ID: &str = "00000001";
 /// `LIVE`, it is `FULLY_MUTABLE` (the emulator's own stack operations create, update and
 /// delete these resource types, which is what that value states: "the resource type
 /// includes an update handler to process updates to the type during stack update
-/// operations"), and it has no publisher id — "extensions provided by Amazon Web Services
-/// are not assigned a publisher ID". The schema, the description, the published URLs and
-/// the registration instants are NOT known here, so they stay absent rather than invented.
+/// operations"), it has no publisher id — "extensions provided by Amazon Web Services are
+/// not assigned a publisher ID" — its `SourceUrl` is the open-source repository AWS
+/// publishes that type's resource provider in ([`aws_published_source_url`]), and its
+/// registration instants are the instant this registry came into being
+/// ([`REGISTRY_GENESIS`]), which is how long it has held them. The schema, the description
+/// and the documentation URL are NOT known here, so they stay absent rather than invented.
 pub fn aws_published(region: &str, type_kind: &str, type_name: &str) -> Option<StoredExtension> {
     if type_kind != registry_type::RESOURCE
         || !crate::state::template::IMPLEMENTED_RESOURCE_TYPES.contains(&type_name)
@@ -432,6 +436,36 @@ fn public_arn_region(arn: &str) -> Option<&str> {
     names_a_public_extension.then_some(region)
 }
 
+/// The instant this emulator's registry came into being, which is what the Amazon-Web-
+/// Services-published records report as `TimeCreated` and `LastUpdated`.
+///
+/// Those records are not registered by anybody — they are in every account's registry
+/// already — so there is no registration call whose instant could be stored on them. What
+/// is true of them here is that they have been in this registry for as long as it has
+/// existed, and that instant is this one: resolved once, on the first registry read, so
+/// every record reports the same instant and a second read of one reports the instant the
+/// first did. A registry WRITER (`RegisterType`, `ActivateType`) stores the instant of its
+/// own call instead ([`StoredTypeVersion::new`]).
+static REGISTRY_GENESIS: ::std::sync::LazyLock<SystemTime> =
+    ::std::sync::LazyLock::new(SystemTime::now);
+
+/// The source the extensions Amazon Web Services publishes are built from: AWS's
+/// CloudFormation resource providers are open source, one repository per service, named
+/// `aws-cloudformation-resource-providers-<service>` after the type's own service segment
+/// (`AWS::S3::Bucket` -> `.../aws-cloudformation-resource-providers-s3`). `SourceUrl` is
+/// "the URL of the source code for the extension", and that is the URL for one of these,
+/// derived from the type name rather than held as a per-type constant.
+fn aws_published_source_url(type_name: &str) -> Option<String> {
+    let service = type_name.split("::").nth(1)?;
+    if service.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "https://github.com/aws-cloudformation/aws-cloudformation-resource-providers-{}",
+        service.to_ascii_lowercase()
+    ))
+}
+
 /// The record [`aws_published`] and [`aws_published_by_arn`] both answer with.
 fn aws_published_record(region: &str, type_name: &str) -> StoredExtension {
     let arn = public_type_arn(region, registry_type::RESOURCE, type_name);
@@ -448,14 +482,16 @@ fn aws_published_record(region: &str, type_name: &str) -> StoredExtension {
         // contract-test status belongs to registered private extension versions.
         type_tests_status: None,
         type_tests_status_description: None,
-        source_url: None,
+        source_url: aws_published_source_url(type_name),
         documentation_url: None,
         public_version_number: None,
         execution_role_arn: None,
         logging_config: None,
         required_activated_types: Vec::new(),
-        time_created: None,
-        last_updated: None,
+        // Every extension version in the registry carries the instant it entered it; for
+        // one nobody registered that is [`REGISTRY_GENESIS`].
+        time_created: Some(*REGISTRY_GENESIS),
+        last_updated: Some(*REGISTRY_GENESIS),
     };
     StoredExtension {
         type_kind: registry_type::RESOURCE.to_string(),

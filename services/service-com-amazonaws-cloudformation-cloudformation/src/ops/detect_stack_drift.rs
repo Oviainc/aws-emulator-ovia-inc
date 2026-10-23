@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetectStackDrift
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetectStackDrift`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetectStackDrift::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: starts a drift detection on one stack. Each resource the detection covers
+//! is read from the service that OWNS it and compared with the configuration the stack's
+//! template declared for it (see [`crate::state::drift`]), so the result reports what those
+//! resources really are rather than what CloudFormation once applied. What the check found
+//! is recorded on the stack (`Stack$DriftInformation`) and on each resource it covered,
+//! while the detection operation's own status — read back by
+//! `DescribeStackDriftDetectionStatus` under the `StackDriftDetectionId` this answers
+//! with — is answered in progress and concludes a moment later, the way AWS answers a
+//! detection that is still running. A `StackName` no live stack carries is refused with
+//! `ValidationError`; `LogicalResourceIds` filters which resources are checked.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +154,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetectStackDrift` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetectStackDriftErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetectStackDrift"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no stack to detect drift on, so
+            // this answers 501 rather than a detection id nothing stands behind.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DetectStackDrift",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+        // "CloudFormation generates new results, with a new drift detection ID, each time
+        // this operation is run."
+        let detection_id = crate::state::new_drift_detection_id();
+
+        // The store lock is taken for the write and RELEASED at the end of this block: the
+        // reads that ask each owning service what its resource IS now run after it, and
+        // each of those reaches another service's own handler.
+        let (stack_id, stack_region, resources) = {
+            let mut store = state.lock();
+            store.settle(now);
+
+            let stack = store.resolve(&input.stack_name).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::stack_does_not_exist(&input.stack_name),
+                )
+            })?;
+            let stack_id = stack.stack_id.clone();
+            let stack_region = stack.region.clone();
+            // "The logical names of any resources you want to use as filters": a filter
+            // over the stack's own resources, so the detection covers exactly the ones it
+            // names and a name the stack has not deployed selects nothing to check. This
+            // operation models no error at all, and nothing documents a refusal for such a
+            // filter, so none is invented here.
+            let filters = input.logical_resource_ids.as_deref();
+            let resources: Vec<crate::state::StoredResource> = stack
+                .resources
+                .iter()
+                .filter(|deployed| {
+                    filters.is_none_or(|filters| {
+                        filters.contains(&deployed.resource.logical_id)
+                    })
+                })
+                .map(|deployed| deployed.resource.clone())
+                .collect();
+
+            store.record_drift_detection(crate::state::StoredDriftDetection {
+                detection_id: detection_id.clone(),
+                stack_id: stack_id.clone(),
+                initiated_at: now,
+                // "DETECTION_IN_PROGRESS: The stack drift detection operation is currently
+                // in progress" — which is what a caller monitoring the operation sees until
+                // the clock makes its conclusion due.
+                detection_status: crate::state::drift_detection_status::DETECTION_IN_PROGRESS
+                    .to_string(),
+                detection_status_reason: None,
+                stack_drift_status: None,
+                drifted_resource_count: None,
+                pending: None,
+            });
+            (stack_id, stack_region, resources)
+        };
+
+        // The comparison itself: one read per covered resource, from the service that owns
+        // it, in the stack's own Region — where its resources live.
+        let detected = crate::state::drift::detect(ctx, &stack_region, &resources).await;
+
+        let mut store = state.lock();
+        // What the check FOUND goes onto the stack and the resources it covered as of the
+        // instant the detection was initiated, which is what both `LastCheckTimestamp`
+        // members report ("most recent time when a drift detection operation was initiated
+        // on the stack").
+        store.apply_drift_result(
+            &stack_id,
+            now,
+            detected.stack_drift_status(),
+            &detected.results,
+        );
+        if let Some(detection) = store.drift_detection_mut(&detection_id) {
+            detection.pending = Some(crate::state::PendingDriftOutcome {
+                // "DETECTION_FAILED: The stack drift detection operation has failed for at
+                // least one resource in the stack"; otherwise the operation "has
+                // successfully completed for all resources in the stack that support drift
+                // detection".
+                detection_status: if detected.failure.is_some() {
+                    crate::state::drift_detection_status::DETECTION_FAILED.to_string()
+                } else {
+                    crate::state::drift_detection_status::DETECTION_COMPLETE.to_string()
+                },
+                detection_status_reason: detected.failure.clone(),
+                stack_drift_status: detected.stack_drift_status().to_string(),
+                drifted_resource_count: detected.drifted_count(),
+                // The operation is answered while it is still running, and its conclusion
+                // becomes due a moment later — nothing sleeps for it.
+                due_at: ::std::time::SystemTime::now() + crate::state::DRIFT_DETECTION_DELAY,
+            });
+        }
+
+        Ok(DetectStackDriftOutput {
+            stack_drift_detection_id: detection_id,
+        })
     }
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStackDriftDetectionStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStackDriftDetectionStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStackDriftDetectionStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reads back one drift-detection operation by the
+//! `StackDriftDetectionId` `DetectStackDrift` handed out — the stack it ran on, the instant
+//! it was initiated, its detection status, and, once it has completed, the stack-level
+//! drift status and the number of resources that drifted. A detection id this account has
+//! not run is refused with `ValidationError`.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +167,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStackDriftDetectionStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStackDriftDetectionStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStackDriftDetectionStatus"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there are no detection results to read, so
+            // this answers 501 rather than a status nothing stands behind.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeStackDriftDetectionStatus",
+            ));
+        };
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a transition the clock had
+        // already made due — here the detection's own completion, which was owed at the
+        // same instant whether or not anybody polled for it.
+        store.settle(::std::time::SystemTime::now());
+
+        let detection = store
+            .drift_detection(&input.stack_drift_detection_id)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::drift_detection_does_not_exist(
+                        &input.stack_drift_detection_id,
+                    ),
+                )
+            })?;
+
+        Ok(DescribeStackDriftDetectionStatusOutput {
+            stack_id: detection.stack_id.clone(),
+            stack_drift_detection_id: detection.detection_id.clone(),
+            // "This value will be NULL for any stack drift detection operation that has
+            // not yet concluded" — as will the drifted count, which "is NULL until the
+            // drift detection operation reaches a status of DETECTION_COMPLETE".
+            stack_drift_status: detection.stack_drift_status.clone(),
+            detection_status: detection.detection_status.clone(),
+            detection_status_reason: detection.detection_status_reason.clone(),
+            drifted_stack_resource_count: detection.drifted_resource_count,
+            // "Time at which the stack drift detection operation was initiated."
+            timestamp: crate::state::timestamp(detection.initiated_at),
+        })
     }
 }
