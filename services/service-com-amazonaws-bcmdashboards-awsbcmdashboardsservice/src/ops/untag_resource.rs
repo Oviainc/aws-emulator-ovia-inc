@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the named tag keys from the resource a `ResourceArn` identifies, and
+//! nothing else: a key the resource does not carry is a no-op (so the call is
+//! idempotent), every key not named keeps its value, and an ARN that names no
+//! stored resource is refused with the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +141,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the dashboard store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // The ARN is resolved against the stored resources first, so untagging a
+        // resource that does not exist is refused instead of silently succeeding.
+        let Some(tags) = state.resource_tags_mut(&input.resource_arn) else {
+            crate::state::record_state_change(
+                ctx,
+                Self::NAME,
+                &input.resource_arn,
+                "ResourceNotFoundException",
+            );
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("No resource found for arn {}", input.resource_arn),
+                },
+            )
+            .into());
+        };
+
+        // Remove exactly the named keys. The requested keys go into a set first, so the
+        // removal is one pass over the stored tags however many keys the request names
+        // (and a key named twice means the same as a key named once). A key the resource
+        // does not carry is not an error — removal is idempotent — and every tag whose
+        // key the request did not name keeps its value AND its position in the stored
+        // list, so the next read reports the stored tags minus the named keys, in the
+        // order they were stored.
+        let removed: ::std::collections::BTreeSet<&str> = input
+            .resource_tag_keys
+            .iter()
+            .map(String::as_str)
+            .collect();
+        tags.retain(|tag| !removed.contains(tag.key.as_str()));
+
+        // Record that this call changed state, for the audit stream.
+        crate::state::record_state_change(ctx, Self::NAME, &input.resource_arn, "SUCCESS");
+
+        Ok(UntagResourceOutput {})
     }
 }

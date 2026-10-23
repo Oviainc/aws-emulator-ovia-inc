@@ -184,7 +184,11 @@ async fn state_changing_operations_emit_one_audit_record_each() {
     let created = ok_call(
         &router,
         "CreateDashboard",
-        &json!({"name": "Audited Dashboard", "widgets": []}),
+        &json!({
+            "name": "Audited Dashboard",
+            "widgets": [],
+            "resourceTags": [{"key": "env", "value": "prod"}],
+        }),
     )
     .await;
     let arn = created["arn"].as_str().expect("an arn").to_string();
@@ -208,10 +212,30 @@ async fn state_changing_operations_emit_one_audit_record_each() {
         "SUCCESS",
     );
 
+    // Removing a tag changes the stored record too, so it accounts for itself.
+    ok_call(
+        &router,
+        "UntagResource",
+        &json!({"resourceArn": arn, "resourceTagKeys": ["env"]}),
+    )
+    .await;
+    assert_record(
+        &capture.record_for("UntagResource"),
+        "UntagResource",
+        &arn,
+        "SUCCESS",
+    );
+
     // The reporting operations change nothing, so they account for nothing.
     ok_call(&router, "GetDashboard", &json!({"arn": arn})).await;
     ok_call(&router, "ListDashboards", &json!({})).await;
-    for operation in ["GetDashboard", "ListDashboards"] {
+    ok_call(
+        &router,
+        "ListTagsForResource",
+        &json!({"resourceArn": arn}),
+    )
+    .await;
+    for operation in ["GetDashboard", "ListDashboards", "ListTagsForResource"] {
         let leaked = capture.records_for(operation);
         assert!(
             leaked.is_empty(),
@@ -249,6 +273,13 @@ async fn refused_state_changes_are_audited_with_their_outcome() {
             400,
             absent,
             "ValidationException",
+        ),
+        (
+            "UntagResource",
+            json!({"resourceArn": absent, "resourceTagKeys": ["env"]}),
+            404,
+            absent,
+            "ResourceNotFoundException",
         ),
     ];
 

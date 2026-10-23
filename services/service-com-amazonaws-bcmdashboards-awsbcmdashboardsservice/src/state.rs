@@ -5,8 +5,9 @@
 //! The dashboard records every dashboard operation reads and writes live here, so
 //! `CreateDashboard`, `GetDashboard`, `ListDashboards`, `UpdateDashboard` and
 //! `DeleteDashboard` all see one copy of each resource. The helpers below (ARN and
-//! widget-id minting, the `DashboardReference` projection, the pagination cursor
-//! codec) are shared by those handlers rather than duplicated per operation.
+//! widget-id minting, the `DashboardReference` projection, the tag resolution the
+//! tagging operations share, the pagination cursor codec) are shared by those handlers
+//! rather than duplicated per operation.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -67,8 +68,8 @@ pub struct Dashboard {
     pub widgets: Vec<Widget>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
-    /// The tags supplied at create time, read back by `ListTagsForResource` (and
-    /// state for the other tagging operations once they are implemented).
+    /// The tags supplied at create time, read back by `ListTagsForResource` and
+    /// narrowed by `UntagResource`, in the order they were stored.
     pub resource_tags: Vec<ResourceTag>,
     /// The resource-based policy document attached to this dashboard, or `None`
     /// while no policy is attached — the two are distinct, and `GetResourcePolicy`
@@ -130,8 +131,8 @@ pub struct ScheduledReportRecord {
     pub updated_at: SystemTime,
     pub last_execution_at: Option<SystemTime>,
     pub health_status: Option<HealthStatus>,
-    /// The tags supplied at create time, read back by `ListTagsForResource` (and
-    /// state for the other tagging operations once they are implemented).
+    /// The tags supplied at create time, read back by `ListTagsForResource` and
+    /// narrowed by `UntagResource`, in the order they were stored.
     pub resource_tags: Vec<ResourceTag>,
 }
 
@@ -255,6 +256,21 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
         self.scheduled_reports
             .get(resource_arn)
             .map(|report| report.resource_tags.as_slice())
+    }
+
+    /// The tags persisted on the resource `resource_arn` names, for a handler that
+    /// CHANGES them, or `None` when this service holds no resource under that ARN.
+    ///
+    /// Resolves the ARN exactly as [`Self::resource_tags`] does — both resource types
+    /// `ResourceArn` admits, in the same order — so a tagging write and a tagging read
+    /// always agree on which resource an ARN names and share one copy of its tags.
+    pub fn resource_tags_mut(&mut self, resource_arn: &str) -> Option<&mut Vec<ResourceTag>> {
+        if let Some(dashboard) = self.dashboards.get_mut(resource_arn) {
+            return Some(&mut dashboard.resource_tags);
+        }
+        self.scheduled_reports
+            .get_mut(resource_arn)
+            .map(|report| &mut report.resource_tags)
     }
 
     /// The resource-based policy document attached to the dashboard `resource_arn`
