@@ -16,7 +16,26 @@
 
 use serde_json::{json, Value};
 
-use crate::wire::{emulator, ok, ACCOUNT_ID, CALLER_PRINCIPAL};
+use crate::wire::{emulator, ok, ACCOUNT_ID, CALLER_PRINCIPAL, PRINCIPAL_PERMISSIONS_TAG};
+
+/// `grants` as the catalog REPORTS them: every element carries the
+/// [`PRINCIPAL_PERMISSIONS_TAG`] discriminator, whatever the client sent.
+fn as_reported(grants: Value) -> Value {
+    let tagged: Vec<Value> = grants
+        .as_array()
+        .expect("a grant list is a list")
+        .iter()
+        .map(|grant| {
+            let mut grant = grant.clone();
+            grant
+                .as_object_mut()
+                .expect("a grant is a structure")
+                .insert("__type".to_string(), json!(PRINCIPAL_PERMISSIONS_TAG));
+            grant
+        })
+        .collect();
+    Value::Array(tagged)
+}
 
 /// The `CreateTableDefaultPermissions` a database carries when its create named none:
 /// the single `ALL` grant to the Lake Formation `IAM_ALLOWED_PRINCIPALS` principal.
@@ -26,12 +45,12 @@ use crate::wire::{emulator, ok, ACCOUNT_ID, CALLER_PRINCIPAL};
 /// of `PrincipalPermissions{Principal: DataLakePrincipal, Permissions: PermissionList}`,
 /// and `ALL` is one of the `Permission` enum's values.
 fn iam_allowed_principals_grant() -> Value {
-    json!([
+    as_reported(json!([
         {
             "Principal": { "DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS" },
             "Permissions": [ "ALL" ]
         }
-    ])
+    ]))
 }
 
 /// Create `database` and read it back.
@@ -110,7 +129,7 @@ async fn a_databases_create_table_default_permissions_are_reported_on_every_read
         (
             "explicitly empty grant list",
             json!({ "Name": "grants_empty_db", "CreateTableDefaultPermissions": [] }),
-            json!([]),
+            as_reported(json!([])),
         ),
         (
             "one grant of one permission",
@@ -123,12 +142,12 @@ async fn a_databases_create_table_default_permissions_are_reported_on_every_read
                     }
                 ]
             }),
-            json!([
+            as_reported(json!([
                 {
                     "Principal": { "DataLakePrincipalIdentifier": analyst },
                     "Permissions": [ "SELECT" ]
                 }
-            ]),
+            ])),
         ),
         (
             // The permissions here are `Permission` enum values the issue did not cite.
@@ -142,12 +161,12 @@ async fn a_databases_create_table_default_permissions_are_reported_on_every_read
                     }
                 ]
             }),
-            json!([
+            as_reported(json!([
                 {
                     "Principal": { "DataLakePrincipalIdentifier": engineer },
                     "Permissions": [ "CREATE_TABLE", "ALTER", "DATA_LOCATION_ACCESS" ]
                 }
-            ]),
+            ])),
         ),
         (
             "two grants",
@@ -164,7 +183,7 @@ async fn a_databases_create_table_default_permissions_are_reported_on_every_read
                     }
                 ]
             }),
-            json!([
+            as_reported(json!([
                 {
                     "Principal": { "DataLakePrincipalIdentifier": analyst },
                     "Permissions": [ "SELECT" ]
@@ -173,7 +192,7 @@ async fn a_databases_create_table_default_permissions_are_reported_on_every_read
                     "Principal": { "DataLakePrincipalIdentifier": engineer },
                     "Permissions": [ "ALL" ]
                 }
-            ]),
+            ])),
         ),
     ];
 
