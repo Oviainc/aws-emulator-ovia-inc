@@ -33,3 +33,5 @@ mod test_mapping;
 mod transformer_lifecycle;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
+#[path = "all/update_transformer.rs"]
+mod update_transformer;

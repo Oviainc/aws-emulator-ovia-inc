@@ -50,7 +50,7 @@ impl Reply {
     }
 
     /// A string at a JSON pointer, or `""` when absent.
-    fn text(&self, pointer: &str) -> &str {
+    pub(crate) fn text(&self, pointer: &str) -> &str {
         self.body
             .pointer(pointer)
             .and_then(Value::as_str)
@@ -58,8 +58,13 @@ impl Reply {
     }
 
     /// A number at a JSON pointer, or `None` when absent or not a number.
-    fn number(&self, pointer: &str) -> Option<f64> {
+    pub(crate) fn number(&self, pointer: &str) -> Option<f64> {
         self.body.pointer(pointer).and_then(Value::as_f64)
+    }
+
+    /// A boolean at a JSON pointer, or `None` when absent or not a boolean.
+    pub(crate) fn boolean(&self, pointer: &str) -> Option<bool> {
+        self.body.pointer(pointer).and_then(Value::as_bool)
     }
 }
 
@@ -154,7 +159,7 @@ impl Emulator {
 /// round trip. `NON_ALPHANUMERIC` over-encodes (it also escapes `-._~`, which RFC 3986
 /// leaves unreserved); that is still a valid encoding of the same value, and it keeps
 /// the test free of a hand-rolled escaper.
-fn query_encode(value: &str) -> String {
+pub(crate) fn query_encode(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 

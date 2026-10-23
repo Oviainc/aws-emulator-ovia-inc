@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/client_error_wire_status.rs"]
 mod client_error_wire_status;
+#[path = "all/rpc_success_status.rs"]
+mod rpc_success_status;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/state_roundtrip.rs"]

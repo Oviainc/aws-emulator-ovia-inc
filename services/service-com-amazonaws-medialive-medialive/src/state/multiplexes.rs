@@ -192,24 +192,14 @@ pub enum MultiplexStartRefusal {
     NotStartable(String),
 }
 
-/// Why [`ComAmazonawsMedialiveMedialiveState::insert_multiplex_program`] stored
-/// nothing. Each variant is one refusal `CreateMultiplexProgram` models.
+/// Why a `MultiplexProgramSettings` a request carried is not one the real
+/// service accepts, whatever operation carried it: every writer of a program's
+/// settings — `CreateMultiplexProgram` and `UpdateMultiplexProgram` — refuses
+/// the same values for the same reasons, so the checks
+/// ([`program_settings_refusal`]) and the wording ([`Display`]) live here once
+/// rather than once per operation.
 #[derive(Debug)]
-pub enum MultiplexProgramRefusal {
-    /// No multiplex in the store has the id the request named, so there is
-    /// nothing to create the program in.
-    MultiplexNotFound,
-    /// The multiplex the request named is going away (`DELETING`) or gone
-    /// (`DELETED`), so no program can be created in it. Carries its current
-    /// `MultiplexState`, so the refusal can name it.
-    MultiplexGone(String),
-    /// The multiplex already holds a program with that `ProgramName`, which is
-    /// what identifies a program within one multiplex.
-    ProgramNameInUse,
-    /// The multiplex already holds a program with that `ProgramNumber`
-    /// ("Unique program number"). Carries the number and the name of the
-    /// program already holding it.
-    ProgramNumberInUse { program_number: i32, held_by: String },
+pub enum MultiplexProgramSettingsRefusal {
     /// A `MultiplexProgramSettings` member fell outside the range the model
     /// publishes for it. Carries the member's wire path inside the structure,
     /// the value the request carried and that published range.
@@ -231,8 +221,87 @@ pub enum MultiplexProgramRefusal {
     /// which each member's own documentation forbids ("When this field is
     /// defined, StatmuxSettings must be undefined" and conversely).
     VideoSettingsOverSpecified,
+}
+
+/// The refusal's wording, which names the member, the rule and the value the
+/// request carried, so a caller can fix the request from that text alone. One
+/// copy, so two writers of the same settings cannot word the same refusal
+/// differently.
+impl std::fmt::Display for MultiplexProgramSettingsRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SettingOutOfRange {
+                member,
+                value,
+                min,
+                max,
+            } => write!(
+                f,
+                "multiplexProgramSettings.{member} must be between {min} and {max}, got {value}"
+            ),
+            Self::SettingTooLong {
+                member,
+                length,
+                max,
+            } => write!(
+                f,
+                "multiplexProgramSettings.{member} must be at most {max} characters, got {length}"
+            ),
+            Self::VideoSettingsOverSpecified => f.write_str(
+                "multiplexProgramSettings.videoSettings must define exactly one of constantBitrate and statmuxSettings",
+            ),
+        }
+    }
+}
+
+/// Why [`ComAmazonawsMedialiveMedialiveState::insert_multiplex_program`] stored
+/// nothing. Each variant is one refusal `CreateMultiplexProgram` models.
+#[derive(Debug)]
+pub enum MultiplexProgramRefusal {
+    /// No multiplex in the store has the id the request named, so there is
+    /// nothing to create the program in.
+    MultiplexNotFound,
+    /// The multiplex the request named is going away (`DELETING`) or gone
+    /// (`DELETED`), so no program can be created in it. Carries its current
+    /// `MultiplexState`, so the refusal can name it.
+    MultiplexGone(String),
+    /// The multiplex already holds a program with that `ProgramName`, which is
+    /// what identifies a program within one multiplex.
+    ProgramNameInUse,
+    /// The multiplex already holds a program with that `ProgramNumber`
+    /// ("Unique program number"). Carries the number and the name of the
+    /// program already holding it.
+    ProgramNumberInUse { program_number: i32, held_by: String },
+    /// The `MultiplexProgramSettings` the request carried are not ones the real
+    /// service accepts.
+    Settings(MultiplexProgramSettingsRefusal),
     /// The multiplex already holds [`MAX_MULTIPLEX_PROGRAMS`] programs.
     MultiplexFull,
+}
+
+/// Why [`ComAmazonawsMedialiveMedialiveState::update_multiplex_program`] wrote
+/// nothing. Each variant is one refusal `UpdateMultiplexProgram` models — a
+/// different set from the create's: an update resolves a program that must
+/// ALREADY exist (so "not found" is one of its refusals and "name in use" is
+/// not) and never grows the multiplex (so its per-multiplex cap cannot be
+/// reached).
+#[derive(Debug)]
+pub enum MultiplexProgramUpdateRefusal {
+    /// No multiplex in the store has the id the request named.
+    MultiplexNotFound,
+    /// The multiplex exists but holds no program of that `ProgramName`.
+    ProgramNotFound,
+    /// The multiplex the request named is going away (`DELETING`) or gone
+    /// (`DELETED`), so its programs are no longer updatable. Carries its
+    /// current `MultiplexState`, so the refusal can name it.
+    MultiplexGone(String),
+    /// ANOTHER program of the same multiplex already holds the `ProgramNumber`
+    /// the new settings ask for ("Unique program number"). Carries the number
+    /// and the name of that program.
+    ProgramNumberInUse { program_number: i32, held_by: String },
+    /// The new `MultiplexProgramSettings` are not ones the real service
+    /// accepts — the same refusals, with the same wording, the create makes.
+    Settings(MultiplexProgramSettingsRefusal),
 }
 
 /// The first `MultiplexProgramSettings` member whose value falls outside the
@@ -251,7 +320,7 @@ pub enum MultiplexProgramRefusal {
 /// structure, so a value the real service refuses would otherwise be stored.
 fn program_setting_out_of_range(
     settings: &MultiplexProgramSettings,
-) -> Option<MultiplexProgramRefusal> {
+) -> Option<MultiplexProgramSettingsRefusal> {
     let video = settings.video_settings.as_ref();
     let statmux = video.and_then(|video| video.statmux_settings.as_ref());
     // (wire path within `multiplexProgramSettings`, the value the request
@@ -287,7 +356,7 @@ fn program_setting_out_of_range(
         .into_iter()
         .find_map(|(member, value, min, max)| match value {
             Some(value) if !(min..=max).contains(&value) => {
-                Some(MultiplexProgramRefusal::SettingOutOfRange {
+                Some(MultiplexProgramSettingsRefusal::SettingOutOfRange {
                     member,
                     value,
                     min,
@@ -302,7 +371,7 @@ fn program_setting_out_of_range(
 /// max the model publishes for it ([`MAX_SERVICE_DESCRIPTOR_NAME_LEN`]), if any.
 fn service_descriptor_too_long(
     settings: &MultiplexProgramSettings,
-) -> Option<MultiplexProgramRefusal> {
+) -> Option<MultiplexProgramSettingsRefusal> {
     let descriptor = settings.service_descriptor.as_ref()?;
     [
         (
@@ -318,7 +387,7 @@ fn service_descriptor_too_long(
     .find_map(|(member, value)| {
         let length = value.chars().count();
         (length > MAX_SERVICE_DESCRIPTOR_NAME_LEN).then_some(
-            MultiplexProgramRefusal::SettingTooLong {
+            MultiplexProgramSettingsRefusal::SettingTooLong {
                 member,
                 length,
                 max: MAX_SERVICE_DESCRIPTOR_NAME_LEN,
@@ -337,6 +406,24 @@ fn video_settings_over_specified(settings: &MultiplexProgramSettings) -> bool {
     settings.video_settings.as_ref().is_some_and(|video| {
         video.constant_bitrate.is_some() && video.statmux_settings.is_some()
     })
+}
+
+/// The first reason these `MultiplexProgramSettings` are not ones the real
+/// service accepts, if any: the published ranges, the published lengths and the
+/// documented mutual exclusion inside `VideoSettings`, in one place.
+///
+/// Every writer of a program's settings runs this same check, so a value
+/// `CreateMultiplexProgram` refuses is a value `UpdateMultiplexProgram` refuses
+/// too — an update cannot store settings a create could not have stored.
+fn program_settings_refusal(
+    settings: &MultiplexProgramSettings,
+) -> Option<MultiplexProgramSettingsRefusal> {
+    program_setting_out_of_range(settings)
+        .or_else(|| service_descriptor_too_long(settings))
+        .or_else(|| {
+            video_settings_over_specified(settings)
+                .then_some(MultiplexProgramSettingsRefusal::VideoSettingsOverSpecified)
+        })
 }
 
 /// One created multiplex program, as `CreateMultiplexProgram` stored it.
@@ -653,13 +740,8 @@ impl ComAmazonawsMedialiveMedialiveState {
         program_name: String,
         multiplex_program_settings: MultiplexProgramSettings,
     ) -> Result<(), MultiplexProgramRefusal> {
-        if let Some(refusal) = program_setting_out_of_range(&multiplex_program_settings)
-            .or_else(|| service_descriptor_too_long(&multiplex_program_settings))
-        {
-            return Err(refusal);
-        }
-        if video_settings_over_specified(&multiplex_program_settings) {
-            return Err(MultiplexProgramRefusal::VideoSettingsOverSpecified);
+        if let Some(refusal) = program_settings_refusal(&multiplex_program_settings) {
+            return Err(MultiplexProgramRefusal::Settings(refusal));
         }
 
         let multiplex = self
@@ -699,6 +781,94 @@ impl ComAmazonawsMedialiveMedialiveState {
                 multiplex_program_settings,
             },
         );
+        Ok(())
+    }
+
+    /// Replace the settings of the program `program_name` of the multiplex
+    /// `multiplex_id`, or refuse.
+    ///
+    /// `multiplex_program_settings` is the `MultiplexProgramSettings` the
+    /// request carried, which the model makes OPTIONAL: an update that carries
+    /// none asks for no change, so the stored program is left exactly as it is
+    /// and the caller is answered with it. When settings ARE carried they
+    /// REPLACE the stored ones whole — the model's update member is the
+    /// structure itself, not a per-member patch — so an absent nested member
+    /// becomes absent on the program.
+    ///
+    /// The checks and the write live together here for the same reason as in
+    /// [`ComAmazonawsMedialiveMedialiveState::insert_multiplex_program`]: a
+    /// handler cannot check one rule and write past another. The settings are
+    /// validated before anything is resolved, so settings the real service
+    /// refuses are refused whatever program the request names.
+    ///
+    /// The refusals are ordered outside in, each check reaching only what the
+    /// one before it resolved: the multiplex, then its state, then the program,
+    /// then the number. So a program of a multiplex that is going away is
+    /// refused for the MULTIPLEX (`MultiplexGone`) whether or not that program
+    /// exists, and a program that does not exist is refused as
+    /// `ProgramNotFound` whatever number the new settings ask for.
+    pub fn update_multiplex_program(
+        &mut self,
+        multiplex_id: &str,
+        program_name: &str,
+        multiplex_program_settings: Option<MultiplexProgramSettings>,
+    ) -> Result<(), MultiplexProgramUpdateRefusal> {
+        if let Some(refusal) = multiplex_program_settings
+            .as_ref()
+            .and_then(program_settings_refusal)
+        {
+            return Err(MultiplexProgramUpdateRefusal::Settings(refusal));
+        }
+
+        let multiplex = self
+            .multiplexes
+            .get_mut(multiplex_id)
+            .ok_or(MultiplexProgramUpdateRefusal::MultiplexNotFound)?;
+        // A multiplex that is going away or gone carries no updatable program,
+        // the same state rule the create applies.
+        if !multiplex.accepts_programs() {
+            return Err(MultiplexProgramUpdateRefusal::MultiplexGone(
+                multiplex.state.clone(),
+            ));
+        }
+
+        let Some(multiplex_program_settings) = multiplex_program_settings else {
+            // No settings, so nothing to write — but the program the caller is
+            // about to be answered with still has to exist.
+            return if multiplex.programs.contains_key(program_name) {
+                Ok(())
+            } else {
+                Err(MultiplexProgramUpdateRefusal::ProgramNotFound)
+            };
+        };
+
+        // `ProgramNumber` is "Unique program number" within the multiplex, so
+        // the new number may be the program's OWN but not another program's.
+        // The holder is taken by name here, while the map is only read, so the
+        // write below borrows it once and the program is resolved once.
+        let program_number = multiplex_program_settings.program_number;
+        let held_by = multiplex
+            .programs
+            .values()
+            .find(|program| {
+                program.program_name != program_name
+                    && program.multiplex_program_settings.program_number == program_number
+            })
+            .map(|program| program.program_name.clone());
+
+        // The one lookup of the program itself: it is both the existence check
+        // and the write, so there is no second, unreachable resolution.
+        let program = multiplex
+            .programs
+            .get_mut(program_name)
+            .ok_or(MultiplexProgramUpdateRefusal::ProgramNotFound)?;
+        if let Some(held_by) = held_by {
+            return Err(MultiplexProgramUpdateRefusal::ProgramNumberInUse {
+                program_number,
+                held_by,
+            });
+        }
+        program.multiplex_program_settings = multiplex_program_settings;
         Ok(())
     }
 

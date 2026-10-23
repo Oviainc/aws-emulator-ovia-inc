@@ -33,9 +33,11 @@ pub(crate) struct Transcribe {
     pub(crate) router: Arc<MultiServiceRouter>,
 }
 
-/// One answer: the HTTP status and the parsed JSON body.
+/// One answer: the HTTP status, the `Content-Type` it was sent with and the parsed
+/// JSON body.
 pub(crate) struct Reply {
     pub(crate) status: u16,
+    pub(crate) content_type: Option<String>,
     pub(crate) body: Value,
 }
 
@@ -101,6 +103,11 @@ pub(crate) async fn dispatch(
         .expect("valid request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let body = if response.body().is_empty() {
         Value::Null
     } else {
@@ -111,7 +118,11 @@ pub(crate) async fn dispatch(
             )
         })
     };
-    Reply { status, body }
+    Reply {
+        status,
+        content_type,
+        body,
+    }
 }
 
 impl Reply {

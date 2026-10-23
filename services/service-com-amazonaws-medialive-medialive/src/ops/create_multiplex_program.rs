@@ -263,31 +263,9 @@ fn refused(
                 "multiplexProgramSettings.programNumber {program_number} is already used by the program {held_by} of multiplex {multiplex_id}"
             )),
         }),
-        Refusal::SettingOutOfRange {
-            member,
-            value,
-            min,
-            max,
-        } => CreateMultiplexProgramErrorModeled::BadRequestException(BadRequestException {
-            message: Some(format!(
-                "multiplexProgramSettings.{member} must be between {min} and {max}, got {value}"
-            )),
-        }),
-        Refusal::SettingTooLong {
-            member,
-            length,
-            max,
-        } => CreateMultiplexProgramErrorModeled::BadRequestException(BadRequestException {
-            message: Some(format!(
-                "multiplexProgramSettings.{member} must be at most {max} characters, got {length}"
-            )),
-        }),
-        Refusal::VideoSettingsOverSpecified => {
+        Refusal::Settings(settings) => {
             CreateMultiplexProgramErrorModeled::BadRequestException(BadRequestException {
-                message: Some(
-                    "multiplexProgramSettings.videoSettings must define exactly one of constantBitrate and statmuxSettings"
-                        .to_string(),
-                ),
+                message: Some(settings.to_string()),
             })
         }
         Refusal::MultiplexFull => {
