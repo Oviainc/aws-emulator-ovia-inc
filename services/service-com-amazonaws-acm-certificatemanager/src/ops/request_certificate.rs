@@ -399,12 +399,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             key_usages: Vec::new(),
             extended_key_usages: Vec::new(),
             exported: false,
-            // ACM sent this certificate's validation mail now, for a request that
-            // asked for email validation; the documented 72-hour resend window
-            // (`crate::state::RESEND_VALIDATION_WINDOW`) runs from here.
-            validation_email_sent_at: (validation_method
+            // ACM dispatches this certificate's first validation mail itself, a bounded
+            // span after the request is accepted, for a request that asked for email
+            // validation: until then nothing has been mailed, so no mailbox is recorded
+            // and the documented 72-hour resend window
+            // (`crate::state::RESEND_VALIDATION_WINDOW`) has not started.
+            validation_email_sent_at: None,
+            pending_validation_email: (validation_method
                 == crate::state::VALIDATION_METHOD_EMAIL)
-                .then_some(now),
+                .then(|| now + crate::state::VALIDATION_EMAIL_DISPATCH_DELAY),
             // Nothing is revoked: `RevokedAt` and `RevocationReason` "exist only when
             // the certificate status is REVOKED" (`CertificateDetail` docs).
             revoked_at: None,

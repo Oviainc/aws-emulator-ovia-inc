@@ -26,6 +26,12 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex encoding for those labels and for the opaque List* paging tokens.
 hex = { workspace = true }
+# `iam_trust_policy`: the one reading of an IAM trust policy, shared with every other
+# service that resolves a caller-supplied role before it writes.
+service-common = { path = "../common" }
+# The IAM store CreateHarvestJob resolves an S3Destination's `roleArn` against, to check
+# the role's trust policy grants mediapackage.amazonaws.com before a job is submitted.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

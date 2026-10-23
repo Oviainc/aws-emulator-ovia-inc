@@ -12,8 +12,13 @@
 //!
 //! * `CreateConnectionAlias` mints an `AliasId` matching the model's
 //!   `^wsca-[0-9a-z]{8,63}$` for ANY `ConnectionString` the model admits, persists the
-//!   connection string as supplied, and reports the alias as `CREATING` until the clock
-//!   settles it to `CREATED`.
+//!   connection string as supplied, and hands the alias back ready: a describe issued
+//!   straight after the create reports `CREATED`, and reading it again does not move it.
+//! * Every described alias reports a non-empty `Associations` list
+//!   (`ConnectionAliasAssociationList` is `len 1..25`), whose entries carry a modelled
+//!   `AssociationStatus`; an alias associated with no directory reports exactly one
+//!   entry, `NOT_ASSOCIATED`, with no member naming a directory, an account or a
+//!   connection identifier.
 //! * A connection string a stored alias already holds cannot be taken by a second alias
 //!   (`ResourceAlreadyExistsException`), and the hold is released when the alias is gone.
 //! * `DeleteConnectionAlias` moves the persisted alias to `DELETING` and the clock drops
@@ -22,6 +27,7 @@
 //!   request names, paginated over a stable creation order.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_workspaces_workspacesservice::ops::types::ASSOCIATION_STATUS_VALUES;
 
 use crate::workspace_lifecycle::{call, emulator_with_engine, settle};
 
@@ -120,6 +126,49 @@ async fn describe_one(
     reported.into_iter().next()
 }
 
+/// Assert `described` reports the `Associations` list AWS reports for an alias that is
+/// associated with no directory.
+///
+/// The list is never absent and never empty: `ConnectionAlias$Associations` targets
+/// `ConnectionAliasAssociationList`, `len 1..25`. For an alias no directory association
+/// names, the single entry's `AssociationStatus` is `NOT_ASSOCIATED` — one of the
+/// model's `AssociationStatus` values — and the three members that would name the
+/// association (`AssociatedAccountId`, `ResourceId`, `ConnectionIdentifier`) are absent,
+/// because there is no association to name one.
+fn assert_not_associated(case: &str, described: &Value) {
+    let associations = described["Associations"].as_array().unwrap_or_else(|| {
+        panic!("case {case:?}: every described alias reports an Associations list, got {described:?}")
+    });
+    assert!(
+        (1..=25).contains(&associations.len()),
+        "case {case:?}: Associations is len 1..25, got {associations:?}"
+    );
+    for association in associations {
+        let status = association["AssociationStatus"].as_str().unwrap_or_default();
+        assert!(
+            ASSOCIATION_STATUS_VALUES.contains(&status),
+            "case {case:?}: AssociationStatus must be one of {ASSOCIATION_STATUS_VALUES:?}, got {association:?}"
+        );
+    }
+    assert_eq!(
+        associations.len(),
+        1,
+        "case {case:?}: an alias associated with no directory reports one association, got {associations:?}"
+    );
+    let only = &associations[0];
+    assert_eq!(
+        only["AssociationStatus"].as_str(),
+        Some("NOT_ASSOCIATED"),
+        "case {case:?}: an alias associated with no directory is NOT_ASSOCIATED, got {only:?}"
+    );
+    for member in ["AssociatedAccountId", "ResourceId", "ConnectionIdentifier"] {
+        assert!(
+            only[member].is_null(),
+            "case {case:?}: {member} names an association this alias does not have, got {only:?}"
+        );
+    }
+}
+
 /// The wire error code of a refused call (`__type` carries `<namespace>#<Shape>`).
 fn error_code(body: &Value) -> String {
     body["__type"].as_str().unwrap_or_default().to_string()
@@ -133,15 +182,15 @@ async fn created_aliases_are_persisted_and_described_back() {
     for (case, connection_string) in connection_string_table() {
         let alias_id = create_alias(&router, case, &connection_string).await;
 
-        // The alias is reported before the clock settles it, so a caller that reads
-        // straight after the create still observes the transient state.
+        // The alias is handed back ready: the describe that follows the create
+        // reports it CREATED, with no transient state to poll through.
         let described = describe_one(&router, &alias_id)
             .await
             .unwrap_or_else(|| panic!("case {case:?}: alias {alias_id} must be stored"));
         assert_eq!(
             described["State"].as_str(),
-            Some("CREATING"),
-            "case {case:?}: an alias being created is CREATING, got {described:?}"
+            Some("CREATED"),
+            "case {case:?}: a created alias is CREATED straight away, got {described:?}"
         );
         assert_eq!(
             described["ConnectionString"].as_str(),
@@ -158,9 +207,15 @@ async fn created_aliases_are_persisted_and_described_back() {
             Some(engine::emulator_account_id()),
             "case {case:?}: the owner is the emulator's account, got {described:?}"
         );
-        assert!(
-            described["Associations"].is_null(),
-            "case {case:?}: a never-associated alias reports no associations, got {described:?}"
+        assert_not_associated(case, &described);
+
+        // Describing again reports the same alias: a read moves nothing.
+        let reread = describe_one(&router, &alias_id)
+            .await
+            .unwrap_or_else(|| panic!("case {case:?}: alias {alias_id} must still be stored"));
+        assert_eq!(
+            reread, described,
+            "case {case:?}: describing an alias twice reports the same alias"
         );
 
         created.push((case, connection_string, alias_id));
@@ -183,13 +238,14 @@ async fn created_aliases_are_persisted_and_described_back() {
         assert_eq!(
             described["State"].as_str(),
             Some("CREATED"),
-            "case {case:?}: a created alias settles to CREATED, got {described:?}"
+            "case {case:?}: a created alias stays CREATED, got {described:?}"
         );
         assert_eq!(
             described["ConnectionString"].as_str(),
             Some(connection_string.as_str()),
             "case {case:?}: the connection string must survive settling, got {described:?}"
         );
+        assert_not_associated(case, &described);
     }
 
     // No filter: every stored alias, in creation order.
@@ -263,6 +319,14 @@ async fn deleting_an_alias_moves_it_through_deleting_and_drops_it() {
     let (router, engine) = emulator_with_engine();
     let alias_id = create_alias(&router, "delete lifecycle", "redirect.example.com").await;
     settle(&engine);
+    let described = describe_one(&router, &alias_id)
+        .await
+        .expect("a created alias is reported");
+    assert_eq!(
+        described["State"].as_str(),
+        Some("CREATED"),
+        "an alias is CREATED before its deletion starts, got {described:?}"
+    );
 
     let (status, body) = call(
         &router,
@@ -284,6 +348,9 @@ async fn deleting_an_alias_moves_it_through_deleting_and_drops_it() {
         Some("DELETING"),
         "an alias being deleted is DELETING, got {described:?}"
     );
+    // Deleting the alias does not associate it with anything: the list is still the
+    // one NOT_ASSOCIATED entry.
+    assert_not_associated("an alias being deleted", &described);
 
     settle(&engine);
     assert_eq!(

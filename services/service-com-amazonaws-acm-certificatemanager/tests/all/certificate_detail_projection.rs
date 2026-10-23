@@ -15,7 +15,10 @@
 
 use serde_json::{json, Value};
 
-use crate::certificate_lifecycle::{call, describe, request_certificate, router, KEY_ALGORITHMS};
+use crate::certificate_lifecycle::{
+    call, describe, hold_pending_validations, request_certificate, router, router_with_engine,
+    KEY_ALGORITHMS,
+};
 
 /// Every modelled `KeyAlgorithm`, beside the X.509 algorithm descriptor a certificate
 /// detail reports it as and the algorithm the certificate is signed with.
@@ -59,8 +62,8 @@ struct DetailCase<'a> {
 }
 
 /// The mailbox list a name validated by `method` must report: email validation names
-/// the messages ACM has sent — none here, so the empty list — while a name validated
-/// by DNS or HTTP has no mailbox list at all.
+/// the messages ACM has sent — none while the initial dispatch is still owed, so the
+/// empty list — while a name validated by DNS or HTTP has no mailbox list at all.
 fn expected_validation_emails(method: &str) -> Value {
     if method == "EMAIL" {
         json!([])
@@ -230,10 +233,14 @@ async fn the_detail_reports_the_metadata_the_record_decides() {
         },
     ];
 
-    let router = router();
+    let (router, engine) = router_with_engine();
     for case in cases {
         let label = case.label;
         let arn = request_certificate(&router, &case.request).await;
+        // This suite is about the record a request creates, so every transition the
+        // clock owes it — the validation outcome and the initial validation mail — is
+        // held out instead of racing the wall clock.
+        hold_pending_validations(&engine);
         let detail = describe(&router, &arn).await;
 
         let domain = case.request["DomainName"].as_str().unwrap_or_default();
@@ -463,7 +470,7 @@ async fn a_request_named_validation_domain_applies_to_that_name_only() {
     // plus the case where the request names none.
     let methods: &[Option<&str>] = &[Some("DNS"), Some("EMAIL"), Some("HTTP"), None];
 
-    let router = router();
+    let (router, engine) = router_with_engine();
     for (index, method) in methods.iter().enumerate() {
         let case = format!("ValidationMethod={method:?}");
         // The first name is validated through a domain the request chose — a
@@ -485,6 +492,9 @@ async fn a_request_named_validation_domain_applies_to_that_name_only() {
         }
 
         let arn = request_certificate(&router, &body).await;
+        // The row is about the validation domains the request fixed, so the clock-owed
+        // mail dispatch is held out and no mailbox has been written to yet.
+        hold_pending_validations(&engine);
         let detail = describe(&router, &arn).await;
         let validations = detail["DomainValidationOptions"]
             .as_array()

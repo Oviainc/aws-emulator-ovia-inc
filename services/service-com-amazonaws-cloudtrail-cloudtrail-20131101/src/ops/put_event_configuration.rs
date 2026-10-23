@@ -502,7 +502,7 @@ fn configure_trail(
             )
             .into())
         }
-        crate::state::TrailForMutation::Absent => {
+        crate::state::TrailForMutation::Absent { .. } => {
             return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                 PutEventConfigurationErrorModeled::TrailNotFoundException(TrailNotFoundException {
                     message: Some(crate::state::unknown_trail_message(identifier)),

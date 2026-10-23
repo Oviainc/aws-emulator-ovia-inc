@@ -220,6 +220,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.whitelist.as_deref(),
             input.cmaf_package.as_ref(),
         )?;
+        // Every member of an endpoint that is a NUMBER OF SECONDS is a count of seconds of
+        // media, so none of them may be negative. Judged by the one function the update
+        // calls too, before anything is stored, so a refused request persists nothing.
+        crate::state::bound_origin_endpoint_durations(
+            input.startover_window_seconds,
+            input.time_delay_seconds,
+            input.hls_package.as_ref(),
+            input.dash_package.as_ref(),
+            input.cmaf_package.as_ref(),
+            input.mss_package.as_ref(),
+        )?;
 
         // An OriginEndpoint packages ONE Channel: a ChannelId naming no stored channel
         // has nothing to package, so the endpoint is not created. This is a value in the

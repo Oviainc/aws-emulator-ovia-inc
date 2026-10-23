@@ -320,13 +320,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            crate::state::TrailForMutation::Absent => {
-                return Err(PutEventSelectorsErrorModeled::TrailNotFoundException(
-                    TrailNotFoundException {
-                        message: Some(format!("Unknown trail: {}", input.trail_name)),
-                    },
-                )
-                .into());
+            crate::state::TrailForMutation::Absent { .. } => {
+                // The model says 404 for a not-found trail; CloudTrail answers 400
+                // (`crate::state::TRAIL_NOT_FOUND_STATUS`). No recording pins this
+                // operation's wording, so it carries the shared text: the identifier
+                // as the request sent it, plus the account the lookup ran in.
+                return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                    PutEventSelectorsErrorModeled::TrailNotFoundException(
+                        TrailNotFoundException {
+                            message: Some(crate::state::unknown_trail_message(&input.trail_name)),
+                        },
+                    ),
+                    crate::state::TRAIL_NOT_FOUND_STATUS,
+                ));
             }
         };
 

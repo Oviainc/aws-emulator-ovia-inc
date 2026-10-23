@@ -347,7 +347,9 @@ async fn every_target_prefix_form_serves_the_trail_lifecycle() {
             .await
             .expect_error(
                 &format!("{form}: GetTrail after DeleteTrail"),
-                404,
+                // CloudTrail answers a not-found trail with 400, not the 404 its
+                // model annotates; see `state::TRAIL_NOT_FOUND_STATUS`.
+                400,
                 "TrailNotFoundException",
             );
         let listed = emulator.call(prefix, "ListTrails", &json!({})).await;
@@ -473,17 +475,19 @@ async fn modelled_failures_survive_the_dotted_target_prefix() {
             "InvalidTrailNameException",
         ),
         (
+            // CloudTrail answers a not-found trail with 400, not the 404 its model
+            // annotates; see `state::TRAIL_NOT_FOUND_STATUS`.
             "an unknown trail",
             "GetTrail",
             json!({"Name": "ct-absent"}),
-            404,
+            400,
             "TrailNotFoundException",
         ),
         (
             "an unknown trail's status",
             "GetTrailStatus",
             json!({"Name": "ct-absent"}),
-            404,
+            400,
             "TrailNotFoundException",
         ),
     ];
