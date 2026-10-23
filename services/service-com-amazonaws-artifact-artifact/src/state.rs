@@ -547,6 +547,23 @@ impl InquiryContentRecord {
             Self::File { .. } => INPUT_SOURCE_FILE,
         }
     }
+
+    /// The display name this content DERIVES, when it carries one.
+    ///
+    /// A submission made of a single text query names itself: the query text is the
+    /// content, so the service's display name for the inquiry is that text and a caller
+    /// finds its inquiry in a listing under exactly what it submitted. An uploaded
+    /// document carries no single query to name the inquiry after — its queries are
+    /// written inside the file — so it derives nothing and the submitted title stands.
+    ///
+    /// TOTAL: `None` means "this content derives no name", which is what makes
+    /// [`ComplianceInquiry::display_name`] fall back to the title rather than guessing.
+    pub fn derived_name(&self) -> Option<&str> {
+        match self {
+            Self::Text(query) => Some(query.as_str()),
+            Self::File { .. } => None,
+        }
+    }
 }
 
 /// One query within one compliance inquiry — the `QuerySummary` projection
@@ -635,7 +652,11 @@ pub struct ComplianceInquiry {
     /// `InquiryId`, `^compliance-inquiry-[a-zA-Z0-9]{16}$`.
     pub id: String,
     pub arn: String,
-    /// "Title of the inquiry" (`CreateComplianceInquiryRequest$name`).
+    /// "Title of the inquiry" (`CreateComplianceInquiryRequest$name`), as the caller
+    /// submitted it. What a READER sees is
+    /// [`display_name`](Self::display_name): a submission that derives its own name
+    /// (a single text query) is reported under that name, so this member is the title
+    /// of record rather than the projected one.
     pub name: String,
     /// One of `InquiryStatus`'s values.
     pub status: String,
@@ -717,12 +738,24 @@ impl ComplianceInquiry {
         }
     }
 
+    /// The name every read of this inquiry reports — `InquirySummary$name`,
+    /// `InquiryDetail$name` and the exported document's `name`.
+    ///
+    /// The content names the inquiry when it derives a name
+    /// ([`InquiryContentRecord::derived_name`]), and the caller-supplied title stands
+    /// only for content that derives none. One rule, applied in one place, so the
+    /// create, the listing, the metadata read and the export cannot disagree about what
+    /// an inquiry is called.
+    pub fn display_name(&self) -> &str {
+        self.content.derived_name().unwrap_or(self.name.as_str())
+    }
+
     /// The `InquirySummary` projection `CreateComplianceInquiry` and
     /// `ListComplianceInquiries` return.
     pub fn to_summary(&self) -> InquirySummary {
         InquirySummary {
             arn: self.arn.clone(),
-            name: self.name.clone(),
+            name: self.display_name().to_string(),
             id: self.id.clone(),
             status: self.status.clone(),
             status_message: self.status_message.clone(),
@@ -737,7 +770,7 @@ impl ComplianceInquiry {
     pub fn to_detail(&self) -> InquiryDetail {
         InquiryDetail {
             arn: self.arn.clone(),
-            name: self.name.clone(),
+            name: self.display_name().to_string(),
             id: self.id.clone(),
             status: self.status.clone(),
             status_message: self.status_message.clone(),
@@ -792,7 +825,7 @@ impl ComplianceInquiry {
         let document = ::serde_json::json!({
             "complianceInquiryId": self.id,
             "arn": self.arn,
-            "name": self.name,
+            "name": self.display_name(),
             "status": self.status,
             "statusMessage": self.status_message,
             "supportMode": self.support_mode,
