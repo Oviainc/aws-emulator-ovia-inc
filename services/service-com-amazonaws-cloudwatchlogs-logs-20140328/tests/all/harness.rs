@@ -81,6 +81,26 @@ impl Logs {
         error_code(&parsed)
     }
 
+    /// Call one operation that must be refused as a client error, returning its wire
+    /// error code AND the message it reports — for a refusal whose message the service
+    /// builds from the request, so the message carries the rule.
+    pub async fn refusal(&self, operation: &str, body: &Value) -> (String, String) {
+        let (status, parsed) = self.call(operation, body).await;
+        assert_eq!(
+            status, 400,
+            "{operation} {body}: expected HTTP 400, got {status} {parsed}"
+        );
+        let message = parsed
+            .get("message")
+            .or_else(|| parsed.get("Message"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!("{operation} {body}: a refusal carries a message, got {parsed}")
+            })
+            .to_string();
+        (error_code(&parsed), message)
+    }
+
     /// The one log group the service reports under `identifier` (a name or either ARN
     /// form), or `None` once it is gone. Every suite that reads a log group's state back
     /// goes through this, so what it asserts is what a client can observe.

@@ -246,6 +246,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // select the same policy.
         let wanted_group = match input.resource_arn.as_deref() {
             Some(resource_arn) => {
+                // A value that is not an ARN at all is refused with the service's
+                // validation-error message naming the member and the value it could not
+                // parse; the kind check below answers a well-formed ARN of the wrong
+                // kind.
+                if let Some(message) =
+                    crate::state::unparsable_arn_message("resourceArn", resource_arn)
+                {
+                    return Err(invalid(&message));
+                }
                 if !crate::state::is_log_group_arn(resource_arn) {
                     return Err(invalid(
                         "resourceArn must be the ARN of a CloudWatch Logs log group",

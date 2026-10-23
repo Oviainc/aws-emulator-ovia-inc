@@ -129,6 +129,21 @@ pub const SUBSCRIPTION_DESTINATIONS: [(&str, &str); 4] = [
 /// @aws.region, and @source.log".
 pub const SUBSCRIPTION_SYSTEM_FIELDS: [&str; 3] = ["@aws.account", "@aws.region", "@source.log"];
 
+/// The `distribution` a subscription filter carries when the put naming it specified
+/// none, from `PutSubscriptionFilter$distribution`: "By default, log data is grouped by
+/// log stream, but the grouping can be set to random for a more even distribution." It is
+/// one of the model's `Distribution` enum values (`ByLogStream` | `Random`), so a filter
+/// always has a distribution to report.
+pub const DEFAULT_DISTRIBUTION: &str = "ByLogStream";
+
+/// The bracketed forms a filter pattern can open, as `(open, close)` pairs: a JSON
+/// selector pattern is wrapped in `{ … }` and a space-delimited pattern in `[ … ]`
+/// ("Filter pattern syntax for metric filters, subscription filters, filter log events,
+/// and Live Tail", referenced from `PutSubscriptionFilter`). A pattern that opens one of
+/// these forms must close it, which is the rule
+/// [`validate_filter_pattern`] holds a pattern to.
+pub const FILTER_PATTERN_DELIMITERS: [(char, char); 2] = [('{', '}'), ('[', ']')];
+
 /// THE EMULATOR'S OWN CEILING on the log streams one group holds, not an AWS quota:
 /// CloudWatch Logs documents no limit on log streams, but this emulator keeps every
 /// stream in memory, so it refuses to create more than this many in one group rather
@@ -456,7 +471,10 @@ pub struct SubscriptionFilterRecord {
     pub filter_pattern: String,
     pub destination_arn: String,
     pub role_arn: Option<String>,
-    pub distribution: Option<String>,
+    /// How log data is spread over the destination. Never absent: a put that names no
+    /// `distribution` gets the documented default ([`DEFAULT_DISTRIBUTION`]), so a
+    /// client reads back the grouping the filter is actually configured with.
+    pub distribution: String,
     pub apply_on_transformed_logs: bool,
     pub field_selection_criteria: Option<String>,
     pub emit_system_fields: Option<Vec<String>>,
@@ -622,14 +640,57 @@ pub fn log_stream_arn(region: &str, group_name: &str, stream_name: &str) -> Stri
 /// that is not an ARN. The resource segment is whatever follows the account, colons and
 /// slashes included, because a resource id carries its own separators.
 pub fn arn_service_and_resource(arn: &str) -> Option<(&str, &str)> {
+    arn_parts(arn).map(|(service, _account, resource)| (service, resource))
+}
+
+/// The `(service, account, resource)` segments of an ARN
+/// (`arn:<partition>:<service>:<region>:<account>:<resource>`), or `None` for anything
+/// that is not an ARN.
+fn arn_parts(arn: &str) -> Option<(&str, &str, &str)> {
     let rest = arn.strip_prefix("arn:")?;
     // partition, service, region, account, then the whole resource segment.
     let mut segments = rest.splitn(5, ':');
     let _partition = segments.next()?;
     let service = segments.next()?;
     let _region = segments.next()?;
-    let _account = segments.next()?;
-    Some((service, segments.next().unwrap_or_default()))
+    let account = segments.next()?;
+    Some((service, account, segments.next().unwrap_or_default()))
+}
+
+/// The destination vendor CloudWatch Logs delivers to without assuming a role: a Lambda
+/// function is invoked directly, which is why `PutSubscriptionFilter` documents the
+/// `iam:PassRole` requirement for "any destination except a Lambda function".
+pub const SELF_DELIVERED_DESTINATION_VENDOR: &str = "lambda";
+
+/// The vendor of a `destinationArn` whose delivery needs the role `roleArn` names, or
+/// `None` when the filter can be configured without one.
+///
+/// "To perform a PutSubscriptionFilter operation for any destination except a Lambda
+/// function, you must also have the iam:PassRole permission": every vendor but Lambda is
+/// delivered to through a role CloudWatch Logs assumes. The exception is a logical
+/// destination owned by ANOTHER account, where the destination's own policy authorises
+/// the delivery (`roleArn`: "You don't need to provide the ARN when you are working with
+/// a logical destination for cross-account delivery").
+///
+/// A vendor this operation delivers to nothing in ([`SUBSCRIPTION_DESTINATIONS`]) needs
+/// no role either: there is no delivery to authorise, and such a `destinationArn` is
+/// refused for the resource it names instead.
+pub fn subscription_role_required_vendor(arn: &str) -> Option<&str> {
+    let (vendor, account, resource) = arn_parts(arn)?;
+    if vendor == SELF_DELIVERED_DESTINATION_VENDOR
+        || !SUBSCRIPTION_DESTINATIONS
+            .iter()
+            .any(|(name, _)| vendor == *name)
+    {
+        return None;
+    }
+    let cross_account_logical_destination = vendor == "logs"
+        && resource.starts_with("destination:")
+        && account != ::engine::emulator_account_id();
+    if cross_account_logical_destination {
+        return None;
+    }
+    Some(vendor)
 }
 
 /// Whether an ARN names a CloudWatch Logs log group — the only resource type a resource
@@ -683,6 +744,116 @@ pub fn is_subscription_destination_arn(arn: &str) -> bool {
             .iter()
             .any(|(name, prefix)| service == *name && resource.starts_with(prefix))
     })
+}
+
+/// AWS's request-derived refusal message for a member the service parses as an ARN and
+/// was handed something that is not one: the validation-error template naming the member
+/// and the value it could not parse. `None` when the value parses as an ARN, whatever
+/// resource it names — a well-formed ARN of the wrong kind is a different refusal, with
+/// its own message.
+pub fn unparsable_arn_message(member: &str, value: &str) -> Option<String> {
+    arn_service_and_resource(value)
+        .is_none()
+        .then(|| format!("1 validation error detected: Unable to parse {member} {value}"))
+}
+
+/// Hold a `filterPattern` to the filter-pattern syntax's bracket rule: a pattern that
+/// opens one of the bracketed forms in [`FILTER_PATTERN_DELIMITERS`] must close it with
+/// the matching delimiter, and the brackets it nests inside that form must balance. The
+/// `Err` carries the message to refuse with, as the service states the rule.
+///
+/// A pattern that opens no bracketed form — a term, a text or a regular-expression
+/// pattern — carries no bracket structure to check, and the empty pattern (the modelled
+/// `FilterPattern` is `length 0..1024`) matches every event.
+pub fn validate_filter_pattern(pattern: &str) -> Result<(), String> {
+    let pattern = pattern.trim();
+    let Some(first) = pattern.chars().next() else {
+        return Ok(());
+    };
+    let Some((open, close)) = FILTER_PATTERN_DELIMITERS
+        .iter()
+        .copied()
+        .find(|(open, _)| *open == first)
+    else {
+        return Ok(());
+    };
+    if !pattern.ends_with(close) {
+        return Err(format!(
+            "If a filter pattern starts with '{open}' it must end with '{close}'"
+        ));
+    }
+    if let Err(defect) = filter_pattern_structure(pattern, open) {
+        return Err(match defect {
+            PatternDefect::UnbalancedBrackets => format!(
+                "Invalid filter pattern: the brackets in a '{open}' … '{close}' filter pattern must be balanced"
+            ),
+            PatternDefect::UnterminatedQuotedString => {
+                "Invalid filter pattern: a quoted string is not terminated".to_string()
+            }
+            PatternDefect::UnterminatedRegex => {
+                "Invalid filter pattern: a regular expression is not terminated".to_string()
+            }
+        });
+    }
+    Ok(())
+}
+
+/// What [`filter_pattern_structure`] found wrong with a pattern, so the refusal names the
+/// defect it detected rather than one of them for all three.
+enum PatternDefect {
+    UnbalancedBrackets,
+    UnterminatedQuotedString,
+    UnterminatedRegex,
+}
+
+/// Whether a filter pattern's structure closes: its brackets open and close in order —
+/// the bracketed forms in [`FILTER_PATTERN_DELIMITERS`], plus the `()` that group a JSON
+/// pattern's terms, only in a JSON pattern, because a space-delimited pattern's terms can
+/// carry a bare parenthesis — and the literals it opens are terminated.
+///
+/// A quoted string (`"…"`) and a regular-expression literal (`%…%`) are opaque: the
+/// pattern syntax lets them carry any character, so a bracket inside one is data rather
+/// than structure. A backslash escapes the character after it.
+fn filter_pattern_structure(pattern: &str, opened: char) -> Result<(), PatternDefect> {
+    let groups_terms_in_parentheses = opened == '{';
+    let mut open_brackets: Vec<char> = Vec::new();
+    let mut quoted = false;
+    let mut regex = false;
+    let mut chars = pattern.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' => {
+                chars.next();
+            }
+            '"' if !regex => quoted = !quoted,
+            '%' if !quoted => regex = !regex,
+            _ if quoted || regex => {}
+            '(' | ')' if !groups_terms_in_parentheses => {}
+            '{' | '[' | '(' => open_brackets.push(character),
+            '}' | ']' | ')' => {
+                let opened = match character {
+                    '}' => '{',
+                    ']' => '[',
+                    _ => '(',
+                };
+                if open_brackets.pop() != Some(opened) {
+                    return Err(PatternDefect::UnbalancedBrackets);
+                }
+            }
+            _ => {}
+        }
+    }
+    if quoted {
+        return Err(PatternDefect::UnterminatedQuotedString);
+    }
+    if regex {
+        return Err(PatternDefect::UnterminatedRegex);
+    }
+    if open_brackets.is_empty() {
+        Ok(())
+    } else {
+        Err(PatternDefect::UnbalancedBrackets)
+    }
 }
 
 /// The log group name a `logGroupIdentifier` names: the identifier itself when it is a

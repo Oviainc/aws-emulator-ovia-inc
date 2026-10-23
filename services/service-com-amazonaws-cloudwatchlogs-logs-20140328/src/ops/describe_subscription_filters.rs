@@ -214,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeSubscriptionFiltersErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some("The specified log group does not exist".to_string()),
+                        message: Some("The specified log group does not exist.".to_string()),
                     },
                 )
                 .into(),
@@ -286,7 +286,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         filter_pattern: Some(filter.filter_pattern.clone()),
                         destination_arn: Some(filter.destination_arn.clone()),
                         role_arn: filter.role_arn.clone(),
-                        distribution: filter.distribution.clone(),
+                        // Never absent: a filter put without a `distribution` carries
+                        // the documented default, so a client reads back the grouping it
+                        // is configured with.
+                        distribution: Some(filter.distribution.clone()),
                         apply_on_transformed_logs: filter.apply_on_transformed_logs,
                         creation_time: Some(filter.creation_time_ms),
                         // "Returns the fieldSelectionCriteria value if it was specified

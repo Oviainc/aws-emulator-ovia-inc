@@ -34,6 +34,20 @@ const LIMIT_MAX: i64 = 50;
 /// @aws.region, and @source.log".
 const SYSTEM_FIELDS: [&str; 3] = ["@aws.account", "@aws.region", "@source.log"];
 
+/// The values `distribution` takes. Source: the model's `Distribution` enum
+/// (`ByLogStream` | `Random`).
+const DISTRIBUTIONS: [&str; 2] = ["ByLogStream", "Random"];
+
+/// The grouping a filter is configured with when the put named no `distribution`.
+/// Source: `PutSubscriptionFilter$distribution` — "By default, log data is grouped by
+/// log stream, but the grouping can be set to random for a more even distribution."
+const DEFAULT_DISTRIBUTION: &str = DISTRIBUTIONS[0];
+
+/// The bracketed forms a filter pattern can open, as `(open, close)` pairs. Source: the
+/// filter-pattern syntax `PutSubscriptionFilter` references — a JSON selector pattern is
+/// wrapped in `{ … }`, a space-delimited pattern in `[ … ]`.
+const PATTERN_DELIMITERS: [(char, char); 2] = [('{', '}'), ('[', ']')];
+
 /// One put row: everything the request names, so the assertions can be derived from it.
 #[derive(Debug, Clone)]
 struct Row {
@@ -75,9 +89,20 @@ impl Row {
     }
 }
 
-/// An ARN in another service's namespace, of the form that service publishes.
+/// An ARN in another service's namespace, of the form that service publishes. The
+/// account is another one than the emulator's own, so a cross-account destination is
+/// distinguishable from a same-account one.
 fn arn(service: &str, resource: &str) -> String {
     format!("arn:aws:{service}:{REGION}:{ACCOUNT}:{resource}")
+}
+
+/// An ARN owned by the emulator's OWN account — the account every ARN it mints carries,
+/// so a destination named with it is a same-account destination.
+fn own_account_arn(service: &str, resource: &str) -> String {
+    format!(
+        "arn:aws:{service}:{REGION}:{}:{resource}",
+        engine::emulator_account_id()
+    )
 }
 
 /// An IAM role ARN — the `roleArn` form, which carries no region because IAM is global.
@@ -272,8 +297,8 @@ async fn put_is_readable_back_through_describe() {
         );
         assert_eq!(
             member(&found, "distribution"),
-            row.distribution,
-            "case {row:?}: distribution is reported only when it was specified, got {found}"
+            Some(row.distribution.unwrap_or(DEFAULT_DISTRIBUTION)),
+            "case {row:?}: distribution is what was specified, or the documented default, got {found}"
         );
         assert_eq!(
             found.get("applyOnTransformedLogs").and_then(Value::as_bool),
@@ -341,8 +366,8 @@ async fn put_under_one_name_updates_in_place() {
         );
         assert_eq!(
             member(&filter, "distribution"),
-            row.distribution,
-            "case {row:?}: an update drops distribution when the put omits it, got {filter}"
+            Some(row.distribution.unwrap_or(DEFAULT_DISTRIBUTION)),
+            "case {row:?}: an update that omits distribution resets it to the default, got {filter}"
         );
         assert_eq!(
             member(&filter, "roleArn"),
@@ -389,6 +414,7 @@ async fn filters_are_sorted_prefix_filtered_and_paged() {
                     "filterName": name,
                     "filterPattern": "",
                     "destinationArn": arn("firehose", "deliverystream/target"),
+                    "roleArn": role_arn("CWLtoFirehoseRole"),
                 }),
             )
             .await;
@@ -497,6 +523,7 @@ async fn filters_are_sorted_prefix_filtered_and_paged() {
 async fn quota_is_two_filters_per_log_group() {
     let logs = Logs::new();
     let destination = arn("kinesis", "stream/quota-target");
+    let role = role_arn("CWLtoKinesisRole");
 
     for group in ["quota-group-a", "quota-group-b"] {
         create_group(&logs, group).await;
@@ -508,6 +535,7 @@ async fn quota_is_two_filters_per_log_group() {
                     "filterName": format!("filter-{index}"),
                     "filterPattern": "",
                     "destinationArn": destination,
+                    "roleArn": role,
                 }),
             )
             .await;
@@ -520,6 +548,7 @@ async fn quota_is_two_filters_per_log_group() {
                     "filterName": "one-too-many",
                     "filterPattern": "",
                     "destinationArn": destination,
+                    "roleArn": role,
                 }),
             )
             .await,
@@ -534,6 +563,7 @@ async fn quota_is_two_filters_per_log_group() {
                 "filterName": "filter-0",
                 "filterPattern": "UPDATED",
                 "destinationArn": destination,
+                "roleArn": role,
             }),
         )
         .await;
@@ -554,6 +584,7 @@ async fn requests_that_cannot_be_stored_are_refused() {
     let group = "refusal-group";
     create_group(&logs, group).await;
     let destination = arn("firehose", "deliverystream/target");
+    let role = role_arn("CWLtoFirehoseRole");
 
     // "Creates or updates a subscription filter and associates it with the specified log
     // group": there is no such group to associate it with.
@@ -565,6 +596,7 @@ async fn requests_that_cannot_be_stored_are_refused() {
                 "filterName": "orphan",
                 "filterPattern": "",
                 "destinationArn": destination,
+                "roleArn": role,
             }),
         )
         .await,
@@ -605,6 +637,7 @@ async fn requests_that_cannot_be_stored_are_refused() {
                     "filterName": "rejected",
                     "filterPattern": "",
                     "destinationArn": candidate,
+                    "roleArn": role,
                 }),
             )
             .await,
@@ -630,6 +663,7 @@ async fn requests_that_cannot_be_stored_are_refused() {
                     "filterName": "rejected",
                     "filterPattern": "",
                     "destinationArn": destination,
+                    "roleArn": role,
                     "emitSystemFields": fields,
                 }),
             )
@@ -677,5 +711,468 @@ async fn deleting_the_log_group_removes_its_filters() {
         filters_of(&logs, group).await,
         Vec::<Value>::new(),
         "case after recreating the group: its filters went with the group"
+    );
+}
+
+/// The `distribution` a filter is configured with, over the whole class: each value the
+/// `Distribution` enum declares, and the put that names none — which takes the
+/// documented default, so every filter reports a grouping. A value outside the enum is
+/// refused.
+#[tokio::test]
+async fn distribution_is_reported_and_defaults_to_the_documented_grouping() {
+    let logs = Logs::new();
+    let group = "distribution-group";
+    create_group(&logs, group).await;
+    let name = "distributed";
+    let put = |distribution: Option<&str>| {
+        let mut body = json!({
+            "logGroupName": group,
+            "filterName": name,
+            "filterPattern": "",
+            "destinationArn": arn("lambda", "function:log-consumer"),
+        });
+        if let Some(distribution) = distribution {
+            body["distribution"] = json!(distribution);
+        }
+        body
+    };
+
+    // One row per enum value, plus the row that names none.
+    let mut cases: Vec<(Option<&str>, &str)> = vec![(None, DEFAULT_DISTRIBUTION)];
+    cases.extend(DISTRIBUTIONS.iter().map(|value| (Some(*value), *value)));
+    for (requested, expected) in cases {
+        logs.ok("PutSubscriptionFilter", &put(requested)).await;
+        let found = one_filter(&logs, group, name).await;
+        assert_eq!(
+            member(&found, "distribution"),
+            Some(expected),
+            "case distribution {requested:?}: expected {expected}, got {found}"
+        );
+    }
+
+    // A value outside the modelled `Distribution` enum — including an enum value in the
+    // wrong case — is refused rather than stored.
+    for candidate in ["bylogstream", "RANDOM", "RoundRobin"] {
+        let (status, body) = logs
+            .call("PutSubscriptionFilter", &put(Some(candidate)))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case distribution {candidate}: only a modelled Distribution value is accepted, got {status} {body}"
+        );
+    }
+}
+
+/// A filter pattern is parsed when the filter is configured: one that opens a bracketed
+/// form must close it with the matching delimiter, and the brackets nested inside that
+/// form must balance. A pattern that opens no bracketed form has no bracket structure to
+/// hold to, and a refused put stores nothing.
+#[tokio::test]
+async fn an_unclosed_bracketed_filter_pattern_is_refused() {
+    let logs = Logs::new();
+    let accepted_group = "pattern-group";
+    let refused_group = "pattern-refusal-group";
+    create_group(&logs, accepted_group).await;
+    create_group(&logs, refused_group).await;
+    let destination = arn("lambda", "function:log-consumer");
+    let name = "patterned";
+    let put = |group: &str, pattern: &str| {
+        json!({
+            "logGroupName": group,
+            "filterName": name,
+            "filterPattern": pattern,
+            "destinationArn": destination,
+        })
+    };
+
+    // Every pattern form the syntax carries, closed: the empty pattern, a term pattern,
+    // a regular-expression pattern, a JSON pattern (grouped, indexed, carrying a quoted
+    // brace and a bracketed regex), a space-delimited pattern, and one surrounded by
+    // whitespace.
+    for pattern in [
+        "",
+        "ERROR",
+        "?ERROR ?WARN",
+        "%(?i)(error|warn)%",
+        "{ $.level = \"ERROR\" }",
+        "{ ($.a = 1) || ($.b = 2) }",
+        "{ $.items[0].id = 7 }",
+        "{ $.message = \"a } brace inside a string\" }",
+        "{ $.message = %^\\[ERROR\\]% }",
+        "[w1=ERROR, w2]",
+        // A space-delimited pattern's terms can carry a bare parenthesis, which is not
+        // bracket structure.
+        "[w1=ERROR, w2=f(x]",
+        "  { $.level = \"ERROR\" }  ",
+    ] {
+        logs.ok("PutSubscriptionFilter", &put(accepted_group, pattern))
+            .await;
+        let found = one_filter(&logs, accepted_group, name).await;
+        assert_eq!(
+            member(&found, "filterPattern"),
+            Some(pattern),
+            "case pattern {pattern:?}: a closed pattern is stored as given, got {found}"
+        );
+    }
+
+    // A pattern that opens a bracketed form and does not close it is refused with the
+    // rule, stated for the delimiter pair it opened.
+    let unclosed: Vec<(String, String)> = PATTERN_DELIMITERS
+        .iter()
+        .flat_map(|(open, close)| {
+            let rule = format!("If a filter pattern starts with '{open}' it must end with '{close}'");
+            [
+                format!("{open} $.level = "),
+                format!("{open} $.level = \"ERROR\""),
+                format!("{open}w1=ERROR, w2"),
+            ]
+            .map(|pattern| (pattern, rule.clone()))
+        })
+        .collect();
+    for (pattern, rule) in &unclosed {
+        let (code, message) = logs
+            .refusal("PutSubscriptionFilter", &put(refused_group, pattern))
+            .await;
+        assert_eq!(
+            code, "InvalidParameterException",
+            "case pattern {pattern:?}: an unclosed pattern is refused, got {code} {message}"
+        );
+        assert_eq!(
+            &message, rule,
+            "case pattern {pattern:?}: the refusal states the rule, got {message}"
+        );
+    }
+
+    // A pattern that closes the form it opened but whose structure does not close inside
+    // it is refused too — the parse covers the whole pattern, not just its ends — and the
+    // refusal names the defect it detected.
+    let brackets = |open: char, close: char| {
+        format!(
+            "Invalid filter pattern: the brackets in a '{open}' … '{close}' filter pattern must be balanced"
+        )
+    };
+    for (pattern, expected) in [
+        ("{ { $.level = \"ERROR\" }", brackets('{', '}')),
+        ("{ $.level = \"ERROR\" } }", brackets('{', '}')),
+        ("{ ($.a = 1 }", brackets('{', '}')),
+        ("[w1=ERROR, w2]]", brackets('[', ']')),
+        (
+            "{ $.message = \"unterminated }",
+            "Invalid filter pattern: a quoted string is not terminated".to_string(),
+        ),
+        (
+            "{ $.message = %unterminated }",
+            "Invalid filter pattern: a regular expression is not terminated".to_string(),
+        ),
+    ] {
+        let (code, message) = logs
+            .refusal("PutSubscriptionFilter", &put(refused_group, pattern))
+            .await;
+        assert_eq!(
+            code, "InvalidParameterException",
+            "case pattern {pattern:?}: a pattern that does not close is refused, got {code} {message}"
+        );
+        assert_eq!(
+            message, expected,
+            "case pattern {pattern:?}: the refusal names the defect, got {message}"
+        );
+    }
+
+    // Nothing a refused put named was stored, so the group advertises no subscription.
+    assert_eq!(
+        filters_of(&logs, refused_group).await,
+        Vec::<Value>::new(),
+        "case after the refused patterns: a refused put persists nothing"
+    );
+}
+
+/// A member this operation parses as an ARN, handed a value that is not an ARN, is
+/// refused with the service's request-derived validation-error message: it names the
+/// member and the value it could not parse. A well-formed ARN naming a resource the
+/// operation does not deliver to is a different refusal, reporting the resource kind
+/// rather than a parse failure.
+#[tokio::test]
+async fn a_member_that_is_not_an_arn_reports_a_parse_failure() {
+    let logs = Logs::new();
+    let group = "arn-group";
+    create_group(&logs, group).await;
+    let destination = arn("lambda", "function:log-consumer");
+
+    // Values that are not ARNs: a bare name, a hostname, a truncated ARN missing the
+    // segments an ARN has, and one whose scheme is not `arn:`.
+    for candidate in [
+        "not-a-valid-arn",
+        "cloudwatch-log-processing",
+        "lambda.amazonaws.com",
+        "arn:aws:lambda",
+        "arn:aws:lambda:eu-west-2",
+        "aws:lambda:eu-west-2:123456789012:function:log-consumer",
+        " ",
+    ] {
+        // The rule holds for every ARN member of the request, not only the one the
+        // destination is named in.
+        for (member_name, body) in [
+            (
+                "destinationArn",
+                json!({
+                    "logGroupName": group,
+                    "filterName": "rejected",
+                    "filterPattern": "",
+                    "destinationArn": candidate,
+                }),
+            ),
+            (
+                "roleArn",
+                json!({
+                    "logGroupName": group,
+                    "filterName": "rejected",
+                    "filterPattern": "",
+                    "destinationArn": destination,
+                    "roleArn": candidate,
+                }),
+            ),
+        ] {
+            let (code, message) = logs.refusal("PutSubscriptionFilter", &body).await;
+            assert_eq!(
+                code, "InvalidParameterException",
+                "case {member_name} {candidate:?}: a value that is not an ARN is refused, got {code} {message}"
+            );
+            assert_eq!(
+                message,
+                format!("1 validation error detected: Unable to parse {member_name} {candidate}"),
+                "case {member_name} {candidate:?}: the refusal names the member and the value, got {message}"
+            );
+        }
+    }
+
+    // A value that IS an ARN, naming a resource this operation does not deliver to, is
+    // refused for the resource it names — not reported as a parse failure.
+    let group_arn = format!("arn:aws:logs:{REGION}:{ACCOUNT}:log-group:{group}");
+    for candidate in [
+        "arn:aws:s3:::my-bucket".to_string(),
+        arn("sns", "log-topic"),
+        group_arn,
+    ] {
+        let (code, message) = logs
+            .refusal(
+                "PutSubscriptionFilter",
+                &json!({
+                    "logGroupName": group,
+                    "filterName": "rejected",
+                    "filterPattern": "",
+                    "destinationArn": candidate,
+                    "roleArn": role_arn("CWLtoTargetRole"),
+                }),
+            )
+            .await;
+        assert_eq!(
+            code, "InvalidParameterException",
+            "case {candidate}: an unsupported destination is refused, got {code} {message}"
+        );
+        assert!(
+            !message.starts_with("1 validation error detected"),
+            "case {candidate}: an ARN that parses is not reported as a parse failure, got {message}"
+        );
+    }
+
+    // No refused put stored anything.
+    assert_eq!(
+        filters_of(&logs, group).await,
+        Vec::<Value>::new(),
+        "case after the refusals: a refused put persists nothing"
+    );
+}
+
+/// Delivery to any destination but a Lambda function goes through a role CloudWatch Logs
+/// assumes, so a put that names no `roleArn` is refused and the refusal names the vendor
+/// it was asked to deliver to. A Lambda function is invoked directly, and a logical
+/// destination owned by another account authorises the delivery with its own policy, so
+/// neither needs a role.
+#[tokio::test]
+async fn a_destination_that_needs_a_role_is_refused_without_one() {
+    let logs = Logs::new();
+    let group = "role-group";
+    create_group(&logs, group).await;
+    let name = "to-destination";
+    let put = |destination: &str, role: Option<String>| {
+        let mut body = json!({
+            "logGroupName": group,
+            "filterName": name,
+            "filterPattern": "",
+            "destinationArn": destination,
+        });
+        if let Some(role) = role {
+            body["roleArn"] = json!(role);
+        }
+        body
+    };
+
+    // One row per vendor that needs a role: each streaming destination, and a logical
+    // destination owned by this same account.
+    for (vendor, destination) in [
+        ("kinesis", arn("kinesis", "stream/role-target")),
+        ("firehose", arn("firehose", "deliverystream/role-target")),
+        (
+            "logs",
+            own_account_arn("logs", "destination:same-account-destination"),
+        ),
+    ] {
+        let (code, message) = logs
+            .refusal("PutSubscriptionFilter", &put(&destination, None))
+            .await;
+        assert_eq!(
+            code, "InvalidParameterException",
+            "case vendor {vendor} without roleArn: the put is refused, got {code} {message}"
+        );
+        assert_eq!(
+            message,
+            format!("destinationArn for vendor {vendor} cannot be used without roleArn"),
+            "case vendor {vendor}: the refusal names the vendor, got {message}"
+        );
+        assert_eq!(
+            filters_of(&logs, group).await,
+            Vec::<Value>::new(),
+            "case vendor {vendor}: a put refused for a missing roleArn stores nothing"
+        );
+
+        // The same put, with a role, is accepted and readable back.
+        let role = role_arn("CWLtoTargetRole");
+        logs.ok(
+            "PutSubscriptionFilter",
+            &put(&destination, Some(role.clone())),
+        )
+        .await;
+        let found = one_filter(&logs, group, name).await;
+        assert_eq!(
+            (
+                member(&found, "destinationArn"),
+                member(&found, "roleArn")
+            ),
+            (Some(destination.as_str()), Some(role.as_str())),
+            "case vendor {vendor}: the configured destination and role are reported, got {found}"
+        );
+        logs.ok(
+            "DeleteSubscriptionFilter",
+            &json!({"logGroupName": group, "filterName": name}),
+        )
+        .await;
+    }
+
+    // What needs no role at all.
+    for destination in [
+        arn("lambda", "function:log-consumer"),
+        arn("logs", "destination:cross-account-destination"),
+    ] {
+        logs.ok("PutSubscriptionFilter", &put(&destination, None))
+            .await;
+        let found = one_filter(&logs, group, name).await;
+        assert_eq!(
+            member(&found, "destinationArn"),
+            Some(destination.as_str()),
+            "case {destination}: it needs no roleArn, got {found}"
+        );
+        assert_eq!(
+            member(&found, "roleArn"),
+            None,
+            "case {destination}: no role was configured, got {found}"
+        );
+    }
+
+    // A vendor this operation delivers to nothing in needs no role either: the refusal
+    // reports the resource it was handed, not a role requirement for a delivery that
+    // could never happen.
+    for destination in ["arn:aws:s3:::my-bucket".to_string(), arn("sns", "log-topic")] {
+        let (code, message) = logs
+            .refusal("PutSubscriptionFilter", &put(&destination, None))
+            .await;
+        assert_eq!(
+            code, "InvalidParameterException",
+            "case {destination}: an unsupported destination is refused, got {code} {message}"
+        );
+        assert!(
+            !message.contains("roleArn"),
+            "case {destination}: an unsupported vendor is refused for its resource, got {message}"
+        );
+    }
+}
+
+/// `DeleteSubscriptionFilter` removes exactly the filter it names from the group it is
+/// associated with: the others stay, the name is free for a new filter, and a filter the
+/// group does not hold — or a group that does not exist — is refused.
+#[tokio::test]
+async fn delete_removes_only_the_subscription_filter_it_names() {
+    let logs = Logs::new();
+    let group = "delete-group";
+    let other_group = "delete-group-other";
+    create_group(&logs, group).await;
+    create_group(&logs, other_group).await;
+    let destination = arn("lambda", "function:log-consumer");
+    let put = |group: &str, name: &str| {
+        json!({
+            "logGroupName": group,
+            "filterName": name,
+            "filterPattern": "",
+            "destinationArn": destination,
+        })
+    };
+
+    // The quota is two filters per group, so the group holds both, and another group
+    // holds a filter under one of the same names.
+    let names = ["keep", "remove"];
+    for name in names {
+        logs.ok("PutSubscriptionFilter", &put(group, name)).await;
+    }
+    logs.ok("PutSubscriptionFilter", &put(other_group, names[1]))
+        .await;
+
+    logs.ok(
+        "DeleteSubscriptionFilter",
+        &json!({"logGroupName": group, "filterName": names[1]}),
+    )
+    .await;
+    assert_eq!(
+        names_of(&filters_of(&logs, group).await),
+        vec![names[0].to_string()],
+        "case after the delete: only the filter the delete named is gone"
+    );
+    assert_eq!(
+        names_of(&filters_of(&logs, other_group).await),
+        vec![names[1].to_string()],
+        "case another group: a filter of the same name on another group is untouched"
+    );
+
+    // The name is free again: a new filter can take it, and the group is back at the
+    // quota.
+    logs.ok("PutSubscriptionFilter", &put(group, names[1])).await;
+    let mut expected: Vec<String> = names.iter().map(ToString::to_string).collect();
+    expected.sort();
+    assert_eq!(
+        names_of(&filters_of(&logs, group).await),
+        expected,
+        "case re-put after the delete: the name is free again"
+    );
+
+    // What a delete refuses: a filter the group does not hold, and a group that does not
+    // exist.
+    for (case, request) in [
+        (
+            "a filter the group does not hold",
+            json!({"logGroupName": group, "filterName": "never-created"}),
+        ),
+        (
+            "a log group that does not exist",
+            json!({"logGroupName": "no-such-group", "filterName": names[0]}),
+        ),
+    ] {
+        assert_eq!(
+            logs.err("DeleteSubscriptionFilter", &request).await,
+            "ResourceNotFoundException",
+            "case {case}: there is nothing to delete"
+        );
+    }
+    assert_eq!(
+        names_of(&filters_of(&logs, group).await),
+        expected,
+        "case after the refused deletes: nothing else was removed"
     );
 }
