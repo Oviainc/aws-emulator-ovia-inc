@@ -52,9 +52,14 @@ const FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 /// (`smithy_query(query="operation", operation="ListInvoiceUnits")`: range 1..500).
 const MAX_RESULTS_RANGE: (i64, i64) = (1, 500);
 
-/// How many tags one resource holds: `ResourceTagList` is modelled `length 0..200`
-/// (`smithy_query(query="operation", operation="TagResource")`).
-const MAX_RESOURCE_TAGS: usize = 200;
+/// How many tags ONE RESOURCE holds — the per-resource quota the service enforces,
+/// which is strictly below `ResourceTagList`'s per-CALL maximum (modelled `length
+/// 0..200`, `smithy_query(query="operation", operation="TagResource")`) so that a
+/// caller tagging in batches can reach it.
+const MAX_RESOURCE_TAGS: usize = 50;
+
+/// The per-CALL maximum of `ResourceTagList`, which is NOT the per-resource quota.
+const MAX_TAGS_PER_CALL: usize = 200;
 
 /// A router carrying only this service, over one shared engine — the same assembly the
 /// production router performs, minus the other services.
@@ -647,9 +652,10 @@ async fn tag_state_is_what_list_tags_reports() {
     );
 }
 
-/// RULE 4, at its bound: a resource holds at most `ResourceTagList`'s maximum, and the
+/// RULE 4, at its bound: a resource holds at most the per-resource tag quota, and the
 /// write that would pass it is refused with the modelled quota error rather than
-/// applied in part.
+/// applied in part — including a single call that stays within the per-call array
+/// maximum but asks for more tags than the resource may hold.
 #[tokio::test]
 async fn a_tag_write_past_the_modelled_maximum_is_refused() {
     let router = emulator();
@@ -710,5 +716,22 @@ async fn a_tag_write_past_the_modelled_maximum_is_refused() {
     assert!(
         !tags.iter().any(|(key, _)| key == "one-too-many"),
         "case after a refused write: the refused key must not be stored, got {tags:?}"
+    );
+
+    // The per-CALL array maximum is not the quota: a single legal call carrying that
+    // many tags is still refused, because the RESOURCE may not hold them.
+    let fresh = create_unit(&router, "QuotaUnitPerCall", &[]).await;
+    let per_call_max: Vec<Value> = (0..MAX_TAGS_PER_CALL)
+        .map(|index| json!({"Key": format!("key-{index}"), "Value": "v"}))
+        .collect();
+    let refused_batch = call(
+        &router,
+        "TagResource",
+        &json!({"ResourceArn": fresh, "ResourceTags": per_call_max}),
+    )
+    .await;
+    assert_eq!(
+        refused_batch.status, 402,
+        "case {MAX_TAGS_PER_CALL} tags in one call: expected HTTP 402, got {refused_batch:?}"
     );
 }

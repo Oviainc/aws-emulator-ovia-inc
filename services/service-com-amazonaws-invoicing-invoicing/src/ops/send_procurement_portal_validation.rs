@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendProcurementPortalValidation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendProcurementPortalValidation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendProcurementPortalValidation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts the validation of a procurement portal preference: resolves the
+//! `ProcurementPortalPreferenceArn` against the preference registry in
+//! [`crate::state`], issues a validation code for it and returns the ARN. An ARN that
+//! names no stored preference is the modelled `ResourceNotFoundException` (HTTP 404) —
+//! there is nothing to validate, and no validation state is created for it.
+//!
+//! The issued code is kept in state and never put on the wire: the modelled response
+//! carries only the ARN, because the real service delivers the code OUT OF BAND through
+//! the configured portal. `VerifyProcurementPortalValidation` checks a submitted code
+//! against the one issued here.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +161,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendProcurementPortalValidation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendProcurementPortalValidationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendProcurementPortalValidation"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SendProcurementPortalValidationErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let mut store = state.lock();
+        let client_token = input.client_token.as_deref();
+
+        // The ARN has to name a preference this emulator holds: validation is state
+        // ABOUT a preference, so there is nothing to start for one that does not exist.
+        // The model declares `ResourceNotFoundException` (HTTP 404) for exactly this.
+        // Checked BEFORE the idempotency replay, so a replay against a preference that
+        // is gone reports it gone rather than answering for it.
+        if !store
+            .procurement_portal_preferences
+            .contains_key(&input.procurement_portal_preference_arn)
+        {
+            return Err(
+                SendProcurementPortalValidationErrorModeled::ResourceNotFoundException(
+                    crate::state::no_such_resource(&input.procurement_portal_preference_arn),
+                )
+                .into(),
+            );
+        }
+
+        // `@idempotent`: a replay (the same `ClientToken` against the same preference)
+        // answers with the ARN the first call returned and issues no second code.
+        if let Some(arn) = store.replayed_result(
+            Self::NAME,
+            &input.procurement_portal_preference_arn,
+            client_token,
+        ) {
+            return Ok(SendProcurementPortalValidationOutput {
+                procurement_portal_preference_arn: arn,
+            });
+        }
+
+        // Issuing the code is what this operation DOES ("initiates the validation
+        // process by issuing a validation code"), so it writes: the code and the instant
+        // it was issued at are recorded against the preference, replacing any code an
+        // earlier send issued, and the code itself stays in state because the model's
+        // response carries only the ARN.
+        let code = store.issue_portal_validation_code();
+        let issued_at = crate::state::now();
+        if let Some(stored) = store
+            .procurement_portal_preferences
+            .get_mut(&input.procurement_portal_preference_arn)
+        {
+            stored.validation = Some(crate::state::IssuedPortalValidation {
+                code,
+                issued_at,
+                verified_at: None,
+            });
+        }
+
+        store.record_result(
+            Self::NAME,
+            &input.procurement_portal_preference_arn,
+            client_token,
+            &input.procurement_portal_preference_arn,
+        );
+        Ok(SendProcurementPortalValidationOutput {
+            procurement_portal_preference_arn: input.procurement_portal_preference_arn,
+        })
     }
 }

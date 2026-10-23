@@ -150,7 +150,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        if !store.invoice_units.contains_key(&input.resource_arn) {
+        // The tag plane answers for the resources that EXIST: a unit a delete has
+        // retired is history kept for point-in-time reads, and its tags went with it.
+        if store.live_invoice_unit(&input.resource_arn).is_none() {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 crate::state::no_such_resource(&input.resource_arn),
             )

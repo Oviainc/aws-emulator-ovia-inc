@@ -78,7 +78,8 @@
 //! * `ProcurementPortalInstanceEndpoint` (BasicStringWithoutSpace, len 0..1024, pattern
 //!   ^\S+$) — The endpoint URL where e-invoices will be delivered to the procurement portal.
 //!   Must be a valid HTTPS URL.
-//! * `ProcurementPortalName` (ProcurementPortalName, one of: COUPA | SAP_BUSINESS_NETWORK)
+//! * `ProcurementPortalName` (ProcurementPortalName, one of: ZIP | SAP_BUSINESS_NETWORK |
+//!   JAGGAER | COUPA)
 //!   **required** — The name of the procurement portal.
 //! * `ProcurementPortalSharedSecret` (SensitiveBasicStringWithoutSpace, len 0..1024, pattern
 //!   ^\S+$) — The shared secret or authentication credential used to establish secure
