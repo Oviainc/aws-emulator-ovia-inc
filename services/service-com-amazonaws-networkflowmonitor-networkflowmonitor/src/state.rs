@@ -2,10 +2,11 @@
 
 //! Engine state for the com-amazonaws-networkflowmonitor-networkflowmonitor service.
 //!
-//! The records here are the ONLY place a Network Flow Monitor scope or monitor
-//! exists: every implemented handler in `src/ops/` mints into this store or reads
-//! out of it, so a create is observable by the next get/list and a delete by the
-//! next reader.
+//! The records here are the ONLY place a Network Flow Monitor scope, monitor or
+//! top-contributors query exists: every implemented handler in `src/ops/` mints
+//! into this store or reads out of it, so a create is observable by the next
+//! get/list, a delete by the next reader, and a started query by the next status
+//! poll.
 //!
 //! Two things this slice deliberately does NOT emulate, so a reader does not
 //! mistake a modelled error for reachable behaviour: authorization (every
@@ -83,6 +84,36 @@ pub const MAX_SCOPES: usize = 100;
 /// `MAX_MONITORS` records, each holding at most [`MAX_MONITOR_RESOURCES`] entries
 /// per resource list and [`MAX_UPDATE_TOKENS`] remembered client tokens.
 pub const MAX_MONITORS: usize = 100;
+
+/// The most top-contributors queries this emulator holds at once, for the same
+/// reason and with the same refusal as [`MAX_SCOPES`]: a `StartQuery*` past it is
+/// refused with the modelled `ServiceQuotaExceededException` (HTTP 402), which all
+/// three `StartQuery*` operations declare, rather than letting an unauthenticated
+/// caller grow this process's memory one query record at a time. A query record is
+/// fixed size (the window, the metric and the status it was started with), so the
+/// store's query half is bounded by this number alone. AWS publishes its own query
+/// quota and it is not this number; this is the emulator's own ceiling, chosen well
+/// above what a client script needs.
+pub const MAX_QUERIES: usize = 200;
+
+/// How long a freshly started query stays `QUEUED` before the clock owes it
+/// `RUNNING`, and how long it stays `RUNNING` before the clock owes it the terminal
+/// `SUCCEEDED` (`QueryStatus`: QUEUED | RUNNING | SUCCEEDED | FAILED | CANCELED).
+///
+/// AWS does not document how long a top-contributors query takes, so both spans are
+/// chosen rather than cited: long enough that a caller polling straight after
+/// `StartQuery*` still observes `QUEUED`, short enough that a client script does not
+/// wait. The due instants are stored on the record ([`Query::running_at`],
+/// [`Query::succeeded_at`]) and materialized by whichever call runs after they fall
+/// due — nothing ever sleeps.
+pub const QUERY_RUNNING_DELAY: Duration = Duration::from_millis(250);
+
+/// The second half of the span [`QUERY_RUNNING_DELAY`] documents: when a query
+/// started at `t` is owed `SUCCEEDED`.
+pub const QUERY_COMPLETION_DELAY: Duration = Duration::from_millis(500);
+
+/// What a `queryId` names in the modelled errors of the query operations.
+pub const QUERY_RESOURCE: &str = "query";
 
 /// The most entries one monitor's `localResources` or `remoteResources` list
 /// holds, and the most entries one request may name in any ONE of its resource
@@ -365,6 +396,152 @@ impl Monitor {
                 &deduped_resources(input.remote_resources.as_deref().unwrap_or_default()),
             )
             && self.tags == tags_of(input.tags.as_ref())
+    }
+}
+
+/// Which family of top-contributors query a record is, and so which operations
+/// reach it: the model binds three independent query lifecycles over three
+/// different URI families, each with its own `StartQuery*`, `StopQuery*`,
+/// `GetQueryStatus*` and `GetQueryResults*`. A `queryId` minted by one is not a
+/// query of another, so the kind is part of a lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryKind {
+    /// `POST /monitors/{monitorName}/topContributorsQueries`.
+    MonitorTopContributors,
+    /// `POST /workloadInsights/{scopeId}/topContributorsQueries`.
+    WorkloadInsightsTopContributors,
+    /// `POST /workloadInsights/{scopeId}/topContributorsDataQueries`.
+    WorkloadInsightsTopContributorsData,
+}
+
+/// `QueryStatus`, the lifecycle status of a query. The wire values are the model's
+/// (QUEUED | RUNNING | SUCCEEDED | FAILED | CANCELED); `FAILED` is not modelled
+/// here because nothing in this emulator makes a query fail — a query whose window
+/// holds no observed network flow still succeeds, with no rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryStatus {
+    /// The query has been accepted and not started yet: the status a start
+    /// answers with.
+    Queued,
+    /// The query is running.
+    Running,
+    /// The query finished and its results can be read.
+    Succeeded,
+    /// The query was stopped by `StopQuery*` before it finished.
+    Canceled,
+}
+
+impl QueryStatus {
+    /// The value this status serializes as.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Queued => "QUEUED",
+            Self::Running => "RUNNING",
+            Self::Succeeded => "SUCCEEDED",
+            Self::Canceled => "CANCELED",
+        }
+    }
+
+    /// Whether this status is terminal: the query will not move again on its own.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Canceled)
+    }
+}
+
+/// A top-contributors query, as this emulator holds it.
+///
+/// The record is everything the `StartQuery*` request asked for plus the lifecycle
+/// the clock drives, so `GetQueryStatus*` and `GetQueryResults*` answer from what
+/// was started rather than from their own arguments.
+#[derive(Debug, Clone)]
+pub struct Query {
+    /// `queryId` — unique within the store, and this query's key.
+    pub query_id: String,
+    /// Which query lifecycle this record belongs to.
+    pub kind: QueryKind,
+    /// The resource the query was started for: the `monitorName` of a monitor
+    /// query, the `scopeId` of a workload-insights one. A query is only reachable
+    /// under the resource it was started for.
+    pub owner: String,
+    /// The `metricName` the query was started with, which is what decides the
+    /// `unit` its results are reported in.
+    pub metric_name: String,
+    /// The `destinationCategory` the query was started with.
+    pub destination_category: String,
+    /// `startTime` — the beginning of the window the query covers, kept exactly as
+    /// the request carried it.
+    pub start_time: ::aws_smithy_types::DateTime,
+    /// `endTime` — the end of that window.
+    pub end_time: ::aws_smithy_types::DateTime,
+    /// `limit`, when the request carried one.
+    pub limit: Option<i32>,
+    /// `status`.
+    pub status: QueryStatus,
+    /// When the clock owes this query `RUNNING`.
+    pub running_at: SystemTime,
+    /// When the clock owes this query `SUCCEEDED`.
+    pub succeeded_at: SystemTime,
+}
+
+impl Query {
+    /// The query counterpart of [`Scope::settle`]: materialize the status changes
+    /// the clock has already made due. A terminal status never moves, so a query
+    /// `StopQuery*` canceled stays canceled however long the completion instant it
+    /// would otherwise have reached is past.
+    fn settle(&mut self, now: SystemTime) {
+        if self.status == QueryStatus::Queued && now >= self.running_at {
+            self.status = QueryStatus::Running;
+        }
+        if self.status == QueryStatus::Running && now >= self.succeeded_at {
+            self.status = QueryStatus::Succeeded;
+        }
+    }
+
+    /// What `StopQuery*` does to this query: cancel it, or say why it cannot be
+    /// canceled.
+    ///
+    /// A query that has not finished becomes `CANCELED`. A query already `CANCELED`
+    /// is left as it is and the call succeeds — `StopQueryMonitorTopContributors` is
+    /// `@idempotent`, so the retry of a stop that already landed must not be refused.
+    /// A query that FINISHED is refused with the modelled `ValidationException`: there
+    /// is nothing left to stop, and answering success would tell the caller it
+    /// canceled a query whose results are sitting in the store.
+    pub fn stop(&mut self) -> Result<(), ValidationException> {
+        match self.status {
+            QueryStatus::Queued | QueryStatus::Running => {
+                self.status = QueryStatus::Canceled;
+                Ok(())
+            }
+            QueryStatus::Canceled => Ok(()),
+            QueryStatus::Succeeded => Err(ValidationException {
+                message: Some(format!(
+                    "query {} has already finished with status {} and cannot be stopped",
+                    self.query_id,
+                    self.status.as_wire()
+                )),
+            }),
+        }
+    }
+}
+
+/// The `MetricUnit` a metric's values are reported in, from the metric's own
+/// meaning: a byte count for data transferred, a duration for a round trip, and a
+/// plain count for the two event metrics.
+///
+/// The values are `MetricUnit`'s own (`smithy_query(query="shape",
+/// shape="MetricUnit")`: Seconds | … | Bytes | … | Count | …), and the metrics are
+/// the union of `MonitorMetric` (ROUND_TRIP_TIME | TIMEOUTS | RETRANSMISSIONS |
+/// DATA_TRANSFERRED) and `WorkloadInsightsMetric` (TIMEOUTS | RETRANSMISSIONS |
+/// DATA_TRANSFERRED), so one function serves both query families. A metric the
+/// model does not declare cannot reach here — the boundary validator refuses it
+/// against `MonitorMetric`/`WorkloadInsightsMetric` before a handler runs — so an
+/// unknown name is reported as `None`, the unit the model has for "no unit".
+pub fn metric_unit(metric_name: &str) -> &'static str {
+    match metric_name {
+        "DATA_TRANSFERRED" => "Bytes",
+        "ROUND_TRIP_TIME" => "Milliseconds",
+        "TIMEOUTS" | "RETRANSMISSIONS" => "Count",
+        _ => "None",
     }
 }
 
@@ -654,6 +831,11 @@ pub struct ComAmazonawsNetworkflowmonitorNetworkflowmonitorState {
     /// `scopeArn` or a `resourceArn` resolves it without scanning the store. This
     /// is how `CreateMonitor` refuses a `scopeArn` that is not a stored scope.
     pub arn_index: HashMap<String, ResourceRef>,
+    /// Every top-contributors query, keyed by `queryId` — a `BTreeMap`, so a walk
+    /// over the store is in a stable order. One map holds all three query families
+    /// because a `queryId` is unique across the store and each record names its own
+    /// [`QueryKind`]; splitting them would mean three lookups for one id.
+    pub queries: BTreeMap<String, Query>,
     /// Source of the sequence number behind every minted `scopeId`. Monotonic, so
     /// no two scopes in one store ever share an id.
     pub next_sequence: u64,
@@ -667,6 +849,9 @@ impl ComAmazonawsNetworkflowmonitorNetworkflowmonitorState {
         }
         for monitor in self.monitors.values_mut() {
             monitor.settle(now);
+        }
+        for query in self.queries.values_mut() {
+            query.settle(now);
         }
     }
 
@@ -714,6 +899,68 @@ impl ComAmazonawsNetworkflowmonitorNetworkflowmonitorState {
                 .map(|monitor| &mut monitor.tags),
         }
     }
+
+    /// The query `query_id` names in the `kind` lifecycle of `owner`, or `None` when
+    /// no such query is in the store.
+    ///
+    /// All three parts have to match: a `queryId` is only reachable through the
+    /// operation family that minted it and under the monitor or scope it was started
+    /// for, so one query's id is never an id of another's lifecycle.
+    pub fn query(&self, kind: QueryKind, owner: &str, query_id: &str) -> Option<&Query> {
+        self.queries
+            .get(query_id)
+            .filter(|query| query.kind == kind && query.owner == owner)
+    }
+
+    /// The same lookup for a writer.
+    pub fn query_mut(
+        &mut self,
+        kind: QueryKind,
+        owner: &str,
+        query_id: &str,
+    ) -> Option<&mut Query> {
+        self.queries
+            .get_mut(query_id)
+            .filter(|query| query.kind == kind && query.owner == owner)
+    }
+
+    /// Mint a query for a `StartQuery*` request and store it, answering the
+    /// `queryId` the caller polls it with.
+    ///
+    /// `started_at` is the instant the call ran, which is what the two due instants
+    /// are measured from, so the lifecycle a later reader materializes is the one
+    /// this call started rather than one measured from whenever that reader ran.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_query(
+        &mut self,
+        kind: QueryKind,
+        owner: &str,
+        metric_name: &str,
+        destination_category: &str,
+        start_time: ::aws_smithy_types::DateTime,
+        end_time: ::aws_smithy_types::DateTime,
+        limit: Option<i32>,
+        started_at: SystemTime,
+    ) -> String {
+        let id = query_id(self.next_sequence());
+        self.queries.insert(
+            id.clone(),
+            Query {
+                query_id: id.clone(),
+                kind,
+                owner: owner.to_string(),
+                metric_name: metric_name.to_string(),
+                destination_category: destination_category.to_string(),
+                start_time,
+                end_time,
+                limit,
+                status: QueryStatus::Queued,
+                running_at: started_at + QUERY_RUNNING_DELAY,
+                succeeded_at: started_at + QUERY_COMPLETION_DELAY,
+            },
+        );
+        id
+    }
 }
 
 /// A `scopeId` for sequence number `sequence`.
@@ -725,6 +972,17 @@ impl ComAmazonawsNetworkflowmonitorNetworkflowmonitorState {
 /// and makes id order creation order, so a list page resumes deterministically.
 pub fn scope_id(sequence: u64) -> String {
     format!("00000000-0000-4000-8000-{sequence:012x}")
+}
+
+/// A `queryId` for sequence number `sequence`.
+///
+/// `queryId` is a plain `String` in the model with no pattern, and the real
+/// service's are "internally-generated identifier[s]", so this is UUID-shaped for
+/// the same reason [`scope_id`] is — with RFC 4122's version (4) nibble and a
+/// DIFFERENT variant nibble (9 rather than 8), so a minted query id is never equal
+/// to a minted scope id even though both draw on the one store sequence.
+pub fn query_id(sequence: u64) -> String {
+    format!("00000000-0000-4000-9000-{sequence:012x}")
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -812,6 +1070,59 @@ pub fn field_validation(member: &str, message: impl Into<String>) -> ValidationE
     ValidationException {
         message: Some(format!("{member}: {}", message.into())),
     }
+}
+
+/// `Some(the modelled 400)` when `query` has no result page to report, `None` when
+/// it does.
+///
+/// A query's results exist once that query has SUCCEEDED: one still `QUEUED` or
+/// `RUNNING` has not produced them yet, and one `StopQuery*` left `CANCELED` never
+/// will. Answering a successful empty page for either would make a query that never
+/// finished indistinguishable from one that did, so the read is refused with the
+/// modelled `ValidationException` — which, with the 404 for an id that names no
+/// query, is the whole of what the results readers model for a client.
+pub fn results_unavailable(query: &Query) -> Option<ValidationException> {
+    if query.status == QueryStatus::Succeeded {
+        return None;
+    }
+    Some(ValidationException {
+        message: Some(format!(
+            "query {} is {}; results are reported once a query has SUCCEEDED",
+            query.query_id,
+            query.status.as_wire()
+        )),
+    })
+}
+
+/// The message the modelled 400 for an inverted query window carries.
+///
+/// A `StartQuery*` request whose `endTime` is earlier than its `startTime` names no
+/// window at all, and the refusal is the same sentence whatever the two instants
+/// were: it states the relation that failed and echoes nothing of the request. This
+/// is the wording the real service answers that condition with, which is why it is
+/// a constant rather than built per request.
+pub const END_BEFORE_START: &str = "EndTime cannot be before StartTime";
+
+/// `Some(the modelled 400)` when `end_time` is earlier than `start_time`, `None`
+/// when the two bound a window a query can cover.
+///
+/// The three `StartQuery*` operations all take the same `@required` `startTime` /
+/// `endTime` pair, so one check serves all three: a window is well formed when its
+/// end is not before its start, and an empty window (the two equal) is well formed.
+/// The comparison is on the instant each value names — whole seconds and then the
+/// sub-second part — so two values that differ only below the second still order
+/// correctly.
+pub fn inverted_window(
+    start_time: ::aws_smithy_types::DateTime,
+    end_time: ::aws_smithy_types::DateTime,
+) -> Option<ValidationException> {
+    let instant = |at: ::aws_smithy_types::DateTime| (at.secs(), at.subsec_nanos());
+    if instant(end_time) < instant(start_time) {
+        return Some(ValidationException {
+            message: Some(END_BEFORE_START.to_string()),
+        });
+    }
+    None
 }
 
 /// The listing a page token belongs to, so a token minted by one list is not

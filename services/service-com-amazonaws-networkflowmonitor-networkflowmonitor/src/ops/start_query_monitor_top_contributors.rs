@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartQueryMonitorTopContributors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartQueryMonitorTopContributors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a top-contributors query over one monitor and answers with the `queryId`
+//! the caller polls it with.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartQueryMonitorTopContributors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The window the request names has to BE a window: a request whose `endTime`
+//! precedes its `startTime` is refused with the modelled `ValidationException`
+//! (HTTP 400) before anything is minted. The monitor also has to be one this
+//! service's store holds — `ValidationException` is the only client refusal this
+//! operation models, so an unknown `monitorName` is named in one.
+//!
+//! The accepted query is minted into the store ([`crate::state::Query`]), so
+//! `GetQueryStatusMonitorTopContributors`, `GetQueryResultsMonitorTopContributors`
+//! and `StopQueryMonitorTopContributors` all answer from this one record.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +176,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartQueryMonitorTopContributors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartQueryMonitorTopContributorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartQueryMonitorTopContributors"))
+        let _ = ctx;
+
+        // The window first: it is a property of the request alone, so it is answered
+        // before the store is reached and whatever else the request names.
+        if let Some(refusal) = crate::state::inverted_window(input.start_time, input.end_time) {
+            return Err(
+                StartQueryMonitorTopContributorsErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                StartQueryMonitorTopContributorsErrorModeled::InternalServerException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.settle(now);
+
+        if !state.monitors.contains_key(&input.monitor_name) {
+            return Err(
+                StartQueryMonitorTopContributorsErrorModeled::ValidationException(
+                    crate::state::field_validation(
+                        "monitorName",
+                        format!("monitor {} was not found", input.monitor_name),
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        if state.queries.len() >= crate::state::MAX_QUERIES {
+            return Err(
+                StartQueryMonitorTopContributorsErrorModeled::ServiceQuotaExceededException(
+                    crate::state::quota_exceeded(
+                        crate::state::QUERY_RESOURCE,
+                        crate::state::MAX_QUERIES,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let query_id = state.start_query(
+            crate::state::QueryKind::MonitorTopContributors,
+            &input.monitor_name,
+            &input.metric_name,
+            &input.destination_category,
+            input.start_time,
+            input.end_time,
+            input.limit,
+            now,
+        );
+
+        Ok(StartQueryMonitorTopContributorsOutput { query_id })
     }
 }
