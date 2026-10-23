@@ -390,6 +390,30 @@ impl ComAmazonawsMedialiveMedialiveState {
             .find(|template| template.region == region && template.name == name)
     }
 
+    /// The eventbridge rule templates stored in `region`, in the order their ids
+    /// were minted, beginning at the template `start` names when a `NextToken`
+    /// carried a resume point.
+    ///
+    /// The store itself is private, so this is how a listing reads it: a
+    /// `BTreeMap` range scan from the resume point, which is why a token naming a
+    /// template deleted since the previous page resumes at the next surviving id
+    /// instead of failing. Templates of other regions are invisible, for the
+    /// reason [`Self::event_bridge_rule_template`] states.
+    pub fn event_bridge_rule_templates_in<'a>(
+        &'a self,
+        region: &'a str,
+        start: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a EventBridgeRuleTemplateRecord> + 'a {
+        let first = match start {
+            Some(token) => ::std::ops::Bound::Included(token),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        self.event_bridge_rule_templates
+            .range::<str, _>((first, ::std::ops::Bound::Unbounded))
+            .map(|(_, template)| template)
+            .filter(move |template| template.region == region)
+    }
+
     /// The ids of the templates stored in the eventbridge rule template group
     /// `group_id` — the templates `DeleteEventBridgeRuleTemplateGroup` documents
     /// must be "moved to another group or deleted" before the group goes.
@@ -512,3 +536,30 @@ macro_rules! event_bridge_rule_template_output {
 }
 
 pub(crate) use event_bridge_rule_template_output;
+
+/// Project a stored [`EventBridgeRuleTemplateRecord`] onto the
+/// `EventBridgeRuleTemplateSummary` a listing reports.
+///
+/// The summary is the same stored template the flat shape above reports, read
+/// through the list shape: every member it shares with that shape carries the
+/// stored value, so a listing and the `GetEventBridgeRuleTemplate` beside it
+/// cannot disagree about one template. Where the two shapes differ, the summary
+/// reports `EventTargetCount` instead of the targets themselves — "the number of
+/// targets configured to send matching events", which is the LENGTH of the stored
+/// target list rather than anything recorded at create time.
+pub fn event_bridge_rule_template_summary(
+    template: &EventBridgeRuleTemplateRecord,
+) -> crate::ops::types::EventBridgeRuleTemplateSummary {
+    crate::ops::types::EventBridgeRuleTemplateSummary {
+        arn: template.arn.clone(),
+        created_at: ::aws_smithy_types::DateTime::from(template.created_at),
+        description: template.description.clone(),
+        event_target_count: i32::try_from(template.event_targets.len()).unwrap_or(i32::MAX),
+        event_type: template.event_type.clone(),
+        group_id: template.group_id.clone(),
+        id: template.id.clone(),
+        modified_at: Some(::aws_smithy_types::DateTime::from(template.modified_at)),
+        name: template.name.clone(),
+        tags: Some(template.tags.clone()),
+    }
+}
