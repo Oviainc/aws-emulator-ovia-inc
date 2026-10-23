@@ -334,10 +334,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             certify_for_marketplace: package.certify_for_marketplace,
             model_approval_status: package.model_approval_status.clone(),
             // The identity that registered the package, recorded then and replayed
-            // unchanged. Nothing but that registration has written to it, so there is no
-            // modifying identity to report.
+            // unchanged, beside the identity of the last call that MODIFIED it — absent
+            // until one has, since the clock settling the registration status is not a
+            // caller.
             created_by: Some(package.created_by.clone()),
-            last_modified_by: None,
+            last_modified_by: package.last_modified_by.clone(),
             metadata_properties: package.metadata_properties.clone(),
             model_metrics: package.model_metrics.clone(),
             // Reported only once something has modified the package (the status reaching

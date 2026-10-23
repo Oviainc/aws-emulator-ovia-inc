@@ -411,7 +411,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 managed_storage_type: input.managed_storage_type,
                 tags,
                 created_by: crate::state::caller_user_context(ctx),
+                // No call has modified the package yet, so there is no modifying
+                // identity to report; `UpdateModelPackage` records one.
+                last_modified_by: None,
                 client_token: input.client_token,
+                update_client_tokens: Vec::new(),
                 status: crate::state::MODEL_PACKAGE_STATUS_PENDING.to_string(),
                 creation_time: now,
                 last_modified_time: now,

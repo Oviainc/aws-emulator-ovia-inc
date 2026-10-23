@@ -77,6 +77,8 @@ mod model_package_group_lifecycle;
 mod model_package_group_policy;
 #[path = "all/model_package_registry.rs"]
 mod model_package_registry;
+#[path = "all/model_package_updates.rs"]
+mod model_package_updates;
 #[path = "all/notebook_instance_lifecycle.rs"]
 mod notebook_instance_lifecycle;
 #[path = "all/notebook_instance_stop.rs"]
