@@ -3,7 +3,10 @@
 //! @op GetSuiteDefinition
 //!
 //! Answers from the suite definition the store holds: its ARN, the requested (or latest)
-//! configuration version, both timestamps and its tags. A pure read — it never writes.
+//! configuration version, the definition's ONE live configuration, both timestamps and its
+//! tags. A version the definition never handed out is refused as not found; a version it
+//! did is echoed back, and the configuration served is still the live one — a definition
+//! keeps no per-version snapshots. A pure read — it never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -165,23 +168,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let version = input
-            .suite_definition_version
-            .clone()
-            .unwrap_or_else(|| definition.latest_version.clone());
-        let configuration = definition
-            .configuration(input.suite_definition_version.as_deref())
-            .ok_or_else(|| {
-                GetSuiteDefinitionErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::not_found_message(
-                            "suiteDefinitionVersion",
-                            &version,
-                        )),
-                    },
-                )
-            })?
-            .clone();
+        // A version-qualified read VALIDATES the version against the labels the definition
+        // has handed out and ECHOES it back, but a definition holds exactly one live
+        // configuration — there are no per-version snapshots — so the configuration served
+        // is that live one, whichever version the caller named.
+        let version = match input.suite_definition_version.as_deref() {
+            Some(requested) => {
+                if !definition.holds_version(requested) {
+                    return Err(GetSuiteDefinitionErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::not_found_message(
+                                "suiteDefinitionVersion",
+                                requested,
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                requested.to_string()
+            }
+            None => definition.latest_version.clone(),
+        };
+        let configuration = definition.configuration.clone();
 
         Ok(GetSuiteDefinitionOutput {
             suite_definition_id: Some(definition.id.clone()),
