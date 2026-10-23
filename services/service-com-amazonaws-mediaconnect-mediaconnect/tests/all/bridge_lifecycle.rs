@@ -38,6 +38,10 @@ pub(crate) fn minted_flow_arn(suffix: u64, name: &str) -> String {
 
 /// A gateway ARN of the form this service mints — what a bridge's `PlacementArn` names
 /// (`ListedBridge$PlacementArn`: "the ARN of the gateway associated with the bridge").
+///
+/// `pub(crate)` because the other bridge suites (`tests/all/update_bridge.rs`) place
+/// their bridges on the same kind of ARN, so there is one encoding of it in this test
+/// crate rather than one per suite.
 pub(crate) fn minted_gateway_arn(suffix: u64, name: &str) -> String {
     engine::emulator_arn(
         mc::SERVICE_NAMESPACE,

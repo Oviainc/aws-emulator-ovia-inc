@@ -45,6 +45,8 @@ mod resource_tags;
 mod revoke_flow_entitlement;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_bridge.rs"]
+mod update_bridge;
 #[path = "all/update_flow.rs"]
 mod update_flow;
 #[path = "all/update_flow_entitlement.rs"]
