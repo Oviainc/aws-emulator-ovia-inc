@@ -24,8 +24,9 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. EDITED here: a numeric-bound (`@range`) violation is
+//!   stated against the member and the bound, without quoting the submitted number
+//!   back; every other class keeps the framework's wording. See [`clause`].
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -41,9 +42,77 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service answers an input-constraint violation with: the
+/// modelled `ValidationException` (`@httpError 400`,
+/// `com.amazonaws.notifications#ValidationException`, bound to every operation as a
+/// service-common error), which is also the code the framework's own refusal renderer
+/// picks. Restated here because `override_refusal` replaces the code and the message
+/// together, and a message without its matching code is worse than leaving both alone.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The clause this service states for one violated constraint.
+///
+/// A NUMERIC BOUND (`@range`) violation names the member and the bound it broke and does
+/// NOT quote the number submitted there: the recorded refusal of a `maxResults` outside
+/// its range reads `Value at '<member>' failed to satisfy constraint: Member must have
+/// value less than or equal to <max>`. Every other violation class keeps the framework's
+/// own clause — which quotes the submitted value, the form
+/// `services/common/src/validation.rs` states as the cross-service default — so this
+/// service rewords only the half its recordings pin.
+///
+/// (The subject half of a validation message is one of the two parts
+/// `services/common/src/validation.rs` lists as still to migrate into it; until that
+/// lands it is spelled per service, as in the other service crates that word their own
+/// refusals.)
+fn clause(violation: &Violation) -> String {
+    match &violation.kind {
+        ViolationKind::MinValue(min) => format!(
+            "Value at '{}' failed to satisfy constraint: Member must have value greater than \
+             or equal to {min}",
+            violation.path
+        ),
+        ViolationKind::MaxValue(max) => format!(
+            "Value at '{}' failed to satisfy constraint: Member must have value less than or \
+             equal to {max}",
+            violation.path
+        ),
+        _ => violation.message(),
+    }
+}
+
+/// True for the violation classes this service words differently from the framework.
+fn reworded(violation: &Violation) -> bool {
+    matches!(
+        violation.kind,
+        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
+    )
+}
+
+/// How this service states a refusal of the values a request carried, or `None` to keep
+/// the framework's wording when no clause of it is one this service rewords.
+///
+/// The envelope is the framework's own (`N validation error(s) detected: …`, clauses
+/// joined with `; ` in the order the validating walk found them), so a refusal mixing a
+/// range violation with another class reads as one message.
+fn invalid_refusal(violations: &[Violation]) -> Option<Refused> {
+    if !violations.iter().any(reworded) {
+        return None;
+    }
+    let clauses: Vec<String> = violations.iter().map(clause).collect();
+    let message = match clauses.len() {
+        0 => return None,
+        1 => format!("1 validation error detected: {}", clauses[0]),
+        n => format!("{n} validation errors detected: {}", clauses.join("; ")),
+    };
+    Some(Refused {
+        code: VALIDATION_EXCEPTION.to_string(),
+        message,
+    })
+}
 
 /// The `com-amazonaws-notifications-notifications` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +167,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // This service states a NUMERIC BOUND failure against the member that failed
+        // and the bound it broke, without quoting the submitted number back (see
+        // [`clause`]); every other class keeps the framework's wording, and so does an
+        // authentication refusal, which is not an input-constraint failure at all. The
+        // code stays the modelled `ValidationException` (HTTP 400), which is what the
+        // framework would have answered; only the wording changes.
+        match refusal {
+            Refusal::Invalid(violations) => invalid_refusal(violations),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
