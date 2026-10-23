@@ -49,5 +49,7 @@ mod service_claim;
 mod stage_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_reads_by_arn.rs"]
+mod tag_reads_by_arn;
 #[path = "all/validation_message_rules.rs"]
 mod validation_message_rules;
