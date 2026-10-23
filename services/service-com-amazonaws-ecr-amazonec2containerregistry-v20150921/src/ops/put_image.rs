@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutImage
-//! Pushes an image manifest into a repository: the manifest is stored under its own
-//! content digest, its tag (when the push carries one) is attached to that digest, and
-//! the `Image` returned is read back out of the stored record.
+//! Pushes an image manifest into a repository: every blob the manifest references must
+//! already be in the repository, the manifest is stored under its own content digest,
+//! its tag (when the push carries one) is attached to that digest, and the `Image`
+//! returned is read back out of the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -227,6 +228,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .repository_mut(&input.repository_name)
             .map_err(fault_error)?;
 
+        // A manifest is only pushable once every blob it references is in the
+        // repository: "when an image is pushed and all new image layers have been
+        // uploaded, the PutImage API is called once". A manifest naming a blob the
+        // repository does not hold is refused with `LayersNotFoundException` ("the
+        // specified layers could not be found, or the specified layer is not valid for
+        // this repository") and nothing is stored, so the repository never advertises an
+        // image that cannot be pulled. The refusal names the digests that resolved to no
+        // blob, the repository and the registry.
+        let missing = repo.missing_layers(&input.image_manifest);
+        if !missing.is_empty() {
+            return Err(
+                PutImageErrorModeled::LayersNotFoundException(LayersNotFoundException {
+                    message: Some(format!(
+                        "Layers with digests '[{}]' required for pushing image into \
+                         repository with name '{}' in the registry with id '{}' do not exist",
+                        missing.join(","),
+                        repo.name,
+                        repo.registry_id
+                    )),
+                })
+                .into(),
+            );
+        }
+
         match input.image_tag.as_deref() {
             // The very same manifest under the very same tag is already in the
             // repository, so there is nothing to push.
@@ -248,10 +273,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(PutImageErrorModeled::ImageTagAlreadyExistsException(
                     ImageTagAlreadyExistsException {
                         message: Some(format!(
-                            "Tag '{tag}' in repository '{}' already exists and cannot be \
-                             overwritten because the repository is configured as \
-                             {}",
-                            repo.name, repo.image_tag_mutability
+                            "The image tag '{tag}' already exists in the '{}' repository \
+                             and cannot be overwritten because the tag is immutable.",
+                            repo.name
                         )),
                     },
                 )

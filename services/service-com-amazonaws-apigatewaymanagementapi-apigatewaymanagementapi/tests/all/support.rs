@@ -34,12 +34,12 @@ fn router(engine: &Arc<InMemoryEngine>) -> MultiServiceRouter {
     router
 }
 
-/// A signed-looking request addressing `connection_id` on this service.
-fn request(method: &str, connection_id: &str, body: Vec<u8>) -> http::Request<Bytes> {
+/// A signed-looking request addressing `path` on `host`.
+fn request(host: &str, method: &str, path: &str, body: Vec<u8>) -> http::Request<Bytes> {
     http::Request::builder()
         .method(method)
-        .uri(format!("https://{HOST}/@connections/{connection_id}"))
-        .header("host", HOST)
+        .uri(format!("https://{host}{path}"))
+        .header("host", host)
         .header(
             "authorization",
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/execute-api/aws4_request, \
@@ -56,8 +56,22 @@ pub async fn call(
     connection_id: &str,
     body: Vec<u8>,
 ) -> (u16, Bytes) {
+    call_at(engine, HOST, method, &format!("/@connections/{connection_id}"), body).await
+}
+
+/// Dispatch one request at an arbitrary endpoint host and request path — what a caller
+/// addressing the owning API's invoke URL sends, where the path carries that URL's own
+/// prefix (its stage, or a custom domain's base-path mapping) in front of the modelled
+/// `/@connections/{ConnectionId}` binding.
+pub async fn call_at(
+    engine: &Arc<InMemoryEngine>,
+    host: &str,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> (u16, Bytes) {
     let response = router(engine)
-        .dispatch(request(method, connection_id, body))
+        .dispatch(request(host, method, path, body))
         .await;
     let status = response.status().as_u16();
     (status, response.into_body())

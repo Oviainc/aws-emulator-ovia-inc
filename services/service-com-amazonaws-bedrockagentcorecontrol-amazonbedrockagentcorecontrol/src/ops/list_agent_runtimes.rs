@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ended on, hex-encoded, and the next page starts strictly after it.
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
                 ListAgentRuntimesErrorModeled::ValidationException(ValidationException {
                     message: "nextToken is not a token this service issued".to_string(),
                     reason: "FieldValidationFailed".to_string(),
@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if agent_runtimes.len() >= page_size {
                 // At least one runtime is left over, so hand back a token that
                 // resumes exactly where this page ended.
-                next_token = last_included.map(encode_page_token);
+                next_token = last_included.map(crate::state::encode_page_token);
                 break;
             }
             agent_runtimes.push(summary);
@@ -210,13 +210,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// when the caller names none.
 const MAX_PAGE_SIZE: i32 = 100;
 
-/// Encode the id a page ended on as the opaque `nextToken` (`^\S*$`).
-fn encode_page_token(agent_runtime_id: &str) -> String {
-    ::hex::encode(agent_runtime_id.as_bytes())
-}
-
-/// Recover the id a `nextToken` was issued for, or `None` when the token was not
-/// issued by [`encode_page_token`].
-fn decode_page_token(token: &str) -> Option<String> {
-    String::from_utf8(::hex::decode(token).ok()?).ok()
-}
+// The opaque `nextToken` codec is `crate::state`'s
+// (`encode_page_token`/`decode_page_token`): every `@paginated` listing in this
+// service issues and reads the same token form.

@@ -45,6 +45,44 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether this service serves the request these `parts` came from.
+///
+/// This service signs as `execute-api` — a signing name it SHARES with the Amazon API
+/// Gateway Management API
+/// (`services/service-com-amazonaws-apigatewaymanagementapi-apigatewaymanagementapi`,
+/// `aws.auth#sigv4` name `execute-api`), because an Amazon Connect participant endpoint
+/// is itself served through API Gateway. The router resolves a request's routing key
+/// from the SigV4 credential scope FIRST, so both services see the same key: claiming
+/// on the signing name alone makes each claim its peer's traffic, the router finds two
+/// claimants and answers `500 AmbiguousService` — a code no AWS model declares — which
+/// makes BOTH services unreachable.
+///
+/// Their modelled URI path spaces are disjoint: every operation of this service is bound
+/// under `/participant/…` (`ROUTE_PATH_SEGMENTS` is `["participant"]`), while the
+/// management API's are bound under `/@connections/…`. So the claim adds the framework's
+/// path-segment conjunct over this service's own generated, model-derived segments.
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable owner
+/// of that rule and is CALLED here rather than re-implemented. It takes a whole
+/// `http::Request` while [`Service::can_handle`] is handed only the request's parts, so
+/// the two things it reads — the URI and the headers — are re-presented to it as a
+/// bodiless request. It reads neither the body nor the method, so nothing it decides on
+/// is missing.
+fn can_handle_parts(parts: &http::request::Parts) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    emulator_server::can_handle_based_on_route_key_and_path(
+        &request,
+        crate::ROUTE_KEY,
+        crate::ROUTE_PATH_SEGMENTS,
+    )
+}
+
 /// The `com-amazonaws-connectparticipant-amazonconnectparticipantservicelambda` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +112,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // The signing name `execute-api` is SHARED with the API Gateway Management API,
+        // so the claim is the signing name AND this service's own modelled path space.
+        // See [`can_handle_parts`] for why, and for who owns the rule.
+        can_handle_parts(parts)
     }
 
     fn override_operation(

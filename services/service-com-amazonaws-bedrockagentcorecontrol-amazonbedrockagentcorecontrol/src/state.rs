@@ -33,14 +33,15 @@ use crate::ops::types::{
     CertificateConfiguration, CreateGatewayOutput, CreateGatewayTargetOutput,
     CredentialProviderConfiguration, FilesystemConfiguration, GatewayInterceptorConfiguration,
     GatewayPolicyEngineConfiguration, GatewayProtocolConfiguration, GetGatewayOutput,
-    GetGatewayTargetOutput, Harness, HarnessAgentCoreRuntimeEnvironment,
+    GetGatewayTargetOutput, Harness, HarnessAgentCoreRuntimeEnvironment, HttpTargetConfiguration,
+    InferenceTargetConfiguration,
     HarnessAgentCoreRuntimeEnvironmentRequest, HarnessEnvironmentArtifact,
     HarnessEnvironmentProvider, HarnessEnvironmentProviderRequest, HarnessHook,
     HarnessMemoryConfiguration, HarnessModelConfiguration, HarnessSkill, HarnessSystemContentBlock,
     HarnessTool, HarnessTruncationConfiguration, IndexedKey, LifecycleConfiguration,
     McpTargetConfiguration, Memory, MemoryStrategy, MetadataConfiguration, NamespaceKeyEntry,
     NetworkConfiguration, PrivateEndpoint, ProtocolConfiguration, RequestHeaderConfiguration,
-    RuntimeMetadataConfiguration, StreamDeliveryResources, TargetConfiguration,
+    RuntimeMetadataConfiguration, StreamDeliveryResources, TargetConfiguration, TargetSummary,
     ValidationException, ValidationExceptionField, WorkloadIdentityDetails,
 };
 
@@ -485,6 +486,43 @@ impl GatewayTargetRecord {
             authorization_data: None,
             protocol_type: None,
             certificate_configurations: self.certificate_configurations.clone(),
+        }
+    }
+
+    /// This target as one entry of a target listing (`TargetSummary`), with the
+    /// status the clock owes it at `now` — the same status the single-target read
+    /// reports, off the same record, so a listing cannot drift from a read.
+    pub fn summary(&self, now: SystemTime) -> TargetSummary {
+        // `resourcePriority` and `listingMode` are configurable on exactly one
+        // target shape, the MCP server target
+        // (`smithy_query shape=McpServerTargetConfiguration`), so they are
+        // reported for that shape and omitted for every other one, which carries
+        // neither.
+        let mcp_server = match &self.target_configuration {
+            TargetConfiguration::Mcp(McpTargetConfiguration::mcpServer(server)) => Some(server),
+            _ => None,
+        };
+        TargetSummary {
+            target_id: self.target_id.clone(),
+            name: self.name.clone(),
+            status: self.status_at(now).to_string(),
+            description: self.description.clone(),
+            created_at: timestamp(self.created_at),
+            updated_at: timestamp(self.updated_at),
+            resource_priority: mcp_server.map(|server| {
+                server
+                    .resource_priority
+                    .unwrap_or(DEFAULT_TARGET_RESOURCE_PRIORITY)
+            }),
+            // Nothing has synchronized this target: `SynchronizeGatewayTargets`
+            // is the operation that would, and it is not implemented.
+            last_synchronized_at: None,
+            // Carried only by a credential provider with an authorization-code
+            // grant that needs user federation; none of the providers a target
+            // can be created with here does.
+            authorization_data: None,
+            target_type: Some(target_type(&self.target_configuration).to_string()),
+            listing_mode: mcp_server.and_then(|server| server.listing_mode.clone()),
         }
     }
 
@@ -1256,6 +1294,23 @@ fn suffix_for(name: &str, counter: u64, at: SystemTime) -> String {
         .collect()
 }
 
+/// Encode the store key a page ended on as the opaque `nextToken` every
+/// `@paginated` listing in this service hands back.
+///
+/// Hex keeps the token inside the modelled `^\S*$` pattern for every key the
+/// store can hold, and the codec lives here rather than in one `ops/` file so
+/// two listings cannot issue tokens the other cannot read.
+pub fn encode_page_token(key: &str) -> String {
+    ::hex::encode(key.as_bytes())
+}
+
+/// Recover the store key a `nextToken` was issued for, or `None` when the token
+/// was not issued by [`encode_page_token`] — which the listing refuses with its
+/// own modelled `ValidationException`.
+pub fn decode_page_token(token: &str) -> Option<String> {
+    String::from_utf8(::hex::decode(token).ok()?).ok()
+}
+
 /// A stored instant as the wire timestamp (`DateTimestamp`, `date-time`).
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at
@@ -1344,6 +1399,41 @@ pub fn mcp_lambda_arn(configuration: &TargetConfiguration) -> Option<&str> {
             Some(lambda.lambda_arn.as_str())
         }
         _ => None,
+    }
+}
+
+/// `TargetSummary.resourcePriority` / `McpServerTargetConfiguration.resourcePriority`
+/// when the configuration names none. The model documents the default: "Priority
+/// for resolving MCP server targets with shared resource URIs. Lower values take
+/// precedence. Defaults to 1000 when not set."
+pub const DEFAULT_TARGET_RESOURCE_PRIORITY: i32 = 1_000;
+
+/// The `TargetType` a target configuration IS: the union member the caller
+/// configured, named in `TargetType`'s own vocabulary (`OPEN_API_SCHEMA |
+/// SMITHY_MODEL | MCP_SERVER | LAMBDA | API_GATEWAY | CONNECTOR |
+/// AGENTCORE_RUNTIME | PASSTHROUGH | PROVIDER | HTTP_CONNECTOR`, from
+/// `smithy_query shape=TargetType`).
+///
+/// A target's type is not stored twice: it is derived from the configuration the
+/// target was created with, so the two cannot disagree. Both connector-shaped
+/// configurations that are not HTTP (an MCP connector and an inference
+/// connector) report `CONNECTOR` — the only connector value the enum offers
+/// besides the HTTP one.
+pub fn target_type(configuration: &TargetConfiguration) -> &'static str {
+    match configuration {
+        TargetConfiguration::Mcp(McpTargetConfiguration::openApiSchema(_)) => "OPEN_API_SCHEMA",
+        TargetConfiguration::Mcp(McpTargetConfiguration::smithyModel(_)) => "SMITHY_MODEL",
+        TargetConfiguration::Mcp(McpTargetConfiguration::Lambda(_)) => "LAMBDA",
+        TargetConfiguration::Mcp(McpTargetConfiguration::mcpServer(_)) => "MCP_SERVER",
+        TargetConfiguration::Mcp(McpTargetConfiguration::apiGateway(_)) => "API_GATEWAY",
+        TargetConfiguration::Mcp(McpTargetConfiguration::Connector(_)) => "CONNECTOR",
+        TargetConfiguration::Http(HttpTargetConfiguration::agentcoreRuntime(_)) => {
+            "AGENTCORE_RUNTIME"
+        }
+        TargetConfiguration::Http(HttpTargetConfiguration::Passthrough(_)) => "PASSTHROUGH",
+        TargetConfiguration::Http(HttpTargetConfiguration::Connector(_)) => "HTTP_CONNECTOR",
+        TargetConfiguration::Inference(InferenceTargetConfiguration::Connector(_)) => "CONNECTOR",
+        TargetConfiguration::Inference(InferenceTargetConfiguration::Provider(_)) => "PROVIDER",
     }
 }
 

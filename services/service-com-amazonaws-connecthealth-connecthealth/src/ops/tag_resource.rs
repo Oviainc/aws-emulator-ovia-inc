@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: MERGES the request's tags into the tag set [`crate::state`] records for
+//! the resource the ARN names — a key the request names takes the request's value, a key
+//! it does not name keeps the one it had — so every reader of that resource's tags
+//! (`GetDomain`, and `ListTagsForResource` once implemented) reports the merged set. An
+//! ARN that names no resource this service holds is a 404 `ResourceNotFoundException`,
+//! and a merge that would carry the resource past the tag limits is refused with nothing
+//! written.
 //!
 //! ## Shape of an operation
 //!
@@ -55,6 +53,24 @@
 //!
 //! * `resourceArn` (String) **required** — The ARN of the resource to tag
 //! * `tags` (TagMap) **required** — The tags to add to the resource
+//!
+//! ## Errors
+//!
+//! The model lists NONE for this operation
+//! (`smithy_query(query="operation",operation="TagResource")` reports `errors: []`), so
+//! both of the shapes below are widened in through `extra_errors`; each is a shape this
+//! SERVICE models and another operation declares:
+//!
+//! * `ResourceNotFoundException` (HTTP 404) — `resourceArn` names no resource of this
+//!   service, exactly as `GetDomain` answers a `domainId` that names no domain.
+//! * `ServiceQuotaExceededException` (HTTP 402) — the merged tag set would exceed
+//!   [`crate::state::MAX_TAGS_PER_RESOURCE`], the same condition and the same channel
+//!   `CreateDomain` uses for a create carrying more tags than a resource may hold.
+//!
+//! A tag key or value outside its modelled length is refused as a 400
+//! `ValidationException` (`crate::scaffolded::Scaffolded::validation`): the model bounds
+//! `TagKey` at 1..128 and `TagValue` at 0..256 and declares no error shape for a bad
+//! input, so that is the only channel for it.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -94,9 +110,18 @@ impl ::aws_smithy_schema::serde::SerializableStruct for TagResourceOutput {
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.connecthealth#TagResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.connecthealth#TagResource",
+    extra_errors = ["ResourceNotFoundException", "ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
+    /// Declared on the service (and on `GetDomain`), not on this operation: the ARN
+    /// names no resource this service holds.
+    ResourceNotFoundException(ResourceNotFoundException),
+    /// Declared on the service (and on `CreateDomain`), not on this operation: the
+    /// resource cannot hold the merged tag set.
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -150,18 +175,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The store is unreachable only when this service was mounted on a foreign
+        // engine; a refusal is the only channel this operation has for that.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "TagResource could not reach this service's store",
+            ));
+        };
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // Every handler materialises the deletions the CLOCK already made due first, so
+        // the ARN of a resource whose deletion has fallen due no longer resolves here.
+        store.purge_due_deletions(now);
+
+        // The ARN has to name a resource this service holds: tags live beside the
+        // resource, so there is nothing to attach them to otherwise.
+        if !store.holds_resource_arn(&input.resource_arn) {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Resource {} was not found", input.resource_arn)),
+                },
+            )
+            .into());
+        }
+
+        // The model bounds a tag key at 1..128 characters and a value at 0..256
+        // (`smithy_query(query="shape",shape="TagMap")`); checked here as well because a
+        // constraint on a MAP's key or value is not one the boundary walk can refuse
+        // through the member it was bound to. Same bounds, and the same refusal, as
+        // `CreateDomain` applies to the tags a create carries.
+        if let Some((key, value)) = input.tags.iter().find(|(key, value)| {
+            key.is_empty()
+                || key.len() > crate::state::MAX_TAG_KEY_LEN
+                || value.len() > crate::state::MAX_TAG_VALUE_LEN
+        }) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "tags entry '{}' is outside the bounds of a tag: a key is 1..{} characters \
+                 and a value 0..{} (key {} characters, value {} characters)",
+                key.chars().take(32).collect::<String>(),
+                crate::state::MAX_TAG_KEY_LEN,
+                crate::state::MAX_TAG_VALUE_LEN,
+                key.len(),
+                value.len()
+            )));
+        }
+
+        // The limit is on the resource's tag SET, so it is the merged set that is
+        // bounded: re-tagging keys the resource already carries is always accepted,
+        // while new keys that would carry it past the cap are refused.
+        let merged = store.tags_after_merge(&input.resource_arn, input.tags);
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "resource {} would carry {} tags, more than the maximum of {}",
+                        input.resource_arn,
+                        merged.len(),
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `@idempotent`: the merged set is what is stored, so repeating the call writes
+        // the same set again and changes nothing.
+        store.set_tags(&input.resource_arn, merged);
+        Ok(TagResourceOutput)
     }
 }

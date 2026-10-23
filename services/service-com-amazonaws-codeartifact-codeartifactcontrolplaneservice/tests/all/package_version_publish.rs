@@ -17,7 +17,9 @@
 //! 3. `assetSHA256` is an integrity check: a digest that disagrees with the bytes
 //!    received is `ValidationException` (400) and stores nothing.
 //! 4. Only the `generic` format can be published through this API; every other
-//!    `PackageFormat` is `ValidationException` (400).
+//!    `PackageFormat` is `ValidationException` (400). A `generic` publish that names no
+//!    `namespace` is `ValidationException` (400) too: the namespace is a component of the
+//!    version's identity, not a label.
 //! 5. A publish into a domain or repository that is not held is
 //!    `ResourceNotFoundException` (404) naming the resource that was missing.
 //! 6. `unfinished` keeps a version open for further assets and the publish that omits it
@@ -54,8 +56,16 @@ use crate::domain_repository_lifecycle::create_repository;
 use crate::harness::{auth_for, call, create_domain, emulator, Answer, REGION};
 
 /// The domain and repository every case publishes into.
-const DOMAIN: &str = "pkg-domain";
-const REPOSITORY: &str = "pkg-repo";
+pub const DOMAIN: &str = "pkg-domain";
+pub const REPOSITORY: &str = "pkg-repo";
+
+/// The namespace every publish carries unless a case names another.
+///
+/// A generic package version's identity is `<namespace>/<package>/<version>`, so
+/// `namespace` is required of a `generic` publish even though the model marks the member
+/// optional (other formats derive it — a Maven groupId, an npm scope). A row that needs
+/// a request WITHOUT one takes it off with [`Publish::without_namespace`].
+pub const NAMESPACE: &str = "team-core";
 
 /// Send one request whose body is RAW BYTES rather than JSON, with extra headers.
 ///
@@ -63,7 +73,7 @@ const REPOSITORY: &str = "pkg-repo";
 /// `PublishPackageVersion`: its `assetContent` is a streaming binary payload and its
 /// `assetSHA256` rides the `x-amz-content-sha256` header. The response is reduced to the
 /// same shared [`Answer`].
-async fn call_with_payload(
+pub async fn call_with_payload(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -109,28 +119,28 @@ fn sha256_hex(content: &[u8]) -> String {
 
 /// One `PublishPackageVersion` request.
 #[derive(Debug, Clone)]
-struct Publish {
-    domain: String,
-    repository: String,
-    format: String,
-    namespace: Option<String>,
-    package: String,
-    version: String,
-    asset_name: String,
-    content: Vec<u8>,
+pub struct Publish {
+    pub domain: String,
+    pub repository: String,
+    pub format: String,
+    pub namespace: Option<String>,
+    pub package: String,
+    pub version: String,
+    pub asset_name: String,
+    pub content: Vec<u8>,
     /// The digest to DECLARE. `None` declares the true digest of `content`.
-    declared_sha256: Option<String>,
-    unfinished: Option<bool>,
+    pub declared_sha256: Option<String>,
+    pub unfinished: Option<bool>,
 }
 
 impl Publish {
     /// A publish of `content` that declares the true digest and closes the version.
-    fn new(package: &str, version: &str, asset_name: &str, content: Vec<u8>) -> Self {
+    pub fn new(package: &str, version: &str, asset_name: &str, content: Vec<u8>) -> Self {
         Self {
             domain: DOMAIN.to_string(),
             repository: REPOSITORY.to_string(),
             format: "generic".to_string(),
-            namespace: None,
+            namespace: Some(NAMESPACE.to_string()),
             package: package.to_string(),
             version: version.to_string(),
             asset_name: asset_name.to_string(),
@@ -140,17 +150,23 @@ impl Publish {
         }
     }
 
-    fn namespace(mut self, namespace: &str) -> Self {
+    pub fn namespace(mut self, namespace: &str) -> Self {
         self.namespace = Some(namespace.to_string());
         self
     }
 
-    fn unfinished(mut self, unfinished: bool) -> Self {
+    /// Send no `namespace` at all — the request the generic format refuses.
+    pub fn without_namespace(mut self) -> Self {
+        self.namespace = None;
+        self
+    }
+
+    pub fn unfinished(mut self, unfinished: bool) -> Self {
         self.unfinished = Some(unfinished);
         self
     }
 
-    fn declaring(mut self, digest: &str) -> Self {
+    pub fn declaring(mut self, digest: &str) -> Self {
         self.declared_sha256 = Some(digest.to_string());
         self
     }
@@ -172,7 +188,7 @@ impl Publish {
 
 /// `PublishPackageVersion`: the asset bytes are the HTTP payload and the declared digest
 /// is the `x-amz-content-sha256` header the model binds `assetSHA256` to.
-async fn publish(router: &MultiServiceRouter, request: &Publish) -> Answer {
+pub async fn publish(router: &MultiServiceRouter, request: &Publish) -> Answer {
     let digest = request
         .declared_sha256
         .clone()
@@ -188,7 +204,7 @@ async fn publish(router: &MultiServiceRouter, request: &Publish) -> Answer {
 }
 
 /// `DescribePackageVersion` for the version a [`Publish`] addresses.
-async fn describe(router: &MultiServiceRouter, request: &Publish) -> Answer {
+pub async fn describe(router: &MultiServiceRouter, request: &Publish) -> Answer {
     let mut uri = format!(
         "/v1/package/version?domain={}&repository={}&format={}&package={}&version={}",
         request.domain, request.repository, request.format, request.package, request.version
@@ -204,7 +220,7 @@ async fn describe_domain(router: &MultiServiceRouter, domain: &str) -> Answer {
 }
 
 /// A router holding [`DOMAIN`]/[`REPOSITORY`], which every publish case needs.
-async fn emulator_with_repository() -> MultiServiceRouter {
+pub async fn emulator_with_repository() -> MultiServiceRouter {
     let router = emulator();
     let created = create_domain(&router, DOMAIN, None).await;
     assert_eq!(created.status, 200, "CreateDomain failed: {created:?}");
@@ -215,7 +231,7 @@ async fn emulator_with_repository() -> MultiServiceRouter {
 
 /// Content of `size` bytes that is not text: every byte value cycles, so a row that
 /// mangled the payload (a text codec, a truncation) cannot pass by accident.
-fn binary_content(size: usize, seed: u8) -> Vec<u8> {
+pub fn binary_content(size: usize, seed: u8) -> Vec<u8> {
     (0..size)
         .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
         .collect()
@@ -229,11 +245,10 @@ fn binary_content(size: usize, seed: u8) -> Vec<u8> {
 async fn published_version_round_trips_through_describe() {
     let router = emulator_with_repository().await;
 
-    // Rows differ along what the rule generalises over: namespace present or absent,
-    // asset size (including a single byte), the shape of the version string, and the
-    // asset name.
+    // Rows differ along what the rule generalises over: the namespace, the asset size
+    // (including a single byte), the shape of the version string, and the asset name.
     let cases = vec![
-        ("no namespace, one byte", Publish::new("alpha", "1.0.0", "payload.bin", vec![0x00])),
+        ("one byte", Publish::new("alpha", "1.0.0", "payload.bin", vec![0x00])),
         (
             "namespaced, small text",
             Publish::new("beta", "2.0.0-rc.1", "notes.txt", b"hello generic".to_vec())
@@ -600,7 +615,9 @@ async fn addressing_a_resource_that_is_not_held_is_not_found() {
     }
 
     // A read of a package that was never published, and of a version of a package that
-    // was: both are 404, and the error says which resource is missing.
+    // was: both are 404, and both name the PACKAGE at the coordinate they addressed — a
+    // package exists in a repository only through its versions, so a coordinate holding
+    // none has no package at it either.
     let published = Publish::new("held", "1.0.0", "payload.bin", b"x".to_vec());
     assert_eq!(
         publish(&router, &published).await.status,
@@ -617,7 +634,7 @@ async fn addressing_a_resource_that_is_not_held_is_not_found() {
 
     let reads = vec![
         ("package never published", absent_package, "package"),
-        ("version never published", absent_version, "package-version"),
+        ("version never published", absent_version, "package"),
         ("namespace is part of the key", absent_namespace, "package"),
     ];
     for (label, case, resource_type) in &reads {
@@ -903,11 +920,14 @@ async fn origin_control_decides_whether_a_package_accepts_a_publish() {
 
         // `PutPackageOriginConfiguration` is `POST /v1/package` with the package
         // coordinate in the query string; it creates the package when it does not exist.
+        // The coordinate is the (format, namespace, package) TRIPLE, so it carries the
+        // same namespace the publishes do — a configuration written under another
+        // namespace belongs to another package.
         let configured = call(
             &router,
             "POST",
             &format!(
-                "/v1/package?domain={DOMAIN}&repository={REPOSITORY}&format=generic&package={package}"
+                "/v1/package?domain={DOMAIN}&repository={REPOSITORY}&format=generic&namespace={NAMESPACE}&package={package}"
             ),
             Some(serde_json::json!({
                 "restrictions": { "publish": publish_restriction, "upstream": "ALLOW" }

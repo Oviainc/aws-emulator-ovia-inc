@@ -5,7 +5,9 @@
 //! Adds tags to an SWF domain: the tags the request carries are merged into the stored
 //! domain's own tag list under one lock — a key the domain already carries takes the
 //! new value, a key it does not is appended — so `ListTagsForResource` reads back
-//! exactly what this call wrote. An ARN that resolves to no stored domain is the
+//! exactly what this call wrote. A tag outside the documented tag character class is
+//! refused with a 400 `ValidationException` before the store is reached, the same way
+//! `RegisterDomain` refuses one. An ARN that resolves to no stored domain is the
 //! modelled `UnknownResourceFault`, and a merge that would leave the domain above the
 //! documented maximum of 50 tags is the modelled `TooManyTagsFault`, storing nothing.
 //!
@@ -163,7 +165,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The caller-chosen batch is bounded BEFORE any work proportional to it, and
+        // Every tag the request carries is checked against the documented tag character
+        // class BEFORE the store is reached — "Tags may only contain unicode letters,
+        // digits, whitespace, or these symbols: _ . : / = + - @" — the same validator
+        // `RegisterDomain` applies to the tags it stores. The class is not modelled, so
+        // the boundary validator passes a tag outside it; without this check one entry
+        // point would store a tag the other refuses, and `ListTagsForResource` would then
+        // report a tag Amazon SWF would never have accepted.
+        for tag in &input.tags {
+            crate::state::validate_tag(&tag.key, tag.value.as_deref())
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+
+        // The caller-chosen batch is then bounded BEFORE any work proportional to it, and
         // before the store lock is taken: "Amazon SWF supports a maximum of 50 tags per
         // resource", so a request carrying more than that many tags can only ever exceed
         // the maximum, whatever the domain already holds. Refusing it here is what keeps

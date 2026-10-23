@@ -253,11 +253,22 @@ impl MetricDestinationRecord {
     /// Project the stored record onto the model's `MetricDestinationSummary` — the one
     /// conversion `ListRumMetricsDestinations` goes through, so what a read reports is
     /// exactly what the put wrote.
+    ///
+    /// EVERY member of the summary is materialised, not only the ones this destination
+    /// kind carries a value for: a destination that has no ARN and no role (a
+    /// `CloudWatch` one) reports `DestinationArn` and `IamRoleArn` as the EMPTY STRING
+    /// rather than leaving them absent, which is the value recorded behaviour reports and
+    /// which the model admits — `DestinationArn` is `@length(min: 0, max: 2048)`, and
+    /// both members are documented as describing the Evidently case only ("If the
+    /// destination is Evidently, this specifies the ARN of the Evidently experiment…",
+    /// "This field appears only when the destination is Evidently"). So a client reading
+    /// either member to decide whether a destination is Evidently-backed finds a defined
+    /// empty value instead of a missing key.
     pub fn to_summary(&self) -> MetricDestinationSummary {
         MetricDestinationSummary {
             destination: Some(self.destination.clone()),
-            destination_arn: self.destination_arn.clone(),
-            iam_role_arn: self.iam_role_arn.clone(),
+            destination_arn: Some(self.destination_arn.clone().unwrap_or_default()),
+            iam_role_arn: Some(self.iam_role_arn.clone().unwrap_or_default()),
         }
     }
 }

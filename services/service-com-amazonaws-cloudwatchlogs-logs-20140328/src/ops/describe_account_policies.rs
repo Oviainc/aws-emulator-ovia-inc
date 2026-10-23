@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAccountPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAccountPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: reports the account-level policies of the requested `policyType` from the
+//! shared store, narrowed by the `policyName` and `accountIdentifiers` filters the request
+//! carries. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAccountPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## One page, so no `nextToken`
+//!
+//! This operation models no `limit`, and `PutAccountPolicy`'s own quotas bound how many
+//! account-level policies of one type an account can hold (at most twenty), so every
+//! matching policy fits in one page and this handler mints no `nextToken`. A `nextToken`
+//! on the request can therefore only be a token this operation did not issue, and it is
+//! refused as invalid rather than silently ignored — the same way the other paginated
+//! readers of this service refuse a token they did not mint.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +168,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAccountPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAccountPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAccountPolicies"))
+        // `ctx` carries only request metadata, and this operation reports: it reads the
+        // store and writes nothing.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAccountPoliciesError::from(
+                DescribeAccountPoliciesErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        let invalid = |message: String| {
+            DescribeAccountPoliciesError::from(
+                DescribeAccountPoliciesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        // "Currently, you can specify only one account ID in this parameter." The model
+        // admits a list of up to twenty, so nothing refuses a longer one before this
+        // handler runs; the refusal names the member and the count it was given.
+        let account_identifiers = input.account_identifiers.unwrap_or_default();
+        if account_identifiers.len() > 1 {
+            return Err(invalid(format!(
+                "accountIdentifiers can specify only one account ID, got {}",
+                account_identifiers.len()
+            )));
+        }
+
+        // Every stored policy belongs to this emulator's own account, so a request naming
+        // a source account names one whose policies this account does not hold: the
+        // filter selects none of them. "If you omit this parameter, only the policy in the
+        // current account is returned."
+        let account_matches = account_identifiers
+            .iter()
+            .all(|identifier| identifier == ::engine::emulator_account_id());
+
+        // A token this operation never mints cannot be a position in an enumeration it
+        // issued. See the module docs: every matching policy is reported in one page.
+        if let Some(token) = input.next_token.as_deref() {
+            return Err(invalid(format!(
+                "nextToken '{token}' was not issued by DescribeAccountPolicies"
+            )));
+        }
+
+        // "Use this parameter to limit the returned policies to only the policies that
+        // match the policy type that you specify", and `policyName` "to only the policy
+        // with the name that you specify": both are filters, so a filter that matches
+        // nothing reports an empty list rather than refusing the request. The store is
+        // keyed by `(policyType, policyName)`, so one type's policies come out in
+        // policy-name order.
+        let reported: Vec<AccountPolicy> = store
+            .account_policies
+            .iter()
+            .filter(|_| account_matches)
+            .filter(|((policy_type, _), _)| *policy_type == input.policy_type)
+            .filter(|((_, policy_name), _)| {
+                input
+                    .policy_name
+                    .as_deref()
+                    .is_none_or(|wanted| wanted == policy_name.as_str())
+            })
+            .map(|(_, policy)| policy.reported())
+            .collect();
+
+        Ok(DescribeAccountPoliciesOutput {
+            account_policies: Some(reported),
+            next_token: None,
+        })
     }
 }

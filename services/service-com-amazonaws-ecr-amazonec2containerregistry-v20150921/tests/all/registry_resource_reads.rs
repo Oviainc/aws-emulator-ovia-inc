@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_ecr_amazonec2containerregistry_v20150921 as ecr;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{emulator_with_engine, ok, refused, REGISTRY_ID};
+use crate::wire::{emulator_with_engine, given_layer, ok, refused, REGISTRY_ID};
 
 /// An account id that is NOT this emulator's registry.
 const OTHER_REGISTRY_ID: &str = "123456789012";
@@ -61,9 +61,11 @@ async fn push(
 
 /// Seed one pull through cache rule into the registry's store.
 ///
-/// `CreatePullThroughCacheRule` is the only operation that creates one and is still a 501
-/// stub (its own filed issue), so the update and validate paths are exercised against a
-/// record placed straight into the same store those handlers read.
+/// `CreatePullThroughCacheRule` is the operation that creates one, and it refuses an
+/// upstream URL it cannot resolve to a supported registry, so the update and validate
+/// paths are exercised here against a record placed straight into the same store those
+/// handlers read — which is also how a rule naming an upstream the create would refuse
+/// is arranged.
 fn seed_pull_through_cache_rule(
     engine: &engine::InMemoryEngine,
     prefix: &str,
@@ -141,15 +143,16 @@ fn stored_template_prefixes(engine: &engine::InMemoryEngine) -> BTreeSet<String>
 }
 
 /// An image manifest a push can store: distinct `salt` gives it a distinct digest.
+///
+/// It references no blob, because a manifest cannot be pushed before every blob it
+/// references is in the repository (`PutImage`'s `LayersNotFoundException`) and these
+/// cases are about resolving a NAME rather than about blobs — the `layer_availability`
+/// suite covers those.
 fn image_manifest(salt: &str) -> String {
     json!({
         "schemaVersion": 2,
         "mediaType": OCI_MANIFEST_MEDIA_TYPE,
-        "config": {
-            "mediaType": "application/vnd.oci.image.config.v1+json",
-            "digest": format!("sha256:{salt:0>64}"),
-            "size": 7,
-        },
+        "annotations": {"salt": salt},
         "layers": [],
     })
     .to_string()
@@ -310,11 +313,16 @@ async fn image_status_reads_resolve_the_repository_then_the_image() {
 }
 
 /// An artifact manifest that refers to `subject`, as an OCI artifact does.
+///
+/// A `config` descriptor names a blob, and a manifest naming a blob the repository does
+/// not hold cannot be pushed, so the caller passes the digest of a blob it has already
+/// uploaded (`config_digest`).
 fn artifact_manifest(
     subject: &str,
     media_type: Option<&str>,
     artifact_type: Option<&str>,
     config_media_type: Option<&str>,
+    config_digest: &str,
     annotations: &[(&str, &str)],
 ) -> String {
     let mut manifest = json!({
@@ -335,7 +343,7 @@ fn artifact_manifest(
     if let Some(config_media_type) = config_media_type {
         manifest["config"] = json!({
             "mediaType": config_media_type,
-            "digest": format!("sha256:{:0>64}", "e3b0"),
+            "digest": config_digest,
             "size": 2,
         });
     }
@@ -432,6 +440,9 @@ async fn list_image_referrers_reports_the_artifacts_that_name_the_subject() {
     // Every row is pushed as an untagged artifact of the same repository, beside two
     // manifests that must NOT be reported: one referring to another subject, and the
     // subject itself, which refers to nothing.
+    // The one blob every artifact below names as its config: in the repository first,
+    // because a manifest cannot be pushed before the blobs it references are.
+    let config_digest = given_layer(&router, "setup", "referrers", b"artifact config").await;
     let mut expected: HashMap<String, Row<'_>> = HashMap::new();
     for row in &rows {
         let (case, media_type, artifact_type, config_media_type, annotations, _, _) = *row;
@@ -440,6 +451,7 @@ async fn list_image_referrers_reports_the_artifacts_that_name_the_subject() {
             media_type,
             artifact_type,
             config_media_type,
+            &config_digest,
             annotations,
         );
         let digest = push(&router, case, "referrers", &manifest, None).await;
@@ -450,6 +462,7 @@ async fn list_image_referrers_reports_the_artifacts_that_name_the_subject() {
         Some(OCI_MANIFEST_MEDIA_TYPE),
         Some("application/vnd.example.sbom.v1+json"),
         None,
+        &config_digest,
         &[],
     );
     push(&router, "another subject", "referrers", &elsewhere, None).await;
@@ -581,6 +594,7 @@ async fn list_image_referrers_filters_and_paginates_the_computed_set() {
             Some(OCI_MANIFEST_MEDIA_TYPE),
             Some(artifact_type),
             None,
+            "",
             &[("type", artifact_type)],
         );
         push(&router, artifact_type, "referrer-filters", &manifest, None).await;
@@ -765,6 +779,9 @@ async fn pull_through_cache_rule_update_and_validate_resolve_the_prefix() {
         "arn:aws:secretsmanager:eu-west-1:000000000000:secret:ecr-pullthroughcache/docker-hub";
     const OTHER_SECRET: &str =
         "arn:aws:secretsmanager:eu-west-1:000000000000:secret:ecr-pullthroughcache/other";
+    /// The credential the updated rule is created with.
+    const INITIAL_SECRET: &str =
+        "arn:aws:secretsmanager:eu-west-1:000000000000:secret:ecr-pullthroughcache/initial";
     const ROLE: &str = "arn:aws:iam::000000000000:role/ecr-pull-through-cache";
 
     let (router, engine) = emulator_with_engine();
@@ -816,7 +833,10 @@ async fn pull_through_cache_rule_update_and_validate_resolve_the_prefix() {
         "docker-hub",
         Some("docker-hub"),
         "registry-1.docker.io",
-        None,
+        // Created WITH a credential: credentials are updatable only on a rule that was
+        // created authenticated, so an unauthenticated rule has none of these rows'
+        // updates to apply.
+        Some(INITIAL_SECRET),
         None,
     );
     for (case, patch, expected_credential, expected_role) in &updates {

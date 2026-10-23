@@ -15,6 +15,8 @@
 mod approval_team_lifecycle;
 #[path = "all/authorization_gate.rs"]
 mod authorization_gate;
+#[path = "all/inactive_team_version_deletion.rs"]
+mod inactive_team_version_deletion;
 #[path = "all/policy_catalog.rs"]
 mod policy_catalog;
 #[path = "all/policy_versions.rs"]

@@ -19,6 +19,8 @@ mod approval_rule_template_content_update;
 mod approval_rule_templates;
 #[path = "all/approval_rules_and_commits.rs"]
 mod approval_rules_and_commits;
+#[path = "all/batch_associate_approval_rule_template.rs"]
+mod batch_associate_approval_rule_template;
 #[path = "all/batch_get_repositories.rs"]
 mod batch_get_repositories;
 #[path = "all/blob_content.rs"]

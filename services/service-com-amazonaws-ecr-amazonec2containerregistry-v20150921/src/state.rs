@@ -403,14 +403,25 @@ pub const REPORTED_LAYER_PART_SIZE: i64 = 10 * 1024 * 1024;
 /// emulator's own bound, set well above any layer an ordinary push sends.
 pub const MAX_LAYER_UPLOAD_BYTES: usize = 128 * 1024 * 1024;
 
+/// See [`MAX_REPOSITORIES`]. This one bounds [`Repo::layer_blobs`], which grows by one
+/// entry per `CompleteLayerUpload` that registers a blob the repository did not already
+/// hold, and nothing shrinks: a registered blob stays for the life of the process, so
+/// the registry needs a ceiling on how many blobs one repository holds a record of.
+/// Past it the completion is refused with the `ServerException`
+/// `CompleteLayerUpload` models — reaching the ceiling is this registry's own capacity,
+/// not a fault in the request, and that operation models no limit error. AWS publishes
+/// no fixed maximum layer count per repository, so the number is this emulator's own
+/// bound, set well above the layer count of any ordinary image set.
+pub const MAX_LAYERS_PER_REPOSITORY: usize = 10_000;
+
 /// One in-flight layer upload: what `InitiateLayerUpload` opened, addressed by the
 /// upload id it handed the client.
 ///
 /// `UploadLayerPart` streams the layer into it one part at a time and
-/// `CompleteLayerUpload` (still a 501 stub with an issue of its own) is what closes it,
-/// so what is kept here is what opening the upload decided — which repository it is
-/// for, the part size the client was told to send, when it was opened — plus the layer
-/// bytes received so far.
+/// `CompleteLayerUpload` is what closes it, registering the assembled blob on the
+/// repository ([`Repo::layer_blobs`]) and dropping the upload, so what is kept here is
+/// what opening the upload decided — which repository it is for, the part size the
+/// client was told to send, when it was opened — plus the layer bytes received so far.
 #[derive(Debug, Clone)]
 pub struct LayerUpload {
     /// The repository the upload was opened against. An upload id is only valid for
@@ -418,9 +429,9 @@ pub struct LayerUpload {
     pub repository_name: String,
     /// The `partSize` reported to the client when the upload was opened.
     pub part_size: i64,
-    /// When `InitiateLayerUpload` opened it. Nothing reads it yet: the first operation
-    /// that does — `CompleteLayerUpload`, still a 501 stub with its own issue — is the
-    /// one to decide whether an upload also expires with age.
+    /// When `InitiateLayerUpload` opened it. Nothing reads it: an upload is closed by
+    /// `CompleteLayerUpload`, and AWS publishes no age at which an in-flight upload
+    /// expires, so this registry expires none.
     pub started_at: SystemTime,
     /// The layer bytes accepted so far, in the order they arrived. Each part starts
     /// where the previous one ended, so this is the prefix of the layer the registry
@@ -1049,6 +1060,16 @@ pub struct Repo {
     pub policy_text: Option<String>,
     pub images: BTreeMap<String, ImageRecord>,
     pub tag_index: BTreeMap<String, String>,
+    /// The blobs this repository holds, by digest: one entry per layer upload
+    /// `CompleteLayerUpload` closed against it, carrying the digest the registry
+    /// computed over the assembled bytes and how many bytes those were. A manifest
+    /// cannot be pushed before every blob it references is in here, which is what
+    /// `PutImage`'s `LayersNotFoundException` reports, and it is where
+    /// `BatchCheckLayerAvailability` reads a layer's availability from. Blobs are
+    /// per-repository: a layer uploaded to one repository is not a layer of another.
+    /// The bytes themselves are not kept — nothing serves them yet — only the
+    /// registry's record of the blob.
+    pub layer_blobs: BTreeMap<String, LayerBlob>,
     /// The repository's lifecycle policy, which `PutLifecyclePolicy` sets: the policy
     /// `StartLifecyclePolicyPreview` evaluates when the start call names none, and the
     /// document `GetLifecyclePolicy` reports. `None` until a policy is put and again
@@ -1221,38 +1242,50 @@ impl Repo {
 
     /// Every blob this repository holds, by digest.
     ///
-    /// A manifest cannot be pushed before every blob it references is in the
-    /// repository — `PutImage` models `LayersNotFoundException` for exactly that, "the
-    /// specified layers could not be found, or the specified layer is not valid for
-    /// this repository" — so the blobs the stored manifests reference are the blobs the
-    /// repository holds, and their descriptors are where their sizes and media types
-    /// come from. Blobs are per-repository: a layer pushed to one repository is not a
-    /// layer of another, which is why this is a method on the repository.
+    /// A blob is in a repository because a layer upload against that repository was
+    /// COMPLETED — `CompleteLayerUpload` is what registers one, under the digest the
+    /// registry computed over the bytes it assembled — so [`Self::layer_blobs`] is the
+    /// record of what the repository holds, and the byte count it carries is the
+    /// registry's own count rather than anything a manifest declares. What a manifest
+    /// adds is the blob's MEDIA TYPE, which only a descriptor referencing it states (a
+    /// V2 schema 1 `fsLayers` entry states not even that), so it is filled in here from
+    /// whichever stored manifest knows it. Blobs are per-repository: a layer uploaded to
+    /// one repository is not a layer of another, which is why this is a method on the
+    /// repository.
     pub fn layers(&self) -> BTreeMap<String, LayerBlob> {
-        let mut layers: BTreeMap<String, LayerBlob> = BTreeMap::new();
+        let mut layers = self.layer_blobs.clone();
         for image in self.images.values() {
             for blob in manifest_blobs(&image.manifest) {
-                match layers.entry(blob.digest.clone()) {
-                    Entry::Vacant(slot) => {
-                        slot.insert(blob);
-                    }
-                    // One blob can be referenced by several manifests, and the formats
-                    // differ in what they say about it (a V2 schema 1 `fsLayers` entry
-                    // carries the digest alone), so each field is filled by whichever
-                    // descriptor knows it.
-                    Entry::Occupied(mut held) => {
-                        let record = held.get_mut();
-                        if record.size.is_none() {
-                            record.size = blob.size;
-                        }
-                        if record.media_type.is_none() {
-                            record.media_type = blob.media_type;
-                        }
+                // A descriptor for a blob the repository does not hold describes
+                // nothing here: only a held blob is a layer of this repository.
+                if let Entry::Occupied(mut held) = layers.entry(blob.digest.clone()) {
+                    let record = held.get_mut();
+                    if record.media_type.is_none() {
+                        record.media_type = blob.media_type;
                     }
                 }
             }
         }
         layers
+    }
+
+    /// The digests `manifest` references that this repository does not hold, each once
+    /// and in the order [`manifest_blobs`] reads them: the image's layers, then its
+    /// configuration blob.
+    ///
+    /// Empty means every blob the manifest references is in the repository, so the
+    /// manifest may be stored; anything else is what `PutImage`'s
+    /// `LayersNotFoundException` names. The same blob referenced twice is one missing
+    /// blob, so it is named once. A document that is not a manifest at all references no
+    /// blob ([`manifest_blobs`]), and so names no missing one.
+    pub fn missing_layers(&self, manifest: &str) -> Vec<String> {
+        let mut missing: Vec<String> = Vec::new();
+        for blob in manifest_blobs(manifest) {
+            if !self.layer_blobs.contains_key(&blob.digest) && !missing.contains(&blob.digest) {
+                missing.push(blob.digest);
+            }
+        }
+        missing
     }
 
     /// Apply `incoming` to this repository's metadata tags: a key the repository already
@@ -2071,8 +2104,15 @@ pub fn check_tag_count(existing: &[Tag], incoming: &[Tag]) -> Result<(), Fault> 
 /// The content digest of an image manifest: `sha256:<hex>` over the manifest bytes,
 /// which is how a registry addresses a manifest it was handed.
 pub fn manifest_digest(manifest: &str) -> String {
+    content_digest(manifest.as_bytes())
+}
+
+/// The content digest of `content`: `sha256:<hex>` over the bytes, the form a registry
+/// addresses any content it holds by — a manifest ([`manifest_digest`]) and the layer
+/// blob `CompleteLayerUpload` assembles out of an upload's parts alike.
+pub fn content_digest(content: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    format!("sha256:{}", hex::encode(Sha256::digest(manifest.as_bytes())))
+    format!("sha256:{}", hex::encode(Sha256::digest(content)))
 }
 
 /// The media type a manifest declares about itself, for a push that named none.
@@ -2087,7 +2127,8 @@ pub fn manifest_media_type(manifest: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-/// Every blob an image manifest references, in the order the manifest lists them.
+/// Every blob an image manifest references: its filesystem layers in the order the
+/// manifest lists them, and then its configuration blob.
 ///
 /// A manifest names its blobs as descriptors, and both container-image manifest
 /// formats in use spell them the same way: the Docker image manifest V2 schema 2 and
@@ -2097,14 +2138,16 @@ pub fn manifest_media_type(manifest: &str) -> Option<String> {
 /// them as `fsLayers[].blobSum`, a digest and nothing else. A manifest list or OCI
 /// image index references *manifests* rather than blobs, so its `manifests` entries are
 /// deliberately not read here: they are other images, not this one's layers.
+///
+/// The layers come before the configuration blob because that is the order a refusal
+/// built from this list reports them in — `PutImage`'s `LayersNotFoundException` names
+/// the image's layers first — and it is the only place the order is observable: every
+/// other reader keys the blobs by digest.
 pub fn manifest_blobs(manifest: &str) -> Vec<LayerBlob> {
     let Ok(document) = serde_json::from_str::<serde_json::Value>(manifest) else {
         return Vec::new();
     };
     let mut blobs = Vec::new();
-    if let Some(blob) = document.get("config").and_then(blob_descriptor) {
-        blobs.push(blob);
-    }
     if let Some(layers) = document.get("layers").and_then(serde_json::Value::as_array) {
         blobs.extend(layers.iter().filter_map(blob_descriptor));
     }
@@ -2119,6 +2162,9 @@ pub fn manifest_blobs(manifest: &str) -> Vec<LayerBlob> {
                 media_type: None,
             })
         }));
+    }
+    if let Some(blob) = document.get("config").and_then(blob_descriptor) {
+        blobs.push(blob);
     }
     blobs
 }
