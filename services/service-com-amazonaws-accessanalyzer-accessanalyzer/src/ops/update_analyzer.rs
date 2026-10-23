@@ -179,8 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // or `ORGANIZATION` analyzer has no `AnalyzerConfiguration` to modify, so the
             // request is refused rather than silently storing one. The refusal is about
             // the analyzer the path names rather than about one malformed member, so it
-            // carries no `fieldList` — and its reason is the field-validation
-            // discriminator AWS answers with, not the modelled `notSupported`; see
+            // carries no `fieldList`, its message is the service's own fixed text for an
+            // unsupported action (it names neither the operation nor the analyzer's
+            // type), and its reason is the field-validation discriminator AWS answers
+            // with, not the modelled `notSupported`; see
             // [`crate::state::unsupported_action_exception`].
             let Some(configured_access) = analyzer.configured_access() else {
                 crate::state::audit(
@@ -189,10 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::AuditOutcome::ValidationRefused,
                 );
                 return Err(UpdateAnalyzerErrorModeled::ValidationException(
-                    crate::state::unsupported_action_exception(format!(
-                        "UpdateAnalyzer is not supported for an analyzer of type {}",
-                        analyzer.r#type
-                    )),
+                    crate::state::unsupported_action_exception(),
                 )
                 .into());
             };
