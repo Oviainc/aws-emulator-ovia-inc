@@ -26,6 +26,7 @@
 //! issue happens to mention is one row.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::LOG_GROUP_NAME_REGEX_PATTERN;
 
 use crate::harness::{Logs, REGION};
 
@@ -343,8 +344,9 @@ async fn pattern_bounds_decide_refusal_not_the_segment_cap() {
 
     // A refusal names the member and the constraint the value broke, on the template
     // this service words a constraint violation with: "N validation error detected: Value
-    // at '<member>' failed to satisfy constraint: <constraint>" — carrying neither the
-    // submitted value nor a pattern's `^`/`$` anchors.
+    // at '<member>' failed to satisfy constraint: <constraint>" — carrying nothing of the
+    // submitted value, and stating a `@pattern` constraint as the model spells it (the one
+    // rendering rule, on `requirement` in src/service.rs).
     for operation in ["ListLogGroups", "ListAggregateLogGroupSummaries"] {
         for (case, pattern, constraint) in [
             ("below the member's minimum length", "ab".to_string(), "length"),
@@ -378,10 +380,12 @@ async fn pattern_bounds_decide_refusal_not_the_segment_cap() {
                 !message.contains(&pattern),
                 "case {operation} {case}: the template carries no submitted value, got {message}"
             );
+            let states_the_modelled_pattern = !message.contains("regular expression pattern")
+                || message.ends_with(LOG_GROUP_NAME_REGEX_PATTERN);
             assert!(
-                !message.contains("$") && !message.contains(": ^"),
-                "case {operation} {case}: a pattern constraint is rendered unanchored, got \
-                 {message}"
+                states_the_modelled_pattern,
+                "case {operation} {case}: a pattern constraint states the modelled expression, \
+                 got {message}"
             );
         }
     }

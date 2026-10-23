@@ -33,6 +33,8 @@ mod config_setup_and_rule_loop;
 mod config_tagging;
 #[path = "all/discovered_resources.rs"]
 mod discovered_resources;
+#[path = "all/error_message_rules.rs"]
+mod error_message_rules;
 #[path = "all/list_configuration_recorders.rs"]
 mod list_configuration_recorders;
 #[path = "all/pending_aggregation_requests.rs"]

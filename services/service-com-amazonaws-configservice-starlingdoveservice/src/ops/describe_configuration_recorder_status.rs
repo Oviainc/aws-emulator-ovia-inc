@@ -203,9 +203,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         DescribeConfigurationRecorderStatusErrorModeled::NoSuchConfigurationRecorderException(
                             NoSuchConfigurationRecorderException {
-                                message: Some(format!(
-                                    "there is no configuration recorder named '{name}'"
-                                )),
+                                message: Some(
+                                    crate::state::NO_SUCH_CONFIGURATION_RECORDER.to_string(),
+                                ),
                             },
                         )
                         .into(),
@@ -224,9 +224,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     DescribeConfigurationRecorderStatusErrorModeled::NoSuchConfigurationRecorderException(
                         NoSuchConfigurationRecorderException {
-                            message: Some(format!(
-                                "there is no configuration recorder with the ARN '{arn}'"
-                            )),
+                            message: Some(
+                                crate::state::NO_SUCH_CONFIGURATION_RECORDER.to_string(),
+                            ),
                         },
                     )
                     .into(),

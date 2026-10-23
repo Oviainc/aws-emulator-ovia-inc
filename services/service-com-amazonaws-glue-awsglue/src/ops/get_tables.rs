@@ -442,9 +442,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let end = start.saturating_add(page_size).min(matching.len());
 
         let page = &matching[start..end];
+        // The listing serves the SAME projection as the single-table read, element by
+        // element — including the catalog/database identity and the row-filtering flag —
+        // so a client that works from a listing is never less informed than one that
+        // re-reads each table. Only `AttributesToGet` narrows an element, and then to
+        // exactly the members it named.
         let table_list: Vec<Table> = page
             .iter()
-            .map(|table| projection.apply(table.to_table()))
+            .map(|table| projection.apply(table.to_table(&database.database_id)))
             .collect();
         // The token names the last entry of the page, taken from the page itself so
         // there is no index arithmetic to underflow on an empty page.
