@@ -366,8 +366,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `PutRumMetricsDestination` call names a destination.
             metric_destinations: ::std::collections::BTreeMap::new(),
             // A monitor is created with no resource policy: `PutResourcePolicy` is the
-            // only call that attaches one.
+            // only call that attaches one, and the one that stores revision 1 of it.
             resource_policy: None,
+            policy_revisions: 0,
         });
 
         // The id was minted and stored under the SAME lock this call still holds, so the

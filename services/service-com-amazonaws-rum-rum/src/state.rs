@@ -251,13 +251,32 @@ impl MetricDestinationRecord {
 /// beside the caller's identity-based policies ([`authorization`]).
 #[derive(Debug, Clone)]
 pub struct ResourcePolicyRecord {
-    /// `PolicyDocument` exactly as the `PutResourcePolicy` call delivered it — kept
-    /// verbatim, never re-serialized, so a read reports the bytes that were written.
+    /// `PolicyDocument` in the canonical form the service stores it in
+    /// ([`canonical_policy_document`]): the submitted document's content, with the
+    /// whitespace between its JSON tokens dropped. Everything a caller controls inside
+    /// the document — its elements, their order, their values — is kept as written, so
+    /// what a read reports is the policy that was written.
     pub document: String,
-    /// The `PolicyRevisionId` this revision was stored under: minted by the service on
-    /// every successful put, and what a later conditional put or delete is checked
-    /// against.
-    pub revision_id: String,
+    /// This revision's number: 1 for the first policy revision an app monitor ever
+    /// stores and one more than the previous revision for every later successful write,
+    /// which is what makes a revision ORDERED — a client can tell which of two
+    /// revisions it holds is the later one. Rendered on the wire by
+    /// [`Self::revision_id`]; written only through
+    /// [`AppMonitorRecord::store_resource_policy`], so no two revisions of one monitor's
+    /// policy can share a number.
+    pub revision: u64,
+}
+
+impl ResourcePolicyRecord {
+    /// `PolicyRevisionId` as the wire carries it: the revision number in decimal.
+    ///
+    /// `PolicyRevisionId` is modelled as a 1..255-character string with no pattern, and
+    /// the value is the SERVICE's — a caller only ever passes one back to make a
+    /// conditional request. The decimal rendering of the revision number fits those
+    /// bounds for every number a `u64` holds.
+    pub fn revision_id(&self) -> String {
+        self.revision.to_string()
+    }
 }
 
 /// One persisted app monitor.
@@ -316,6 +335,12 @@ pub struct AppMonitorRecord {
     /// `PolicyNotFoundException` for, and what the authorization evaluation reads beside
     /// the caller's identity-based policies.
     pub resource_policy: Option<ResourcePolicyRecord>,
+    /// How many resource-policy revisions this monitor has ever stored: the source of
+    /// the next revision number ([`Self::store_resource_policy`]). It counts WRITES, not
+    /// the policy currently held, so it is not reset by `DeleteResourcePolicy` — a
+    /// revision id a caller read before a delete must never pass the conditional check
+    /// of a policy stored after it.
+    pub policy_revisions: u64,
 }
 
 impl AppMonitorRecord {
@@ -386,10 +411,28 @@ impl AppMonitorRecord {
 
     /// The revision id of this monitor's stored resource policy, or `None` while it
     /// carries no policy.
-    pub fn policy_revision_id(&self) -> Option<&str> {
+    pub fn policy_revision_id(&self) -> Option<String> {
         self.resource_policy
             .as_ref()
-            .map(|policy| policy.revision_id.as_str())
+            .map(ResourcePolicyRecord::revision_id)
+    }
+
+    /// Store `document` as this monitor's resource policy, as the NEXT revision of it,
+    /// and report the record just written.
+    ///
+    /// The ONE writer of [`Self::resource_policy`] and of [`Self::policy_revisions`], so
+    /// every accepted `PutResourcePolicy` advances the revision by exactly one: the first
+    /// policy a monitor stores is revision 1, the write that replaces it is revision 2,
+    /// and so on. The document is stored in its canonical form
+    /// ([`canonical_policy_document`]): its content, with the caller's insignificant
+    /// whitespace dropped.
+    pub fn store_resource_policy(&mut self, document: &str) -> &ResourcePolicyRecord {
+        self.policy_revisions = self.policy_revisions.saturating_add(1);
+        let stored = ResourcePolicyRecord {
+            document: canonical_policy_document(document),
+            revision: self.policy_revisions,
+        };
+        self.resource_policy.insert(stored)
     }
 
     /// Why a request carrying `provided` as its `PolicyRevisionId` cannot act on this
@@ -409,7 +452,7 @@ impl AppMonitorRecord {
         provided: Option<&str>,
     ) -> Option<InvalidPolicyRevisionIdException> {
         let provided = provided?;
-        (self.policy_revision_id() != Some(provided))
+        (self.policy_revision_id().as_deref() != Some(provided))
             .then(|| policy_revision_mismatch(provided))
     }
 
@@ -469,23 +512,6 @@ impl ComAmazonawsRumRumState {
                 return candidate;
             }
         }
-    }
-
-    /// Mint a fresh `PolicyRevisionId` for a resource policy a call is about to store.
-    ///
-    /// `PolicyRevisionId` is modelled as a 1..255-character string with no pattern, and
-    /// the value is the SERVICE's: a caller only ever passes one back to make a
-    /// conditional request, so what matters is that no two puts produce the same id
-    /// (otherwise a stale id would pass a conditional check) and that it cannot be
-    /// guessed from the previous one. Both come from the same digest-of-(seed, counter)
-    /// construction [`Self::mint_app_monitor_id`] uses, under its own domain string so
-    /// the two id spaces cannot collide.
-    pub fn mint_policy_revision_id(&mut self) -> String {
-        if self.id_seed == 0 {
-            self.id_seed = nanos_since_epoch() as u64;
-        }
-        self.next_id_seq = self.next_id_seq.wrapping_add(1);
-        uuid_v4_shaped(POLICY_REVISION_DOMAIN, self.id_seed, self.next_id_seq)
     }
 
     /// Store `record`, keeping the `Id` -> `Name` index in step with the primary map.
@@ -559,9 +585,6 @@ fn nanos_since_epoch() -> u128 {
 
 /// The id space [`ComAmazonawsRumRumState::mint_app_monitor_id`] draws from.
 const APP_MONITOR_ID_DOMAIN: &str = "rum/appmonitor";
-
-/// The id space [`ComAmazonawsRumRumState::mint_policy_revision_id`] draws from.
-const POLICY_REVISION_DOMAIN: &str = "rum/policyrevision";
 
 /// One `(domain, seed, sequence)` triple as a canonical, lowercase, version-4-shaped
 /// UUID string.
@@ -840,6 +863,45 @@ pub fn tagged_resource_not_found() -> ResourceNotFoundException {
     }
 }
 
+/// The stored form of a `PolicyDocument`: the submitted JSON text with every
+/// insignificant whitespace character removed.
+///
+/// The service parses the document it is given (it refuses one that is not a well-formed
+/// policy, see [`policy_document_refusal`]) and keeps the parse's canonical text, so what
+/// a later read reports is the policy's content and not the caller's layout: whitespace
+/// between JSON tokens carries no meaning. Nothing INSIDE the document is touched —
+/// whitespace in a string literal is content, element order, numbers and escapes are kept
+/// exactly as written — so the document still holds the same statements, in the same
+/// order, as the caller wrote them.
+pub fn canonical_policy_document(document: &str) -> String {
+    let mut canonical = String::with_capacity(document.len());
+    // Whether the scanner is inside a JSON string literal, and whether the previous
+    // character opened an escape sequence inside one (so an escaped quote does not end
+    // the literal).
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in document.chars() {
+        if in_string {
+            canonical.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if character == '"' {
+            in_string = true;
+            canonical.push(character);
+        } else if !character.is_whitespace() {
+            canonical.push(character);
+        }
+    }
+    canonical
+}
+
 /// Why this `PolicyDocument` is not a resource policy this service can store, or `None`
 /// when it is one.
 ///
@@ -1022,11 +1084,19 @@ fn is_policy_condition_value(value: &::serde_json::Value) -> bool {
     }
 }
 
+/// The wording RUM answers `PolicyNotFoundException` with.
+///
+/// Recorded behaviour: the message is this CONSTANT, carrying no part of the request —
+/// the monitor the caller asked about is already the one it addressed, so the error says
+/// only that the resource policy is not there. (The shape models `message` and nothing
+/// else, so the whole body is this one member.)
+pub const POLICY_NOT_FOUND_MESSAGE: &str = "Resource policy does not exist";
+
 /// `PolicyNotFoundException` for an app monitor that exists but carries no resource
-/// policy. The message is built from the request, so it names the monitor asked about.
-pub fn policy_not_found(name: &str) -> PolicyNotFoundException {
+/// policy.
+pub fn policy_not_found() -> PolicyNotFoundException {
     PolicyNotFoundException {
-        message: format!("App monitor {name} does not have a resource policy."),
+        message: POLICY_NOT_FOUND_MESSAGE.to_string(),
     }
 }
 

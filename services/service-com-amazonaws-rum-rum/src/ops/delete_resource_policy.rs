@@ -209,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // finds none.
         if record.resource_policy.is_none() {
             return Err(DeleteResourcePolicyErrorModeled::PolicyNotFoundException(
-                crate::state::policy_not_found(&input.name),
+                crate::state::policy_not_found(),
             )
             .into());
         }
@@ -227,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // removed", so it is read off the policy this call took away.
         let removed = record.resource_policy.take();
         Ok(DeleteResourcePolicyOutput {
-            policy_revision_id: removed.map(|policy| policy.revision_id),
+            policy_revision_id: removed.map(|policy| policy.revision_id()),
         })
     }
 }

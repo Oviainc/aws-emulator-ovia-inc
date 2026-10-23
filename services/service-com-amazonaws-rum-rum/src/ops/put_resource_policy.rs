@@ -261,10 +261,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Every accepted put is a NEW revision of the policy, so the id it reports is
-        // freshly minted: the id the caller held is exactly what a later conditional
-        // request must no longer satisfy.
-        let revision_id = store.mint_policy_revision_id();
         let Some(record) = store.app_monitors.get_mut(&input.name) else {
             // Unreachable: the same lock has been held since the `contains_key` above.
             return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
@@ -272,21 +268,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // The document is stored as the request delivered it, byte for byte.
-        record.resource_policy = Some(crate::state::ResourcePolicyRecord {
-            document: input.policy_document,
-            revision_id: revision_id.clone(),
-        });
+        // Every accepted put is a NEW revision of the policy: the stored revision is the
+        // previous one plus one (1 for the monitor's first policy), so the id the caller
+        // held is exactly what a later conditional request must no longer satisfy, and
+        // two revisions a client holds can be ordered. The document is stored as its
+        // CONTENT: the layout the caller's printer chose is not part of the policy
+        // (`crate::state::canonical_policy_document`).
+        let stored = record.store_resource_policy(&input.policy_document);
 
         // Reported off the record this call just wrote, under the lock it still holds, so
         // what a following `GetResourcePolicy` reads is what is answered here.
-        let stored = record
-            .resource_policy
-            .as_ref()
-            .map(|policy| policy.document.clone());
         Ok(PutResourcePolicyOutput {
-            policy_document: stored,
-            policy_revision_id: Some(revision_id),
+            policy_document: Some(stored.document.clone()),
+            policy_revision_id: Some(stored.revision_id()),
         })
     }
 }
