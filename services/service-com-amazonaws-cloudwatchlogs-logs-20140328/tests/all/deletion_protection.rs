@@ -28,49 +28,13 @@ const NAME_FORMS: [&str; 4] = [
     "mixed-1_2.3/4#5",
 ];
 
-/// The one log group the service reports under `identifier` (a name or either ARN form),
-/// or `None` once it is gone.
-async fn group_of(logs: &Logs, identifier: &str) -> Option<Value> {
-    let page = logs
-        .ok(
-            "DescribeLogGroups",
-            &json!({"logGroupIdentifiers": [identifier]}),
-        )
-        .await;
-    let groups = page
-        .get("logGroups")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("DescribeLogGroups must return logGroups, got {page}"))
-        .clone();
-    assert!(
-        groups.len() <= 1,
-        "case {identifier}: at most one log group is reported under one identifier, got {groups:?}"
-    );
-    groups.into_iter().next()
-}
-
 /// The `deletionProtectionEnabled` the service reports for one log group.
 async fn protection_of(logs: &Logs, identifier: &str) -> Option<bool> {
-    group_of(logs, identifier)
+    logs.describe_group(identifier)
         .await
         .unwrap_or_else(|| panic!("case {identifier}: the log group must still exist"))
         .get("deletionProtectionEnabled")
         .and_then(Value::as_bool)
-}
-
-/// Both ARN forms a log group carries: `arn` (with the trailing `:*`) and `logGroupArn`.
-async fn arns_of(logs: &Logs, name: &str) -> (String, String) {
-    let group = group_of(logs, name)
-        .await
-        .unwrap_or_else(|| panic!("case {name}: the log group must exist"));
-    let member = |key: &str| {
-        group
-            .get(key)
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("case {name}: a log group carries {key}, got {group}"))
-            .to_string()
-    };
-    (member("arn"), member("logGroupArn"))
 }
 
 /// Put a deletion-protection state through one identifier form, asserting the empty 200
@@ -145,7 +109,7 @@ async fn protection_blocks_the_delete_until_it_is_disabled() {
             "case {case}: a new group reports the deletion protection it was created with"
         );
 
-        let (_arn, log_group_arn) = arns_of(&logs, &name).await;
+        let (_arn, log_group_arn) = logs.group_arns(&name).await;
         let identifier = if form == "name" {
             name.clone()
         } else {
@@ -216,7 +180,7 @@ async fn protection_blocks_the_delete_until_it_is_disabled() {
         logs.ok("DeleteLogGroup", &json!({"logGroupName": name}))
             .await;
         assert_eq!(
-            group_of(&logs, &name).await,
+            logs.describe_group(&name).await,
             None,
             "case {case}: the group is gone once protection is disabled and it is deleted"
         );
@@ -231,7 +195,8 @@ async fn a_later_put_replaces_the_state_and_nothing_else() {
     let group = "repeated.puts/group";
     logs.ok("CreateLogGroup", &json!({"logGroupName": group}))
         .await;
-    let before = group_of(&logs, group)
+    let before = logs
+        .describe_group(group)
         .await
         .expect("the group was just created");
 
@@ -239,7 +204,8 @@ async fn a_later_put_replaces_the_state_and_nothing_else() {
     // as a no-op rather than a toggle.
     for enabled in [true, true, false, false, true, false] {
         put_protection(&logs, group, enabled).await;
-        let after = group_of(&logs, group)
+        let after = logs
+            .describe_group(group)
             .await
             .expect("a put does not delete the group");
         assert_eq!(
@@ -304,7 +270,7 @@ async fn protection_is_per_log_group() {
                 "case {group}: the refusal carries the modelled error code, got {body}"
             );
             assert!(
-                group_of(&logs, group).await.is_some(),
+                logs.describe_group(group).await.is_some(),
                 "case {group}: the protected group survives its refused delete"
             );
         } else {
@@ -313,7 +279,7 @@ async fn protection_is_per_log_group() {
                 "case {group}: an unprotected group is deleted, got {status} {body}"
             );
             assert_eq!(
-                group_of(&logs, group).await,
+                logs.describe_group(group).await,
                 None,
                 "case {group}: the unprotected group is gone after its delete"
             );
@@ -329,7 +295,7 @@ async fn a_put_on_an_unknown_log_group_is_refused() {
     let present = "present-group";
     logs.ok("CreateLogGroup", &json!({"logGroupName": present}))
         .await;
-    let (arn, log_group_arn) = arns_of(&logs, present).await;
+    let (arn, log_group_arn) = logs.group_arns(present).await;
 
     let unknown = [
         ("a name nobody created", "no-such-group".to_string()),
@@ -360,7 +326,7 @@ async fn a_put_on_an_unknown_log_group_is_refused() {
             );
         }
         assert_eq!(
-            group_of(&logs, &identifier).await,
+            logs.describe_group(&identifier).await,
             None,
             "case {case} ({identifier}): a refused put does not create the group"
         );
