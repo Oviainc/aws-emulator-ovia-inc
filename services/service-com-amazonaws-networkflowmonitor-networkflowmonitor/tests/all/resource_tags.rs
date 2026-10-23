@@ -15,14 +15,12 @@
 //! privileged.
 //!
 //! The harness (`Emulator`, `Answer`, `targets`, `client_token`) is the one
-//! `scope_monitor_lifecycle.rs` already builds; only the tag-plane calls are added
-//! here.
+//! `tests/all/harness.rs` owns and every suite in this crate dispatches through;
+//! only the tag-plane calls are added here.
 
 use serde_json::{json, Map, Value};
 
-use crate::scope_monitor_lifecycle::{
-    client_token, targets, Answer, Emulator, ACCOUNT_ID, REGION, SIGNING_NAME,
-};
+use crate::harness::{client_token, targets, Answer, Emulator, ACCOUNT_ID, REGION, SIGNING_NAME};
 
 /// `TagKey`'s own `@length` maximum, from the model
 /// (`smithy_query(query="shape",shape="TagMap")`: key target `TagKey`, len 1..128).
