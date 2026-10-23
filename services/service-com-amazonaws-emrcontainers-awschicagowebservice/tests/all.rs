@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/job_template_idempotency.rs"]
 mod job_template_idempotency;
+#[path = "all/job_template_lifecycle.rs"]
+mod job_template_lifecycle;
 #[path = "all/security_configuration.rs"]
 mod security_configuration;
 #[path = "all/state_roundtrip.rs"]
