@@ -43,6 +43,9 @@ lingua = { version = "1.8", default-features = false, features = [
 # VADER sentiment engine behind DetectSentiment: a rule-based English sentiment
 # analyser returning positive/negative/neutral proportions and a compound score.
 vader_sentiment = "0.1"
+# Regular-expression engine behind the PII recognizer in ops::contains_pii_entities:
+# it matches each PII entity type's published form over the submitted document.
+regex = "1.12"
 # Amazon S3 client the asynchronous dominant-language detection job reads its input
 # documents with and writes its `output.tar.gz` back through, over the in-process
 # callback into this same emulator (no network client feature is enabled: the

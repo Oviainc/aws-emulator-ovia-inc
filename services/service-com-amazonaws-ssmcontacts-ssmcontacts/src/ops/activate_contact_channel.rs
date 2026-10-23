@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ActivateContactChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ActivateContactChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ActivateContactChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Activates the contact channel `ContactChannelId` names, by checking the caller's
+//! `ActivationCode` against the code Incident Manager delivered TO that channel.
+//!
+//! Two things happen before the check, in this order:
+//!
+//! 1. The ACCOUNT-level Incident Manager precondition
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]):
+//!    SSM Contacts is fronted by a per-account replication set, and until the account has
+//!    an active one this call is refused with the modelled `ValidationException` (HTTP 400)
+//!    WITHOUT resolving `ContactChannelId`.
+//! 2. The resource lookup: an onboarded account naming a channel the store does not hold
+//!    gets the modelled `ResourceNotFoundException` (HTTP 404).
+//!
+//! The code itself is never on the wire in either direction but the caller's: AWS delivers
+//! it out of band, to the address or number the channel names, and this emulator's stand-in
+//! for that carrier is the channel record itself
+//! ([`crate::state::ContactChannelRecord::activation_code`]). A channel that has had no
+//! code delivered, or a code that is not the latest one delivered, is refused with the
+//! modelled `ValidationException` naming `activationCode` — never with a 404, because the
+//! channel was found.
+//!
+//! Activation is idempotent: the operation models no "already activated" error and its
+//! output carries no state, so re-presenting a channel's current code leaves it ACTIVATED.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +162,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ActivateContactChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ActivateContactChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ActivateContactChannel"))
+        // The channel is addressed by ARN and nothing is read off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ActivateContactChannelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+
+        // The account gate comes FIRST: it is evaluated before `ContactChannelId` is
+        // resolved, so a non-onboarded account is refused identically whether or not its
+        // channel exists.
+        state
+            .require_active_replication_set()
+            .map_err(account_precondition_failed)?;
+
+        let Some(channel) = state.contact_channels.get_mut(&input.contact_channel_id) else {
+            return Err(ActivateContactChannelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Contact channel {} not found",
+                        input.contact_channel_id
+                    ),
+                    resource_id: input.contact_channel_id.clone(),
+                    resource_type: CONTACT_CHANNEL_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The code is compared against the one last DELIVERED to this channel. A channel
+        // that was created with activation deferred and has had no `SendActivationCode`
+        // holds none, so nothing a caller presents can match.
+        if channel.activation_code.as_deref() != Some(input.activation_code.as_str()) {
+            return Err(validation(
+                "Value at 'activationCode' failed to satisfy constraint: Member must be the \
+                 activation code most recently sent to this contact channel",
+            ));
+        }
+
+        channel.activation_status = ACTIVATED.to_string();
+
+        Ok(ActivateContactChannelOutput {})
     }
+}
+
+/// The `ActivationStatus` an activated channel carries, from the model's own
+/// `ActivationStatus` value set ([`ACTIVATION_STATUS_VALUES`]).
+const ACTIVATED: &str = "ACTIVATED";
+
+/// The `resourceType` this operation's not-found error names, spelled as the channel
+/// lifecycle's other handlers spell it.
+const CONTACT_CHANNEL_RESOURCE_TYPE: &str = "contact-channel";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` because the failure is not a member-level one, and `fields` is
+/// present but EMPTY for the same reason — no field of the request is at fault.
+fn account_precondition_failed(message: String) -> ActivateContactChannelError {
+    ActivateContactChannelErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// A member-level refusal: the same modelled `ValidationException`, naming the field.
+fn validation(message: impl Into<String>) -> ActivateContactChannelError {
+    ActivateContactChannelErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: "activationCode".to_string(),
+            message: "The activation code is not the one sent to this contact channel"
+                .to_string(),
+        }]),
+    })
+    .into()
 }

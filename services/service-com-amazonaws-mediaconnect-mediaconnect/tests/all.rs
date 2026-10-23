@@ -31,6 +31,8 @@ mod flow_projection;
 mod flow_sources;
 #[path = "all/gateway_lifecycle.rs"]
 mod gateway_lifecycle;
+#[path = "all/lifecycle_preconditions.rs"]
+mod lifecycle_preconditions;
 #[path = "all/ops_name_bindings.rs"]
 mod ops_name_bindings;
 #[path = "all/remove_flow_output.rs"]

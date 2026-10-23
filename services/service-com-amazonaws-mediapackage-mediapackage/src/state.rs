@@ -153,6 +153,11 @@ pub const ORIGIN_ENDPOINT_SHAPE: &str = "OriginEndpoint";
 /// How a MediaPackage error names a HarvestJob in `errors`.
 pub const HARVEST_JOB_KIND: &str = "harvestJob";
 
+/// How a MediaPackage error names an IngestEndpoint in `errors` — the shape name,
+/// lowerCamel, the way every other resource type is keyed here
+/// (`com.amazonaws.mediapackage#IngestEndpoint`).
+pub const INGEST_ENDPOINT_KIND: &str = "ingestEndpoint";
+
 /// `NotFoundException` (404) for a resource the request addressed BY ID that this service
 /// does not hold: keyed by the resource type, because what is missing is the resource and
 /// not a value in the request.
@@ -173,6 +178,15 @@ pub fn origin_endpoint_not_found(id: &str) -> ServiceError {
 /// [`resource_not_found`] for a HarvestJob.
 pub fn harvest_job_not_found(id: &str) -> ServiceError {
     resource_not_found(HARVEST_JOB_KIND, id)
+}
+
+/// [`resource_not_found`] for an IngestEndpoint.
+///
+/// 404 and not a 422 reference refusal: the id travels as an `@httpLabel`, so the request
+/// ADDRESSES that ingest endpoint rather than referring to it from a body member — the
+/// same reason a channel or an origin endpoint the service does not hold is a 404.
+pub fn ingest_endpoint_not_found(id: &str) -> ServiceError {
+    resource_not_found(INGEST_ENDPOINT_KIND, id)
 }
 
 /// `UnprocessableEntityException` (422) for a create whose id is already in use: the
@@ -686,6 +700,19 @@ pub struct ChannelRecord {
 }
 
 impl ChannelRecord {
+    /// Where in [`Self::ingest_endpoints`] the endpoint whose `Id` is `id` sits, or `None`
+    /// when this channel carries no such endpoint.
+    ///
+    /// A POSITION rather than a reference, so a caller that has to mint through the store
+    /// (which needs the store mutably) can resolve the target first and write to it after.
+    /// An ingest endpoint exists only as part of its channel, so this is the only way it
+    /// is ever addressed.
+    pub fn ingest_endpoint_position(&self, id: &str) -> Option<usize> {
+        self.ingest_endpoints
+            .iter()
+            .position(|endpoint| endpoint.id.as_deref() == Some(id))
+    }
+
     /// The modelled `Channel` shape for this record. Every channel-returning operation
     /// renders its output from this one projection, so they cannot disagree.
     pub fn to_channel(&self) -> Channel {

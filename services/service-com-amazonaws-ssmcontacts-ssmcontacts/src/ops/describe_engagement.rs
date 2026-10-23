@@ -6,12 +6,17 @@
 //! `StartEngagement` sent, when it started, and the `StopTime` `StopEngagement` recorded
 //! if it has been stopped. A read: it writes nothing.
 //!
-//! Like every SSM Contacts data-plane call that resolves a resource it is refused with the
-//! modelled `ValidationException` (HTTP 400) while the account has no ACTIVE Incident
-//! Manager replication set
-//! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]),
-//! BEFORE the engagement is looked up; an `EngagementId` the store does not hold is the
-//! modelled `ResourceNotFoundException` (HTTP 404).
+//! Two things happen before the report, in this order:
+//!
+//! 1. The ACCOUNT-level Incident Manager precondition: while the account has no ACTIVE
+//!    replication set the call is refused with the modelled `ValidationException`
+//!    (HTTP 400), BEFORE the engagement is looked up. This operation's whole subject is one
+//!    resource ARN, and without a replication set the account has no home region to resolve
+//!    it in, so the refusal names THE ARN THE REQUEST SUPPLIED
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`])
+//!    rather than the account.
+//! 2. The resource lookup: an `EngagementId` the store does not hold is the modelled
+//!    `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -175,6 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The engagement is addressed by ARN; nothing is read off the request envelope.
         let _ = ctx;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -192,9 +198,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The account gate comes FIRST, before `EngagementId` is resolved, so a
         // non-onboarded account is refused identically whether or not its engagement
-        // exists.
+        // exists — and the refusal names the ARN the request supplied, which is what cannot
+        // be resolved without a replication set.
         state
-            .require_active_replication_set()
+            .require_active_replication_set_for(&input.engagement_id)
             .map_err(account_precondition_failed)?;
 
         let Some(engagement) = state.engagements.get(&input.engagement_id) else {
@@ -219,9 +226,10 @@ const ENGAGEMENT_RESOURCE_TYPE: &str = "engagement";
 /// The account precondition's refusal: this operation's modelled `ValidationException`,
 /// which the model classifies `client` with `httpError` 400.
 ///
-/// `reason` carries `OTHER` because the failure is not a member-level one, and `fields` is
-/// present but EMPTY for the same reason — no field of the request is at fault. The same
-/// shape `UpdateContact` answers this precondition with.
+/// `reason` carries `OTHER` because the failure is not a member-level one — the request's
+/// `EngagementId` is well formed; what cannot be resolved is the account's registry — and
+/// `fields` is present but EMPTY for the same reason. The same shape `UpdateContact`
+/// answers this precondition with.
 fn account_precondition_failed(message: String) -> DescribeEngagementError {
     DescribeEngagementErrorModeled::ValidationException(ValidationException {
         message,

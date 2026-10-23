@@ -15,6 +15,8 @@
 mod contact_lifecycle;
 #[path = "all/contact_updates.rs"]
 mod contact_updates;
+#[path = "all/data_plane_precondition.rs"]
+mod data_plane_precondition;
 #[path = "all/engagement_lifecycle.rs"]
 mod engagement_lifecycle;
 #[path = "all/state_roundtrip.rs"]

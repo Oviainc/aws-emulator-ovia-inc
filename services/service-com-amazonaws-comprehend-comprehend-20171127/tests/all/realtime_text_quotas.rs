@@ -19,14 +19,18 @@ use crate::comprehend_client::{error_code, Comprehend};
 /// Every real-time inference operation this emulator implements, with the
 /// per-document quota it enforces in UTF-8 bytes.
 ///
-/// Source: `crate::state::REALTIME_TEXT_QUOTA_BYTES` and
-/// `crate::state::DOMINANT_LANGUAGE_TEXT_QUOTA_BYTES`, the service's own quota
-/// table — Comprehend's model states no byte maximum, so the quota is the one the
-/// service publishes for real-time analysis: 100,000 bytes for
-/// `DetectDominantLanguage` and 5,000 bytes for a single-document inference call.
-/// Comprehend's other real-time `Detect*` operations are still scaffolded (they
-/// answer HTTP 501), so they have no row here yet.
+/// Source: `crate::state::REALTIME_TEXT_QUOTA_BYTES`,
+/// `crate::state::DOMINANT_LANGUAGE_TEXT_QUOTA_BYTES` and
+/// `crate::state::PII_TEXT_QUOTA_BYTES`, the service's own quota table — the quota is
+/// the one each operation's own modelled member documentation states, or the one the
+/// service publishes for real-time analysis where the model states none: 100,000
+/// bytes for `DetectDominantLanguage` and for PII analysis (whose `Text` member
+/// documents "The maximum string size is 100 KB"), and 5,000 bytes for a
+/// single-document inference call whose model states no maximum. Comprehend's other
+/// real-time `Detect*` operations are still scaffolded (they answer HTTP 501), so
+/// they have no row here yet.
 const QUOTAS: &[(&str, usize)] = &[
+    ("ContainsPiiEntities", 100_000),
     ("DetectSentiment", 5_000),
     ("DetectSyntax", 5_000),
     ("DetectDominantLanguage", 100_000),
@@ -35,9 +39,11 @@ const QUOTAS: &[(&str, usize)] = &[
 /// The request body for `operation` carrying `text`.
 fn body(operation: &str, text: String) -> Value {
     match operation {
-        // `LanguageCode` is `@required` on DetectSentiment, and the engine reads
+        // `LanguageCode` is `@required` on these operations, and each accepts
         // English, so the size check is the only thing that can refuse the call.
-        "DetectSentiment" | "DetectSyntax" => json!({ "Text": text, "LanguageCode": "en" }),
+        "ContainsPiiEntities" | "DetectSentiment" | "DetectSyntax" => {
+            json!({ "Text": text, "LanguageCode": "en" })
+        }
         _ => json!({ "Text": text }),
     }
 }

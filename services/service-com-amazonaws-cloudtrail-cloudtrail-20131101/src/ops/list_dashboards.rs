@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDashboards
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDashboards`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the CloudTrail Lake dashboards the shared dashboard registry
+//! (`crate::state`) holds for the Region the request is served in, in dashboard-name
+//! order, a page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDashboards::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only: it writes nothing, so two enumerations of an untouched registry
+//! report the same dashboards. The registry is keyed name-first, which is the order a
+//! page walks and the order a page token resumes at: the token is the registry key the
+//! next page starts from, rendered `<name>:<region>` (neither field can hold a colon),
+//! which is also at least the 4 characters the modelled `PaginationToken` requires.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +149,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDashboards` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDashboardsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDashboards"))
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDashboardsErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "ListDashboards needs the CloudTrail dashboard registry, which this \
+                         engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        // "The maximum number of dashboards to display on a single page": a request
+        // that names none takes the service's own cap, which is the largest page the
+        // model admits. Modelled constraints are refused BEFORE this handler runs, so
+        // a value that reaches here is already inside the published range.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .filter(|size| *size > 0)
+            .unwrap_or(crate::state::LIST_DASHBOARDS_MAX_PAGE_SIZE)
+            .min(crate::state::LIST_DASHBOARDS_MAX_PAGE_SIZE);
+
+        // The page token is the registry key the next page resumes at, which the
+        // name-ordered registry seeks to directly.
+        let resume_at: Option<crate::state::DashboardKey> =
+            input.next_token.as_deref().map(|token| {
+                let (name, token_region) = token.split_once(':').unwrap_or((token, ""));
+                (name.to_string(), token_region.to_string())
+            });
+        let remaining: Box<dyn Iterator<Item = &crate::state::DashboardRecord>> = match resume_at {
+            Some(key) => Box::new(store.dashboards.range(key..).map(|(_, record)| record)),
+            None => Box::new(store.dashboards.values()),
+        };
+
+        // "Returns information about all dashboards in the account, in the current
+        // Region": a dashboard is a regional resource, so the ones reported are the
+        // ones homed in the Region this request is served in — narrowed further by
+        // each filter the request names, a name PREFIX and an exact dashboard type.
+        let matching = remaining.filter(|record| {
+            record.home_region == region
+                && input
+                    .name_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| record.name.starts_with(prefix))
+                && input
+                    .r#type
+                    .as_deref()
+                    .is_none_or(|wanted| record.dashboard_type == wanted)
+        });
+
+        let mut page: Vec<DashboardDetail> = Vec::new();
+        let mut next_token = None;
+        for record in matching {
+            if page.len() == page_size {
+                // One dashboard past a full page: report where to resume rather than
+                // carrying it.
+                next_token = Some(format!("{}:{}", record.name, record.home_region));
+                break;
+            }
+            page.push(DashboardDetail {
+                dashboard_arn: Some(record.dashboard_arn.clone()),
+                r#type: Some(record.dashboard_type.clone()),
+            });
+        }
+
+        Ok(ListDashboardsOutput {
+            dashboards: Some(page),
+            next_token,
+        })
     }
 }

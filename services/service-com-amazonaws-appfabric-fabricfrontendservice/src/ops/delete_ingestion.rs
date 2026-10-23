@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIngestion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIngestion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! REMOVES one ingestion from the app bundle that owns it, so a later
+//! `GetIngestion` or `ListIngestions` no longer reports it: the delete is a write
+//! against the same store `CreateIngestion` wrote the record into.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIngestion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation is `@idempotent`, so a delete of an ingestion the bundle no
+//! longer holds changes nothing and still answers 204 — the end state the caller
+//! asked for is already the state of the store. A delete under an app bundle that
+//! does not exist is the modelled `ResourceNotFoundException`: the parent of the
+//! path is a resource in its own right, and this operation declares that error
+//! (the sibling `GetIngestion` and `ListIngestions` answer an unknown bundle the
+//! same way).
+//!
+//! AWS documents two preconditions for this call — the ingestion must be stopped
+//! (disabled) and its ingestion destinations must be deleted first — so an
+//! ingestion whose `IngestionState` is not `disabled`, or that still holds any
+//! destination, is refused with the modelled `ValidationException` rather than
+//! deleted.
+//!
+//! Authorization is NOT modelled here (nor anywhere in this emulator): every
+//! request's signature is verified by the framework, but no IAM evaluation runs,
+//! so the modelled `AccessDeniedException` is never returned and a 204 from this
+//! operation says nothing about whether the caller would be permitted on AWS.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +160,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIngestion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIngestionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIngestion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteIngestionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AppFabric emulator could not reach its state store".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The bundle is the parent of this path and a resource of its own: an
+        // identifier naming no stored bundle is the not-found this operation
+        // models, the same answer `GetIngestion` and `ListIngestions` give.
+        let Some(bundle) = store.resolve_bundle_mut(&input.app_bundle_identifier) else {
+            return Err(DeleteIngestionErrorModeled::ResourceNotFoundException(
+                crate::state::app_bundle_not_found(&input.app_bundle_identifier),
+            )
+            .into());
+        };
+
+        // ONE lookup of the record, by either `Identifier` form. @idempotent: a
+        // target this bundle does not hold leaves the store in exactly the state
+        // the request asks for, so nothing is written and the call succeeds.
+        let Some(ingestion) = bundle.resolve_ingestion(&input.ingestion_identifier) else {
+            crate::state::audit_resource_change(
+                ctx.parts(),
+                Self::NAME,
+                "Ingestion",
+                &input.ingestion_identifier,
+                "already absent",
+            );
+            return Ok(DeleteIngestionOutput {});
+        };
+
+        // The two preconditions the operation documents: "You must stop (disable)
+        // the ingestion and you must delete all associated ingestion destinations
+        // before you can delete an app ingestion." The state is required to BE
+        // `disabled` rather than merely not `enabled`, so a state added to
+        // `IngestionState` later is refused rather than silently deletable.
+        if ingestion.state != crate::state::INGESTION_STATE_DISABLED {
+            return Err(DeleteIngestionErrorModeled::ValidationException(
+                crate::state::precondition_not_met(format!(
+                    "Ingestion {} is {} and must be stopped before it can be deleted.",
+                    ingestion.arn, ingestion.state
+                )),
+            )
+            .into());
+        }
+        if !ingestion.destinations.is_empty() {
+            return Err(DeleteIngestionErrorModeled::ValidationException(
+                crate::state::precondition_not_met(format!(
+                    "Ingestion {} still has {} ingestion destination(s); delete them before deleting the ingestion.",
+                    ingestion.arn,
+                    ingestion.destinations.len()
+                )),
+            )
+            .into());
+        }
+
+        // The record's own key, read off the record the lookup above resolved, so
+        // the remove cannot name anything else.
+        let ingestion_key = ingestion.id.clone();
+        bundle.ingestions.remove(&ingestion_key);
+        crate::state::audit_resource_change(
+            ctx.parts(),
+            Self::NAME,
+            "Ingestion",
+            &ingestion_key,
+            "deleted",
+        );
+        Ok(DeleteIngestionOutput {})
     }
 }

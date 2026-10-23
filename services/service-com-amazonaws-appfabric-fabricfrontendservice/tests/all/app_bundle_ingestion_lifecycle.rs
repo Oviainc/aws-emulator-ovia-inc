@@ -30,6 +30,19 @@ const REGION: &str = "us-east-1";
 /// The account segment of every ARN a generated emulator emits.
 const ACCOUNT: &str = "000000000000";
 
+/// An `appfabric` ARN for a resource no create call ever minted, in the form
+/// `CreateIngestion` builds (`appbundle/<uuid>/ingestion/<uuid>`).
+pub(crate) fn unknown_ingestion_arn(bundle_uuid: &str, ingestion_uuid: &str) -> String {
+    format!(
+        "arn:aws:appfabric:{REGION}:{ACCOUNT}:appbundle/{bundle_uuid}/ingestion/{ingestion_uuid}"
+    )
+}
+
+/// An `appfabric` app-bundle ARN for a bundle no create call ever minted.
+pub(crate) fn unknown_bundle_arn(bundle_uuid: &str) -> String {
+    format!("arn:aws:appfabric:{REGION}:{ACCOUNT}:appbundle/{bundle_uuid}")
+}
+
 /// One emulator: the shared engine plus this service mounted on a router.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
@@ -53,9 +66,16 @@ impl Answer {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
-        let engine = Arc::new(engine::InMemoryEngine::new());
+        Self::with_engine(&Arc::new(engine::InMemoryEngine::new()))
+    }
+
+    /// The same emulator over an engine the CALLER keeps a handle to, so a test
+    /// can also reach the store the handlers write through
+    /// (`state::service_state`) — the only way to set up a resource state no
+    /// implemented operation can reach yet.
+    pub(crate) fn with_engine(engine: &Arc<engine::InMemoryEngine>) -> Self {
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
+        router.register_service(EmulatedService::new(Arc::clone(engine)));
         Self { router }
     }
 
@@ -112,7 +132,7 @@ impl Emulator {
         .await
     }
 
-    async fn get_ingestion(&self, bundle: &str, ingestion: &str) -> Answer {
+    pub(crate) async fn get_ingestion(&self, bundle: &str, ingestion: &str) -> Answer {
         self.call(
             "GET",
             &format!(
@@ -125,10 +145,24 @@ impl Emulator {
         .await
     }
 
-    async fn list_ingestions(&self, bundle: &str, query: &str) -> Answer {
+    pub(crate) async fn list_ingestions(&self, bundle: &str, query: &str) -> Answer {
         self.call(
             "GET",
             &format!("/appbundles/{}/ingestions{query}", encode(bundle)),
+            None,
+        )
+        .await
+    }
+
+    /// `DELETE /appbundles/{appBundleIdentifier}/ingestions/{ingestionIdentifier}`.
+    pub(crate) async fn delete_ingestion(&self, bundle: &str, ingestion: &str) -> Answer {
+        self.call(
+            "DELETE",
+            &format!(
+                "/appbundles/{}/ingestions/{}",
+                encode(bundle),
+                encode(ingestion)
+            ),
             None,
         )
         .await
@@ -162,7 +196,7 @@ fn client_token(seed: u32) -> String {
 }
 
 /// A UUID-shaped identifier no create call ever minted.
-fn unknown_uuid() -> String {
+pub(crate) fn unknown_uuid() -> String {
     "ffffffff-ffff-4fff-8fff-ffffffffffff".to_string()
 }
 
@@ -176,7 +210,7 @@ pub(crate) fn arn_of(body: &Value, resource: &str) -> String {
 
 /// The bare UUID at the end of an ARN, which is the other identifier form the
 /// model's `Identifier` shape accepts for the same resource.
-fn uuid_of(arn: &str) -> String {
+pub(crate) fn uuid_of(arn: &str) -> String {
     arn.rsplit('/')
         .next()
         .unwrap_or_else(|| panic!("an ARN with a resource id, got {arn}"))
@@ -1395,6 +1429,10 @@ async fn state_changing_operations_write_an_audit_record() {
     emulator.list_app_bundles("").await;
     emulator.list_ingestions(&bundle, "").await;
 
+    emulator.delete_ingestion(&bundle, &ingestion).await;
+    // Deleting what is already gone is a success, and is recorded as such.
+    emulator.delete_ingestion(&bundle, &ingestion).await;
+
     emulator.delete_app_bundle(&bundle).await;
     // Deleting what is already gone is a success, and is recorded as such.
     emulator.delete_app_bundle(&bundle).await;
@@ -1422,6 +1460,20 @@ async fn state_changing_operations_write_an_audit_record() {
             "Ingestion",
             ingestion_id.clone(),
             "created",
+        ),
+        (
+            "a deleted ingestion",
+            "DeleteIngestion",
+            "Ingestion",
+            ingestion_id.clone(),
+            "deleted",
+        ),
+        (
+            "a delete of an absent ingestion",
+            "DeleteIngestion",
+            "Ingestion",
+            ingestion.clone(),
+            "already absent",
         ),
         (
             "a deleted app bundle",

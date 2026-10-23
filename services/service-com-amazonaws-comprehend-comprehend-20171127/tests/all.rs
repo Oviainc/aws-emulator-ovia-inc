@@ -25,6 +25,8 @@ mod document_classifiers;
 mod dominant_language_jobs;
 #[path = "all/key_phrases_jobs.rs"]
 mod key_phrases_jobs;
+#[path = "all/pii_detection.rs"]
+mod pii_detection;
 #[path = "all/pii_entities_jobs.rs"]
 mod pii_entities_jobs;
 #[path = "all/realtime_text_quotas.rs"]

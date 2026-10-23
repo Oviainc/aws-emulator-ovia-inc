@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutContactPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutContactPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutContactPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches `Policy` to the contact or escalation plan `ContactArn` names, writing it to
+//! [`crate::state::ContactRecord::policy`] so the next `GetContactPolicy` reports what
+//! this call wrote. A second put REPLACES the policy: a resource has one policy, not a
+//! list of them.
+//!
+//! The order of the checks is the order of the refusals:
+//!
+//! 1. The ACCOUNT-level Incident Manager precondition
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]):
+//!    until the account has an active replication set the call is refused with the modelled
+//!    `ValidationException` (HTTP 400) — BEFORE `ContactArn` is resolved and before the
+//!    policy document is looked at at all, so a non-onboarded account never gets a
+//!    policy-shape complaint.
+//! 2. The policy document: a resource policy is a JSON policy document, so one that is not
+//!    a JSON object names no statements and is refused with the modelled
+//!    `ValidationException` naming `policy`. The modelled `Policy` constrains only its
+//!    length (1..395000) and that it is not all whitespace (`pattern` `\S`), so nothing
+//!    beyond that is required of its contents here.
+//! 3. The resource lookup: an onboarded account naming a contact the store does not hold
+//!    gets the modelled `ResourceNotFoundException` (HTTP 404).
+//!
+//! A refused put writes nothing, so the contact keeps the policy it had.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +166,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutContactPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutContactPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutContactPolicy"))
+        // The contact is addressed by ARN; nothing is read off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutContactPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+
+        // The account gate comes FIRST: before the policy document is parsed, before
+        // `ContactArn` is resolved, and before anything is written.
+        state
+            .require_active_replication_set()
+            .map_err(account_precondition_failed)?;
+
+        // A resource policy is a JSON policy document.
+        if !serde_json::from_str::<serde_json::Value>(&input.policy)
+            .is_ok_and(|document| document.is_object())
+        {
+            return Err(validation(
+                "Value at 'policy' failed to satisfy constraint: Member must be a JSON policy \
+                 document",
+            ));
+        }
+
+        let Some(contact) = state.contacts.get_mut(&input.contact_arn) else {
+            return Err(PutContactPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Contact {} not found", input.contact_arn),
+                    resource_id: input.contact_arn.clone(),
+                    resource_type: CONTACT_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        contact.policy = Some(input.policy.clone());
+
+        Ok(PutContactPolicyOutput {})
     }
+}
+
+/// The `resourceType` this operation's not-found error names, spelled as the contact
+/// handlers spell it.
+const CONTACT_RESOURCE_TYPE: &str = "contact";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` and `fields` is present but EMPTY: the failure is account
+/// level, so no field of the request is at fault.
+fn account_precondition_failed(message: String) -> PutContactPolicyError {
+    PutContactPolicyErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// A member-level refusal: the same modelled `ValidationException`, naming the field.
+fn validation(message: impl Into<String>) -> PutContactPolicyError {
+    PutContactPolicyErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: "policy".to_string(),
+            message: "The resource policy must be a JSON policy document".to_string(),
+        }]),
+    })
+    .into()
 }

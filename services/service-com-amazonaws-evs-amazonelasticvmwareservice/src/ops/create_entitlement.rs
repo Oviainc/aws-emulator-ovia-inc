@@ -14,10 +14,11 @@
 //! already entitled through the same connector reports the stored record.
 //!
 //! `connectorId` is persisted on the record and scopes it, but is not checked against
-//! a connector: this service stores no connector records yet
-//! (`CreateEnvironmentConnector` / `ListEnvironmentConnectors` still answer 501), so
-//! there is nothing to check it against. That precondition belongs with the connector
-//! slice, beside the environment lookup below.
+//! a stored connector here: an entitlement is created through a vCenter Server
+//! connector, and whether a create must refuse a `connectorId` that names no VCENTER
+//! connector of the environment is this operation's own precondition — it belongs with
+//! this operation's issue, beside the environment lookup below, not with the connector
+//! operations that merely make the records available.
 //!
 //! ## Shape of an operation
 //!
