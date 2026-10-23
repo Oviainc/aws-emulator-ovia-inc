@@ -285,17 +285,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "valid values are NONE for open access" (`Route$AuthorizationType`): a route
+        // the request gave no authorization type is open.
+        let authorization_type = input
+            .authorization_type
+            .unwrap_or_else(|| crate::state::DEFAULT_AUTHORIZATION_TYPE.to_string());
+        // The same requirement every writer of a route enforces: a route whose
+        // authorization is decided by an `Authorizer` resource has to name one. Checked
+        // BEFORE an id is minted, so a refused create consumes nothing.
+        if let Err(message) = crate::state::validate_route_authorization(
+            &authorization_type,
+            input.authorizer_id.as_deref(),
+        ) {
+            return Err(bad_request(&message));
+        }
+
         let route_id = api.mint_route_id();
 
         let record = crate::state::Route {
             route_id: route_id.clone(),
             route_key: input.route_key,
             target: input.target,
-            // "valid values are NONE for open access" (`Route$AuthorizationType`): a
-            // route the request gave no authorization type is open.
-            authorization_type: input
-                .authorization_type
-                .unwrap_or_else(|| crate::state::DEFAULT_AUTHORIZATION_TYPE.to_string()),
+            authorization_type,
             authorizer_id: input.authorizer_id,
             api_key_required: input.api_key_required.unwrap_or(false),
             operation_name: input.operation_name,

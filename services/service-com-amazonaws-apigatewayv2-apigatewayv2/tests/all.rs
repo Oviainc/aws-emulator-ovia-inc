@@ -33,6 +33,8 @@ mod protocol_type_gating;
 mod route_request_parameter;
 #[path = "all/route_response_lifecycle.rs"]
 mod route_response_lifecycle;
+#[path = "all/route_update.rs"]
+mod route_update;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/stage_lifecycle.rs"]
