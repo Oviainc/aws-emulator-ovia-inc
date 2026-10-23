@@ -17,6 +17,8 @@ mod core_network_lifecycle;
 mod global_network_lifecycle;
 #[path = "all/link_lifecycle.rs"]
 mod link_lifecycle;
+#[path = "all/list_tags_for_resource.rs"]
+mod list_tags_for_resource;
 #[path = "all/network_resource_counts.rs"]
 mod network_resource_counts;
 #[path = "all/resource_not_found_message.rs"]
