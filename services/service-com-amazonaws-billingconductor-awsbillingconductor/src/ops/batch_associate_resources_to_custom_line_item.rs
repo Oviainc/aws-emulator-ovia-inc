@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchAssociateResourcesToCustomLineItem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchAssociateResourcesToCustomLineItem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! PERSISTS the association of each requested resource to a percentage custom line
+//! item, and reports the outcome PER RESOURCE: the ones it associated in
+//! `SuccessfullyAssociatedResources`, the ones it could not in
+//! `FailedAssociatedResources` with the modelled `AssociateResourceErrorReason`.
+//! `ListResourcesAssociatedToCustomLineItem` reads the associations back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchAssociateResourcesToCustomLineItem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A fault of the REQUEST as a whole — a target that does not exist, a target that is
+//! not a percentage custom line item, a billing period range that covers no period —
+//! is a modelled error for the whole call; a fault of ONE named resource is that
+//! element's `Error`, because the batch's other elements still succeed.
+//!
+//! The operation is `@idempotent`: re-associating a resource the item already holds
+//! succeeds and changes nothing, so a retry (or a repeat inside one request) cannot
+//! double-count `AssociationSize`.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +132,42 @@ impl From<BatchAssociateResourcesToCustomLineItemErrorModeled> for BatchAssociat
     }
 }
 
+/// Refuse the request with this operation's modelled 400 `ValidationException`,
+/// naming the `ValidationExceptionReason` the model enumerates and the member at
+/// fault.
+fn validation(
+    reason: &str,
+    field: &str,
+    message: String,
+) -> BatchAssociateResourcesToCustomLineItemError {
+    BatchAssociateResourcesToCustomLineItemErrorModeled::ValidationException(
+        crate::state::validation_exception(reason, field, message),
+    )
+    .into()
+}
+
+/// Why one requested resource cannot be associated: the modelled
+/// `AssociateResourceErrorReason` that classifies it, and the text that says which
+/// resource and why.
+type AssociationRefusal = (&'static str, String);
+
+/// One requested resource resolved against the store: what the caller named, and
+/// either the full ARN of the resource it names or the refusal its element reports.
+type ResolvedResource<'a> = (&'a String, Result<String, AssociationRefusal>);
+
+/// One element of `FailedAssociatedResources`: the resource as the CALLER named it,
+/// and why its association failed, classified by the `AssociateResourceErrorReason`
+/// the model enumerates.
+fn failed(arn: &str, reason: &str, message: String) -> AssociateResourceResponseElement {
+    AssociateResourceResponseElement {
+        arn: Some(arn.to_string()),
+        error: Some(AssociateResourceError {
+            message: Some(message),
+            reason: Some(reason.to_string()),
+        }),
+    }
+}
+
 /// The `BatchAssociateResourcesToCustomLineItem` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -163,18 +204,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchAssociateResourcesToCustomLineItem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchAssociateResourcesToCustomLineItemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchAssociateResourcesToCustomLineItem"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchAssociateResourcesToCustomLineItemErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the billingconductor store is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        // "A percentage custom line item ARN to associate the resources to" — the
+        // pattern accepts the full ARN or the bare id, and both name one stored item.
+        let target_arn = crate::state::normalize_custom_line_item_arn(&input.target_arn);
+        let Some(target) = state.custom_line_items.get(&target_arn) else {
+            return Err(
+                BatchAssociateResourcesToCustomLineItemErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: "the custom line item does not exist".to_string(),
+                        resource_id: target_arn,
+                        resource_type: "customlineitem".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // This operation associates resources to a PERCENTAGE custom line item: a
+        // percentage "is multiplied against the combined value of its associated
+        // resources", while a flat item's charge is a fixed value that no association
+        // enters into. So a flat target cannot hold the association at all.
+        if !target.is_percentage() {
+            return Err(validation(
+                "ILLEGAL_CUSTOMLINEITEM",
+                "TargetArn",
+                format!(
+                    "the custom line item {target_arn} is not a percentage custom line item"
+                ),
+            ));
+        }
+
+        // The range the association applies in: the start is inclusive and the end
+        // exclusive, so an end at or before the start would cover no billing period.
+        if let Some(range) = &input.billing_period_range {
+            if !crate::state::billing_period_range_is_ordered(range) {
+                return Err(validation(
+                    "ILLEGAL_BILLING_PERIOD_RANGE",
+                    "BillingPeriodRange.ExclusiveEndBillingPeriod",
+                    "the exclusive end billing period must be later than the inclusive \
+                     start billing period"
+                        .to_string(),
+                ));
+            }
+        }
+        let inclusive_start_billing_period = input
+            .billing_period_range
+            .as_ref()
+            .map(|range| range.inclusive_start_billing_period.clone());
+        let exclusive_end_billing_period = input
+            .billing_period_range
+            .as_ref()
+            .and_then(|range| range.exclusive_end_billing_period.clone());
+
+        // EVERY requested resource is resolved against the store FIRST, so the
+        // outcomes are decided on one consistent view and the stored item is borrowed
+        // exactly once below. `Ok` is the resource's full ARN, `Err` the reason its
+        // association cannot be made.
+        let resolved: Vec<ResolvedResource<'_>> = input
+            .resource_arns
+            .iter()
+            .map(|requested| {
+                let outcome = match state.resolve_association_element(requested) {
+                    // The ARN has to name a resource that exists: a billing group or
+                    // another custom line item, in the full-ARN or the bare-id form.
+                    None => Err((
+                        "INVALID_ARN",
+                        format!("the resource {requested} does not exist"),
+                    )),
+                    // A custom line item cannot be a resource of itself: its charge
+                    // would be a percentage of itself, which has no value.
+                    Some(arn) if arn == target_arn => Err((
+                        "ILLEGAL_CUSTOMLINEITEM",
+                        "a custom line item cannot be associated to itself".to_string(),
+                    )),
+                    Some(arn) => Ok(arn),
+                };
+                (requested, outcome)
+            })
+            .collect();
+
+        // The target was read above under the same lock this handler still holds, so
+        // it is still stored. Answering the modelled server error rather than skipping
+        // the resource keeps the promise the output shape makes: every requested
+        // resource is reported in one of the two lists.
+        let now = crate::state::now_millis();
+        let Some(target) = state.custom_line_items.get_mut(&target_arn) else {
+            return Err(
+                BatchAssociateResourcesToCustomLineItemErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the custom line item could not be read for writing".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut associated = Vec::new();
+        let mut failures = Vec::new();
+        for (requested, outcome) in resolved {
+            let resource_arn = match outcome {
+                Err((reason, message)) => {
+                    failures.push(failed(requested, reason, message));
+                    continue;
+                }
+                Ok(resource_arn) => resource_arn,
+            };
+            // `@idempotent`: the association this call asks for already holds, so the
+            // call adds nothing and leaves the stored range as the earlier call set
+            // it — and `AssociationSize` does not double-count.
+            if target.association(&resource_arn).is_some() {
+                associated.push(AssociateResourceResponseElement {
+                    arn: Some(requested.clone()),
+                    error: None,
+                });
+                continue;
+            }
+            // One more association than the model can represent for this item is a
+            // limit the request cannot get around.
+            if target.associated_resources.len() >= crate::state::MAX_RESOURCES_PER_CUSTOM_LINE_ITEM
+            {
+                failures.push(failed(
+                    requested,
+                    "SERVICE_LIMIT_EXCEEDED",
+                    format!(
+                        "a custom line item holds at most {} associated resources",
+                        crate::state::MAX_RESOURCES_PER_CUSTOM_LINE_ITEM
+                    ),
+                ));
+                continue;
+            }
+            target
+                .associated_resources
+                .push(crate::state::ResourceAssociationRecord {
+                    arn: resource_arn,
+                    inclusive_start_billing_period: inclusive_start_billing_period.clone(),
+                    exclusive_end_billing_period: exclusive_end_billing_period.clone(),
+                });
+            target.last_modified_time_millis = now;
+            associated.push(AssociateResourceResponseElement {
+                arn: Some(requested.clone()),
+                error: None,
+            });
+        }
+
+        Ok(BatchAssociateResourcesToCustomLineItemOutput {
+            successfully_associated_resources: Some(associated),
+            failed_associated_resources: Some(failures),
+        })
     }
 }

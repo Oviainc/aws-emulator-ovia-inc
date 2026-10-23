@@ -49,6 +49,11 @@ pub fn billing_group_arn(id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, ARN_REGION, &format!("billinggroup/{id}"))
 }
 
+/// The full ARN of a custom line item resource id.
+pub fn custom_line_item_arn(id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, ARN_REGION, &format!("customlineitem/{id}"))
+}
+
 /// The full ARN of a pricing rule resource id.
 pub fn pricing_rule_arn(id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, ARN_REGION, &format!("pricingrule/{id}"))
@@ -74,6 +79,53 @@ pub fn normalize_billing_group_arn(value: &str) -> String {
     } else {
         billing_group_arn(value)
     }
+}
+
+/// A `CustomLineItemArn` as this service stores it: the pattern accepts the full ARN
+/// or the bare `[a-zA-Z0-9]{10}` id. See [`normalize_billing_group_arn`].
+pub fn normalize_custom_line_item_arn(value: &str) -> String {
+    if value.starts_with("arn:") {
+        value.to_string()
+    } else {
+        custom_line_item_arn(value)
+    }
+}
+
+/// How a resource associated to a percentage custom line item relates to it.
+///
+/// `CustomLineItemAssociationElement` admits a `billinggroup` ARN or a
+/// `customlineitem` ARN, and `CustomLineItemRelationship` has exactly two values —
+/// one per class: the billing group a custom line item is computed inside sits ABOVE
+/// it (`PARENT`), and another custom line item whose charge feeds the percentage sits
+/// BELOW it (`CHILD`). So the resource type segment of the ARN decides, and the
+/// `Relationship` filter separates the two classes.
+pub fn association_relationship(arn: &str) -> &'static str {
+    if arn.contains(":billinggroup/") {
+        "PARENT"
+    } else {
+        "CHILD"
+    }
+}
+
+/// A `BillingPeriod` (`^\d{4}-(0?[1-9]|1[012])$`) as a comparable month count, so
+/// `2026-7` and `2026-07` are the same period and two periods order by time.
+/// `None` when the value is not a billing period at all.
+///
+/// The shape of each segment is checked HERE rather than assumed: this is the point
+/// that decides whether a caller-supplied string is a billing period, so the year is
+/// exactly four ASCII digits and the month one or two — which also keeps the month
+/// count far inside `i64`, whatever a request carries.
+pub fn billing_period_key(value: &str) -> Option<i64> {
+    let (year, month) = value.split_once('-')?;
+    if year.len() != 4 || !year.bytes().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    if !(1..=2).contains(&month.len()) || !month.bytes().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    let year: i64 = year.parse::<u16>().ok()?.into();
+    let month: i64 = month.parse::<u8>().ok()?.into();
+    (1..=12).contains(&month).then_some(year * 12 + month)
 }
 
 /// A `PricingPlanArn` as this service stores it. See [`normalize_billing_group_arn`].
@@ -298,6 +350,102 @@ impl BillingGroupRecord {
     }
 }
 
+/// One resource associated to a percentage custom line item, as
+/// `BatchAssociateResourcesToCustomLineItem` (or the `AssociatedValues` of the
+/// charge details the item was created with) persisted it. The billing period range
+/// is the one the associating call named, so `EndBillingPeriod` is reported from the
+/// association rather than guessed.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceAssociationRecord {
+    /// The FULL ARN of the associated billing group or custom line item.
+    pub arn: String,
+    pub inclusive_start_billing_period: Option<String>,
+    pub exclusive_end_billing_period: Option<String>,
+}
+
+impl ResourceAssociationRecord {
+    /// `Relationship`, DERIVED from the resource the ARN names — see
+    /// [`association_relationship`].
+    pub fn relationship(&self) -> &'static str {
+        association_relationship(&self.arn)
+    }
+
+    /// Is this association in effect during `billing_period`? The start is
+    /// inclusive and the end exclusive, as the member names say
+    /// (`InclusiveStartBillingPeriod` / `ExclusiveEndBillingPeriod`); an absent
+    /// bound is open, so an association made without a range covers every period.
+    pub fn covers(&self, billing_period: &str) -> bool {
+        let Some(wanted) = billing_period_key(billing_period) else {
+            return false;
+        };
+        let after_start = self
+            .inclusive_start_billing_period
+            .as_deref()
+            .and_then(billing_period_key)
+            .is_none_or(|start| wanted >= start);
+        let before_end = self
+            .exclusive_end_billing_period
+            .as_deref()
+            .and_then(billing_period_key)
+            .is_none_or(|end| wanted < end);
+        after_start && before_end
+    }
+}
+
+/// A custom line item as `CreateCustomLineItem` persisted it. `AssociationSize` and
+/// the percentage/flat distinction are DERIVED from this record (see the methods
+/// below), never stored twice.
+#[derive(Debug, Clone, Default)]
+pub struct CustomLineItemRecord {
+    pub arn: String,
+    pub name: String,
+    pub description: String,
+    pub billing_group_arn: String,
+    pub account_id: Option<String>,
+    /// `CustomLineItemChargeDetails.Type`: `FEE` or `CREDIT`.
+    pub charge_type: String,
+    /// `ChargeDetails.Flat.ChargeValue`, set for a flat custom line item only.
+    pub flat_charge_value: Option<f64>,
+    /// `ChargeDetails.Percentage.PercentageValue`, set for a percentage custom line
+    /// item only — the kind resources can be associated to.
+    pub percentage_value: Option<f64>,
+    pub line_item_filters: Vec<crate::ops::types::LineItemFilter>,
+    pub computation_rule: Option<String>,
+    /// `PresentationDetails.Service`.
+    pub presentation_service: Option<String>,
+    pub inclusive_start_billing_period: Option<String>,
+    pub exclusive_end_billing_period: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    /// The associated resources, in association order.
+    pub associated_resources: Vec<ResourceAssociationRecord>,
+    pub creation_time_millis: i64,
+    pub last_modified_time_millis: i64,
+}
+
+impl CustomLineItemRecord {
+    /// True for a PERCENTAGE custom line item: the model documents
+    /// `CustomLineItemChargeDetails` as containing "only one of `Flat` or
+    /// `Percentage`", and a percentage value is "multiplied against the combined
+    /// value of its associated resources" — so it is the only kind that has
+    /// associated resources at all.
+    pub fn is_percentage(&self) -> bool {
+        self.percentage_value.is_some()
+    }
+
+    /// `AssociationSize`: "The number of resources that are associated to the custom
+    /// line item."
+    pub fn association_size(&self) -> i64 {
+        i64::try_from(self.associated_resources.len()).unwrap_or(i64::MAX)
+    }
+
+    /// The association for `arn`, if this item already holds one.
+    pub fn association(&self, arn: &str) -> Option<&ResourceAssociationRecord> {
+        self.associated_resources
+            .iter()
+            .find(|association| association.arn == arn)
+    }
+}
+
 /// Per-service state for com-amazonaws-billingconductor-awsbillingconductor. A handler reaches it through [`service_state`].
 ///
 /// The maps are ordered (`BTreeMap`/`BTreeSet`) so that the list operations page
@@ -322,6 +470,13 @@ impl BillingGroupRecord {
 ///   return before any insert), and
 ///   [`remove_billing_group`](ComAmazonawsBillingconductorAwsbillingconductorState::remove_billing_group)
 ///   reclaims a deleted group's share of all of them.
+/// * `custom_line_items` holds one entry per custom line item, at most
+///   [`MAX_CUSTOM_LINE_ITEMS`], and each item at most
+///   [`MAX_RESOURCES_PER_CUSTOM_LINE_ITEM`] associated resources — the maximum the
+///   model itself can represent. A create past the cap is REFUSED with
+///   `ServiceLimitExceededException`, and an association past it fails THAT resource
+///   with the modelled `SERVICE_LIMIT_EXCEEDED` reason; a deleted billing group takes
+///   its items, and their associations, with it.
 /// * `unassociated_accounts` keeps the released accounts a later
 ///   `ListAccountAssociations` has to report as `UNMONITORED`. Nothing deletes a
 ///   linked account, so this one is capped at [`MAX_UNASSOCIATED_ACCOUNTS`] and
@@ -349,6 +504,12 @@ pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     pub pricing_plan_names: BTreeMap<String, String>,
     /// Billing groups by full ARN.
     pub billing_groups: BTreeMap<String, BillingGroupRecord>,
+    /// Custom line items by full ARN, at most [`MAX_CUSTOM_LINE_ITEMS`]; each one
+    /// holds at most [`MAX_RESOURCES_PER_CUSTOM_LINE_ITEM`] associated resources.
+    /// A custom line item applies to a billing group, so
+    /// [`remove_billing_group`](ComAmazonawsBillingconductorAwsbillingconductorState::remove_billing_group)
+    /// reclaims the ones that named a deleted group.
+    pub custom_line_items: BTreeMap<String, CustomLineItemRecord>,
     /// Billing group name -> ARN ("The billing group name. The names must be unique.").
     pub billing_group_names: BTreeMap<String, String>,
     /// Account id -> billing group ARN. The index that makes "not associated with
@@ -452,6 +613,24 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         let removed = self.billing_groups.remove(group_arn)?;
         self.billing_group_names.remove(&removed.name);
 
+        // A custom line item "applies to" one billing group, so it cannot outlive
+        // it; and an association names a resource that exists, so every association
+        // of the deleted group or of one of its items goes with them.
+        let orphaned: Vec<String> = self
+            .custom_line_items
+            .iter()
+            .filter(|(_, item)| item.billing_group_arn == group_arn)
+            .map(|(arn, _)| arn.clone())
+            .collect();
+        for arn in &orphaned {
+            self.custom_line_items.remove(arn);
+        }
+        for item in self.custom_line_items.values_mut() {
+            item.associated_resources.retain(|association| {
+                association.arn != group_arn && !orphaned.contains(&association.arn)
+            });
+        }
+
         let released: Vec<String> = self
             .account_associations
             .iter()
@@ -463,7 +642,8 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             self.note_unassociated_account(&account_id);
         }
 
-        self.idempotency_tokens.retain(|_, arn| arn != group_arn);
+        self.idempotency_tokens
+            .retain(|_, arn| arn != group_arn && !orphaned.contains(arn));
         let remaining = &self.idempotency_tokens;
         self.idempotency_order
             .retain(|key| remaining.contains_key(key));
@@ -513,6 +693,27 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// `PricingPlanFullArn` pattern names.
     pub fn pricing_plan_exists(&self, arn: &str) -> bool {
         is_aws_managed_pricing_plan(arn) || self.pricing_plans.contains_key(arn)
+    }
+
+    /// The stored resource a `CustomLineItemAssociationElement` names, as its full
+    /// ARN, or `None` when no such resource exists.
+    ///
+    /// The member admits a full `customlineitem` or `billinggroup` ARN and the bare
+    /// `[a-zA-Z0-9]{10,12}` id of either, so a bare id is resolved against what is
+    /// stored and names the same resource the ARN form does.
+    pub fn resolve_association_element(&self, value: &str) -> Option<String> {
+        if value.starts_with("arn:") {
+            let arn = value.to_string();
+            return (self.custom_line_items.contains_key(&arn)
+                || self.billing_groups.contains_key(&arn))
+            .then_some(arn);
+        }
+        let item_arn = custom_line_item_arn(value);
+        if self.custom_line_items.contains_key(&item_arn) {
+            return Some(item_arn);
+        }
+        let group_arn = billing_group_arn(value);
+        self.billing_groups.contains_key(&group_arn).then_some(group_arn)
     }
 
     /// The pricing rules associated with the plan `plan_arn` names: FULL rule ARNs,
@@ -739,6 +940,24 @@ pub const MAX_PRICING_PLANS: usize = 1000;
 /// see [`MAX_PRICING_PLANS`] for why it exists and how it is enforced.
 pub const MAX_BILLING_GROUPS: usize = 1000;
 
+/// How many custom line items this emulator stores for the account. A CHOSEN bound;
+/// see [`MAX_PRICING_PLANS`] for why it exists and how it is enforced.
+pub const MAX_CUSTOM_LINE_ITEMS: usize = 1000;
+
+/// How many resources one percentage custom line item may hold.
+///
+/// A CHOSEN bound, informed by the model rather than read off it:
+/// `CustomLineItemAssociationsList` — the `ChargeDetails.Percentage.AssociatedValues`
+/// a custom line item is CREATED with — carries `@length(max: 5)`, so five is the
+/// most the create's own shape can express, and holding a stored item within what
+/// the create can express keeps it representable. (The documented AWS quota for
+/// resources per percentage custom line item is not in the model;
+/// `BatchAssociateResourcesToCustomLineItem`'s `ResourceArns` admits 1..30 per
+/// request, which bounds a request rather than the membership it accumulates.) An
+/// association past the bound fails THAT resource with the modelled
+/// `SERVICE_LIMIT_EXCEEDED` reason rather than displacing a stored association.
+pub const MAX_RESOURCES_PER_CUSTOM_LINE_ITEM: usize = 5;
+
 /// How many pricing rules this emulator stores for the account. A CHOSEN bound;
 /// see [`MAX_PRICING_PLANS`] for why it exists and how it is enforced. A rule IS
 /// deletable (`DeletePricingRule`), so a caller that reaches the cap can make room
@@ -848,6 +1067,26 @@ pub fn paginate<T>(
 pub fn first_duplicate(values: &[String]) -> Option<&String> {
     let mut seen = BTreeSet::new();
     values.iter().find(|value| !seen.insert(value.as_str()))
+}
+
+/// Is a `CustomLineItemBillingPeriodRange` ordered, i.e. does it describe a non-empty
+/// span of billing periods?
+///
+/// The member names carry the rule: `InclusiveStartBillingPeriod` is in the range and
+/// `ExclusiveEndBillingPeriod` is not, so an end equal to or earlier than the start
+/// would cover no billing period at all. A range with no end is open and always
+/// ordered.
+pub fn billing_period_range_is_ordered(
+    range: &crate::ops::types::CustomLineItemBillingPeriodRange,
+) -> bool {
+    let Some(end) = range
+        .exclusive_end_billing_period
+        .as_deref()
+        .and_then(billing_period_key)
+    else {
+        return true;
+    };
+    billing_period_key(&range.inclusive_start_billing_period).is_none_or(|start| start < end)
 }
 
 /// The modelled `ValidationException` this service refuses a request with: the

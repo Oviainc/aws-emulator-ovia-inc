@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCustomLineItem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCustomLineItem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints and PERSISTS a custom line item in a billing group: its charge details, its
+//! effective billing period range and — for a percentage item — the resources its
+//! `ChargeDetails.Percentage.AssociatedValues` named, which
+//! `BatchAssociateResourcesToCustomLineItem` extends and
+//! `ListResourcesAssociatedToCustomLineItem` reads back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCustomLineItem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SIMPLIFICATION: a `ClientToken` replay answers with the ARN the token's first call
+//! minted WITHOUT comparing the rest of the request, the way `CreateBillingGroup`
+//! does it here — the model declares no idempotent-parameter-mismatch error for this
+//! operation either.
+//!
+//! This operation models NO `ResourceNotFoundException`, so a request naming a
+//! billing group or an associated resource that does not exist is refused with the
+//! modelled `ValidationException` carrying the `ValidationExceptionReason` the model
+//! enumerates for that fault.
 //!
 //! ## Shape of an operation
 //!
@@ -143,6 +149,16 @@ impl From<CreateCustomLineItemErrorModeled> for CreateCustomLineItemError {
     }
 }
 
+/// Refuse the request with this operation's modelled 400 `ValidationException`,
+/// naming the `ValidationExceptionReason` the model enumerates and the member at
+/// fault.
+fn validation(reason: &str, field: &str, message: String) -> CreateCustomLineItemError {
+    CreateCustomLineItemErrorModeled::ValidationException(crate::state::validation_exception(
+        reason, field, message,
+    ))
+    .into()
+}
+
 /// The `CreateCustomLineItem` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -179,18 +195,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCustomLineItem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCustomLineItemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCustomLineItem"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateCustomLineItemErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // An idempotent retry answers with the ARN the first call minted and creates
+        // no second custom line item.
+        if let Some(arn) = state.replayed_idempotent_arn(Self::NAME, input.client_token.as_deref())
+        {
+            return Ok(CreateCustomLineItemOutput { arn: Some(arn) });
+        }
+
+        // "The charge details of a custom line item. It should contain only one of
+        // `Flat` or `Percentage`." Neither, or both, is not a charge this service can
+        // compute.
+        let charge_details = &input.charge_details;
+        let flat_charge_value = charge_details.flat.as_ref().map(|flat| flat.charge_value);
+        let percentage = charge_details.percentage.clone();
+        if flat_charge_value.is_some() == percentage.is_some() {
+            return Err(validation(
+                "ILLEGAL_CHARGE_DETAILS",
+                "ChargeDetails",
+                "the charge details must contain exactly one of Flat or Percentage"
+                    .to_string(),
+            ));
+        }
+
+        // "The Amazon Resource Name (ARN) that references the billing group where the
+        // custom line item applies to" — it has to be a billing group that exists.
+        let billing_group_arn = crate::state::normalize_billing_group_arn(&input.billing_group_arn);
+        if !state.billing_groups.contains_key(&billing_group_arn) {
+            return Err(validation(
+                "MISSING_BILLINGGROUP",
+                "BillingGroupArn",
+                format!("the billing group {billing_group_arn} does not exist"),
+            ));
+        }
+
+        // The range the item is effective in: the start is inclusive and the end
+        // exclusive, so the end has to be a LATER billing period than the start.
+        let period_range = input.billing_period_range.clone();
+        if let Some(range) = &period_range {
+            if !crate::state::billing_period_range_is_ordered(range) {
+                return Err(validation(
+                    "ILLEGAL_BILLING_PERIOD_RANGE",
+                    "BillingPeriodRange.ExclusiveEndBillingPeriod",
+                    "the exclusive end billing period must be later than the inclusive \
+                     start billing period"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // "A list of resource ARNs to associate to the percentage custom line item."
+        // Each one has to name a stored billing group or custom line item, and naming
+        // the same resource twice would ask for one association twice.
+        let associated_values = percentage
+            .as_ref()
+            .and_then(|percentage| percentage.associated_values.clone())
+            .unwrap_or_default();
+        let mut associated_resources: Vec<crate::state::ResourceAssociationRecord> =
+            Vec::with_capacity(associated_values.len());
+        for value in &associated_values {
+            let Some(arn) = state.resolve_association_element(value) else {
+                return Err(validation(
+                    "INVALID_ARN",
+                    "ChargeDetails.Percentage.AssociatedValues",
+                    format!("the resource {value} does not exist"),
+                ));
+            };
+            // The duplicate check is on the RESOLVED ARN, because a full ARN and the
+            // bare id the member also admits name ONE resource: that is the same
+            // identity `BatchAssociateResourcesToCustomLineItem` is idempotent over,
+            // so neither path can store one resource twice.
+            if associated_resources
+                .iter()
+                .any(|association| association.arn == arn)
+            {
+                return Err(validation(
+                    "ILLEGAL_RESOURCE_ARNS",
+                    "ChargeDetails.Percentage.AssociatedValues",
+                    format!("the resource {arn} is listed more than once"),
+                ));
+            }
+            associated_resources.push(crate::state::ResourceAssociationRecord {
+                arn,
+                inclusive_start_billing_period: period_range
+                    .as_ref()
+                    .map(|range| range.inclusive_start_billing_period.clone()),
+                exclusive_end_billing_period: period_range
+                    .as_ref()
+                    .and_then(|range| range.exclusive_end_billing_period.clone()),
+            });
+        }
+
+        // The store is bounded by an explicit maximum, and a create past it is
+        // refused rather than served by evicting an item a later caller must still be
+        // able to read.
+        if state.custom_line_items.len() >= crate::state::MAX_CUSTOM_LINE_ITEMS {
+            return Err(CreateCustomLineItemErrorModeled::ServiceLimitExceededException(
+                ServiceLimitExceededException {
+                    message: format!(
+                        "the maximum number of custom line items ({}) already exists",
+                        crate::state::MAX_CUSTOM_LINE_ITEMS
+                    ),
+                    resource_id: None,
+                    resource_type: Some("customlineitem".to_string()),
+                    limit_code: "CustomLineItemsPerAccount".to_string(),
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // 10 characters, the width the `CustomLineItemArn` pattern allows.
+        let id = state.mint_resource_id(10);
+        let arn = crate::state::custom_line_item_arn(&id);
+        let now = crate::state::now_millis();
+        let record = crate::state::CustomLineItemRecord {
+            arn: arn.clone(),
+            name: input.name,
+            description: input.description,
+            billing_group_arn,
+            account_id: input.account_id,
+            charge_type: charge_details.r#type.clone(),
+            flat_charge_value,
+            percentage_value: percentage.map(|percentage| percentage.percentage_value),
+            line_item_filters: charge_details.line_item_filters.clone().unwrap_or_default(),
+            computation_rule: input.computation_rule,
+            presentation_service: input
+                .presentation_details
+                .map(|presentation| presentation.service),
+            inclusive_start_billing_period: period_range
+                .as_ref()
+                .map(|range| range.inclusive_start_billing_period.clone()),
+            exclusive_end_billing_period: period_range
+                .and_then(|range| range.exclusive_end_billing_period),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            associated_resources,
+            creation_time_millis: now,
+            last_modified_time_millis: now,
+        };
+        state.custom_line_items.insert(arn.clone(), record);
+        state.record_idempotent_arn(Self::NAME, input.client_token.as_deref(), &arn);
+
+        Ok(CreateCustomLineItemOutput { arn: Some(arn) })
     }
 }

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourcesAssociatedToCustomLineItem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourcesAssociatedToCustomLineItem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! REPORTS the resources associated to a custom line item, as
+//! `CreateCustomLineItem`'s `AssociatedValues` and
+//! `BatchAssociateResourcesToCustomLineItem` persisted them. A pure read: it writes
+//! nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourcesAssociatedToCustomLineItem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `Relationship` is DERIVED from the resource the association names (see
+//! `crate::state::association_relationship`) and `EndBillingPeriod` from the billing
+//! period range the associating call set, so neither can drift from the association.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +164,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourcesAssociatedToCustomLineItem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourcesAssociatedToCustomLineItemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourcesAssociatedToCustomLineItem"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListResourcesAssociatedToCustomLineItemErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the billingconductor store is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        // The `CustomLineItemArn` pattern accepts the full ARN or the bare id.
+        let arn = crate::state::normalize_custom_line_item_arn(&input.arn);
+        let Some(item) = state.custom_line_items.get(&arn) else {
+            return Err(
+                ListResourcesAssociatedToCustomLineItemErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: "the custom line item does not exist".to_string(),
+                        resource_id: arn,
+                        resource_type: "customlineitem".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let wanted_relationship = input
+            .filters
+            .as_ref()
+            .and_then(|filters| filters.relationship.clone());
+        let mut selected: Vec<(String, ListResourcesAssociatedToCustomLineItemResponseElement)> =
+            Vec::new();
+        for association in &item.associated_resources {
+            // "The billing period for which the resource associations will be
+            // listed": an association is listed for a period its range covers, the
+            // start inclusive and the end exclusive.
+            if let Some(billing_period) = &input.billing_period {
+                if !association.covers(billing_period) {
+                    continue;
+                }
+            }
+            // The filter names "the types of resource associations that should be
+            // retrieved", so an association of another relationship is left out.
+            if let Some(relationship) = &wanted_relationship {
+                if relationship != association.relationship() {
+                    continue;
+                }
+            }
+            selected.push((
+                association.arn.clone(),
+                ListResourcesAssociatedToCustomLineItemResponseElement {
+                    arn: Some(association.arn.clone()),
+                    relationship: Some(association.relationship().to_string()),
+                    end_billing_period: association.exclusive_end_billing_period.clone(),
+                },
+            ));
+        }
+        // The page is cut over the ARN order, so the `NextToken` a call hands back
+        // names the same cut point on the next one however the associations grow.
+        selected.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let (associated_resources, next_token) =
+            crate::state::paginate(selected, input.next_token.as_deref(), input.max_results);
+
+        Ok(ListResourcesAssociatedToCustomLineItemOutput {
+            arn: Some(item.arn.clone()),
+            associated_resources: Some(associated_resources),
+            next_token,
+        })
     }
 }
