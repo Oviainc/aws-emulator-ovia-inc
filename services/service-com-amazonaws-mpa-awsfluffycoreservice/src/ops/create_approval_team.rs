@@ -220,12 +220,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `@idempotencyToken` replay: the same token answers with the team the first
-        // call minted, rather than minting a second one.
+        // call minted, rather than minting a second one. The token is recorded under its
+        // RESOURCE KIND (`crate::state::idempotency_key`), so a token the caller also
+        // used on another create resolves to that create's resource, not to this one.
         let client_token = input
             .client_token
             .as_deref()
             .filter(|token| !token.is_empty())
-            .map(ToString::to_string);
+            .map(|token| {
+                crate::state::idempotency_key(crate::state::APPROVAL_TEAM_RESOURCE, token)
+            });
         if let Some(token) = client_token.as_deref() {
             if let Some(arn) = state.idempotency_tokens.get(token).cloned() {
                 if let Some(team) = state.team(&arn) {

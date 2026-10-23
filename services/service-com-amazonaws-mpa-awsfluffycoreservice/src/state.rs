@@ -34,6 +34,17 @@
 //! * The end of a pending deletion window ([`DEFAULT_PENDING_WINDOW_DAYS`]). Once it
 //!   elapses the team is gone, so `GetApprovalTeam` answers 404 and
 //!   `ListApprovalTeams` omits it.
+//! * The activation of a new identity source ([`IDENTITY_SOURCE_ACTIVATION_DELAY`]). A
+//!   source is `CREATING` until it comes due and `ACTIVE` afterwards, which is what
+//!   `IdentitySourceStatus`' non-terminal `CREATING` token stands for.
+//!
+//! # Identity sources
+//!
+//! The identity source is this service's other caller-created resource:
+//! `CreateIdentitySource` mints an [`IdentitySource`] record here and
+//! `ListIdentitySources` pages over them in creation order
+//! ([`ComAmazonawsMpaAwsfluffycoreserviceState::identity_sources_in_creation_order`]),
+//! so a listed entry is always read off the stored record.
 //!
 //! # The policy catalog
 //!
@@ -104,6 +115,15 @@ const MAX_ACCESS_DENIED_MESSAGE: usize = 1000;
 /// observes the transient `PENDING` state and the errors that go with it.
 pub const INVITATION_RESPONSE_DELAY: Duration = Duration::from_millis(500);
 
+/// How long after `CreateIdentitySource` the emulator reports the new source as
+/// `ACTIVE` (and therefore how long it stays `CREATING`).
+///
+/// CHOSEN, not documented: AWS publishes no duration for the association with an IAM
+/// Identity Center instance to settle. It sits inside the 250–750 ms window this project
+/// fixes for a clock-owed transition, so a caller that lists the source immediately
+/// still observes the transient `CREATING` status the model declares.
+pub const IDENTITY_SOURCE_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
 /// Days between the delete request and the team's removal when
 /// `StartActiveApprovalTeamDeletion` omits `PendingWindowDays`.
 ///
@@ -136,6 +156,15 @@ pub const MAX_PENDING_WINDOW_DAYS: i32 = 36_500;
 /// [`ComAmazonawsMpaAwsfluffycoreserviceState::remove_team`] frees a team's entries in
 /// both when the team goes.
 pub const MAX_APPROVAL_TEAMS: usize = 1_000;
+
+/// Largest number of identity sources the store will hold.
+///
+/// From `ListIdentitySources`' own output: `IdentitySources` is `length(max: 20)` and
+/// `MaxResults` is `range(1..20)`, so twenty is the most identity sources this service
+/// can report at all. It is also what keeps a client looping on `CreateIdentitySource`
+/// from growing this process's heap without bound; the model declares
+/// `ServiceQuotaExceededException` (402) for exactly this condition.
+pub const MAX_IDENTITY_SOURCES: usize = 20;
 
 /// Largest page a paginated list operation of this service returns, from `MaxResults`'
 /// modelled `range(min: 1, max: 20)` / `default: 20` — the same shape every one of them
@@ -375,6 +404,140 @@ impl ApprovalTeam {
     pub fn number_of_approvers(&self) -> i32 {
         i32::try_from(self.approvers.len()).unwrap_or(i32::MAX)
     }
+}
+
+/// The type of resource that provides an identity source's identities, in the tokens
+/// `IdentitySourceType` declares (`smithy_query(query="shape",shape="IdentitySourceType")`:
+/// `IAM_IDENTITY_CENTER`). It is read off the `IdentitySourceParameters` a create request
+/// carries, whose only member today is `IamIdentityCenter`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentitySourceType {
+    IamIdentityCenter,
+}
+
+impl IdentitySourceType {
+    /// The wire token, as `IdentitySourceType` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::IamIdentityCenter => "IAM_IDENTITY_CENTER",
+        }
+    }
+}
+
+/// Status of an identity source, in the tokens `IdentitySourceStatus` declares.
+///
+/// `CREATING` and `ACTIVE` are the two a source this service records moves through
+/// ([`ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] owes the transition).
+/// `DELETING` is for `DeleteIdentitySource` to record and `ERROR` for a failed
+/// association — both still scaffolded, so nothing constructs them today; they are
+/// carried here so the enum is the model's whole token catalog rather than the subset
+/// one operation reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentitySourceStatus {
+    Creating,
+    Active,
+    Deleting,
+    Error,
+}
+
+impl IdentitySourceStatus {
+    /// The wire token, as `IdentitySourceStatus` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Creating => "CREATING",
+            Self::Active => "ACTIVE",
+            Self::Deleting => "DELETING",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+/// A stored identity source: everything the identity-source operations report.
+#[derive(Debug, Clone)]
+pub struct IdentitySource {
+    pub arn: String,
+    pub source_type: IdentitySourceType,
+    /// `IamIdentityCenter$InstanceArn`: the IAM Identity Center instance that provides
+    /// this source's identities, as the create request named it.
+    pub instance_arn: String,
+    /// `IamIdentityCenter$Region`: the region of that instance, as the create request
+    /// named it. It is the INSTANCE's region, which need not be the region the identity
+    /// source's own ARN carries.
+    pub instance_region: String,
+    pub status: IdentitySourceStatus,
+    pub creation_time: SystemTime,
+    /// Instant at which this source's activation (`CREATING` -> `ACTIVE`) becomes due.
+    /// `None` once it has been materialised.
+    pub activation_due: Option<SystemTime>,
+    pub tags: BTreeMap<String, String>,
+    /// Creation order, the stable ordering `ListIdentitySources` pages over.
+    pub seq: u64,
+}
+
+impl IdentitySource {
+    /// A freshly created identity source: `CREATING` until the clock owes its
+    /// activation.
+    #[must_use]
+    pub fn creating(
+        arn: String,
+        source_type: IdentitySourceType,
+        instance_arn: String,
+        instance_region: String,
+        tags: BTreeMap<String, String>,
+        now: SystemTime,
+        seq: u64,
+    ) -> Self {
+        Self {
+            arn,
+            source_type,
+            instance_arn,
+            instance_region,
+            status: IdentitySourceStatus::Creating,
+            creation_time: now,
+            activation_due: Some(now + IDENTITY_SOURCE_ACTIVATION_DELAY),
+            tags,
+            seq,
+        }
+    }
+}
+
+/// The key a `ClientToken` is recorded under in
+/// [`ComAmazonawsMpaAwsfluffycoreserviceState::idempotency_tokens`].
+///
+/// AWS scopes an `@idempotencyToken` to the create it was given to, so the key carries
+/// the KIND of resource the token minted — the resource name of that kind's ARN
+/// (`approval-team`, `identity-source`). Without it one map keyed by the token alone
+/// would let a token reused across two creates resolve to the other kind's resource and
+/// overwrite its record.
+#[must_use]
+pub fn idempotency_key(resource_kind: &str, token: &str) -> String {
+    format!("{resource_kind}/{token}")
+}
+
+/// Resource kind of an approval team, as [`idempotency_key`] names it — the resource
+/// name `ApprovalTeamArn`'s pattern carries.
+pub const APPROVAL_TEAM_RESOURCE: &str = "approval-team";
+
+/// Resource kind of an identity source, as [`idempotency_key`] names it — the resource
+/// name the `IdentitySource` resource's `arn` template carries.
+pub const IDENTITY_SOURCE_RESOURCE: &str = "identity-source";
+
+/// ARN of an identity source, in the form the `IdentitySource` resource's own `arn`
+/// template fixes (`identity-source/{IdentitySourceArn}`):
+/// `arn:aws:mpa:<region>:<account>:identity-source/<id>`.
+///
+/// The identifier carries no modelled pattern, so its form is this emulator's: the
+/// store's creation counter, zero-padded, so an id is never reused and ARN order and
+/// creation order agree.
+#[must_use]
+pub fn identity_source_arn(region: &str, seq: u64) -> String {
+    ::engine::emulator_arn(
+        "mpa",
+        region,
+        &format!("{IDENTITY_SOURCE_RESOURCE}/ids-{seq:012}"),
+    )
 }
 
 /// Longest category or name segment a policy ARN may carry, from the
@@ -723,7 +886,11 @@ pub struct ComAmazonawsMpaAwsfluffycoreserviceState {
     pub approval_teams: BTreeMap<String, ApprovalTeam>,
     /// Team name -> ARN. Backs the `ConflictException` a duplicate name earns.
     pub name_index: BTreeMap<String, String>,
-    /// `ClientToken` -> ARN. Backs the idempotent replay of `CreateApprovalTeam`.
+    /// `ClientToken` -> ARN. Backs the idempotent replay of the `@idempotencyToken`
+    /// creates (`CreateApprovalTeam`, `CreateIdentitySource`). An `@idempotencyToken` is
+    /// scoped to the resource the request creates, so an entry is keyed through
+    /// [`idempotency_key`] and the same token used on two different creates replays each
+    /// against its own resource instead of overwriting the other's record.
     pub idempotency_tokens: BTreeMap<String, String>,
     /// The account that is the MANAGEMENT account of the organization this store
     /// records, if any.
@@ -746,10 +913,15 @@ pub struct ComAmazonawsMpaAwsfluffycoreserviceState {
     /// reader — `ListPolicies` and `ListPolicyVersions` alike — answers out of this one
     /// map.
     pub policies: BTreeMap<String, CatalogPolicy>,
+    /// Every identity source, keyed by its ARN. `CreateIdentitySource` records one here
+    /// and `ListIdentitySources` reports them.
+    pub identity_sources: BTreeMap<String, IdentitySource>,
     /// Source of [`ApprovalTeam::seq`].
     next_team_seq: u64,
     /// Source of [`Approver::approver_id`].
     next_approver_seq: u64,
+    /// Source of [`IdentitySource::seq`] and of the id its ARN carries.
+    next_identity_source_seq: u64,
 }
 
 impl Default for ComAmazonawsMpaAwsfluffycoreserviceState {
@@ -763,8 +935,10 @@ impl Default for ComAmazonawsMpaAwsfluffycoreserviceState {
             idempotency_tokens: BTreeMap::new(),
             organization_management_account_id: None,
             policies: seeded_policy_catalog(SystemTime::now()),
+            identity_sources: BTreeMap::new(),
             next_team_seq: 0,
             next_approver_seq: 0,
+            next_identity_source_seq: 0,
         }
     }
 }
@@ -833,6 +1007,21 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
                 team.status_code = None;
             }
         }
+
+        // A new identity source is ACTIVE once its activation comes due.
+        for source in self.identity_sources.values_mut() {
+            if source.status != IdentitySourceStatus::Creating {
+                continue;
+            }
+            let Some(due) = source.activation_due else {
+                continue;
+            };
+            if due > now {
+                continue;
+            }
+            source.status = IdentitySourceStatus::Active;
+            source.activation_due = None;
+        }
     }
 
     /// Drop a team and everything that indexes it.
@@ -861,12 +1050,15 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     ///
     /// The one place a tagging operation resolves a resource ARN, so `TagResource` and
     /// `ListTagsForResource` agree on which resources exist and read the same map. The
-    /// approval team is the only resource this service stores, so an ARN naming
-    /// anything else is not found; when another resource is added here, both operations
-    /// pick it up from this one function.
+    /// resources this service stores are the approval team and the identity source, so
+    /// an ARN naming anything else is not found; when another resource is added here,
+    /// both operations pick it up from this one function.
     #[must_use]
     pub fn resource_tags(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
-        self.team(arn).map(|team| &team.tags)
+        if let Some(team) = self.team(arn) {
+            return Some(&team.tags);
+        }
+        self.identity_source(arn).map(|source| &source.tags)
     }
 
     /// Whether this store records a RESOURCE under `arn`.
@@ -884,7 +1076,43 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     /// The tags of the resource `arn` names, for update. Same resolution as
     /// [`ComAmazonawsMpaAwsfluffycoreserviceState::resource_tags`].
     pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
-        self.team_mut(arn).map(|team| &mut team.tags)
+        if self.approval_teams.contains_key(arn) {
+            return self.team_mut(arn).map(|team| &mut team.tags);
+        }
+        self.identity_source_mut(arn)
+            .map(|source| &mut source.tags)
+    }
+
+    /// The stored identity source with this ARN.
+    #[must_use]
+    pub fn identity_source(&self, arn: &str) -> Option<&IdentitySource> {
+        self.identity_sources.get(arn)
+    }
+
+    /// The stored identity source with this ARN, for update.
+    pub fn identity_source_mut(&mut self, arn: &str) -> Option<&mut IdentitySource> {
+        self.identity_sources.get_mut(arn)
+    }
+
+    /// Record an identity source, replacing any entry under the same ARN.
+    pub fn insert_identity_source(&mut self, source: IdentitySource) {
+        self.identity_sources.insert(source.arn.clone(), source);
+    }
+
+    /// Every stored identity source in creation order — the stable ordering
+    /// `ListIdentitySources` pages over.
+    #[must_use]
+    pub fn identity_sources_in_creation_order(&self) -> Vec<&IdentitySource> {
+        let mut sources: Vec<&IdentitySource> = self.identity_sources.values().collect();
+        sources.sort_by_key(|source| source.seq);
+        sources
+    }
+
+    /// The next identity-source creation-order sequence number, which is also the id its
+    /// ARN carries ([`identity_source_arn`]). Never reused.
+    pub fn next_identity_source_seq(&mut self) -> u64 {
+        self.next_identity_source_seq += 1;
+        self.next_identity_source_seq
     }
 
     /// Every stored team in creation order — the stable ordering
@@ -901,12 +1129,13 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     /// what tells a missing resource from a resource with no policy of the name asked
     /// for.
     ///
-    /// An approval team is the only resource this store records, and a team's attached
-    /// policies are the `Policies` references it carries, so the resource-policy reads
-    /// and `GetApprovalTeam$Policies` report one and the same attachment list. Each
-    /// reference is resolved through the CATALOG, so every member reported comes from
-    /// the policy record itself; a reference the catalog does not hold names no policy
-    /// and is reported by nothing.
+    /// An approval team is the only resource this store records that policies attach to,
+    /// and a team's attached policies are the `Policies` references it carries, so the
+    /// resource-policy reads and `GetApprovalTeam$Policies` report one and the same
+    /// attachment list. Each reference is resolved through the CATALOG, so every member
+    /// reported comes from the policy record itself; a reference the catalog does not
+    /// hold names no policy and is reported by nothing. An identity source attaches no
+    /// policy, so an identity-source ARN here resolves to nothing.
     #[must_use]
     pub fn resource_policies(&self, resource_arn: &str) -> Option<Vec<ResourcePolicy>> {
         let team = self.team(resource_arn)?;
@@ -1045,7 +1274,7 @@ where
 /// `arn:aws:mpa:<region>:<account>:approval-team/<name>`.
 #[must_use]
 pub fn team_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn("mpa", region, &format!("approval-team/{name}"))
+    ::engine::emulator_arn("mpa", region, &format!("{APPROVAL_TEAM_RESOURCE}/{name}"))
 }
 
 /// The account every caller of this emulator authenticates as: every request is
