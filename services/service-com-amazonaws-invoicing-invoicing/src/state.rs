@@ -13,6 +13,16 @@
 //! documents `LastModified` as "the version of invoice unit configuration used to
 //! create the invoices" — so a read at an instant must answer with the configuration
 //! that was in effect then, not with the latest one.
+//!
+//! Beside the invoice units sits the INVOICE registry [`ComAmazonawsInvoicingInvoicingState::invoices`],
+//! the one copy of the invoices this emulator holds, which `ListInvoiceSummaries`
+//! reports. An invoice is ISSUED by AWS out of a billing period's activity: no
+//! operation of this service's API creates one (`smithy_query(query="list_operations")`
+//! lists one create, `CreateInvoiceUnit`), and this emulator runs no billing, so
+//! nothing mints an invoice here either. The registry therefore starts out EMPTY —
+//! which is the answer a reader owes for an account that has no invoices — and a
+//! reader reports exactly what it holds rather than synthesising amounts for charges
+//! nothing incurred.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,8 +30,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AccessDeniedException, InternalServerException, InvoiceProfile, InvoiceUnit, InvoiceUnitRule,
-    ResourceNotFoundException, ResourceTag,
+    AccessDeniedException, InternalServerException, InvoiceProfile, InvoiceSummary, InvoiceUnit,
+    InvoiceUnitRule, ResourceNotFoundException, ResourceTag,
 };
 
 /// Per-service state for com-amazonaws-invoicing-invoicing. A handler reaches it through [`service_state`].
@@ -31,6 +41,15 @@ pub struct ComAmazonawsInvoicingInvoicingState {
     /// `BTreeMap` so `ListInvoiceUnits` walks a stable, deterministic order and a
     /// pagination token (a position in that order) stays meaningful across calls.
     pub invoice_units: BTreeMap<String, StoredInvoiceUnit>,
+    /// Every invoice this emulator holds, keyed by its `InvoiceId`, as the modelled
+    /// `InvoiceSummary` a reader reports it with — one copy, so two readers of one
+    /// invoice cannot disagree. A `BTreeMap` so `ListInvoiceSummaries` walks a stable,
+    /// deterministic order and a pagination token (a position in that order) stays
+    /// meaningful across calls.
+    ///
+    /// Empty until something puts an invoice here, because nothing in this service's
+    /// API issues one — see the module docs.
+    pub invoices: BTreeMap<String, InvoiceSummary>,
     /// `ResourceTags` per resource ARN, as `CreateInvoiceUnit` and `TagResource`
     /// persisted them and `ListTagsForResource` reports them. One tag per key: a
     /// later write of a key already set replaces that key's value.
@@ -257,9 +276,10 @@ pub struct InvoiceUnitVersion {
     pub last_modified: DateTime,
 }
 
-/// A total order on timestamps, so a stored `LastModified` can be compared with a
-/// requested `AsOf` without assuming `DateTime` is itself `Ord`.
-fn instant_key(at: &DateTime) -> (i64, u32) {
+/// A total order on timestamps, so a stored instant can be compared with a requested
+/// one — a `LastModified` against an `AsOf`, an `IssuedDate` against a `DateInterval`'s
+/// bounds — without assuming `DateTime` is itself `Ord`.
+pub fn instant_key(at: &DateTime) -> (i64, u32) {
     (at.secs(), at.subsec_nanos())
 }
 
@@ -321,6 +341,20 @@ pub fn no_such_resource(arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
         resource_id: Some(arn.to_string()),
+    }
+}
+
+/// The 404 a reader answers for a resource named by something that is NOT an ARN — an
+/// invoice id, say: the same constant message, with the ARN member left unset.
+///
+/// That member is modelled `InvoiceUnitArnString`, whose `@pattern` admits only an ARN
+/// (`smithy_query(query="shape", shape="ResourceNotFoundException")`), so a
+/// non-ARN identifier cannot be reported in it without answering a value the model
+/// says that member never holds.
+pub fn no_such_resource_unnamed() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+        resource_id: None,
     }
 }
 
