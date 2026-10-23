@@ -16,10 +16,10 @@
 //! Five opt-in seams are yours to change; every one defaults to the framework's
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
-//! - `can_handle` — which requests this service claims. The default matches the
-//!   request's resolved route key against this service's signing name. Edit it
-//!   for anything the model does not express: a signing name shared by several
-//!   services, or routing that keys on the access-key id.
+//! - `can_handle` — which requests this service claims. EDITED HERE: the framework's
+//!   default (the request's resolved route key equals this service's signing name),
+//!   plus a request whose `X-Amz-Target` names this service, which the framework's
+//!   routing-key fallback misreads for this service's dotted target prefix.
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself. THIS service
@@ -47,6 +47,13 @@ use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The target rule in isolation: which operation an `X-Amz-Target` names, over the
+/// prefix forms a client can write. Lives beside this file rather than inline so the
+/// table can grow without pushing the seams it tests off the screen; the wire behaviour
+/// it produces is asserted end-to-end in `tests/all/target_prefix_dispatch.rs`.
+#[cfg(test)]
+mod rpc_target;
 
 /// The header an `awsJson` client names the operation in.
 const TARGET_HEADER: &str = "x-amz-target";
@@ -202,69 +209,5 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    //! The target rule in isolation: which operation an `X-Amz-Target` names, over the
-    //! prefix forms a client can write. The wire behaviour it produces is asserted
-    //! end-to-end in `tests/all/target_prefix_dispatch.rs`.
-
-    use super::operation_from_target;
-
-    /// The local name of this service's model shape, as `shape_name` derives it.
-    const SHAPE: &str = "CloudTrail_20131101";
-
-    #[test]
-    fn the_operation_is_the_segment_after_the_last_dot() {
-        // (case, target, the operation it names for this service)
-        let rows: [(&str, &str, Option<&str>); 9] = [
-            (
-                "the fully qualified Coral prefix an SDK sends",
-                "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.CreateTrail",
-                Some("CreateTrail"),
-            ),
-            (
-                "the bare service shape name",
-                "CloudTrail_20131101.DescribeTrails",
-                Some("DescribeTrails"),
-            ),
-            (
-                "one namespace label",
-                "cloudtrail.CloudTrail_20131101.ListTrails",
-                Some("ListTrails"),
-            ),
-            (
-                "surrounding whitespace",
-                " CloudTrail_20131101.GetTrail ",
-                Some("GetTrail"),
-            ),
-            (
-                "an operation this model does not bind is still read as an operation",
-                "CloudTrail_20131101.NoSuchOperation",
-                Some("NoSuchOperation"),
-            ),
-            (
-                "another service's prefix",
-                "DynamoDB_20120810.GetItem",
-                None,
-            ),
-            (
-                "a prefix that merely ends in this shape name's characters",
-                "NotCloudTrail_20131101.CreateTrail",
-                None,
-            ),
-            ("no dot at all", "CreateTrail", None),
-            ("an empty operation", "CloudTrail_20131101.", None),
-        ];
-
-        for (case, target, expected) in rows {
-            let actual = operation_from_target(target, SHAPE);
-            assert_eq!(
-                actual, expected,
-                "case {case:?}: expected {expected:?} from target {target:?}, got {actual:?}"
-            );
-        }
     }
 }
