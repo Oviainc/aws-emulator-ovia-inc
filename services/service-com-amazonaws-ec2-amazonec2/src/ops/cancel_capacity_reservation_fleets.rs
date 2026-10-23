@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelCapacityReservationFleets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelCapacityReservationFleets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelCapacityReservationFleets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels the Capacity Reservation Fleets a request names: each moves to `cancelling`,
+//! which the clock owes `cancelled`, and the Fleets that could not be cancelled are reported
+//! in `FailedFleetCancellations`. The ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +135,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelCapacityReservationFleets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelCapacityReservationFleetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelCapacityReservationFleets"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            capacity_reservation_fleet_id_is_well_formed,
+            capacity_reservation_fleet_not_found_message, deduplicate_ids,
+            invalid_capacity_reservation_fleet_id_malformed, require_service_state,
+            CAPACITY_RESERVATION_FLEET_CANCELLABLE_STATES,
+            CAPACITY_RESERVATION_FLEET_STATE_CANCELLING, INCORRECT_STATE,
+            INVALID_CAPACITY_RESERVATION_FLEET_ID_NOT_FOUND, MAX_RESOURCE_IDS,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — a Fleet is
+        // cancelled by its id, and the store holds Fleets per account. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        // "The IDs of the Capacity Reservation Fleets to cancel"
+        // (`$CapacityReservationFleetIds`), a `@required` list the boundary validator has
+        // already refused an absent one for. Naming one Fleet twice asks for one
+        // cancellation, so the ids are deduplicated before anything is reported about them —
+        // otherwise one Fleet would appear twice, once cancelled and once in the wrong state.
+        if input.capacity_reservation_fleet_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "CapacityReservationFleetIds carries {} ids, above the maximum of \
+                 {MAX_RESOURCE_IDS}",
+                input.capacity_reservation_fleet_ids.len()
+            )));
+        }
+        let fleet_ids = deduplicate_ids(&input.capacity_reservation_fleet_ids);
+        if fleet_ids.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "capacityReservationFleetIds must name at least one Capacity Reservation \
+                 Fleet to cancel",
+            ));
+        }
+        // Something that is not a Capacity Reservation Fleet id at all is refused for the
+        // WHOLE request, before any Fleet is looked up or moved: there is nothing to look up,
+        // so it is not a Fleet that "could not be cancelled" but a request that cannot be
+        // read. `FailedFleetCancellations` is for ids that NAME something.
+        for fleet_id in &fleet_ids {
+            if !capacity_reservation_fleet_id_is_well_formed(fleet_id) {
+                return Err(invalid_capacity_reservation_fleet_id_malformed(fleet_id));
+            }
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The moves the CLOCK already owed are materialised before any state is read, so a
+        // Fleet is cancelled from the state it is actually in: a `submitted` Fleet whose
+        // `active` fell due is cancelled from `active`, and one whose cancellation has
+        // already completed is seen as `cancelled` rather than cancelled a second time.
+        store.materialize_due_transitions();
+
+        // DryRun sits AFTER every parameter has been validated and before anything is
+        // changed: the flag asks whether the request WOULD have succeeded, so one that would
+        // have been refused is refused with that reason instead, and nothing is cancelled.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let mut successful: Vec<CapacityReservationFleetCancellationState> = Vec::new();
+        let mut failed: Vec<FailedCapacityReservationFleetCancellationResult> = Vec::new();
+        for fleet_id in fleet_ids {
+            // An id that names no Fleet of the account is one Fleet that could not be
+            // cancelled, not a request that cannot be served: this operation reports per
+            // Fleet, so the other ids are still cancelled.
+            let Some(record) = store.capacity_reservation_fleets.get_mut(&fleet_id) else {
+                failed.push(cancellation_failure(
+                    &fleet_id,
+                    INVALID_CAPACITY_RESERVATION_FLEET_ID_NOT_FOUND,
+                    capacity_reservation_fleet_not_found_message(&fleet_id),
+                ));
+                continue;
+            };
+            // "The Capacity Reservation Fleet's status changes to `cancelled`" by way of
+            // `cancelling`, from a state the Fleet has not already left
+            // (`CAPACITY_RESERVATION_FLEET_CANCELLABLE_STATES`). A Fleet that is already
+            // being cancelled, is cancelled, has expired or has failed has nothing left to
+            // cancel, so it is reported as a Fleet that could not be cancelled rather than
+            // moved again.
+            let current_state = record.state().to_string();
+            let Some(previous_state) = record.begin_cancellation() else {
+                failed.push(cancellation_failure(
+                    &fleet_id,
+                    INCORRECT_STATE,
+                    format!(
+                        "The Capacity Reservation Fleet '{fleet_id}' is in state \
+                         '{current_state}', which is not a state it can be cancelled from \
+                         (one of: {})",
+                        CAPACITY_RESERVATION_FLEET_CANCELLABLE_STATES.join(" | ")
+                    ),
+                ));
+                continue;
+            };
+            // Read the state back OUT of the stored record, so the caller is told the state a
+            // later describe will report rather than the word this handler meant to write.
+            successful.push(CapacityReservationFleetCancellationState {
+                capacity_reservation_fleet_id: Some(fleet_id.clone()),
+                previous_fleet_state: Some(previous_state),
+                current_fleet_state: Some(record.state().to_string()),
+            });
+            debug_assert_eq!(
+                record.state(),
+                CAPACITY_RESERVATION_FLEET_STATE_CANCELLING,
+                "a cancellation leaves the Fleet in the transient state the clock owes \
+                 `cancelled`"
+            );
+        }
+
+        // Both sets are reported even when empty: EC2's ec2Query XML carries the set element
+        // for an empty list too (`<failedFleetCancellationSet/>` on a call in which every
+        // Fleet was cancelled), so a client reading either set finds it where it expects it.
+        Ok(CancelCapacityReservationFleetsOutput {
+            successful_fleet_cancellations: Some(successful),
+            failed_fleet_cancellations: Some(failed),
+        })
+    }
+}
+
+/// One entry of `FailedFleetCancellations`: the Fleet that could not be cancelled, and why.
+///
+/// The `code` is a `&'static str` out of this service's own catalog
+/// ([`crate::state::INVALID_CAPACITY_RESERVATION_FLEET_ID_NOT_FOUND`],
+/// [`crate::state::INCORRECT_STATE`]) — the same codes the request-level refusals of this
+/// service carry, so a client branches on one spelling of each.
+fn cancellation_failure(
+    fleet_id: &str,
+    code: &'static str,
+    message: String,
+) -> FailedCapacityReservationFleetCancellationResult {
+    FailedCapacityReservationFleetCancellationResult {
+        capacity_reservation_fleet_id: Some(fleet_id.to_string()),
+        cancel_capacity_reservation_fleet_error: Some(CancelCapacityReservationFleetError {
+            code: Some(code.to_string()),
+            message: Some(message),
+        }),
     }
 }

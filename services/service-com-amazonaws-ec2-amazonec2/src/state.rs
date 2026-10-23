@@ -456,6 +456,20 @@
 //! deliver, one that was cancelled, one whose payment is pending or failed — are stored, as
 //! [`CapacityBlockRecord::pinned_state`].
 //!
+//! ## Capacity Reservation Fleets
+//!
+//! [`ComAmazonawsEc2Amazonec2State::capacity_reservation_fleets`] holds the account's
+//! Capacity Reservation Fleets as [`CapacityReservationFleetRecord`]s: the modelled
+//! [`CapacityReservationFleet`] every operation that reports one answers with — including
+//! the individual Capacity Reservations the create reserved its capacity through — plus the
+//! move the clock owes it ([`CapacityReservationFleetTransition`]) — `submitted` ->
+//! `active` after `CreateCapacityReservationFleet`, and `cancelling` -> `cancelled` after
+//! `CancelCapacityReservationFleets`. Both fall due on the same monotonic clock and the same
+//! [`TRANSITION_DELAY`] as an instance's [`PendingTransition`], and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies them. The store is
+//! keyed by `CapacityReservationFleetId` in a [`BTreeMap`], the order
+//! `DescribeCapacityReservationFleets` reports and pages over.
+//!
 //! ## Secondary subnets
 //!
 //! [`ComAmazonawsEc2Amazonec2State::secondary_subnets`] holds the account's secondary
@@ -546,6 +560,7 @@ use crate::ops::types::{
     AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
     ByoipCidr,
     CapacityBlock, ExportTask, FpgaImage, FpgaImageState, ImageUsageReport, LoadPermission,
+    CapacityReservationFleet, FleetCapacityReservation,
     StorageLocation, VolumeRecycleBinInfo,
     CreateVolumeOutput, DescribeFastLaunchImagesSuccessItem, DisableFastLaunchOutput,
     VolumeModification,
@@ -1523,6 +1538,13 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// same request answers with that task instead of starting a second import: "The token
     /// to enable idempotency for VM import requests" (`ImportImageRequest$ClientToken`).
     pub import_image_task_client_tokens: HashMap<String, String>,
+    /// Every Capacity Reservation Fleet the account holds, by `CapacityReservationFleetId`,
+    /// as a [`CapacityReservationFleetRecord`] — see the module docs. Ordered by id, which
+    /// is the order `DescribeCapacityReservationFleets` reports and pages over.
+    pub capacity_reservation_fleets: BTreeMap<String, CapacityReservationFleetRecord>,
+    /// A `CreateCapacityReservationFleet` `ClientToken` and the Fleet id it minted, so a
+    /// repeat of the same request answers with that Fleet instead of creating a second one.
+    pub capacity_reservation_fleet_client_tokens: HashMap<String, String>,
     /// The account's placement groups, as the modelled [`PlacementGroup`] shape every
     /// operation that reports one answers with, keyed by `GroupId` in a [`BTreeMap`] — the
     /// same stable order the other stores are kept in, which is the order
@@ -1624,6 +1646,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_block_public_access_exclusions: BTreeMap::new(),
             import_image_tasks: BTreeMap::new(),
             import_image_task_client_tokens: HashMap::new(),
+            capacity_reservation_fleets: BTreeMap::new(),
+            capacity_reservation_fleet_client_tokens: HashMap::new(),
             spot_instance_requests: BTreeMap::new(),
             spot_instance_request_client_tokens: HashMap::new(),
             placement_groups: BTreeMap::new(),
@@ -2913,6 +2937,7 @@ impl ComAmazonawsEc2Amazonec2State {
         // documents, so they are read off the wall clock rather than `now`.
         self.expire_due_address_transfers(SystemTime::now());
         self.complete_due_import_image_tasks(now);
+        self.materialize_due_capacity_reservation_fleet_moves(now);
         self.materialize_due_spot_instance_requests(now);
     }
 
@@ -3247,9 +3272,11 @@ pub const LONG_RESOURCE_ID_DIGITS: usize = 17;
 ///   `i-00000000000000000` with `InvalidInstanceID.Malformed` too, and the mint counts
 ///   from one, so no instance can ever hold the null id.
 ///
-/// The structural part of this is the INSTANCE id's rule, not a rule about every EC2
-/// id: the same all-zero suffix on a network interface (`eni-00000000000000000`) IS
-/// answered `NotFound`, so it is not generalised to the other id readers here.
+/// The structural part of this is the rule of SOME EC2 id kinds, not of every one
+/// ([`issued_long_id_is_well_formed`], which a Capacity Reservation Fleet id reads through
+/// too on its own recorded evidence): the same all-zero suffix on a network interface
+/// (`eni-00000000000000000`) IS answered `NotFound`, so it is not generalised to the other
+/// id readers here.
 ///
 /// ## Where each clause's evidence is, so the rule can be re-checked
 ///
@@ -3271,15 +3298,7 @@ pub const LONG_RESOURCE_ID_DIGITS: usize = 17;
 ///   (cause 1, the same id under `DryRun`), whose cause 7 is also where the
 ///   `eni-00000000000000000` -> `NotFound` counter-example comes from.
 pub fn instance_id_is_well_formed(id: &str) -> bool {
-    let Some(suffix) = id.strip_prefix("i-") else {
-        return false;
-    };
-    suffix.len() == LONG_RESOURCE_ID_DIGITS
-        && suffix
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-        && suffix.starts_with('0')
-        && suffix.bytes().any(|byte| byte != b'0')
+    issued_long_id_is_well_formed("i", id)
 }
 
 /// Refuse an instance id the request named that this service cannot resolve: a
@@ -5273,14 +5292,29 @@ impl ComAmazonawsEc2Amazonec2State {
             };
             // No room for the AMI means the import cannot produce one at all, so it ends in
             // the state a failed import ends in rather than staying `active` for ever: the
-            // task is `deleted` and its message says which ceiling stopped it.
-            if !self.has_image_capacity() {
+            // task is `deleted` and its message says which ceiling stopped it — the number of
+            // images this store holds, or the caller-chosen bytes they hold, a count of
+            // records being no bound on the bytes each one carries.
+            let no_room = if !self.has_image_capacity() {
+                Some(format!(
+                    "This emulator holds {MAX_IMAGES} images, which is as many as it \
+                     stores, so the imported AMI could not be created"
+                ))
+            } else {
+                let payload_bytes = image_payload_bytes(&spec);
+                self.would_exceed_stored_bytes(payload_bytes).then(|| {
+                    format!(
+                        "This emulator holds {held} of at most {MAX_STORED_BYTES} bytes of \
+                         caller-supplied data, so the imported AMI could not be created \
+                         with {payload_bytes} more",
+                        held = self.stored_bytes()
+                    )
+                })
+            };
+            if let Some(reason) = no_room {
                 if let Some(record) = self.import_image_tasks.get_mut(&task_id) {
                     record.view.status = Some(IMPORT_TASK_STATE_DELETED.to_string());
-                    record.view.status_message = Some(format!(
-                        "This emulator holds {MAX_IMAGES} images, which is as many as it \
-                         stores, so the imported AMI could not be created"
-                    ));
+                    record.view.status_message = Some(reason);
                     record.view.progress = None;
                     for detail in record.view.snapshot_details.iter_mut().flatten() {
                         detail.status = Some(IMPORT_TASK_STATE_DELETED.to_string());
@@ -6645,7 +6679,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// Whether another image fits inside the store's ceiling ([`MAX_IMAGES`]).
     ///
     /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
-    /// instead of growing the store past its ceiling.
+    /// instead of growing the store past its ceiling. A writer asks
+    /// [`Self::would_exceed_stored_bytes`] with [`image_payload_bytes`] beside it, because a
+    /// count of records is no bound on the caller-chosen bytes each one holds.
     pub fn has_image_capacity(&self) -> bool {
         self.images.len() < MAX_IMAGES
     }
@@ -8386,13 +8422,21 @@ impl ComAmazonawsEc2Amazonec2State {
         self.capacity_blocks.len().saturating_add(count) <= MAX_STORED_CAPACITY_BLOCKS
     }
 
-    /// Store one Capacity Block and answer the `CapacityBlockId` it was given.
+    /// Store one Capacity Block and answer the `CapacityBlockId` it was given, or `None`
+    /// with NOTHING written when the store has no room for it.
     ///
     /// The one place a Capacity Block enters this store, so every writer of one — and
     /// `DescribeCapacityBlocks`, which reports what this wrote — agrees on the id form, the
     /// stored shape and which members a block carries. The caller-chosen bytes the record
     /// retains are charged here, so no path can store them uncharged.
-    pub fn insert_capacity_block(&mut self, spec: CapacityBlockSpec) -> String {
+    ///
+    /// Both ceilings are also asked HERE, the way [`Self::insert_byoip_cidr`] asks its own,
+    /// so no path can get past them by forgetting to: the record ceiling
+    /// ([`Self::has_capacity_block_capacity`], because nothing in this emulator reclaims a
+    /// stored block) and the byte budget ([`Self::would_exceed_stored_bytes`], because a
+    /// count of records is no bound on the caller-chosen bytes each one holds). A writer maps
+    /// the `None` to the quota refusal its own operation answers with.
+    pub fn insert_capacity_block(&mut self, spec: CapacityBlockSpec) -> Option<String> {
         let capacity_block_id = self.next_id(CAPACITY_BLOCK_ID_PREFIX);
         let block = CapacityBlock {
             capacity_block_id: Some(capacity_block_id.clone()),
@@ -8408,7 +8452,11 @@ impl ComAmazonawsEc2Amazonec2State {
             state: None,
             tags: Some(spec.tags),
         };
-        self.add_stored_bytes(capacity_block_payload_bytes(&block));
+        let charge = capacity_block_payload_bytes(&block);
+        if !self.has_capacity_block_capacity(1) || self.would_exceed_stored_bytes(charge) {
+            return None;
+        }
+        self.add_stored_bytes(charge);
         self.capacity_blocks.insert(
             capacity_block_id.clone(),
             CapacityBlockRecord {
@@ -8416,7 +8464,7 @@ impl ComAmazonawsEc2Amazonec2State {
                 pinned_state: spec.pinned_state,
             },
         );
-        capacity_block_id
+        Some(capacity_block_id)
     }
 }
 
@@ -10987,6 +11035,37 @@ pub fn prefixed_id_is_well_formed(prefix: &str, id: &str) -> bool {
         && suffix
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Whether `id` is a well-formed LONG-form EC2 resource id of the kind `prefix` names that
+/// EC2 could have ISSUED.
+///
+/// The stricter reading of [`prefixed_id_is_well_formed`], for the resource kinds AWS answers
+/// `Invalid<Kind>.Malformed` for an id that merely LOOKS hexadecimal: the suffix carries
+/// exactly [`LONG_RESOURCE_ID_DIGITS`] lowercase hexadecimal digits, its leading digit is
+/// `0` (the long form carries 68 bits for a 64-bit internal identifier, so an issued id
+/// always reads `<prefix>-0…`, which is also what [`ComAmazonawsEc2Amazonec2State::next_id`]
+/// mints), and they are not all `0` (the placeholder every client reaches for, which the
+/// mint counting from one can never produce).
+///
+/// Which resource kinds read ids this way is a fact about each kind, not about every EC2 id:
+/// [`instance_id_is_well_formed`] and [`capacity_reservation_fleet_id_is_well_formed`] do,
+/// each on the evidence recorded with it, while a network interface id answers `NotFound`
+/// for the same all-zero suffix and so reads ids through
+/// [`prefixed_id_is_well_formed`] instead.
+pub fn issued_long_id_is_well_formed(prefix: &str, id: &str) -> bool {
+    let Some(suffix) = id
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    suffix.len() == LONG_RESOURCE_ID_DIGITS
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && suffix.starts_with('0')
+        && suffix.bytes().any(|byte| byte != b'0')
 }
 
 /// Whether `id` is a well-formed VPC ENDPOINT id, as opposed to an id of one of the two
@@ -13783,6 +13862,513 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 }
 
+// =============================================================================
+// Capacity Reservation Fleets
+// =============================================================================
+
+/// The id prefix every Capacity Reservation Fleet is minted with, the `crf-` of the
+/// `CapacityReservationFleetId` AWS's own error text spells ("Capacity Reservation Fleet ID
+/// 'crf-…'").
+pub const CAPACITY_RESERVATION_FLEET_ID_PREFIX: &str = "crf";
+
+/// The id prefix of one Capacity Reservation — the resource a Fleet creates per instance
+/// type it reserves for (`FleetCapacityReservation$CapacityReservationId`).
+pub const CAPACITY_RESERVATION_ID_PREFIX: &str = "cr";
+
+/// The `ResourceType` a `CreateCapacityReservationFleet` tag specification may name: the
+/// Fleet it creates (the modelled `ResourceType` enum's `capacity-reservation-fleet`
+/// member). "The tags are automatically assigned to the Capacity Reservations in the Fleet"
+/// (`CreateCapacityReservationFleetRequest$TagSpecifications`), so the one tag list is the
+/// Fleet's and its reservations'.
+pub const RESOURCE_TYPE_CAPACITY_RESERVATION_FLEET: &str = "capacity-reservation-fleet";
+
+/// "`submitted` - The Capacity Reservation Fleet request has been submitted and Amazon
+/// Elastic Compute Cloud is preparing to create the Capacity Reservations"
+/// (`CapacityReservationFleet$State`): where every Fleet starts, and a NON-terminal state,
+/// so the clock owes it [`CAPACITY_RESERVATION_FLEET_STATE_ACTIVE`].
+pub const CAPACITY_RESERVATION_FLEET_STATE_SUBMITTED: &str = "submitted";
+
+/// "`modifying` - The Capacity Reservation Fleet is being modified"
+/// (`CapacityReservationFleet$State`).
+pub const CAPACITY_RESERVATION_FLEET_STATE_MODIFYING: &str = "modifying";
+
+/// "`active` - The Capacity Reservation Fleet has fulfilled its total target capacity and
+/// it is attempting to maintain this capacity" (`CapacityReservationFleet$State`).
+pub const CAPACITY_RESERVATION_FLEET_STATE_ACTIVE: &str = "active";
+
+/// "`partially_fulfilled` - The Capacity Reservation Fleet has partially fulfilled its
+/// total target capacity" (`CapacityReservationFleet$State`).
+pub const CAPACITY_RESERVATION_FLEET_STATE_PARTIALLY_FULFILLED: &str = "partially_fulfilled";
+
+/// "`expiring` - The Capacity Reservation Fleet has reach its end date and it is in the
+/// process of expiring" (`CapacityReservationFleet$State`).
+pub const CAPACITY_RESERVATION_FLEET_STATE_EXPIRING: &str = "expiring";
+
+/// "`cancelling` - The Capacity Reservation Fleet is in the process of being cancelled"
+/// (`CapacityReservationFleet$State`): where a cancellation puts a Fleet, and a NON-terminal
+/// state, so the clock owes it [`CAPACITY_RESERVATION_FLEET_STATE_CANCELLED`].
+pub const CAPACITY_RESERVATION_FLEET_STATE_CANCELLING: &str = "cancelling";
+
+/// "The Capacity Reservation Fleet's status changes to `cancelled`"
+/// (`CancelCapacityReservationFleets`): the end of a cancellation, and terminal.
+pub const CAPACITY_RESERVATION_FLEET_STATE_CANCELLED: &str = "cancelled";
+
+/// The states a Capacity Reservation Fleet can be cancelled FROM.
+///
+/// A cancellation moves a Fleet that is still doing something — one preparing its
+/// reservations, one being modified, one holding capacity, one expiring — into
+/// [`CAPACITY_RESERVATION_FLEET_STATE_CANCELLING`]. The states left out are the ones a Fleet
+/// has already left: `cancelling` and `cancelled` (the cancellation has already happened),
+/// and `expired` and `failed`, where "The Fleet can't create new Capacity Reservations"
+/// (`CapacityReservationFleet$State`) and so there is nothing left to cancel.
+pub const CAPACITY_RESERVATION_FLEET_CANCELLABLE_STATES: [&str; 5] = [
+    CAPACITY_RESERVATION_FLEET_STATE_SUBMITTED,
+    CAPACITY_RESERVATION_FLEET_STATE_MODIFYING,
+    CAPACITY_RESERVATION_FLEET_STATE_ACTIVE,
+    CAPACITY_RESERVATION_FLEET_STATE_PARTIALLY_FULFILLED,
+    CAPACITY_RESERVATION_FLEET_STATE_EXPIRING,
+];
+
+/// "Currently, only the `prioritized` allocation strategy is supported […] Valid values:
+/// `prioritized`" (`CreateCapacityReservationFleetRequest$AllocationStrategy`), so it is
+/// both the only value a request may name and the strategy a request that names none gets.
+pub const FLEET_ALLOCATION_STRATEGY_PRIORITIZED: &str = "prioritized";
+
+/// The capacity units one instance provides when a specification names no `Weight`.
+///
+/// "The number of capacity units provided by the specified instance type. This value,
+/// together with the total target capacity that you specify for the Fleet determine the
+/// number of instances for which the Fleet reserves capacity. Both values are based on units
+/// that make sense for your workload"
+/// (`ReservationFleetInstanceSpecification$Weight`) — the model publishes no default, so a
+/// specification that names no weight is read in units of instances: one instance provides
+/// one unit, which makes `TotalTargetCapacity` a count of instances.
+pub const DEFAULT_FLEET_INSTANCE_WEIGHT: f64 = 1.0;
+
+/// The largest number of instance type specifications one `CreateCapacityReservationFleet`
+/// may carry.
+///
+/// A bound in the same style as [`MAX_FILTERS`], not an AWS quota: the model declares no
+/// `@length` for `ReservationFleetInstanceSpecificationList`, and each entry is work and
+/// memory this process does, so the number a caller can send has to be finite.
+pub const MAX_FLEET_INSTANCE_TYPE_SPECIFICATIONS: usize = 100;
+
+/// The largest number of Capacity Reservation Fleets this in-memory store holds.
+///
+/// A capacity bound in the same style as [`MAX_VPCS`], not an AWS quota: each Fleet is a
+/// record in this process's memory, so the number a caller can create has to be finite.
+/// [`ComAmazonawsEc2Amazonec2State::has_capacity_reservation_fleet_capacity`] is the
+/// predicate a writer asks before inserting; a create past it refuses with
+/// [`capacity_reservation_fleet_limit_exceeded`].
+pub const MAX_CAPACITY_RESERVATION_FLEETS: usize = 1_000;
+
+/// The code a create past [`MAX_CAPACITY_RESERVATION_FLEETS`] answers with, following the
+/// `<Resource>LimitExceeded` convention every per-resource quota refusal of this service
+/// uses ([`VPC_LIMIT_EXCEEDED`], [`VPC_BPA_EXCLUSION_LIMIT_EXCEEDED`]).
+pub const CAPACITY_RESERVATION_FLEET_LIMIT_EXCEEDED: &str = "CapacityReservationFleetLimitExceeded";
+
+/// The code EC2 answers for something that is not a Capacity Reservation Fleet id at all,
+/// BEFORE it looks the id up — so a caller can tell a typo from a Fleet the account does not
+/// hold.
+pub const INVALID_CAPACITY_RESERVATION_FLEET_ID_MALFORMED: &str =
+    "InvalidCapacityReservationFleetId.Malformed";
+
+/// The code EC2 answers for a well-formed Capacity Reservation Fleet id the account holds no
+/// Fleet under.
+pub const INVALID_CAPACITY_RESERVATION_FLEET_ID_NOT_FOUND: &str =
+    "InvalidCapacityReservationFleetId.NotFound";
+
+/// Whether `id` is a well-formed Capacity Reservation Fleet id — one EC2 could have ISSUED.
+///
+/// The long-form rule ([`issued_long_id_is_well_formed`]) under this resource's own `crf`
+/// prefix: `CapacityReservationFleetId` is a plain string in the model
+/// (`smithy_query(query="shape",shape="CapacityReservationFleetId")`), so the form is the one
+/// AWS's `InvalidCapacityReservationFleetId.Malformed` answers for anything outside —
+/// including an id whose leading digit is above zero and the all-zero placeholder, both of
+/// which the recorded units behind
+/// `issues/.../20261023T102725Z-ec2-cancelcapacityreservationfleets-stub.md` and
+/// `issues/.../20261023T102725Z-ec2-modifycapacityreservationfleet-stub.md` were answered
+/// `InvalidCapacityReservationFleetId.Malformed` for.
+pub fn capacity_reservation_fleet_id_is_well_formed(id: &str) -> bool {
+    issued_long_id_is_well_formed(CAPACITY_RESERVATION_FLEET_ID_PREFIX, id)
+}
+
+/// Refuse something that is not a Capacity Reservation Fleet id: HTTP 400
+/// [`INVALID_CAPACITY_RESERVATION_FLEET_ID_MALFORMED`].
+pub fn invalid_capacity_reservation_fleet_id_malformed<E>(fleet_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CAPACITY_RESERVATION_FLEET_ID_MALFORMED,
+        400,
+        format!("Capacity Reservation Fleet ID '{fleet_id}' is malformed"),
+    )
+}
+
+/// Why a well-formed Capacity Reservation Fleet id resolves to nothing.
+///
+/// ONE wording, so the request-level refusal `DescribeCapacityReservationFleets` answers and
+/// the per-Fleet entry `CancelCapacityReservationFleets` reports in its
+/// `FailedFleetCancellations` say the same thing about the same id.
+pub fn capacity_reservation_fleet_not_found_message(fleet_id: &str) -> String {
+    format!("The Capacity Reservation Fleet ID '{fleet_id}' does not exist")
+}
+
+/// Refuse a Capacity Reservation Fleet id the account holds no Fleet under: HTTP 400
+/// [`INVALID_CAPACITY_RESERVATION_FLEET_ID_NOT_FOUND`].
+pub fn invalid_capacity_reservation_fleet_id_not_found<E>(fleet_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CAPACITY_RESERVATION_FLEET_ID_NOT_FOUND,
+        400,
+        capacity_reservation_fleet_not_found_message(fleet_id),
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_CAPACITY_RESERVATION_FLEETS`]: HTTP
+/// 400 [`CAPACITY_RESERVATION_FLEET_LIMIT_EXCEEDED`].
+pub fn capacity_reservation_fleet_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        CAPACITY_RESERVATION_FLEET_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of Capacity Reservation Fleets has been reached \
+             ({MAX_CAPACITY_RESERVATION_FLEETS})"
+        ),
+    )
+}
+
+/// The move the clock owes one Capacity Reservation Fleet: a [`ClockTransition`] to the
+/// `CapacityReservationFleetState` member it becomes.
+///
+/// The `to` is a `&'static str` so only a word from this module's own catalog constants can
+/// be stored — never a request's text.
+pub type CapacityReservationFleetTransition = ClockTransition<&'static str>;
+
+/// One Capacity Reservation Fleet: the modelled [`CapacityReservationFleet`] every operation
+/// that reports one answers with, plus the two facts that shape carries no member for.
+///
+/// `CreateCapacityReservationFleet`, `DescribeCapacityReservationFleets` and
+/// `CancelCapacityReservationFleets` all report the same Fleet, so the one stored view is
+/// what all of them answer from and they cannot describe one Fleet differently — the create
+/// result's flat member set is a projection of this view
+/// ([`CapacityReservationFleetRecord::view`]), not a second copy of it.
+#[derive(Debug, Clone)]
+pub struct CapacityReservationFleetRecord {
+    /// The Fleet as the model shapes it, carrying the state reached so far and the Capacity
+    /// Reservations it reserves its capacity through.
+    pub view: CapacityReservationFleet,
+    /// The move the clock owes this Fleet, while one is owed.
+    pub pending: Option<CapacityReservationFleetTransition>,
+}
+
+impl CapacityReservationFleetRecord {
+    /// The Fleet's `CapacityReservationFleetState` as it was last reported.
+    pub fn state(&self) -> &str {
+        self.view.state.as_deref().unwrap_or_default()
+    }
+
+    /// The Fleet's own id.
+    pub fn capacity_reservation_fleet_id(&self) -> &str {
+        self.view
+            .capacity_reservation_fleet_id
+            .as_deref()
+            .unwrap_or_default()
+    }
+
+    /// Start cancelling this Fleet, answering the state it was in, or `None` when its
+    /// current state is not one a cancellation runs from
+    /// ([`CAPACITY_RESERVATION_FLEET_CANCELLABLE_STATES`]).
+    ///
+    /// "The Capacity Reservation Fleet's status changes to `cancelled`"
+    /// (`CancelCapacityReservationFleets`) by way of `cancelling`, "the process of being
+    /// cancelled" the state catalog names — so the caller is answered the transient state
+    /// and the clock owes the terminal one. Any move that was owed before (a `submitted`
+    /// Fleet's `active`) is REPLACED: the Fleet is being cancelled, not activated.
+    pub fn begin_cancellation(&mut self) -> Option<String> {
+        let previous = self.state().to_string();
+        if !CAPACITY_RESERVATION_FLEET_CANCELLABLE_STATES.contains(&previous.as_str()) {
+            return None;
+        }
+        self.view.state = Some(CAPACITY_RESERVATION_FLEET_STATE_CANCELLING.to_string());
+        self.pending = Some(CapacityReservationFleetTransition::starting_now(
+            CAPACITY_RESERVATION_FLEET_STATE_CANCELLED,
+        ));
+        Some(previous)
+    }
+
+    /// Apply the move the clock owed this Fleet.
+    ///
+    /// `active` is where the Fleet "has fulfilled its total target capacity and it is
+    /// attempting to maintain this capacity" (`CapacityReservationFleet$State`): the capacity
+    /// was reserved by the create, so reaching it changes the Fleet's state word and nothing
+    /// else. `cancelled` is the end of a cancellation, where "The individual Capacity
+    /// Reservations in the Fleet are cancelled" (`CancelCapacityReservationFleets`) — so the
+    /// Fleet then holds no capacity and reports no reservations.
+    fn apply_due_move(&mut self, to: &'static str) {
+        self.view.state = Some(to.to_string());
+        if to == CAPACITY_RESERVATION_FLEET_STATE_CANCELLED {
+            self.view.total_fulfilled_capacity = Some(0.0);
+            // The set is still reported, now empty: EC2's ec2Query XML carries a set element
+            // for an empty list, and a cancelled Fleet holds no Capacity Reservation.
+            self.view.instance_type_specifications = Some(Vec::new());
+        }
+        self.pending = None;
+    }
+}
+
+/// How many instances one Capacity Reservation takes to cover `total_target_capacity` at
+/// `weight` capacity units per instance: the quotient rounded UP, because an instance is not
+/// reserved in fractions.
+///
+/// A count outside the modelled `Integer` member's range is clamped to its ends rather than
+/// wrapping: `weight` is bounded below by the modelled `@range` (`min: 0.001`) and
+/// `total_target_capacity` above by `Integer`, so the clamp is unreachable for any request
+/// the boundary validator admits — it is there so the conversion cannot be lossy by
+/// construction.
+fn fleet_instance_count(total_target_capacity: i32, weight: f64) -> i32 {
+    let count = (f64::from(total_target_capacity) / weight).ceil();
+    if !count.is_finite() || count <= 0.0 {
+        return 0;
+    }
+    if count >= f64::from(i32::MAX) {
+        return i32::MAX;
+    }
+    // Inside `i32`, and integral after `ceil`, so this conversion is exact.
+    count as i32
+}
+
+/// "The capacity units that have been fulfilled"
+/// (`CapacityReservationFleet$TotalFulfilledCapacity`): the sum of what each of the Fleet's
+/// Capacity Reservations fulfils, so the Fleet's total and its reservations cannot disagree.
+pub fn fleet_fulfilled_capacity(reservations: &[FleetCapacityReservation]) -> f64 {
+    reservations
+        .iter()
+        .filter_map(|reservation| reservation.fulfilled_capacity)
+        .sum()
+}
+
+/// One instance type a Capacity Reservation Fleet reserves capacity for, as a writer has
+/// already validated it: the words come out of the modelled catalogs rather than from the
+/// request's text, and the zone is one the signed Region has.
+#[derive(Debug, Clone)]
+pub struct CapacityReservationFleetInstanceSpec {
+    /// "The instance type for which the Capacity Reservation Fleet reserves capacity"
+    /// (`ReservationFleetInstanceSpecification$InstanceType`), a member of the modelled
+    /// `InstanceType` enum.
+    pub instance_type: &'static str,
+    /// "The type of operating system for which the Capacity Reservation Fleet reserves
+    /// capacity" (`$InstancePlatform`), a member of the modelled
+    /// `CapacityReservationInstancePlatform` enum.
+    pub instance_platform: &'static str,
+    /// The Availability Zone the capacity is reserved in, and its id: "A Capacity
+    /// Reservation Fleet can't span Availability Zones", so every specification of one
+    /// Fleet carries the same zone.
+    pub availability_zone: String,
+    /// The id of [`Self::availability_zone`], resolved against the signed Region's zones.
+    pub availability_zone_id: String,
+    /// "The number of capacity units provided by the specified instance type" (`$Weight`),
+    /// defaulted to [`DEFAULT_FLEET_INSTANCE_WEIGHT`].
+    pub weight: f64,
+    /// "The priority to assign to the instance type […] A lower value indicates a high
+    /// priority" (`$Priority`), or `None` when the request assigned none.
+    pub priority: Option<i32>,
+    /// "Indicates whether the Capacity Reservation Fleet supports EBS-optimized instances
+    /// types" (`$EbsOptimized`).
+    pub ebs_optimized: bool,
+}
+
+/// What a writer must say to store a Capacity Reservation Fleet; everything else about the
+/// record — the Fleet's id, its ARN, the state it starts in, the Capacity Reservations it
+/// reserves through, the move the clock owes it and the bytes it charges — is derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_capacity_reservation_fleet`].
+#[derive(Debug, Clone)]
+pub struct CapacityReservationFleetSpec {
+    /// The Region the request was signed for, which the Fleet's ARN names.
+    pub region: String,
+    /// The allocation strategy the Fleet reserves capacity by, as a `&'static str` out of
+    /// this module's catalog ([`FLEET_ALLOCATION_STRATEGY_PRIORITIZED`]).
+    pub allocation_strategy: &'static str,
+    /// The instance matching criteria every Capacity Reservation of the Fleet inherits, out
+    /// of the GENERATED catalog of the modelled `FleetInstanceMatchCriteria` enum
+    /// (`crate::ops::types::FLEET_INSTANCE_MATCH_CRITERIA_VALUES`), whose single member
+    /// `open` is also the default — "Currently, Capacity Reservation Fleets support `open`
+    /// instance matching criteria only" (`CapacityReservationFleet$InstanceMatchCriteria`).
+    pub instance_match_criteria: &'static str,
+    /// The tenancy every Capacity Reservation of the Fleet inherits, out of the GENERATED
+    /// catalog of the modelled `FleetCapacityReservationTenancy` enum
+    /// (`crate::ops::types::FLEET_CAPACITY_RESERVATION_TENANCY_VALUES`), whose single member
+    /// is "`default` - The Capacity Reservation Fleet is created on hardware that is shared
+    /// with other Amazon Web Services accounts" (`CapacityReservationFleet$Tenancy`).
+    pub tenancy: &'static str,
+    /// "The total number of capacity units to be reserved by the Capacity Reservation
+    /// Fleet" (`CreateCapacityReservationFleetRequest$TotalTargetCapacity`).
+    pub total_target_capacity: i32,
+    /// "The date and time at which the Capacity Reservation Fleet expires"
+    /// (`$EndDate`), or `None` for a Fleet the request gave no end date.
+    pub end_date: Option<::aws_smithy_types::DateTime>,
+    /// The instance types the Fleet may reserve capacity for, in the order the request gave
+    /// them.
+    pub instance_specs: Vec<CapacityReservationFleetInstanceSpec>,
+    /// The tags the request's `TagSpecifications` assign to the Fleet.
+    pub tags: Vec<Tag>,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another Capacity Reservation Fleet fits inside the store's ceiling
+    /// ([`MAX_CAPACITY_RESERVATION_FLEETS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses with
+    /// [`capacity_reservation_fleet_limit_exceeded`] when it answers `false`.
+    pub fn has_capacity_reservation_fleet_capacity(&self) -> bool {
+        self.capacity_reservation_fleets.len() < MAX_CAPACITY_RESERVATION_FLEETS
+    }
+
+    /// The Capacity Reservations one Fleet reserves its target capacity through: one per
+    /// instance type specification the request named, in the order it named them.
+    ///
+    /// "Information about the instance types for which to reserve the capacity"
+    /// (`CapacityReservationFleet$InstanceTypeSpecifications`) — every specification is
+    /// reported, carrying what the Fleet reserved on it. WHICH of them that is follows the
+    /// allocation strategy: `prioritized` "uses the priority that you assigned to each
+    /// instance type to determine which of the specified instance types to use" first,
+    /// moving on only when the capacity it asked for is not available
+    /// (`CreateCapacityReservationFleetRequest$AllocationStrategy`), and "A lower value
+    /// indicates a high priority" (`ReservationFleetInstanceSpecification$Priority`), a
+    /// specification that assigned none coming after every one that did. The capacity this
+    /// emulator reserves is always available, so the highest-priority specification covers
+    /// the whole target and the others reserve nothing.
+    ///
+    /// How many instances covering the target takes is the target capacity divided by what
+    /// one instance of that type provides, rounded UP: "This value, together with the total
+    /// target capacity that you specify for the Fleet determine the number of instances for
+    /// which the Fleet reserves capacity" (`$Weight`), and an instance is not reserved in
+    /// fractions — so the capacity fulfilled is that count times the weight, which is at
+    /// least the target. A specification nothing was reserved on holds no Capacity
+    /// Reservation, so it reports neither an id nor a create date: there is no reservation to
+    /// name.
+    fn fleet_capacity_reservations(
+        &mut self,
+        spec: &CapacityReservationFleetSpec,
+        created_at: SystemTime,
+    ) -> Vec<FleetCapacityReservation> {
+        // The specification the strategy reserves on: the lowest `Priority` value, the
+        // earliest of them when several share it (`min_by_key` keeps the first).
+        let chosen = spec
+            .instance_specs
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, instance_spec)| instance_spec.priority.unwrap_or(i32::MAX))
+            .map(|(index, _)| index);
+        let mut reservations: Vec<FleetCapacityReservation> =
+            Vec::with_capacity(spec.instance_specs.len());
+        for (index, instance_spec) in spec.instance_specs.iter().enumerate() {
+            let weight = if instance_spec.weight > 0.0 {
+                instance_spec.weight
+            } else {
+                DEFAULT_FLEET_INSTANCE_WEIGHT
+            };
+            let reserved_here = chosen == Some(index);
+            let total_instance_count = if reserved_here {
+                fleet_instance_count(spec.total_target_capacity, weight)
+            } else {
+                0
+            };
+            reservations.push(FleetCapacityReservation {
+                capacity_reservation_id: reserved_here
+                    .then(|| self.next_id(CAPACITY_RESERVATION_ID_PREFIX)),
+                availability_zone: Some(instance_spec.availability_zone.clone()),
+                availability_zone_id: Some(instance_spec.availability_zone_id.clone()),
+                instance_type: Some(instance_spec.instance_type.to_string()),
+                instance_platform: Some(instance_spec.instance_platform.to_string()),
+                total_instance_count: Some(total_instance_count),
+                fulfilled_capacity: Some(f64::from(total_instance_count) * weight),
+                ebs_optimized: Some(instance_spec.ebs_optimized),
+                create_date: reserved_here.then(|| system_time_to_date_time(created_at)),
+                weight: Some(weight),
+                priority: instance_spec.priority,
+            });
+        }
+        reservations
+    }
+
+    /// Store a Capacity Reservation Fleet and answer it as it was stored.
+    ///
+    /// The one way a Fleet is stored, so the id it carries, the ARN it reports, the state it
+    /// starts in, the Capacity Reservations it reserves through, the move the clock owes it
+    /// and the bytes it charges cannot be built two ways.
+    ///
+    /// The CALL reserves the capacity: "Creates a Capacity Reservation Fleet"
+    /// (`CreateCapacityReservationFleet`) answers with the
+    /// `FleetCapacityReservations` it created and the capacity they fulfil, so those are
+    /// facts of the create rather than of a later instant. What the Fleet still owes the
+    /// clock is its own STATE word: a Fleet is answered in the non-terminal `submitted`,
+    /// where "Amazon Elastic Compute Cloud is preparing to create the Capacity Reservations"
+    /// (`CapacityReservationFleet$State`), and reaches `active` one [`TRANSITION_DELAY`]
+    /// later.
+    ///
+    /// What comes back is the stored view itself, so a create answers exactly what a later
+    /// `DescribeCapacityReservationFleets` will report without reading the store a second
+    /// time.
+    pub fn insert_capacity_reservation_fleet(
+        &mut self,
+        spec: CapacityReservationFleetSpec,
+    ) -> CapacityReservationFleet {
+        let fleet_id = self.next_id(CAPACITY_RESERVATION_FLEET_ID_PREFIX);
+        let created_at = SystemTime::now();
+        let reservations = self.fleet_capacity_reservations(&spec, created_at);
+        let view = CapacityReservationFleet {
+            capacity_reservation_fleet_id: Some(fleet_id.clone()),
+            // "The ARN of the Capacity Reservation Fleet"
+            // (`CapacityReservationFleet$CapacityReservationFleetArn`): an EC2 ARN in the
+            // Region the request was signed for, under the resource type the modelled
+            // `ResourceType` catalog publishes for this resource.
+            capacity_reservation_fleet_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("{RESOURCE_TYPE_CAPACITY_RESERVATION_FLEET}/{fleet_id}"),
+            )),
+            state: Some(CAPACITY_RESERVATION_FLEET_STATE_SUBMITTED.to_string()),
+            total_target_capacity: Some(spec.total_target_capacity),
+            // "The capacity units that have been fulfilled" — what the Capacity Reservations
+            // this call created fulfil, summed in one place.
+            total_fulfilled_capacity: Some(fleet_fulfilled_capacity(&reservations)),
+            tenancy: Some(spec.tenancy.to_string()),
+            end_date: spec.end_date,
+            create_time: Some(system_time_to_date_time(created_at)),
+            instance_match_criteria: Some(spec.instance_match_criteria.to_string()),
+            allocation_strategy: Some(spec.allocation_strategy.to_string()),
+            instance_type_specifications: Some(reservations),
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(tag_list_bytes(view.tags.as_deref().unwrap_or_default()));
+        let stored = view.clone();
+        self.capacity_reservation_fleets.insert(
+            fleet_id,
+            CapacityReservationFleetRecord {
+                view,
+                pending: Some(CapacityReservationFleetTransition::starting_now(
+                    CAPACITY_RESERVATION_FLEET_STATE_ACTIVE,
+                )),
+            },
+        );
+        stored
+    }
+
+    /// Apply every Capacity Reservation Fleet move the clock owes, as of `now`.
+    ///
+    /// Called by [`Self::materialize_due_transitions`], which is the one place every owed
+    /// move is applied from.
+    fn materialize_due_capacity_reservation_fleet_moves(&mut self, now: Instant) {
+        for record in self.capacity_reservation_fleets.values_mut() {
+            let due = record
+                .pending
+                .as_ref()
+                .filter(|pending| now >= pending.due_at)
+                .map(|pending| pending.to);
+            if let Some(to) = due {
+                record.apply_due_move(to);
+            }
+        }
+    }
+}
 // ---------------------------------------------------------------------------
 // Network Access Scopes and their analyses
 // ---------------------------------------------------------------------------

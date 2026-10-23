@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCapacityReservationFleet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCapacityReservationFleet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCapacityReservationFleet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a Capacity Reservation Fleet: one Fleet record per call, in the non-terminal
+//! `submitted` state the clock owes `active`, reserving its target capacity through the
+//! Capacity Reservations the `prioritized` allocation strategy chooses. The ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +186,372 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCapacityReservationFleet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCapacityReservationFleetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCapacityReservationFleet"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            availability_zones_in_region, capacity_reservation_fleet_limit_exceeded,
+            offered_instance_types, request_region, require_service_state,
+            system_time_to_date_time, tag_list_bytes, tags_from_specifications,
+            CapacityReservationFleetInstanceSpec, CapacityReservationFleetSpec,
+            DEFAULT_FLEET_INSTANCE_WEIGHT, FLEET_ALLOCATION_STRATEGY_PRIORITIZED,
+            MAX_CLIENT_TOKEN_CHARS, MAX_FLEET_INSTANCE_TYPE_SPECIFICATIONS, MAX_STORED_BYTES,
+            RESOURCE_TYPE_CAPACITY_RESERVATION_FLEET,
+        };
+
+        // The Region of the request's SigV4 credential scope: a Capacity Reservation Fleet
+        // reserves capacity in one Availability Zone of one Region, and the zone a
+        // specification names is resolved against that Region's zones. It is also the Region
+        // the Fleet's ARN names.
+        let region = request_region(ctx.parts());
+
+        // "Currently, only the `prioritized` allocation strategy is supported […] Valid
+        // values: `prioritized`" (`$AllocationStrategy`) — a plain `String` in the model, so
+        // this handler is the only place that catalog can be enforced. A request that names
+        // none gets the one strategy there is.
+        let allocation_strategy = match input.allocation_strategy.as_deref() {
+            None | Some(FLEET_ALLOCATION_STRATEGY_PRIORITIZED) => {
+                FLEET_ALLOCATION_STRATEGY_PRIORITIZED
+            }
+            Some(other) => {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{other}' for allocationStrategy. \
+                     Valid values: {FLEET_ALLOCATION_STRATEGY_PRIORITIZED}"
+                )));
+            }
+        };
+
+        // The two single-member enums of this operation: "Currently, Capacity Reservation
+        // Fleets support `open` instance matching criteria only" (`$InstanceMatchCriteria`)
+        // and the modelled `FleetCapacityReservationTenancy` (`$Tenancy`). The catalogs are
+        // the GENERATED ones, so this crate holds no second copy of either, and a request
+        // that names neither inherits the single value each publishes.
+        let instance_match_criteria = catalog_word(
+            input.instance_match_criteria.as_deref(),
+            FLEET_INSTANCE_MATCH_CRITERIA_VALUES,
+            "instanceMatchCriteria",
+        )?;
+        let tenancy = catalog_word(
+            input.tenancy.as_deref(),
+            FLEET_CAPACITY_RESERVATION_TENANCY_VALUES,
+            "tenancy",
+        )?;
+
+        // "The total number of capacity units to be reserved by the Capacity Reservation
+        // Fleet" (`$TotalTargetCapacity`): a Fleet that reserves no capacity units reserves
+        // nothing, which is not something to answer with a success.
+        if input.total_target_capacity < 1 {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for totalTargetCapacity. It must be at least 1",
+                input.total_target_capacity
+            )));
+        }
+
+        // "The date and time at which the Capacity Reservation Fleet expires. When the
+        // Capacity Reservation Fleet expires, its state changes to `expired`" (`$EndDate`):
+        // an end date already behind us names a Fleet that is over before it is created.
+        let now = ::std::time::SystemTime::now();
+        if let Some(end_date) = input.end_date {
+            if end_date.as_secs_f64() <= system_time_to_date_time(now).as_secs_f64() {
+                return Err(Scaffolded::invalid_parameter_value(
+                    "Invalid value for endDate. It must be a time in the future",
+                ));
+            }
+        }
+
+        // "Information about the instance types for which to reserve the capacity"
+        // (`$InstanceTypeSpecifications`): a Fleet reserves capacity FOR instance types, so
+        // one that names none has nothing to reserve. The model declares no `@length` for
+        // the list, so its ceiling is enforced here.
+        let specifications = input.instance_type_specifications.as_deref().unwrap_or(&[]);
+        if specifications.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "instanceTypeSpecifications must name at least one instance type for \
+                 which to reserve capacity",
+            ));
+        }
+        if specifications.len() > MAX_FLEET_INSTANCE_TYPE_SPECIFICATIONS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "instanceTypeSpecifications carries {} entries, above the maximum of \
+                 {MAX_FLEET_INSTANCE_TYPE_SPECIFICATIONS}",
+                specifications.len()
+            )));
+        }
+
+        let zones = availability_zones_in_region(&region);
+        let mut instance_specs: Vec<CapacityReservationFleetInstanceSpec> =
+            Vec::with_capacity(specifications.len());
+        for specification in specifications {
+            // "The instance type for which the Capacity Reservation Fleet reserves capacity"
+            // and "The type of operating system for which [it] reserves capacity": both come
+            // out of a modelled catalog, so the stored word is EC2's own rather than the
+            // request's text, and a misspelling is refused instead of reserving capacity
+            // nothing can run on.
+            let Some(requested_type) = specification.instance_type.as_deref() else {
+                return Err(Scaffolded::missing_parameter(
+                    "Each instanceTypeSpecification must name an instanceType",
+                ));
+            };
+            let Some(instance_type) = offered_instance_types()
+                .iter()
+                .copied()
+                .find(|offered| *offered == requested_type)
+            else {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{requested_type}' for instanceType. \
+                     EC2 offers no such instance type"
+                )));
+            };
+            let Some(requested_platform) = specification.instance_platform.as_deref() else {
+                return Err(Scaffolded::missing_parameter(
+                    "Each instanceTypeSpecification must name an instancePlatform",
+                ));
+            };
+            let instance_platform = catalog_word(
+                Some(requested_platform),
+                CAPACITY_RESERVATION_INSTANCE_PLATFORM_VALUES,
+                "instancePlatform",
+            )?;
+
+            // "The Availability Zone in which the Capacity Reservation Fleet reserves the
+            // capacity" / "The ID of the Availability Zone in which [it] reserves the
+            // capacity": the two name one zone two ways, so a specification gives one of
+            // them, and the zone has to be one the signed Region has.
+            let zone = match (
+                specification.availability_zone.as_deref(),
+                specification.availability_zone_id.as_deref(),
+            ) {
+                (Some(_), Some(_)) => {
+                    return Err(Scaffolded::invalid_parameter_combination(
+                        "Either availabilityZone or availabilityZoneId may be specified \
+                         for an instanceTypeSpecification, not both",
+                    ));
+                }
+                (None, None) => {
+                    return Err(Scaffolded::missing_parameter(
+                        "Each instanceTypeSpecification must name either availabilityZone \
+                         or availabilityZoneId",
+                    ));
+                }
+                (Some(zone_name), None) => zones
+                    .iter()
+                    .find(|zone| zone.zone_name == zone_name)
+                    .ok_or_else(|| {
+                        Scaffolded::invalid_parameter_value(format!(
+                            "Invalid value '{zone_name}' for availabilityZone. \
+                             Region '{region}' has no such Availability Zone"
+                        ))
+                    })?,
+                (None, Some(zone_id)) => zones
+                    .iter()
+                    .find(|zone| zone.zone_id == zone_id)
+                    .ok_or_else(|| {
+                        Scaffolded::invalid_parameter_value(format!(
+                            "Invalid value '{zone_id}' for availabilityZoneId. \
+                             Region '{region}' has no such Availability Zone"
+                        ))
+                    })?,
+            };
+            // "A Capacity Reservation Fleet can't span Availability Zones. All instance type
+            // specifications that you specify for the Fleet must use the same Availability
+            // Zone" (`ReservationFleetInstanceSpecification$AvailabilityZone`).
+            if let Some(first) = instance_specs.first() {
+                if first.availability_zone != zone.zone_name {
+                    return Err(Scaffolded::invalid_parameter_combination(format!(
+                        "A Capacity Reservation Fleet cannot span Availability Zones: \
+                         '{}' and '{}' were both specified",
+                        first.availability_zone, zone.zone_name
+                    )));
+                }
+            }
+
+            // "The number of capacity units provided by the specified instance type"
+            // (`$Weight`), whose modelled `@range` (0.001 … 99.999) the boundary validator
+            // has already enforced; a specification that names none is read in units of
+            // instances (`DEFAULT_FLEET_INSTANCE_WEIGHT`).
+            let weight = specification.weight.unwrap_or(DEFAULT_FLEET_INSTANCE_WEIGHT);
+            if !weight.is_finite() || weight <= 0.0 {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{weight}' for weight. \
+                     It must be the number of capacity units one instance provides"
+                )));
+            }
+            // "The priority to assign to the instance type" (`$Priority`), whose modelled
+            // `@range` has `min: 0`.
+            if specification.priority.is_some_and(|priority| priority < 0) {
+                return Err(Scaffolded::invalid_parameter_value(
+                    "Invalid value for priority. It must not be negative",
+                ));
+            }
+            instance_specs.push(CapacityReservationFleetInstanceSpec {
+                instance_type,
+                instance_platform,
+                availability_zone: zone.zone_name.clone(),
+                availability_zone_id: zone.zone_id.clone(),
+                weight,
+                priority: specification.priority,
+                // "Indicates whether the Capacity Reservation Fleet supports EBS-optimized
+                // instances types" (`$EbsOptimized`): a Fleet the request said nothing about
+                // does not.
+                ebs_optimized: specification.ebs_optimized.unwrap_or(false),
+            });
+        }
+
+        // "The tags to assign to the Capacity Reservation Fleet" (`$TagSpecifications`): the
+        // Fleet is the only resource this call creates, so a specification naming any other
+        // resource type is refused rather than accepted and discarded. The shared helper also
+        // bounds the tag count, each key and value, and the reserved `aws:` prefix.
+        let tags = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            RESOURCE_TYPE_CAPACITY_RESERVATION_FLEET,
+            Self::NAME,
+        )?;
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The moves the CLOCK already owed are materialised before any Fleet is read back, so
+        // a replayed create reports the state a describe in the same instant reports: each
+        // move was due at this instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE anything is read
+        // back or written: the flag asks whether the request WOULD have succeeded, so one
+        // that would have been refused is refused with that reason instead — and a dry run
+        // is never answered with a success body, not even the one an already-used
+        // `ClientToken` would replay.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`$ClientToken`) — one token names the Fleet it
+        // created, so a replay reports that Fleet and creates nothing. Read before the
+        // ceilings, because a replay stores nothing and so need not clear the gates a fresh
+        // create has to.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| {
+                store
+                    .capacity_reservation_fleet_client_tokens
+                    .get(token)
+                    .cloned()
+            })
+            .and_then(|fleet_id| store.capacity_reservation_fleets.get(&fleet_id))
+            .map(|record| record.view.clone());
+        if let Some(view) = replayed {
+            return Ok(fleet_created(&view));
+        }
+
+        // Nothing in this emulator reclaims a stored Fleet, so both ceilings — the number of
+        // records and the caller-chosen bytes they hold — are asked before the write.
+        if !store.has_capacity_reservation_fleet_capacity() {
+            return Err(capacity_reservation_fleet_limit_exceeded());
+        }
+        let payload_bytes = tag_list_bytes(&tags);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        let created = store.insert_capacity_reservation_fleet(CapacityReservationFleetSpec {
+            region,
+            allocation_strategy,
+            instance_match_criteria,
+            tenancy,
+            total_target_capacity: input.total_target_capacity,
+            end_date: input.end_date,
+            instance_specs,
+            tags,
+        });
+        let fleet_id = created
+            .capacity_reservation_fleet_id
+            .clone()
+            .unwrap_or_default();
+        if let Some(token) = input.client_token.clone() {
+            store
+                .capacity_reservation_fleet_client_tokens
+                .insert(token, fleet_id.clone());
+        }
+
+        // Answer the Fleet as it was STORED, so a caller is told about a Fleet a later
+        // describe will report rather than about one this handler merely built.
+        let Some(stored) = store
+            .capacity_reservation_fleets
+            .get(&fleet_id)
+            .map(|record| record.view.clone())
+        else {
+            return Err(Scaffolded::internal_error(format!(
+                "the newly created Capacity Reservation Fleet '{fleet_id}' could not be \
+                 read back"
+            )));
+        };
+        Ok(fleet_created(&stored))
+    }
+}
+
+/// The modelled word `requested` names out of `catalog`, the catalog's first value when it
+/// names none, or a refusal naming `member`.
+///
+/// `catalog` is a GENERATED `*_VALUES` constant, so an enum's members live in exactly one
+/// place; answering a `&'static str` out of it is what keeps a request's own text out of the
+/// store. Defaulting to the first value is only reached for the single-member enums this
+/// operation documents no other default for. An empty catalog cannot happen for a modelled
+/// enum, and would leave nothing to default to, so it is refused rather than guessed at.
+fn catalog_word<E>(
+    requested: Option<&str>,
+    catalog: &'static [&'static str],
+    member: &str,
+) -> Result<&'static str, crate::scaffolded::Scaffolded<E>> {
+    match requested {
+        None => catalog.first().copied().ok_or_else(|| {
+            crate::scaffolded::Scaffolded::internal_error(format!(
+                "the model publishes no value for {member}"
+            ))
+        }),
+        Some(requested) => catalog
+            .iter()
+            .copied()
+            .find(|modelled| *modelled == requested)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{requested}' for {member}. Valid values: {}",
+                    catalog.join(" | ")
+                ))
+            }),
+    }
+}
+
+/// This operation's result for the Fleet `view`.
+///
+/// `CreateCapacityReservationFleetResult` is the modelled `CapacityReservationFleet` with its
+/// members spread flat — the Fleet's Capacity Reservations under the name
+/// `FleetCapacityReservations` rather than `InstanceTypeSpecifications` — so this is a
+/// PROJECTION of the one stored view, never a second copy of it: the create and the describe
+/// cannot report one Fleet differently.
+fn fleet_created(view: &CapacityReservationFleet) -> CreateCapacityReservationFleetOutput {
+    CreateCapacityReservationFleetOutput {
+        capacity_reservation_fleet_id: view.capacity_reservation_fleet_id.clone(),
+        state: view.state.clone(),
+        total_target_capacity: view.total_target_capacity,
+        total_fulfilled_capacity: view.total_fulfilled_capacity,
+        instance_match_criteria: view.instance_match_criteria.clone(),
+        allocation_strategy: view.allocation_strategy.clone(),
+        create_time: view.create_time,
+        end_date: view.end_date,
+        tenancy: view.tenancy.clone(),
+        fleet_capacity_reservations: view.instance_type_specifications.clone(),
+        tags: view.tags.clone(),
     }
 }

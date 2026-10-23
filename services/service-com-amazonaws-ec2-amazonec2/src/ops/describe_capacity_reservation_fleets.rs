@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCapacityReservationFleets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCapacityReservationFleets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCapacityReservationFleets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Capacity Reservation Fleets the account holds, narrowed by
+//! `CapacityReservationFleetIds` and `Filters` and paged in `CapacityReservationFleetId`
+//! order. The ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +141,257 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCapacityReservationFleets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCapacityReservationFleetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCapacityReservationFleets"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            capacity_reservation_fleet_id_is_well_formed, decode_page_token, encode_page_token,
+            invalid_capacity_reservation_fleet_id_malformed,
+            invalid_capacity_reservation_fleet_id_not_found, invalid_pagination_token_for,
+            require_service_state, CompiledFilter, MatchBudget, MAX_FILTERS,
+            MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — the store
+        // holds Capacity Reservation Fleets per account, so the Region a request was signed
+        // for does not narrow them. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let requested_ids = input
+            .capacity_reservation_fleet_ids
+            .clone()
+            .unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "CapacityReservationFleetIds carries {} ids, above the maximum of \
+                 {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+        // Something that is not a Fleet id at all is refused BEFORE the store is read, so a
+        // caller can tell a typo from a Fleet the account does not hold.
+        for fleet_id in &requested_ids {
+            if !capacity_reservation_fleet_id_is_well_formed(fleet_id) {
+                return Err(invalid_capacity_reservation_fleet_id_malformed(fleet_id));
+            }
+        }
+
+        // Matching cost is filters x values x held values x stored Fleets and the model
+        // bounds none of them, so the request-controlled factors are capped here, before any
+        // work proportional to them is done — and their PRODUCT is charged to one
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any Fleet
+        // would have matched it, so an unsupported filter can never read as "no results".
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !CAPACITY_RESERVATION_FLEET_FILTERS.contains(&name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token to use to retrieve the next page of results" — anything else is refused
+        // rather than read as an id, and it is refused before any other member is looked at,
+        // so whether a bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // A reporting operation may materialise the moves the CLOCK already owed — a
+        // `submitted` Fleet's `active`, a `cancelling` Fleet's `cancelled` — because each was
+        // due at this instant whether or not anybody called, so applying them changes nothing
+        // a later caller would not have seen anyway. It is also what makes the `state` filter
+        // below compare against the state the caller is shown.
+        store.materialize_due_transitions();
+
+        // "The IDs of the Capacity Reservation Fleets to describe": an id that names no Fleet
+        // of the account is an error, not an absent row.
+        for fleet_id in &requested_ids {
+            if !store.capacity_reservation_fleets.contains_key(fleet_id) {
+                return Err(invalid_capacity_reservation_fleet_id_not_found(fleet_id));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named Fleet
+        // resolved: the flag asks whether the request WOULD have succeeded, so one that would
+        // have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored Fleets,
+        // filters, values, held values and value length is bounded however the caller
+        // combines them — which is also what bounds how long this holds the state lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<CapacityReservationFleet> = Vec::new();
+        for record in store.capacity_reservation_fleets.values() {
+            if budget.exhausted() {
+                break;
+            }
+            // The id narrowing is read off the stored record, so a Fleet the request did not
+            // name costs no comparison at all.
+            if !requested_ids.is_empty()
+                && !requested_ids
+                    .iter()
+                    .any(|id| record.capacity_reservation_fleet_id() == id.as_str())
+            {
+                continue;
+            }
+            if matches_every_filter(&record.view, &selectors, &mut budget) {
+                selected.push(record.view.clone());
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `CapacityReservationFleetId` order, which the cursor below names a position
+        // in. The store is an ordered map, so its iteration order already satisfies this
+        // sort; doing it here establishes the invariant the cursor depends on at the point of
+        // use.
+        selected.sort_by(|left, right| {
+            left.capacity_reservation_fleet_id
+                .cmp(&right.capacity_reservation_fleet_id)
+        });
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|fleet| {
+                fleet
+                    .capacity_reservation_fleet_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // `MaxResults` carries the modelled `range 1..100`
+        // (`smithy_query(query="shape",shape="DescribeCapacityReservationFleetsMaxResults")`),
+        // so the boundary validator has already refused anything outside it, and a request
+        // that names no page size gets the largest page this operation serves — the
+        // `NextToken` path then behaves the same whether or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_FLEETS_PER_PAGE)
+            .clamp(1, MAX_FLEETS_PER_PAGE);
+
+        // A token only when a Fleet follows this page: "This value is null when there are no
+        // more results to return" (`DescribeCapacityReservationFleetsResult$NextToken`).
+        let next_token = page
+            .get(limit)
+            .and_then(|fleet| fleet.capacity_reservation_fleet_id.as_deref())
+            .map(encode_page_token);
+
+        Ok(DescribeCapacityReservationFleetsOutput {
+            capacity_reservation_fleets: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
     }
+}
+
+/// The filter names this operation documents, from
+/// `DescribeCapacityReservationFleetsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeCapacityReservationFleetsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// That list is exactly these four — this operation documents NO tag filter, unlike the
+/// describes that do, so `tag:<key>` is as undocumented here as any other misspelling. Every
+/// entry must be answered by [`filter_values`].
+const CAPACITY_RESERVATION_FLEET_FILTERS: [&str; 4] = [
+    "allocation-strategy",
+    "instance-match-criteria",
+    "state",
+    "tenancy",
+];
+
+/// The largest page this operation serves, and the size a request that names none gets: the
+/// modelled maximum of `DescribeCapacityReservationFleetsMaxResults`
+/// (`smithy_query(query="operation",operation="DescribeCapacityReservationFleets")` reports
+/// `range {min: 1, max: 100}`).
+const MAX_FLEETS_PER_PAGE: usize = 100;
+
+/// The values the EC2 filter `name` compares against this Fleet.
+///
+/// A filter naming an attribute this Fleet does not carry compares against NO values, so it
+/// selects nothing — the same answer AWS gives for any member a resource has not got.
+/// `name` is one of [`CAPACITY_RESERVATION_FLEET_FILTERS`].
+fn filter_values<'a>(
+    fleet: &'a CapacityReservationFleet,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "allocation-strategy" => text(fleet.allocation_strategy.as_deref()),
+        "instance-match-criteria" => text(fleet.instance_match_criteria.as_deref()),
+        "state" => text(fleet.state.as_deref()),
+        "tenancy" => text(fleet.tenancy.as_deref()),
+        // Unreachable: the filter-name check has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `fleet` satisfy every filter?
+///
+/// The AND/OR evaluation, the wildcard matching and the budget charging all live in
+/// [`crate::state::matches_every_filter`], so this operation only says WHERE a filter's
+/// values come from.
+fn matches_every_filter(
+    fleet: &CapacityReservationFleet,
+    selectors: &[crate::state::CompiledFilter],
+    budget: &mut crate::state::MatchBudget,
+) -> bool {
+    crate::state::matches_every_filter(selectors, budget, &|name| filter_values(fleet, name))
 }
