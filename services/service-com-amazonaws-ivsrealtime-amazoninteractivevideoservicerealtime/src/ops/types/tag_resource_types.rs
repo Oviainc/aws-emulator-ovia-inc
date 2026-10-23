@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#TagResourceRequest")]
+// `skip_validation = ["resourceArn"]`: see the same attribute on `ListTagsForResourceInput`
+// — the modelled `ResourceArn` `@pattern` cannot be satisfied by any IVS ARN that exists,
+// so the walk must not refuse the label and `crate::state::check_resource_arn` takes its
+// place in the handler.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.ivsrealtime#TagResourceRequest",
+    skip_validation = ["resourceArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct TagResourceInput {
     pub resource_arn: String,

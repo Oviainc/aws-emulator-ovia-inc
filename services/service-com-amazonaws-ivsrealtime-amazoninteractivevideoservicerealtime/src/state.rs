@@ -9,8 +9,12 @@
 //! than in any one operation's file.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+use ::aws_smithy_schema_server::constraints::{validate, LengthTrait, PatternTrait};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
@@ -875,6 +879,180 @@ pub fn missing_member_violation(member_name: String) -> Violation {
         path: member_name,
         kind: ViolationKind::MissingRequiredMember,
         value: None,
+    }
+}
+
+// =============================================================================
+// The tagging surface: the `resourceArn` it admits, and the resource it names
+// =============================================================================
+//
+// `ListTagsForResource` / `TagResource` / `UntagResource` all carry the resource's ARN
+// in the `/tags/{resourceArn}` path label, and all three target the same `ResourceArn`
+// shape. Both halves of that surface live here: the admission rule for the label, and
+// the one lookup that maps an ARN onto the stored resource whose tags it names, so the
+// three operations cannot disagree about either.
+
+/// The HTTP status a successful tagging call that has NO content to report answers with.
+///
+/// `TagResource` and `UntagResource` leave their success code defaulted in the model
+/// (`@http` carries no `code:`, i.e. `codeDefaulted: true`), so the Smithy default of 200
+/// is not a statement about this service — the status is a behavioural fact, and the
+/// recorded AWS responses are what states it: both answer `204 No Content` with an empty
+/// body, which is what their output structures carry (`TagResourceResponse` and
+/// `UntagResourceResponse` declare no members). A 200 there promises a body the response
+/// does not carry, so every client path gated on 204 — conditional body parsing, caches
+/// and proxies that key on it — takes the wrong branch.
+///
+/// `ListTagsForResource` keeps the defaulted 200: it HAS content, the `tags` map.
+pub const NO_CONTENT_SUCCESS_STATUS: u16 = 204;
+
+/// The modelled `ResourceArn` `@pattern` with its resource-type element read as
+/// one-or-more of the characters the model's own character class names.
+///
+/// The model writes that element once (`[a-z-]`), which matches exactly ONE character,
+/// so taken literally no IVS ARN that exists could satisfy it — every resource type in
+/// this model's ARN shapes (`stage`, `encoder-configuration`, `ingest-configuration`,
+/// `storage-configuration`, `composition`, `public-key`) is longer than one character,
+/// and the recordings show AWS accepting `…:stage/<id>` on all three tagging operations
+/// and round-tripping that stage's tags. Repeating the group is the only reading of the
+/// model under which the recorded behaviour is possible; everything else about the
+/// pattern — the literal `arn:aws:ivs:` prefix, the region, account and id classes — is
+/// the model's, unchanged.
+const RESOURCE_ARN_PATTERN: &str = r"^arn:aws:ivs:[a-z0-9-]+:[0-9]+:[a-z-]+/[a-zA-Z0-9-]+$";
+
+/// `ResourceArn`: the modelled `@length(1..128)` plus [`RESOURCE_ARN_PATTERN`].
+static RESOURCE_ARN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(128))));
+    traits.insert(Box::new(PatternTrait::new(RESOURCE_ARN_PATTERN)));
+    traits
+});
+
+/// The `resourceArn` member schema the framework's constraint walk reads: its name gives
+/// the violation path and its trait map carries the constraints.
+static M_RESOURCE_ARN: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ivsrealtime#TaggedResource$resourceArn",
+        "com.amazonaws.ivsrealtime",
+        "resourceArn",
+    ),
+    ShapeType::String,
+    "resourceArn",
+    0,
+)
+.with_traits(&RESOURCE_ARN_TRAITS);
+
+/// The root of the shadow input the walk is driven over. Its member list is empty on
+/// purpose: the walk visits what [`TaggedResource`] WRITES, and a root struct schema
+/// carries no member name, so it contributes no path segment.
+static TAGGED_RESOURCE_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "com.amazonaws.ivsrealtime#TaggedResource",
+        "com.amazonaws.ivsrealtime",
+        "TaggedResource",
+    ),
+    ShapeType::Structure,
+    &[],
+);
+
+/// One request's `resourceArn`, written for the validating walk the way the codec writes
+/// a string member.
+struct TaggedResource<'a> {
+    resource_arn: &'a str,
+}
+
+impl SerializableStruct for TaggedResource<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&M_RESOURCE_ARN, self.resource_arn)
+    }
+}
+
+/// Check a tagging call's `resourceArn` against the member's modelled `@length` and
+/// [`RESOURCE_ARN_PATTERN`]. `Err` is the sentence to put on the `ValidationException`.
+///
+/// The check is run by the FRAMEWORK's own constraint walk over the member schema above,
+/// and the refusal is worded by [`stated_violations`] — the same two steps every other
+/// refusal of this service goes through — so an ARN refused here is refused and worded
+/// exactly as one the boundary walk refuses. The boundary cannot do it itself: the
+/// modelled pattern is unsatisfiable (see [`RESOURCE_ARN_PATTERN`]), so each tagging
+/// input carries `skip_validation = ["resourceArn"]` and this takes its place.
+pub fn check_resource_arn(operation: &str, resource_arn: &str) -> Result<(), String> {
+    let violations: Vec<Violation> = validate(&TaggedResource { resource_arn }, &TAGGED_RESOURCE_SCHEMA);
+    match stated_violations(operation, &violations) {
+        None => Ok(()),
+        Some(message) => Err(message),
+    }
+}
+
+/// Tags one resource may carry, from the modelled `Tags` `@length(0..50)`
+/// (`smithy_query(query="shape", shape="Tags")`).
+///
+/// The framework's walk bounds the map ONE REQUEST sent; the bound is on the RESOURCE's
+/// tag set, so `TagResource` checks the set its call would leave behind — a rule about
+/// stored state, which no input shape expresses.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// Refuse a call that would leave a resource carrying more than
+/// [`MAX_TAGS_PER_RESOURCE`] tags. `Err` is the sentence to put on the
+/// `ValidationException`.
+///
+/// Worded through [`violation_clause`], so the refusal reads like the `@length` refusal
+/// the framework's walk words for a map member — the operation, the member path, the
+/// maximum and what the request would leave.
+pub fn check_tag_count(operation: &str, found: usize) -> Result<(), String> {
+    if found <= MAX_TAGS_PER_RESOURCE {
+        return Ok(());
+    }
+    Err(violation_clause(
+        operation,
+        &Violation {
+            path: "tags".to_string(),
+            kind: ViolationKind::MaxLength(
+                i64::try_from(MAX_TAGS_PER_RESOURCE).unwrap_or(i64::MAX),
+            ),
+            // The walk renders a collection as `"<n> items"`, which is what
+            // `violation_clause` reads the found count back off.
+            value: Some(format!("{found} items")),
+        },
+    ))
+}
+
+/// The resource type an IVS ARN names (`stage`, `encoder-configuration`, …), or `None`
+/// when the string carries no sixth `:`-field at all.
+///
+/// The type is that field up to its `/`, from the ARN form every ARN shape in this model
+/// pins: `arn:aws:ivs:<region>:<account>:<type>/<id>`.
+pub fn arn_resource_type(arn: &str) -> Option<&str> {
+    arn.split(':').nth(5)?.split('/').next()
+}
+
+/// The tags attached to the resource `arn` names, or `None` when this store holds no
+/// such resource.
+///
+/// A stage is the one resource type this store can hold: `CreateStage` is the only
+/// create this service implements, so every other resource type in its ARN shapes names
+/// nothing, and a well-formed ARN naming one is answered exactly as an ARN naming a
+/// deleted stage is — not found. Each such create is its own gap issue, and when one
+/// lands its record joins the match below.
+pub fn resource_tags(
+    state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    arn: &str,
+) -> Option<HashMap<String, String>> {
+    match arn_resource_type(arn)? {
+        "stage" => state.stages.get(arn).map(|stage| stage.tags.clone()),
+        _ => None,
+    }
+}
+
+/// The `tags` of the resource `arn` names, to be changed in place. `None` when this
+/// store holds no such resource; see [`resource_tags`].
+pub fn resource_tags_mut<'a>(
+    state: &'a mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    arn: &str,
+) -> Option<&'a mut HashMap<String, String>> {
+    match arn_resource_type(arn)? {
+        "stage" => state.stages.get_mut(arn).map(|stage| &mut stage.tags),
+        _ => None,
     }
 }
 
