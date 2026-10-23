@@ -87,7 +87,14 @@
 //! SAYS: the operation's own semantic validation (a grouping it will not accept), its
 //! resource lookups (a plan or a group that exists nowhere) and its dispatch — an
 //! operation nobody has implemented yet is denied rather than answered with the
-//! scaffold's 501.
+//! scaffold's 501. Because the gate sits in front of the handler, it also precedes the
+//! two stages a handler reaches before it answers: an `@idempotencyToken` lookup (a
+//! `ClientToken` a denied caller reuses cannot launder a cached success out of
+//! `CreatePricingRule`) and any per-resource result assembly (the batch association
+//! operations deny the whole call rather than report it in `FailedAssociatedResources` /
+//! `FailedDisassociatedResources`). Reading the caller and the store is all it does, so
+//! it is the same answer for every racer of a concurrent set — no racer wins and no
+//! state is mutated.
 //!
 //! One refusal still comes BEFORE it: the boundary's modelled-constraint refusal above.
 //! That is the recorded order, not a convenience — the same recorded callers that are
@@ -214,7 +221,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// `tests/all/validation_messages.rs` drives every operation the model declares and fails
 /// when one of them is not served through the wrapper, and
 /// `every_payer_gated_operation_denies_a_caller_that_is_not_the_payer_account` in
-/// `tests/all/payer_account_gate.rs` fails when one of them is not gated.
+/// `tests/all/payer_account_gate.rs` fails when one of them is not gated, while
+/// `tests/all/payer_gate_precedes_idempotency_existence_and_assembly.rs` pins the STAGES
+/// the gate comes before (the idempotency-token lookup, resource existence resolution,
+/// per-resource result assembly and state mutation, under concurrency).
 fn pre_handler_check_table<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
 ) -> HashMap<&'static str, Box<dyn ErasedOperation>> {
