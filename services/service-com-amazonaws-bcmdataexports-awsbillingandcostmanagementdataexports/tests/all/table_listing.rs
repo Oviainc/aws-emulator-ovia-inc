@@ -456,7 +456,10 @@ async fn an_unissued_next_token_is_refused() {
 
 /// The smallest `CreateExport` request the model accepts, for the exports this suite
 /// needs only as something for the OTHER listing to page over.
-fn minimal_export_request(name: &str) -> Value {
+///
+/// `pub(crate)` so another suite that needs several exports and does not care about their
+/// definitions builds them from this one request rather than from a second copy of it.
+pub(crate) fn minimal_export_request(name: &str) -> Value {
     json!({
         "Export": {
             "Name": name,
