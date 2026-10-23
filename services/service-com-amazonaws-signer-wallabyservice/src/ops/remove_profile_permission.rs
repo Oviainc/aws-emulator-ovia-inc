@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveProfilePermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveProfilePermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveProfilePermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one cross-account permission statement from a signing profile's
+//! permission policy. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -116,6 +109,33 @@ impl From<RemoveProfilePermissionErrorModeled> for RemoveProfilePermissionError 
     }
 }
 
+/// The modelled 404 for a profile name this account holds no profile for.
+///
+/// `code` carries the condition a client branches on — the profile named by the
+/// request does not exist — which is the only machine-readable discriminator a
+/// 404 body has.
+fn profile_not_found(profile_name: &str) -> RemoveProfilePermissionError {
+    RemoveProfilePermissionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("profile with name {profile_name} does not exists")),
+        code: Some(crate::state::ERROR_CODE_PROFILE_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 404 for a statement id the profile's permission policy does not
+/// hold — including the case where the profile holds no policy at all, which is a
+/// policy holding no statement of that id.
+fn statement_not_found(profile_name: &str, statement_id: &str) -> RemoveProfilePermissionError {
+    RemoveProfilePermissionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "statement id {statement_id} does not exist in the permissions of profile \
+             {profile_name}"
+        )),
+        code: Some(crate::state::permissions::ERROR_CODE_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
 /// The `RemoveProfilePermission` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -152,18 +172,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveProfilePermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveProfilePermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveProfilePermission"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                RemoveProfilePermissionErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the signer profile store is unavailable".to_string()),
+                        code: Some(crate::state::ERROR_CODE_INTERNAL_SERVICE_ERROR.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        if !store.profiles.contains_key(&input.profile_name) {
+            return Err(profile_not_found(&input.profile_name));
+        }
+
+        let Some(policy) = store.profile_permissions.get(&input.profile_name) else {
+            return Err(statement_not_found(
+                &input.profile_name,
+                &input.statement_id,
+            ));
+        };
+
+        // `revisionId` is required here: a removal is applied only while the
+        // revision it was issued against is still current, so a writer holding a
+        // superseded revision is told rather than removing a statement it has not
+        // seen the policy in.
+        if policy.revision_id != input.revision_id {
+            return Err(
+                RemoveProfilePermissionErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "revision id {} is not the current revision of the permissions of \
+                         profile {}",
+                        input.revision_id, input.profile_name
+                    )),
+                    code: Some(crate::state::permissions::ERROR_CODE_CONFLICT.to_string()),
+                })
+                .into(),
+            );
+        }
+        if !policy.statements.contains_key(&input.statement_id) {
+            return Err(statement_not_found(
+                &input.profile_name,
+                &input.statement_id,
+            ));
+        }
+
+        // The removal moves the policy to a fresh revision, which is what this
+        // call answers with and what every later read of the policy reports. The
+        // policy itself survives its last statement going: its revision chain is
+        // what a later add has to name.
+        let revision_id = store.mint_permission_revision_id();
+        let policy = store
+            .profile_permissions
+            .get_mut(&input.profile_name)
+            .expect("the policy resolved above is still in the store");
+        policy.statements.remove(&input.statement_id);
+        policy.revision_id = revision_id;
+
+        Ok(RemoveProfilePermissionOutput {
+            revision_id: Some(policy.revision_id.clone()),
+        })
     }
 }

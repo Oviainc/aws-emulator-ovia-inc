@@ -14,6 +14,9 @@
 #[path = "all/error_responses.rs"]
 mod error_responses;
 
+#[path = "all/profile_permissions.rs"]
+mod profile_permissions;
+
 #[path = "all/profile_revocation_and_identity.rs"]
 mod profile_revocation_and_identity;
 
