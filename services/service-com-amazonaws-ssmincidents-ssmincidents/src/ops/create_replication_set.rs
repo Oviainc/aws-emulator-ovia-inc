@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReplicationSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReplicationSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Refused UNCONDITIONALLY as deprecated: Amazon Web Services stopped accepting new
+//! Incident Manager customers on November 7, 2025, and `CreateReplicationSet` now fails
+//! every call with the error code `UnsupportedOperationException`. No replication set is
+//! ever created, so this handler writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateReplicationSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The code is NOT in this operation's modelled error closure (see the contract below),
+//! so it goes out through a synthetic error shape — [`UnsupportedOperationException`]
+//! here — widened into the operation's error channel, exactly as a service's documented
+//! but unmodelled error code is handled elsewhere in this project.
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +94,85 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssmincidents-ssminciden
 // here — hence the `CreateReplicationSetError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
+/// The `message` member of the synthetic `UnsupportedOperationException` error shape.
+static UNSUPPORTED_OPERATION_EXCEPTION_MESSAGE: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "smithy.framework#UnsupportedOperationException$message",
+            "smithy.framework",
+            "message",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "message",
+        0,
+    )
+    .with_xml_name("Message");
+
+/// Schema for the synthetic `UnsupportedOperationException` error shape.
+///
+/// Deliberately in the `smithy.framework` namespace, like the scaffold's own synthetic
+/// shapes: this shape is NOT in this service's model, so it must not collide with a
+/// modelled one. The wire code comes from
+/// [`smithy_server_runtime::OperationError::shape_name`] below, not from this schema.
+static UNSUPPORTED_OPERATION_EXCEPTION_SCHEMA: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "smithy.framework#UnsupportedOperationException",
+            "smithy.framework",
+            "UnsupportedOperationException",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&UNSUPPORTED_OPERATION_EXCEPTION_MESSAGE],
+    );
+
+/// The HTTP status this refusal carries: 400.
+///
+/// The shape is not in the model, so it carries no `httpError` trait, and Smithy's
+/// default status for a client error without one is 400 — the same status every AWS
+/// model in this repo that DOES declare `UnsupportedOperationException` (CloudTrail,
+/// WorkMail, Cognito Identity Provider, AppIntegrations) gives it. A 4xx is also what
+/// keeps an SDK retry classifier from retrying a call that can never succeed.
+const UNSUPPORTED_OPERATION_EXCEPTION_STATUS: u16 = 400;
+
+/// The payload of the deprecation refusal: that this operation accepts no call.
+#[derive(Debug, Clone)]
+pub struct UnsupportedOperationException {
+    pub message: String,
+}
+
+impl UnsupportedOperationException {
+    /// The refusal every `CreateReplicationSet` call gets.
+    ///
+    /// The wording states the rule — the API is deprecated, and since when — rather
+    /// than anything about one request: the refusal does not depend on the input.
+    pub fn deprecated() -> Self {
+        Self {
+            message: "CreateReplicationSet API is deprecated since Nov 7, 2025.".to_string(),
+        }
+    }
+}
+
+impl ::std::fmt::Display for UnsupportedOperationException {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        write!(f, "UnsupportedOperationException: {}", self.message)
+    }
+}
+
+impl ::std::error::Error for UnsupportedOperationException {}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for UnsupportedOperationException {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_string(
+            &UNSUPPORTED_OPERATION_EXCEPTION_MESSAGE,
+            self.message.as_str(),
+        )?;
+        Ok(())
+    }
+}
+
 #[smithy_macros::operation_error("com.amazonaws.ssmincidents#CreateReplicationSet")]
 #[derive(Debug)]
 pub enum CreateReplicationSetErrorModeled {
@@ -105,10 +184,84 @@ pub enum CreateReplicationSetErrorModeled {
     ValidationException(ValidationException),
 }
 
-/// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::create_replication_set::CreateReplicationSetError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type CreateReplicationSetError = crate::scaffolded::Scaffolded<CreateReplicationSetErrorModeled>;
+/// This operation's error channel, as the `impl Operation` below names it
+/// (`crate::ops::create_replication_set::CreateReplicationSetError`): the scaffold
+/// wrapper (a modelled error, or a refusal) widened by the synthetic
+/// [`UnsupportedOperationException`].
+///
+/// The widening is what lets this operation answer the code AWS now answers every call
+/// with, even though the model declares no shape for it. Everything else still goes out
+/// through `crate::scaffolded::Scaffolded`, so nothing about how a modelled error
+/// renders changes.
+#[derive(Debug)]
+pub enum CreateReplicationSetError {
+    /// The framework channel: a modelled error, or a refusal.
+    Scaffolded(crate::scaffolded::Scaffolded<CreateReplicationSetErrorModeled>),
+    /// The operation is deprecated and accepts no call.
+    UnsupportedOperationException(UnsupportedOperationException),
+}
+
+impl ::std::fmt::Display for CreateReplicationSetError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Scaffolded(error) => write!(f, "{error}"),
+            Self::UnsupportedOperationException(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl ::std::error::Error for CreateReplicationSetError {
+    fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {
+        match self {
+            Self::Scaffolded(error) => error.source(),
+            Self::UnsupportedOperationException(error) => error.source(),
+        }
+    }
+}
+
+/// Every method delegates to the wrapped channel, so the synthetic variant is the only
+/// one that behaves differently — and it is the one that must carry
+/// `UnsupportedOperationException`.
+impl smithy_server_runtime::OperationError for CreateReplicationSetError {
+    fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
+        match self {
+            Self::Scaffolded(error) => error.as_serializable(),
+            Self::UnsupportedOperationException(error) => error,
+        }
+    }
+
+    fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
+        match self {
+            Self::Scaffolded(error) => error.variant_schema(),
+            Self::UnsupportedOperationException(_) => &UNSUPPORTED_OPERATION_EXCEPTION_SCHEMA,
+        }
+    }
+
+    /// The wire error code (`__type` and `x-amzn-errortype` on restJson1). Keep the
+    /// literal as it is: it is what a client branches on.
+    fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Scaffolded(error) => error.shape_name(),
+            Self::UnsupportedOperationException(_) => "UnsupportedOperationException",
+        }
+    }
+
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::Scaffolded(error) => error.http_status(),
+            Self::UnsupportedOperationException(_) => UNSUPPORTED_OPERATION_EXCEPTION_STATUS,
+        }
+    }
+
+    fn query_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Scaffolded(error) => error.query_error_code(),
+            // No `awsQueryError` trait to honour: the shape is not in the model, and
+            // Incident Manager is a restJson1 service whose clients read the code above.
+            Self::UnsupportedOperationException(_) => None,
+        }
+    }
+}
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
@@ -116,7 +269,17 @@ pub type CreateReplicationSetError = crate::scaffolded::Scaffolded<CreateReplica
 /// this operation is implemented.
 impl From<CreateReplicationSetErrorModeled> for CreateReplicationSetError {
     fn from(modeled: CreateReplicationSetErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Scaffolded(crate::scaffolded::Scaffolded::Modeled(modeled))
+    }
+}
+
+/// Same for the framework channel, so `Scaffolded::validation(..)` keeps reading the way
+/// it does in every other handler.
+impl From<crate::scaffolded::Scaffolded<CreateReplicationSetErrorModeled>>
+    for CreateReplicationSetError
+{
+    fn from(scaffolded: crate::scaffolded::Scaffolded<CreateReplicationSetErrorModeled>) -> Self {
+        Self::Scaffolded(scaffolded)
     }
 }
 
@@ -156,18 +319,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReplicationSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReplicationSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReplicationSet"))
+        let _ = (ctx, &self.engine);
+        // The operation is deprecated: AWS stopped accepting new Incident Manager
+        // customers on 2025-11-07 and every call now fails, whatever `regions`,
+        // `tags` or `clientToken` it carries. So nothing is read, nothing is stored,
+        // and no idempotency token is remembered — a replayed `clientToken` is refused
+        // the same way, because no ARN was ever minted for it.
+        let _ = &input;
+        Err(CreateReplicationSetError::UnsupportedOperationException(
+            UnsupportedOperationException::deprecated(),
+        ))
     }
 }

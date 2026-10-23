@@ -9,11 +9,11 @@
 //! * `incident_records` — what `StartIncident` creates, `GetIncidentRecord` /
 //!   `ListIncidentRecords` report, `UpdateIncidentRecord` mutates and
 //!   `DeleteIncidentRecord` removes.
-//! * `replication_sets` — the account's Incident Manager replication set(s), which
-//!   `ListReplicationSets` reports. AWS holds at most ONE per account; the map is
-//!   keyed by ARN like the other two so every replication-set read path resolves the
-//!   same stored object, and the creating path is the single place that invariant is
-//!   enforced.
+//! * `replication_sets` — the account's Incident Manager onboarding: the replication
+//!   set(s) `ListReplicationSets` reports and `GetReplicationSet` resolves an ARN
+//!   against. AWS holds at most ONE per account; the map is keyed by ARN like the
+//!   other two so every replication-set read path resolves the same stored object,
+//!   and the creating path is the single place that invariant is enforced.
 //!
 //! `idempotency` records the ARN each `@idempotencyToken` minted the first time, so a
 //! replayed `clientToken` answers with the same ARN instead of creating a second
@@ -26,7 +26,7 @@ use aws_smithy_types::DateTime;
 use crate::ops::types::{
     Action, ChatChannel, IncidentRecord, IncidentRecordSource, IncidentRecordSummary,
     IncidentTemplate, Integration, NotificationTargetItem, RegionInfo, RelatedItem,
-    TimelineEvent,
+    ReplicationSet, TimelineEvent,
 };
 
 /// The `IncidentRecordStatus` value a freshly started incident carries.
@@ -49,6 +49,8 @@ pub const MANUAL_INCIDENT_SOURCE: &str = "aws.ssm-incidents";
 pub const RESOURCE_TYPE_RESPONSE_PLAN: &str = "RESPONSE_PLAN";
 /// See [`RESOURCE_TYPE_RESPONSE_PLAN`].
 pub const RESOURCE_TYPE_INCIDENT_RECORD: &str = "INCIDENT_RECORD";
+/// See [`RESOURCE_TYPE_RESPONSE_PLAN`].
+pub const RESOURCE_TYPE_REPLICATION_SET: &str = "REPLICATION_SET";
 
 /// The `quotaCode` this emulator reports when the response-plan store is full. The
 /// model constrains neither the code's form nor its value, so it names what the quota
@@ -89,6 +91,12 @@ pub const MAX_RESPONSE_PLANS: usize = 1_000;
 /// With [`MAX_LIST_FILTERS`] this also bounds the records x filters scan
 /// `ListIncidentRecords` performs under the state lock.
 pub const MAX_INCIDENT_RECORDS: usize = 10_000;
+
+/// The most replication sets this store holds. Incident Manager onboards an account
+/// with ONE replication set — `CreateReplicationSet`'s own documentation describes "a
+/// replication set" per account, spanning up to three Regions (`regions`, `length
+/// 1..3`) — so there is never a second one to hold.
+pub const MAX_REPLICATION_SETS: usize = 1;
 
 /// The most idempotency replays remembered at once. Each distinct caller-supplied
 /// `clientToken` adds one entry, so the map is bounded and the oldest entries are
@@ -273,6 +281,22 @@ pub struct ReplicationSetEntry {
 }
 
 impl ReplicationSetEntry {
+    /// Project the stored set onto the modelled `ReplicationSet` shape
+    /// `GetReplicationSet` returns, so that read reports what was stored rather than a
+    /// fixed answer.
+    pub fn to_replication_set(&self) -> ReplicationSet {
+        ReplicationSet {
+            arn: Some(self.arn.clone()),
+            region_map: self.region_map.clone(),
+            status: self.status.clone(),
+            deletion_protected: self.deletion_protected,
+            created_time: self.created_time,
+            created_by: self.created_by.clone(),
+            last_modified_time: self.last_modified_time,
+            last_modified_by: self.last_modified_by.clone(),
+        }
+    }
+
     /// Sort key giving the stored replication sets one total order — oldest first,
     /// ties broken by ARN — so paging over the same state twice visits them in the
     /// same order. The model documents no order for `replicationSetArns` (an account
@@ -292,10 +316,10 @@ pub fn replication_set_arn(id: &str) -> String {
 
 /// Per-service state for com-amazonaws-ssmincidents-ssmincidents. A handler reaches it through [`service_state`].
 ///
-/// Every map here is bounded: `response_plans` by [`MAX_RESPONSE_PLANS`],
+/// Every map here is bounded: `response_plans` by [`MAX_RESPONSE_PLANS`] and
 /// `incident_records` by [`MAX_INCIDENT_RECORDS`] (both consulted before a create
-/// inserts), `replication_sets` by the one replication set AWS permits an account
-/// (enforced where a set is created) and `idempotency` by
+/// inserts), `replication_sets` by [`MAX_REPLICATION_SETS`] — the one replication set
+/// AWS permits an account, enforced where a set is created — and `idempotency` by
 /// [`MAX_IDEMPOTENCY_ENTRIES`] with oldest-first eviction, so no sequence of requests
 /// can make this process hold memory without limit.
 #[derive(Debug, Default)]
@@ -306,7 +330,8 @@ pub struct ComAmazonawsSsmincidentsSsmincidentsState {
     /// [`MAX_INCIDENT_RECORDS`].
     pub incident_records: HashMap<String, IncidentRecordEntry>,
     /// The account's replication set(s), keyed by replication-set ARN, as
-    /// `ListReplicationSets` reports them. AWS permits at most one per account, so
+    /// `ListReplicationSets` reports them and `GetReplicationSet` resolves an ARN
+    /// against. AWS permits at most one per account ([`MAX_REPLICATION_SETS`]), so
     /// this map is bounded by the operation that creates one: no request adds a
     /// second.
     pub replication_sets: HashMap<String, ReplicationSetEntry>,
