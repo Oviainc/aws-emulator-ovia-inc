@@ -9,7 +9,7 @@
 //! own wording for the member), which is a uniqueness constraint on a value that is not
 //! the primary key.
 //!
-//! Both resource maps are `BTreeMap`s, so a `List*` enumerates in a stable order and an
+//! Every resource map is a `BTreeMap`, so a `List*` enumerates in a stable order and an
 //! opaque `NextToken` only has to carry the ARN the last page ended on.
 //!
 //! `engagements` is keyed by `EngagementArn` for the same reason: `StopEngagement` and

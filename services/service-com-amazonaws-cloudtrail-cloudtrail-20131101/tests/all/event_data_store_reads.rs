@@ -200,12 +200,7 @@ async fn get_in(emulator: &Emulator, region: &str, identifier: &str) -> Reply {
 
 /// The error `Message` a reply carries, or `""`.
 fn message(reply: &Reply) -> &str {
-    reply
-        .body
-        .get("Message")
-        .or_else(|| reply.body.get("message"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
+    reply.message()
 }
 
 /// Assert `body` reports exactly what `record` persists.

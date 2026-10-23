@@ -83,10 +83,12 @@ fn cloudtrail_operations_route_under_the_target_prefix_an_sdk_sends() {
                     format!("{SDK_TARGET_PREFIX}GetTrail"),
                     br#"{"Name":"absent-trail"}"#,
                     // `TrailNotFoundException` carries `@httpError(404)` in the model
-                    // (`smithy_query(query="operation", operation="GetTrail")`), so a
-                    // routed read of an absent trail answers 404 — not the
-                    // dispatcher's 501.
-                    404,
+                    // (`smithy_query(query="operation", operation="GetTrail")`), but
+                    // CloudTrail answers 400 for a not-found trail on the wire
+                    // (`state::TRAIL_NOT_FOUND_STATUS`) — either way a routed read of
+                    // an absent trail is the modelled refusal, not the dispatcher's
+                    // 501.
+                    400,
                 ),
                 (
                     "a trail listing under the SDK's prefix",

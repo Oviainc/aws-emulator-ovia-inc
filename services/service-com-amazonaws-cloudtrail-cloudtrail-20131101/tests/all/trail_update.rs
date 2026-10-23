@@ -372,14 +372,16 @@ async fn an_update_is_refused_without_changing_the_trail() {
             "a well-formed name naming no trail",
             HOME_REGION,
             json!({"Name": "absent-trail"}),
-            404,
+            // CloudTrail answers a not-found trail with 400, not the 404 its model
+            // annotates; see `state::TRAIL_NOT_FOUND_STATUS`.
+            400,
             "TrailNotFoundException",
         ),
         (
             "a well-formed trail ARN naming no trail",
             HOME_REGION,
             json!({"Name": "arn:aws:cloudtrail:us-east-1:000000000000:trail/absent-trail"}),
-            404,
+            400,
             "TrailNotFoundException",
         ),
         (
@@ -533,13 +535,7 @@ async fn a_refused_trail_name_names_the_rule_it_broke() {
                 .await;
             let case = format!("{operation} with a name {case}");
             reply.expect_error(&case, 400, "InvalidTrailNameException");
-            let message = reply
-                .body
-                .get("Message")
-                .or_else(|| reply.body.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+            let message = reply.message();
             for fragment in &fragments {
                 assert!(
                     message.contains(fragment.as_str()),
@@ -550,34 +546,41 @@ async fn a_refused_trail_name_names_the_rule_it_broke() {
     }
 }
 
-/// A well-formed identifier naming no trail is refused with the identifier EXACTLY
-/// as the caller wrote it — a bare name or a trail ARN — and the account the lookup
-/// ran in, the same text whichever operation was called.
+/// A well-formed identifier naming no trail is refused with `TrailNotFoundException`
+/// at HTTP 400 — the status CloudTrail answers with, not the `@httpError(404)` its
+/// model annotates — naming the trail and the account the lookup ran in: the trail's
+/// ARN for the operations that resolve the identifier to one Region's trail
+/// (`UpdateTrail`, `GetTrailStatus`, `DeleteTrail`), and the identifier exactly as
+/// the caller wrote it for `GetTrail`, which resolves none.
 #[tokio::test]
-async fn an_unknown_trail_is_refused_naming_the_identifier_as_given() {
+async fn an_unknown_trail_is_refused_naming_the_trail_and_the_account() {
     let emulator = Emulator::new();
-    let identifiers = [
-        "absent-trail".to_string(),
-        format!("arn:aws:cloudtrail:{HOME_REGION}:000000000000:trail/absent-trail"),
-    ];
+    let account = engine::emulator_account_id();
+    let arn = format!("arn:aws:cloudtrail:{HOME_REGION}:{account}:trail/absent-trail");
+    let identifiers = ["absent-trail".to_string(), arn.clone()];
+
     for identifier in &identifiers {
-        for operation in ["UpdateTrail", "GetTrail", "GetTrailStatus", "DeleteTrail"] {
+        for operation in ["UpdateTrail", "GetTrailStatus", "DeleteTrail"] {
             let reply = emulator.call(operation, &json!({"Name": identifier})).await;
             let case = format!("{operation} with the unknown trail {identifier}");
-            reply.expect_error(&case, 404, "TrailNotFoundException");
-            let message = reply
-                .body
-                .get("Message")
-                .or_else(|| reply.body.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let expected = format!("Unknown trail: {identifier} for the user: 000000000000");
+            reply.expect_error(&case, 400, "TrailNotFoundException");
+            let message = reply.message();
+            let expected = format!("Unknown trail: {arn} for the user: {account}");
             assert_eq!(
                 message, expected,
                 "case {case}: expected {expected:?}, got {message:?}"
             );
         }
+
+        let reply = emulator.call("GetTrail", &json!({"Name": identifier})).await;
+        let case = format!("GetTrail with the unknown trail {identifier}");
+        reply.expect_error(&case, 400, "TrailNotFoundException");
+        let message = reply.message();
+        let expected = format!("Unknown trail: {identifier} for the user: {account}");
+        assert_eq!(
+            message, expected,
+            "case {case}: expected {expected:?}, got {message:?}"
+        );
     }
 }
 

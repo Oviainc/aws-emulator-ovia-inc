@@ -146,12 +146,12 @@ pub const CHANNEL_KIND: &str = "channel";
 /// How a MediaPackage error names an OriginEndpoint in `errors`.
 pub const ORIGIN_ENDPOINT_KIND: &str = "originEndpoint";
 
+/// How a MediaPackage error names a HarvestJob in `errors`.
+pub const HARVEST_JOB_KIND: &str = "harvestJob";
+
 /// The Smithy shape name of the resource an OriginEndpoint is, as the dependency refusal
 /// below names the children blocking a delete.
 pub const ORIGIN_ENDPOINT_SHAPE: &str = "OriginEndpoint";
-
-/// How a MediaPackage error names a HarvestJob in `errors`.
-pub const HARVEST_JOB_KIND: &str = "harvestJob";
 
 /// How a MediaPackage error names an IngestEndpoint in `errors` — the shape name,
 /// lowerCamel, the way every other resource type is keyed here
@@ -459,6 +459,169 @@ pub fn bound_origin_endpoint_members(
                 )?;
             }
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Durations in seconds
+//
+// Several members of an OriginEndpoint are a NUMBER OF SECONDS: a window of content to
+// retain or to publish, a segment or buffer length, a delay, an interval between
+// rotations or tags. Each is a count of seconds of media, so none of them can be
+// negative — a window of minus one hundred seconds is not a window — and MediaPackage
+// refuses a request carrying one with `UnprocessableEntityException` (422), storing
+// nothing. The model targets every one of them at the plain `__integer` shape and
+// declares no `@range`
+// (`smithy_query(query="shape",shape="com.amazonaws.mediapackage#HlsPackage",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`),
+// so the floor is not a modelled constraint the framework's own walk could refuse: it is
+// the service's rule, enforced here for EVERY such member rather than for the one a
+// client happened to get wrong.
+// ---------------------------------------------------------------------------
+
+/// The smallest value a duration-in-seconds member may carry. Zero is a real value for
+/// each of them — `StartoverWindowSeconds` 0 is startover playback disabled, and
+/// `TimeDelaySeconds` 0 no delay, which is what [`apply_origin_endpoint_defaults`] fills
+/// an absent one with — so the floor is zero and not one.
+pub const MIN_DURATION_SECONDS: i32 = 0;
+
+/// The refusal a negative duration-in-seconds member answers with: the floor it broke,
+/// keyed by that member, in the wording every other refused numeric member here uses.
+fn duration_refusal(member: &str) -> ServiceError {
+    member_invalid(
+        member,
+        format!("must be greater than or equal to {MIN_DURATION_SECONDS}"),
+    )
+}
+
+/// Refuse a negative value in any duration-in-seconds member of an OriginEndpoint create
+/// or update request, keyed by the member path the wire names.
+///
+/// Both handlers call this, so the floor one enforces cannot drift from the other's: an
+/// update must not be able to store a window a create of it would have refused. Members
+/// are judged in a fixed order (the request's own member order, outermost first), so one
+/// request is always refused by the same member — and a member's PATH is built only when
+/// that member is the one being refused, so an accepted request allocates nothing.
+pub fn bound_origin_endpoint_durations(
+    startover_window_seconds: Option<i32>,
+    time_delay_seconds: Option<i32>,
+    hls_package: Option<&HlsPackage>,
+    dash_package: Option<&DashPackage>,
+    cmaf_package: Option<&CmafPackageCreateOrUpdateParameters>,
+    mss_package: Option<&MssPackage>,
+) -> Result<(), ServiceError> {
+    /// One group of members whose paths are fixed: refuse the first negative one.
+    fn judge(members: &[(&str, Option<i32>)]) -> Result<(), ServiceError> {
+        for (member, seconds) in members {
+            if seconds.is_some_and(|seconds| seconds < MIN_DURATION_SECONDS) {
+                return Err(duration_refusal(member));
+            }
+        }
+        Ok(())
+    }
+
+    judge(&[
+        ("startoverWindowSeconds", startover_window_seconds),
+        ("timeDelaySeconds", time_delay_seconds),
+    ])?;
+    if let Some(package) = hls_package {
+        judge(&[
+            (
+                "hlsPackage.playlistWindowSeconds",
+                package.playlist_window_seconds,
+            ),
+            (
+                "hlsPackage.programDateTimeIntervalSeconds",
+                package.program_date_time_interval_seconds,
+            ),
+            (
+                "hlsPackage.segmentDurationSeconds",
+                package.segment_duration_seconds,
+            ),
+            (
+                "hlsPackage.encryption.keyRotationIntervalSeconds",
+                package
+                    .encryption
+                    .as_ref()
+                    .and_then(|encryption| encryption.key_rotation_interval_seconds),
+            ),
+        ])?;
+    }
+    if let Some(package) = dash_package {
+        judge(&[
+            (
+                "dashPackage.manifestWindowSeconds",
+                package.manifest_window_seconds,
+            ),
+            (
+                "dashPackage.minBufferTimeSeconds",
+                package.min_buffer_time_seconds,
+            ),
+            (
+                "dashPackage.minUpdatePeriodSeconds",
+                package.min_update_period_seconds,
+            ),
+            (
+                "dashPackage.segmentDurationSeconds",
+                package.segment_duration_seconds,
+            ),
+            (
+                "dashPackage.suggestedPresentationDelaySeconds",
+                package.suggested_presentation_delay_seconds,
+            ),
+            (
+                "dashPackage.encryption.keyRotationIntervalSeconds",
+                package
+                    .encryption
+                    .as_ref()
+                    .and_then(|encryption| encryption.key_rotation_interval_seconds),
+            ),
+        ])?;
+    }
+    if let Some(package) = cmaf_package {
+        judge(&[
+            (
+                "cmafPackage.segmentDurationSeconds",
+                package.segment_duration_seconds,
+            ),
+            (
+                "cmafPackage.encryption.keyRotationIntervalSeconds",
+                package
+                    .encryption
+                    .as_ref()
+                    .and_then(|encryption| encryption.key_rotation_interval_seconds),
+            ),
+        ])?;
+        // A CMAF package's child HLS manifests carry the same two window members an
+        // `HlsPackage` does, so the same floor holds for each of them, named by its index
+        // the way the wire indexes a list member — rendered only for the one refused.
+        for (index, manifest) in package.hls_manifests.iter().flatten().enumerate() {
+            for (member, seconds) in [
+                ("playlistWindowSeconds", manifest.playlist_window_seconds),
+                (
+                    "programDateTimeIntervalSeconds",
+                    manifest.program_date_time_interval_seconds,
+                ),
+            ] {
+                if seconds.is_some_and(|seconds| seconds < MIN_DURATION_SECONDS) {
+                    return Err(duration_refusal(&format!(
+                        "cmafPackage.hlsManifests[{index}].{member}"
+                    )));
+                }
+            }
+        }
+    }
+    if let Some(package) = mss_package {
+        judge(&[
+            (
+                "mssPackage.manifestWindowSeconds",
+                package.manifest_window_seconds,
+            ),
+            (
+                "mssPackage.segmentDurationSeconds",
+                package.segment_duration_seconds,
+            ),
+        ])?;
     }
     Ok(())
 }
@@ -1047,6 +1210,123 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsMediapackageMediapackageState>)
+}
+
+// ---------------------------------------------------------------------------
+// What `CreateHarvestJob` decides about a submission before it stores one
+//
+// Both rules below are about the REQUEST, not about the record: the window has to name an
+// interval of media, and the destination role has to be one this service could write as.
+// They live here, beside the store the handler guards, rather than inside the harvest-job
+// record's own section, because neither is a property of a stored job.
+// ---------------------------------------------------------------------------
+
+/// The service principal MediaPackage assumes a harvest job's `S3Destination.RoleArn` as.
+///
+/// A harvest writes to the caller's bucket as that role, so the role's trust policy has to
+/// let this principal assume it — the same up-front check every service that acts as a
+/// caller-supplied role makes.
+pub const HARVEST_SERVICE_PRINCIPAL: &str = "mediapackage.amazonaws.com";
+
+/// The instant an ISO-8601 date-time names, in NANOSECONDS since the epoch.
+///
+/// `StartTime` and `EndTime` are modelled as `__string`, so the FRAMEWORK does not parse
+/// them: the handler does, because the service compares them. Both zone spellings
+/// RFC 3339 admits are read — a `Z` instant and a numeric offset, which is what
+/// `datetime.isoformat()` produces — so two requests naming the same instant are judged
+/// the same way; a bound carrying NO zone suffix is read as UTC (see the body). The offset
+/// is resolved through the ONE shared reader every service with a string-typed timestamp
+/// uses (`service_common::rfc3339`), so nothing about reading a zone is written here; the
+/// calendar conversion stays in the maintained library.
+///
+/// The unit is nanoseconds and not seconds because RFC 3339 admits a fractional second
+/// and the comparison this feeds is a STRICT one: truncating to whole seconds would make
+/// a half-second window compare as empty and refuse a window the caller can harvest.
+///
+/// `None` for text that is not an ISO-8601 instant at all — which the caller is told
+/// about ([`instant_invalid`]) rather than silently accepted — for EVERY input, including
+/// arbitrary non-ASCII text: the text comes straight off the wire, so this must never
+/// panic.
+pub fn parse_instant(text: &str) -> Option<i128> {
+    // A bound carrying no zone suffix at all is read as UTC rather than refused: the
+    // members are modelled plain `__string` with no `@pattern`, nothing published says a
+    // zone is required, and a client sending `datetime.isoformat()` output for a naive
+    // datetime sends exactly this form. BOTH bounds are read the same way, so the ordering
+    // comparison stays well defined. Text that is not a date-time at all still fails the
+    // parse below and is refused.
+    let (civil, offset) = ::service_common::rfc3339::split_utc_offset(text).unwrap_or((text, 0));
+    let instant = ::aws_smithy_types::DateTime::from_str(
+        &format!("{civil}Z"),
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .ok()?;
+    let secs = i128::from(instant.secs().checked_sub(offset)?);
+    Some(secs * 1_000_000_000 + i128::from(instant.subsec_nanos()))
+}
+
+/// `UnprocessableEntityException` (422) for a timestamp member this service cannot read as
+/// an instant.
+pub fn instant_invalid(member: &str) -> ServiceError {
+    member_invalid(member, "must be an ISO 8601 date-time")
+}
+
+/// `UnprocessableEntityException` (422) for a harvest window whose end does not come after
+/// its start.
+///
+/// A harvest window is an interval of media, so its end has to be LATER than its start: an
+/// empty or inverted window names no content to harvest. Keyed by `endTime`, which is the
+/// member the caller has to fix (`startTime` names a real instant).
+pub fn harvest_window_invalid() -> ServiceError {
+    member_invalid("endTime", "must be later than the start time")
+}
+
+/// The IAM store a harvest job's destination role is resolved against.
+///
+/// It is the IAM service's OWN state struct, reached through the SAME shared engine this
+/// service's store lives in, so MediaPackage reads the very records `CreateRole` wrote
+/// rather than a second copy of them.
+pub type IamState =
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::ComAmazonawsIamAwsidentitymanagementv20100508State;
+
+/// The IAM store in the SAME shared engine, which is where the account's roles live.
+///
+/// This is the IAM service's OWN accessor, called rather than copied. `None` has the same
+/// meaning as for [`service_state`]: the engine carries no such store, which a handler
+/// reports as a server fault.
+pub fn iam_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<IamState>> {
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
+}
+
+/// `None` when this emulator has no reason to think MediaPackage could not write to the
+/// destination as `role_arn`; otherwise the refusal that answers the submission.
+///
+/// A harvest job writes the exported content to the caller's bucket AS that role, so the
+/// service checks up front that the role's trust policy lets
+/// [`HARVEST_SERVICE_PRINCIPAL`] assume it and refuses the submission when it does not.
+/// The role is resolved against the account's IAM records — the same records `CreateRole`
+/// wrote — by its ARN. An ARN the IAM store holds no role for is NOT evidence of a missing
+/// trust (the role may belong to another account, or to a client that never told this
+/// emulator about it), so the submission goes ahead; only a role this emulator holds and
+/// whose trust policy withholds the grant is refused.
+pub fn harvest_role_refusal(role_arn: &str, iam: &IamState) -> Option<ServiceError> {
+    let role = iam.roles.values().find(|role| role.arn == role_arn)?;
+    let document = role.assume_role_policy_document.as_deref()?;
+    match ::service_common::iam_trust_policy::admits_service_principal(
+        document,
+        HARVEST_SERVICE_PRINCIPAL,
+    ) {
+        // A document this emulator cannot read as a policy is no evidence either way.
+        None | Some(true) => None,
+        Some(false) => Some(member_invalid(
+            "s3Destination.roleArn",
+            format!(
+                "names a role {HARVEST_SERVICE_PRINCIPAL} cannot assume: check the trust \
+                 policy grants it sts:AssumeRole"
+            ),
+        )),
+    }
 }
 
 /// The modelled `Tags` map (`map<string,string>`) for a stored tag set.

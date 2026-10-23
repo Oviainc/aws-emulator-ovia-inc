@@ -28,6 +28,9 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Renders that id, and encodes the opaque ListCostCategoryDefinitions pagination cursor.
 hex = { workspace = true }
+# `rfc3339`: the one reading of the UTC offset a string-typed timestamp declares, shared
+# with every other service that has to compare two of them.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
