@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/api_lifecycle.rs"]
 mod api_lifecycle;
+#[path = "all/deployment_lifecycle.rs"]
+mod deployment_lifecycle;
 #[path = "all/integration_lifecycle.rs"]
 mod integration_lifecycle;
 #[path = "all/route_request_parameter.rs"]
