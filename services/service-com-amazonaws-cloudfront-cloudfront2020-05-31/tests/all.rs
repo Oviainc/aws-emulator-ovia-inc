@@ -21,6 +21,8 @@ mod distribution_lifecycle;
 mod distribution_tags;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/invalidation_list.rs"]
+mod invalidation_list;
 #[path = "all/key_value_store_lifecycle.rs"]
 mod key_value_store_lifecycle;
 #[path = "all/state_roundtrip.rs"]
