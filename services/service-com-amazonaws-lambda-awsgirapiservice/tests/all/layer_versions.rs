@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the layer slice: `PublishLayerVersion`, the `GetLayerVersion`
-//! read of what it stored, and the `Layers` a function's configuration reports for the
-//! layer versions it was created with.
+//! read of what it stored, `DeleteLayerVersion` taking exactly one version back out, and
+//! the `Layers` a function's configuration reports for the layer versions it was created
+//! with.
 //!
 //! Every suite drives real HTTP requests through the router, so the assertions are about
 //! the wire behaviour (status, body) rather than about any handler's internals. Each
@@ -121,6 +122,30 @@ async fn publish_layer_version(
 async fn get_layer_version(router: &MultiServiceRouter, reference: &str, version: i64) -> Answer {
     let uri = format!("/2018-10-31/layers/{reference}/versions/{version}");
     json_call(router, "GET", &uri, &Value::Null).await
+}
+
+/// `DeleteLayerVersion` on a layer reference and a version number.
+async fn delete_layer_version(router: &MultiServiceRouter, reference: &str, version: i64) -> Answer {
+    let uri = format!("/2018-10-31/layers/{reference}/versions/{version}");
+    json_call(router, "DELETE", &uri, &Value::Null).await
+}
+
+/// The `AccountUsage$TotalCodeSize` `GetAccountSettings` reports.
+async fn total_code_size(router: &MultiServiceRouter) -> i64 {
+    let settings = json_call(router, "GET", ACCOUNT_SETTINGS_URI, &Value::Null).await;
+    assert_eq!(
+        settings.status,
+        200,
+        "expected 200 from GetAccountSettings, got {} {}",
+        settings.status,
+        settings.text()
+    );
+    settings
+        .json()
+        .get("AccountUsage")
+        .and_then(|usage| usage.get("TotalCodeSize").cloned())
+        .and_then(|size| size.as_i64())
+        .unwrap_or_else(|| panic!("expected AccountUsage.TotalCodeSize, got {}", settings.text()))
 }
 
 /// `GetFunctionConfiguration` on a function name.
@@ -885,24 +910,525 @@ async fn account_usage_counts_the_published_layer_archives() {
         );
         expected += i64::try_from(archive.len()).unwrap_or_default();
 
-        let settings = json_call(&router, "GET", ACCOUNT_SETTINGS_URI, &Value::Null).await;
+        let actual = total_code_size(&router).await;
         assert_eq!(
-            settings.status,
-            200,
-            "case {index}: expected 200 from GetAccountSettings, got {} {}",
-            settings.status,
-            settings.text()
+            actual,
+            expected,
+            "case {:?}: expected TotalCodeSize {expected}, got {actual}",
+            format!("after {} layer version(s)", index + 1)
         );
-        let usage = settings
-            .json()
-            .get("AccountUsage")
-            .cloned()
-            .unwrap_or_default();
+    }
+}
+
+/// Publish one version per archive under `layer`, asserting each call reports the next
+/// version number counting up from `first_version`.
+async fn publish_each(
+    router: &MultiServiceRouter,
+    layer: &str,
+    archives: &[Vec<u8>],
+    first_version: i64,
+) {
+    for (index, archive) in archives.iter().enumerate() {
+        let expected = first_version + i64::try_from(index).unwrap_or_default();
+        let answer = publish_layer_version(
+            router,
+            layer,
+            &json!({ "Content": { "ZipFile": zip_file(archive) } }),
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            201,
+            "case {:?}: expected 201 from PublishLayerVersion, got {} {}",
+            format!("{layer}:{expected}"),
+            answer.status,
+            answer.text()
+        );
         assert_member(
-            &format!("after {} layer version(s)", index + 1),
-            &usage,
-            "TotalCodeSize",
+            &format!("{layer}:{expected}"),
+            &answer.json(),
+            "Version",
             Some(json!(expected)),
         );
+    }
+}
+
+/// The archive length of version `version` of a layer published from `archives`, as the
+/// test holds them: version numbers count up from 1, so version `n` is the `n`th archive.
+fn archive_size(archives: &[Vec<u8>], version: i64) -> i64 {
+    let index = usize::try_from(version - 1).unwrap_or_default();
+    i64::try_from(archives[index].len()).unwrap_or_default()
+}
+
+/// One row of the deletion table: the version to delete, how its layer is addressed, and
+/// the versions of that layer the store must still hold afterwards.
+struct DeleteCase {
+    /// The case name.
+    case: &'static str,
+    /// The `LayerName` the delete addresses the layer by.
+    reference: String,
+    /// The version number to delete.
+    version: i64,
+    /// Every version of the layer that must still be readable after the delete.
+    remaining: Vec<i64>,
+}
+
+/// "Deletes a version of an Lambda layer. Deleted versions can no longer be viewed":
+/// a delete takes exactly the version it names out of the store, leaves every other
+/// version of the same layer readable, and stops the deleted archive counting towards the
+/// account's used code storage.
+///
+/// The rows differ along which version is deleted (one in the middle, the latest, the
+/// first, the last one left), how the layer is addressed (its bare name or its ARN, the
+/// two forms `LayerName` documents), and whether the version is there at all — the repeat
+/// of an already deleted version, which the `@idempotent` operation answers just the same.
+#[tokio::test]
+async fn delete_layer_version_removes_only_the_version_it_names() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+
+    // Four versions of one layer, each published from an archive of its own length, so a
+    // read's digest says which version answered it.
+    let archives = [
+        archive_bytes(32),
+        archive_bytes(256),
+        archive_bytes(1_024),
+        archive_bytes(2_048),
+    ];
+    publish_each(&router, "pruned", &archives, 1).await;
+
+    let cases = vec![
+        DeleteCase {
+            case: "a middle version by name",
+            reference: "pruned".to_string(),
+            version: 2,
+            remaining: vec![1, 3, 4],
+        },
+        DeleteCase {
+            case: "the latest version by ARN",
+            reference: layer_arn("pruned"),
+            version: 4,
+            remaining: vec![1, 3],
+        },
+        DeleteCase {
+            case: "a version already deleted",
+            reference: "pruned".to_string(),
+            version: 2,
+            remaining: vec![1, 3],
+        },
+        DeleteCase {
+            case: "the first version",
+            reference: "pruned".to_string(),
+            version: 1,
+            remaining: vec![3],
+        },
+        DeleteCase {
+            case: "the last version left",
+            reference: layer_arn("pruned"),
+            version: 3,
+            remaining: vec![],
+        },
+    ];
+
+    for case in &cases {
+        let answer = delete_layer_version(&router, &case.reference, case.version).await;
+        assert_eq!(
+            answer.status,
+            204,
+            "case {:?}: expected 204 from DeleteLayerVersion, got {} {}",
+            case.case,
+            answer.status,
+            answer.text()
+        );
+        assert!(
+            answer.body.is_empty(),
+            "case {:?}: expected an empty body on the 204, got {:?}",
+            case.case,
+            answer.text()
+        );
+
+        // Every version of the layer, read back: the ones the row leaves behind still
+        // report the archive they were published from, and the deleted ones are gone.
+        for version in 1..=i64::try_from(archives.len()).unwrap_or_default() {
+            let read = get_layer_version(&router, "pruned", version).await;
+            if case.remaining.contains(&version) {
+                assert_eq!(
+                    read.status,
+                    200,
+                    "case {:?}: expected version {version} to survive, got {} {}",
+                    case.case,
+                    read.status,
+                    read.text()
+                );
+                let content = read.json().get("Content").cloned().unwrap_or_default();
+                let index = usize::try_from(version - 1).unwrap_or_default();
+                assert_member(
+                    case.case,
+                    &content,
+                    "CodeSha256",
+                    Some(json!(expected_code_sha256(&archives[index]))),
+                );
+            } else {
+                assert_eq!(
+                    read.status,
+                    404,
+                    "case {:?}: expected version {version} to be deleted, got {} {}",
+                    case.case,
+                    read.status,
+                    read.text()
+                );
+                let code = read.error_code();
+                assert!(
+                    code.contains("ResourceNotFoundException"),
+                    "case {:?}: expected ResourceNotFoundException for version {version}, \
+                     got {code:?}",
+                    case.case
+                );
+            }
+        }
+
+        // The deleted archive is no longer storage this account uses, so the usage the
+        // account reports is the sum of what the layer still holds.
+        let expected: i64 = case
+            .remaining
+            .iter()
+            .map(|version| archive_size(&archives, *version))
+            .sum();
+        let actual = total_code_size(&router).await;
+        assert_eq!(
+            actual, expected,
+            "case {:?}: expected TotalCodeSize {expected} after the delete, got {actual}",
+            case.case
+        );
+    }
+}
+
+/// The operation is `@idempotent`, so deleting a version the store does not hold is a
+/// success that removes nothing: the post-condition already holds. It also creates
+/// nothing by being asked, and refuses a `LayerName` that names no layer.
+///
+/// The rows differ along what is missing: the layer (by name and by ARN), the version
+/// number (one past the last, the member's own default of 0, a much later one).
+#[tokio::test]
+async fn delete_layer_version_is_idempotent_on_a_version_the_store_does_not_hold() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+
+    let archive = archive_bytes(128);
+    publish_each(&router, "kept", std::slice::from_ref(&archive), 1).await;
+
+    let cases: Vec<(&str, String, i64)> = vec![
+        ("unknown layer", "absent".to_string(), 1),
+        ("unknown layer by ARN", layer_arn("absent"), 1),
+        ("one past the last version", "kept".to_string(), 2),
+        ("the VersionNumber default", "kept".to_string(), 0),
+        ("a much later version", "kept".to_string(), 99),
+    ];
+
+    for (case, reference, version) in &cases {
+        let answer = delete_layer_version(&router, reference, *version).await;
+        assert_eq!(
+            answer.status,
+            204,
+            "case {case:?}: expected 204 from DeleteLayerVersion, got {} {}",
+            answer.status,
+            answer.text()
+        );
+        assert!(
+            answer.body.is_empty(),
+            "case {case:?}: expected an empty body on the 204, got {:?}",
+            answer.text()
+        );
+
+        // Nothing was removed: the one version that exists still does, and still reports
+        // its own archive.
+        let read = get_layer_version(&router, "kept", 1).await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case:?}: expected the published version to survive, got {} {}",
+            read.status,
+            read.text()
+        );
+        let content = read.json().get("Content").cloned().unwrap_or_default();
+        assert_member(
+            case,
+            &content,
+            "CodeSha256",
+            Some(json!(expected_code_sha256(&archive))),
+        );
+        // And nothing was created: the version the row named is still absent.
+        let absent = get_layer_version(&router, reference, *version).await;
+        assert_eq!(
+            absent.status,
+            404,
+            "case {case:?}: expected the deleted version to stay absent, got {} {}",
+            absent.status,
+            absent.text()
+        );
+    }
+
+    // A `LayerName` that is well formed for the member's pattern but names a Lambda
+    // resource of another kind names no layer, so the call is refused rather than
+    // reported as a delete of nothing.
+    let refused = delete_layer_version(
+        &router,
+        "arn:aws:lambda:us-east-1:000000000000:function:not-a-layer",
+        1,
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        400,
+        "case \"not a layer name\": expected 400 from DeleteLayerVersion, got {} {}",
+        refused.status,
+        refused.text()
+    );
+}
+
+/// One row of the renumbering table: how many versions the layer holds before the
+/// delete, which of them are deleted, and the version number the next publish must
+/// therefore report.
+struct RenumberCase {
+    /// The case name, which is also the layer name.
+    case: &'static str,
+    /// The versions published before any delete.
+    published_before: i64,
+    /// The versions deleted, in order.
+    deleted: Vec<i64>,
+    /// The version number the publish after those deletes must report.
+    expected_next: i64,
+}
+
+/// A deleted version number is never handed out again: the next `PublishLayerVersion`
+/// counts from the highest number ever published under the layer's name, not from the
+/// versions the layer still holds.
+///
+/// The rows differ along how many versions existed and which were deleted: the only one,
+/// the latest, one in the middle, and every one of them.
+#[tokio::test]
+async fn a_deleted_layer_version_number_is_not_reused() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+
+    let cases = vec![
+        RenumberCase {
+            case: "only-version",
+            published_before: 1,
+            deleted: vec![1],
+            expected_next: 2,
+        },
+        RenumberCase {
+            case: "latest-version",
+            published_before: 3,
+            deleted: vec![3],
+            expected_next: 4,
+        },
+        RenumberCase {
+            case: "middle-version",
+            published_before: 3,
+            deleted: vec![2],
+            expected_next: 4,
+        },
+        RenumberCase {
+            case: "every-version",
+            published_before: 3,
+            deleted: vec![1, 2, 3],
+            expected_next: 4,
+        },
+    ];
+
+    for case in &cases {
+        let archives: Vec<Vec<u8>> = (1..=case.published_before)
+            .map(|version| archive_bytes(64 * usize::try_from(version).unwrap_or(1)))
+            .collect();
+        publish_each(&router, case.case, &archives, 1).await;
+
+        for version in &case.deleted {
+            let answer = delete_layer_version(&router, case.case, *version).await;
+            assert_eq!(
+                answer.status,
+                204,
+                "case {:?}: expected 204 deleting version {version}, got {} {}",
+                case.case,
+                answer.status,
+                answer.text()
+            );
+        }
+
+        let next = archive_bytes(4_096);
+        let published = publish_layer_version(
+            &router,
+            case.case,
+            &json!({ "Content": { "ZipFile": zip_file(&next) } }),
+        )
+        .await;
+        assert_eq!(
+            published.status,
+            201,
+            "case {:?}: expected 201 from PublishLayerVersion, got {} {}",
+            case.case,
+            published.status,
+            published.text()
+        );
+        assert_member(
+            case.case,
+            &published.json(),
+            "Version",
+            Some(json!(case.expected_next)),
+        );
+        assert_member(
+            case.case,
+            &published.json(),
+            "LayerVersionArn",
+            Some(json!(layer_version_arn(case.case, case.expected_next))),
+        );
+
+        // The new version is readable under its own number, and every deleted number
+        // stays deleted rather than being answered by the version just published.
+        let read = get_layer_version(&router, case.case, case.expected_next).await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {:?}: expected 200 reading version {}, got {} {}",
+            case.case,
+            case.expected_next,
+            read.status,
+            read.text()
+        );
+        assert_member(
+            case.case,
+            &read.json().get("Content").cloned().unwrap_or_default(),
+            "CodeSha256",
+            Some(json!(expected_code_sha256(&next))),
+        );
+        for version in &case.deleted {
+            let gone = get_layer_version(&router, case.case, *version).await;
+            assert_eq!(
+                gone.status,
+                404,
+                "case {:?}: expected version {version} to stay deleted, got {} {}",
+                case.case,
+                gone.status,
+                gone.text()
+            );
+        }
+    }
+}
+
+/// "To avoid breaking functions, a copy of the version remains in Lambda until no
+/// functions refer to it" — so deleting a version a function already holds succeeds and
+/// leaves that function's configuration exactly as it was, while "deleted versions can no
+/// longer be viewed or added to functions": a read of it answers the modelled 404 and a
+/// new function naming it is refused.
+#[tokio::test]
+async fn deleting_a_layer_version_a_function_refers_to_leaves_that_function_alone() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+
+    let archives = [archive_bytes(512), archive_bytes(1_024)];
+    publish_each(&router, "referenced", &archives, 1).await;
+    let first = layer_version_arn("referenced", 1);
+    let second = layer_version_arn("referenced", 2);
+    let expected_layers = json!([
+        { "Arn": first, "CodeSize": archive_size(&archives, 1) },
+        { "Arn": second, "CodeSize": archive_size(&archives, 2) },
+    ]);
+
+    let created = json_call(
+        &router,
+        "POST",
+        FUNCTIONS_URI,
+        &json!({
+            "FunctionName": "holder",
+            "Role": ROLE,
+            "Runtime": "python3.12",
+            "Handler": "index.handler",
+            "Code": { "ZipFile": zip_file(&archive_bytes(64)) },
+            "Layers": [first, second],
+        }),
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        201,
+        "the function under test must be created: got {} {}",
+        created.status,
+        created.text()
+    );
+
+    let deleted = delete_layer_version(&router, "referenced", 1).await;
+    assert_eq!(
+        deleted.status,
+        204,
+        "case \"referenced version\": expected 204 from DeleteLayerVersion, got {} {}",
+        deleted.status,
+        deleted.text()
+    );
+
+    // The function still refers to the version it was configured with, archive size and
+    // all: the delete breaks nothing that already holds the version.
+    let configuration = get_function_configuration(&router, "holder").await;
+    assert_eq!(
+        configuration.status,
+        200,
+        "case \"referenced version\": expected 200 from GetFunctionConfiguration, got {} {}",
+        configuration.status,
+        configuration.text()
+    );
+    assert_member(
+        "referenced version",
+        &configuration.json(),
+        "Layers",
+        Some(expected_layers),
+    );
+
+    // The deleted version can no longer be viewed.
+    let read = get_layer_version(&router, "referenced", 1).await;
+    assert_eq!(
+        read.status,
+        404,
+        "case \"referenced version\": expected the deleted version to be gone, got {} {}",
+        read.status,
+        read.text()
+    );
+
+    // Nor added to a function: a new function naming it is refused, while one naming the
+    // version that was not deleted is created, so the refusal is about the deleted
+    // version alone.
+    let cases: Vec<(&str, &str, u16)> = vec![
+        ("newcomer-on-deleted", first.as_str(), 400),
+        ("newcomer-on-surviving", second.as_str(), 201),
+    ];
+    for (case, layer, expected_status) in &cases {
+        let answer = json_call(
+            &router,
+            "POST",
+            FUNCTIONS_URI,
+            &json!({
+                "FunctionName": case,
+                "Role": ROLE,
+                "Runtime": "python3.12",
+                "Handler": "index.handler",
+                "Code": { "ZipFile": zip_file(&archive_bytes(64)) },
+                "Layers": [layer],
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            *expected_status,
+            "case {case:?}: expected {expected_status} from CreateFunction, got {} {}",
+            answer.status,
+            answer.text()
+        );
+        if *expected_status == 400 {
+            let code = answer.error_code();
+            assert!(
+                code.contains("InvalidParameterValueException"),
+                "case {case:?}: expected the InvalidParameterValueException error code, \
+                 got {code:?}"
+            );
+        }
     }
 }
