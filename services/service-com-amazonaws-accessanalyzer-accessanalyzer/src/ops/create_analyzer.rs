@@ -255,9 +255,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `statusReason` explains a non-ACTIVE status; an active analyzer has none.
             status_reason: None,
             created_at: now,
-            // Nothing has been analyzed yet, so neither `lastResourceAnalyzed` member is set.
-            last_resource_analyzed: None,
-            last_resource_analyzed_at: None,
+            // Nothing has been scanned yet, so neither `lastResourceAnalyzed` member is
+            // reported: `StartResourceScan` is what fills this map, and the summary
+            // derives both members from it.
+            resource_scans: ::std::collections::BTreeMap::new(),
             // An untagged create stores an EMPTY tag set, not an absent one: the
             // analyzer's `tags` is a collection that always exists, and `GetAnalyzer`
             // reports it as the `{}` the model's `TagsMap` describes.

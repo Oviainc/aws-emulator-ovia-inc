@@ -153,8 +153,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        // The analyzer's two `lastResourceAnalyzed` members are derived from its scans
+        // against the clock, so the projection is taken at one instant; nothing is
+        // written, so this read leaves the store exactly as it found it.
         Ok(GetAnalyzerOutput {
-            analyzer: analyzer.summary(),
+            analyzer: analyzer.summary_at(::std::time::SystemTime::now()),
         })
     }
 }
