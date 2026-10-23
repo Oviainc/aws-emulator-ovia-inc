@@ -606,7 +606,36 @@ impl FederationState {
             Self::Disabled => "DISABLED",
         }
     }
+
+    /// Whether Lake query federation is on, or on its way on — the two states
+    /// `DisableFederation` has something to turn off.
+    pub fn is_on(self) -> bool {
+        matches!(self, Self::Enabling | Self::Enabled)
+    }
+
+    /// The state this one settles into once the transition it names has run, or
+    /// `None` for a state the clock owes nothing on.
+    ///
+    /// `ENABLING` and `DISABLING` exist in the model precisely because the
+    /// Enable/Disable pair is asynchronous; `ENABLED` and `DISABLED` are terminal.
+    pub fn settled(self) -> Option<Self> {
+        match self {
+            Self::Enabling => Some(Self::Enabled),
+            Self::Disabling => Some(Self::Disabled),
+            Self::Enabled | Self::Disabled => None,
+        }
+    }
 }
+
+/// How long an event data store reads `ENABLING` / `DISABLING` before the clock
+/// settles it into `ENABLED` / `DISABLED`.
+///
+/// The model's `FederationStatus` enum carries both in-flight values, so
+/// `EnableFederation` and `DisableFederation` ARE asynchronous. CloudTrail
+/// publishes no duration for either, so this span is the emulator's own: short
+/// enough not to stall a workflow, non-zero so a caller that reads the store
+/// straight after the call still sees the transient status.
+pub const FEDERATION_SETTLE_AFTER: Duration = Duration::from_millis(500);
 
 /// One persisted CloudTrail Lake event data store.
 ///
@@ -644,6 +673,10 @@ pub struct EventDataStoreRecord {
     pub kms_key_id: Option<String>,
     pub billing_mode: EventDataStoreBillingMode,
     pub federation_status: FederationState,
+    /// When an in-flight `federation_status` (`ENABLING` / `DISABLING`) is due to
+    /// settle into the state it is heading for; `None` once it has, and for a
+    /// store whose federation is not moving.
+    pub federation_settles_at: Option<SystemTime>,
     /// The role Lake query federation accesses the store's resources through; set
     /// only while federation is on.
     pub federation_role_arn: Option<String>,
@@ -666,6 +699,30 @@ impl EventDataStoreRecord {
     /// This store's ARN, derived from the Region it lives in and its id.
     pub fn arn(&self) -> String {
         event_data_store_arn(&self.region, &self.id)
+    }
+
+    /// Materialise the federation transition the clock already owes: `ENABLING`
+    /// into `ENABLED`, `DISABLING` into `DISABLED`.
+    ///
+    /// A reporting operation may call this: the transition was due at
+    /// `federation_settles_at` whether or not anybody read the store, so applying
+    /// it changes nothing a later caller would otherwise have seen. Federation
+    /// reaching `DISABLED` releases the role it ran under — that role is held
+    /// "only while federation is on".
+    pub fn settle_federation(&mut self, now: SystemTime) {
+        let Some(due) = self.federation_settles_at else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.federation_settles_at = None;
+        if let Some(settled) = self.federation_status.settled() {
+            self.federation_status = settled;
+            if !settled.is_on() {
+                self.federation_role_arn = None;
+            }
+        }
     }
 }
 
@@ -769,17 +826,22 @@ impl QueryRecord {
 /// Why a caller-supplied event data store identifier could not be read at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventDataStoreRejection {
-    /// Shaped like an ARN but not an event data store ARN ⇒
-    /// `EventDataStoreARNInvalidException` (HTTP 400).
+    /// Readable as neither an event data store ARN nor the bare id suffix of one
+    /// ⇒ `EventDataStoreARNInvalidException` (HTTP 400). Carries the value as the
+    /// request gave it, which is what the refusal names.
     InvalidArn(String),
 }
 
 impl EventDataStoreRejection {
-    /// The refusal text: built from the request, naming the value and the rule it
-    /// broke, so a caller can fix the request from it alone.
-    pub fn message(self) -> String {
+    /// The refusal text: built from the request, naming the ARN it addressed, so a
+    /// caller can fix the request from it alone. See
+    /// [`event_data_store_arn_invalid_message`] for the wording and why a bare id
+    /// needs the Region the call was made in.
+    pub fn message(self, request_region: &str) -> String {
         match self {
-            Self::InvalidArn(message) => message,
+            Self::InvalidArn(value) => {
+                event_data_store_arn_invalid_message(&value, request_region)
+            }
         }
     }
 }
@@ -833,9 +895,7 @@ pub fn parse_event_data_store_identifier(
             .strip_prefix(EVENT_DATA_STORE_RESOURCE_PREFIX)
             .unwrap_or(value);
         if id.is_empty() {
-            return Err(EventDataStoreRejection::InvalidArn(
-                event_data_store_arn_rejection(value),
-            ));
+            return Err(EventDataStoreRejection::InvalidArn(value.to_string()));
         }
         return Ok(EventDataStoreIdentifier {
             id: id.to_string(),
@@ -845,9 +905,7 @@ pub fn parse_event_data_store_identifier(
 
     let fields: Vec<&str> = value.split(':').collect();
     let [arn, partition, service, region, account, resource] = fields.as_slice() else {
-        return Err(EventDataStoreRejection::InvalidArn(
-            event_data_store_arn_rejection(value),
-        ));
+        return Err(EventDataStoreRejection::InvalidArn(value.to_string()));
     };
     let id = resource.strip_prefix(EVENT_DATA_STORE_RESOURCE_PREFIX);
     match id {
@@ -864,19 +922,30 @@ pub fn parse_event_data_store_identifier(
                 region: Some((*region).to_string()),
             })
         }
-        _ => Err(EventDataStoreRejection::InvalidArn(
-            event_data_store_arn_rejection(value),
-        )),
+        _ => Err(EventDataStoreRejection::InvalidArn(value.to_string())),
     }
 }
 
-/// The text an unreadable event data store identifier is refused with.
-fn event_data_store_arn_rejection(value: &str) -> String {
-    format!(
-        "'{value}' is not a valid event data store ARN: the format of an event data store \
-         ARN is arn:aws:cloudtrail:<region>:<account-id>:eventdatastore/<event-data-store-id>, \
-         or the event data store id alone"
-    )
+/// The text an unreadable event data store identifier is refused with, worded the
+/// way the real service words it: "The event data store ARN <arn> format is not
+/// valid."
+///
+/// It names the ARN the request addressed rather than the characters it typed:
+/// a value that is ARN-shaped is named as given, and a bare id is completed into
+/// the ARN it names in the Region the call was made in — which is why the Region
+/// is a parameter. Recorded CloudTrail responses carry both forms: an identifier
+/// that is not a CloudTrail ARN is echoed whole, and a bare id that cannot be read
+/// comes back as `arn:aws:cloudtrail:<request-region>:<account>:eventdatastore/<id>`.
+pub fn event_data_store_arn_invalid_message(value: &str, request_region: &str) -> String {
+    let addressed = if value.contains(':') {
+        value.to_string()
+    } else {
+        let id = value
+            .strip_prefix(EVENT_DATA_STORE_RESOURCE_PREFIX)
+            .unwrap_or(value);
+        event_data_store_arn(request_region, id)
+    };
+    format!("The event data store ARN {addressed} format is not valid.")
 }
 
 /// Per-service state for com-amazonaws-cloudtrail-cloudtrail-20131101. A handler reaches it through [`service_state`].
@@ -1043,6 +1112,23 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
         let addressed = identifier.addressed_region(request_region);
         self.event_data_stores
             .get(&identifier.id)
+            .filter(|record| record.region == addressed)
+    }
+
+    /// [`Self::addressed_event_data_store`] for a caller that CHANGES the store —
+    /// or that materialises a transition the clock already owed it (see
+    /// [`EventDataStoreRecord::settle_federation`]).
+    ///
+    /// The addressing rule is the same one: a store is reachable only from the
+    /// Region it lives in, whether it is named by a bare id or by an ARN.
+    pub fn addressed_event_data_store_mut(
+        &mut self,
+        identifier: &EventDataStoreIdentifier,
+        request_region: &str,
+    ) -> Option<&mut EventDataStoreRecord> {
+        let addressed = identifier.addressed_region(request_region).to_string();
+        self.event_data_stores
+            .get_mut(&identifier.id)
             .filter(|record| record.region == addressed)
     }
 

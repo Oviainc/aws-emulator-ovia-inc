@@ -3,8 +3,14 @@
 //! @op GetEventDataStore
 //!
 //! Reports one CloudTrail Lake event data store, addressed either by its ARN or by
-//! the id suffix of that ARN. It is a pure read: every member of the answer comes
-//! from the stored record, and nothing in the registry changes.
+//! the id suffix of that ARN. Every member of the answer comes from the stored
+//! record.
+//!
+//! The one thing it writes is a federation transition the clock already owed the
+//! store (`ENABLING` into `ENABLED`, `DISABLING` into `DISABLED`): that was due at
+//! the store's settle instant whether or not anybody read it, so materialising it
+//! here changes nothing a later caller would otherwise have seen — the same way
+//! `get_dashboard` materialises `CREATING` into `CREATED`.
 //!
 //! ## Shape of an operation
 //!
@@ -188,6 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetEventDataStoreErrorModeled::UnsupportedOperationException(
                 UnsupportedOperationException {
@@ -199,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let store = state.lock();
+        let mut store = state.lock();
 
         // `EventDataStore` is either a store ARN or the id suffix of one; a value
         // that can be read as neither names no store in any account. The
@@ -210,12 +217,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(|rejection| {
                 GetEventDataStoreErrorModeled::EventDataStoreARNInvalidException(
                     EventDataStoreARNInvalidException {
-                        message: Some(rejection.message()),
+                        message: Some(rejection.message(&region)),
                     },
                 )
             })?;
 
-        let Some(record) = store.addressed_event_data_store(&identifier, &region) else {
+        let Some(record) = store.addressed_event_data_store_mut(&identifier, &region) else {
             return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                 GetEventDataStoreErrorModeled::EventDataStoreNotFoundException(
                     EventDataStoreNotFoundException {
@@ -227,6 +234,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 NOT_FOUND_STATUS,
             ));
         };
+
+        // The federation transition the clock owed this store is applied before it
+        // is reported, so the status this read answers with is the one the store
+        // was already in.
+        record.settle_federation(now);
 
         Ok(report(record))
     }

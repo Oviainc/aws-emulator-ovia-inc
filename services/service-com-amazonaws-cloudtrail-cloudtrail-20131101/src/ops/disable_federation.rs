@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableFederation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableFederation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableFederation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Turns Lake query federation off on one CloudTrail Lake event data store,
+//! addressed either by its ARN or by the id suffix of that ARN. The answer is
+//! computed from the stored record: the ARN the store derives from its Region and
+//! id, and the federation status the store carries after the call.
+//!
+//! Federation is turned off asynchronously — the model's `FederationStatus` enum
+//! carries `DISABLING` beside `DISABLED` — so a store whose federation is on moves
+//! to `DISABLING` here and the clock settles it into `DISABLED`
+//! ([`crate::state::FEDERATION_SETTLE_AFTER`]). A store whose federation is
+//! already off is left exactly as it is: the model declares no "federation not
+//! enabled" error for this operation (unlike `EnableFederation`, which models
+//! `EventDataStoreFederationEnabledException` for the already-on case), so the
+//! call is idempotent.
 //!
 //! ## Shape of an operation
 //!
@@ -196,18 +201,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableFederation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableFederationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableFederation"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisableFederationErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "DisableFederation needs the CloudTrail event data store registry, \
+                         which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `EventDataStore` is "The ARN (or ID suffix of the ARN) of the event data
+        // store": a value that can be read as neither names no store in any
+        // account. The identifier is read here rather than through
+        // `ComAmazonawsCloudtrailCloudtrail20131101State::event_data_store` so the
+        // refusal below can name the ARN it addressed.
+        let identifier = crate::state::parse_event_data_store_identifier(&input.event_data_store)
+            .map_err(|rejection| {
+                DisableFederationErrorModeled::EventDataStoreARNInvalidException(
+                    EventDataStoreARNInvalidException {
+                        message: Some(rejection.message(&region)),
+                    },
+                )
+            })?;
+        let addressed_arn = identifier.arn(&region);
+
+        let Some(record) = store.addressed_event_data_store_mut(&identifier, &region) else {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                DisableFederationErrorModeled::EventDataStoreNotFoundException(
+                    EventDataStoreNotFoundException {
+                        message: Some(crate::state::event_data_store_not_found_message(
+                            &addressed_arn,
+                        )),
+                    },
+                ),
+                NOT_FOUND_STATUS,
+            ));
+        };
+
+        // A federation transition the clock already owed this store was due
+        // whatever this call does, so it is materialised before the status below is
+        // read: that is what keeps a wind-down that has finished from reading
+        // `DISABLING` for ever.
+        record.settle_federation(now);
+
+        // A store being torn down carries no configuration left to change — the
+        // modelled `InactiveEventDataStoreException` ("The event data store is
+        // inactive") is what a call addressing one is told.
+        if !record.status.is_queryable() {
+            return Err(
+                DisableFederationErrorModeled::InactiveEventDataStoreException(
+                    InactiveEventDataStoreException {
+                        message: Some(format!(
+                            "The event data store {} is {}.",
+                            record.arn(),
+                            record.status.as_wire()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Federation that is on (`ENABLED`, or an `ENABLING` that has not settled
+        // yet) starts winding down, and the clock settles it into `DISABLED`. Any
+        // other state is already off or already on its way off, so the call writes
+        // nothing: a store that is `DISABLING` keeps the instant it was already
+        // given rather than having its wind-down restarted by a repeat call.
+        if record.federation_status.is_on() {
+            record.federation_status = crate::state::FederationState::Disabling;
+            record.federation_settles_at = Some(now + crate::state::FEDERATION_SETTLE_AFTER);
+            record.updated_at = Some(now);
+        }
+
+        Ok(DisableFederationOutput {
+            event_data_store_arn: Some(record.arn()),
+            federation_status: Some(record.federation_status.as_wire().to_string()),
+        })
     }
 }
+
+/// The HTTP status this service answers a not-found refusal with.
+///
+/// The model annotates `EventDataStoreNotFoundException` `@httpError(404)`, but
+/// CloudTrail answers 400 for it on the wire: the recorded response for this very
+/// operation is `HTTP 400` with `__type` `EventDataStoreNotFoundException` and a
+/// `Message` naming the store's ARN. The error CODE is the model's; only the
+/// status is stated here, through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`] — the same way
+/// `get_event_data_store` and `describe_query` state it.
+const NOT_FOUND_STATUS: u16 = 400;

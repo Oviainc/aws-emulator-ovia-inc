@@ -230,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map_err(|rejection| {
                         DescribeQueryErrorModeled::EventDataStoreARNInvalidException(
                             EventDataStoreARNInvalidException {
-                                message: Some(rejection.message()),
+                                message: Some(rejection.message(&region)),
                             },
                         )
                     })?

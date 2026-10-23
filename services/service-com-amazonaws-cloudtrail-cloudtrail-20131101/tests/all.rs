@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/dashboard_lifecycle.rs"]
 mod dashboard_lifecycle;
+#[path = "all/disable_federation.rs"]
+mod disable_federation;
 #[path = "all/emulator.rs"]
 mod emulator;
 #[path = "all/event_data_store_reads.rs"]
