@@ -248,10 +248,23 @@ async fn the_project_to_build_path_is_served_from_stored_state() {
         build["startTime"].is_number(),
         "StartBuild: startTime must be set, got {build}"
     );
-    // Resolved from the project, with the overrides applied.
+    // Resolved from the project, with the overrides applied and the flags AWS
+    // documents a default for reported at the value the build RUNS WITH — the
+    // project keeps what it was configured with, so `insecureSsl` is only on the
+    // build.
     assert_eq!(
-        build["source"], project["source"],
+        build["source"]["type"], project["source"]["type"],
         "StartBuild: source comes from the project, got {build}"
+    );
+    assert_eq!(
+        build["source"]["buildspec"], project["source"]["buildspec"],
+        "StartBuild: source comes from the project, got {build}"
+    );
+    assert_eq!(
+        build["source"]["insecureSsl"],
+        json!(false),
+        "StartBuild: a source that does not enable insecureSsl runs with it off, \
+         got {build}"
     );
     assert_eq!(
         build["serviceRole"], project["serviceRole"],

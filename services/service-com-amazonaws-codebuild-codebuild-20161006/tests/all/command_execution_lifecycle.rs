@@ -367,8 +367,9 @@ async fn start_command_execution_mints_one_execution_per_command_and_reads_it_ba
             "{case}: BatchGetCommandExecutions must report the stored execution, \
              got {fetched}"
         );
-        assert!(
-            fetched["commandExecutionsNotFound"].is_null(),
+        assert_eq!(
+            fetched["commandExecutionsNotFound"],
+            json!([]),
             "{case}: an execution that exists is not missing, got {fetched}"
         );
     }
@@ -798,20 +799,11 @@ async fn batch_get_command_executions_resolves_ids_within_their_sandbox() {
             reported, expected_found,
             "{case}: expected {expected_found:?}, got {reported:?}"
         );
-        if expected_missing.is_empty() {
-            // `commandExecutionsNotFound` targets `CommandExecutionIds`, bounded at
-            // 1..100 entries, so an empty one is absent rather than `[]`.
-            assert!(
-                body["commandExecutionsNotFound"].is_null(),
-                "{case}: nothing is missing, so the member is absent, got {body}"
-            );
-        } else {
-            assert_eq!(
-                body["commandExecutionsNotFound"],
-                json!(expected_missing),
-                "{case}: expected {expected_missing:?} missing, got {body}"
-            );
-        }
+        assert_eq!(
+            body["commandExecutionsNotFound"],
+            json!(expected_missing),
+            "{case}: expected {expected_missing:?} missing, got {body}"
+        );
     }
 }
 
