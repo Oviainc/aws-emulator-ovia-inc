@@ -137,7 +137,11 @@ fn ranked_labels(
 /// The four are then normalised, so they sum to 1, and the verdict is their
 /// arg-max. Text the engine finds no sentiment in leaves `Neutral` holding all of
 /// it.
-fn score_sentiment(text: &str) -> (String, SentimentScore) {
+///
+/// Visible to the crate because `DetectTargetedSentiment` scores the clause each
+/// mention sits in through exactly this function: one document and one clause must
+/// be scored on the same scale, so there is one scorer rather than two.
+pub(crate) fn score_sentiment(text: &str) -> (String, SentimentScore) {
     let scores = analyzer().polarity_scores(text);
     let positive_share = scores.get("pos").copied().unwrap_or_default();
     let negative_share = scores.get("neg").copied().unwrap_or_default();
