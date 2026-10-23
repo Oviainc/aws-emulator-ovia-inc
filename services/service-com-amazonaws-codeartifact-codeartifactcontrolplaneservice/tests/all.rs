@@ -31,6 +31,8 @@ mod package_version_publish;
 mod repository_endpoint;
 #[path = "all/repository_permissions_policy.rs"]
 mod repository_permissions_policy;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

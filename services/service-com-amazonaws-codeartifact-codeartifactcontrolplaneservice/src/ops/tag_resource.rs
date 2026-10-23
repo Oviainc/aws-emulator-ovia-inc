@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds or updates the tags of the resource the caller's `resourceArn` names:
+//!
+//! * the ARN is resolved against the store — `service_common::arn` says whether it is a
+//!   well-formed ARN in this service's namespace at all (it is a bad REQUEST when it is
+//!   not), and [`crate::state::taggable_resource`] reads the record it names;
+//! * the tag set is merged by KEY ([`crate::state::merged_tags`]), so a key already held
+//!   takes the new value rather than appearing twice, and values travel verbatim;
+//! * the merged set is bounded by [`crate::state::MAX_TAGS_PER_RESOURCE`], refused with
+//!   `ServiceQuotaExceededException` (402) BEFORE anything is written, so a refused call
+//!   leaves the resource exactly as it was.
+//!
+//! `ListTagsForResource` reads back what this writes; both reach the one tag list stored
+//! on the domain or repository record, so neither can hold its own copy.
 //!
 //! ## Shape of an operation
 //!
@@ -144,20 +149,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The ONE resolution of a caller-supplied `resourceArn`, shared with
+        // `ListTagsForResource` (`state::resolve_taggable`): a value that is not a
+        // well-formed ARN of this service's own namespace names nothing this API can
+        // address, so it is refused on the INPUT, while a well-formed one naming no kind
+        // this store holds is a resource that is not found.
+        let reference = match crate::state::resolve_taggable(&input.resource_arn) {
+            Ok(reference) => reference,
+            Err(crate::state::TagArnRefusal::NotThisServicesArn) => {
+                return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "resourceArn {} is not a CodeArtifact resource ARN.",
+                        input.resource_arn
+                    ),
+                    reason: Some("CANNOT_PARSE".to_string()),
+                })
+                .into());
+            }
+            Err(crate::state::TagArnRefusal::NoSuchResource) => {
+                return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Resource {} not found.", input.resource_arn),
+                        resource_id: Some(input.resource_arn.clone()),
+                        // The ARN parsed but names no kind this store holds, so there is
+                        // no resolved kind to report.
+                        resource_type: None,
+                    },
+                )
+                .into());
+            }
+        };
+
+        // Every path below that cannot find the resource answers with ONE refusal: a
+        // well-formed ARN of this namespace either names a record this store holds or
+        // names no resource at all. An engine holding no state for this service holds
+        // no domain either, so it is that same not-found — never a server fault, which
+        // this operation does not model. The kind IS resolved here, so the refusal
+        // reports it.
+        let not_found = || {
+            TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("Resource {} not found.", input.resource_arn),
+                resource_id: Some(input.resource_arn.clone()),
+                resource_type: crate::state::reported_resource_type(&reference),
+            })
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(not_found().into());
+        };
+        let mut store = state.lock();
+        let Some(held) = store.resource_tags_mut(&reference) else {
+            return Err(not_found().into());
+        };
+
+        // Merged first, then bounded, then stored: the quota is a bound on what the
+        // resource would HOLD, and a refusal must leave the tag set untouched.
+        let merged = crate::state::merged_tags(held, &input.tags);
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "Cannot tag resource {}: the request would leave it holding {} tags, \
+                         more than the maximum of {} tags per resource.",
+                        input.resource_arn,
+                        merged.len(),
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    ),
+                    resource_id: Some(input.resource_arn.clone()),
+                    resource_type: crate::state::reported_resource_type(&reference),
+                },
+            )
+            .into());
+        }
+        *held = merged;
+
+        Ok(TagResourceOutput {})
     }
 }

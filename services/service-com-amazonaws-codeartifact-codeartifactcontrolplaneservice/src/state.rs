@@ -277,6 +277,244 @@ impl ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Resource tagging
+//
+// Everything the ARN-addressed tag surface needs, in one place: the bound, the records'
+// one tag list, the ARN resolver and the keyed merge. `TagResource` and
+// `ListTagsForResource` reach the SAME list through the accessors below, so a writer and
+// a reader cannot hold their own copies of a resource's tags.
+// ---------------------------------------------------------------------------
+
+/// Maximum tags one resource holds, from CodeArtifact's own published tag restrictions
+/// ("Tagging resources in CodeArtifact": "Maximum number of tags per resource – 50";
+/// the same block's "Maximum key length – 128" and "Maximum value length – 256" are
+/// what `TagKey` and `TagValue` model).
+///
+/// This is an ACCUMULATED bound on the resource, not on one request: `TagList` is
+/// modelled `@length(0..200)`, so the boundary validator refuses an oversized single
+/// batch, and nothing but this constant stops a sequence of small batches from growing
+/// one resource's tag set without limit.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The tag accessors, a second `impl` block beside the store's own so this whole surface
+/// reads in one place.
+impl ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState {
+    /// The tags of the resource an ARN named, resolved through [`ResourceRef`].
+    ///
+    /// `None` means this store holds no such resource — the same rule as
+    /// [`Self::domain`], extended through the domain to its repositories and package
+    /// groups — which each ARN-addressed operation answers with its own modelled
+    /// not-found error.
+    pub fn resource_tags(&self, reference: &ResourceRef) -> Option<&[Tag]> {
+        match reference {
+            ResourceRef::Domain { owner, name } => {
+                Some(self.domain(name, owner.as_deref())?.tags.as_slice())
+            }
+            ResourceRef::Repository {
+                owner,
+                domain,
+                repository,
+            } => Some(
+                self.domain(domain, owner.as_deref())?
+                    .repositories
+                    .get(repository)?
+                    .tags
+                    .as_slice(),
+            ),
+            ResourceRef::PackageGroup {
+                owner,
+                domain,
+                pattern,
+            } => Some(
+                self.domain(domain, owner.as_deref())?
+                    .package_groups
+                    .get(pattern)?
+                    .tags
+                    .as_slice(),
+            ),
+        }
+    }
+
+    /// [`Self::resource_tags`], for an operation that rewrites the tag set it resolves.
+    pub fn resource_tags_mut(&mut self, reference: &ResourceRef) -> Option<&mut Vec<Tag>> {
+        match reference {
+            ResourceRef::Domain { owner, name } => {
+                Some(&mut self.domain_mut(name, owner.as_deref())?.tags)
+            }
+            ResourceRef::Repository {
+                owner,
+                domain,
+                repository,
+            } => Some(
+                &mut self
+                    .domain_mut(domain, owner.as_deref())?
+                    .repositories
+                    .get_mut(repository)?
+                    .tags,
+            ),
+            ResourceRef::PackageGroup {
+                owner,
+                domain,
+                pattern,
+            } => Some(
+                &mut self
+                    .domain_mut(domain, owner.as_deref())?
+                    .package_groups
+                    .get_mut(pattern)?
+                    .tags,
+            ),
+        }
+    }
+}
+
+/// A resource of THIS service that a caller addressed by ARN, as the identifiers the
+/// store is keyed by.
+///
+/// Only the kinds this store actually holds are represented — the three that carry a tag
+/// set. A CodeArtifact ARN naming anything else (a package, a package version, an asset)
+/// resolves to no record here, which [`taggable_resource`] reports by answering `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceRef {
+    /// `arn:<partition>:codeartifact:<region>:<owner>:domain/<name>`.
+    Domain {
+        /// The account the ARN pins the resource to, or `None` when the ARN's account
+        /// field is empty — the same optional qualifier the `domainOwner` member is.
+        owner: Option<String>,
+        name: String,
+    },
+    /// `arn:<partition>:codeartifact:<region>:<owner>:repository/<domain>/<name>`.
+    Repository {
+        owner: Option<String>,
+        domain: String,
+        repository: String,
+    },
+    /// `arn:<partition>:codeartifact:<region>:<owner>:package-group/<domain><pattern>`,
+    /// the form [`package_group_arn`] mints: the pattern is a path from the domain root,
+    /// so it carries its own `/` separators and its leading `/` is the one between the
+    /// domain segment and the path.
+    PackageGroup {
+        owner: Option<String>,
+        domain: String,
+        /// The stored pattern, leading `/` included — the key `Domain::package_groups`
+        /// holds a group under.
+        pattern: String,
+    },
+}
+
+/// The resource a PARSED ARN of this service's namespace names, read from its ACCOUNT
+/// and RESOURCE fields.
+///
+/// Takes the `Arn` that `service_common::arn::parse_of(value, SERVICE_SIGNING_NAME)`
+/// yields — the one parse of a caller-supplied ARN — so a value that is not a
+/// well-formed ARN of this namespace never reaches here: that is a bad REQUEST, a
+/// different answer from a resource that is not held. `None` here means the ARN is ours
+/// and well formed, but its resource field names no kind this store holds.
+///
+/// The REGION field is deliberately not read: this store is not partitioned per region
+/// (see [`ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState::domains`]), so
+/// an ARN resolves to the one record of that name whatever region minted it.
+#[must_use]
+pub fn taggable_resource(arn: &::service_common::arn::Arn<'_>) -> Option<ResourceRef> {
+    // An empty account field pins the ARN to no account, so it qualifies nothing.
+    let owner = (!arn.account.is_empty()).then(|| arn.account.to_string());
+
+    // The shape of the RESOURCE field is this service's own: `<type>/<id…>`, where a
+    // package group's id is a path carrying further `/` separators.
+    let mut segments = arn.resource.splitn(3, '/');
+    match (segments.next()?, segments.next(), segments.next()) {
+        ("domain", Some(name), None) if !name.is_empty() => Some(ResourceRef::Domain {
+            owner,
+            name: name.to_string(),
+        }),
+        ("repository", Some(domain), Some(repository))
+            if !domain.is_empty() && !repository.is_empty() && !repository.contains('/') =>
+        {
+            Some(ResourceRef::Repository {
+                owner,
+                domain: domain.to_string(),
+                repository: repository.to_string(),
+            })
+        }
+        // A package group's identifier is a PATH, so everything after the domain segment
+        // belongs to it, `/` separators included — the leading one is what makes `/*` the
+        // ancestor of `/npm/*`.
+        ("package-group", Some(domain), Some(path)) if !domain.is_empty() && !path.is_empty() => {
+            Some(ResourceRef::PackageGroup {
+                owner,
+                domain: domain.to_string(),
+                pattern: format!("/{path}"),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Why a caller-supplied `resourceArn` names no resource of this service.
+///
+/// Both tag operations model the same two refusals for the same two reasons, so the
+/// reason is decided ONCE (in [`resolve_taggable`]) and each handler lifts it into its
+/// own modelled error enum — the two cannot drift into disagreeing about which ARN is a
+/// bad request and which is a missing resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagArnRefusal {
+    /// Not a well-formed ARN of this service's namespace: it addresses nothing this API
+    /// can reach, so it is a bad REQUEST (`ValidationException`, HTTP 400).
+    NotThisServicesArn,
+    /// A well-formed ARN of this namespace whose resource field names no kind this store
+    /// holds (`ResourceNotFoundException`, HTTP 404).
+    NoSuchResource,
+}
+
+/// The resource a caller-supplied `resourceArn` names, or why it names none.
+///
+/// The ONE place a tag operation parses an ARN: [`service_common::arn::parse_of`] decides
+/// whether the value is this service's ARN at all, and [`taggable_resource`] which record
+/// kind it addresses.
+pub fn resolve_taggable(resource_arn: &str) -> Result<ResourceRef, TagArnRefusal> {
+    let parsed = ::service_common::arn::parse_of(resource_arn, SERVICE_SIGNING_NAME)
+        .ok_or(TagArnRefusal::NotThisServicesArn)?;
+    taggable_resource(&parsed).ok_or(TagArnRefusal::NoSuchResource)
+}
+
+/// The `repository` value of the modelled `ResourceType` enum — the counterpart of
+/// [`DOMAIN_RESOURCE_TYPE`]. (`ResourceType` models exactly `asset`, `domain`, `package`,
+/// `package-version` and `repository`; see `RESOURCE_TYPE_VALUES` in `ops::types`.)
+pub const REPOSITORY_RESOURCE_TYPE: &str = "repository";
+
+/// The `resourceType` a modelled error reports for a resolved resource.
+///
+/// `None` for a package group: `ResourceType` declares no value for one, so the member is
+/// left unset rather than filled with a spelling the model does not define.
+#[must_use]
+pub fn reported_resource_type(reference: &ResourceRef) -> Option<String> {
+    match reference {
+        ResourceRef::Domain { .. } => Some(DOMAIN_RESOURCE_TYPE.to_string()),
+        ResourceRef::Repository { .. } => Some(REPOSITORY_RESOURCE_TYPE.to_string()),
+        ResourceRef::PackageGroup { .. } => None,
+    }
+}
+
+/// `held` with `incoming` applied, the way CodeArtifact's `TagResource` documents it
+/// ("Adds or updates tags for a resource"): a key the resource already holds keeps its
+/// position and takes the new value, and a key it does not hold is appended.
+///
+/// Tag KEYS are the identity of a tag, so the result holds one entry per distinct key —
+/// including when one request repeats a key, where the last value in the request wins.
+/// Values are copied verbatim: a tag value is an opaque Unicode string, never
+/// normalised, trimmed or re-encoded.
+#[must_use]
+pub fn merged_tags(held: &[Tag], incoming: &[Tag]) -> Vec<Tag> {
+    let mut merged = held.to_vec();
+    for tag in incoming {
+        match merged.iter_mut().find(|held| held.key == tag.key) {
+            Some(existing) => existing.value = tag.value.clone(),
+            None => merged.push(tag.clone()),
+        }
+    }
+    merged
+}
+
 /// A stored CodeArtifact domain.
 #[derive(Debug, Clone)]
 pub struct Domain {

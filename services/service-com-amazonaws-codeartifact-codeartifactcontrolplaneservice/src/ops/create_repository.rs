@@ -275,6 +275,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A resource's tag set is keyed by tag KEY and bounded per resource wherever it
+        // is written, so the create sites apply the same merge and the same cap as
+        // `TagResource`: one entry per distinct key, at most
+        // `MAX_TAGS_PER_RESOURCE` of them. Refused before the repository is stored, so
+        // an over-quota create leaves no repository behind.
+        let tags = crate::state::merged_tags(&[], input.tags.as_deref().unwrap_or_default());
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateRepositoryErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "Cannot create repository {}: tags carries {} distinct keys, more than \
+                         the maximum of {} tags per resource.",
+                        input.repository,
+                        tags.len(),
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    ),
+                    resource_id: Some(input.repository.clone()),
+                    resource_type: Some("repository".to_string()),
+                },
+            )
+            .into());
+        }
+
         let repository = crate::state::Repository {
             name: input.repository.clone(),
             domain_name: domain.name.clone(),
@@ -294,7 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is what adds one.
             external_connections: Vec::new(),
             created_time: ::std::time::SystemTime::now(),
-            tags: input.tags.clone().unwrap_or_default(),
+            tags,
             policy: None,
             // No policy has ever been attached to a repository that was just created.
             policy_attachments: 0,

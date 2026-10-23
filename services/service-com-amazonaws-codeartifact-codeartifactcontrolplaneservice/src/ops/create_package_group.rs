@@ -247,6 +247,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A resource's tag set is keyed by tag KEY and bounded per resource wherever it
+        // is written, so this create site applies the same merge and the same cap as
+        // `TagResource`: one entry per distinct key, at most
+        // `MAX_TAGS_PER_RESOURCE` of them. Refused before the group is stored, so an
+        // over-quota create leaves no group behind.
+        let tags = crate::state::merged_tags(&[], input.tags.as_deref().unwrap_or_default());
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreatePackageGroupErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "Cannot create package group '{pattern}': tags carries {} distinct keys, \
+                         more than the maximum of {} tags per resource.",
+                        tags.len(),
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    ),
+                    resource_id: Some(pattern.clone()),
+                    resource_type: None,
+                },
+            )
+            .into());
+        }
+
         let group = crate::state::PackageGroup {
             pattern: pattern.clone(),
             domain_name: domain.name.clone(),
@@ -261,7 +283,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             restrictions: crate::state::origin_restrictions_in_mode(
                 crate::state::ORIGIN_MODE_INHERIT,
             ),
-            tags: input.tags.clone().unwrap_or_default(),
+            tags,
         };
         domain.package_groups.insert(pattern.clone(), group);
 

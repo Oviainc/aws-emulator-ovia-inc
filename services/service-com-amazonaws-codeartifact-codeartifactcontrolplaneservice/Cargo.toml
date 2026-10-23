@@ -28,12 +28,21 @@ sha2 = { workspace = true }
 # Hex encoding for those ARN suffixes, for the opaque `nextToken` cursors and for the
 # hex digests an asset's `hashes` map and `assetSHA256` are spelled in.
 hex = { workspace = true }
+# `arn`: the one parse of a caller-supplied `resourceArn`, so this service agrees with
+# every other on which ARNs name its own resources and what an ARN's fields are.
+service-common = { path = "../common" }
 # The remaining two algorithms of the model's `HashAlgorithm` enum, which an
 # `AssetSummary.hashes` map reports beside SHA-256 and SHA-512.
 md-5 = "0.10"
 sha1 = "0.10"
 # The opaque `versionRevision` of a package version: base64 of its content digest.
 base64 = "0.22"
+
+[dev-dependencies]
+# Percent-encoding for the `resourceArn` query value the tagging suite sends: an ARN
+# carries `:` and `/`, and the refusal rows carry spaces and non-ASCII, so the suite uses
+# the maintained encoder the sibling service crates use rather than its own.
+percent-encoding = "2.3"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

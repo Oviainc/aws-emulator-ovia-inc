@@ -212,6 +212,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A resource's tag set is keyed by tag KEY and bounded per resource wherever it
+        // is written, so the create sites apply the same merge and the same cap as
+        // `TagResource`: one entry per distinct key, at most
+        // `MAX_TAGS_PER_RESOURCE` of them. Refused before the domain is stored, so an
+        // over-quota create leaves no domain behind.
+        let tags = crate::state::merged_tags(&[], input.tags.as_deref().unwrap_or_default());
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateDomainErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "Cannot create domain {}: tags carries {} distinct keys, more than the \
+                         maximum of {} tags per resource.",
+                        input.domain,
+                        tags.len(),
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    ),
+                    resource_id: Some(input.domain.clone()),
+                    resource_type: Some("domain".to_string()),
+                },
+            )
+            .into());
+        }
+
         // Bound once: the domain and the root package group it is created with report the
         // same owner and the same `createdTime`, because they are created together.
         let owner = ::engine::emulator_account_id().to_string();
@@ -230,7 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::default_encryption_key_arn(&region, &input.domain)
             })),
             s3_bucket_arn: crate::state::asset_bucket_arn(&region, &input.domain),
-            tags: input.tags.clone().unwrap_or_default(),
+            tags,
             policy: None,
             // No policy has ever been attached to a domain that was just created.
             policy_attachments: 0,

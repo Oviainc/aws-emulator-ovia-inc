@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags the resource the caller's `resourceArn` names holds — the ONE tag
+//! list stored on the domain or repository record that `CreateDomain`,
+//! `CreateRepository` and `TagResource` write, so this reader cannot disagree with the
+//! writer. The ARN is resolved exactly as `TagResource` resolves it (a value that is not
+//! a well-formed ARN of this service's namespace is a bad request; a well-formed one
+//! naming no held record is a 404), and nothing here writes to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -145,20 +143,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // The ONE resolution of a caller-supplied `resourceArn`, shared with
+        // `TagResource` (`state::resolve_taggable`): an ARN outside this service's
+        // namespace addresses nothing this API can report on, so it is refused on the
+        // input, while a well-formed one naming no kind this store holds is missing.
+        let reference = match crate::state::resolve_taggable(&input.resource_arn) {
+            Ok(reference) => reference,
+            Err(crate::state::TagArnRefusal::NotThisServicesArn) => {
+                return Err(ListTagsForResourceErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "resourceArn {} is not a CodeArtifact resource ARN.",
+                            input.resource_arn
+                        ),
+                        reason: Some("CANNOT_PARSE".to_string()),
+                    },
+                )
+                .into());
+            }
+            Err(crate::state::TagArnRefusal::NoSuchResource) => {
+                return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Resource {} not found.", input.resource_arn),
+                        resource_id: Some(input.resource_arn.clone()),
+                        resource_type: None,
+                    },
+                )
+                .into());
+            }
+        };
+
+        let not_found = || {
+            ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Resource {} not found.", input.resource_arn),
+                    resource_id: Some(input.resource_arn.clone()),
+                    resource_type: crate::state::reported_resource_type(&reference),
+                },
+            )
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(not_found().into());
+        };
+        let store = state.lock();
+        let Some(held) = store.resource_tags(&reference) else {
+            return Err(not_found().into());
+        };
+
+        // A resource with no tags reports an EMPTY list, not an absent member: the tag
+        // set of a resource that exists is always known.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(held.to_vec()),
+        })
     }
 }
