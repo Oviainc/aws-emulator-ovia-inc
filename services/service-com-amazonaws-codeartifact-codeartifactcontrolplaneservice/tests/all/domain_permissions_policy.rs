@@ -10,8 +10,8 @@
 //! example:
 //!
 //! 1. Reading a domain's resource policy answers 200 with the record the domain holds,
-//!    reported verbatim (`resourceArn`, `revision` and `document`) for any legal policy
-//!    document and domain name — and reading is a pure read, so repeating it answers
+//!    reported as it is stored (`resourceArn`, `revision` and `document`) for any legal
+//!    policy document and domain name — and reading is a pure read, so repeating it answers
 //!    identically and leaves the stored policy in place.
 //! 2. Every resource a domain-scoped policy call cannot resolve is
 //!    `ResourceNotFoundException` (404): a domain not held, a domain held by an account
@@ -134,15 +134,21 @@ struct PolicyCase {
     label: &'static str,
     domain: String,
     document: String,
+    /// The document as CodeArtifact stores and reports it: the submitted JSON with the
+    /// whitespace between its tokens gone and a one-element `Action`/`Resource` list
+    /// rendered as the string. Written out here rather than computed, so the expectation is
+    /// independent of the emulator's own rendering — [`crate::policy_document_rendering`]
+    /// is the suite that asserts that rule over a table of forms.
+    stored: String,
     /// Whether the calls pin `domainOwner` to the owning account.
     pin_owner: bool,
 }
 
 /// The policy table. Rows differ along what rules 1 and 3 generalise over: the form and
 /// size of the policy document (minimal object, several statements, embedded whitespace and
-/// non-ASCII text, the modelled maximum length), the length and character set of the domain
-/// name (modelled minimum, hyphenated, modelled maximum), and whether the calls pin
-/// `domainOwner`.
+/// non-ASCII text, one-element value lists, the modelled maximum length), the length and
+/// character set of the domain name (modelled minimum, hyphenated, modelled maximum), and
+/// whether the calls pin `domainOwner`.
 ///
 /// The bounds are the model's own
 /// (`smithy_query(query="shape",shape="ResourcePolicy,PolicyRevision,PolicyDocument")` and
@@ -163,24 +169,37 @@ fn policy_cases() -> Vec<PolicyCase> {
             label: "minimal document, shortest domain name",
             domain: "ab".to_string(),
             document: r#"{"Version":"2012-10-17","Statement":[]}"#.to_string(),
+            stored: r#"{"Version":"2012-10-17","Statement":[]}"#.to_string(),
             pin_owner: false,
         },
         PolicyCase {
             label: "two statements, pretty-printed, owner pinned",
             domain: "my-domain".to_string(),
             document: "{\n\t\"Version\": \"2012-10-17\",\n\t\"Statement\": [\n\t\t{\"Sid\": \"read\", \"Effect\": \"Allow\", \"Principal\": {\"AWS\": \"arn:aws:iam::111122223333:root\"}, \"Action\": [\"codeartifact:DescribeDomain\", \"codeartifact:GetAuthorizationToken\"], \"Resource\": \"*\"},\n\t\t{\"Sid\": \"deny\", \"Effect\": \"Deny\", \"Principal\": \"*\", \"Action\": \"codeartifact:DeleteDomain\", \"Resource\": \"*\"}\n\t]\n}".to_string(),
+            stored: r#"{"Version":"2012-10-17","Statement":[{"Sid":"read","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111122223333:root"},"Action":["codeartifact:DescribeDomain","codeartifact:GetAuthorizationToken"],"Resource":"*"},{"Sid":"deny","Effect":"Deny","Principal":"*","Action":"codeartifact:DeleteDomain","Resource":"*"}]}"#.to_string(),
             pin_owner: true,
         },
         PolicyCase {
             label: "non-ASCII text in the document",
             domain: "accent-domain-1".to_string(),
             document: r#"{"Version":"2012-10-17","Statement":[{"Sid":"café-lecture","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111122223333:root"},"Action":"codeartifact:DescribeDomain","Resource":"*"}]}"#.to_string(),
+            stored: r#"{"Version":"2012-10-17","Statement":[{"Sid":"café-lecture","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111122223333:root"},"Action":"codeartifact:DescribeDomain","Resource":"*"}]}"#.to_string(),
+            pin_owner: false,
+        },
+        PolicyCase {
+            label: "one-element action and resource lists, indented",
+            domain: "one-element-lists".to_string(),
+            document: "{ \"Version\": \"2012-10-17\",\n  \"Statement\": [ { \"Sid\": \"single\",\n    \"Effect\": \"Allow\",\n    \"Principal\": { \"AWS\": [ \"arn:aws:iam::111122223333:root\" ] },\n    \"Action\": [ \"codeartifact:DescribeDomain\" ],\n    \"Resource\": [ \"*\" ] } ] }".to_string(),
+            stored: r#"{"Version":"2012-10-17","Statement":[{"Sid":"single","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111122223333:root"},"Action":"codeartifact:DescribeDomain","Resource":"*"}]}"#.to_string(),
             pin_owner: false,
         },
         PolicyCase {
             label: "modelled maximum document length, longest domain name",
             // A 50-character domain name: `DomainName`'s modelled maximum.
             domain: format!("d{}e", "x".repeat(48)),
+            // Compact and with no one-element list, so the stored form is the submitted
+            // one: the modelled maximum length is what this row is about.
+            stored: padded.clone(),
             document: padded,
             pin_owner: true,
         },
@@ -227,7 +246,7 @@ async fn attached_policy_round_trips_through_stored_state() {
                 written.body["policy"]["document"].as_str(),
                 written.body["policy"]["resourceArn"].as_str()
             ),
-            (Some(document), Some(expected_arn.as_str())),
+            (Some(case.stored.as_str()), Some(expected_arn.as_str())),
             "case {label:?}: a write must answer with the document it stored, on the domain's \
              own ARN, got {written:?}"
         );
@@ -264,7 +283,7 @@ async fn attached_policy_round_trips_through_stored_state() {
                     .as_ref()
                     .and_then(|policy| policy.revision.clone())
             ),
-            (Some(document.to_string()), revision_of(&written)),
+            (Some(case.stored.clone()), revision_of(&written)),
             "case {label:?}: reading must leave the stored policy in place, got \
              {still_stored:?}"
         );

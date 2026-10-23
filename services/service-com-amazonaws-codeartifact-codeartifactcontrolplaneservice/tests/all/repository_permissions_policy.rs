@@ -11,9 +11,11 @@
 //!
 //! The rules under test, each asserted over a TABLE of inputs rather than one example:
 //!
-//! 1. A put attaches the policy document to the repository VERBATIM — byte-identical,
-//!    whitespace, member order, non-ASCII characters and all — under the repository's own
-//!    ARN and a revision, and a later get answers with that same policy.
+//! 1. A put attaches the policy document to the repository as CodeArtifact renders it —
+//!    the caller's JSON minus the whitespace between its tokens, with a one-element value
+//!    list rendered as the string, and member order, statement count and string contents
+//!    (non-ASCII characters included) left alone — under the repository's own ARN and a
+//!    revision, and a later get answers with that same policy.
 //! 2. `policyRevision` is an optimistic lock: a put or delete that names one proceeds only
 //!    while that is still the revision held (a caller that names none is not locking), and
 //!    a refused write is `ConflictException` (409) that leaves the stored policy unchanged.
@@ -118,14 +120,19 @@ fn padded_document(total_len: usize) -> String {
     format!("{prefix}{}{suffix}", "p".repeat(pad))
 }
 
-/// One document to attach, and the document to replace it with.
+/// One document to attach, and the document to replace it with — each beside the form
+/// CodeArtifact stores and reports it in, written out rather than computed so the
+/// expectation does not come from the emulator's own rendering
+/// ([`crate::policy_document_rendering`] is the suite that asserts that rule).
 struct PolicyCase {
     label: &'static str,
     /// Suffix of the domain and repository this case works in, so cases cannot see each
     /// other's state. `DomainName` admits `^[a-z][a-z0-9\-]{0,48}[a-z0-9]$`.
     slug: &'static str,
     document: String,
+    stored: String,
     replacement: String,
+    replacement_stored: String,
 }
 
 /// The document table. Rows differ along what rule 1 generalises over: the document's
@@ -137,40 +144,52 @@ fn policy_cases() -> Vec<PolicyCase> {
             label: "compact single-statement object",
             slug: "compact",
             document: r#"{"Version":"2012-10-17","Statement":[{"Sid":"ReadAll","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:root"},"Action":["codeartifact:DescribePackageVersion","codeartifact:ReadFromRepository"],"Resource":"*"}]}"#.to_string(),
+            stored: r#"{"Version":"2012-10-17","Statement":[{"Sid":"ReadAll","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:root"},"Action":["codeartifact:DescribePackageVersion","codeartifact:ReadFromRepository"],"Resource":"*"}]}"#.to_string(),
             replacement: r#"{"Version":"2012-10-17","Statement":[{"Sid":"ReadAll","Effect":"Deny","Principal":"*","Action":"codeartifact:ReadFromRepository","Resource":"*"}]}"#.to_string(),
+            replacement_stored: r#"{"Version":"2012-10-17","Statement":[{"Sid":"ReadAll","Effect":"Deny","Principal":"*","Action":"codeartifact:ReadFromRepository","Resource":"*"}]}"#.to_string(),
         },
         PolicyCase {
             label: "pretty-printed across lines, with tabs and trailing newline",
             slug: "pretty",
             document: "{\n\t\"Version\": \"2012-10-17\",\n\t\"Statement\": [\n\t\t{\n\t\t\t\"Sid\": \"Indented\",\n\t\t\t\"Effect\": \"Allow\",\n\t\t\t\"Principal\": { \"AWS\": \"arn:aws:iam::000000000000:role/reader\" },\n\t\t\t\"Action\": \"codeartifact:ReadFromRepository\",\n\t\t\t\"Resource\": \"*\"\n\t\t}\n\t]\n}\n".to_string(),
+            stored: r#"{"Version":"2012-10-17","Statement":[{"Sid":"Indented","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:role/reader"},"Action":"codeartifact:ReadFromRepository","Resource":"*"}]}"#.to_string(),
             replacement: "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": []\n}".to_string(),
+            replacement_stored: r#"{"Version":"2012-10-17","Statement":[]}"#.to_string(),
         },
         PolicyCase {
             label: "member order that is not alphabetical, two statements",
             slug: "unordered",
             document: r#"{"Statement":[{"Resource":"*","Action":"codeartifact:PublishPackageVersion","Principal":{"AWS":"000000000000"},"Effect":"Allow","Sid":"B"},{"Sid":"A","Effect":"Deny","Principal":"*","Action":"codeartifact:DeletePackageVersions","Resource":"*"}],"Version":"2012-10-17"}"#.to_string(),
+            stored: r#"{"Statement":[{"Resource":"*","Action":"codeartifact:PublishPackageVersion","Principal":{"AWS":"000000000000"},"Effect":"Allow","Sid":"B"},{"Sid":"A","Effect":"Deny","Principal":"*","Action":"codeartifact:DeletePackageVersions","Resource":"*"}],"Version":"2012-10-17"}"#.to_string(),
             replacement: r#"{"Statement":[{"Sid":"A","Effect":"Deny","Principal":"*","Action":"codeartifact:DeletePackageVersions","Resource":"*"}],"Version":"2012-10-17"}"#.to_string(),
+            replacement_stored: r#"{"Statement":[{"Sid":"A","Effect":"Deny","Principal":"*","Action":"codeartifact:DeletePackageVersions","Resource":"*"}],"Version":"2012-10-17"}"#.to_string(),
         },
         PolicyCase {
             label: "non-ASCII characters in a condition value",
             slug: "unicode",
             document: r#"{"Version":"2012-10-17","Statement":[{"Sid":"Unicode","Effect":"Allow","Principal":"*","Action":"codeartifact:ReadFromRepository","Resource":"*","Condition":{"StringEquals":{"aws:PrincipalTag/équipe":"café — ☕ 团队"}}}]}"#.to_string(),
+            stored: r#"{"Version":"2012-10-17","Statement":[{"Sid":"Unicode","Effect":"Allow","Principal":"*","Action":"codeartifact:ReadFromRepository","Resource":"*","Condition":{"StringEquals":{"aws:PrincipalTag/équipe":"café — ☕ 团队"}}}]}"#.to_string(),
             replacement: r#"{"Version":"2012-10-17","Statement":[{"Sid":"Unicode","Effect":"Deny","Principal":"*","Action":"codeartifact:ReadFromRepository","Resource":"*","Condition":{"StringEquals":{"aws:PrincipalTag/équipe":"naïve"}}}]}"#.to_string(),
+            replacement_stored: r#"{"Version":"2012-10-17","Statement":[{"Sid":"Unicode","Effect":"Deny","Principal":"*","Action":"codeartifact:ReadFromRepository","Resource":"*","Condition":{"StringEquals":{"aws:PrincipalTag/équipe":"naïve"}}}]}"#.to_string(),
         },
         PolicyCase {
             label: "modelled maximum document length",
             slug: "longest",
+            // Compact and carrying no one-element list, so the stored form is the
+            // submitted one: this row is about the modelled maximum length.
             document: padded_document(MAX_POLICY_DOCUMENT_LEN),
+            stored: padded_document(MAX_POLICY_DOCUMENT_LEN),
             replacement: padded_document(MAX_POLICY_DOCUMENT_LEN - 1),
+            replacement_stored: padded_document(MAX_POLICY_DOCUMENT_LEN - 1),
         },
     ]
 }
 
-/// RULES 1, 2, 3 and 6, over the document table: the document round-trips verbatim, the
-/// revision locks the next write, a refused write changes nothing, and a delete hands back
-/// what it removed.
+/// RULES 1, 2, 3 and 6, over the document table: the document round-trips through the
+/// store, the revision locks the next write, a refused write changes nothing, and a delete
+/// hands back what it removed.
 #[tokio::test]
-async fn policy_round_trips_verbatim_and_its_revision_locks_the_next_write() {
+async fn policy_round_trips_through_the_store_and_its_revision_locks_the_next_write() {
     let router = emulator();
 
     for case in policy_cases() {
@@ -230,8 +249,9 @@ async fn policy_round_trips_verbatim_and_its_revision_locks_the_next_write() {
         assert_eq!(put.status, 200, "case {label:?}: put failed: {put:?}");
         assert_eq!(
             policy_field(&put, "document"),
-            case.document,
-            "case {label:?}: the stored document must be the submitted bytes"
+            case.stored,
+            "case {label:?}: the stored document must be the submitted document as the \
+             service renders it"
         );
         assert_eq!(
             policy_field(&put, "resourceArn"),
@@ -278,8 +298,9 @@ async fn policy_round_trips_verbatim_and_its_revision_locks_the_next_write() {
         );
         assert_eq!(
             policy_field(&replaced, "document"),
-            case.replacement,
-            "case {label:?}: the replacement document must be stored verbatim"
+            case.replacement_stored,
+            "case {label:?}: the replacement document must be stored as the service renders \
+             it"
         );
         let second_revision = policy_field(&replaced, "revision").to_string();
         assert_ne!(
@@ -304,7 +325,7 @@ async fn policy_round_trips_verbatim_and_its_revision_locks_the_next_write() {
         let unchanged = get_policy(&router, &domain, &repository).await;
         assert_eq!(
             policy_field(&unchanged, "document"),
-            case.replacement,
+            case.replacement_stored,
             "case {label:?}: a refused put must leave the document unchanged"
         );
         assert_eq!(

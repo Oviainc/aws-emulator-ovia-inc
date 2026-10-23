@@ -227,12 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteRepositoryPermissionsPolicyErrorModeled::ConflictException(
                     ConflictException {
-                        message: format!(
-                            "The policyRevision '{}' is not the current revision of the resource policy on repository '{}' in domain '{}'.",
-                            input.policy_revision.as_deref().unwrap_or_default(),
-                            input.repository,
-                            input.domain
-                        ),
+                        message: crate::state::POLICY_REVISION_CONFLICT_MESSAGE.to_string(),
                         resource_id: Some(input.repository.clone()),
                         resource_type: Some("repository".to_string()),
                     },

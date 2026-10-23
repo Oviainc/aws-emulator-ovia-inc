@@ -3,7 +3,10 @@
 //! @op PutRepositoryPermissionsPolicy
 //!
 //! Attaches a resource policy to a repository, under the optimistic-locking rules the
-//! whole `*PermissionsPolicy` family shares (`crate::state::policy_revision_matches`).
+//! whole `*PermissionsPolicy` family shares (`crate::state::policy_revision_matches`). The
+//! stored document is the caller's own `policyDocument` minified
+//! (`crate::state::stored_policy_document`): its structure and its string contents are the
+//! caller's, only the whitespace between its JSON tokens goes.
 //!
 //! ## Shape of an operation
 //!
@@ -180,8 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // string", and the modelled pattern (`^[\P{C}\s]+$`) only forbids control
         // characters — so JSON well-formedness is the service's own rule, applied through
         // the one check the whole policy family shares, before anything is written. The
-        // document is parsed ONLY to check it: what gets stored and reported is the string
-        // the caller sent, never a re-serialised rendering of it.
+        // document is parsed ONLY to check it: what gets stored and reported is the
+        // caller's own JSON minified, never a re-serialised rendering of it — so a scalar
+        // statement member stays the scalar the caller wrote.
         if let Some(refusal) = crate::state::policy_document_refusal(&input.policy_document) {
             return Err(
                 PutRepositoryPermissionsPolicyErrorModeled::ValidationException(refusal).into(),
@@ -235,12 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(PutRepositoryPermissionsPolicyErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "The policyRevision '{}' is not the current revision of the resource policy on repository '{}' in domain '{}'.",
-                        input.policy_revision.as_deref().unwrap_or_default(),
-                        input.repository,
-                        input.domain
-                    ),
+                    message: crate::state::POLICY_REVISION_CONFLICT_MESSAGE.to_string(),
                     resource_id: Some(input.repository.clone()),
                     resource_type: Some("repository".to_string()),
                 },
