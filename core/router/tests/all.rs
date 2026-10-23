@@ -11,6 +11,14 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/boot_serve.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+//
+// This first entry is out of alphabetical order on purpose: both the appended region
+// at the end of this file and the span of the sorted list beside a suite's own name
+// are where concurrently landing suites add their line, so a declaration placed there
+// collides with every one of them. The head of the list is the one region nothing
+// else appends to.
+#[path = "all/kinesisvideo_signing_name_routing.rs"]
+mod kinesisvideo_signing_name_routing;
 #[path = "all/amplifybackend_app_registration.rs"]
 mod amplifybackend_app_registration;
 #[path = "all/apigateway_signing_name_routing.rs"]
