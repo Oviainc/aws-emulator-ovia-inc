@@ -2,14 +2,18 @@
 
 //! @op BatchGetInvoiceProfile
 //!
-//! Reports the invoice profile of each account the request names, for accounts of the
-//! requester's organization as [`crate::state::ComAmazonawsInvoicingInvoicingState::organization_accounts`]
+//! Reports the invoice profile of each account the request names, for the LINKED accounts
+//! of the requester's organization as [`crate::state::ComAmazonawsInvoicingInvoicingState::linked_accounts`]
 //! knows them. The operation is documented "the accounts must be linked accounts under
 //! the requester management account organization", so a request that names an account
-//! this organization does not contain is refused WHOLE with the modelled
+//! that is not such a linked account is refused WHOLE with the modelled
 //! `AccessDeniedException` (HTTP 403) — the requester has no access to an account
 //! outside its own organization, and none of the requested profiles is reported, because
 //! the request itself is what the service refuses.
+//!
+//! The requester's OWN account is refused the same way: it is the management account of
+//! the organization, and a management account is not a linked account under itself, so
+//! naming it does not satisfy what the operation documents.
 //!
 //! `@readonly`: this handler only reads state.
 //!
@@ -172,14 +176,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         // "The accounts must be linked accounts under the requester management account
-        // organization": the requester holds no access to an account its organization
-        // does not contain, so naming one is refused with the modelled 403, naming the
-        // first such account in request order — and refused WHOLE, rather than answered
-        // for the accounts it may read.
-        let organization = store.organization_accounts();
+        // organization": the requester holds no access to an account that is not a linked
+        // account of its organization — including its own management account, which is not
+        // a linked account under itself — so naming one is refused with the modelled 403,
+        // naming the first such account in request order, and refused WHOLE rather than
+        // answered for the accounts it may read.
+        let linked = store.linked_accounts();
         if let Some(outsider) = requested
             .iter()
-            .find(|account_id| !organization.contains(**account_id))
+            .find(|account_id| !linked.contains(**account_id))
         {
             return Err(BatchGetInvoiceProfileErrorModeled::AccessDeniedException(
                 crate::state::not_authorized_for_account(outsider),
