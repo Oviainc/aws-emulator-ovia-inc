@@ -2812,10 +2812,11 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
     /// The tag set stored for the resource `arn` names, or `None` when no stored
     /// resource answers to it.
     ///
-    /// An event data store is reachable only from the Region it lives in, which is the
-    /// Region its ARN pins — the same rule [`Self::event_data_store`] applies. A
-    /// channel answers `None` whatever its id: `CreateChannel` is not implemented, so
-    /// the registry holds no channel and an ARN naming one names nothing.
+    /// An event data store and a channel are reachable only from the Region they live
+    /// in, which is the Region their ARN pins — the same rule [`Self::event_data_store`]
+    /// and [`Self::addressed_channel`] apply. A channel the registry does not hold (no
+    /// channel carries that id in that Region) answers `None`, which its caller reports
+    /// as `ChannelNotFoundException`.
     pub fn resource_tags(&self, arn: &TaggableArn) -> Option<&[Tag]> {
         match arn {
             TaggableArn::Trail { region, name } => self
@@ -2831,7 +2832,14 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
                 .get(id)
                 .filter(|record| record.region == *region)
                 .map(|record| record.tags.as_slice()),
-            TaggableArn::Channel { .. } => None,
+            // The channel registry is keyed by the id and Region a channel ARN pins
+            // ([`channels::ChannelKey`]), which is exactly what a tagging ARN
+            // carries — the same two fields a trail's or a store's ARN is looked up
+            // by here.
+            TaggableArn::Channel { region, id } => self
+                .channels
+                .get(&(id.clone(), region.clone()))
+                .map(|record| record.tags.as_slice()),
         }
     }
 
@@ -2852,7 +2860,10 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
                 .get_mut(id)
                 .filter(|record| record.region == *region)
                 .map(|record| &mut record.tags),
-            TaggableArn::Channel { .. } => None,
+            TaggableArn::Channel { region, id } => self
+                .channels
+                .get_mut(&(id.clone(), region.clone()))
+                .map(|record| &mut record.tags),
         }
     }
 }

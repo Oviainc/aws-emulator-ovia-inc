@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a CloudTrail Lake channel in the shared channel registry (`crate::state`)
+//! and reports it back.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +184,181 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannel"))
+        use crate::state::channels;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // `Name`'s length and character set, and the 1..200 bound on
+        // `Destinations`, are modelled constraints the boundary validator already
+        // refused; what is left to this handler is the rules the model cannot
+        // express.
+        channels::validate_channel_source(&input.source).map_err(|message| {
+            CreateChannelErrorModeled::InvalidSourceException(InvalidSourceException {
+                message: Some(message),
+            })
+        })?;
+
+        let tags = input.tags.unwrap_or_default();
+        if tags.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
+            return Err(CreateChannelErrorModeled::TagsLimitExceededException(
+                TagsLimitExceededException {
+                    message: Some(format!(
+                        "Tags carries {} tags; the limit is {} tags per channel",
+                        tags.len(),
+                        crate::state::TAGS_PER_RESOURCE_LIMIT
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(duplicate) = crate::state::first_duplicate_tag_key(&tags) {
+            return Err(CreateChannelErrorModeled::InvalidTagParameterException(
+                InvalidTagParameterException {
+                    message: Some(format!(
+                        "Tags carries the tag key '{duplicate}' more than once"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateChannelErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "CreateChannel needs the CloudTrail channel registry, which this \
+                         engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // Every destination must be an event data store this account holds. The
+        // channel is refused whole, so a request naming one bad destination
+        // persists nothing.
+        for destination in &input.destinations {
+            store
+                .resolve_channel_destination(destination, &region)
+                .map_err(destination_error)?;
+        }
+
+        // A channel name is taken within the Region it was created in, so the same
+        // name in another Region is a different channel.
+        if store.channel_named(&region, &input.name).is_some() {
+            return Err(CreateChannelErrorModeled::ChannelAlreadyExistsException(
+                ChannelAlreadyExistsException {
+                    message: Some(format!("Channel {} already exists in {region}", input.name)),
+                },
+            )
+            .into());
+        }
+
+        // "A maximum of one channel is allowed per source"
+        // (`CreateChannelRequest$Source`), per Region for the same reason the name
+        // is: a channel is a Regional resource.
+        if let Some(existing) = store.channel_sourced_from(&region, &input.source) {
+            return Err(CreateChannelErrorModeled::ChannelAlreadyExistsException(
+                ChannelAlreadyExistsException {
+                    message: Some(format!(
+                        "Channel {} already logs the source {} in {region}; a maximum of \
+                         one channel is allowed per source",
+                        existing.name, input.source
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The registry holds state for the life of the process and every request
+        // may add to it, so the bound is on the WHOLE registry — the same choice
+        // [`channels::CHANNEL_QUOTA`] documents and `CreateTrail` /
+        // `CreateDashboard` apply. A per-Region bound would not bound anything: the
+        // Region comes from the caller's own credential scope, so a caller could
+        // grow the store without end by varying the Region it signs for. The
+        // message says so rather than claiming an account or Region limit.
+        if store.channels.len() >= channels::CHANNEL_QUOTA {
+            return Err(CreateChannelErrorModeled::ChannelMaxLimitExceededException(
+                ChannelMaxLimitExceededException {
+                    message: Some(format!(
+                        "This emulator's channel registry already holds its maximum of {} \
+                         channels; delete a channel before creating another",
+                        channels::CHANNEL_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = channels::ChannelRecord::created(
+            &region,
+            &input.name,
+            &input.source,
+            input.destinations,
+            tags,
+        );
+
+        // Report the stored record, so the response and every later read of this
+        // channel are the same values.
+        let output = CreateChannelOutput {
+            channel_arn: Some(record.channel_arn.clone()),
+            name: Some(record.name.clone()),
+            source: Some(record.source.clone()),
+            destinations: Some(record.destinations.clone()),
+            // `Tags` is reported only when the request carried some, so a channel
+            // created without tags does not read back as one with an empty list.
+            tags: (!record.tags.is_empty()).then(|| record.tags.clone()),
+        };
+
+        store.channels.insert(record.key(), record);
+        Ok(output)
     }
+}
+
+/// The modelled failure a refused destination answers with. Each
+/// [`crate::state::channels::DestinationRejection`] variant names one, so every
+/// channel operation refuses the same destination the same way.
+fn destination_error(
+    rejection: crate::state::channels::DestinationRejection,
+) -> CreateChannelError {
+    use crate::state::channels::DestinationRejection;
+
+    let modeled = match rejection {
+        DestinationRejection::ArnInvalid(message) => {
+            CreateChannelErrorModeled::EventDataStoreARNInvalidException(
+                EventDataStoreARNInvalidException {
+                    message: Some(message),
+                },
+            )
+        }
+        DestinationRejection::NotFound(message) => {
+            // The one refusal whose status is not its shape's `@httpError`: the
+            // shape carries 404 and the service answers 400 (recorded wire step:
+            // `400 EventDataStoreNotFoundException` for a well-formed event data
+            // store ARN that names no store). See
+            // `state::channels::EVENT_DATA_STORE_NOT_FOUND_HTTP_STATUS`.
+            return crate::scaffolded::Scaffolded::modeled_with_status(
+                CreateChannelErrorModeled::EventDataStoreNotFoundException(
+                    EventDataStoreNotFoundException {
+                        message: Some(message),
+                    },
+                ),
+                crate::state::channels::EVENT_DATA_STORE_NOT_FOUND_HTTP_STATUS,
+            );
+        }
+        DestinationRejection::Inactive(message) => {
+            CreateChannelErrorModeled::InactiveEventDataStoreException(
+                InactiveEventDataStoreException {
+                    message: Some(message),
+                },
+            )
+        }
+        DestinationRejection::InvalidParameter(message) => {
+            CreateChannelErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+        }
+    };
+    modeled.into()
 }
