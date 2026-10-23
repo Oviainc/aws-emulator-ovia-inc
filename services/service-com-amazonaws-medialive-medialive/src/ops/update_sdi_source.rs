@@ -170,7 +170,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(source) if !source.is_deleted() => source,
             found => {
                 let message = if found.is_some() {
-                    format!("SdiSource {} already deleted", input.sdi_source_id)
+                    crate::state::already_deleted_message(&format!(
+                        "SdiSource {}",
+                        input.sdi_source_id
+                    ))
                 } else {
                     format!("SdiSource not found: {}", input.sdi_source_id)
                 };
