@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds to or modifies the tags of the resource an ARN names, against the shared
+//! store: the tags the request names are MERGED into the resource's tag set — a
+//! pipeline's, a custom action type's or a webhook's, whichever the ARN names — so a
+//! key the resource already carries takes the new value and every other key it holds
+//! is left alone. The refusals are the ones the model declares for each condition:
+//! `InvalidArnException` for a string that is not a `codepipeline` resource ARN,
+//! `ResourceNotFoundException` for a well-formed ARN naming no resource this service
+//! holds, `InvalidTagsException` for a tag set that cannot describe a resource's
+//! tags (a key named twice, or a key in the namespace AWS reserves with the `aws:`
+//! prefix — [`crate::state::validate_tags`], the rule every operation of this
+//! service that sets tags applies), and `TooManyTagsException` past
+//! [`crate::state::MAX_TAGS_PER_RESOURCE`]. The resource
+//! is resolved FIRST, so a call naming a resource that cannot be reached is refused
+//! for that whatever its tags say — the same answer the listing, which carries no
+//! tags, gives the same ARN — and the request is then judged whole BEFORE anything
+//! is written, so a refused call leaves the resource's tags exactly as they were.
 //!
 //! ## Shape of an operation
 //!
@@ -109,6 +117,24 @@ impl From<TagResourceErrorModeled> for TagResourceError {
     }
 }
 
+/// How this operation refuses an ARN it cannot resolve to a stored resource: each
+/// [`crate::state::TagTargetProblem`] maps to the error the model declares for it,
+/// carrying the message the shared resolver built from the request.
+fn arn_error(problem: &crate::state::TagTargetProblem) -> TagResourceError {
+    let message = Some(problem.message().to_string());
+    match problem {
+        crate::state::TagTargetProblem::InvalidArn(_) => {
+            TagResourceErrorModeled::InvalidArnException(InvalidArnException { message })
+        }
+        crate::state::TagTargetProblem::NotFound(_) => {
+            TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message,
+            })
+        }
+    }
+    .into()
+}
+
 /// The `TagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -145,18 +171,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let state = crate::state::require_state(&*self.engine)?;
+
+        let incoming = crate::state::tag_set(&input.tags);
+
+        let mut store = state.lock();
+        // The resource comes FIRST, so every operation addressing a resource by ARN
+        // answers one request the same way: the rule for resolving an ARN lives in
+        // `state::tag_target`, reached here through the `resource_tags` /
+        // `set_resource_tags` seam that reads and writes whichever KIND of resource
+        // the ARN named. A call naming a resource that cannot be reached is refused
+        // for that, whatever its tags say.
+        let mut updated = store
+            .resource_tags(&input.resource_arn)
+            .map_err(|problem| arn_error(&problem))?;
+
+        // A tag set no resource of this service can carry, each defect reported as
+        // the error shape the model declares for it — the same rule every operation
+        // that sets tags here applies. Judged before anything is written, so a
+        // refused call leaves the resource's tags as they were.
+        if let Err(problem) = crate::state::validate_tags(&input.tags) {
+            let message = Some(problem.message().to_string());
+            return Err(match problem {
+                crate::state::TagProblem::TooMany(_) => {
+                    TagResourceErrorModeled::TooManyTagsException(TooManyTagsException { message })
+                }
+                crate::state::TagProblem::Invalid(_) => {
+                    TagResourceErrorModeled::InvalidTagsException(InvalidTagsException { message })
+                }
+            }
+            .into());
+        }
+
+        // The bound is judged on the MERGED set too: rewriting a key the resource
+        // already carries never grows it, while a new key does.
+        let merged = crate::state::tag_count_after_merge(&updated, &incoming);
+        if merged > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "tagging {} would leave it holding {merged} tags, past the limit of {}",
+                        input.resource_arn,
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+        updated.extend(incoming);
+        store
+            .set_resource_tags(&input.resource_arn, updated)
+            .map_err(|problem| arn_error(&problem))?;
+
+        Ok(TagResourceOutput::default())
     }
 }

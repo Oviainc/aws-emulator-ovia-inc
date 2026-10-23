@@ -4,7 +4,8 @@
 //! plus the small helpers every handler of this crate shares.
 //!
 //! The pipeline definition lifecycle (`CreatePipeline` / `GetPipeline` /
-//! `ListPipelines` / `DeletePipeline`), the custom action types
+//! `ListPipelines` / `DeletePipeline`), the tag set each pipeline carries
+//! (`TagResource` / `ListTagsForResource`), the custom action types
 //! `CreateCustomActionType` mints and `ListActionTypes` reports, the execution
 //! records `StartPipelineExecution` mints, the stage-transition states
 //! `DisableStageTransition` / `EnableStageTransition` change and the webhooks
@@ -218,11 +219,15 @@ pub const AUTHENTICATION_UNAUTHENTICATED: &str = "UNAUTHENTICATED";
 /// service mints is owned by `Custom`.
 pub const ACTION_OWNER_CUSTOM: &str = "Custom";
 
-/// The most tags one resource of this service holds.
+/// The most tags one resource of this service holds before a tagging call is refused
+/// with `TooManyTagsException` ("The tags limit for a resource has been exceeded").
 ///
-/// AWS's resource-tagging limit of 50 tags per resource, which is what the modelled
-/// `TooManyTagsException` ("The tags limit for a resource has been exceeded")
-/// reports when a request would carry a resource past it.
+/// `TagList` carries no `@length`, so the bound is enforced by the handlers. The
+/// figure is AWS's resource-tagging limit of 50 tags per resource, which
+/// CodePipeline's own "Tagging resources" guide states for a pipeline, custom action
+/// or webhook. A bound is also required here: a resource's tag set grows on every
+/// accepted `TagResource` call, so without one a caller could grow the store without
+/// limit.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// Per-service state for com-amazonaws-codepipeline-codepipeline-20150709. A handler reaches it through [`service_state`].
@@ -408,6 +413,122 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
             .retain(|(pipeline_name, _), _| pipeline_name != name);
     }
 
+    /// The tags of the resource `arn` names.
+    ///
+    /// The ARN is resolved by [`Self::tag_target`], so the reader and the writer
+    /// refuse the same strings with the same message, and the set is reported the
+    /// same way whichever KIND of resource holds it — a pipeline's tags are stored as
+    /// a [`TagSet`] already, an action type's as the `TagList` its create answered
+    /// with.
+    pub fn resource_tags(&self, arn: &str) -> Result<TagSet, TagTargetProblem> {
+        let target = self.tag_target(arn)?;
+        match &target {
+            TagTarget::Pipeline(name) => self.pipelines.get(name).map(|p| p.tags.clone()),
+            TagTarget::ActionType(key) => {
+                self.action_types.get(key).map(|record| tag_set(&record.tags))
+            }
+            TagTarget::Webhook(name) => {
+                self.webhooks.get(name).map(|webhook| tag_set(&webhook.tags))
+            }
+        }
+        .ok_or_else(|| unresolved_after_lookup(&target))
+    }
+
+    /// Store `tags` as the tags of the resource `arn` names: the one seam through
+    /// which a tagging operation changes a resource's tags, whichever kind it is.
+    ///
+    /// The caller computes the set to store from [`Self::resource_tags`] and judges
+    /// it ([`validate_tags`], [`tag_count_after_merge`]) before calling this, so a
+    /// refused request never reaches the store.
+    pub fn set_resource_tags(&mut self, arn: &str, tags: TagSet) -> Result<(), TagTargetProblem> {
+        let target = self.tag_target(arn)?;
+        match &target {
+            TagTarget::Pipeline(name) => match self.pipelines.get_mut(name) {
+                Some(pipeline) => pipeline.tags = tags,
+                None => return Err(unresolved_after_lookup(&target)),
+            },
+            TagTarget::ActionType(key) => match self.action_types.get_mut(key) {
+                // An action type keeps its tags as the modelled `TagList`, so the
+                // set is written back in its key order.
+                Some(record) => record.tags = tag_list(&tags),
+                None => return Err(unresolved_after_lookup(&target)),
+            },
+            TagTarget::Webhook(name) => match self.webhooks.get_mut(name) {
+                // A webhook keeps its tags as the modelled `TagList` too.
+                Some(webhook) => webhook.tags = tag_list(&tags),
+                None => return Err(unresolved_after_lookup(&target)),
+            },
+        }
+        Ok(())
+    }
+
+    /// The taggable resource `arn` names, as the store holds it.
+    ///
+    /// One rule, shared by every operation that reaches a resource BY ARN rather than
+    /// by name: the ARN is first read as a `codepipeline` resource ARN
+    /// ([`parse_resource_arn`]) — a string that is not one is refused as
+    /// `InvalidArnException` — and then resolved against the store, where an ARN that
+    /// names no resource held here is refused as `ResourceNotFoundException`, naming
+    /// the resource and the account the ARN asked for. A resource resolves only
+    /// within the scope its ARN names — on the ARN the service minted for it — so an
+    /// ARN differing in partition, Region or account names a resource in another
+    /// scope rather than this one.
+    pub fn tag_target(&self, arn: &str) -> Result<TagTarget, TagTargetProblem> {
+        let parsed = parse_resource_arn(arn).ok_or_else(|| {
+            TagTargetProblem::InvalidArn(format!(
+                "{arn} is not a valid CodePipeline resource ARN"
+            ))
+        })?;
+        let account = parsed.account;
+        match parsed.resource {
+            ResourceRef::Pipeline(name) => {
+                if self.pipelines.get(&name).is_some_and(|p| p.arn == arn) {
+                    Ok(TagTarget::Pipeline(name))
+                } else {
+                    Err(TagTargetProblem::NotFound(format!(
+                        "Pipeline with name {name} does not exist in account {account}."
+                    )))
+                }
+            }
+            // A custom action type is a taggable resource this service holds:
+            // `CreateCustomActionType` registers it with the tags its caller applied,
+            // and the ARN names it by its four `ActionTypeId` members. Only a
+            // REGISTRATION is a resource of the account — the action types the
+            // service itself provides belong to no caller, and carry no Region — and
+            // it resolves, like a pipeline, only on the ARN the service would mint
+            // for it, so partition, Region and account must all be the ones it was
+            // registered in.
+            ResourceRef::ActionType { identifier, key } => {
+                let held = self.action_types.get(&key).is_some_and(|record| {
+                    record
+                        .region
+                        .as_deref()
+                        .is_some_and(|region| action_type_arn(region, &identifier) == arn)
+                });
+                if held {
+                    Ok(TagTarget::ActionType(key))
+                } else {
+                    Err(TagTargetProblem::NotFound(format!(
+                        "ActionType with id {identifier} does not exist in account {account}."
+                    )))
+                }
+            }
+            // A webhook is a taggable resource this service holds too: `PutWebhook`
+            // stores it with the tags its caller applied, and the ARN names it by
+            // `WebhookDefinition$name`. It resolves, like the other kinds, only on
+            // the ARN the service minted for it.
+            ResourceRef::Webhook(name) => {
+                if self.webhooks.get(&name).is_some_and(|w| w.arn == arn) {
+                    Ok(TagTarget::Webhook(name))
+                } else {
+                    Err(TagTargetProblem::NotFound(format!(
+                        "Webhook with name {name} does not exist in account {account}."
+                    )))
+                }
+            }
+        }
+    }
+
     /// A webhook trigger URL in `region` that no stored webhook already uses.
     ///
     /// Like [`Self::new_execution_id`]: the 122 random bits make a collision against
@@ -524,6 +645,32 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
     }
 }
 
+/// The taggable resource an ARN resolved to, as the store holds it: which store, and
+/// the key it is held under. Answered by
+/// [`ComAmazonawsCodepipelineCodepipeline20150709State::tag_target`] only for a
+/// resource that EXISTS, so the accessors built on it read and write the one the
+/// caller's ARN named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagTarget {
+    /// A pipeline, keyed by `PipelineDeclaration$name`.
+    Pipeline(String),
+    /// A custom action type this account registered, keyed by its identity.
+    ActionType(ActionTypeKey),
+    /// A webhook, keyed by `WebhookDefinition$name`.
+    Webhook(String),
+}
+
+impl TagTarget {
+    /// How a refusal names this resource.
+    fn describe(&self) -> String {
+        match self {
+            Self::Pipeline(name) => format!("Pipeline with name {name}"),
+            Self::ActionType(key) => format!("ActionType with id {}", key.cursor()),
+            Self::Webhook(name) => format!("Webhook with name {name}"),
+        }
+    }
+}
+
 /// The URL a webhook is triggered on, in the shape CodePipeline generates
 /// (`https://<region>.webhooks.aws/trigger?t=<opaque token>&v=1`).
 ///
@@ -606,6 +753,117 @@ impl Webhook {
     }
 }
 
+/// The refusal for the case [`ComAmazonawsCodepipelineCodepipeline20150709State::tag_target`]
+/// has already ruled out: it answers a target only for a resource it just found in
+/// the same store, so the accessors above cannot miss it. Reported as the same
+/// refusal rather than as an invented success, and stated ONCE so no caller invents
+/// its own wording for an unreachable case.
+fn unresolved_after_lookup(target: &TagTarget) -> TagTargetProblem {
+    TagTargetProblem::NotFound(format!("{} does not exist.", target.describe()))
+}
+
+/// The identity an `actiontype` ARN's `<owner>/<category>/<provider>/<version>`
+/// names, or `None` when it is not four non-empty members.
+///
+/// The ARN orders the members OWNER first, while [`ActionTypeKey`] is ordered the way
+/// `ActionTypeId` declares them (category first), so the two renderings are not the
+/// same string and this is the one place that maps between them. Called by
+/// [`parse_resource_arn`], so a `ResourceRef::ActionType` always carries the identity
+/// its ARN names.
+fn action_type_arn_key(identifier: &str) -> Option<ActionTypeKey> {
+    let mut parts = identifier.split('/');
+    let key = ActionTypeKey {
+        owner: parts.next()?.to_string(),
+        category: parts.next()?.to_string(),
+        provider: parts.next()?.to_string(),
+        version: parts.next()?.to_string(),
+    };
+    if parts.next().is_some()
+        || [&key.category, &key.owner, &key.provider, &key.version]
+            .iter()
+            .any(|member| member.is_empty())
+    {
+        return None;
+    }
+    Some(key)
+}
+
+/// The ARN this service mints for the action type `identifier` names, registered in
+/// `region` — what an ARN naming that registration has to equal.
+fn action_type_arn(region: &str, identifier: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{ARN_TYPE_ACTION_TYPE}{identifier}"),
+    )
+}
+
+/// A resource's tags: tag key -> tag value.
+///
+/// A tag SET, not a list: `TagResource` "adds to or modifies the tags of the given
+/// resource", so a key a resource already carries is overwritten rather than
+/// duplicated, and the key order a listing pages through is the total order of a
+/// `BTreeMap` (what makes a tag cursor round-trip deterministically).
+pub type TagSet = BTreeMap<String, String>;
+
+/// Whether `key` is in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace, matched in
+/// any letter case — the reading [`validate_tags`] enforces, so one rule decides it
+/// for every caller.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    // `str::get` answers `None` rather than panicking when the key's first four
+    // bytes are not a character boundary, so a key that cannot carry the prefix is
+    // simply not one.
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The modelled `TagList` as a [`TagSet`]: a key named twice keeps the LAST value,
+/// though no handler reaches that case — [`validate_tags`] refuses a list naming one
+/// key twice before the set is built.
+pub fn tag_set<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> TagSet {
+    tags.into_iter()
+        .map(|tag| (tag.key.clone(), tag.value.clone()))
+        .collect()
+}
+
+/// A [`TagSet`] as the modelled `TagList`, ordered by key.
+pub fn tag_list(tags: &TagSet) -> Vec<Tag> {
+    tags.iter()
+        .map(|(key, value)| Tag {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+/// How many tags a resource would hold once `incoming` is merged into `existing`:
+/// a key already present is replaced, so only new keys add to the count.
+pub fn tag_count_after_merge(existing: &TagSet, incoming: &TagSet) -> usize {
+    existing.len() + incoming.keys().filter(|key| !existing.contains_key(*key)).count()
+}
+
+/// Why a tag operation cannot reach the resource an ARN names. Each variant carries
+/// the message the refusal reports, built from the request so the caller can see
+/// WHICH resource in WHICH account was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagTargetProblem {
+    /// The string is not a `codepipeline` resource ARN: refused as
+    /// `InvalidArnException`.
+    InvalidArn(String),
+    /// A well-formed ARN naming no resource this service holds: refused as
+    /// `ResourceNotFoundException`.
+    NotFound(String),
+}
+
+impl TagTargetProblem {
+    /// Why the ARN could not be resolved.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::InvalidArn(message) | Self::NotFound(message) => message,
+        }
+    }
+}
+
 /// A defect in a `WebhookDefinition` that the model's own constraints cannot express,
 /// so it has to be refused by the handler.
 ///
@@ -629,6 +887,122 @@ impl WebhookProblem {
             Self::FilterPattern(message) | Self::Authentication(message) => message,
         }
     }
+}
+
+/// A well-formed `codepipeline` resource ARN, split into the parts a refusal and a
+/// lookup need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceArnRef {
+    /// The Region segment.
+    pub region: String,
+    /// The 12-digit account segment.
+    pub account: String,
+    /// The resource the ARN names.
+    pub resource: ResourceRef,
+}
+
+/// What a well-formed `codepipeline` resource ARN names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceRef {
+    /// `arn:<partition>:codepipeline:<region>:<account>:<pipeline-name>` — a pipeline
+    /// ARN carries the name directly, with no resource-type prefix.
+    Pipeline(String),
+    /// `arn:<partition>:codepipeline:<region>:<account>:actiontype:<owner>/<category>/<provider>/<version>`,
+    /// carrying both the identifier as written and the identity it names.
+    ActionType {
+        /// The `<owner>/<category>/<provider>/<version>` the ARN carries.
+        identifier: String,
+        /// The identity those four members name.
+        key: ActionTypeKey,
+    },
+    /// `arn:<partition>:codepipeline:<region>:<account>:webhook:<webhook-name>`.
+    Webhook(String),
+}
+
+/// The `actiontype` resource-type prefix in a `codepipeline` resource ARN.
+const ARN_TYPE_ACTION_TYPE: &str = "actiontype:";
+
+/// The `webhook` resource-type prefix in a `codepipeline` resource ARN.
+const ARN_TYPE_WEBHOOK: &str = "webhook:";
+
+/// The resource `arn` names, or `None` when `arn` is not a `codepipeline` resource
+/// ARN at all.
+///
+/// `ResourceArn`'s modelled pattern
+/// (`^arn:aws(-[\w]+)*:codepipeline:.+:[0-9]{12}:.+$`) is already enforced at the
+/// boundary, so it is not re-checked here; what this adds is the structure the
+/// pattern cannot state — that the region segment is a region token, and that the
+/// resource segment names one of the resource forms CodePipeline defines. A resource
+/// segment with no type prefix this service defines is read as a pipeline name
+/// (CodePipeline's pipeline ARNs carry it bare), so a name no pipeline uses resolves
+/// as "no such resource" rather than as a malformed ARN.
+pub fn parse_resource_arn(arn: &str) -> Option<ResourceArnRef> {
+    // Six segments: the resource portion is the rest, because it may itself contain
+    // `:` (the `actiontype:`/`webhook:` forms do).
+    let mut segments = arn.splitn(6, ':');
+    if segments.next()? != "arn" {
+        return None;
+    }
+    if !is_arn_partition(segments.next()?) {
+        return None;
+    }
+    if segments.next()? != ARN_SERVICE {
+        return None;
+    }
+    let region = segments.next()?;
+    if !is_region_token(region) {
+        return None;
+    }
+    let account = segments.next()?;
+    if account.len() != 12 || !account.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let resource = segments.next()?;
+
+    let resource = if let Some(identifier) = resource.strip_prefix(ARN_TYPE_ACTION_TYPE) {
+        // The four `ActionTypeId` members, or no action type at all.
+        Some(ResourceRef::ActionType {
+            identifier: identifier.to_string(),
+            key: action_type_arn_key(identifier)?,
+        })
+    } else if let Some(name) = resource.strip_prefix(ARN_TYPE_WEBHOOK) {
+        (!name.is_empty()).then(|| ResourceRef::Webhook(name.to_string()))
+    } else {
+        (!resource.is_empty()).then(|| ResourceRef::Pipeline(resource.to_string()))
+    }?;
+    Some(ResourceArnRef {
+        region: region.to_string(),
+        account: account.to_string(),
+        resource,
+    })
+}
+
+/// Whether `partition` is an ARN partition: `aws`, or `aws-` followed by one or more
+/// `-`-separated word segments (`aws-cn`, `aws-us-gov`), which is what
+/// `ResourceArn`'s `aws(-[\w]+)*` states.
+fn is_arn_partition(partition: &str) -> bool {
+    match partition.strip_prefix("aws") {
+        None => false,
+        Some("") => true,
+        Some(rest) => rest.strip_prefix('-').is_some_and(|rest| {
+            rest.split('-')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        }),
+    }
+}
+
+/// Whether `region` is a region token: non-empty, lower-case alphanumerics and `-`
+/// (`us-east-1`). An ARN whose fourth segment is anything else is not addressing an
+/// AWS Region, so it names no resource.
+///
+/// Every ARN this service mints satisfies it: the region comes from
+/// [`request_region`], which reads the SigV4 credential scope (whose region is
+/// lower-case by the signing specification) or falls back to [`DEFAULT_REGION`].
+fn is_region_token(region: &str) -> bool {
+    !region.is_empty()
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 /// Refuse a `WebhookDefinition` whose filters or authentication parameters cannot
@@ -840,11 +1214,12 @@ pub struct ActionTypeRecord {
     /// offers in every Region. `ListActionTypes$regionFilter` ("The Region to filter
     /// on for the list of action types") is what reads it.
     pub region: Option<String>,
-    /// The tags applied to this action type, as `CreateCustomActionType` stored
-    /// them. Empty for an action type the service provides itself, which no caller
-    /// tagged. `ActionType` carries no `tags` member, so only an operation that
-    /// reports a resource's tags reads it: `CreateCustomActionType`'s own answer
-    /// today, and `ListTagsForResource` once that stub is written.
+    /// The tags applied to this action type, as `CreateCustomActionType` stored them
+    /// and a later `TagResource` call merged into them. Empty for an action type the
+    /// service provides itself, which no caller tagged (and which no caller can tag:
+    /// it belongs to no account). `ActionType` carries no `tags` member, so only an
+    /// operation that reports a resource's tags reads it: `CreateCustomActionType`'s
+    /// own answer and `ListTagsForResource`.
     pub tags: Vec<Tag>,
 }
 
@@ -1066,8 +1441,8 @@ pub struct Pipeline {
     pub created: SystemTime,
     /// When the pipeline was last updated.
     pub updated: SystemTime,
-    /// The tags applied to the pipeline.
-    pub tags: Vec<Tag>,
+    /// The tags applied to the pipeline, keyed by tag key (see [`TagSet`]).
+    pub tags: TagSet,
     /// Every version of the declaration, keyed by version number.
     pub versions: BTreeMap<i32, PipelineDeclaration>,
     /// The transitions a caller has changed the state of, keyed by
@@ -1101,7 +1476,7 @@ impl Pipeline {
         declaration: PipelineDeclaration,
         arn: String,
         now: SystemTime,
-        tags: Vec<Tag>,
+        tags: TagSet,
     ) -> Self {
         let pipeline_type = resolved_pipeline_type(&declaration);
         let execution_mode = resolved_execution_mode(&declaration);
@@ -1332,6 +1707,11 @@ impl Pipeline {
         }
     }
 
+    /// This pipeline's tags as the modelled `TagList`, ordered by key.
+    pub fn tag_list(&self) -> Vec<Tag> {
+        tag_list(&self.tags)
+    }
+
     /// This pipeline's `PipelineMetadata`, as `GetPipeline` reports it.
     pub fn metadata(&self) -> PipelineMetadata {
         PipelineMetadata {
@@ -1415,14 +1795,18 @@ impl TagProblem {
 
 /// Refuse a tag set no resource of this service can carry.
 ///
-/// Neither rule is expressible as a Smithy constraint (`TagList` carries no length
-/// bound and a list cannot require distinct keys):
+/// None of the rules is expressible as a Smithy constraint (`TagList` carries no
+/// length bound, a list cannot require distinct keys, and `TagKey` carries no
+/// `@pattern`):
 ///
 /// * at most [`MAX_TAGS_PER_RESOURCE`] tags on one resource;
 /// * one key at most once — a map from key to value cannot hold a key twice, so a
 ///   list naming one key twice does not describe a tag set;
 /// * no key in AWS's reserved [`RESERVED_TAG_KEY_PREFIX`] namespace, which a caller
 ///   may not set, matched in any letter case.
+///
+/// Every operation that sets tags on a resource of this service applies it, so one
+/// request is refused the same way whichever resource it addresses.
 pub fn validate_tags(tags: &[Tag]) -> Result<(), TagProblem> {
     if tags.len() > MAX_TAGS_PER_RESOURCE {
         return Err(TagProblem::TooMany(format!(
@@ -1432,14 +1816,7 @@ pub fn validate_tags(tags: &[Tag]) -> Result<(), TagProblem> {
     }
     let mut seen = BTreeSet::new();
     for tag in tags {
-        // `str::get` answers `None` rather than panicking when the key's first four
-        // bytes are not a character boundary, so a key that cannot carry the prefix
-        // is simply not one.
-        if tag
-            .key
-            .get(..RESERVED_TAG_KEY_PREFIX.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
-        {
+        if is_reserved_tag_key(&tag.key) {
             return Err(TagProblem::Invalid(format!(
                 "tags names the key {} in the reserved {RESERVED_TAG_KEY_PREFIX} namespace",
                 tag.key
@@ -1732,9 +2109,18 @@ pub fn to_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
 
 /// The region to mint a resource's ARN in: the one the request's SigV4 credential
 /// scope names, else [`DEFAULT_REGION`].
+///
+/// The scope's region is accepted only when it is a region token
+/// ([`is_region_token`]) — the same rule [`parse_resource_arn`] applies when reading
+/// an ARN back. That makes "every ARN this service mints parses again" an invariant
+/// rather than an assumption: a credential scope naming something that is not a
+/// Region (an upper-case or punctuated string) would otherwise mint an ARN that no
+/// ARN-addressed operation could ever resolve, so the request is answered in the
+/// default Region instead.
 pub fn request_region(headers: &::http::HeaderMap) -> String {
     ::emulator_server::sigv4_credential_scope(headers)
         .map(|scope| scope.region)
+        .filter(|region| is_region_token(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
@@ -1855,6 +2241,9 @@ pub const CURSOR_PIPELINE: &str = "pipeline";
 /// The cursor kind a `ListPipelineExecutions` token carries.
 pub const CURSOR_EXECUTION: &str = "execution";
 
+/// The cursor kind a `ListTagsForResource` token carries.
+pub const CURSOR_TAG: &str = "tag";
+
 /// The cursor kind a `ListWebhooks` token carries.
 pub const CURSOR_WEBHOOK: &str = "webhook";
 
@@ -1866,20 +2255,22 @@ pub const CURSOR_ACTION_TYPE: &str = "actionType";
 /// Base64 of `<kind>:<key>` (the encoding AWS's own opaque tokens use, from
 /// `aws_smithy_types::base64`): opaque to the caller, round-trips exactly, and stays
 /// inside `NextToken`'s modelled 1..2048 length for every key this service pages
-/// over (a pipeline or webhook name is at most 100 characters, an execution id 36,
-/// and an action type's four `ActionTypeId` members at most 8 + 10 + 35 + 9). The
-/// kind prefix is what lets [`decode_page_token`] reject a token this listing never
-/// issued; none of `PipelineName`, `WebhookName` or `PipelineExecutionId` can contain
-/// `:`, so the prefix is unambiguous.
+/// over (a pipeline or webhook name is at most 100 characters, an execution id 36, a
+/// `TagKey` 128, and an action type's four `ActionTypeId` members at most
+/// 8 + 10 + 35 + 9). The kind prefix is what lets [`decode_page_token`] reject a
+/// token this listing never issued, and it is unambiguous because no kind contains
+/// `:` and [`decode_page_token`] splits on the FIRST one — so a key that itself
+/// contains `:` (a `TagKey` may) still round-trips exactly.
 ///
 /// Every listing applies ONE rule to a cursor: the page resumes at the first item
 /// still in the listing's order at or after the key, and the token is refused with
 /// `InvalidNextTokenException` only when it is not a cursor that listing issued or
 /// no such position exists. They differ only in what their order makes possible:
-/// `ListPipelines`, `ListWebhooks` and `ListActionTypes` are ordered BY the key, so
-/// an item deleted between pages still has a position (the next key) and paging
-/// continues; `ListPipelineExecutions` is ordered by when each execution started, so
-/// an id that is no longer retained has no position at all and its cursor is refused.
+/// `ListPipelines`, `ListTagsForResource`, `ListWebhooks` and `ListActionTypes` are
+/// ordered BY the key, so an item deleted between pages still has a position (the
+/// next key) and paging continues; `ListPipelineExecutions` is ordered by when each
+/// execution started, so an id that is no longer retained has no position at all and
+/// its cursor is refused.
 pub fn encode_page_token(kind: &str, key: &str) -> String {
     ::aws_smithy_types::base64::encode(format!("{kind}:{key}"))
 }

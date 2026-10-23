@@ -185,14 +185,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::request_region(&ctx.parts().headers),
             &name,
         );
-        let tags = input.tags.unwrap_or_default();
+        // Tags created with the pipeline are judged by the same rule every operation
+        // that sets tags on a resource of this service applies
+        // (`state::validate_tags`), each defect reported as the error shape the model
+        // declares for it.
+        if let Err(problem) = crate::state::validate_tags(input.tags.as_deref().unwrap_or_default())
+        {
+            let message = Some(problem.message().to_string());
+            return Err(match problem {
+                crate::state::TagProblem::TooMany(_) => {
+                    CreatePipelineErrorModeled::TooManyTagsException(TooManyTagsException {
+                        message,
+                    })
+                }
+                crate::state::TagProblem::Invalid(_) => {
+                    CreatePipelineErrorModeled::InvalidTagsException(InvalidTagsException {
+                        message,
+                    })
+                }
+            }
+            .into());
+        }
+        let tags = crate::state::tag_set(input.tags.as_deref().unwrap_or_default());
         let pipeline = crate::state::Pipeline::create(
             input.pipeline,
             arn,
             ::std::time::SystemTime::now(),
-            tags.clone(),
+            tags,
         );
         let stored = pipeline.declaration.clone();
+        // Reported from the stored set, so the create answers with the same tags a
+        // later `ListTagsForResource` call does.
+        let stored_tags = pipeline.tag_list();
 
         {
             let mut state = state.lock();
@@ -224,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pipeline: Some(stored),
             // Tags are reported only when the caller applied some: an absent member
             // and an empty list state the same fact, and AWS omits the member.
-            tags: (!tags.is_empty()).then_some(tags),
+            tags: (!stored_tags.is_empty()).then_some(stored_tags),
         })
     }
 }
