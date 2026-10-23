@@ -53,14 +53,20 @@ fn elb_arn(resource: &str) -> String {
     format!("arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT_ID}:{resource}")
 }
 
-fn is_lower_hex(value: &str, characters: usize) -> bool {
+/// Whether `value` is `characters` LOWERCASE hexadecimal characters.
+///
+/// Shared with `ecs_elbv2_stack_identifiers.rs`, which holds the same ids to the same
+/// alphabet.
+pub(crate) fn is_lower_hex(value: &str, characters: usize) -> bool {
     value.len() == characters
         && value
             .chars()
             .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))
 }
 
-fn is_upper_hex(value: &str, characters: usize) -> bool {
+/// Whether `value` is `characters` UPPERCASE hexadecimal characters, the alphabet of
+/// CloudFormation's own generated name segment.
+pub(crate) fn is_upper_hex(value: &str, characters: usize) -> bool {
     value.len() == characters
         && value
             .chars()

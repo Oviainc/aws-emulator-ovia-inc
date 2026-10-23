@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEnvironmentHost
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEnvironmentHost`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds an ESX host to a stored environment and persists it in [`crate::state`]: the
+//! host name, key and instance type the request gave, a management IP address taken
+//! out of the environment's own `vmkManagement` VLAN subnet, and `HostState`
+//! `CREATING` (the clock owes it `CREATED`). `ListEnvironmentHosts` reports what this
+//! operation stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEnvironmentHost::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules it enforces, each from the documentation quoted under "Modeled contract"
+//! below. This operation's error contract is `ThrottlingException` and
+//! `ValidationException` ONLY — it declares no `ResourceNotFoundException` — so a
+//! well-formed `environmentId` that names no environment is refused with the
+//! `ValidationException` that names it ([`crate::state::environment_not_found_validation`]):
+//!
+//! 1. The `environmentId` names an environment this service holds, in the Region the
+//!    request was addressed to. Refused on its own, because a request against an
+//!    environment that is not there has nothing further to judge.
+//! 2. "This action can only be used after the Amazon EVS environment is deployed": an
+//!    environment that has not reached `CREATED` cannot take a host yet.
+//! 3. "You cannot use the `dedicatedHostId` and `placementGroupId` parameters together
+//!    in the same `CreateEnvironmentHost` action" — the `HostInfoForCreate` shape's own
+//!    rule, refused through the one helper `CreateEnvironment` uses for it.
+//! 4. "DNS hostnames for hosts must be unique across Amazon EVS environments and
+//!    within VCF" (`hostName` doc).
+//! 5. The environment's `vmkManagement` VLAN subnet has an address left for the host:
+//!    an ESX host's management interface lives on that VLAN, so that subnet's usable
+//!    range is what bounds how many hosts one environment can hold.
+//!
+//! Rules 2 to 5 are evaluated together, so a request that breaks several is refused
+//! ONCE with one `ValidationException` whose `fieldList` carries an entry per failure —
+//! the shape `CreateEnvironment` answers with. A refused request adds nothing.
+//!
+//! `esxVersion` is stored as supplied and reported by nothing: the modelled `Host`
+//! shape carries no ESX version member, and the catalogue that would resolve the
+//! default version for an environment's VCF version is `GetVersions`, which still
+//! answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -103,11 +128,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `CreateEnvironmentHostError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#CreateEnvironmentHost")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#CreateEnvironmentHost",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateEnvironmentHostErrorModeled {
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -161,18 +192,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEnvironmentHost` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEnvironmentHostErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEnvironmentHost"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateEnvironmentHostErrorModeled::InternalServerException(InternalServerException {
+                message: "The Amazon EVS environment store is unavailable.".to_string(),
+            })
+        })?;
+        // `clientToken` is read and ignored on purpose: "This parameter is not used in
+        // Amazon EVS currently. If you supply input for this parameter, it will have no
+        // effect." (`clientToken` doc). The unique-host-name rule below is what makes a
+        // repeated create refuse rather than add a second host.
+        let _ = &input.client_token;
+        let region = crate::state::request_region(ctx.parts());
+        let environment_arn = crate::state::environment_arn(&region, &input.environment_id);
+        // Authorization first: AWS decides it at the IAM layer, before the resource the
+        // request names is evaluated.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&environment_arn),
+        ) {
+            return Err(denied);
+        }
+        let created_at_ms = crate::state::now_ms();
+
+        let mut state = state.lock();
+        // Reporting only: this materialises the state changes the clock already owed,
+        // which were due whether or not anybody called, so "the environment is
+        // deployed" is judged against the state that is due at this instant.
+        state.materialise_due_transitions();
+        // Whether some OTHER environment already has a host of this name: the
+        // uniqueness the doc states is across environments, so it is read before this
+        // environment is borrowed.
+        let host_name_is_taken = state.host_name_is_taken(&input.host.host_name);
+
+        // This operation declares no `ResourceNotFoundException`, so an environment id
+        // that names nothing is refused with the ValidationException that names it. An
+        // environment that has reached DELETED is gone for this purpose too.
+        let environment = state
+            .environment_in_region_mut(&region, &input.environment_id)
+            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .ok_or_else(|| {
+                CreateEnvironmentHostErrorModeled::ValidationException(
+                    crate::state::environment_not_found_validation(&input.environment_id),
+                )
+            })?;
+
+        // Every remaining precondition, evaluated before anything is stored and all of
+        // them together, so a caller can correct them in one round trip.
+        let mut failures: Vec<ValidationExceptionField> = Vec::new();
+        // "This action can only be used after the Amazon EVS environment is deployed."
+        if environment.state != crate::state::STATE_CREATED {
+            failures.push(crate::state::field_failure(
+                "environmentId",
+                &format!(
+                    "names an environment whose state is {}; a host can only be added after \
+                     the environment is deployed",
+                    environment.state
+                ),
+            ));
+        }
+        if input.host.dedicated_host_id.is_some() && input.host.placement_group_id.is_some() {
+            failures.push(crate::state::placement_conflict_failure("host"));
+        }
+        // "DNS hostnames for hosts must be unique across Amazon EVS environments and
+        // within VCF": the scope is every environment, THIS one included, which is what
+        // `host_name_is_taken` walks.
+        if host_name_is_taken {
+            failures.push(crate::state::field_failure(
+                "host.hostName",
+                "is already used by a host of an Amazon EVS environment; host DNS hostnames \
+                 must be unique across environments",
+            ));
+        }
+        // The management address the host takes, out of the environment's own
+        // `vmkManagement` VLAN subnet: `None` means that subnet is full, which is what
+        // bounds how many hosts one environment can hold.
+        let ip_address = environment.next_host_ip();
+        if ip_address.is_none() {
+            failures.push(crate::state::field_failure(
+                "host",
+                &format!(
+                    "cannot be added: the environment's {} VLAN subnet has no address left \
+                     for another host",
+                    crate::state::VMK_MANAGEMENT_FUNCTION
+                ),
+            ));
+        }
+        if !failures.is_empty() {
+            return Err(CreateEnvironmentHostErrorModeled::ValidationException(
+                crate::state::aggregate_validation_error(failures),
+            )
+            .into());
+        }
+        // Reached only with an address, because its absence is one of the failures above.
+        let Some(ip_address) = ip_address else {
+            return Err(CreateEnvironmentHostErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "No management address could be assigned to the host.".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The host is CREATING until it has been built and joined the environment,
+        // which is the move to CREATED the clock owes it.
+        let pending = crate::state::PendingStatus::starting_now(crate::state::HOST_CREATED);
+        let due_at = pending.due_at;
+        let host = crate::state::StoredHost::creating(
+            &input.host,
+            ip_address,
+            input.esx_version,
+            created_at_ms,
+            pending,
+        );
+        // The name is unique across environments, checked above, so the slot is vacant.
+        let host = environment
+            .hosts
+            .entry(input.host.host_name.clone())
+            .or_insert(host)
+            .to_wire();
+        // Adding a host changes the environment, so the record is re-stamped and the
+        // summary this operation answers with reports that.
+        environment.modified_at_ms = created_at_ms;
+        let environment_summary = environment.to_summary();
+        state.note_transition_due(due_at);
+
+        Ok(CreateEnvironmentHostOutput {
+            environment_summary: Some(environment_summary),
+            host: Some(host),
+        })
     }
 }

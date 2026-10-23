@@ -99,6 +99,8 @@ mod transit_gateway_lifecycle;
 mod verified_access_trust_providers;
 #[path = "all/volume_lifecycle.rs"]
 mod volume_lifecycle;
+#[path = "all/volume_modifications.rs"]
+mod volume_modifications;
 #[path = "all/vpc_attributes.rs"]
 mod vpc_attributes;
 #[path = "all/vpc_block_public_access_exclusions.rs"]
