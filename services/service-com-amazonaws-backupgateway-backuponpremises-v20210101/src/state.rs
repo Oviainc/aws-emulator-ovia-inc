@@ -30,6 +30,13 @@
 //! Both listings page through one helper ([`page_of`], handing back a [`Page`]), so a
 //! page boundary and the token that encodes it mean the same thing whichever resource
 //! is being listed.
+//!
+//! A hypervisor also carries its PROPERTY MAPPINGS ([`StoredPropertyMappings`]) — the
+//! VMware-to-Amazon tag mappings and the IAM role they are applied with. They live on
+//! the hypervisor record rather than in a map beside it, because that is the resource
+//! they belong to: `GetHypervisorPropertyMappings` reports the mappings of the record its
+//! `ServerArn` resolves to, and a hypervisor that carries none has no mappings resource
+//! to report ([`MissingResource::PropertyMappings`]).
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -39,6 +46,12 @@ use crate::ops::types::{
     BandwidthRateLimitInterval, Gateway, GatewayDetails, Hypervisor, HypervisorDetails,
     MaintenanceStartTime, Tag,
 };
+
+/// The modelled mapping shape a stored property mapping is kept as, re-exported so the
+/// record, the handlers and a test all name ONE type
+/// (`smithy_query(query="shape",shape="VmwareToAwsTagMapping")`: `VmwareCategory`,
+/// `VmwareTagName`, `AwsTagKey`, `AwsTagValue`, all required) instead of mirroring it.
+pub use crate::ops::types::VmwareToAwsTagMapping;
 
 /// This service's ARN namespace (`smithy_query(query="service_info")`:
 /// `awsService.arnNamespace`), and the second-to-last ARN segment every gateway ARN
@@ -74,6 +87,21 @@ pub const HYPERVISOR_NOT_FOUND: &str = "HypervisorNotFound";
 
 /// See [`HYPERVISOR_NOT_FOUND`].
 pub const HYPERVISOR_NOT_FOUND_MESSAGE: &str = "The hypervisor is not found.";
+
+/// `ResourceNotFoundException$ErrorCode` for a hypervisor that really exists but carries
+/// no property mappings, so there is no mappings resource to report. See
+/// [`MissingResource::PropertyMappings`].
+///
+/// `ErrorCode` is documented as "A description of which resource wasn't found"
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), and the resource
+/// that is missing here is the MAPPINGS, not the hypervisor — so the code names them,
+/// the way [`HYPERVISOR_NOT_FOUND`] names the hypervisor.
+pub const MAPPINGS_NOT_FOUND: &str = "MappingsNotFound";
+
+/// See [`MAPPINGS_NOT_FOUND`]. Phrased like [`HYPERVISOR_NOT_FOUND_MESSAGE`], the
+/// sentence this service is recorded stating for a resource it holds nothing for; the
+/// requirement is the error shape and the `ErrorCode`, and this wording is an example.
+pub const MAPPINGS_NOT_FOUND_MESSAGE: &str = "The mappings are not found.";
 
 /// The region a minted ARN falls back to when the request carries no SigV4 credential
 /// scope to read one from (an unsigned request on an emulator with authentication off).
@@ -295,6 +323,15 @@ pub struct StoredHypervisor {
     /// The resource's tags, by key — the same representation [`StoredGateway::tags`]
     /// uses, so the tagging operations treat both resources alike.
     pub tags: BTreeMap<String, String>,
+    /// The hypervisor's property mappings, absent until they have been SET for it.
+    ///
+    /// An import never mints mappings: `PutHypervisorPropertyMappings` is the operation
+    /// that writes them (still a scaffold answering 501 under its own stub issue), and
+    /// `GetHypervisorPropertyMappings` reports whatever this field holds. Absent is a
+    /// meaningful value and not an empty mapping set: a hypervisor with no mappings has
+    /// no mappings resource to report ([`MissingResource::PropertyMappings`]), where one
+    /// whose mappings are an empty list has.
+    pub property_mappings: Option<StoredPropertyMappings>,
 }
 
 impl StoredHypervisor {
@@ -351,6 +388,22 @@ impl StoredHypervisor {
     pub fn tag_list(&self) -> Vec<Tag> {
         tag_list(&self.tags)
     }
+}
+
+/// The property mappings SET for one hypervisor.
+///
+/// The members are exactly the ones `GetHypervisorPropertyMappings` reports beside the
+/// `HypervisorArn` (`smithy_query(query="operation",
+/// operation="GetHypervisorPropertyMappings")`: `IamRoleArn`, `VmwareToAwsTagMappings`),
+/// kept as the MODELLED [`VmwareToAwsTagMapping`] shape so a member cannot drift between
+/// what is stored and what is serialised, and in the order they were set — a list, not a
+/// set, is what the model declares.
+#[derive(Debug, Clone)]
+pub struct StoredPropertyMappings {
+    /// `IamRoleArn` — the role the mappings are applied with.
+    pub iam_role_arn: String,
+    /// `VmwareToAwsTagMappings`, in the order they were set.
+    pub vmware_to_aws_tag_mappings: Vec<VmwareToAwsTagMapping>,
 }
 
 /// What an import asks for a hypervisor to be created with: the members
@@ -546,6 +599,9 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
             latest_metadata_sync_status_message: None,
             created_time: now,
             tags: configuration.tags,
+            // An import sets no property mappings: they are SET for a hypervisor that
+            // already exists, so a freshly imported record carries none.
+            property_mappings: None,
         };
         // `or_insert` hands back a reference INTO the map, so the record returned is the
         // one the store now holds; the id counter makes the key fresh, so this always
@@ -788,6 +844,14 @@ pub enum MissingResource {
     /// The store holds hypervisors ([`StoredHypervisor`]), so this arm is reached for a
     /// hypervisor ARN the store has no record under — never for one it does.
     Hypervisor,
+    /// A hypervisor the store DOES hold, which carries no property mappings
+    /// ([`StoredHypervisor::property_mappings`]) — so the resource that is missing is the
+    /// mappings and not the hypervisor.
+    ///
+    /// Chosen by the operation that resolved the mappings, never by [`Self::for_arn`]:
+    /// the ARN names a hypervisor in both cases, and only the record says which of the
+    /// two is missing.
+    PropertyMappings,
     /// Every other resource type, including a `gateway/<id>` ARN with no gateway
     /// behind it.
     Other,
@@ -808,6 +872,7 @@ impl MissingResource {
     pub fn error_code(self) -> Option<&'static str> {
         match self {
             Self::Hypervisor => Some(HYPERVISOR_NOT_FOUND),
+            Self::PropertyMappings => Some(MAPPINGS_NOT_FOUND),
             Self::Other => None,
         }
     }
@@ -816,6 +881,7 @@ impl MissingResource {
     pub fn message(self, arn: &str) -> String {
         match self {
             Self::Hypervisor => HYPERVISOR_NOT_FOUND_MESSAGE.to_string(),
+            Self::PropertyMappings => MAPPINGS_NOT_FOUND_MESSAGE.to_string(),
             Self::Other => resource_not_found_message(arn),
         }
     }
@@ -826,7 +892,10 @@ impl MissingResource {
     pub fn status_override(self) -> Option<u16> {
         match self {
             Self::Hypervisor => Some(400),
-            Self::Other => None,
+            // No recording shows this service answering a missing mappings resource with
+            // anything but the status `ResourceNotFoundException`'s `@httpError` declares,
+            // so that case keeps the model's 404 like every other resource type.
+            Self::PropertyMappings | Self::Other => None,
         }
     }
 }

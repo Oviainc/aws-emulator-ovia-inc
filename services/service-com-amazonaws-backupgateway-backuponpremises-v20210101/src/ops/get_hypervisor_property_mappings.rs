@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetHypervisorPropertyMappings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetHypervisorPropertyMappings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetHypervisorPropertyMappings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the property mappings PERSISTED on the hypervisor an ARN names — the IAM role
+//! they are applied with and every VMware-to-Amazon tag mapping, in the stored order —
+//! read out of [`crate::state`]. `@readonly`: it writes nothing, and a hypervisor that
+//! carries no mappings has no mappings resource to report, which is the modelled
+//! `ResourceNotFoundException`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -89,10 +85,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `GetHypervisorPropertyMappingsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupgateway#GetHypervisorPropertyMappings")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupgateway#GetHypervisorPropertyMappings",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetHypervisorPropertyMappingsErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -146,18 +146,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetHypervisorPropertyMappings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetHypervisorPropertyMappingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetHypervisorPropertyMappings"))
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetHypervisorPropertyMappingsErrorModeled::InternalServerException(
+                InternalServerException {
+                    error_code: None,
+                    message: Some(
+                        "Backup gateway state is unavailable on this engine.".to_string(),
+                    ),
+                },
+            )
+        })?;
+        let state = state.lock();
+
+        // `HypervisorArn`'s length and pattern are refused by the boundary validator
+        // before `handle` runs, so reaching here means the ARN is well formed; whether it
+        // names a hypervisor, and whether that hypervisor carries mappings, are facts of
+        // the STORE — which is what this lookup asks, in that order: a mappings read of an
+        // ARN naming no hypervisor is a missing HYPERVISOR, and only a hypervisor the
+        // store really holds can be missing its MAPPINGS.
+        let stored = state.hypervisor(&input.hypervisor_arn);
+        let missing = match stored {
+            None => Some(crate::state::MissingResource::Hypervisor),
+            Some(hypervisor) if hypervisor.property_mappings.is_none() => {
+                Some(crate::state::MissingResource::PropertyMappings)
+            }
+            Some(_) => None,
+        };
+        if let Some(missing) = missing {
+            // One place chooses the status and the `ErrorCode` together
+            // (`crate::state::MissingResource`), so every operation of this service
+            // refuses a resource it holds no record for the same way.
+            let error = GetHypervisorPropertyMappingsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    error_code: missing.error_code().map(str::to_string),
+                    message: Some(missing.message(&input.hypervisor_arn)),
+                },
+            );
+            return Err(match missing.status_override() {
+                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+                None => error.into(),
+            });
+        }
+
+        // Every member comes off the record the store holds: the ARN is the store's own
+        // key (not the string the request carried), and the role and the mappings are the
+        // ones that were set for that record, in the order they were set.
+        let hypervisor = stored.expect("the lookup above resolved this ARN to a hypervisor");
+        let mappings = hypervisor
+            .property_mappings
+            .as_ref()
+            .expect("the lookup above found property mappings on that record");
+        Ok(GetHypervisorPropertyMappingsOutput {
+            hypervisor_arn: Some(hypervisor.arn.clone()),
+            iam_role_arn: Some(mappings.iam_role_arn.clone()),
+            vmware_to_aws_tag_mappings: Some(mappings.vmware_to_aws_tag_mappings.clone()),
+        })
     }
 }

@@ -17,6 +17,8 @@ mod gateway_lifecycle;
 mod hypervisor_import_concurrency;
 #[path = "all/hypervisor_listing.rs"]
 mod hypervisor_listing;
+#[path = "all/hypervisor_property_mappings.rs"]
+mod hypervisor_property_mappings;
 #[path = "all/hypervisor_reads.rs"]
 mod hypervisor_reads;
 #[path = "all/negative_paths.rs"]
