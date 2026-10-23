@@ -3,7 +3,9 @@
 //! @op DescribeConnectionAliases
 //!
 //! Implemented: reports the connection aliases this service has persisted, filtered by
-//! the identifiers the request names and paginated over creation order.
+//! the identifiers the request names and paginated over creation order. Every reported
+//! alias carries its `Associations` list, which is never empty: an alias associated with
+//! no directory carries the single `NOT_ASSOCIATED` entry.
 //!
 //! ## Shape of an operation
 //!
@@ -190,8 +192,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
         // Reporting only: this materialises the transitions the clock already owes
-        // (CREATING -> CREATED, a completed deletion), each of which was due at this
-        // instant whether or not anybody called.
+        // (a completed deletion), each of which was due at this instant whether or
+        // not anybody called.
         state.settle();
 
         let matched: Vec<&crate::state::ConnectionAliasRecord> = state

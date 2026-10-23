@@ -239,11 +239,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          is deleted from the Region it was created in"
                     )),
                 },
+            )
+            .into(),
+            // The model says 404 for a not-found trail; CloudTrail answers 400. See
+            // `crate::state::TRAIL_NOT_FOUND_STATUS`.
+            None => crate::scaffolded::Scaffolded::modeled_with_status(
+                DeleteTrailErrorModeled::TrailNotFoundException(TrailNotFoundException {
+                    message: Some(crate::state::trail_not_found_arn_message(&region, &name)),
+                }),
+                crate::state::TRAIL_NOT_FOUND_STATUS,
             ),
-            None => DeleteTrailErrorModeled::TrailNotFoundException(TrailNotFoundException {
-                message: Some(crate::state::unknown_trail_message(&input.name)),
-            }),
-        }
-        .into())
+        })
     }
 }

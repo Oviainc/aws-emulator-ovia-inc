@@ -19,5 +19,7 @@ mod contact_updates;
 mod data_plane_precondition;
 #[path = "all/engagement_lifecycle.rs"]
 mod engagement_lifecycle;
+#[path = "all/rotation_reads.rs"]
+mod rotation_reads;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

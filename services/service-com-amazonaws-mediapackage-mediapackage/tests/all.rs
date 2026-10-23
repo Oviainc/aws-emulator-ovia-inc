@@ -15,6 +15,8 @@
 mod channel_lifecycle;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/harvest_job_rejections.rs"]
+mod harvest_job_rejections;
 #[path = "all/harvest_jobs.rs"]
 mod harvest_jobs;
 #[path = "all/ingest_credentials.rs"]
@@ -23,6 +25,8 @@ mod ingest_credentials;
 mod mutation_persistence;
 #[path = "all/origin_endpoint_defaults.rs"]
 mod origin_endpoint_defaults;
+#[path = "all/origin_endpoint_durations.rs"]
+mod origin_endpoint_durations;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/rotate_channel_credentials.rs"]

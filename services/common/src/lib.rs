@@ -40,6 +40,9 @@
 //! * [`network`], the contract the account's EC2 network — which subnets a Region has —
 //!   is modelled against, so no two services answer "does this subnet exist"
 //!   differently;
+//! * [`rfc3339`], the ONE reading of the UTC offset an RFC 3339 timestamp declares, for
+//!   every service whose model carries a timestamp as a STRING and then has to compare or
+//!   order two of them;
 //! * [`rpc_target`], the ONE reading of an `awsJson` `X-Amz-Target` — which service and
 //!   which operation it names — for every service whose published target prefix carries
 //!   dots of its own, which the framework's first-dot readers cannot route;
@@ -161,6 +164,7 @@ pub mod iot_commands;
 pub mod iot_job_executions;
 pub mod lex;
 pub mod network;
+pub mod rfc3339;
 pub mod rpc_target;
 pub mod shared_path;
 pub mod validation;

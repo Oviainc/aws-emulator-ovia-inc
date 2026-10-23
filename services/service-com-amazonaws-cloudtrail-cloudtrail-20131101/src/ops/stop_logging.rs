@@ -244,13 +244,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into())
             }
-            crate::state::TrailForMutation::Absent => {
-                Err(StopLoggingErrorModeled::TrailNotFoundException(
-                    TrailNotFoundException {
-                        message: Some(crate::state::unknown_trail_message(&input.name)),
-                    },
-                )
-                .into())
+            crate::state::TrailForMutation::Absent { name } => {
+                // The model says 404 for a not-found trail; CloudTrail answers 400.
+                // See `crate::state::TRAIL_NOT_FOUND_STATUS`.
+                Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                    StopLoggingErrorModeled::TrailNotFoundException(TrailNotFoundException {
+                        message: Some(crate::state::trail_not_found_arn_message(&region, &name)),
+                    }),
+                    crate::state::TRAIL_NOT_FOUND_STATUS,
+                ))
             }
         }
     }

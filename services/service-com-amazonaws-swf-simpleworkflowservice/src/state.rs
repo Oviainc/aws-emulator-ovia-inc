@@ -7,7 +7,7 @@
 //! computes its response from what is stored here — nothing is canned and nothing is
 //! echoed back out of the request that asked for it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ::aws_smithy_types::DateTime;
 use ::sha2::{Digest, Sha256};
@@ -301,6 +301,27 @@ impl EventAttributes {
             Self::WorkflowExecutionCancelRequested(_) => "WorkflowExecutionCancelRequested",
         }
     }
+
+    /// The `scheduledEventId` of the decision task these attributes take OUT of its
+    /// task list, when that is what the event records.
+    ///
+    /// A scheduled decision task waits in its task list until a decider is handed it
+    /// (`DecisionTaskStarted`, whose `scheduledEventId` names the task it started) or
+    /// it times out there first (`DecisionTaskTimedOut`, same member). No stored
+    /// variant records either event yet — the operations that would write them
+    /// (`PollForDecisionTask` and the start-to-close sweep behind it) are still
+    /// scaffolds tracked by their own gap issues — so every event answers `None`
+    /// today. This exhaustive match is the single place that enumerates them, so a
+    /// variant added later cannot be forgotten by
+    /// [`Execution::pending_decision_tasks_on`].
+    pub fn decision_task_left_task_list(&self) -> Option<i64> {
+        match self {
+            Self::WorkflowExecutionStarted(_)
+            | Self::DecisionTaskScheduled(_)
+            | Self::WorkflowExecutionTerminated(_)
+            | Self::WorkflowExecutionCancelRequested(_) => None,
+        }
+    }
 }
 
 /// One event of a run's persisted history.
@@ -502,6 +523,31 @@ impl Execution {
     pub fn is_open(&self) -> bool {
         self.status == EXECUTION_STATUS_OPEN
     }
+
+    /// How many of this run's decision tasks are still WAITING in `task_list`: one per
+    /// `DecisionTaskScheduled` event of its history that names that list and that no
+    /// later event has taken out of it (see
+    /// [`EventAttributes::decision_task_left_task_list`]).
+    ///
+    /// The history IS the record of which tasks were scheduled where — the scheduling
+    /// event carries its own `taskList`, so a run whose decision tasks were scheduled
+    /// on more than one list contributes to each list separately.
+    pub fn pending_decision_tasks_on(&self, task_list: &str) -> usize {
+        let taken: HashSet<i64> = self
+            .history
+            .iter()
+            .filter_map(|event| event.attributes.decision_task_left_task_list())
+            .collect();
+        self.history
+            .iter()
+            .filter(|event| match &event.attributes {
+                EventAttributes::DecisionTaskScheduled(scheduled) => {
+                    scheduled.task_list.name == task_list && !taken.contains(&event.event_id)
+                }
+                _ => false,
+            })
+            .count()
+    }
 }
 
 /// One registered domain and everything scoped to it.
@@ -590,6 +636,22 @@ impl Domain {
                 activity_type.deprecation_date = Some(at);
             }
         }
+    }
+
+    /// How many decision tasks are waiting in `task_list` across this domain — what
+    /// `CountPendingDecisionTasks` answers with. A task list is scoped to its domain,
+    /// so only this domain's runs contribute, and a list no decision task was ever
+    /// scheduled in holds none.
+    ///
+    /// Only an OPEN run has tasks in the list: closing a run drops whatever decision
+    /// tasks it had waiting, which is the same reason
+    /// `DescribeWorkflowExecution` reports no open decision task for a closed run.
+    pub fn pending_decision_tasks_on(&self, task_list: &str) -> usize {
+        self.executions
+            .values()
+            .filter(|execution| execution.is_open())
+            .map(|execution| execution.pending_decision_tasks_on(task_list))
+            .sum()
     }
 
     /// The `runId` a call naming `workflow_id` addresses: the one it gave, when a run

@@ -15,7 +15,9 @@
 //!
 //! It owns the connection-alias lifecycle on the same terms: one record per
 //! alias, the creation order `DescribeConnectionAliases` paginates over, and the
-//! two transitions `CreateConnectionAlias` and `DeleteConnectionAlias` start.
+//! transition `DeleteConnectionAlias` starts. `CreateConnectionAlias` starts
+//! none: WorkSpaces answers a describe issued straight after it with the alias
+//! already `CREATED` (see [`ConnectionAliasLifecycleState`]).
 //!
 //! It also owns the account-link records the six account-link operations share
 //! (`CreateAccountLinkInvitation`, `AcceptAccountLinkInvitation`,
@@ -44,9 +46,9 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    AccountLink, ComputeType, ConnectionAlias, IpRuleItem, RootStorage, Tag, UserStorage,
-    Workspace, WorkspaceBundle, WorkspaceProperties, WorkspaceRequest, WorkspacesIpGroup,
-    COMPUTE_VALUES,
+    AccountLink, ComputeType, ConnectionAlias, ConnectionAliasAssociation, IpRuleItem, RootStorage,
+    Tag, UserStorage, Workspace, WorkspaceBundle, WorkspaceProperties, WorkspaceRequest,
+    WorkspacesIpGroup, COMPUTE_VALUES,
 };
 
 /// How long a lifecycle transition the clock owes stays in its transient state.
@@ -54,9 +56,9 @@ use crate::ops::types::{
 /// `CreateWorkspaces`, `StartWorkspaces`, `StopWorkspaces` and
 /// `TerminateWorkspaces` are documented as asynchronous: each returns while the
 /// WorkSpace is still in a transient state (`PENDING`, `STARTING`, `STOPPING`,
-/// `TERMINATING`). `CreateConnectionAlias` and `DeleteConnectionAlias` are the
-/// same: the model's `ConnectionAliasState` carries the transient `CREATING` and
-/// `DELETING` beside the settled `CREATED`. The span is deliberately non-zero so
+/// `TERMINATING`). `DeleteConnectionAlias` is the same: the model's
+/// `ConnectionAliasState` carries the transient `DELETING` beside the settled
+/// `CREATED`. The span is deliberately non-zero so
 /// a caller that describes a resource straight after the call still observes that
 /// transient state, and short enough that a test settles quickly. It is a CHOSEN
 /// span, not a duration AWS documents.
@@ -558,6 +560,14 @@ impl DirectoryRegistrationState {
 /// anything a test or a client script creates.
 pub const MAX_STORED_CONNECTION_ALIASES: usize = 500;
 
+/// The `AssociationStatus` of a connection alias associated with no directory.
+///
+/// One of the model's `AssociationStatus` values (see
+/// `ASSOCIATION_STATUS_VALUES` in `ops::types`), and the only one that describes
+/// an alias no directory association names: the others each describe an
+/// association that exists, is being made or is being undone.
+pub const ASSOCIATION_STATUS_NOT_ASSOCIATED: &str = "NOT_ASSOCIATED";
+
 /// The operational state of a stored connection alias.
 ///
 /// `Creating`, `Created` and `Deleting` each render to a value of the model's
@@ -565,6 +575,14 @@ pub const MAX_STORED_CONNECTION_ALIASES: usize = 500;
 /// `ops::types`). That enum has no "deleted" value, because a deleted alias is
 /// not reported at all: `Removed` is the terminal state the clock moves a
 /// deleting alias to, and the record is dropped from the store as it is reached.
+///
+/// A created alias is stored `Created`, not `Creating`: `CreateConnectionAlias`
+/// reports no `State` at all (its result carries only `AliasId`), and a
+/// `DescribeConnectionAliases` issued straight after it reports the alias
+/// `CREATED` — WorkSpaces hands the alias back ready, so no clock-owed
+/// transition is due for a create. `Creating` is kept because the model carries
+/// the value and [`Self::as_wire`] stays total over the enum; the only transient
+/// state this store enters is `Deleting`, which `DeleteConnectionAlias` starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionAliasLifecycleState {
     /// The alias is being created.
@@ -745,20 +763,37 @@ impl ConnectionAliasRecord {
     }
 
     /// This record as the modelled `ConnectionAlias` structure.
-    ///
-    /// `Associations` stays absent: an association is created only by
-    /// `AssociateConnectionAlias`, which is still a scaffold stub, so no stored
-    /// alias has one to report. The model's `ConnectionAliasAssociationList` is
-    /// `len 1..25`, so "no associations" is the absent member rather than an
-    /// empty list.
     pub fn to_connection_alias(&self) -> ConnectionAlias {
         ConnectionAlias {
             connection_string: Some(self.connection_string.clone()),
             alias_id: Some(self.alias_id.clone()),
             state: self.state.as_wire().map(str::to_string),
             owner_account_id: Some(self.owner_account_id.clone()),
-            associations: None,
+            associations: Some(self.to_associations()),
         }
+    }
+
+    /// The alias's `Associations` list, as a describe reports it.
+    ///
+    /// The member is always reported and the list is never empty:
+    /// `ConnectionAliasAssociationList` is `len 1..25`, so an alias holding no
+    /// directory association cannot be described with an empty list, and
+    /// WorkSpaces describes such an alias with exactly one entry carrying
+    /// `AssociationStatus` [`ASSOCIATION_STATUS_NOT_ASSOCIATED`].
+    ///
+    /// `AssociatedAccountId`, `ResourceId` and `ConnectionIdentifier` are the
+    /// members that name an association's directory, the account that made it
+    /// and its DNS identifier: they stay absent while there is no association to
+    /// name one. `AssociateConnectionAlias` is the only operation that
+    /// associates an alias with a directory and is still a scaffold stub, so
+    /// every stored alias is in exactly that position.
+    fn to_associations(&self) -> Vec<ConnectionAliasAssociation> {
+        vec![ConnectionAliasAssociation {
+            association_status: Some(ASSOCIATION_STATUS_NOT_ASSOCIATED.to_string()),
+            associated_account_id: None,
+            resource_id: None,
+            connection_identifier: None,
+        }]
     }
 }
 
@@ -1727,23 +1762,21 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
         }
 
         let seq = self.next_alias_seq();
-        let mut record = ConnectionAliasRecord {
+        let record = ConnectionAliasRecord {
             seq,
             // `ConnectionAliasId` is `^wsca-[0-9a-z]{8,63}$`; the sequence number
             // alone decides the id, so no two aliases can share one.
             alias_id: format!("wsca-{seq:08x}"),
             connection_string: connection_string.to_string(),
             owner_account_id: ::engine::emulator_account_id().to_string(),
-            state: ConnectionAliasLifecycleState::Creating,
+            // The alias is handed back ready: a describe issued straight after
+            // the create reports it CREATED, so the store owes the clock no
+            // creation transition (see `ConnectionAliasLifecycleState`).
+            state: ConnectionAliasLifecycleState::Created,
             tags,
             created: SystemTime::now(),
             pending: None,
         };
-        // Creation is asynchronous: CREATING now, CREATED once the clock owes it.
-        record.begin(
-            ConnectionAliasLifecycleState::Creating,
-            ConnectionAliasLifecycleState::Created,
-        );
         self.insert_alias_record(record.clone());
         Ok(record)
     }
