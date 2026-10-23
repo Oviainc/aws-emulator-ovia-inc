@@ -5,7 +5,8 @@
 //! Everything the ELBv2 provisioning loop persists lives in the ONE guarded
 //! [`ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State`] value, so every
 //! handler in this crate sees the same store across requests: load balancers, their
-//! listeners, target groups and the targets registered with them.
+//! listeners, target groups and the targets registered with them, and the trust
+//! stores a mutual-TLS listener authenticates against.
 //!
 //! Records are the service's own storage shape; each one converts to its modelled
 //! Smithy shape through a `to_shape` method, so a describe answers exactly what the
@@ -17,7 +18,7 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Action, AvailabilityZone, Certificate, Listener, LoadBalancer, LoadBalancerAddress,
     LoadBalancerState, Matcher, TargetDescription, TargetGroup, TargetHealth,
-    TargetHealthDescription,
+    TargetHealthDescription, TrustStore,
 };
 
 /// How long after the call that starts it a load balancer owes its move out of
@@ -384,6 +385,56 @@ impl TargetGroupRecord {
     }
 }
 
+/// The statuses the model's `TrustStoreStatus` enum names
+/// (`smithy_query(query="shape",shape="TrustStoreStatus")`: `ACTIVE`, `CREATING`).
+/// A trust store AWS returns from `CreateTrustStore` is not ready yet, so it starts
+/// at `CREATING` and the clock owes it [`TRUST_STORE_ACTIVE`] at [`SETTLE_AFTER`].
+pub const TRUST_STORE_CREATING: &str = "CREATING";
+/// The status of a trust store whose settling span is over.
+pub const TRUST_STORE_ACTIVE: &str = "ACTIVE";
+
+/// A persisted trust store: everything `DescribeTrustStores` reports about one, plus
+/// the two instants that decide the order it is reported in and when the clock owes it
+/// its move to [`TRUST_STORE_ACTIVE`].
+///
+/// `CreateTrustStore` — the operation that mints one, counting
+/// `number_of_ca_certificates` from the CA certificates bundle it is given — is still
+/// a scaffold stub with its own issue; this is the record it fills, and the one
+/// `DescribeTrustStores` reads.
+#[derive(Debug, Clone)]
+pub struct TrustStoreRecord {
+    pub arn: String,
+    pub name: String,
+    pub status: String,
+    /// When the clock owes this trust store its move to [`TRUST_STORE_ACTIVE`].
+    pub active_at: SystemTime,
+    /// Creation order, which is the order a paginated read walks it in. Not reported:
+    /// the `TrustStore` shape models no creation time.
+    pub created_at: SystemTime,
+    /// How many CA certificates the trust store's bundle holds — counted from that
+    /// bundle's bytes when it is stored, never guessed.
+    pub number_of_ca_certificates: i32,
+    /// How many revoked certificates the trust store's revocation lists hold. Written
+    /// by `AddTrustStoreRevocations`/`RemoveTrustStoreRevocations`, both still scaffold
+    /// stubs, so the shape is read off this field rather than restated: it follows the
+    /// store the day a revocation can be added.
+    pub total_revoked_entries: i64,
+}
+
+impl TrustStoreRecord {
+    pub fn to_shape(&self) -> TrustStore {
+        TrustStore {
+            name: Some(self.name.clone()),
+            trust_store_arn: Some(self.arn.clone()),
+            status: Some(self.status.clone()),
+            number_of_ca_certificates: Some(self.number_of_ca_certificates),
+            // "The number of revoked certificates in the trust store" — what the
+            // record holds, never a figure computed here.
+            total_revoked_entries: Some(self.total_revoked_entries),
+        }
+    }
+}
+
 /// A persisted listener.
 #[derive(Debug, Clone, Default)]
 pub struct ListenerRecord {
@@ -500,6 +551,11 @@ pub struct ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     pub name_to_tg_arn: HashMap<String, String>,
     /// Listeners by ARN.
     pub listeners: HashMap<String, ListenerRecord>,
+    /// Trust stores by ARN.
+    pub trust_stores: HashMap<String, TrustStoreRecord>,
+    /// Trust store name to ARN: the model documents a trust store's name as unique
+    /// per region, so `Names` lookups resolve through it directly.
+    pub name_to_trust_store_arn: HashMap<String, String>,
     /// The counter the resource-id generator mixes, so an ARN is stable and unique
     /// within a run. A counter and a seed, not a store: nothing accumulates here.
     next_id: u64,
@@ -534,17 +590,24 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
         self.load_balancers.values().any(|lb| lb.id == id)
             || self.target_groups.keys().any(|arn| arn.ends_with(&suffix))
             || self.listeners.keys().any(|arn| arn.ends_with(&suffix))
+            || self.trust_stores.keys().any(|arn| arn.ends_with(&suffix))
     }
 
-    /// Materialize the load balancer state moves the clock already made due.
+    /// Materialize the state moves the clock already made due.
     ///
-    /// A reporting operation calls this before it reads: the move from
-    /// `provisioning` to `active` was owed at [`SETTLE_AFTER`] past the create, even
-    /// if nobody had called since.
+    /// A reporting operation calls this before it reads: a load balancer's move from
+    /// `provisioning` to `active`, and a trust store's from `CREATING` to `ACTIVE`,
+    /// were owed at [`SETTLE_AFTER`] past the create, even if nobody had called
+    /// since.
     pub fn settle(&mut self, now: SystemTime) {
         for lb in self.load_balancers.values_mut() {
             if lb.state_code == "provisioning" && now >= lb.active_at {
                 lb.state_code = "active".to_string();
+            }
+        }
+        for store in self.trust_stores.values_mut() {
+            if store.status == TRUST_STORE_CREATING && now >= store.active_at {
+                store.status = TRUST_STORE_ACTIVE.to_string();
             }
         }
     }
@@ -565,6 +628,18 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     pub fn target_groups_in_order(&self) -> Vec<&TargetGroupRecord> {
         let mut records: Vec<&TargetGroupRecord> = self.target_groups.values().collect();
         records.sort_by(|a, b| a.arn.cmp(&b.arn));
+        records
+    }
+
+    /// Trust stores in a stable order (oldest first, ARN breaking ties), which is the
+    /// order pagination walks.
+    pub fn trust_stores_in_order(&self) -> Vec<&TrustStoreRecord> {
+        let mut records: Vec<&TrustStoreRecord> = self.trust_stores.values().collect();
+        records.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.arn.cmp(&b.arn))
+        });
         records
     }
 

@@ -17,3 +17,5 @@ mod listener_tls_certificates;
 mod provisioning_loop;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/trust_stores.rs"]
+mod trust_stores;
