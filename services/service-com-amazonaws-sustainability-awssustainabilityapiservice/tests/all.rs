@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/request_claiming.rs"]
 mod request_claiming;
+#[path = "all/signed_request_refusals.rs"]
+mod signed_request_refusals;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/sustainability_reporting.rs"]

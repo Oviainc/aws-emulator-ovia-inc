@@ -209,17 +209,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // The centralized walk calls this on a framework-level refusal — one taken
+        // before any handler ran — to let this service state it the way its model
+        // does. BOTH the code and the message are replaced, because a client
+        // branches on the code.
+        //
+        // `restJson1` resolves the error SHAPE from `x-amzn-errortype` (and the
+        // body's `__type`), so a refusal must name a shape THIS service's model
+        // declares, or the client cannot map the answer onto a modelled error at
+        // all. The framework's own 403 names `AccessDenied`, which is not in this
+        // model; the modelled shape is `AccessDeniedException` (`@error("client")`,
+        // `@httpError(403)`, required `Message` with `jsonName: "message"` — see
+        // `smithy_query(query="shape", shape="AccessDeniedException")`), and its
+        // documented text is the sentence below.
+        match refusal {
+            Refusal::Unauthenticated => Some(Refused {
+                code: crate::state::ACCESS_DENIED_EXCEPTION.to_string(),
+                message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+            }),
+            // A value outside a declared bound, or an absent required member, already
+            // renders as this service's modelled `ValidationException` (HTTP 400) with
+            // the AWS validation envelope the framework builds from the violations, so
+            // there is nothing to reword.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
