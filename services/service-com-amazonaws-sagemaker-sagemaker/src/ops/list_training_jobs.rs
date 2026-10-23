@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTrainingJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTrainingJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTrainingJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: filters, sorts and pages the training jobs stored in `crate::state`. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,6 +147,48 @@ impl<Eng> ListTrainingJobs<Eng> {
     }
 }
 
+/// The `SortOrder` member that orders a result set from the lowest sort key up, spelled
+/// once so neither the default below nor the match arm that reads it carries a bare
+/// literal (`crate::state::ORDER_DESCENDING` is its opposite).
+const ORDER_ASCENDING: &str = "Ascending";
+
+/// `SortOrder`'s documented default for THIS operation ("The sort order for results. The
+/// default is `Ascending`.") — named apart from `crate::state::DEFAULT_SORT_ORDER`, which
+/// is the `Descending` default `ListModels` and `ListEndpoints` document, so the two
+/// cannot be conflated. `SortBy`'s default is the shared `crate::state::DEFAULT_SORT_BY`
+/// (`CreationTime`), which this operation documents too.
+const DOCUMENTED_DEFAULT_SORT_ORDER: &str = ORDER_ASCENDING;
+
+/// The field `SortBy` names, resolved once per request from the member the caller sent.
+#[derive(Clone, Copy)]
+enum SortField {
+    Name,
+    CreationTime,
+    Status,
+}
+
+/// One job's sort key, computed once per job. The variants never mix within a request:
+/// every key of one result set comes from the same [`SortField`].
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum SortKey {
+    Text(String),
+    Instant((i64, u32)),
+}
+
+impl SortField {
+    /// `job`'s key under this field. `Status` compares the stored status string
+    /// lexicographically, because AWS documents no order for that sort field.
+    fn key_of(self, job: &crate::state::TrainingJob) -> SortKey {
+        match self {
+            Self::Name => SortKey::Text(job.name.clone()),
+            Self::Status => SortKey::Text(job.status.clone()),
+            Self::CreationTime => SortKey::Instant(crate::state::timestamp_key(
+                crate::state::timestamp(job.creation_time),
+            )),
+        }
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListTrainingJobs<Eng>
 {
@@ -169,20 +204,206 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTrainingJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTrainingJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTrainingJobs"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `SortBy` and `SortOrder` are resolved to the field and direction this handler
+        // orders by, and a value that is neither — including a member the model may add to
+        // either enum — is REFUSED here rather than silently ordered by another key. The
+        // message lists the members the model generates (`SORT_BY_VALUES`,
+        // `SORT_ORDER_VALUES`), so it cannot drift from the enum either.
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_BY);
+        let sort_field = match sort_by {
+            "Name" => SortField::Name,
+            "CreationTime" => SortField::CreationTime,
+            "Status" => SortField::Status,
+            other => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "SortBy must be one of {}; got \"{other}\".",
+                    SORT_BY_VALUES.join(", ")
+                )))
+            }
+        };
+        let descending = match input
+            .sort_order
+            .as_deref()
+            .unwrap_or(DOCUMENTED_DEFAULT_SORT_ORDER)
+        {
+            crate::state::ORDER_DESCENDING => true,
+            ORDER_ASCENDING => false,
+            other => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "SortOrder must be one of {}; got \"{other}\".",
+                    SORT_ORDER_VALUES.join(", ")
+                )))
+            }
+        };
+
+        // `StatusEquals` and `WarmPoolStatusEquals` each select on exactly one member of
+        // their modelled enum, so a value that is not a member is REFUSED rather than
+        // quietly matching nothing and reporting an empty page as "no such jobs" — the
+        // same rule `list_endpoints` applies to its own `StatusEquals`.
+        if let Some(status) = input.status_equals.as_deref() {
+            if !TRAINING_JOB_STATUS_VALUES.contains(&status) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "StatusEquals must be one of {}; got \"{status}\".",
+                    TRAINING_JOB_STATUS_VALUES.join(", ")
+                )));
+            }
+        }
+        if let Some(status) = input.warm_pool_status_equals.as_deref() {
+            if !WARM_POOL_RESOURCE_STATUS_VALUES.contains(&status) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "WarmPoolStatusEquals must be one of {}; got \"{status}\".",
+                    WARM_POOL_RESOURCE_STATUS_VALUES.join(", ")
+                )));
+            }
+        }
+
+        let created_after = input.creation_time_after.map(crate::state::timestamp_key);
+        let created_before = input.creation_time_before.map(crate::state::timestamp_key);
+        let modified_after = input
+            .last_modified_time_after
+            .map(crate::state::timestamp_key);
+        let modified_before = input
+            .last_modified_time_before
+            .map(crate::state::timestamp_key);
+
+        let store = state.lock();
+        // Every filter but `StatusEquals` selects on the job's STORED value, and an
+        // omitted filter selects every job. `StatusEquals` is applied further down,
+        // because this operation's doc gives it a different point of application.
+        let matching: Vec<&crate::state::TrainingJob> = store
+            .training_jobs
+            .values()
+            .filter(|job| {
+                input
+                    .name_contains
+                    .as_deref()
+                    .is_none_or(|needle| job.name.contains(needle))
+            })
+            .filter(|job| {
+                // Both bounds are inclusive, so a timestamp copied straight out of a
+                // prior response's `CreationTime` still selects that job.
+                let created =
+                    crate::state::timestamp_key(crate::state::timestamp(job.creation_time));
+                created_after.is_none_or(|bound| created >= bound)
+                    && created_before.is_none_or(|bound| created <= bound)
+            })
+            .filter(|job| {
+                let modified =
+                    crate::state::timestamp_key(crate::state::timestamp(job.last_modified_time));
+                modified_after.is_none_or(|bound| modified >= bound)
+                    && modified_before.is_none_or(|bound| modified <= bound)
+            })
+            .filter(|job| {
+                // "A filter that retrieves only training jobs with a specific warm pool
+                // status": a job with no warm pool has no such status, so it is excluded.
+                input.warm_pool_status_equals.as_deref().is_none_or(|wanted| {
+                    job.warm_pool_status
+                        .as_ref()
+                        .is_some_and(|warm_pool| warm_pool.status == wanted)
+                })
+            })
+            .filter(|job| {
+                input
+                    .training_plan_arn_equals
+                    .as_deref()
+                    .is_none_or(|wanted| job.training_plan_arn.as_deref() == Some(wanted))
+            })
+            .collect();
+        // The sort key is computed ONCE per job rather than on every comparison, and
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays `TrainingJobName`
+        // ascending in both directions, so two jobs sharing a key (the same creation
+        // instant, or the same status) keep one order whichever way the page is sorted —
+        // and a `NextToken` resolved against a freshly computed result set lands on the
+        // same boundary.
+        let mut keyed: Vec<(SortKey, &crate::state::TrainingJob)> = matching
+            .into_iter()
+            .map(|job| (sort_field.key_of(job), job))
+            .collect();
+        keyed.sort_by(|(left_key, left), (right_key, right)| {
+            let by_key = left_key.cmp(right_key);
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.name.cmp(&right.name))
+        });
+        let matching: Vec<&crate::state::TrainingJob> =
+            keyed.into_iter().map(|(_, job)| job).collect();
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|name| matching.iter().position(|job| job.name == name))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(
+                            "NextToken does not name a page boundary of this result set; \
+                             restart the listing without it.",
+                        )
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // `MaxResults` caps the page, and so does the service's own ceiling: an absent or
+        // larger `MaxResults` still cannot make one call serialise the whole store. The
+        // token below is emitted whenever anything is left, so a paginating client walks
+        // the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let retrieved = &matching[start..end];
+
+        let next_token = match retrieved.last() {
+            // A token only where a further page exists, so a paginating client stops. It
+            // names the last RETRIEVED job, not the last reported one, so the next page
+            // resumes after everything this page already considered.
+            Some(last) if end < matching.len() => {
+                Some(crate::state::encode_page_token(&last.name))
+            }
+            _ => None,
+        };
+
+        // `StatusEquals` filters the RETRIEVED page, not the result set: "When
+        // StatusEquals and MaxResults are set at the same time, the MaxResults number of
+        // training jobs are first retrieved ignoring the StatusEquals parameter and then
+        // they are filtered by the StatusEquals parameter, which is returned as a
+        // response." The page is always bounded (by `MaxResults` or by the service
+        // ceiling above), so the same order applies whether or not the caller sent
+        // `MaxResults` — which is why a page may come back shorter than it, or empty,
+        // while still carrying a `NextToken`.
+        Ok(ListTrainingJobsOutput {
+            training_job_summaries: retrieved
+                .iter()
+                .filter(|job| {
+                    input
+                        .status_equals
+                        .as_deref()
+                        .is_none_or(|wanted| job.status == wanted)
+                })
+                .map(|job| TrainingJobSummary {
+                    training_job_name: job.name.clone(),
+                    training_job_arn: job.arn.clone(),
+                    creation_time: crate::state::timestamp(job.creation_time),
+                    training_end_time: job.training_end_time.map(crate::state::timestamp),
+                    last_modified_time: Some(crate::state::timestamp(job.last_modified_time)),
+                    training_job_status: job.status.clone(),
+                    secondary_status: job.secondary_status.clone(),
+                    warm_pool_status: job.warm_pool_status.clone(),
+                    training_plan_arn: job.training_plan_arn.clone(),
+                })
+                .collect(),
+            next_token,
+        })
     }
 }
