@@ -11,10 +11,10 @@
 //! delete answers from the one record rather than from the request that is being served.
 //!
 //! The same holds for every other resource kind this store carries — a key value store, a
-//! response headers policy, an origin request policy: each record is put there by the call
-//! that creates it and is what every later read of that resource answers from. Neither a
-//! response headers policy nor an origin request policy has a status member or a
-//! propagation deadline, so nothing about one is owed by the clock.
+//! response headers policy, an origin request policy, a cache policy: each record is put
+//! there by the call that creates it and is what every later read of that resource answers
+//! from. None of a response headers policy, an origin request policy or a cache policy has
+//! a status member or a propagation deadline, so nothing about one is owed by the clock.
 //!
 //! Two things in here are owed by the CLOCK rather than by a call:
 //!
@@ -42,6 +42,7 @@ use std::time::{Duration, SystemTime};
 // this list, which every operation added to this service edits.
 use crate::ops::types::{
     ActiveTrustedKeyGroups, ActiveTrustedSigners, AllowedMethods, CacheBehavior, CacheBehaviors,
+    CachePolicy, CachePolicyAlreadyExists, CachePolicyConfig,
     CachedMethods, CloudFrontOriginAccessIdentity, CloudFrontOriginAccessIdentityConfig,
     CNAMEAlreadyExists, ContinuousDeploymentPolicy, ContinuousDeploymentPolicyConfig,
     ContinuousDeploymentSingleHeaderConfig, ContinuousDeploymentSingleWeightConfig,
@@ -51,7 +52,8 @@ use crate::ops::types::{
     FunctionAssociations, GeoRestriction, Invalidation, InvalidationBatch, InvalidationSummary,
     InvalidTagging, KGKeyPairIds, KeyPairIds, KeyValueStore, LambdaFunctionAssociations,
     LoggingConfig, ManagedCertificateRequest, NoSuchCloudFrontOriginAccessIdentity,
-    NoSuchDistribution, NoSuchInvalidation, NoSuchOriginRequestPolicy, NoSuchResource,
+    NoSuchCachePolicy, NoSuchDistribution, NoSuchInvalidation, NoSuchOriginRequestPolicy,
+    NoSuchResource,
     NoSuchResponseHeadersPolicy, Origin, OriginRequestPolicy, OriginRequestPolicyAlreadyExists,
     OriginRequestPolicyConfig, OriginSslProtocols, Parameter, ParameterDefinition, Paths,
     ResponseHeadersPolicy,
@@ -374,6 +376,17 @@ pub const MAX_RESPONSE_HEADERS_POLICIES: usize = 1_000;
 /// CloudFront's own ceiling is an account quota that can be raised and the model states no
 /// number, so this bound is the emulator's rather than a claim about the service.
 pub const MAX_ORIGIN_REQUEST_POLICIES: usize = 1_000;
+
+/// The most cache policies this emulator holds.
+///
+/// CHOSEN by this emulator, for the same reason as [`MAX_ORIGIN_REQUEST_POLICIES`]: a
+/// policy record is what a later read answers from, so it cannot be evicted, and the
+/// create path is refused at this entry count with the modelled `TooManyCachePolicies`
+/// ("You have reached the maximum number of cache policies for this Amazon Web Services
+/// account") instead of growing further. CloudFront's own ceiling is an account quota that
+/// can be raised and the model states no number, so this bound is the emulator's rather
+/// than a claim about the service.
+pub const MAX_CACHE_POLICIES: usize = 1_000;
 
 /// The `PriceClass` reported for a distribution whose stored configuration names none:
 /// the class that covers every CloudFront edge location, which is what
@@ -1348,6 +1361,44 @@ impl StoredOriginRequestPolicy {
     }
 }
 
+/// One CloudFront cache policy, as this emulator persists it.
+///
+/// The record is the single source of truth for the policy's id, the configuration it was
+/// created with, its `LastModifiedTime` and its version token, so the create and every
+/// later read answer from it rather than from the request being served.
+///
+/// Nothing in here is owed by the CLOCK: the model's `CachePolicy` is `Id`,
+/// `LastModifiedTime` and `CachePolicyConfig` only — a policy carries no status and no
+/// propagation deadline, so a policy this service accepts is immediately complete.
+#[derive(Debug, Clone)]
+pub struct StoredCachePolicy {
+    /// `CachePolicy$Id` — the identifier minted when the policy was created, and the key
+    /// the policy is held under.
+    pub id: String,
+    /// The configuration as submitted — "A cache policy configuration." Stored whole, so
+    /// a read reports what was stored rather than re-deriving anything from a request,
+    /// down to the members the create left out.
+    pub config: CachePolicyConfig,
+    /// `CachePolicy$LastModifiedTime` — "The date and time when the cache policy was last
+    /// modified."
+    pub last_modified_time: SystemTime,
+    /// The version token the last mutation handed back, and the single source of truth for
+    /// every `If-Match` check against this policy.
+    pub etag: String,
+}
+
+impl StoredCachePolicy {
+    /// The `CachePolicy` projection every cache policy operation returns, read from the
+    /// one stored record.
+    pub fn to_cache_policy(&self) -> CachePolicy {
+        CachePolicy {
+            id: self.id.clone(),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+            cache_policy_config: self.config.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-cloudfront-cloudfront2020-05-31. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudfrontCloudfront20200531State {
@@ -1395,6 +1446,10 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// for the same reason as `distributions`: one stable total order for a listing to
     /// page through.
     pub origin_request_policies: BTreeMap<String, StoredOriginRequestPolicy>,
+    /// Every cache policy this emulator holds, keyed by its minted id — the identifier
+    /// every cache policy operation addresses one by. A `BTreeMap` for the same reason as
+    /// `distributions`: one stable total order for a listing to page through.
+    pub cache_policies: BTreeMap<String, StoredCachePolicy>,
 }
 
 impl ComAmazonawsCloudfrontCloudfront20200531State {
@@ -1565,6 +1620,24 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// The origin request policy `id` names, or `None` when the store holds none.
     pub fn origin_request_policy(&self, id: &str) -> Option<&StoredOriginRequestPolicy> {
         self.origin_request_policies.get(id)
+    }
+
+    /// The cache policy `id` names, or `None` when the store holds none.
+    pub fn cache_policy(&self, id: &str) -> Option<&StoredCachePolicy> {
+        self.cache_policies.get(id)
+    }
+
+    /// The cache policy whose STORED configuration carries `name`, or `None`.
+    ///
+    /// `CachePolicyConfig$Name` is "A unique name to identify the cache policy", and the
+    /// create models `CachePolicyAlreadyExists` for a name another policy already holds —
+    /// so at most one policy answers, and this is what makes a repeated name a conflict
+    /// rather than a second policy. The comparison is against the stored configuration,
+    /// never against a request.
+    pub fn cache_policy_named(&self, name: &str) -> Option<&StoredCachePolicy> {
+        self.cache_policies
+            .values()
+            .find(|policy| policy.config.name == name)
     }
 
     /// The origin request policy whose STORED configuration carries `name`, or `None`.
@@ -1859,6 +1932,22 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         loop {
             let candidate = self.mint_uuid();
             if !self.origin_request_policies.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
+    /// Allocate a cache policy id no stored policy holds.
+    ///
+    /// `CachePolicy$Id` is the identifier every cache policy operation addresses one by,
+    /// and CloudFront mints a UUID for one (the same shape its origin request and response
+    /// headers policy ids take), so this renders one draw of
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::mint_uuid`] — distinct draws render
+    /// distinctly, so the mint never repeats an id.
+    pub fn allocate_cache_policy_id(&mut self) -> String {
+        loop {
+            let candidate = self.mint_uuid();
+            if !self.cache_policies.contains_key(&candidate) {
                 break candidate;
             }
         }
@@ -2306,6 +2395,12 @@ pub fn response_headers_policy_path(id: &str) -> String {
 /// resource is addressed by ID, as `GetOriginRequestPolicy`'s `{Id}` label is.
 pub fn origin_request_policy_path(id: &str) -> String {
     format!("/2020-05-31/origin-request-policy/{id}")
+}
+
+/// The path of a cache policy resource under this service's API version. The resource is
+/// addressed by ID, as `GetCachePolicy`'s `{Id}` label is.
+pub fn cache_policy_path(id: &str) -> String {
+    format!("/2020-05-31/cache-policy/{id}")
 }
 
 /// The fully qualified URI a `Location` header reports for `path`.
@@ -3266,6 +3361,118 @@ pub fn origin_request_policy_quantity_mismatch(
         .find_map(|(label, quantity, len)| quantity_disagreement(label, *quantity, *len))
 }
 
+/// The modelled `InconsistentQuantities` message for the first list wrapper in a cache
+/// policy configuration whose `Quantity` disagrees with the length of its `Items`, or
+/// `None` when every wrapper agrees.
+///
+/// The SAME rule [`config_quantity_mismatch`],
+/// [`response_headers_policy_quantity_mismatch`] and
+/// [`origin_request_policy_quantity_mismatch`] apply: every CloudFront list travels in a
+/// wrapper stating its own length beside the list itself, and the service refuses a
+/// request where the two disagree. A `CachePolicyConfig` reaches exactly three of them —
+/// the optional `Headers`, `Cookies` and `QueryStrings` lists the three behaviour
+/// configurations under `ParametersInCacheKeyAndForwardedToOrigin` carry — and reaches
+/// none at all when the configuration names no cache key parameters.
+pub fn cache_policy_quantity_mismatch(config: &CachePolicyConfig) -> Option<String> {
+    let parameters = config
+        .parameters_in_cache_key_and_forwarded_to_origin
+        .as_ref()?;
+    let mut counts: Vec<(&'static str, i32, usize)> = Vec::new();
+
+    if let Some(headers) = &parameters.headers_config.headers {
+        counts.push((
+            "HeadersConfig.Headers",
+            headers.quantity,
+            items_len(&headers.items),
+        ));
+    }
+    if let Some(cookies) = &parameters.cookies_config.cookies {
+        counts.push((
+            "CookiesConfig.Cookies",
+            cookies.quantity,
+            items_len(&cookies.items),
+        ));
+    }
+    if let Some(query_strings) = &parameters.query_strings_config.query_strings {
+        counts.push((
+            "QueryStringsConfig.QueryStrings",
+            query_strings.quantity,
+            items_len(&query_strings.items),
+        ));
+    }
+
+    counts
+        .iter()
+        .find_map(|(label, quantity, len)| quantity_disagreement(label, *quantity, *len))
+}
+
+/// Why a cache policy configuration is unusable, as the sentence the modelled
+/// `InvalidArgument` carries — or `None` when every member is within what the model and
+/// the documentation allow.
+///
+/// Two rules, each one the documentation states and each sentence BUILT FROM THE REQUEST:
+/// it names the member and the constraint it broke, which is the one thing the caller
+/// cannot work out for itself.
+///
+/// * The three TTLs are ORDERED: each is "The {minimum,default,maximum} amount of time, in
+///   seconds, that objects stay in the CloudFront cache", so the minimum cannot exceed the
+///   default or the maximum and the default cannot exceed the maximum. Only the members
+///   the request SUPPLIES are compared: a member the request leaves out carries
+///   CloudFront's own documented default for it (86400 or `MinTTL`, whichever is larger,
+///   for `DefaultTTL`; 31536000 or `DefaultTTL`, whichever is larger, for `MaxTTL`), and
+///   refusing a configuration whose only disorder comes from that default would refuse
+///   what the service accepts.
+/// * A TTL is an amount of time in seconds, so a negative one names no duration. The model
+///   puts no `@range` on `long`, so nothing refuses it before a handler runs.
+///
+/// `CachePolicyConfig$Comment`'s documented bound is checked beside these, through the one
+/// [`comment_too_long`] sentence every comment bound in this service is refused with.
+pub fn cache_policy_config_invalid(config: &CachePolicyConfig) -> Option<String> {
+    if let Some(comment) = &config.comment {
+        let length = comment.chars().count();
+        if length > MAX_CACHE_POLICY_COMMENT {
+            return comment_too_long(length).message;
+        }
+    }
+
+    for (label, value) in [
+        ("MinTTL", Some(config.min_ttl)),
+        ("DefaultTTL", config.default_ttl),
+        ("MaxTTL", config.max_ttl),
+    ] {
+        if let Some(value) = value {
+            if value < 0 {
+                return Some(format!(
+                    "An argument is invalid: {label} is an amount of time in seconds and cannot \
+                     be negative, but the request submits {value}"
+                ));
+            }
+        }
+    }
+
+    // The pairs the ordering rule constrains, each compared only where the request
+    // supplies both members of it.
+    let pairs: [(&str, Option<i64>, &str, Option<i64>); 3] = [
+        ("MinTTL", Some(config.min_ttl), "DefaultTTL", config.default_ttl),
+        ("MinTTL", Some(config.min_ttl), "MaxTTL", config.max_ttl),
+        ("DefaultTTL", config.default_ttl, "MaxTTL", config.max_ttl),
+    ];
+    for (lower_label, lower, upper_label, upper) in pairs {
+        let (Some(lower), Some(upper)) = (lower, upper) else {
+            continue;
+        };
+        if lower > upper {
+            return Some(format!(
+                "An argument is invalid: {upper_label} must be greater than or equal to \
+                 {lower_label}, but the request submits {lower_label} {lower} and {upper_label} \
+                 {upper}"
+            ));
+        }
+    }
+
+    None
+}
+
 /// The modelled `InconsistentQuantities` message for an invalidation batch whose
 /// `Paths.Quantity` disagrees with the number of paths it carries, or `None`.
 pub fn batch_quantity_mismatch(batch: &InvalidationBatch) -> Option<String> {
@@ -3729,6 +3936,41 @@ pub fn origin_request_policy_already_exists(name: &str) -> OriginRequestPolicyAl
             "An origin request policy with the name {name} already exists in this account. You \
              must provide a unique name. To modify an existing origin request policy, use \
              UpdateOriginRequestPolicy."
+        )),
+    }
+}
+
+/// The longest comment a cache policy carries.
+///
+/// `CachePolicyConfig$Comment`: "A comment to describe the cache policy. The comment
+/// cannot be longer than 128 characters." The SAME bound, stated in the same words, as
+/// [`MAX_ORIGIN_ACCESS_IDENTITY_COMMENT`] — so it is that constant rather than a second
+/// literal, and a comment past it is refused with the one [`comment_too_long`] sentence.
+pub const MAX_CACHE_POLICY_COMMENT: usize = MAX_ORIGIN_ACCESS_IDENTITY_COMMENT;
+
+/// The modelled `NoSuchCachePolicy` (HTTP 404) for a cache policy id the store does not
+/// hold.
+///
+/// The sentence is the one the model states on the shape itself — "The cache policy does
+/// not exist." — a property of the store rather than of the request, so nothing from the
+/// request belongs in the text.
+pub fn no_such_cache_policy() -> NoSuchCachePolicy {
+    NoSuchCachePolicy {
+        message: Some(NO_SUCH_CACHE_POLICY_MESSAGE.to_string()),
+    }
+}
+
+/// `NoSuchCachePolicy`'s message, as the model documents the shape.
+pub const NO_SUCH_CACHE_POLICY_MESSAGE: &str = "The cache policy does not exist.";
+
+/// The modelled `CachePolicyAlreadyExists` (HTTP 409) for a policy name that is already
+/// taken — "A cache policy with this name already exists. You must provide a unique name.
+/// To modify an existing cache policy, use UpdateCachePolicy."
+pub fn cache_policy_already_exists(name: &str) -> CachePolicyAlreadyExists {
+    CachePolicyAlreadyExists {
+        message: Some(format!(
+            "A cache policy with the name {name} already exists in this account. You must \
+             provide a unique name. To modify an existing cache policy, use UpdateCachePolicy."
         )),
     }
 }

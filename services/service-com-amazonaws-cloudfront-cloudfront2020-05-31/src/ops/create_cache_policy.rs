@@ -1,15 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCachePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCachePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCachePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a cache policy: allocates its id and its first version token, stores the
+//! submitted configuration whole, and reports the record it stored, so a later read
+//! answers from that record rather than from the request being served.
+//!
+//! Four refusals are checked BEFORE anything is minted:
+//!
+//! * a list wrapper whose `Quantity` disagrees with the length of its `Items` —
+//!   `InconsistentQuantities`, the same rule every CloudFront list wrapper obeys
+//!   ([`crate::state::cache_policy_quantity_mismatch`]);
+//! * a configuration whose TTLs are not ordered `MinTTL` <= `DefaultTTL` <= `MaxTTL`, one
+//!   that names a negative TTL, or one whose `Comment` is past the documented 128
+//!   characters — `InvalidArgument`
+//!   ([`crate::state::cache_policy_config_invalid`] states each rule, and why only the
+//!   members the request supplies take part in the ordering);
+//! * a `Name` another policy already holds — `CachePolicyConfig$Name` is "A unique name to
+//!   identify the cache policy", so the second create under a name is
+//!   `CachePolicyAlreadyExists` rather than a second policy;
+//! * more policies than this emulator holds ([`crate::state::MAX_CACHE_POLICIES`]) —
+//!   `TooManyCachePolicies`.
+//!
+//! The model declares three more refusals whose maximum is an account quota CloudFront can
+//! raise and neither the model nor the shape documentation states a number for
+//! (`TooManyCookiesInCachePolicy`, `TooManyHeadersInCachePolicy`,
+//! `TooManyQueryStringsInCachePolicy`). Nothing here refuses on them, for the same reason
+//! `CreateOriginRequestPolicy` does not refuse on its own per-list quotas: a bound invented
+//! for them would refuse configurations the service accepts, which is a worse answer than
+//! accepting them.
+//!
+//! `AccessDenied` is deliberately unreachable from this handler, so a reader does not take
+//! it for an omission: this emulator authorizes no caller. The request boundary verifies
+//! the signature, and no operation in this service consults a principal, so there is no
+//! permission for this one to refuse on.
 //!
 //! ## Shape of an operation
 //!
@@ -100,6 +124,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::StoredCachePolicy;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -175,18 +203,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCachePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCachePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCachePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        let config = input.cache_policy_config;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // Every CloudFront list travels in a wrapper that states its own length beside the
+        // list itself, and a request whose `Quantity` disagrees with its `Items` describes
+        // no list at all: "The value of Quantity and the size of Items don't match."
+        // Checked over every wrapper this configuration reaches, before anything is minted.
+        if let Some(message) = crate::state::cache_policy_quantity_mismatch(&config) {
+            return Err(CreateCachePolicyErrorModeled::InconsistentQuantities(
+                InconsistentQuantities {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The documented constraints on the configuration's own members — the TTL ordering
+        // above all — refused with the modelled `InvalidArgument` ("An argument is
+        // invalid"), naming the member and the constraint it broke.
+        if let Some(message) = crate::state::cache_policy_config_invalid(&config) {
+            return Err(CreateCachePolicyErrorModeled::InvalidArgument(
+                InvalidArgument {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // "A unique name to identify the cache policy": a name identifies ONE policy, so a
+        // name another policy already holds cannot name a second one — the policy that
+        // holds it is left exactly as it was.
+        if store.cache_policy_named(&config.name).is_some() {
+            return Err(CreateCachePolicyErrorModeled::CachePolicyAlreadyExists(
+                crate::state::cache_policy_already_exists(&config.name),
+            )
+            .into());
+        }
+
+        // The store grows only here and a policy cannot be evicted (a later read has to
+        // answer with what this create returned), so the bound is an entry count refused
+        // before the insert.
+        if store.cache_policies.len() >= crate::state::MAX_CACHE_POLICIES {
+            return Err(CreateCachePolicyErrorModeled::TooManyCachePolicies(
+                TooManyCachePolicies {
+                    message: Some(format!(
+                        "This emulator holds at most {} cache policies; delete one before \
+                         creating another",
+                        crate::state::MAX_CACHE_POLICIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.allocate_cache_policy_id();
+        let etag = store.next_etag();
+        let stored = StoredCachePolicy {
+            id: id.clone(),
+            // Stored whole: a later read reports the configuration that was submitted,
+            // down to the members this create left out.
+            config,
+            last_modified_time: now,
+            etag: etag.clone(),
+        };
+        // Read from the record just built, never from the request.
+        let cache_policy = stored.to_cache_policy();
+        let location = crate::state::location_uri(&crate::state::cache_policy_path(&id));
+        store.cache_policies.insert(id, stored);
+
+        Ok(CreateCachePolicyOutput {
+            // "A cache policy."
+            cache_policy: Some(cache_policy),
+            // "The fully qualified URI of the cache policy just created."
+            location: Some(location),
+            // "The current version of the cache policy" — the token an `If-Match` against
+            // this policy is checked against.
+            e_tag: Some(etag),
+        })
     }
 }
