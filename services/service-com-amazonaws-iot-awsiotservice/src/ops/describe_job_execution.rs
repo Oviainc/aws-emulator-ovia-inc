@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeJobExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeJobExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeJobExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the job execution of one job on one thing, from the SHARED job-execution
+//! store the IoT Jobs data plane serves — the execution a `CreateJob` created when it
+//! targeted that thing — with `executionNumber` selecting one of a re-targeted job's
+//! executions and the latest reported when the request names none, as the member
+//! documents. A `jobId`/`thingName` pair the store has no execution for is the
+//! modelled `ResourceNotFoundException` (404).
+//!
+//! Unlike the data plane's device-facing read of the same record, a FINISHED execution
+//! is reported here rather than refused: this model declares no terminal-state error,
+//! and the management API is how a caller sees how a job execution ended.
+//!
+//! This reporting operation writes exactly one thing: the `TIMED_OUT` transition a
+//! timer armed on an execution had already made DUE at its own deadline (see
+//! `service_common::iot_job_executions::JobExecutionRecord::time_out_if_due`), so a
+//! caller is told the status the clock decided and the device polling the data plane
+//! sees the same record. Nothing else about the execution changes on a read.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +154,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeJobExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeJobExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeJobExecution"))
+        let unavailable = || -> DescribeJobExecutionError {
+            DescribeJobExecutionErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into()
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
+        // The executions live in the SHARED store the IoT Jobs data plane serves, so
+        // this read answers from the very record the device polls, starts and updates.
+        let Some(executions) = crate::state::job_execution_store(&*self.engine) else {
+            return Err(unavailable());
+        };
+
+        // Both members are `@required` `@httpLabel`s, so the refusal states the pair
+        // it found no execution for.
+        let not_found = || -> DescribeJobExecutionError {
+            DescribeJobExecutionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No job execution of job {} exists on thing {}",
+                        input.job_id, input.thing_name
+                    )),
+                },
+            )
+            .into()
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::service_common::iot_job_executions::now_epoch_seconds();
+
+        // LOCK ORDER: this service's store first, the shared one second, as
+        // `crate::state::job_execution_store` documents. A job execution belongs to a
+        // job of this account's registry (`CreateJob$jobId` is "A job identifier which
+        // must be unique for your account"), so a `jobId` the registry does not hold
+        // has no job execution to report — which is also what keeps a COMMAND
+        // execution, keyed in the shared store by its own minted `executionId` and
+        // read through `GetCommandExecution`, from being reported here as a job
+        // execution.
+        if !state.lock().jobs.contains_key(&input.job_id) {
+            return Err(not_found());
+        }
+
+        let mut store = executions.lock();
+        // A timer the job or the device armed moves an execution to `TIMED_OUT` by
+        // itself, so the transitions the clock has already made due are recorded
+        // before anything is read: each was owed at its own deadline whether or not
+        // this call happened, and the status a later reader of the shared store sees
+        // must be the same one.
+        store.time_out_due_executions(&input.thing_name, now);
+
+        // ONE lookup, so a pair the store holds no execution for has exactly one
+        // answer: without `executionNumber` it is the LATEST execution of that job on
+        // that thing, which is what the member documents as the default.
+        let Some(record) = store
+            .execution_index(&input.thing_name, &input.job_id, input.execution_number)
+            .and_then(|index| store.record(&input.thing_name, index))
+        else {
+            return Err(not_found());
+        };
+
+        Ok(DescribeJobExecutionOutput {
+            execution: Some(crate::state::to_job_execution(record, &region, now)),
+        })
     }
 }

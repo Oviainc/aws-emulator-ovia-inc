@@ -15,7 +15,8 @@
 //! Nothing here names a wire shape or a Smithy type: a service crate projects a
 //! [`JobExecutionRecord`] onto the shapes ITS model declares (`JobExecution`,
 //! `JobExecutionSummary`, `JobExecutionState`, …). What lives here is the record, the
-//! lookups every reader needs and the quotas that bound the store.
+//! lookups every reader needs, the quotas that bound the store and the one transition
+//! the CLOCK owes an execution ([`JobExecutionRecord::time_out_if_due`]).
 //!
 //! Every caller-driven store is BOUNDED: see the quota constants below,
 //! [`JobExecutionStore::try_insert_execution`] (which refuses past a quota and evicts
@@ -29,6 +30,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const STATUS_QUEUED: &str = "QUEUED";
 /// The status a device moves an execution to when it starts working on it.
 pub const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+/// The status an execution reaches when a timer armed on it expires before it
+/// finished: `TimeoutConfig$inProgressTimeoutInMinutes` — "If the job execution
+/// status is not set to another terminal state before the time expires, it will be
+/// automatically set to TIMED_OUT" — and the same for the device-set step timer
+/// (`UpdateJobExecution$stepTimeoutInMinutes`). It is a `JobExecutionStatus` value of
+/// both IoT models, and TERMINAL (it is not one of the [`PENDING_STATUSES`]).
+pub const STATUS_TIMED_OUT: &str = "TIMED_OUT";
 
 /// The two statuses an execution is PENDING in — the ones
 /// `GetPendingJobExecutions` documents as "not in a terminal status" and
@@ -210,16 +218,52 @@ impl JobExecutionRecord {
     /// `TIMED_OUT`, floored at zero; `None` when no timer is armed or the execution
     /// is already terminal.
     pub fn approximate_seconds_before_timed_out(&self, now: i64) -> Option<i64> {
+        let deadline = self.timeout_deadline()?;
+        Some(deadline.saturating_sub(now).max(0))
+    }
+
+    /// The instant, in epoch seconds, at which this execution becomes `TIMED_OUT`:
+    /// the SOONEST armed timer's deadline, either the step timer the device set or
+    /// the job's in-progress timer. `None` when no timer is armed, or when the
+    /// execution has already reached a status it never leaves (a finished execution
+    /// has no deadline left to reach).
+    pub fn timeout_deadline(&self) -> Option<i64> {
         if self.is_terminal() {
             return None;
         }
-        let deadline = match (self.step_timeout_expires_at, self.execution_timeout_expires_at) {
+        match (self.step_timeout_expires_at, self.execution_timeout_expires_at) {
             (Some(step), Some(exec)) => Some(step.min(exec)),
             (Some(step), None) => Some(step),
             (None, Some(exec)) => Some(exec),
             (None, None) => None,
-        }?;
-        Some(deadline.saturating_sub(now).max(0))
+        }
+    }
+
+    /// Materialise the `TIMED_OUT` transition the CLOCK has already made due, and
+    /// answer whether this call is what moved the execution.
+    ///
+    /// A timer AWS arms moves the execution by itself — "If the job execution status
+    /// is not set to another terminal state before the time expires, it will be
+    /// automatically set to TIMED_OUT" — so the move was owed at
+    /// [`Self::timeout_deadline`] whether or not anybody called; recording it when a
+    /// handler next touches the record is what makes a later reader see the status the
+    /// deadline already decided. The transition is stamped at the DEADLINE and not at
+    /// `now`, so the record says when the execution timed out rather than when it was
+    /// next read, and `versionNumber` is left alone: "Job execution versions are
+    /// incremented each time they are updated by a device"
+    /// (`JobExecution$versionNumber`), and the service's own timer is not a device
+    /// update.
+    pub fn time_out_if_due(&mut self, now: i64) -> bool {
+        match self.timeout_deadline() {
+            Some(deadline) if deadline <= now => {
+                self.status = STATUS_TIMED_OUT.to_string();
+                self.last_updated_at = deadline;
+                self.step_timeout_expires_at = None;
+                self.execution_timeout_expires_at = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The `statusDetails` in the `HashMap` form every modelled `DetailsMap` member
@@ -641,6 +685,25 @@ impl JobExecutionStore {
             .count()
     }
 
+    /// Materialise the `TIMED_OUT` transition every one of `thing_name`'s executions
+    /// has already come due for, and answer how many moved. See
+    /// [`JobExecutionRecord::time_out_if_due`] for why a reporting handler may write
+    /// this: the move was owed at each execution's own deadline, so a handler calls
+    /// this before it reads, and the whole of the thing's queue is materialised at one
+    /// instant rather than only the one record a caller asked about.
+    pub fn time_out_due_executions(&mut self, thing_name: &str, now: i64) -> usize {
+        let Some(executions) = self.things.get_mut(thing_name) else {
+            return 0;
+        };
+        let mut moved = 0usize;
+        for record in executions.iter_mut() {
+            if record.time_out_if_due(now) {
+                moved += 1;
+            }
+        }
+        moved
+    }
+
     /// Remember what a `clientToken` committed, evicting the oldest remembered token
     /// once the index is full.
     pub fn remember_client_token(
@@ -895,6 +958,150 @@ mod tests {
                 .sum::<usize>(),
             "case past the bound: the byte count must follow the store, got {}",
             store.stored_document_bytes
+        );
+    }
+
+    /// One row of the timer table: where each armed deadline sits relative to the
+    /// instant the record is touched at.
+    struct TimerRow {
+        case: &'static str,
+        step: Option<i64>,
+        execution: Option<i64>,
+        now: i64,
+        timed_out: bool,
+    }
+
+    /// A pending execution times out AT its soonest armed deadline and not before,
+    /// whichever timer armed it, and a timer that was re-armed past `now` survives.
+    #[test]
+    fn a_pending_execution_times_out_exactly_at_its_soonest_deadline() {
+        let rows: [TimerRow; 8] = [
+            TimerRow { case: "no timer armed", step: None, execution: None, now: 9_999, timed_out: false },
+            TimerRow { case: "step timer still running", step: Some(2_000), execution: None, now: 1_999, timed_out: false },
+            TimerRow { case: "step timer due this second", step: Some(2_000), execution: None, now: 2_000, timed_out: true },
+            TimerRow { case: "step timer long past", step: Some(2_000), execution: None, now: 99_999, timed_out: true },
+            TimerRow { case: "in-progress timer due", step: None, execution: Some(3_000), now: 3_000, timed_out: true },
+            TimerRow { case: "in-progress timer running", step: None, execution: Some(3_000), now: 2_999, timed_out: false },
+            TimerRow { case: "both armed, the step one is sooner", step: Some(2_000), execution: Some(3_000), now: 2_000, timed_out: true },
+            TimerRow { case: "both armed, neither due yet", step: Some(2_000), execution: Some(3_000), now: 1_000, timed_out: false },
+        ];
+        for TimerRow {
+            case,
+            step,
+            execution,
+            now,
+            timed_out: expected,
+        } in rows
+        {
+            let mut record =
+                JobExecutionRecord::queued("job".to_string(), "thing".to_string(), None, 1_000);
+            record.step_timeout_expires_at = step;
+            record.execution_timeout_expires_at = execution;
+            let moved = record.time_out_if_due(now);
+            assert_eq!(
+                moved, expected,
+                "case {case:?}: expected time_out_if_due == {expected}, got {moved} \
+                 with {record:?}"
+            );
+            let soonest = match (step, execution) {
+                (Some(step), Some(execution)) => Some(step.min(execution)),
+                (Some(step), None) => Some(step),
+                (None, Some(execution)) => Some(execution),
+                (None, None) => None,
+            };
+            if expected {
+                assert_eq!(
+                    (record.status.as_str(), Some(record.last_updated_at)),
+                    (STATUS_TIMED_OUT, soonest),
+                    "case {case:?}: a timed-out execution is stamped at its deadline, \
+                     got {record:?}"
+                );
+                assert!(
+                    record.is_terminal()
+                        && record.approximate_seconds_before_timed_out(now).is_none(),
+                    "case {case:?}: a timed-out execution is terminal and reports no \
+                     remaining time, got {record:?}"
+                );
+                assert!(
+                    !record.time_out_if_due(now + 60),
+                    "case {case:?}: timing out is idempotent, got a second move with \
+                     {record:?}"
+                );
+            } else {
+                assert_eq!(
+                    (record.status.as_str(), record.timeout_deadline()),
+                    (STATUS_QUEUED, soonest),
+                    "case {case:?}: an execution whose deadline has not passed is \
+                     untouched, got {record:?}"
+                );
+            }
+        }
+    }
+
+    /// Materialising a thing's due timeouts moves EVERY execution the clock made due
+    /// and leaves the rest alone, so the thing's whole queue is read at one instant.
+    #[test]
+    fn due_timeouts_are_materialized_for_the_whole_thing() {
+        let mut store = JobExecutionStore::default();
+        // (job, step deadline) — one long past due, one due exactly now, one later,
+        // one with no timer at all.
+        let rows: [(&str, Option<i64>); 4] = [
+            ("job-past", Some(1_500)),
+            ("job-now", Some(2_000)),
+            ("job-later", Some(2_001)),
+            ("job-untimed", None),
+        ];
+        for (job, deadline) in rows {
+            enqueue(&mut store, "thing", job, 1_000);
+            let at = store
+                .execution_index("thing", job, None)
+                .expect("the execution just enqueued");
+            store
+                .record_mut("thing", at)
+                .expect("the index came from this store")
+                .step_timeout_expires_at = deadline;
+        }
+        // A second thing's executions are not touched by reading the first.
+        enqueue(&mut store, "other-thing", "job-past", 1_000);
+        let at = store
+            .execution_index("other-thing", "job-past", None)
+            .expect("the other thing's execution");
+        store
+            .record_mut("other-thing", at)
+            .expect("the index came from this store")
+            .step_timeout_expires_at = Some(1_500);
+
+        let moved = store.time_out_due_executions("thing", 2_000);
+        assert_eq!(
+            moved, 2,
+            "case two due: expected two executions moved, got {moved} with {:?}",
+            store.executions_for("thing")
+        );
+        // (job, expected status)
+        let expected: [(&str, &str); 4] = [
+            ("job-past", STATUS_TIMED_OUT),
+            ("job-now", STATUS_TIMED_OUT),
+            ("job-later", STATUS_QUEUED),
+            ("job-untimed", STATUS_QUEUED),
+        ];
+        for (job, status) in expected {
+            let record = store
+                .resolve_record("thing", job, None)
+                .expect("every enqueued execution is still held");
+            assert_eq!(
+                record.status, status,
+                "case {job:?}: expected status {status}, got {:?}",
+                record.status
+            );
+        }
+        let untouched = store
+            .resolve_record("other-thing", "job-past", None)
+            .expect("the other thing's execution is still held");
+        assert_eq!(
+            untouched.status, STATUS_QUEUED,
+            "case other thing: reading one thing must not move another's executions, \
+             got {:?}",
+            untouched.status
         );
     }
 }
