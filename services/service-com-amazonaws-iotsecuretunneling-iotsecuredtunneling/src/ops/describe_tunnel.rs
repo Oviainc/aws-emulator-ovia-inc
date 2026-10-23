@@ -145,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.tunnels.get(&input.tunnel_id).cloned() else {
             return Err(DescribeTunnelErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Tunnel {} not found", input.tunnel_id)),
+                    message: Some(crate::state::tunnel_not_found_message(&input.tunnel_id)),
                 },
             )
             .into());

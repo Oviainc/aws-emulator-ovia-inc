@@ -571,16 +571,15 @@ async fn rotate_tunnel_access_token_replaces_only_the_selected_tokens() {
             .cloned()
             .unwrap_or_else(|| panic!("case {mode:?}: the opened tunnel was not persisted"));
 
-        let (status, rotated) = call(
-            &router,
-            "RotateTunnelAccessToken",
-            &json!({
-                "tunnelId": tunnel_id,
-                "clientMode": mode,
-                "destinationConfig": {"thingName": "thing-rotate", "services": ["SSH", "HTTP"]},
-            }),
-        )
-        .await;
+        // `destinationConfig` configures the destination end, so it only rides
+        // along on a rotation that covers that end; see
+        // `tunnel_refusal_rules.rs` for the refusal when it does not.
+        let mut rotate_input = json!({"tunnelId": tunnel_id, "clientMode": mode});
+        if rotates_destination {
+            rotate_input["destinationConfig"] =
+                json!({"thingName": "thing-rotate", "services": ["SSH", "HTTP"]});
+        }
+        let (status, rotated) = call(&router, "RotateTunnelAccessToken", &rotate_input).await;
         assert_eq!(
             status, 200,
             "case {mode:?}: RotateTunnelAccessToken answered {rotated:?}"
@@ -657,16 +656,21 @@ async fn rotate_tunnel_access_token_replaces_only_the_selected_tokens() {
             "case {mode:?}: rotate must not extend the tunnel duration"
         );
 
-        // The supplied destinationConfig replaced the stored one.
+        // A supplied destinationConfig replaced the stored one; a rotation that
+        // sent none left the one `OpenTunnel` stored.
         let (_, described) =
             call(&router, "DescribeTunnel", &json!({"tunnelId": tunnel_id})).await;
         let services: Vec<&str> = described["tunnel"]["destinationConfig"]["services"]
             .as_array()
             .map(|entries| entries.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
+        let expected_services: Vec<&str> = if rotates_destination {
+            vec!["SSH", "HTTP"]
+        } else {
+            vec!["SSH"]
+        };
         assert_eq!(
-            services,
-            vec!["SSH", "HTTP"],
+            services, expected_services,
             "case {mode:?}: rotate must apply the supplied destinationConfig, got {services:?}"
         );
     }

@@ -7,10 +7,11 @@
 //! name this tunnel. Rotating does not extend the tunnel's lifetime: the expiry
 //! stays the one `OpenTunnel` computed.
 //!
-//! Rotating against a tunnel that is already `CLOSED` (including one the expiry
-//! sweep just closed) succeeds and mints tokens: the model declares no error for
-//! that case, and the operation's own documentation conditions nothing on status,
-//! so refusing it would be an invented failure.
+//! Rotation reissues the credentials of a LIVE tunnel, so it is refused on a
+//! tunnel that is not `OPEN` — one `CloseTunnel` closed, or one the expiry sweep
+//! closed — with HTTP 400 `ValidationException`, before any token is minted or
+//! stored. A `destinationConfig` configures the destination end, so it is refused
+//! the same way when the requested `clientMode` does not rotate that end.
 //!
 //! ## Shape of an operation
 //!
@@ -168,6 +169,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // `destinationConfig` configures the DESTINATION end of the tunnel, so it
+        // can only accompany a rotation that covers that end (`DESTINATION` or
+        // `ALL`). AWS documents the pairing and refuses the combination; the model
+        // cannot express a cross-member rule, so it is checked here — before the
+        // tunnel is resolved, because the request is unanswerable whatever the
+        // store holds, and so nothing is mutated.
+        if input.destination_config.is_some() && !rotate_destination {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "DestinationConfig is not allowed with clientMode {}",
+                input.client_mode
+            )));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.materialize_expired_tunnels(now);
@@ -175,11 +189,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(tunnel) = store.tunnels.get_mut(&input.tunnel_id) else {
             return Err(RotateTunnelAccessTokenErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Tunnel {} not found", input.tunnel_id)),
+                    message: Some(crate::state::tunnel_not_found_message(&input.tunnel_id)),
                 },
             )
             .into());
         };
+
+        // Credentials are only reissued for a tunnel that is still live: a closed
+        // tunnel can never be connected to, so AWS refuses to mint a client access
+        // token for one. The tunnel is still describable, hence a refusal rather
+        // than the not-found error, and the check runs before any token is minted
+        // or stored so a refused call leaves the record exactly as it was.
+        if tunnel.status != crate::state::TunnelStatus::Open {
+            // The wording ("is close.") is AWS's own for this refusal; what the
+            // request determines is the tunnel it names.
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Tunnel {} is close.",
+                input.tunnel_id
+            )));
+        }
 
         let source_access_token = rotate_source.then(crate::state::mint_access_token);
         let destination_access_token = rotate_destination.then(crate::state::mint_access_token);

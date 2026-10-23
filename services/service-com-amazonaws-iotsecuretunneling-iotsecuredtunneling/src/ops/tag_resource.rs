@@ -135,7 +135,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.tunnel_id_for_arn(&input.resource_arn).is_none() {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Resource {} not found", input.resource_arn)),
+                    // The tunnel the ARN names, named the way every other
+                    // operation of this service names it.
+                    message: Some(crate::state::tunnel_not_found_message_for_arn(
+                        &input.resource_arn,
+                    )),
                 },
             )
             .into());

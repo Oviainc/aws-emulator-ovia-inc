@@ -15,3 +15,5 @@
 mod state_roundtrip;
 #[path = "all/tunnel_lifecycle.rs"]
 mod tunnel_lifecycle;
+#[path = "all/tunnel_refusal_rules.rs"]
+mod tunnel_refusal_rules;

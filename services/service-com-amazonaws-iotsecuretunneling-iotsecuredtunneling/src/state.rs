@@ -290,9 +290,51 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// The ARN resource prefix of a tunnel: a tunnel ARN addresses the resource as
+/// `tunnel/<tunnelId>`.
+const TUNNEL_ARN_RESOURCE_PREFIX: &str = "tunnel/";
+
 /// The ARN of the tunnel `tunnel_id` in `region`.
 pub fn tunnel_arn(region: &str, tunnel_id: &str) -> String {
-    ::engine::emulator_arn(TUNNEL_ARN_SERVICE, region, &format!("tunnel/{tunnel_id}"))
+    ::engine::emulator_arn(
+        TUNNEL_ARN_SERVICE,
+        region,
+        &format!("{TUNNEL_ARN_RESOURCE_PREFIX}{tunnel_id}"),
+    )
+}
+
+/// The `tunnelId` a resource ARN names, or `None` when `arn` is not of the form
+/// `arn:<partition>:iot:<region>:<account>:tunnel/<tunnelId>`.
+///
+/// `TunnelId`'s modelled pattern `^[a-zA-Z0-9_\-+=:]{1,128}$` admits `:`, so the
+/// resource segment is everything after the fifth colon rather than the sixth
+/// colon-separated field.
+pub fn tunnel_id_from_arn(arn: &str) -> Option<&str> {
+    let resource = arn.splitn(6, ':').nth(5)?;
+    let tunnel_id = resource.strip_prefix(TUNNEL_ARN_RESOURCE_PREFIX)?;
+    (!tunnel_id.is_empty()).then_some(tunnel_id)
+}
+
+/// The message every `ResourceNotFoundException` of this service carries.
+///
+/// AWS identifies the missing resource by the TUNNEL's id, in one sentence form
+/// shared by every operation that raises the error — the read, the mutating and
+/// the ARN-addressed tag paths alike — so the message is a function of the
+/// request and of nothing else. Keep this the single place it is built: a
+/// per-operation wording is exactly the divergence this helper exists to
+/// prevent.
+pub fn tunnel_not_found_message(tunnel_id: &str) -> String {
+    format!("Tunnel {tunnel_id} does not exist.")
+}
+
+/// [`tunnel_not_found_message`] for a request that addressed the tunnel by ARN:
+/// the message still names the tunnel by its id, lifted out of `arn`.
+///
+/// An ARN that names no tunnel resource carries no id to lift, so there the
+/// supplied string itself is the only identifier the request offered and the
+/// message names that.
+pub fn tunnel_not_found_message_for_arn(arn: &str) -> String {
+    tunnel_not_found_message(tunnel_id_from_arn(arn).unwrap_or(arn))
 }
 
 /// Unique, opaque bytes for a minted id or access token.
