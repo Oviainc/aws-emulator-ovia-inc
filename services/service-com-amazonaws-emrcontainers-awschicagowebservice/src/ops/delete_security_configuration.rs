@@ -150,6 +150,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.settle();
 
+        // The delete must actually take effect: the record leaves the store here, so the
+        // next `DescribeSecurityConfiguration` of this id finds nothing and answers the
+        // modelled `ResourceNotFoundException` instead of serving a deleted resource.
+        //
         // This operation models no not-found error, so an id that names no stored
         // configuration is refused as an invalid request rather than answered as a no-op:
         // the output reports the id that WAS deleted, and there was none.

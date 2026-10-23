@@ -974,7 +974,10 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     ///
     /// The entry goes WITH the record, on the same terms as [`Self::remove_job_template`]:
     /// this emulator's token index holds exactly one entry per stored configuration and so
-    /// stays bounded by [`MAX_SECURITY_CONFIGURATIONS`].
+    /// stays bounded by [`MAX_SECURITY_CONFIGURATIONS`]. A create retried with the same
+    /// `clientToken` AFTER its configuration was deleted therefore mints a new one rather
+    /// than replaying a record that no longer exists; while the configuration exists — the
+    /// whole window the dedup contract is about — the token never mints a second one.
     pub fn remove_security_configuration(&mut self, id: &str) -> Option<SecurityConfigurationRecord> {
         let record = self.security_configurations.remove(id)?;
         self.idempotency.remove(&(

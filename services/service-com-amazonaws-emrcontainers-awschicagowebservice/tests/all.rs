@@ -19,6 +19,8 @@ mod job_template_idempotency;
 mod job_template_lifecycle;
 #[path = "all/security_configuration.rs"]
 mod security_configuration;
+#[path = "all/security_configuration_delete.rs"]
+mod security_configuration_delete;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/virtual_cluster_job_run_loop.rs"]
