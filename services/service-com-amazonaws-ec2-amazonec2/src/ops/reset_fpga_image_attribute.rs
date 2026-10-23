@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetFpgaImageAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetFpgaImageAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: resets the load permissions of the Amazon FPGA Image the request names back
+//! to the default — none — in [`crate::state`]. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetFpgaImageAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "You can only reset the load permission attribute": a request naming any other attribute
+//! is refused, and so is one naming none, since there is nothing to reset without it. The
+//! refusals keep the same order as every other FPGA-image operation: a malformed id
+//! (`InvalidFpgaImageID.Malformed`), then `DryRun` (`DryRunOperation`), then an id the
+//! account holds no AFI for (`InvalidFpgaImageID.NotFound`).
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +135,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetFpgaImageAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetFpgaImageAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetFpgaImageAttribute"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            dry_run_operation, fpga_image_id_is_well_formed, invalid_fpga_image_id_malformed,
+            invalid_fpga_image_id_not_found, require_service_state,
+        };
+
+        // An AFI carries no Region member of its own, so nothing here depends on the Region
+        // the request was signed for.
+        let _ = ctx;
+
+        if !fpga_image_id_is_well_formed(&input.fpga_image_id) {
+            return Err(invalid_fpga_image_id_malformed(&input.fpga_image_id));
+        }
+
+        // "You can only reset the load permission attribute" (`ResetFpgaImageAttribute`).
+        // The modelled enum refuses any other spelling before this handler runs; the member
+        // is optional in the model, though, and a reset with no attribute names nothing to
+        // reset, so it is refused as a missing parameter rather than read as "the only one
+        // there is".
+        if input.attribute.as_deref().is_none_or(str::is_empty) {
+            return Err(Scaffolded::missing_parameter(format!(
+                "attribute must be specified, and the only attribute that can be reset is '{}'",
+                RESET_FPGA_IMAGE_ATTRIBUTE_NAME_VALUES.join("', '")
+            )));
+        }
+
+        // The permission question, answered before the resource one and before the write.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let Some(record) = store.fpga_images.get_mut(&input.fpga_image_id) else {
+            return Err(invalid_fpga_image_id_not_found(&input.fpga_image_id));
+        };
+        // "Resets the specified attribute ... to its default value": the default load
+        // permission of an AFI is none at all, so the reset clears them.
+        record.load_permissions.clear();
+        Ok(ResetFpgaImageAttributeOutput {
+            // "Is `true` if the request succeeds, and an error otherwise"
+            // (`ResetFpgaImageAttributeResult$Return`).
+            r#return: Some(true),
+        })
     }
 }

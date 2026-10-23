@@ -663,7 +663,9 @@ async fn a_language_the_operation_does_not_analyse_is_refused() {
     let comprehend = Comprehend::new();
 
     // `DetectTargetedSentimentRequest$LanguageCode` documents "Currently, English is
-    // the only supported language", so every other modelled value is refused.
+    // the only supported language", so every other modelled value is refused — as an
+    // input-validation constraint over the operation's own set, which is what
+    // `sync_inference_refusals.rs` asserts the member path, the value and the set of.
     for code in LANGUAGE_CODE_VALUES {
         let (status, body) = comprehend
             .call(
@@ -684,8 +686,8 @@ async fn a_language_the_operation_does_not_analyse_is_refused() {
             );
             assert_eq!(
                 error_code(&body),
-                "UnsupportedLanguageException",
-                "case {code:?}: expected UnsupportedLanguageException, got {body}"
+                "ValidationException",
+                "case {code:?}: expected ValidationException, got {body}"
             );
         }
     }

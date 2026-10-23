@@ -82,7 +82,11 @@
 //! [`text_size_refusal`] are the ONE per-document size quota table and the ONE
 //! size-report refusal the real-time (synchronous) inference operations share, so no
 //! two of them can disagree about the quota or about what a refusal tells the
-//! caller. [`request_region`], [`epoch_parts`] and [`datetime_parts`] are the other
+//! caller. [`MAX_BATCH_DOCUMENTS`], [`batch_size_limit_refusal`] and
+//! [`batch_text_size_refusal`] are the same ONE place for the two quotas a batch
+//! request is refused WHOLESALE for — its document count and any one document's
+//! size — so the `BatchDetect*` family cannot drift apart on either.
+//! [`request_region`], [`epoch_parts`] and [`datetime_parts`] are the other
 //! service-wide helpers that live here rather than in one operation's file.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1593,6 +1597,54 @@ pub fn text_size_refusal(text: &str, quota_bytes: usize) -> Option<String> {
              {quota_bytes} bytes while in this request the text size is {actual_bytes} bytes"
         )
     })
+}
+
+/// The most documents one synchronous batch inference request may carry.
+///
+/// ONE ceiling for the whole `BatchDetect*` family, which is what the model
+/// documents: every batch operation's `TextList` says "The list can contain a
+/// maximum of 25 documents" and the `BatchSizeLimitExceededException` they all
+/// declare names the same 25. The model's `@length` trait states only the floor of
+/// 1, so the ceiling is enforced in the handlers, through this constant and
+/// [`batch_size_limit_refusal`].
+pub const MAX_BATCH_DOCUMENTS: usize = 25;
+
+/// The message `BatchSizeLimitExceededException` carries, for every batch operation.
+///
+/// CONSTANT text: the service reports the quota that was broken and nothing about
+/// the request that broke it — no document count, no operation name — so the same
+/// quota violation reads identically whichever batch operation was called, and a
+/// caller matching the sentence sees one condition rather than one per operation.
+/// The only substitution is [`MAX_BATCH_DOCUMENTS`] itself, so the quota stays
+/// single-sourced.
+pub fn batch_size_limit_refusal() -> String {
+    format!(
+        "Please use a smaller number of items in a single batch. Maximum batch size \
+         is {MAX_BATCH_DOCUMENTS}."
+    )
+}
+
+/// The request-level size refusal for a batch: `Some(message)` when ANY submitted
+/// document is past `quota_bytes`, `None` when every one of them fits.
+///
+/// The per-document byte quota is a PRECONDITION OF THE REQUEST, not a per-item
+/// outcome: a `TextList` that mixes well-formed documents with one oversized
+/// document is refused in its entirety with the caller's own modelled
+/// `TextSizeLimitExceededException` (HTTP 400) and no `ResultList`/`ErrorList` body
+/// at all, so the batch is either analysed whole or refused whole and a caller can
+/// rely on `ResultList` being aligned with the list it submitted. The identical
+/// document submitted alone is refused by the same quota, through the same
+/// [`text_size_refusal`] sentence — which names the quota and the OFFENDING
+/// document's byte length, the pair an adaptive client re-chunks against. When more
+/// than one document is oversized the first one in submission order is the one
+/// reported, because it is the first the service reads.
+pub fn batch_text_size_refusal<'a, I>(texts: I, quota_bytes: usize) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    texts
+        .into_iter()
+        .find_map(|text| text_size_refusal(text, quota_bytes))
 }
 
 /// The region an unsigned request is answered in; emulators default to `us-east-1`

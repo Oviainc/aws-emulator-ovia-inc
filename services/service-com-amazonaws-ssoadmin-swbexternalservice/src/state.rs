@@ -42,12 +42,37 @@ pub const SEED_INSTANCE_ID: &str = "ssoins-7223b1d1ac5e1f0e";
 /// keeps `IdentityStoreArn` inside its modeled 62..93 length.
 pub const SEED_IDENTITY_STORE_ID: &str = "d-9067f3a1c2";
 
-/// The seeded instance's primary Region. Matches `RegionName`'s
-/// `^([a-z]+-){2,3}\d$` pattern and the region every emulated ARN is built in.
-pub const SEED_REGION: &str = "us-east-1";
+/// The Region an instance is enabled in when the request that enabled it names none —
+/// a call that carries no SigV4 credential scope to read a Region off. Matches
+/// `RegionName`'s `^([a-z]+-){2,3}\d$` pattern.
+///
+/// It is a FALLBACK, not the Region of every instance: an instance is enabled in the
+/// Region of the request that enabled it ([`request_region`]), which is what
+/// `DescribeInstance$PrimaryRegion` ("The primary Region where the IAM Identity Center
+/// instance was originally enabled") reports.
+pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// The seeded instance's display name (`NameType`, `^[\w+=,.@-]+$`).
 pub const SEED_INSTANCE_NAME: &str = "IdentityCenter";
+
+/// The Region a request is scoped to: the one its SigV4 credential scope names, or
+/// [`DEFAULT_REGION`] when the request carries no scope.
+///
+/// This is the only Region signal a request carries, and it is what an instance this
+/// account holds is "enabled in": IAM Identity Center is a Regional enablement, so an
+/// instance enabled through a call made in one Region reports that Region as its primary
+/// one rather than a constant the emulator was built with.
+///
+/// Deliberately a per-crate copy of a helper other service crates also hold: the function
+/// that owns the parsing (`emulator_server::sigv4_credential_scope`) lives in the
+/// vendored, read-only framework, and a shared crate cannot be introduced for it without
+/// editing the root `Cargo.toml`, which this project does not allow.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
 
 /// `InstanceStatus`/`RegionStatus` value for a usable instance: the model's
 /// `InstanceStatus` enum is `CREATE_IN_PROGRESS | CREATE_FAILED | DELETE_IN_PROGRESS |
@@ -57,6 +82,24 @@ pub const STATUS_ACTIVE: &str = "ACTIVE";
 /// `InstanceStatus::CREATE_IN_PROGRESS` — the status a freshly created instance carries
 /// until the clock makes its activation due (see [`INSTANCE_ACTIVATION_SPAN`]).
 pub const STATUS_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+
+/// `InstanceStatus::DELETE_IN_PROGRESS` — the status an instance carries between the
+/// `DeleteInstance` that started its removal and the instant that removal falls due (see
+/// [`INSTANCE_DELETION_SPAN`]). `DescribeInstance`'s own documentation declares it
+/// observable: "DELETE_IN_PROGRESS - The instance is being deleted. Returns
+/// AccessDeniedException after the delete operation completes."
+pub const STATUS_DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
+
+/// How long after `DeleteInstance` the instance stops existing.
+///
+/// AWS publishes no duration for it, so this span is the emulator's own CHOSEN one, on
+/// the same footing as [`INSTANCE_ACTIVATION_SPAN`]: it is never zero, so a caller that
+/// describes the instance straight after deleting it still observes the
+/// `DELETE_IN_PROGRESS` status the model declares and the operation documents, and it is
+/// short enough that a test can wait it out. It is held as the instant the removal falls
+/// due and applied by
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::materialize_due`] — nothing sleeps.
+pub const INSTANCE_DELETION_SPAN: Duration = Duration::from_millis(500);
 
 /// How long after `CreateInstance` the new instance's move from `CREATE_IN_PROGRESS` to
 /// `ACTIVE` falls due.
@@ -115,14 +158,22 @@ pub const ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE: &str =
     "This operation is not supported for account instances of IAM Identity Center.";
 
 /// The refusal `CreateInstance` answers with when the account already holds an
-/// instance, as the message of the modelled `ServiceQuotaExceededException` (HTTP 402).
+/// instance, as the message of the modelled `ServiceQuotaExceededException`.
 ///
 /// The rule is the operation's own documentation: "You can create only one instance per
 /// account and across all Amazon Web Services Regions", and "The CreateInstance request
-/// is rejected if … An instance already exists in the same account".
-pub const INSTANCE_QUOTA_EXCEEDED_MESSAGE: &str =
-    "An instance of IAM Identity Center already exists in this account. Only one \
-     instance can be created per account, across all Amazon Web Services Regions.";
+/// is rejected if … An instance already exists in the same account". AWS reports it as a
+/// QUOTA on the account — it names the account the quota was crossed in and points at
+/// the published limits — so the message is BUILT from the account the request ran under
+/// rather than being a constant about instances in general.
+pub fn instance_quota_exceeded_message() -> String {
+    format!(
+        "You have exceeded IAM Identity Center quotas. Cannot create more than 1 \
+         instance for {}. Please refer to \
+         https://docs.aws.amazon.com/singlesignon/latest/userguide/limits.html",
+        ::engine::emulator_account_id()
+    )
+}
 
 /// The refusal a repeated `ClientToken` earns when the rest of the `CreateInstance`
 /// request differs from the call that token belongs to, as the message of the modelled
@@ -134,6 +185,26 @@ pub const INSTANCE_QUOTA_EXCEEDED_MESSAGE: &str =
 pub const CLIENT_TOKEN_MISMATCH_MESSAGE: &str =
     "The ClientToken was already used for a CreateInstance request with different \
      parameters.";
+
+/// The refusal an `InstanceArn` this account holds no instance for earns, as the message
+/// of the modelled `AccessDeniedException` — the only not-found channel
+/// `DescribeInstance`/`DeleteInstance` declare ("DELETE_IN_PROGRESS — … Returns
+/// AccessDeniedException after the delete operation completes").
+///
+/// Built from the request: it names the ARN that resolved to nothing.
+pub fn instance_not_found_message(instance_arn: &str) -> String {
+    format!("No IAM Identity Center instance {instance_arn} exists in this account")
+}
+
+/// The refusal a `TrustedTokenIssuerArn` nothing holds earns, as the message of the
+/// modelled `ResourceNotFoundException`.
+///
+/// Built from the request: AWS names the missing trusted token issuer by the ARN the
+/// caller asked for, which is what tells "this ARN is gone" from "some other resource of
+/// this call is missing".
+pub fn trusted_token_issuer_not_found_message(trusted_token_issuer_arn: &str) -> String {
+    format!("Could not find TrustedTokenIssuer with arn {trusted_token_issuer_arn}.")
+}
 
 /// `KmsKeyType::AWS_OWNED_KMS_KEY` — the instance is encrypted with an Amazon Web
 /// Services owned key, so no `KmsKeyArn` names it ("Cannot be specified when KeyType is
@@ -421,18 +492,30 @@ pub struct Instance {
     /// for an instance that is already in a terminal status. Stored as a due INSTANT and
     /// applied by [`Instance::materialize_due`]; nothing sleeps for it.
     pub active_due: Option<SystemTime>,
+    /// When the clock owes this instance its REMOVAL — the end of the
+    /// `DELETE_IN_PROGRESS` the `DeleteInstance` that started it put the instance in — or
+    /// `None` for an instance nothing is deleting. Stored as a due INSTANT and applied by
+    /// [`ComAmazonawsSsoadminSwbexternalserviceState::materialize_due`], which drops the
+    /// record; nothing sleeps for it.
+    pub deleted_due: Option<SystemTime>,
 }
 
 impl Instance {
     /// An instance in its terminal `ACTIVE` status, owned by the emulator's account and
-    /// enabled in [`SEED_REGION`] alone — what an instance looks like once its creation
-    /// has finished.
+    /// enabled in `region` alone — what an instance looks like once its creation has
+    /// finished.
+    ///
+    /// `region` is the Region the instance was ENABLED in (for a create, the Region of
+    /// the request that created it — [`request_region`]), which is what
+    /// `PrimaryRegion` reports and the one Region of `Regions` that carries
+    /// `IsPrimaryRegion`.
     pub fn active(
         instance_id: &str,
         identity_store_id: &str,
         instance_type: InstanceType,
         name: Option<String>,
         created_date: DateTime,
+        region: &str,
     ) -> Self {
         Self {
             instance_arn: instance_arn(instance_id),
@@ -442,9 +525,9 @@ impl Instance {
             name,
             created_date,
             status: STATUS_ACTIVE.to_string(),
-            primary_region: SEED_REGION.to_string(),
+            primary_region: region.to_string(),
             regions: vec![Region {
-                region_name: SEED_REGION.to_string(),
+                region_name: region.to_string(),
                 status: STATUS_ACTIVE.to_string(),
                 added_date: created_date,
                 is_primary_region: true,
@@ -464,17 +547,19 @@ impl Instance {
             client_token: None,
             tags: Vec::new(),
             active_due: None,
+            deleted_due: None,
         }
     }
 
-    /// A just-created instance: `CREATE_IN_PROGRESS`, with its activation owed
-    /// [`INSTANCE_ACTIVATION_SPAN`] after `now`.
+    /// A just-created instance: `CREATE_IN_PROGRESS`, enabled in `region`, with its
+    /// activation owed [`INSTANCE_ACTIVATION_SPAN`] after `now`.
     pub fn creating(
         instance_id: &str,
         identity_store_id: &str,
         instance_type: InstanceType,
         name: Option<String>,
         now: SystemTime,
+        region: &str,
     ) -> Self {
         let mut instance = Self::active(
             instance_id,
@@ -482,6 +567,7 @@ impl Instance {
             instance_type,
             name,
             DateTime::from(now),
+            region,
         );
         instance.status = STATUS_CREATE_IN_PROGRESS.to_string();
         for region in &mut instance.regions {
@@ -491,11 +577,40 @@ impl Instance {
         instance
     }
 
+    /// Start this instance's deletion at `now`: `DELETE_IN_PROGRESS` until the removal
+    /// falls due, [`INSTANCE_DELETION_SPAN`] later.
+    ///
+    /// Idempotent on an instance already being deleted — the due instant the first
+    /// `DeleteInstance` fixed is kept, so a repeated delete cannot push the removal out.
+    pub fn start_deletion(&mut self, now: SystemTime) {
+        if self.deleted_due.is_some() {
+            return;
+        }
+        // The creation is no longer owed: the instance is on its way out, not in. The
+        // Regions keep the status they had — `RegionStatus` has no deleting value, and
+        // the instance's own `Status` is what says it is going away.
+        self.active_due = None;
+        self.status = STATUS_DELETE_IN_PROGRESS.to_string();
+        self.deleted_due = Some(now + INSTANCE_DELETION_SPAN);
+    }
+
+    /// Whether the clock already owes this instance its REMOVAL from the store.
+    pub fn removal_due(&self, now: SystemTime) -> bool {
+        self.deleted_due.is_some_and(|due| due <= now)
+    }
+
     /// Apply what the CLOCK already owes this instance: an instance whose activation
     /// instant has passed is `ACTIVE`, in every Region it holds. Idempotent, and it
     /// changes nothing before the instant falls due, so a read that calls it answers
     /// exactly what a read at the same instant would have answered without it.
+    ///
+    /// The REMOVAL a delete owes is applied by the store rather than here, since it drops
+    /// the record: see
+    /// [`ComAmazonawsSsoadminSwbexternalserviceState::materialize_due`].
     pub fn materialize_due(&mut self, now: SystemTime) {
+        if self.deleted_due.is_some() {
+            return;
+        }
         if self.active_due.is_some_and(|due| due <= now) {
             self.active_due = None;
             self.status = STATUS_ACTIVE.to_string();
@@ -661,11 +776,12 @@ impl AssignmentOperationRecord {
 }
 
 /// Per-service state for com-amazonaws-ssoadmin-swbexternalservice. A handler reaches it through [`service_state`].
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ComAmazonawsSsoadminSwbexternalserviceState {
-    /// Instances by `InstanceArn`. Seeded with the one ACTIVE instance; an ARN absent
-    /// from this map is the `ResourceNotFoundException` every instance-taking
-    /// operation answers with.
+    /// Instances by `InstanceArn`. The account's AMBIENT instance is enabled into this
+    /// map by the first request that reaches the store (see [`Self::on_request`]); an ARN
+    /// absent from it is the `ResourceNotFoundException`/`AccessDeniedException` every
+    /// instance-taking operation answers with.
     pub instances: BTreeMap<String, Instance>,
     /// Permission sets by `PermissionSetArn`. A `BTreeMap` so `ListPermissionSets`
     /// enumerates in one stable order and can page by key. Holds at most
@@ -684,31 +800,78 @@ pub struct ComAmazonawsSsoadminSwbexternalserviceState {
     /// adding another, and a delete that removes an assignment removes its status
     /// record with it. Holds at most [`MAX_RECORDS_PER_STORE`] records.
     pub assignment_operations: BTreeMap<String, AssignmentOperationRecord>,
+    /// Whether the account's IAM Identity Center ENABLEMENT has been decided already.
+    ///
+    /// The emulator's account gets its instance from the first request that needs one: a
+    /// `CreateInstance` enables the instance the caller asked for
+    /// ([`Self::on_instance_create`]), and any other request finds the account's AMBIENT
+    /// instance ([`Self::on_request`]). This flag is what makes that a ONE-TIME decision:
+    /// an instance a caller deletes stays deleted instead of being replaced by an ambient
+    /// one on the next read, and an instance a caller created is the account's one
+    /// instance rather than a second beside an invented one.
+    pub ambient_instance_enabled: bool,
 }
 
-impl Default for ComAmazonawsSsoadminSwbexternalserviceState {
-    /// Seeds the one ACTIVE instance, so the very first `ListInstances` of a process
-    /// reports a usable target and no handler has to write on a read to create one.
+impl ComAmazonawsSsoadminSwbexternalserviceState {
+    /// What every handler that RESOLVES an instance does BEFORE it looks at this store:
+    /// enable the account's ambient instance if nothing has decided the account's
+    /// enablement yet, then apply every transition the clock already owes
+    /// ([`Self::materialize_due`]).
+    ///
+    /// `region` is the Region of the request ([`request_region`]) — the Region the
+    /// ambient instance is enabled in, since the request is the only Region signal the
+    /// emulator has. Nothing else about the request reaches the record, and a second
+    /// request from another Region finds the instance already enabled and leaves its
+    /// Region alone, so this fixes that Region ONCE and every later read of the instance
+    /// answers the same.
+    pub fn on_request(&mut self, region: &str, now: SystemTime) {
+        self.enable_ambient_instance(region, now);
+        self.materialize_due(now);
+    }
+
+    /// What `CreateInstance` does instead, before it looks at this store.
+    ///
+    /// It enables NO ambient instance: that caller is enabling the account's instance
+    /// ITSELF, and inventing one for it first would refuse — on the account's
+    /// one-instance quota — the very call that establishes the account's enablement. It
+    /// still applies what the clock already owes, so the quota is judged against the
+    /// instances that exist at this instant. Once the create has stored its instance,
+    /// [`Self::instance_enablement_decided`] records that the account's enablement is
+    /// settled, so no later read enables an ambient instance beside it.
+    pub fn on_instance_create(&mut self, now: SystemTime) {
+        self.materialize_due(now);
+    }
+
+    /// Record that the account's IAM Identity Center enablement is settled — a caller's
+    /// `CreateInstance` enabled it — so no later request enables an ambient instance.
+    pub fn instance_enablement_decided(&mut self) {
+        self.ambient_instance_enabled = true;
+    }
+
+    /// Enable the account's ambient instance: the instance the emulator's account already
+    /// holds, the stand-in for an account whose IAM Identity Center was enabled before
+    /// this session started.
     ///
     /// It is an ACCOUNT instance ([`SEED_INSTANCE_TYPE`]): the emulator's account is a
-    /// standalone account, not an Organizations-managed one.
-    fn default() -> Self {
+    /// standalone account, not an Organizations-managed one. It is enabled at most once
+    /// per store, and not at all when the store already holds an instance (one instance
+    /// per account), so no request ever adds a second instance or revives a deleted one.
+    fn enable_ambient_instance(&mut self, region: &str, now: SystemTime) {
+        let already_decided = self.ambient_instance_enabled || !self.instances.is_empty();
+        self.ambient_instance_enabled = true;
+        if already_decided {
+            return;
+        }
         let instance = Instance::active(
             SEED_INSTANCE_ID,
             SEED_IDENTITY_STORE_ID,
             SEED_INSTANCE_TYPE,
             Some(SEED_INSTANCE_NAME.to_string()),
-            DateTime::from(SystemTime::now()),
+            DateTime::from(now),
+            region,
         );
-        let mut instances = BTreeMap::new();
-        instances.insert(instance.instance_arn.clone(), instance);
-        Self {
-            instances,
-            permission_sets: BTreeMap::new(),
-            account_assignments: Vec::new(),
-            trusted_token_issuers: BTreeMap::new(),
-            assignment_operations: BTreeMap::new(),
-        }
+        self.instances
+            .insert(instance.instance_arn.clone(), instance);
     }
 }
 
@@ -723,11 +886,48 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         self.instances.get_mut(instance_arn)
     }
 
-    /// Apply every transition the CLOCK already owes: see [`Instance::materialize_due`].
+    /// Apply every transition the CLOCK already owes: see [`Instance::materialize_due`],
+    /// plus the REMOVAL a `DeleteInstance` owes — an instance whose deletion instant has
+    /// passed no longer exists, whether or not anybody called.
     pub fn materialize_due(&mut self, now: SystemTime) {
+        let removed: Vec<String> = self
+            .instances
+            .values()
+            .filter(|instance| instance.removal_due(now))
+            .map(|instance| instance.instance_arn.clone())
+            .collect();
+        for instance_arn in &removed {
+            self.remove_instance(instance_arn);
+        }
         for instance in self.instances.values_mut() {
             instance.materialize_due(now);
         }
+    }
+
+    /// Drop the instance `instance_arn` names and everything held INSIDE it.
+    ///
+    /// A permission set, an account assignment and a trusted token issuer each belong to
+    /// one instance — every one of them is created under its `InstanceArn` — so an
+    /// instance that no longer exists holds none of them: leaving them behind would let a
+    /// later create of an instance inherit resources nobody created under it. The status
+    /// record of an assignment operation goes with the permission set it names, for the
+    /// same reason.
+    fn remove_instance(&mut self, instance_arn: &str) {
+        self.instances.remove(instance_arn);
+        let orphaned: Vec<String> = self
+            .permission_sets
+            .values()
+            .filter(|record| record.instance_arn == instance_arn)
+            .map(|record| record.permission_set_arn.clone())
+            .collect();
+        self.permission_sets
+            .retain(|_, record| record.instance_arn != instance_arn);
+        self.account_assignments
+            .retain(|record| record.instance_arn != instance_arn);
+        self.trusted_token_issuers
+            .retain(|_, record| record.instance_arn != instance_arn);
+        self.assignment_operations
+            .retain(|_, record| !orphaned.contains(&record.permission_set_arn));
     }
 
     /// Whether the permission-set / account-assignment surface is WITHDRAWN on the
