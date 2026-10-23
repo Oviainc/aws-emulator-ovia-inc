@@ -51,6 +51,8 @@ mod lineage_action_lifecycle;
 mod lineage_associations;
 #[path = "all/lineage_context_lifecycle.rs"]
 mod lineage_context_lifecycle;
+#[path = "all/lineage_group_reporting.rs"]
+mod lineage_group_reporting;
 #[path = "all/list_artifacts.rs"]
 mod list_artifacts;
 #[path = "all/list_endpoints.rs"]

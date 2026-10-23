@@ -31,4 +31,6 @@ handler returns an error, so it never has to construct a value.
 records only that the GENERATOR did not emit it.
 
 `CreateStorageLocation` is now hand-authored the same way in
-`src/ops/create_storage_location.rs`.
+`src/ops/create_storage_location.rs`, and `DescribeAccountAttributes` in
+`src/ops/describe_account_attributes.rs` — so none of the three operations above is
+modeled-but-unwired any more.

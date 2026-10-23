@@ -1001,9 +1001,20 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
     }
 }
 
-/// The `NotFoundException` message for a `restApiId` that names no stored API. Shared
-/// so every operation that resolves an API says the same thing about the same failure.
-pub const NO_SUCH_REST_API: &str = "Invalid REST API identifier specified";
+/// The `NotFoundException` message for a `restApiId` that names no stored API.
+///
+/// API Gateway does not state a fixed sentence here: it names the identifier it could
+/// not resolve, qualified by the account the lookup ran in —
+/// `Invalid API identifier specified <accountId>:<restApiId>` — so the message is BUILT
+/// FROM THE REQUEST. The account segment is the emulator's one account
+/// ([`::emulator_server::emulator_account_id`]), never a literal. Shared so every
+/// operation that resolves an API says the same thing about the same failure.
+pub fn no_such_rest_api(rest_api_id: &str) -> String {
+    format!(
+        "Invalid API identifier specified {}:{rest_api_id}",
+        ::emulator_server::emulator_account_id()
+    )
+}
 
 /// The `NotFoundException` message for a `resourceId` that names no stored resource.
 pub const NO_SUCH_RESOURCE: &str = "Invalid Resource identifier specified";

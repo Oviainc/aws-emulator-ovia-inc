@@ -201,11 +201,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        // A lineage entity belongs to the Region's default lineage group, and SageMaker
+        // models no `CreateLineageGroup`: the service materialises that group when the
+        // first entity is put in it, so creating a trial component is one of the calls
+        // that makes it exist and `DescribeLineageGroup` reports it from here on. A group
+        // the Region already holds is left exactly as it is, and the create is never
+        // refused for the lineage-group bound: this call is about the component.
+        let materialised_group =
+            store.ensure_lineage_group(&region, crate::state::DEFAULT_LINEAGE_GROUP, now);
         store.trial_components.insert(
             key,
             crate::state::TrialComponent {
                 name: input.trial_component_name.clone(),
                 arn: arn.clone(),
+                // The Region this create signed for, so a reader reports the lineage group
+                // of the Region the component was created in.
+                region: region.clone(),
                 // "If DisplayName isn't specified, TrialComponentName is displayed"
                 // (`DisplayName`'s model doc), so the default is resolved at create and
                 // every later read reports the same value.
@@ -231,6 +242,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         drop(store);
 
+        // Both resources this call brought into being are recorded: the trial component,
+        // and the lineage group if this is the call that materialised it.
+        if let Some(group_arn) = materialised_group {
+            crate::state::record_state_change(Self::NAME, &group_arn, ctx);
+        }
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(CreateTrialComponentOutput {
             trial_component_arn: Some(arn),

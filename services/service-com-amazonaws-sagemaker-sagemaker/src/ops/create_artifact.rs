@@ -217,6 +217,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A lineage entity belongs to the account's default lineage group, and SageMaker
+        // models no `CreateLineageGroup`: the service materialises that group when the
+        // first entity is put in it. So creating an artifact is one of the calls that
+        // makes the group exist, and `DescribeLineageGroup` reports it from here on.
+        // A group the Region already holds is left exactly as it is, and the create is
+        // never refused for the lineage-group bound: this call is about the artifact
+        // (`ensure_lineage_group` warns about that bound itself, for every caller).
+        let materialised_group =
+            store.ensure_lineage_group(&region, crate::state::DEFAULT_LINEAGE_GROUP, now);
+
         // The id is the server's: a lineage entity is named by its ARN and the request
         // carries no identifier to derive one from.
         let arn =
@@ -254,6 +264,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         drop(store);
 
+        // Both resources this call brought into being are recorded: the artifact, and the
+        // lineage group if this is the call that materialised it.
+        if let Some(group_arn) = materialised_group {
+            crate::state::record_state_change(Self::NAME, &group_arn, ctx);
+        }
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(CreateArtifactOutput {
             artifact_arn: Some(arn),

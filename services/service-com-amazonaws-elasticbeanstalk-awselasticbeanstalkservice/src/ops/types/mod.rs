@@ -24,11 +24,13 @@ pub mod create_application_version_types;
 pub mod create_configuration_template_types;
 pub mod create_environment_types;
 pub mod create_platform_version_types;
+pub mod create_storage_location_types;
 pub mod delete_application_types;
 pub mod delete_application_version_types;
 pub mod delete_configuration_template_types;
 pub mod delete_environment_configuration_types;
 pub mod delete_platform_version_types;
+pub mod describe_account_attributes_types;
 pub mod describe_application_versions_types;
 pub mod describe_applications_types;
 pub mod describe_configuration_options_types;
@@ -42,6 +44,10 @@ pub mod describe_events_types;
 pub mod describe_instances_health_types;
 pub mod describe_platform_version_types;
 pub mod disassociate_environment_operations_role_types;
+// Empty by design: `ListAvailableSolutionStacks` declares its own shapes in its
+// handler file, since it is the only operation that reaches them. Declared so the
+// module is compiled rather than left as an uncompiled file.
+pub mod list_available_solution_stacks_types;
 pub mod list_platform_branches_types;
 pub mod list_platform_versions_types;
 pub mod list_tags_for_resource_types;
@@ -81,6 +87,8 @@ pub use create_environment_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_platform_version_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
+pub use create_storage_location_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
 pub use delete_application_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use delete_application_version_types::*;
@@ -90,6 +98,8 @@ pub use delete_configuration_template_types::*;
 pub use delete_environment_configuration_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use delete_platform_version_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use describe_account_attributes_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_application_versions_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

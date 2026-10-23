@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRestApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRestApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRestApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: parses the OpenAPI/Swagger definition carried in the `body` payload and
+//! materialises it into the stored API — every path of the definition becomes a
+//! `Resource` (with the ancestors a nested path implies), every operation on a path
+//! becomes a `Method` on that resource, and the document's `info` updates the API's own
+//! name, description and version. `merge` adds the definition to what the API already
+//! has; `overwrite` replaces the API's definition, keeping only its root resource.
 //!
 //! ## Shape of an operation
 //!
@@ -133,6 +130,731 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+use ::serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
+use ::serde::Deserialize;
+
+use crate::state::{MethodEntry, ResourceEntry, RestApiEntry};
+
+use super::create_resource::child_path;
+use super::create_rest_api::ROOT_RESOURCE_PATH;
+
+/// Emulator resource guard, NOT an AWS quota: the largest API definition this emulator
+/// reads.
+///
+/// The `body` member documents AWS's own limit as 6MB ("The maximum size of the API
+/// definition file is 6MB"), but an API here holds at most
+/// [`crate::state::MAX_RESOURCES_PER_API`] resources, so a definition past this cannot be
+/// imported in full anyway. Bounding the BODY is also what bounds the work the readers
+/// below do: once aliases are refused (see [`DefinitionBuilder`]) a definition's parsed
+/// tree is linear in the bytes it was written in, so a request's parse cost is bounded by
+/// this constant rather than by what the document says.
+const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
+
+/// The most nodes one parsed definition may hold.
+///
+/// Chosen: far past the nodes a definition of [`crate::state::MAX_RESOURCES_PER_API`]
+/// paths needs, and small enough that the tree the YAML reader builds stays bounded
+/// whatever shape the body has.
+const MAX_DEFINITION_NODES: usize = 50_000;
+
+/// The most levels one parsed definition may nest. Chosen: far past the nesting of an
+/// OpenAPI document's paths → path item → operation → responses → schema trees.
+const MAX_DEFINITION_DEPTH: usize = 64;
+
+/// The most leading spaces one line of a YAML definition may carry, which is what block
+/// nesting costs per level ([`guard_yaml_nesting`]). Chosen: far past the indentation of a
+/// definition written at any sane indent step.
+const MAX_DEFINITION_INDENT: usize = 256;
+
+/// The most flow collections (`[`, `{`) a YAML definition may have OPEN at once, closers
+/// subtracted; see [`guard_yaml_nesting`]. Chosen: the same bound as
+/// [`MAX_DEFINITION_DEPTH`], which is what the loader's recursion costs.
+const MAX_DEFINITION_FLOW_DEPTH: usize = 64;
+
+/// The most flow openers (`[`, `{`) a YAML definition may carry in total.
+///
+/// The backstop for [`MAX_DEFINITION_FLOW_DEPTH`]: a byte scan cannot tell a `]` inside a
+/// quoted scalar from a real closer, and such a `]` lowers the running depth while the
+/// loader's own depth keeps climbing — but no body can nest deeper than its opener COUNT.
+/// Chosen as the value the sibling CloudFormation guard measured the same loader version
+/// to survive with room to spare. A document written ENTIRELY in flow style is JSON, which
+/// `serde_json` reads under its own recursion limit and which this guard never sees.
+const MAX_DEFINITION_FLOW_OPENERS: usize = 2_048;
+
+/// The most compact block indicators (`- `, `? `) one line of a YAML definition may carry,
+/// which is where block nesting (`- - - x`) descends without costing a column. A hyphen
+/// inside a path, a title or a description is not one of these (no space follows it).
+/// Chosen.
+const MAX_DEFINITION_COMPACT_PER_LINE: usize = 256;
+
+/// The `merge` value of the model's `PutMode` enum, and the documented default: "By
+/// default, the update mode is 'merge'."
+const MODE_MERGE: &str = "merge";
+
+/// The `overwrite` value of the model's `PutMode` enum.
+const MODE_OVERWRITE: &str = "overwrite";
+
+/// The `authorizationType` an imported method is created with. API Gateway imports an
+/// operation that declares no security requirement as an open method, and this emulator
+/// models no authorizers yet (`CreateAuthorizer` writes no record), so every imported
+/// method is open.
+const IMPORTED_AUTHORIZATION_TYPE: &str = "NONE";
+
+/// The document key API Gateway's OpenAPI extensions use for an API's binary media
+/// types — the `binaryMediaTypes` member's counterpart in an imported definition.
+const BINARY_MEDIA_TYPES_EXTENSION: &str = "x-amazon-apigateway-binary-media-types";
+
+/// The keys of an OpenAPI Path Item Object that name an operation API Gateway imports as
+/// a `Method`, mapped to the HTTP verb the method is stored under.
+///
+/// The keys are the OpenAPI Path Item Object's operation fields, plus API Gateway's own
+/// `x-amazon-apigateway-any-method` extension for the `ANY` catch-all; the verbs are
+/// `super::put_method::HTTP_METHODS`, which is the catalog a `Method` may carry.
+const OPERATION_KEYS: &[(&str, &str)] = &[
+    ("get", "GET"),
+    ("put", "PUT"),
+    ("post", "POST"),
+    ("delete", "DELETE"),
+    ("options", "OPTIONS"),
+    ("head", "HEAD"),
+    ("patch", "PATCH"),
+    ("x-amazon-apigateway-any-method", "ANY"),
+];
+
+/// OpenAPI operation keys that are NOT in `super::put_method::HTTP_METHODS`, so API
+/// Gateway cannot put a method for them: importing one is reported as a warning and the
+/// operation is skipped.
+const UNSUPPORTED_OPERATION_KEYS: &[&str] = &["trace", "connect"];
+
+/// Which of the two documented update modes an import runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutModeKind {
+    /// The imported definition is added to the API's existing definition.
+    Merge,
+    /// The imported definition replaces the API's existing definition.
+    Overwrite,
+}
+
+/// The update mode a request asks for: the model's `PutMode` values, defaulting to
+/// `merge` when the query member is absent.
+///
+/// `Err` carries the message for a `mode` outside the enum, naming the member and the
+/// values it accepts.
+pub fn put_mode(mode: Option<&str>) -> Result<PutModeKind, String> {
+    match mode {
+        None | Some(MODE_MERGE) => Ok(PutModeKind::Merge),
+        Some(MODE_OVERWRITE) => Ok(PutModeKind::Overwrite),
+        Some(other) => Err(format!(
+            "mode must be one of {MODE_MERGE}, {MODE_OVERWRITE}, got {other}"
+        )),
+    }
+}
+
+/// One path of an imported definition: the path as the document writes it, and the HTTP
+/// verbs the document puts on it, in document order.
+#[derive(Debug, Clone)]
+pub struct ImportedPath {
+    pub path: String,
+    pub methods: Vec<String>,
+}
+
+/// What an import reads out of an OpenAPI/Swagger definition.
+///
+/// `paths` keeps the document's own order, so the resources an import creates are
+/// created in the order the definition declares them.
+#[derive(Debug, Clone, Default)]
+pub struct ImportedDefinition {
+    /// `info.title`, the API's name.
+    pub title: Option<String>,
+    /// `info.description`.
+    pub description: Option<String>,
+    /// `info.version`.
+    pub version: Option<String>,
+    /// [`BINARY_MEDIA_TYPES_EXTENSION`], absent when the document declares none.
+    pub binary_media_types: Option<Vec<String>>,
+    /// The document's paths, in document order.
+    pub paths: Vec<ImportedPath>,
+    /// What the import could not carry over — reported in the response's `warnings`, and
+    /// what `failOnWarnings` rolls the update back for.
+    pub warnings: Vec<String>,
+}
+
+/// One node of a parsed API definition: the shapes a JSON or YAML document carries, with
+/// a mapping's entries in the DOCUMENT's own order — which is the order the paths of a
+/// definition are imported in.
+///
+/// Both readers below build this: `serde_json` for the JSON spelling (its `MapAccess`
+/// visits a mapping in document order) and the bounded event reader for the YAML one.
+#[derive(Debug, Clone, Default)]
+pub enum Node {
+    /// A null, and the one a document writes as an empty value.
+    #[default]
+    Null,
+    /// A scalar, as its text: a definition is read for strings, and for the SHAPE of
+    /// everything else, so a number or a boolean is kept as it was written.
+    Scalar(String),
+    /// A sequence, in order.
+    Sequence(Vec<Node>),
+    /// A mapping, entries in document order. A document that repeats a key keeps both
+    /// entries and the readers below take the FIRST, so what the import reads does not
+    /// depend on how far the reader got.
+    Mapping(Vec<(String, Node)>),
+}
+
+impl Node {
+    /// A member of this mapping by name; `None` for any other node.
+    fn member(&self, key: &str) -> Option<&Node> {
+        match self {
+            Node::Mapping(entries) => entries
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value),
+            _ => None,
+        }
+    }
+
+    /// This node's text, when it is a scalar.
+    fn text(&self) -> Option<&str> {
+        match self {
+            Node::Scalar(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// A string member of this mapping; `None` when it is absent or not a scalar.
+    fn string_member(&self, key: &str) -> Option<String> {
+        self.member(key).and_then(Node::text).map(str::to_owned)
+    }
+
+    /// This node's mapping entries, when it is a mapping.
+    fn entries(&self) -> Option<&[(String, Node)]> {
+        match self {
+            Node::Mapping(entries) => Some(entries),
+            _ => None,
+        }
+    }
+
+    /// This node's items, when it is a sequence.
+    fn items(&self) -> Option<&[Node]> {
+        match self {
+            Node::Sequence(items) => Some(items),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Node {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(NodeVisitor)
+    }
+}
+
+/// Builds a [`Node`] from `serde_json`'s visits. The JSON spelling of a definition is
+/// read this way rather than through the YAML reader because `serde_json` enforces its
+/// own recursion limit, so a nested JSON body cannot drive the parse deeper than that.
+struct NodeVisitor;
+
+impl<'de> Visitor<'de> for NodeVisitor {
+    type Value = Node;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_unit<E: ::serde::de::Error>(self) -> Result<Node, E> {
+        Ok(Node::Null)
+    }
+
+    fn visit_bool<E: ::serde::de::Error>(self, value: bool) -> Result<Node, E> {
+        Ok(Node::Scalar(value.to_string()))
+    }
+
+    fn visit_i64<E: ::serde::de::Error>(self, value: i64) -> Result<Node, E> {
+        Ok(Node::Scalar(value.to_string()))
+    }
+
+    fn visit_u64<E: ::serde::de::Error>(self, value: u64) -> Result<Node, E> {
+        Ok(Node::Scalar(value.to_string()))
+    }
+
+    fn visit_f64<E: ::serde::de::Error>(self, value: f64) -> Result<Node, E> {
+        Ok(Node::Scalar(value.to_string()))
+    }
+
+    fn visit_str<E: ::serde::de::Error>(self, value: &str) -> Result<Node, E> {
+        Ok(Node::Scalar(value.to_owned()))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Node, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = sequence.next_element()? {
+            items.push(item);
+        }
+        Ok(Node::Sequence(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut mapping: A) -> Result<Node, A::Error> {
+        let mut entries = Vec::new();
+        while let Some((key, value)) = mapping.next_entry::<String, Node>()? {
+            entries.push((key, value));
+        }
+        Ok(Node::Mapping(entries))
+    }
+}
+
+/// One collection the YAML reader has open: what its entries are collected into until its
+/// end event arrives.
+#[derive(Debug)]
+enum Frame {
+    Sequence(Vec<Node>),
+    Mapping {
+        entries: Vec<(String, Node)>,
+        /// The key of the entry being read; `None` while the NEXT node is a key.
+        pending_key: Option<String>,
+    },
+}
+
+/// Reads a YAML definition off the parser's EVENT stream, bounding what it builds.
+///
+/// The event stream rather than `YamlLoader` is what lets this refuse an ALIAS: an alias
+/// copies the node its anchor named, which is how a few hundred bytes of YAML expand into
+/// gigabytes, and nothing in an API definition needs one. The node count and the nesting
+/// depth are bounded here too, so the tree is bounded by constants rather than by what the
+/// document asks for.
+///
+/// The loader's own recursion is NOT abortable from an `EventReceiver` (`on_event` returns
+/// `()`) and exhausting the stack aborts the process rather than unwinding, so nesting is
+/// ALSO refused before `load` is called — see [`guard_yaml_nesting`].
+#[derive(Debug, Default)]
+struct DefinitionBuilder {
+    /// The first document's root node.
+    root: Option<Node>,
+    /// The collections open at this point of the stream.
+    open: Vec<Frame>,
+    /// How many nodes have been placed.
+    nodes: usize,
+    /// Why this document is not read, once a bound or an alias refused it.
+    refused: Option<&'static str>,
+}
+
+impl DefinitionBuilder {
+    /// Place a finished node where the stream says it belongs: an item of the open
+    /// sequence, a key or a value of the open mapping, or the document's root.
+    fn place(&mut self, node: Node) {
+        if self.refused.is_some() {
+            return;
+        }
+        self.nodes = self.nodes.saturating_add(1);
+        if self.nodes > MAX_DEFINITION_NODES {
+            self.refused = Some("the definition carries more nodes than this emulator reads");
+            return;
+        }
+        match self.open.last_mut() {
+            // Only the FIRST document of a multi-document body is read, which is the
+            // document an API definition is.
+            None => {
+                if self.root.is_none() {
+                    self.root = Some(node);
+                }
+            }
+            Some(Frame::Sequence(items)) => items.push(node),
+            Some(Frame::Mapping {
+                entries,
+                pending_key,
+            }) => match pending_key.take() {
+                None => match node {
+                    Node::Scalar(key) => *pending_key = Some(key),
+                    _ => {
+                        self.refused = Some("every key of the definition must be a string");
+                    }
+                },
+                Some(key) => entries.push((key, node)),
+            },
+        }
+    }
+
+    /// Open a collection, refusing a document that nests deeper than
+    /// [`MAX_DEFINITION_DEPTH`].
+    fn open_frame(&mut self, frame: Frame) {
+        if self.refused.is_some() {
+            return;
+        }
+        if self.open.len() >= MAX_DEFINITION_DEPTH {
+            self.refused = Some("the definition nests more deeply than this emulator reads");
+            return;
+        }
+        self.open.push(frame);
+    }
+
+    /// Close the open collection and place it in its parent.
+    fn close_frame(&mut self) {
+        if self.refused.is_some() {
+            return;
+        }
+        let Some(frame) = self.open.pop() else {
+            return;
+        };
+        let node = match frame {
+            Frame::Sequence(items) => Node::Sequence(items),
+            Frame::Mapping { entries, .. } => Node::Mapping(entries),
+        };
+        self.place(node);
+    }
+}
+
+impl ::yaml_rust2::parser::EventReceiver for DefinitionBuilder {
+    fn on_event(&mut self, event: ::yaml_rust2::parser::Event) {
+        use ::yaml_rust2::parser::Event;
+        if self.refused.is_some() {
+            return;
+        }
+        match event {
+            Event::Scalar(value, style, _anchor, _tag) => {
+                // A plain scalar resolves by YAML's core schema, where an empty value,
+                // `~` and `null` are the null value; a quoted scalar is always text.
+                let plain = matches!(style, ::yaml_rust2::scanner::TScalarStyle::Plain);
+                let node = if plain && matches!(value.as_str(), "" | "~" | "null" | "Null" | "NULL")
+                {
+                    Node::Null
+                } else {
+                    Node::Scalar(value)
+                };
+                self.place(node);
+            }
+            Event::SequenceStart(..) => self.open_frame(Frame::Sequence(Vec::new())),
+            Event::MappingStart(..) => self.open_frame(Frame::Mapping {
+                entries: Vec::new(),
+                pending_key: None,
+            }),
+            Event::SequenceEnd | Event::MappingEnd => self.close_frame(),
+            // An alias copies an anchored node, which is the unbounded amplification a
+            // YAML body can carry. No API definition needs one, so a body with one is
+            // not read.
+            Event::Alias(_) => {
+                self.refused =
+                    Some("an alias expands the document it appears in and is not read here");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Pre-flight bounds on an untrusted YAML definition, applied BEFORE the loader builds
+/// anything from it. Only the YAML spelling needs this: the JSON spelling is read by
+/// `serde_json`, which enforces its own nesting limit.
+///
+/// What has to be bounded is how deep the loader can RECURSE, because an `EventReceiver`
+/// cannot abort `load` and because exhausting the stack aborts the process rather than
+/// unwinding. Three measures do that, and each bounds NESTING rather than how big the
+/// document is, so a large flat definition is not affected by any of them:
+///
+/// * [`MAX_DEFINITION_FLOW_DEPTH`] — the flow collections (`[`, `{`) open at once, with
+///   closers subtracted: the nesting a well-formed body reaches.
+/// * [`MAX_DEFINITION_FLOW_OPENERS`] — the total flow openers, the backstop for the one
+///   way the measure above can be fooled: this is a byte scan, so a `]` inside a scalar
+///   lowers the running depth while the loader's own depth keeps climbing. However many
+///   closers a body hides, its real flow nesting cannot exceed its opener COUNT.
+/// * [`MAX_DEFINITION_INDENT`] columns of leading indentation and
+///   [`MAX_DEFINITION_COMPACT_PER_LINE`] compact `- `/`? ` indicators on one line — the
+///   two ways block nesting descends.
+///
+/// The measures and their reasoning are the sibling CloudFormation reader's
+/// (`services/service-com-amazonaws-cloudformation-cloudformation/src/state/template.rs`,
+/// `guard_yaml_body`), which guards the same loader version against the same kind of
+/// caller-supplied body.
+fn guard_yaml_nesting(body: &str) -> Result<(), String> {
+    let refusal =
+        || "Unable to parse API definition: it nests more deeply than this emulator reads";
+    let mut flow_depth = 0usize;
+    let mut flow_openers = 0usize;
+    let mut compact_on_line = 0usize;
+    let mut indent = 0usize;
+    let mut counting_indent = true;
+    let mut previous = b'\n';
+
+    for byte in body.bytes() {
+        match byte {
+            b'\n' | b'\r' => {
+                indent = 0;
+                compact_on_line = 0;
+                counting_indent = true;
+            }
+            b' ' | b'\t' if counting_indent => {
+                indent += 1;
+                if indent > MAX_DEFINITION_INDENT {
+                    return Err(refusal().to_string());
+                }
+            }
+            b'[' | b'{' => {
+                counting_indent = false;
+                flow_depth += 1;
+                flow_openers += 1;
+                if flow_depth > MAX_DEFINITION_FLOW_DEPTH
+                    || flow_openers > MAX_DEFINITION_FLOW_OPENERS
+                {
+                    return Err(refusal().to_string());
+                }
+            }
+            b']' | b'}' => {
+                counting_indent = false;
+                flow_depth = flow_depth.saturating_sub(1);
+            }
+            _ => counting_indent = false,
+        }
+        // A `-` or `?` is a block indicator only where a token may start — at the start of
+        // a line or after a space — and only when a space follows it, which is what
+        // separates `- item` from the hyphen in `/pet-store` or `2026-01-01`.
+        if matches!(previous, b'-' | b'?') && matches!(byte, b' ' | b'\t' | b'\n' | b'\r') {
+            compact_on_line += 1;
+            if compact_on_line > MAX_DEFINITION_COMPACT_PER_LINE {
+                return Err(refusal().to_string());
+            }
+        }
+        previous = byte;
+    }
+    Ok(())
+}
+
+/// The YAML spelling of a definition, read through the bounded event reader.
+fn parse_yaml(text: &str) -> Result<Node, String> {
+    guard_yaml_nesting(text)?;
+    let mut builder = DefinitionBuilder::default();
+    ::yaml_rust2::parser::Parser::new_from_str(text)
+        .load(&mut builder, true)
+        .map_err(|error| format!("Unable to parse API definition: {error}"))?;
+    if let Some(refusal) = builder.refused {
+        return Err(format!("Unable to parse API definition: {refusal}"));
+    }
+    if !builder.open.is_empty() {
+        return Err("Unable to parse API definition: the document is incomplete".to_string());
+    }
+    Ok(builder.root.unwrap_or_default())
+}
+
+/// The full path of a resource for `path` as the definition writes it: the segments
+/// joined again, so a trailing or doubled separator names the same resource as the path
+/// without it, and a path of only separators is the API's root.
+fn normalized_path(path: &str) -> String {
+    let mut normalized = ROOT_RESOURCE_PATH.to_string();
+    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+        normalized = child_path(&normalized, segment);
+    }
+    normalized
+}
+
+/// Read an OpenAPI/Swagger definition out of a `body` payload.
+///
+/// The body is an OpenAPI definition "JSON/YAML file" per the member's documentation, so
+/// both spellings are read: JSON by `serde_json` under its own recursion limit, and
+/// anything else by the bounded YAML reader above. Either way the parse is bounded by
+/// [`MAX_DEFINITION_BYTES`], [`MAX_DEFINITION_NODES`] and [`MAX_DEFINITION_DEPTH`] and
+/// cannot amplify what the body carries.
+///
+/// `Err` carries the message for a body that is not such a document: the caller has to
+/// fix the definition from this text alone.
+pub fn parse_definition(body: &[u8]) -> Result<ImportedDefinition, String> {
+    if body.len() > MAX_DEFINITION_BYTES {
+        return Err(format!(
+            "body may be at most {MAX_DEFINITION_BYTES} bytes, got {}",
+            body.len()
+        ));
+    }
+    let text = std::str::from_utf8(body).map_err(|_| {
+        "body must be a UTF-8 encoded OpenAPI definition in JSON or YAML".to_string()
+    })?;
+    let document = match ::serde_json::from_str::<Node>(text) {
+        Ok(document) => document,
+        // Not JSON — or JSON past `serde_json`'s recursion limit, which the YAML reader's
+        // own depth bound refuses in turn.
+        Err(_) => parse_yaml(text)?,
+    };
+    read_definition(&document)
+}
+
+/// What an import takes out of a parsed definition document.
+fn read_definition(document: &Node) -> Result<ImportedDefinition, String> {
+    if document.entries().is_none() {
+        return Err(
+            "Unable to parse API definition: the definition must be a JSON or YAML object"
+                .to_string(),
+        );
+    }
+    // Every OpenAPI document declares its version — `openapi` from 3.0 on, `swagger`
+    // before it — so a body carrying neither is not an API definition at all.
+    if document.member("openapi").is_none() && document.member("swagger").is_none() {
+        return Err(
+            "Unable to parse API definition: no 'openapi' or 'swagger' version is declared"
+                .to_string(),
+        );
+    }
+
+    let info = document.member("info");
+    let mut definition = ImportedDefinition {
+        title: info.and_then(|info| info.string_member("title")),
+        description: info.and_then(|info| info.string_member("description")),
+        version: info.and_then(|info| info.string_member("version")),
+        binary_media_types: document
+            .member(BINARY_MEDIA_TYPES_EXTENSION)
+            .and_then(Node::items)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.text().map(str::to_owned))
+                    .collect()
+            }),
+        paths: Vec::new(),
+        warnings: Vec::new(),
+    };
+
+    // `paths` is optional from OpenAPI 3.1 on, and a document without it describes an
+    // API with no resources rather than a malformed definition.
+    let Some(paths) = document.member("paths") else {
+        return Ok(definition);
+    };
+    if matches!(paths, Node::Null) {
+        return Ok(definition);
+    }
+    let paths = paths.entries().ok_or_else(|| {
+        "Unable to parse API definition: 'paths' must be an object of paths".to_string()
+    })?;
+    for (path, item) in paths {
+        if !path.starts_with('/') {
+            return Err(format!(
+                "Invalid path '{path}': a path of the API definition must start with '/'"
+            ));
+        }
+        let mut methods = Vec::new();
+        for (operation, _) in item.entries().unwrap_or_default() {
+            let operation = operation.to_ascii_lowercase();
+            if let Some((_, verb)) = OPERATION_KEYS
+                .iter()
+                .find(|(candidate, _)| *candidate == operation.as_str())
+            {
+                methods.push((*verb).to_string());
+            } else if UNSUPPORTED_OPERATION_KEYS.contains(&operation.as_str())
+                // One warning per unsupported operation, up to the number of entries
+                // this emulator reports for a caller-sized list: what the response
+                // carries stays bounded however many paths the document declares.
+                && definition.warnings.len() < crate::state::MAX_COLLECTION_ENTRIES
+            {
+                definition.warnings.push(format!(
+                    "Unsupported method '{operation}' for path '{path}': the method was not imported"
+                ));
+            }
+            // Any other key of a path item (`summary`, `parameters`, a vendor extension)
+            // describes the path rather than a method, so it imports nothing and warns
+            // about nothing.
+        }
+        definition.paths.push(ImportedPath {
+            path: path.clone(),
+            methods,
+        });
+    }
+    Ok(definition)
+}
+
+/// The `Method` an imported operation becomes.
+///
+/// An imported operation carries only its verb into state: the integration, the method
+/// responses and the request models an OpenAPI operation can describe are written by
+/// `PutIntegration` / `PutMethodResponse` / `CreateModel`, and nothing else of the
+/// operation object has a `Method` member to land in.
+fn imported_method(verb: &str) -> MethodEntry {
+    MethodEntry {
+        http_method: verb.to_string(),
+        authorization_type: IMPORTED_AUTHORIZATION_TYPE.to_string(),
+        authorizer_id: None,
+        api_key_required: false,
+        operation_name: None,
+        request_parameters: BTreeMap::new(),
+        request_models: BTreeMap::new(),
+        request_validator_id: None,
+        authorization_scopes: Vec::new(),
+        method_responses: BTreeMap::new(),
+        integration: None,
+    }
+}
+
+/// Refuse a definition whose paths would grow the store past a bound.
+///
+/// Called BEFORE the store lock is taken, so an over-sized definition never reaches the
+/// records. Each bound is this emulator's resource guard from `crate::state`.
+fn bound_definition(definition: &ImportedDefinition) -> Result<(), String> {
+    use crate::state::{
+        bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_PATH_CHARS, MAX_PATH_PART_CHARS,
+        MAX_STRING_CHARS,
+    };
+
+    // The members this import writes onto the `RestApiEntry` are bounded exactly as
+    // `CreateRestApi` bounds the same members of its request: nothing caller-sized
+    // reaches the store unchecked, whichever operation writes it.
+    for (member, value) in [
+        ("info.title", &definition.title),
+        ("info.description", &definition.description),
+        ("info.version", &definition.version),
+    ] {
+        if let Some(value) = value {
+            bound_chars(member, value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(types) = &definition.binary_media_types {
+        bound_entries(BINARY_MEDIA_TYPES_EXTENSION, types.len(), MAX_COLLECTION_ENTRIES)?;
+        for value in types {
+            bound_chars(BINARY_MEDIA_TYPES_EXTENSION, value, MAX_STRING_CHARS)?;
+        }
+    }
+    bound_entries(
+        "the paths of the API definition",
+        definition.paths.len(),
+        crate::state::MAX_RESOURCES_PER_API,
+    )?;
+    for imported in &definition.paths {
+        bound_chars("a path of the API definition", &imported.path, MAX_PATH_CHARS)?;
+        for segment in imported.path.split('/').filter(|part| !part.is_empty()) {
+            bound_chars(
+                "a path segment of the API definition",
+                segment,
+                MAX_PATH_PART_CHARS,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+impl From<&RestApiEntry> for PutRestApiOutput {
+    /// The `RestApi` body for a stored API. `PutRestApi` and `CreateRestApi` share the
+    /// `RestApi` shape but the scaffold renders it as two Rust types, so this mirrors
+    /// the `CreateRestApiOutput` conversion member for member. `warnings` is the one
+    /// member no stored record carries: it belongs to the import that just ran, and the
+    /// handler fills it in.
+    fn from(entry: &RestApiEntry) -> Self {
+        let body = CreateRestApiOutput::from(entry);
+        Self {
+            id: body.id,
+            name: body.name,
+            description: body.description,
+            created_date: body.created_date,
+            version: body.version,
+            warnings: body.warnings,
+            binary_media_types: body.binary_media_types,
+            minimum_compression_size: body.minimum_compression_size,
+            api_key_source: body.api_key_source,
+            endpoint_configuration: body.endpoint_configuration,
+            policy: body.policy,
+            tags: body.tags,
+            disable_execute_api_endpoint: body.disable_execute_api_endpoint,
+            root_resource_id: body.root_resource_id,
+            security_policy: body.security_policy,
+            endpoint_access_mode: body.endpoint_access_mode,
+            api_status: body.api_status,
+            api_status_message: body.api_status_message,
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -206,18 +928,221 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRestApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRestApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Every refusal below is the modelled 400: the request's definition, mode or
+        // size is wrong, and the message names what to fix.
+        fn bad_request(message: String) -> PutRestApiError {
+            PutRestApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        }
+
+        // The definition is parsed and bounded BEFORE the store lock is taken, so a
+        // malformed or over-sized body never reaches the records at all.
+        let mode = put_mode(input.mode.as_deref()).map_err(bad_request)?;
+        let definition = parse_definition(&input.body).map_err(bad_request)?;
+        bound_definition(&definition).map_err(bad_request)?;
+
+        // `parameters` is `@httpQueryParams`, so it carries this request's query string
+        // rather than a member of its own. Its documented key, `ignore=documentation`,
+        // excludes the definition's DocumentationParts from the import — and this
+        // emulator records no DocumentationPart at all (`ImportDocumentationParts` and
+        // `CreateDocumentationPart` are still stubs), so there is nothing for that key to
+        // change here and nothing it could silently drop.
+        let _ = &input.parameters;
+
+        // `failOnWarnings` is "a query parameter to indicate whether to rollback the API
+        // update (true) or not (false) when a warning is encountered": the definition is
+        // read before anything is written, so the rollback is that no record changes at
+        // all.
+        if input.fail_on_warnings && !definition.warnings.is_empty() {
+            return Err(bad_request(format!(
+                "Errors found during import: {}",
+                definition.warnings.join("; ")
+            )));
+        }
+
+        let mut store = state.lock();
+
+        // What the API already holds, so the plan below knows which paths exist. In
+        // `overwrite` mode the imported definition REPLACES the API's own, so only the
+        // root resource survives and every other path counts as new.
+        let (root_resource_id, kept_paths) = {
+            let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+                PutRestApiErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+                })
+            })?;
+            let kept: BTreeSet<String> = match mode {
+                PutModeKind::Merge => api
+                    .resources
+                    .values()
+                    .map(|resource| resource.path.clone())
+                    .collect(),
+                PutModeKind::Overwrite => {
+                    BTreeSet::from([ROOT_RESOURCE_PATH.to_string()])
+                }
+            };
+            (api.root_resource_id.clone(), kept)
+        };
+
+        // The resources the definition asks for that do not exist yet, in document
+        // order, each ancestor before the path that needs it: `/pets/{petId}` creates
+        // `/pets` first, exactly as `CreateResource` would have to.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRestApi"))
+        // The per-API resource quota is enforced AS the plan grows, not after it: a
+        // definition asking for more resources than an API may hold is refused at the
+        // entry that breaks the quota, so neither the plan nor the set it is built from
+        // can grow past the quota however long the document's paths are.
+        let mut known = kept_paths.clone();
+        let mut planned: Vec<(String, String, String)> = Vec::new();
+        for imported in &definition.paths {
+            let mut parent = ROOT_RESOURCE_PATH.to_string();
+            for segment in imported.path.split('/').filter(|part| !part.is_empty()) {
+                let path = child_path(&parent, segment);
+                if known.insert(path.clone()) {
+                    if known.len() > crate::state::MAX_RESOURCES_PER_API {
+                        return Err(PutRestApiErrorModeled::LimitExceededException(
+                            LimitExceededException {
+                                retry_after_seconds: None,
+                                message: Some(format!(
+                                    "Maximum number of resources exceeded for this API: {}",
+                                    crate::state::MAX_RESOURCES_PER_API
+                                )),
+                            },
+                        )
+                        .into());
+                    }
+                    planned.push((path.clone(), segment.to_string(), parent.clone()));
+                }
+                parent = path;
+            }
+        }
+
+        // One id and one creation rank per resource the import creates, so the imported
+        // resources are listed in the order the definition declares them.
+        let ids = store.reserve_ids(planned.len());
+        let sequences: Vec<u64> = (0..planned.len())
+            .map(|_| store.next_sequence())
+            .collect();
+
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            PutRestApiErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+
+        if mode == PutModeKind::Overwrite {
+            // The API's root resource is an attribute of the API itself — `GetRestApi`
+            // reports it as `rootResourceId` — so it survives the replacement under its
+            // own id; what the previous definition hung off it does not.
+            api.resources
+                .retain(|id, _| *id == root_resource_id);
+            if let Some(root) = api.resources.get_mut(&root_resource_id) {
+                root.methods.clear();
+            }
+        }
+
+        let mut by_path: BTreeMap<String, String> = api
+            .resources
+            .values()
+            .map(|resource| (resource.path.clone(), resource.id.clone()))
+            .collect();
+        for (index, (path, path_part, parent_path)) in planned.into_iter().enumerate() {
+            // One id and one rank were reserved per planned resource, and a path is
+            // planned only after every one of its ancestors, so neither lookup can miss.
+            // An inconsistency here would leave a partly imported API reported as a
+            // success, so it is answered as the server-side failure it would be rather
+            // than skipped.
+            let id = ids
+                .get(index)
+                .cloned()
+                .ok_or_else(crate::state::state_unavailable)?;
+            let sequence = sequences
+                .get(index)
+                .copied()
+                .ok_or_else(crate::state::state_unavailable)?;
+            let parent_id = by_path
+                .get(&parent_path)
+                .cloned()
+                .ok_or_else(crate::state::state_unavailable)?;
+            api.resources.insert(
+                id.clone(),
+                ResourceEntry {
+                    id: id.clone(),
+                    parent_id: Some(parent_id),
+                    path_part: Some(path_part),
+                    path: path.clone(),
+                    methods: BTreeMap::new(),
+                    sequence,
+                },
+            );
+            by_path.insert(path, id);
+        }
+
+        // Every operation the definition puts on a path becomes a method on that path's
+        // resource. The imported definition wins over what a path already carried: that
+        // is what both modes mean for a path the definition declares.
+        for imported in &definition.paths {
+            // The path's own resource: planned above when it did not exist, and in
+            // `by_path` either way, so this cannot miss (see the loop above).
+            let resource = by_path
+                .get(&normalized_path(&imported.path))
+                .and_then(|id| api.resources.get_mut(id))
+                .ok_or_else(crate::state::state_unavailable)?;
+            for verb in &imported.methods {
+                resource.methods.insert(verb.clone(), imported_method(verb));
+            }
+        }
+
+        // The definition also describes the API itself: the `info` object is where an
+        // OpenAPI document carries the API's name, description and version, and an
+        // import takes each of them from the document — in BOTH modes, since `info`
+        // describes the definition being imported rather than the paths under it. A
+        // member the document leaves out leaves the stored one alone, so a definition
+        // that says nothing about the API renames nothing. `binaryMediaTypes` comes from
+        // API Gateway's own extension the same way.
+        if let Some(title) = &definition.title {
+            api.name = title.clone();
+        }
+        if definition.description.is_some() {
+            api.description = definition.description.clone();
+        }
+        if definition.version.is_some() {
+            api.version = definition.version.clone();
+        }
+        if let Some(types) = &definition.binary_media_types {
+            api.binary_media_types = types.clone();
+        }
+
+        let stored = store
+            .rest_apis
+            .get(&input.rest_api_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut output = PutRestApiOutput::from(stored);
+        // The only member of the body that is not a stored one: what THIS import could
+        // not carry over. Assigned unconditionally, because an import that warned about
+        // nothing reports no warnings — never a value some other call left behind.
+        output.warnings =
+            (!definition.warnings.is_empty()).then(|| definition.warnings.clone());
+        // Everything below is owned, so the store lock is released before the record is
+        // formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — never the definition itself.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api = ?input.rest_api_id,
+            mode = ?mode,
+            paths = definition.paths.len(),
+            outcome = "imported",
+            "api definition imported",
+        );
+        Ok(output)
     }
 }

@@ -131,7 +131,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `GetRegistryCatalogDataRequest` has no members: the registry this request is
         // signed for is the one whose catalog metadata is reported.
-        let _ = (&input, ctx);
+        let _ = &input;
+        // ECR Public serves its API from ONE Region, so a call signed for any other is
+        // refused with the service-common `UnsupportedCommandException` before this
+        // handler reads or changes anything — see `crate::state::unsupported_in_region`.
+        if let Some(unsupported) = crate::state::unsupported_in_region(ctx.parts(), Self::NAME) {
+            return Err(
+                GetRegistryCatalogDataErrorModeled::UnsupportedCommandException(unsupported)
+                    .into(),
+            );
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(server_error());
         };

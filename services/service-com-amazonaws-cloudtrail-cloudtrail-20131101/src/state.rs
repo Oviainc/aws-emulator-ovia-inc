@@ -34,8 +34,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AdvancedEventSelector, AggregationConfiguration, ContextKeySelector, EventSelector,
-    ImportSource, ImportStatistics, ImportsListItem, PartitionKey, RefreshSchedule, RequestWidget,
-    Tag, Trail, TrailInfo, Widget,
+    ImportSource, ImportStatistics, ImportsListItem, InsightSelector, PartitionKey,
+    RefreshSchedule, RequestWidget, Tag, Trail, TrailInfo, Widget, INSIGHT_TYPE_VALUES,
 };
 
 /// The Region a request is served in when it carries no SigV4 credential scope to
@@ -130,6 +130,66 @@ pub const ADVANCED_SELECTOR_VALUES_PER_TRAIL_LIMIT: usize = 500;
 /// reached through `NextToken`.
 pub const LIST_TRAILS_PAGE_SIZE: usize = 100;
 
+// ---------------------------------------------------------------------------
+// Insights selectors
+//
+// The rules the Insights-selector pair (`PutInsightSelectors` /
+// `GetInsightSelectors`) shares: which event category an Insights selector
+// defaults to, how the `InsightType` value set is worded in a refusal, and how
+// an event data store states which category of events it collects.
+// ---------------------------------------------------------------------------
+
+/// The event category an Insights selector that names none applies to, from the
+/// model doc for `InsightSelector$EventCategories`: "If EventCategories is not
+/// provided, the specified Insights types are enabled on management API calls by
+/// default." It is one of [`crate::ops::types::SOURCE_EVENT_CATEGORY_VALUES`].
+pub const DEFAULT_INSIGHTS_EVENT_CATEGORY: &str = "Management";
+
+/// The event category of the data events Insights can be enabled on, the other
+/// value of the model's `SourceEventCategory` enum
+/// ([`crate::ops::types::SOURCE_EVENT_CATEGORY_VALUES`]).
+pub const DATA_INSIGHTS_EVENT_CATEGORY: &str = "Data";
+
+/// The `AdvancedFieldSelector$Field` an event data store selects a category of
+/// events on. "You can call GetEventDataStore on an event data store to check
+/// whether the event data store logs management events" (model doc for
+/// `PutInsightSelectors`) — which categories a store collects is what its
+/// advanced event selectors state, and they state it on this field.
+pub const EVENT_CATEGORY_FIELD: &str = "eventCategory";
+
+/// The `eventCategory` an event data store that logs Insights events selects on —
+/// the destination store of `PutInsightSelectors$InsightsDestination`, which "must
+/// log Insights events" (model doc for `InvalidInsightSelectorsException`).
+pub const INSIGHT_EVENT_CATEGORY: &str = "Insight";
+
+/// The Insight types the model's `InsightType` enum carries, worded as a refusal
+/// lists them.
+///
+/// The enum carries exactly two values
+/// ([`crate::ops::types::INSIGHT_TYPE_VALUES`]), so the set reads as "A and B";
+/// read off the model rather than written out, so it cannot drift from it.
+pub fn insight_type_value_set() -> String {
+    INSIGHT_TYPE_VALUES.join(" and ")
+}
+
+/// The `InvalidInsightSelectorsException` text for an `InsightType` the model's
+/// enum does not carry: "this exception is thrown when … the specified
+/// `InsightType` in the `InsightSelectors` statement is not valid. Valid values
+/// for InsightType are ApiCallRateInsight and ApiErrorRateInsight."
+///
+/// Built from the request — it names the value the caller sent and the set it is
+/// not in — so a caller can fix the call from the refusal alone. The value set is
+/// off the generated schema (`skip_validation` on `InsightSelector`), so this is
+/// the ONE place that refusal is worded, for every operation that carries an
+/// `InsightSelectors` statement.
+pub fn invalid_insight_type_message(value: &str) -> String {
+    format!(
+        "The provided value is not a valid Insights type: {value}. Valid Insight types are: {}. \
+         Verify your input and then try again.",
+        insight_type_value_set()
+    )
+}
+
 /// Characters a trail name may contain besides ASCII letters and digits, from the
 /// model doc for `CreateTrailRequest$Name`: "periods (.), underscores (_), or
 /// dashes (-)".
@@ -202,9 +262,14 @@ pub struct TrailRecord {
     /// configured — which logs by [`default_event_selector`] and reports
     /// `HasCustomEventSelectors` false.
     pub event_selectors: Option<EventSelectorConfig>,
-    /// Set by `PutInsightSelectors`, which is not implemented yet, so a trail is
-    /// created without Insights selectors.
-    pub has_insight_selectors: bool,
+    /// The Insights selectors `PutInsightSelectors` configured on this trail and
+    /// `GetInsightSelectors` reports.
+    ///
+    /// EMPTY means Insights event logging is OFF, which is also how a caller turns
+    /// it off: "You also use PutInsightSelectors to turn off Insights event logging,
+    /// by passing an empty list of Insights types" (model doc for
+    /// `PutInsightSelectors`). A trail is created with Insights off.
+    pub insight_selectors: Vec<InsightSelector>,
     /// The event aggregation this trail is configured with, as
     /// `PutEventConfiguration` sets it and `GetEventConfiguration` reports it.
     /// Empty for a trail nobody has configured aggregation for; the model bounds
@@ -238,7 +303,11 @@ impl TrailRecord {
             // when something configured them, so it is derived from the stored
             // configuration rather than tracked beside it.
             has_custom_event_selectors: Some(self.event_selectors.is_some()),
-            has_insight_selectors: Some(self.has_insight_selectors),
+            // "Specifies whether a trail has Insight types specified in an
+            // InsightSelector list" — true exactly when a selector list is
+            // configured, so it is derived from the stored selectors rather than
+            // tracked beside them.
+            has_insight_selectors: Some(!self.insight_selectors.is_empty()),
             is_organization_trail: Some(self.is_organization_trail),
             recursive_logging: Some(self.recursive_logging),
         }
@@ -879,6 +948,14 @@ pub struct EventDataStoreRecord {
     /// The store's tag set, as `CreateEventDataStore` seeds it, `RemoveTags` drops
     /// keys from it and `ListTags` reports it.
     pub tags: Vec<Tag>,
+    /// The Insights selectors `PutInsightSelectors` configured on this store and
+    /// `GetInsightSelectors` reports. EMPTY means Insights event logging is off,
+    /// on the same terms as [`TrailRecord::insight_selectors`].
+    pub insight_selectors: Vec<InsightSelector>,
+    /// The ARN of the store the Insights events this store generates are logged
+    /// to (`PutInsightSelectors$InsightsDestination`); `None` while Insights are
+    /// off, which is the only state in which no destination is configured.
+    pub insights_destination: Option<String>,
 }
 
 impl EventDataStoreRecord {
@@ -894,6 +971,26 @@ impl EventDataStoreRecord {
     /// This store's ARN, derived from the Region it lives in and its id.
     pub fn arn(&self) -> String {
         event_data_store_arn(&self.region, &self.id)
+    }
+
+    /// Whether this store collects events of `category`: one of its advanced event
+    /// selectors selects that value on the [`EVENT_CATEGORY_FIELD`].
+    ///
+    /// That is what "the event data store logs management events" and "the
+    /// destination event data store … must log Insights events" (model doc for
+    /// `InvalidInsightSelectorsException`) are read against, so both are decided
+    /// from the store's own selectors rather than from the request asking about it.
+    pub fn logs_event_category(&self, category: &str) -> bool {
+        self.advanced_event_selectors.iter().any(|selector| {
+            selector.field_selectors.iter().any(|field_selector| {
+                field_selector.field == EVENT_CATEGORY_FIELD
+                    && field_selector
+                        .equals
+                        .iter()
+                        .flatten()
+                        .any(|value| value == category)
+            })
+        })
     }
 
     /// Materialise the federation transition the clock already owes: `ENABLING`
@@ -1153,6 +1250,13 @@ pub fn event_data_store_arn_invalid_message(value: &str, request_region: &str) -
 /// different resources, so the two operations that carry them —
 /// `PutEventConfiguration` and `GetEventConfiguration` — read the pair the same
 /// way: exactly one of them addresses the call's resource.
+///
+/// The Insights-selector pair (`PutInsightSelectors` / `GetInsightSelectors`)
+/// carries the same pair under the same rule — "You cannot use this parameter
+/// with the TrailName parameter" (model doc for
+/// `PutInsightSelectorsRequest$EventDataStore`) — and reads it through here too,
+/// so one statement of the rule serves every operation that addresses either a
+/// trail or an event data store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventConfigurationTarget {
     /// The call addresses a trail, by name or by trail ARN.

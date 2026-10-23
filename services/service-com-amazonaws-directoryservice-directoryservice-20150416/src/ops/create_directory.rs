@@ -270,6 +270,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `RegisterEventTopic` is what associates an Amazon SNS topic with the
             // directory; a fresh directory publishes to none.
             event_topics: ::std::collections::BTreeMap::new(),
+            // `EnableDirectoryDataAccess` is what opens the directory to the Directory
+            // Service Data API; a fresh directory is closed to it.
+            data_access_status: crate::state::DATA_ACCESS_DISABLED.to_string(),
+            data_access_due_at: None,
             seq,
         };
         store.directories.insert(directory_id.clone(), record);

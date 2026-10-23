@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableDirectoryDataAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableDirectoryDataAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableDirectoryDataAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Opens a stored directory to the Directory Service Data API, by recording the
+//! `DataAccessStatus` transition the enable starts: the directory leaves
+//! [`crate::state::DATA_ACCESS_DISABLED`] for the transient
+//! [`crate::state::DATA_ACCESS_ENABLING`], and the clock — not a later call — settles it
+//! on [`crate::state::DATA_ACCESS_ENABLED`] once [`crate::state::TRANSITION_SPAN`] has
+//! elapsed. `DescribeDirectoryDataAccess` is what reports that status.
+//!
+//! The modelled `DirectoryId` pattern is refused by the framework's boundary validator
+//! BEFORE this handler runs, so a well-formed request reaches directory resolution: an
+//! id no directory is stored under is refused with `DirectoryDoesNotExistException`, a
+//! directory that is not in service (still being built by the transition its create
+//! owes, or otherwise outside `Active`) with `DirectoryUnavailableException`, and one
+//! whose data access is already enabled — or already on its way there — with
+//! `DirectoryInDesiredStateException`, the error whose own documentation reads "The
+//! directory is already updated to desired update type settings".
+//!
+//! The Smithy model restricts this operation to no `DirectoryType`, so none is refused
+//! here; `UnsupportedOperationException` is left for behaviour this emulator is asked
+//! for and the model does not describe.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +158,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableDirectoryDataAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableDirectoryDataAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableDirectoryDataAccess"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(|| {
+                EnableDirectoryDataAccessErrorModeled::DirectoryDoesNotExistException(
+                    DirectoryDoesNotExistException {
+                        message: Some(crate::state::no_such_directory(&input.directory_id)),
+                        request_id: None,
+                    },
+                )
+            })?;
+
+        // Opening the directory to the Data API changes the directory itself, so it
+        // needs a directory that is in service: one still being built by the transition
+        // its create owes is unavailable, which is the modelled refusal for exactly
+        // that.
+        if directory.stage != crate::state::STAGE_ACTIVE {
+            return Err(
+                EnableDirectoryDataAccessErrorModeled::DirectoryUnavailableException(
+                    DirectoryUnavailableException {
+                        message: Some(format!(
+                            "Directory {id} is in stage {stage} and is not available for \
+                             directory data access changes",
+                            id = directory.directory_id,
+                            stage = directory.stage
+                        )),
+                        request_id: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A directory already enabled — or already on its way there under the
+        // transition an earlier enable started — is in the state this request asks for,
+        // so the enable is refused rather than silently restarting that transition.
+        if directory.data_access_status == crate::state::DATA_ACCESS_ENABLED
+            || directory.data_access_status == crate::state::DATA_ACCESS_ENABLING
+        {
+            return Err(
+                EnableDirectoryDataAccessErrorModeled::DirectoryInDesiredStateException(
+                    DirectoryInDesiredStateException {
+                        message: Some(format!(
+                            "Directory {id} data access is already {status}",
+                            id = directory.directory_id,
+                            status = directory.data_access_status
+                        )),
+                        request_id: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Data access is not in service the instant this call answers: the move to
+        // `Enabled` is owed by the clock, like a create's stage transition.
+        directory.data_access_status = crate::state::DATA_ACCESS_ENABLING.to_string();
+        directory.data_access_due_at = Some(now + crate::state::TRANSITION_SPAN);
+
+        Ok(EnableDirectoryDataAccessOutput {})
     }
 }

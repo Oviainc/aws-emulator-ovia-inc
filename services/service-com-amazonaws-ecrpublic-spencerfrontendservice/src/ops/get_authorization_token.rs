@@ -158,6 +158,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request to read.
         let _ = input;
 
+        // ECR Public serves its API from ONE Region, so a call signed for any other is
+        // refused with the service-common `UnsupportedCommandException` before this
+        // handler mints anything — see `crate::state::unsupported_in_region`.
+        if let Some(unsupported) = crate::state::unsupported_in_region(ctx.parts(), Self::NAME) {
+            return Err(
+                GetAuthorizationTokenErrorModeled::UnsupportedCommandException(unsupported)
+                    .into(),
+            );
+        }
+
         // The token authorizes `docker login` against the registry this store holds, so
         // an unreachable store means there is no registry to authorize access to. The
         // router builds the one engine that carries the store, so this is unreachable

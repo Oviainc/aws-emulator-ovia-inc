@@ -327,7 +327,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.rest_api_id)
             .ok_or_else(|| {
                 UpdateRestApiErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+                    message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
                 })
             })?
             .clone();

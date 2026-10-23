@@ -280,7 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 message: Some(crate::state::unknown_trail_message(&identifier)),
                             },
                         ),
-                        TRAIL_NOT_FOUND_STATUS,
+                        crate::state::TRAIL_NOT_FOUND_STATUS,
                     ));
                 };
                 Ok(GetEventConfigurationOutput {
@@ -301,14 +301,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// and the recorded CloudTrail response carries 400, which is the status
 /// `get_event_data_store` states for the same error from the same evidence.
 const EVENT_DATA_STORE_NOT_FOUND_STATUS: u16 = 400;
-
-/// The HTTP status this service answers a trail not-found refusal with: the model
-/// annotates `TrailNotFoundException` `@httpError(404)` and the recorded
-/// CloudTrail response for an awsJson1_1 trail operation on an absent trail is
-/// HTTP 400 with `__type` `TrailNotFoundException` (issue
-/// `20261022T230533Z-cloudtrail-trail-validation-and-not-found-rejections-answer.md`,
-/// cause 6).
-const TRAIL_NOT_FOUND_STATUS: u16 = 400;
 
 /// Refuse a request that does not address exactly one resource, the way
 /// `PutEventConfiguration` refuses it: naming both resources, and naming

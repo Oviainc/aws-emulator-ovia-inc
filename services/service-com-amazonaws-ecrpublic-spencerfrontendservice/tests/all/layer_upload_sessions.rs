@@ -11,11 +11,12 @@
 //!
 //! Every case goes through the front door a client uses: `POST /` with
 //! `X-Amz-Target: SpencerFrontendService.<Operation>` and an `awsJson1_1` body
-//! (`OPERATIONS.md`, "Wire protocol"). An in-flight upload is not reportable by any
-//! implemented operation (`CompleteLayerUpload` is a 501 stub with an issue of its own),
+//! (`OPERATIONS.md`, "Wire protocol"). An in-flight upload is reported by no operation of
+//! this model — `BatchCheckLayerAvailability` reports COMPLETED layers, not open uploads —
 //! so the cases that need to see what was persisted read the record back from the store
 //! through the engine the router was built over. The harness below is shared with the
-//! layer-part suite (`tests/all/layer_part_uploads.rs`).
+//! layer-part and completion suites (`tests/all/layer_part_uploads.rs`,
+//! `tests/all/layer_upload_completion.rs`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

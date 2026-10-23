@@ -475,7 +475,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `PutEventSelectors` configures some it logs by the documented default
             // (all read and write management events, no data events).
             event_selectors: None,
-            has_insight_selectors: false,
+            // A new trail logs no Insights events until `PutInsightSelectors`
+            // enables them, so it carries no Insights selectors.
+            insight_selectors: Vec::new(),
             // A new trail aggregates nothing until `PutEventConfiguration`
             // configures aggregation for it.
             aggregation_configurations: Vec::new(),

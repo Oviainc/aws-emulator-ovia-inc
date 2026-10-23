@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CompleteLayerUpload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CompleteLayerUpload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CompleteLayerUpload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The commit point of the ECR Public layer-upload data plane: the upload
+//! `InitiateLayerUpload` opened and `UploadLayerPart` filled is CONSUMED here, and the
+//! layer its parts made up enters the named repository's layer set
+//! ([`crate::state::StoredRepository::layers`]), where `BatchCheckLayerAvailability`
+//! reports it.
+//!
+//! The digest is the registry's own: `layerDigest` is "the sha256 digest of the image
+//! layer", so it is computed over the bytes the parts carried
+//! ([`crate::state::layer_digest`]) and the request's `layerDigests` are checked against
+//! it — "you can optionally provide a sha256 digest of the image layer for data
+//! validation purposes" is exactly that check, and a layer whose digest no requested
+//! digest names is refused with `InvalidLayerException` rather than stored.
+//!
+//! An upload that received no part completes nothing: it is refused with
+//! `EmptyUploadException` ("the specified layer upload doesn't contain any layer parts")
+//! and left open, so the client can still upload its parts. `LayerPartTooSmallException`
+//! ("Layer parts must be at least 5 MiB in size") is the one modelled refusal this
+//! handler never answers: it is a statement about the individual parts of a multi-part
+//! upload, and what an upload holds here is the layer's accepted bytes rather than the
+//! partition into parts they arrived in.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +197,211 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CompleteLayerUpload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CompleteLayerUploadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CompleteLayerUpload"))
+        // ECR Public serves its API from ONE Region, so a call signed for any other is
+        // refused with the service-common `UnsupportedCommandException` before this
+        // handler reads or changes anything — see `crate::state::unsupported_in_region`.
+        if let Some(unsupported) = crate::state::unsupported_in_region(ctx.parts(), Self::NAME) {
+            return Err(
+                CompleteLayerUploadErrorModeled::UnsupportedCommandException(unsupported).into(),
+            );
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(server_error());
+        };
+        // Request metadata is used for the audit record only: the layer is committed into
+        // this registry's state, not into anything in the signing region.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        let mut store = state.lock();
+        let registry_id = store.registry_id.clone();
+
+        // "If you do not specify a registry, the default public registry is assumed"
+        // (`registryId`), and the only registry this emulator serves is its own — named
+        // either by account id or by registry alias, which is what `RegistryIdOrAlias`
+        // admits.
+        if let Some(requested_registry) = input.registry_id.as_deref() {
+            if !store.is_this_registry(requested_registry) {
+                return Err(CompleteLayerUploadErrorModeled::RegistryNotFoundException(
+                    RegistryNotFoundException {
+                        message: Some(format!(
+                            "The registry with id or alias '{requested_registry}' does not exist"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A layer is committed INTO a repository, so there has to be one — a repository
+        // deleted while an upload against it was in flight included.
+        let repository_not_found = || {
+            CompleteLayerUploadErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException {
+                    message: Some(format!(
+                        "The repository with name '{}' does not exist in the registry with \
+                         id '{registry_id}'",
+                        input.repository_name
+                    )),
+                },
+            )
+        };
+        if !store.repositories.contains_key(&input.repository_name) {
+            return Err(repository_not_found().into());
+        }
+
+        // The upload id addresses an upload this registry opened, and an id is only valid
+        // for the repository it was issued for — "the upload can't be found, or the
+        // specified upload ID isn't valid for this repository"
+        // (`UploadNotFoundException`), which is the same answer for both. A completed
+        // upload is consumed below, so completing one twice reaches this refusal too.
+        let upload_not_found = || {
+            CompleteLayerUploadErrorModeled::UploadNotFoundException(UploadNotFoundException {
+                message: Some(format!(
+                    "The upload with ID '{}' does not exist for the repository with name \
+                     '{}' in the registry with id '{registry_id}'",
+                    input.upload_id, input.repository_name
+                )),
+            })
+        };
+        let Some(upload) = store.uploads.get(&input.upload_id) else {
+            return Err(upload_not_found().into());
+        };
+        if upload.repository_name != input.repository_name {
+            return Err(upload_not_found().into());
+        }
+
+        // "The specified layer upload doesn't contain any layer parts"
+        // (`EmptyUploadException`): there is no layer to commit, so nothing enters the
+        // repository's layer set and the upload stays open for the parts that never came.
+        if upload.received.is_empty() {
+            return Err(
+                CompleteLayerUploadErrorModeled::EmptyUploadException(EmptyUploadException {
+                    message: Some(format!(
+                        "The upload with id '{}' in the repository with name '{}' in registry \
+                         with id '{registry_id}' cannot be completed because it does not have \
+                         any parts",
+                        input.upload_id, input.repository_name
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The layer's identity, computed over the bytes the parts carried — never taken
+        // from the request.
+        let layer_digest = crate::state::layer_digest(&upload.received);
+        let Ok(layer_size) = i64::try_from(upload.received.len()) else {
+            // Unreachable: a part is accepted only while the upload stays under
+            // `MAX_LAYER_UPLOAD_BYTES`, which is far inside `i64`. Answering the modelled
+            // server fault states that invariant rather than reporting a clamped
+            // `layerSize` for the layer.
+            return Err(server_error());
+        };
+
+        // "The layer digest calculation performed by Amazon ECR when the image layer
+        // doesn't match the digest specified" (`InvalidLayerException`): the request
+        // states which layer it believes it uploaded, and a disagreement means the bytes
+        // that arrived are not that layer. Each requested digest is read under the
+        // spelling digests are compared by (`crate::state::canonical_layer_digest`), so
+        // the hex's case does not decide the answer and the algorithm's token does.
+        if !input
+            .layer_digests
+            .iter()
+            .any(|requested| crate::state::canonical_layer_digest(requested) == layer_digest)
+        {
+            return Err(
+                CompleteLayerUploadErrorModeled::InvalidLayerException(InvalidLayerException {
+                    message: Some(format!(
+                        "The layer digests '{}' of the upload with id '{}' in the repository \
+                         with name '{}' in registry with id '{registry_id}' do not match the \
+                         digest that Amazon ECR has calculated for the uploaded layer",
+                        input.layer_digests.join("', '"),
+                        input.upload_id,
+                        input.repository_name
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // What the repository already holds decides the two remaining refusals, both read
+        // before anything is written: "the image layer already exists in the associated
+        // repository" (`LayerAlreadyExistsException`), and this registry's own ceiling on
+        // how many layers one repository records (see
+        // `crate::state::MAX_LAYERS_PER_REPOSITORY`), past which the completion is
+        // refused with this operation's `ServerException` rather than a client error.
+        let Some(repository) = store.repositories.get(&input.repository_name) else {
+            return Err(repository_not_found().into());
+        };
+        let already_exists = repository.layers.contains_key(&layer_digest);
+        let layer_count = repository.layers.len();
+        if already_exists {
+            return Err(
+                CompleteLayerUploadErrorModeled::LayerAlreadyExistsException(
+                    LayerAlreadyExistsException {
+                        message: Some(format!(
+                            "The layer with digest '{layer_digest}' already exists in the \
+                             repository with name '{}' in registry with id '{registry_id}'",
+                            input.repository_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if layer_count >= crate::state::MAX_LAYERS_PER_REPOSITORY {
+            return Err(
+                CompleteLayerUploadErrorModeled::ServerException(ServerException {
+                    message: Some(format!(
+                        "The repository with name '{}' in registry with id '{registry_id}' \
+                         already holds the maximum of {} image layers",
+                        input.repository_name,
+                        crate::state::MAX_LAYERS_PER_REPOSITORY
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The commit itself: the layer enters the repository and the upload is consumed,
+        // so its id addresses nothing afterwards. The repository is re-resolved under the
+        // same lock the checks above ran under, so it is still there; a store that
+        // answered otherwise would be discarding the write, which must not be reported as
+        // a success.
+        let Some(repository) = store.repositories.get_mut(&input.repository_name) else {
+            return Err(server_error());
+        };
+        repository.layers.insert(layer_digest.clone(), layer_size);
+        store.uploads.remove(&input.upload_id);
+        drop(store);
+
+        // Audit record for a state-changing operation: who asked, what changed, how it
+        // ended. Only wire metadata, server-minted identifiers and a byte count.
+        ::tracing::info!(
+            target: "emulator::audit",
+            audit = true,
+            operation = "CompleteLayerUpload",
+            outcome = "completed",
+            caller_akid = %caller_akid,
+            registry_id = %registry_id,
+            upload_id = %input.upload_id,
+            layer_size = layer_size,
+            "layer upload completed"
+        );
+
+        Ok(CompleteLayerUploadOutput {
+            registry_id: Some(registry_id),
+            repository_name: Some(input.repository_name),
+            upload_id: Some(input.upload_id),
+            layer_digest: Some(layer_digest),
+        })
     }
+}
+
+/// The modelled server fault for a state store this service could not reach.
+fn server_error() -> CompleteLayerUploadError {
+    CompleteLayerUploadErrorModeled::ServerException(ServerException {
+        message: Some("The ECR Public emulator could not reach its state store.".to_string()),
+    })
+    .into()
 }

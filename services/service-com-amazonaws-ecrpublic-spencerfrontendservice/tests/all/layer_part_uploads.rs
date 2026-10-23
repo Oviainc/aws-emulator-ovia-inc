@@ -22,10 +22,9 @@
 //! recorded request.
 //!
 //! The wire plumbing and the store reader are the session suite's shared harness
-//! (`tests/all/layer_upload_sessions.rs`): an in-flight upload is reportable by no
-//! implemented operation (`CompleteLayerUpload` is a 501 stub with an issue of its own),
-//! so what was persisted is read back from the store through the engine the router was
-//! built over.
+//! (`tests/all/layer_upload_sessions.rs`): an in-flight upload is reported by no operation
+//! of this model (`BatchCheckLayerAvailability` reports COMPLETED layers), so what was
+//! persisted is read back from the store through the engine the router was built over.
 
 use std::sync::Arc;
 

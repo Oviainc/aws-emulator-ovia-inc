@@ -306,12 +306,21 @@ pub const MAX_APPLICATION_VERSIONS: usize = 1_000;
 /// `Terminated`, which is what the real quota counts.
 pub const MAX_ENVIRONMENTS: usize = 200;
 
+/// See [`MAX_APPLICATIONS`]: the same published table gives 300 configuration
+/// templates (saved configurations) per account per region. Reported by
+/// DescribeAccountAttributes as `ConfigurationTemplateQuota`;
+/// `CreateConfigurationTemplate` is still scaffolded, so this is the allowance
+/// that create will be held to rather than one anything enforces yet.
+pub const MAX_CONFIGURATION_TEMPLATES: usize = 300;
+
 /// How many custom platform versions one account may hold here.
 ///
 /// Elastic Beanstalk limits custom platform versions per account per region, but
 /// the figure is in neither the model nor this service's own documentation, so
 /// this bound is CHOSEN. It is what keeps the platform store bounded, and what
-/// makes the modelled `TooManyPlatformsException` reachable.
+/// makes the modelled `TooManyPlatformsException` reachable. It is also what
+/// DescribeAccountAttributes reports as `CustomPlatformQuota`, so the quota a
+/// client reads is the one `CreatePlatformVersion` refuses a create past.
 pub const MAX_PLATFORM_VERSIONS: usize = 50;
 
 /// How many tags one Elastic Beanstalk resource can carry, from the service's
@@ -594,11 +603,23 @@ pub const SOLUTION_STACKS: &[SolutionStack] = &[
 ];
 
 /// The server clock, as the modelled timestamp type.
+///
+/// Dated to the MICROSECOND the wire renders: the `date-time` rendering a client
+/// reads carries at most microseconds, so a timestamp stored with a finer fraction
+/// would be compared against (`DescribeEvents`' `StartTime` / `EndTime` window, the
+/// retention horizon) at a value the client was never shown, and a timestamp read
+/// back out of a response would not select the record it came from. Building from
+/// whole seconds plus truncated subsecond microseconds — rather than from an
+/// `f64` of seconds, whose resolution at the current epoch is a fraction of a
+/// microsecond — keeps the stored instant and the rendered one the same instant.
 pub fn now() -> ::aws_smithy_types::DateTime {
     let since_epoch = ::std::time::SystemTime::now()
         .duration_since(::std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
+    ::aws_smithy_types::DateTime::from_secs_and_nanos(
+        i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
+        since_epoch.subsec_micros() * 1_000,
+    )
 }
 
 /// The region this request is addressed to: the region field of its SigV4
@@ -1505,9 +1526,20 @@ impl PendingStatus {
 }
 
 /// One [`STATUS_TRANSITION_SPAN`] from now, on the server clock.
+///
+/// Microsecond-aligned like [`now`] itself — the span is a whole number of
+/// milliseconds, so adding it keeps the stored instant one a `date-time`
+/// rendering can express exactly.
 fn due_date() -> ::aws_smithy_types::DateTime {
-    ::aws_smithy_types::DateTime::from_secs_f64(
-        now().as_secs_f64() + STATUS_TRANSITION_SPAN.as_secs_f64(),
+    let at = now();
+    let nanos =
+        u64::from(at.subsec_nanos()) + u64::from(STATUS_TRANSITION_SPAN.subsec_micros()) * 1_000;
+    let seconds = at.secs()
+        + i64::try_from(STATUS_TRANSITION_SPAN.as_secs() + nanos / 1_000_000_000)
+            .unwrap_or_default();
+    ::aws_smithy_types::DateTime::from_secs_and_nanos(
+        seconds,
+        u32::try_from(nanos % 1_000_000_000).unwrap_or_default(),
     )
 }
 
@@ -1879,6 +1911,7 @@ impl Default for ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             environments: BTreeMap::new(),
             environment_name_index: BTreeMap::new(),
             events: Vec::new(),
+            // No storage bucket until `CreateStorageLocation` creates one.
             storage_buckets: BTreeSet::new(),
             platform_branches: managed_platform_branch_catalog(),
             next_id_counter: 0,

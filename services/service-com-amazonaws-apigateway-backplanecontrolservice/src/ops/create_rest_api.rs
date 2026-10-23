@@ -405,9 +405,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(clone_from) => {
                     let source = store.rest_apis.get(clone_from).ok_or_else(|| {
                         CreateRestApiErrorModeled::BadRequestException(BadRequestException {
-                            message: Some(format!(
-                                "Invalid REST API identifier specified: {clone_from}"
-                            )),
+                            message: Some(crate::state::no_such_rest_api(clone_from)),
                         })
                     })?;
                     // The copy is capped at the same per-API resource quota a built

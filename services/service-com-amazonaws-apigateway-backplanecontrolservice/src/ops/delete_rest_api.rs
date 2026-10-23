@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the whole tree with it.
         if store.rest_apis.remove(&input.rest_api_id).is_none() {
             return Err(DeleteRestApiErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
             })
             .into());
         }

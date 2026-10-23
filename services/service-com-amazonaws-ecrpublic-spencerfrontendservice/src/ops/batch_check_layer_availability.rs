@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchCheckLayerAvailability
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchCheckLayerAvailability`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchCheckLayerAvailability::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The reporting half of the layer-upload data plane: for each requested digest it
+//! reports whether the named repository HOLDS that layer — the set
+//! `CompleteLayerUpload` adds to ([`crate::state::StoredRepository::layers`]) — so a push
+//! can skip a layer that was uploaded before.
+//!
+//! One answer per requested digest, in request order, split between the two output
+//! members the model gives: a layer this repository holds is `AVAILABLE` with the size
+//! the completed upload carried, a well-formed digest it does not hold is a
+//! `MissingLayerDigest` failure, and a digest that is not of the `<algorithm>:<hex>` form
+//! the model's `LayerDigest` declares is an `InvalidLayerDigest` failure — this
+//! operation's own `layerDigests` are `BatchedOperationLayerDigest`, which carries no
+//! pattern, so such a digest reaches the handler instead of being refused at the
+//! boundary. `Layer$mediaType` is reported for no layer: a layer upload carries no media
+//! type, so nothing stored states one.
+//!
+//! A report, so nothing is written: the layer set is projected as it stands.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +167,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchCheckLayerAvailability` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchCheckLayerAvailabilityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchCheckLayerAvailability"))
+        // ECR Public serves its API from ONE Region, so a call signed for any other is
+        // refused with the service-common `UnsupportedCommandException` before this
+        // handler reads anything — see `crate::state::unsupported_in_region`.
+        if let Some(unsupported) = crate::state::unsupported_in_region(ctx.parts(), Self::NAME) {
+            return Err(
+                BatchCheckLayerAvailabilityErrorModeled::UnsupportedCommandException(unsupported)
+                    .into(),
+            );
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(server_error());
+        };
+
+        let store = state.lock();
+        let registry_id = store.registry_id.clone();
+
+        // "If you do not specify a registry, the default public registry is assumed"
+        // (`registryId`), and the only registry this emulator serves is its own — named
+        // either by account id or by registry alias, which is what `RegistryIdOrAlias`
+        // admits.
+        if let Some(requested_registry) = input.registry_id.as_deref() {
+            if !store.is_this_registry(requested_registry) {
+                return Err(
+                    BatchCheckLayerAvailabilityErrorModeled::RegistryNotFoundException(
+                        RegistryNotFoundException {
+                            message: Some(format!(
+                                "The registry with id or alias '{requested_registry}' does not \
+                                 exist"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Layers are held by a repository, so the report is about one this registry holds:
+        // a name it does not hold is refused rather than answered with every digest
+        // missing.
+        let Some(repository) = store.repositories.get(&input.repository_name) else {
+            return Err(
+                BatchCheckLayerAvailabilityErrorModeled::RepositoryNotFoundException(
+                    RepositoryNotFoundException {
+                        message: Some(format!(
+                            "The repository with name '{}' does not exist in the registry with \
+                             id '{registry_id}'",
+                            input.repository_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // One answer per requested digest, in request order: a digest named twice is
+        // answered twice, because the report is about the request's references.
+        let mut layers: Vec<Layer> = Vec::new();
+        let mut failures: Vec<LayerFailure> = Vec::new();
+        for requested in &input.layer_digests {
+            if !crate::state::is_layer_digest_form(requested) {
+                failures.push(LayerFailure {
+                    layer_digest: Some(requested.clone()),
+                    failure_code: Some(INVALID_LAYER_DIGEST.to_string()),
+                    failure_reason: Some(
+                        "The layer digest is not of the form '<algorithm>:<hex>'".to_string(),
+                    ),
+                });
+                continue;
+            }
+            // A digest names one value however its hex is cased, so the lookup is made
+            // under the spelling digests are stored by
+            // (`crate::state::canonical_layer_digest`): the hex half folded, the
+            // algorithm half verbatim.
+            match repository
+                .layers
+                .get(&crate::state::canonical_layer_digest(requested))
+            {
+                Some(layer_size) => layers.push(Layer {
+                    layer_digest: Some(requested.clone()),
+                    layer_availability: Some(LAYER_AVAILABLE.to_string()),
+                    layer_size: Some(*layer_size),
+                    // A layer upload carries no media type, so this repository knows of
+                    // none for a layer: the member is absent rather than invented.
+                    media_type: None,
+                }),
+                None => failures.push(LayerFailure {
+                    layer_digest: Some(requested.clone()),
+                    failure_code: Some(MISSING_LAYER_DIGEST.to_string()),
+                    failure_reason: Some(
+                        "The layer digest is not present in the repository".to_string(),
+                    ),
+                }),
+            }
+        }
+        drop(store);
+
+        // Both members are reported, each possibly empty: an empty list is the statement
+        // that no requested digest fell on that side of the answer.
+        Ok(BatchCheckLayerAvailabilityOutput {
+            layers: Some(layers),
+            failures: Some(failures),
+        })
     }
+}
+
+/// The `LayerAvailability` value a layer this repository holds reports
+/// (`LAYER_AVAILABILITY_VALUES` in `ops/types/shared_types.rs`: `AVAILABLE` /
+/// `UNAVAILABLE`). `UNAVAILABLE` describes a layer the registry knows of but cannot
+/// serve, which nothing in this model produces: a layer is recorded only by the upload
+/// that completed it, and one that was never completed is a failure rather than a layer.
+const LAYER_AVAILABLE: &str = "AVAILABLE";
+
+/// The `LayerFailureCode` for a well-formed digest this repository does not hold
+/// (`LAYER_FAILURE_CODE_VALUES`: `InvalidLayerDigest` / `MissingLayerDigest`).
+const MISSING_LAYER_DIGEST: &str = "MissingLayerDigest";
+
+/// The `LayerFailureCode` for a digest that is not of the form the model's `LayerDigest`
+/// declares (see [`MISSING_LAYER_DIGEST`] for the value set).
+const INVALID_LAYER_DIGEST: &str = "InvalidLayerDigest";
+
+/// The modelled server fault for a state store this service could not reach.
+fn server_error() -> BatchCheckLayerAvailabilityError {
+    BatchCheckLayerAvailabilityErrorModeled::ServerException(ServerException {
+        message: Some("The ECR Public emulator could not reach its state store.".to_string()),
+    })
+    .into()
 }

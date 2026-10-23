@@ -17,6 +17,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::API_REGION;
 use sha2::{Digest, Sha256};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -51,10 +52,28 @@ pub(crate) fn service() -> MultiServiceRouter {
 }
 
 /// One `awsJson1_1` call, returning the HTTP status and the parsed response body.
+///
+/// Signed for the one Region ECR Public serves its API from
+/// (`state::API_REGION`), which is what every case but the Region-gate suite wants.
 pub(crate) async fn call(
     router: &MultiServiceRouter,
     operation: &str,
     body: Value,
+) -> (u16, Value) {
+    call_signed_for(router, operation, body, API_REGION).await
+}
+
+/// One `awsJson1_1` call whose SigV4 credential scope names `region`.
+///
+/// The credential scope is the only place a request carries the Region it addressed, and
+/// its service field (`ecr-public`) is also what routes the request to this service
+/// (`emulator_server::resolve_route_key`). `pub(crate)` so the Region-gate suite drives
+/// the same front door rather than building a second request.
+pub(crate) async fn call_signed_for(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    region: &str,
 ) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
@@ -63,8 +82,10 @@ pub(crate) async fn call(
         .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
         .header(
             "authorization",
-            "AWS4-HMAC-SHA256 Credential=AKIDECRPUBLIC/20260101/us-east-1\
-             /ecr-public/aws4_request, SignedHeaders=host;x-amz-target, Signature=00",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDECRPUBLIC/20260101/{region}\
+                 /ecr-public/aws4_request, SignedHeaders=host;x-amz-target, Signature=00"
+            ),
         )
         .body(bytes::Bytes::from(
             serde_json::to_vec(&body).expect("the request body serializes"),

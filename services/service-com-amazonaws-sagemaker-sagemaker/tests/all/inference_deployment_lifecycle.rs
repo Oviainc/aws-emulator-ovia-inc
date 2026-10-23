@@ -144,6 +144,24 @@ pub(crate) fn str_field(body: &Value, member: &str) -> String {
         .to_string()
 }
 
+/// A numeric member as `f64`, which is how the awsJson protocols put numbers and
+/// timestamps on the wire. Named for the type it answers, because
+/// `batch_transform_jobs` has its own `num_field` reading integer members.
+pub(crate) fn f64_field(body: &Value, member: &str) -> f64 {
+    body.get(member)
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| panic!("expected a numeric member {member} in {body}"))
+}
+
+/// An instant as the epoch-seconds number a wire timestamp carries, so a suite can
+/// compare a reported timestamp against the instant the store holds.
+pub(crate) fn epoch_seconds(at: std::time::SystemTime) -> f64 {
+    let since_epoch = at
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .expect("an instant after the epoch");
+    since_epoch.as_secs_f64()
+}
+
 pub(crate) fn primary_container(image: &str) -> Value {
     json!({ "Image": image })
 }

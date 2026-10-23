@@ -17,6 +17,9 @@
 //! path's depth, which optional members are present, the tag count, the alphabet and case
 //! of the name, how many roles the profile already holds — so no single request is the
 //! specification.
+//!
+//! `tests/all/instance_profile_roles.rs` covers the one refusal no suite here does:
+//! a service-linked role cannot be bound into an instance profile.
 
 use std::collections::BTreeMap;
 

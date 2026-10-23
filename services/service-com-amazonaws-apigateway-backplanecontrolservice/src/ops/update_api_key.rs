@@ -151,9 +151,9 @@ fn apply_patch(
                 // An association can only be created for an API that exists; dropping
                 // one needs no such check, because the association is what goes away.
                 if patch.op == PatchOpKind::Add && !apis.contains(rest_api_id) {
-                    return Err(PatchFailure::NotFound(
-                        crate::state::NO_SUCH_REST_API.to_string(),
-                    ));
+                    return Err(PatchFailure::NotFound(crate::state::no_such_rest_api(
+                        rest_api_id,
+                    )));
                 }
                 patch_string_set(
                     &mut entry.stage_keys,

@@ -302,6 +302,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_authentication_settings: ::std::collections::BTreeMap::new(),
             // No event topic until `RegisterEventTopic` associates one.
             event_topics: ::std::collections::BTreeMap::new(),
+            // `EnableDirectoryDataAccess` is what opens the directory to the Directory
+            // Service Data API; a fresh directory is closed to it.
+            data_access_status: crate::state::DATA_ACCESS_DISABLED.to_string(),
+            data_access_due_at: None,
             seq,
         };
         store.directories.insert(directory_id.clone(), record);
