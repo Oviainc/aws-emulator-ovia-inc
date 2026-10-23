@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVolumesModifications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVolumesModifications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVolumesModifications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the most recent modification [`crate::state`] holds for each EBS
+//! volume that has one, narrowed by `VolumeIds` and the documented filters and paged by
+//! `MaxResults`/`NextToken`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +149,312 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVolumesModifications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVolumesModificationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_RESOURCE_IDS, MatchBudget, decode_page_token, encode_page_token,
+            invalid_pagination_token_for, invalid_volume_modification_not_found,
+            matches_every_filter, require_known_volume, require_service_state,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let requested_ids = input.volume_ids.clone().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "VolumeIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+        // "The maximum number of results (up to a limit of 500)"
+        // (`DescribeVolumesModificationsRequest$MaxResults`): the model declares no
+        // `@range`, so the handler is the only place that documented ceiling can be
+        // enforced — and an unbounded page size is how a caller asks for the whole store
+        // in one answer. The value is bound once, so the number the refusal reports cannot
+        // drift from the one that was tested.
+        if let Some(max_results) = input.max_results {
+            if max_results < 1 {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{max_results}' for maxResults. It must be at least 1"
+                )));
+            }
+            if usize::try_from(max_results).unwrap_or(usize::MAX) > MAX_RESULTS {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{max_results}' for maxResults. It must be at most \
+                     {MAX_RESULTS}"
+                )));
+            }
+        }
+
+        // Matching cost is filters x values x held values x stored modifications and the
+        // model bounds none of them, so the request-controlled factors are capped here,
+        // before any work proportional to them is done — and their PRODUCT is charged to
+        // one [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // modification would have matched it, so an unsupported filter can never read as
+        // "no results".
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !VOLUME_MODIFICATION_FILTERS.contains(&name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token returned from a previous paginated request" — anything else is
+        // refused rather than read as an id, and it is refused before any other member is
+        // looked at, so whether a bogus token is caught never depends on the rest of the
+        // request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // An id that names no volume of the account is an error, not an absent row — a
+        // malformed one before an unknown one.
+        for volume_id in &requested_ids {
+            require_known_volume(&store, volume_id)?;
+        }
+        // "Describes the most recent volume modification request for the specified EBS
+        // volumes": a volume that resolves but has never been modified has no modification
+        // to describe, which EC2 answers as a missing modification rather than as an empty
+        // list. A request that names NO volume asks about the account's modifications
+        // instead, so it reports however many there are, including none.
+        for volume_id in &requested_ids {
+            if !store.volume_modifications.contains_key(volume_id) {
+                return Err(invalid_volume_modification_not_found(volume_id));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named volume and
+        // modification resolved: the flag asks whether the request WOULD have succeeded,
+        // so one that would have been refused is refused with that reason instead. A
+        // request that would have been served answers `DryRunOperation` — the "you have
+        // the required permissions" answer — because this emulator models no caller
+        // principal to withhold them from, so the `UnauthorizedOperation` arm of that
+        // sentence is not an entitlement check a test can drive here.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "If this parameter is set to true, the output includes resources that are
+        // managed by Amazon Web Services services"
+        // (`DescribeVolumesModificationsRequest$IncludeManagedResources`): no modification
+        // this emulator stores is managed by a service (none carries an `Operator`), so
+        // every stored modification is reported either way and the flag narrows nothing.
+        let _ = input.include_managed_resources;
+
+        // The `modifying` -> `optimizing` -> `completed` moves the clock already owed each
+        // modification are observed here, not written: `view_at` derives the state, the
+        // progress and the end time from the stored due instants, so this read changes
+        // nothing a later caller sees — and the `modification-state` filter therefore
+        // compares against the state the caller is shown.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVolumesModifications"))
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored
+        // modifications, filters, values, held values and value length is bounded however
+        // the caller combines them — which is also what bounds how long this holds the
+        // state lock.
+        let now = ::std::time::Instant::now();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        // Each selected modification is carried beside the store's own key, so the page
+        // cursor below is derived from that key rather than from the projected
+        // `VolumeId` member, which the model makes optional: the token is produced
+        // whenever a modification follows the page, whatever the projection carries.
+        let mut selected: Vec<(&str, VolumeModification)> = Vec::new();
+        for (volume_id, record) in &store.volume_modifications {
+            if budget.exhausted() {
+                break;
+            }
+            // The id narrowing is read off the store's own key, so a modification the
+            // request did not name costs no projection and no comparison at all.
+            if !requested_ids.is_empty() && !requested_ids.iter().any(|id| id == volume_id) {
+                continue;
+            }
+            let modification = record.view_at(now);
+            if matches_every_filter(&selectors, &mut budget, &|name| {
+                filter_values(&modification, name)
+            }) {
+                selected.push((volume_id.as_str(), modification));
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `VolumeId` order, which the cursor below names a position in. The store
+        // is an ordered map, so its iteration order already satisfies this sort; doing it
+        // here establishes the invariant the cursor depends on at the point of use.
+        selected.sort_by_key(|(volume_id, _)| *volume_id);
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|(volume_id, _)| *volume_id < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this operation serves,
+        // so the `NextToken` path behaves the same whether or not a page size was asked
+        // for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_RESULTS)
+            .clamp(1, MAX_RESULTS);
+
+        // A token only when a modification follows this page: "The token to include in
+        // another request to get the next page of items. This value is null when there are
+        // no more items to return."
+        let next_token = page
+            .get(limit)
+            .map(|(volume_id, _)| encode_page_token(volume_id));
+
+        Ok(DescribeVolumesModificationsOutput {
+            volumes_modifications: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|(_, modification)| modification.clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
+
+/// The largest page this operation serves, and the page size it uses when the request
+/// names none: "The maximum number of results (up to a limit of 500) to be returned in a
+/// paginated request" (`DescribeVolumesModificationsRequest$MaxResults`).
+///
+/// Applying the documented maximum as the DEFAULT too is what stops a parameterless
+/// describe from materialising the whole store in one response.
+const MAX_RESULTS: usize = 500;
+
+/// The filter names this operation documents, from
+/// `DescribeVolumesModificationsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeVolumesModificationsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// Two of them are documented in camel case (`originalMultiAttachEnabled`,
+/// `targetMultiAttachEnabled`) and are kept exactly as the model spells them: "Filter
+/// names are case-sensitive" (`Filter$Name`). A modification carries no tags, so this
+/// operation documents no `tag:<key>` family and none is accepted. Every entry must be
+/// answered by [`filter_values`].
+const VOLUME_MODIFICATION_FILTERS: [&str; 11] = [
+    "modification-state",
+    "original-iops",
+    "original-size",
+    "original-volume-type",
+    "originalMultiAttachEnabled",
+    "start-time",
+    "target-iops",
+    "target-size",
+    "target-volume-type",
+    "targetMultiAttachEnabled",
+    "volume-id",
+];
+
+/// A boolean attribute as a filter value compares against it: the wire rendering of the
+/// member, `true` or `false`. A member that is not set carries no value for the filter to
+/// match, like any other absent attribute.
+fn boolean_values(value: Option<bool>) -> Vec<::std::borrow::Cow<'static, str>> {
+    value
+        .map(|set| ::std::borrow::Cow::Borrowed(if set { "true" } else { "false" }))
+        .into_iter()
+        .collect()
+}
+
+/// An integer attribute as a filter value compares against it: its decimal rendering. An
+/// attribute the modification does not carry — the IOPS of a volume type that provisions
+/// none, say — compares against nothing, so a filter naming it selects nothing.
+fn integer_values(value: Option<i32>) -> Vec<::std::borrow::Cow<'static, str>> {
+    value
+        .map(|number| ::std::borrow::Cow::Owned(number.to_string()))
+        .into_iter()
+        .collect()
+}
+
+/// The values the EC2 filter `name` compares against this modification.
+///
+/// `name` is a name [`VOLUME_MODIFICATION_FILTERS`] admits. A filter naming an attribute
+/// this modification does not carry compares against NO values, so it selects nothing —
+/// which is the lookup [`crate::state::matches_every_filter`], the one place EC2's AND/OR
+/// filter evaluation lives, asks this operation for.
+fn filter_values<'a>(
+    modification: &'a VolumeModification,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "modification-state" => text(modification.modification_state.as_deref()),
+        "original-iops" => integer_values(modification.original_iops),
+        "original-size" => integer_values(modification.original_size),
+        "original-volume-type" => text(modification.original_volume_type.as_deref()),
+        "originalMultiAttachEnabled" => boolean_values(modification.original_multi_attach_enabled),
+        "start-time" => modification
+            .start_time
+            .map(|start_time| Cow::Owned(start_time.to_string()))
+            .into_iter()
+            .collect(),
+        "target-iops" => integer_values(modification.target_iops),
+        "target-size" => integer_values(modification.target_size),
+        "target-volume-type" => text(modification.target_volume_type.as_deref()),
+        "targetMultiAttachEnabled" => boolean_values(modification.target_multi_attach_enabled),
+        "volume-id" => text(modification.volume_id.as_deref()),
+        // Unreachable: the handler has already refused every other name. An undefined name
+        // compares against nothing, so it could never widen a result even if that check
+        // were bypassed.
+        _ => Vec::new(),
+    }
+}
+

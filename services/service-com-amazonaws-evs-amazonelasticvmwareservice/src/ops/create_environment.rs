@@ -9,23 +9,35 @@
 //! The request-level rules it enforces beyond the modelled constraints, each from the
 //! documentation quoted under "Modeled contract" below:
 //!
-//! 1. `SELF_DEPLOYED` does not support `licenseInfo`, `hosts`, `vcfHostnames`,
-//!    `siteId` or `connectivityInfo`.
-//! 2. `dedicatedHostId` and `placementGroupId` cannot be used together.
-//! 3. A VLAN subnet CIDR block is between /24 and /28, and no two of an
+//! 1. `dedicatedHostId` and `placementGroupId` cannot be used together in one
+//!    `HostInfoForCreate`.
+//! 2. A VLAN subnet CIDR block is between /24 and /28, and no two of an
 //!    environment's VLAN subnets may overlap.
-//! 4. `hcxNetworkAclId` is required when `isHcxPublic` is true.
-//! 5. An environment name is unique within the account and Region.
-//! 6. `termsAccepted` must be true: it is the caller's confirmation that it holds the
+//! 3. `hcxNetworkAclId` is required when `isHcxPublic` is true.
+//! 4. An environment name is unique within the account and Region.
+//! 5. `termsAccepted` must be true: it is the caller's confirmation that it holds the
 //!    VCF licenses the environment needs, so an environment cannot be created without
 //!    it.
-//! 7. The `vpcId` is not already used by another deployed environment of this Region.
+//! 6. The `vpcId` is not already used by another deployed environment of this Region.
+//! 7. The `vpcId` names a VPC the account holds, and the `serviceAccessSubnetId` a
+//!    subnet of THAT VPC: an environment is deployed into the caller's existing
+//!    network, so a request naming a VPC or subnet that does not exist is refused with
+//!    a clause naming the id it gave ([`crate::state::ec2_resources`], which reads
+//!    Amazon EC2's own store).
 //!
-//! Whether the VPC *exists* is not one of them, and neither is the account's AWS
-//! Premium Support subscription: this emulator holds no EC2 and no account-subscription
-//! state to decide either from (EC2's own `CreateVpc` is still a 501 stub), and a guess
-//! either way would refuse or admit every request alike. Only preconditions this
-//! service can actually evaluate are enforced.
+//! Supplying a parameter the chosen VCF mode does not support is NOT one of them.
+//! `SELF_DEPLOYED` "does not support" `licenseInfo`, `hosts`, `vcfHostnames`, `siteId`
+//! and `connectivityInfo` in the sense that it does nothing with them — no hosts are
+//! added and no VCF is installed in that mode — and the recorded wire confirms that a
+//! request carrying all five of them together with `vcfVersion` `SELF_DEPLOYED` is NOT
+//! refused for carrying them: the refusal it drew named the VPC and nothing else. The
+//! members are therefore accepted and stored as supplied, exactly as `clientToken` is
+//! ("If you supply input for this parameter, it will have no effect").
+//!
+//! The account's AWS Premium Support subscription is not a precondition either: this
+//! emulator holds no account-subscription state to decide it from, and a guess either
+//! way would refuse or admit every request alike. Only preconditions this service can
+//! actually evaluate are enforced.
 //!
 //! Every one of those checks runs before anything is minted, and they are all
 //! evaluated: a request that breaks several is refused ONCE, with one
@@ -190,6 +202,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The ONE reading of an IPv4 CIDR block this service has, shared with
+// `CreateEnvironmentHost`, which places a host's management address inside the
+// `vmkManagement` block with it.
+use crate::state::Ipv4Cidr;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -273,6 +290,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "The Amazon EVS environment store is unavailable.".to_string(),
             })
         })?;
+        // Authorization first, before anything about the request is evaluated: AWS
+        // decides it at the IAM layer, and a create names no resource of its own yet.
+        if let Some(denied) =
+            crate::state::authorization::denied(&*self.engine, ctx, Self::NAME, None)
+        {
+            return Err(denied);
+        }
 
         // Every request-level precondition, evaluated before anything is minted. They
         // are all collected rather than short-circuited: AWS reports a request's
@@ -280,10 +304,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // trip instead of one refusal at a time.
         let mut failures: Vec<ValidationExceptionField> = Vec::new();
         failures.extend(terms_accepted_failure(&input));
-        failures.extend(vcf_mode_failures(&input));
         failures.extend(host_failures(input.hosts.as_deref().unwrap_or_default()));
         let vlan_plan = plan_vlans(&input.initial_vlans);
         failures.extend(vlan_failures(&input.initial_vlans, &vlan_plan));
+        // The network the environment is deployed into, from Amazon EC2's own store.
+        // Read before this service's own lock is taken, so only one store is ever held
+        // at a time.
+        failures.extend(crate::state::ec2_resources::network_failures(
+            &*self.engine,
+            &input.vpc_id,
+            &input.service_access_subnet_id,
+        ));
 
         let region = crate::state::request_region(ctx.parts());
         let mut state = state.lock();
@@ -380,6 +411,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             checks: Vec::new(),
             entitlements: std::collections::BTreeMap::new(),
             connectors: std::collections::BTreeMap::new(),
+            hosts: std::collections::BTreeMap::new(),
             pending: Some(crate::state::PendingTransition::starting_now(
                 crate::state::STATE_CREATED,
                 crate::state::STATE_CREATED,
@@ -416,9 +448,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// VLAN of an 802.1Q trunk, so an environment's own VLANs start clear of it.
 const FIRST_VLAN_ID: i32 = 100;
 
-/// The `VcfVersion` value that means the customer installs VCF itself.
-const SELF_DEPLOYED: &str = "SELF_DEPLOYED";
-
 /// The largest VLAN subnet prefix length: "Amazon EVS VLAN subnets have a minimum
 /// CIDR block size of /28 and a maximum size of /24" (`InitialVlans` doc).
 const MAX_VLAN_PREFIX_LEN: u8 = 28;
@@ -441,50 +470,6 @@ struct PlannedVlan<'a> {
     network_acl_id: Option<&'a str>,
 }
 
-/// One IPv4 CIDR block, reduced to the inclusive address range it covers.
-///
-/// Over 32 bits the two rules this operation needs are a mask and a range comparison,
-/// so they are computed here on `std::net::Ipv4Addr` rather than pulled in: a new
-/// dependency would be the only part of this change to touch the workspace's shared
-/// `Cargo.lock`, which every other concurrent change touches as well.
-#[derive(Debug, Clone, Copy)]
-struct Ipv4Cidr {
-    /// The first address of the block (the network address).
-    first: u32,
-    /// The last address of the block (the broadcast address).
-    last: u32,
-    /// The block's prefix length, in bits.
-    prefix_len: u8,
-}
-
-impl Ipv4Cidr {
-    /// Parse `a.b.c.d/<prefix length>`; `None` for anything that is not an IPv4 CIDR
-    /// block.
-    fn parse(cidr: &str) -> Option<Self> {
-        let (address, prefix_len) = cidr.split_once('/')?;
-        let address: ::std::net::Ipv4Addr = address.parse().ok()?;
-        let prefix_len: u8 = prefix_len.parse().ok()?;
-        if prefix_len > 32 {
-            return None;
-        }
-        // The host bits below the prefix are what the block spans: clearing them gives
-        // its first address, setting them its last.
-        let host_bits = 32 - u32::from(prefix_len);
-        let mask = if host_bits == 32 { 0 } else { u32::MAX << host_bits };
-        let first = u32::from(address) & mask;
-        Some(Self {
-            first,
-            last: first | !mask,
-            prefix_len,
-        })
-    }
-
-    /// Whether the two blocks share any address.
-    fn overlaps(&self, other: &Self) -> bool {
-        self.first <= other.last && other.first <= self.last
-    }
-}
-
 /// The failure, if any, of the precondition that the caller accepted the terms:
 /// `termsAccepted` is the "Confirmation that the customer has purchased and will
 /// continue to maintain the required number of VCF software licenses to cover all
@@ -499,46 +484,17 @@ fn terms_accepted_failure(input: &CreateEnvironmentInput) -> Option<ValidationEx
     })
 }
 
-/// Every parameter the chosen VCF mode does not support: "When you specify
-/// SELF_DEPLOYED for vcfVersion ... The licenseInfo, hosts, vcfHostnames, siteId, and
-/// connectivityInfo parameters are not supported in this mode."
-fn vcf_mode_failures(input: &CreateEnvironmentInput) -> Vec<ValidationExceptionField> {
-    if input.vcf_version != SELF_DEPLOYED {
-        return Vec::new();
-    }
-    [
-        ("licenseInfo", input.license_info.is_some()),
-        ("hosts", input.hosts.is_some()),
-        ("vcfHostnames", input.vcf_hostnames.is_some()),
-        ("siteId", input.site_id.is_some()),
-        ("connectivityInfo", input.connectivity_info.is_some()),
-    ]
-    .into_iter()
-    .filter(|(_, supplied)| *supplied)
-    .map(|(member, _)| {
-        crate::state::field_failure(
-            member,
-            &format!("is not supported when vcfVersion is {SELF_DEPLOYED}"),
-        )
-    })
-    .collect()
-}
-
-/// Every host that names both placement mechanisms: "You cannot use the
-/// dedicatedHostId and placementGroupId parameters together in the same
-/// CreateEnvironment action. This results in a ValidationException response."
+/// Every host that names both placement mechanisms, refused through the shape's own
+/// rule ([`crate::state::placement_conflict_failure`]), which `CreateEnvironmentHost`
+/// applies to its single `host` for the same reason: "You cannot use the
+/// `dedicatedHostId` and `placementGroupId` parameters together in the same
+/// `HostInfoForCreate` object. This results in a `ValidationException` response."
 fn host_failures(hosts: &[HostInfoForCreate]) -> Vec<ValidationExceptionField> {
     hosts
         .iter()
         .enumerate()
         .filter(|(_, host)| host.dedicated_host_id.is_some() && host.placement_group_id.is_some())
-        .map(|(index, _)| {
-            crate::state::field_failure(
-                &format!("hosts[{index}]"),
-                "cannot use dedicatedHostId and placementGroupId together in the same \
-                 CreateEnvironment action",
-            )
-        })
+        .map(|(index, _)| crate::state::placement_conflict_failure(&format!("hosts[{index}]")))
         .collect()
 }
 
@@ -548,7 +504,7 @@ fn host_failures(hosts: &[HostInfoForCreate]) -> Vec<ValidationExceptionField> {
 fn plan_vlans(initial: &InitialVlans) -> Vec<PlannedVlan<'_>> {
     vec![
         PlannedVlan {
-            function_name: "vmkManagement",
+            function_name: crate::state::VMK_MANAGEMENT_FUNCTION,
             member: "initialVlans.vmkManagement",
             cidr: &initial.vmk_management.cidr,
             is_public: false,

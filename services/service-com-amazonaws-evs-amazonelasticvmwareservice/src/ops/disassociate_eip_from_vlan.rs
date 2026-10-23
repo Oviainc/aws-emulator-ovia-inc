@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateEipFromVlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateEipFromVlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes an Elastic IP address association from the public HCX VLAN of a stored
+//! environment: the association is dropped from that VLAN in [`crate::state`] and the
+//! `Vlan` this operation answers with reports the associations that are left, so
+//! `ListEnvironmentVlans` reports the same afterwards.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateEipFromVlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules it enforces are `AssociateEipToVlan`'s, from the same documentation:
+//!
+//! 1. The `environmentId` names an environment this service holds, in the Region the
+//!    request was addressed to — otherwise the modelled `ResourceNotFoundException`.
+//! 2. `vlanName` is `hcx`: "hcx is the only accepted VLAN name at this time".
+//! 3. That VLAN is public: the operation is "only allowed for public HCX VLANs at this
+//!    time".
+//! 4. The operation is `@idempotent`, and removal is what that trait means here: the
+//!    call answers with the VLAN that no longer carries the `associationId`, whether
+//!    this call removed it or an earlier one did, so a retried disassociate cannot
+//!    fail because the first one succeeded.
 //!
 //! ## Shape of an operation
 //!
@@ -98,12 +105,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `DisassociateEipFromVlanError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#DisassociateEipFromVlan")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#DisassociateEipFromVlan",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DisassociateEipFromVlanErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -157,18 +170,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateEipFromVlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateEipFromVlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateEipFromVlan"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisassociateEipFromVlanErrorModeled::InternalServerException(InternalServerException {
+                message: "The Amazon EVS environment store is unavailable.".to_string(),
+            })
+        })?;
+        // `clientToken` is read and ignored on purpose: "This parameter is not used in
+        // Amazon EVS currently. If you supply input for this parameter, it will have no
+        // effect." (`clientToken` doc).
+        let _ = &input.client_token;
+        let region = crate::state::request_region(ctx.parts());
+        let environment_arn = crate::state::environment_arn(&region, &input.environment_id);
+        // Authorization first: AWS decides it at the IAM layer, before the resource the
+        // request names is evaluated, so the ARN is the one the REQUEST names.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&environment_arn),
+        ) {
+            return Err(denied);
+        }
+        let modified_at_ms = crate::state::now_ms();
+
+        let mut state = state.lock();
+        // Reporting only: this materialises the state changes the clock already owed,
+        // which were due whether or not anybody called.
+        state.materialise_due_transitions();
+
+        // "hcx is the only accepted VLAN name at this time" (`vlanName` doc).
+        let vlan_name_is_hcx = input.vlan_name == crate::state::HCX_FUNCTION;
+
+        // Regional resource, and one that has reached DELETED is gone as far as this
+        // operation is concerned — the same reading `AssociateEipToVlan` takes.
+        let environment = state
+            .environment_in_region_mut(&region, &input.environment_id)
+            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .ok_or_else(|| {
+                DisassociateEipFromVlanErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
+        if !vlan_name_is_hcx {
+            return Err(DisassociateEipFromVlanErrorModeled::ValidationException(
+                crate::state::field_validation_error(
+                    "vlanName",
+                    &format!(
+                        "must be {}, the only VLAN an Elastic IP address can be disassociated \
+                         from at this time",
+                        crate::state::HCX_FUNCTION
+                    ),
+                ),
+            )
+            .into());
+        }
+        let vlan = environment
+            .vlans
+            .iter_mut()
+            .find(|vlan| vlan.function_name == crate::state::HCX_FUNCTION)
+            .ok_or_else(|| {
+                DisassociateEipFromVlanErrorModeled::ValidationException(
+                    crate::state::field_validation_error(
+                        "vlanName",
+                        "names no VLAN of this environment",
+                    ),
+                )
+            })?;
+        // "This operation is only allowed for public HCX VLANs at this time."
+        if !vlan.is_public {
+            return Err(DisassociateEipFromVlanErrorModeled::ValidationException(
+                crate::state::field_validation_error(
+                    "vlanName",
+                    "names a private VLAN; an Elastic IP address can only be disassociated \
+                     from a public HCX VLAN",
+                ),
+            )
+            .into());
+        }
+
+        // `@idempotent`: the end state is what the call asks for — the VLAN no longer
+        // carries this association — so a repeat of a call that already removed it is
+        // not a failure. Only a call that really removed something re-stamps the record.
+        let before = vlan.eip_associations.len();
+        vlan.eip_associations.retain(|association| {
+            association.association_id.as_deref() != Some(input.association_id.as_str())
+        });
+        let removed = vlan.eip_associations.len() != before;
+        if removed {
+            vlan.modified_at_ms = modified_at_ms;
+        }
+        let vlan = vlan.to_wire();
+        if removed {
+            environment.modified_at_ms = modified_at_ms;
+        }
+        Ok(DisassociateEipFromVlanOutput { vlan: Some(vlan) })
     }
 }
