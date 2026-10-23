@@ -32,8 +32,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Assessment, AssessmentSummary, ClientAuthenticationSettingInfo, DirectoryDescription,
-    DirectoryVpcSettingsDescription, EventTopic, IpRouteInfo, LDAPSSettingInfo, Snapshot,
-    SnapshotLimits, Tag,
+    DirectoryLimits, DirectoryVpcSettingsDescription, EventTopic, IpRouteInfo, LDAPSSettingInfo,
+    Snapshot, SnapshotLimits, Tag,
 };
 
 /// How long a status transition a create owes takes to fall due.
@@ -127,6 +127,10 @@ pub const DEFAULT_MICROSOFT_AD_EDITION: &str = "Enterprise";
 /// changes it afterwards.
 pub const MICROSOFT_AD_DOMAIN_CONTROLLERS: i32 = 2;
 
+/// The `DirectoryType` of an AD Connector: the `ADConnector` value of the modelled
+/// `DirectoryType` enum, which `ConnectDirectory` (still scaffolded) is what persists.
+pub const TYPE_AD_CONNECTOR: &str = "ADConnector";
+
 /// The DNS suffix a directory's access URL is built on, from the `AccessUrl` member's
 /// documentation: "The access URL for the directory, such as
 /// `http://<alias>.awsapps.com`".
@@ -142,8 +146,42 @@ pub const SIMPLE_AD_NETWORK_TYPES: [&str; 2] = ["IPv4", "Dual-stack"];
 /// Directory Service's default quota of 10 directories per account per Region, the
 /// bound `DirectoryLimitExceededException` reports. Every create in this slice
 /// (`CreateDirectory`, `CreateMicrosoftAD`) counts against it, so the Region holds at
-/// most this many directories whatever their type.
+/// most this many directories whatever their type — which is why it is also the limit
+/// `GetDirectoryLimits` reports for each counter of the modelled `DirectoryLimits`
+/// structure: there is ONE allowance here, and each counter is a view of it.
 pub const MAX_DIRECTORIES: usize = 10;
+
+/// Which of the three counters the modelled `DirectoryLimits` structure carries a
+/// stored directory counts towards, decided by its `DirectoryType`.
+///
+/// `DirectoryLimits` reports a (limit, current count, limit reached) triple for
+/// cloud-only directories, for cloud-only Managed Microsoft AD directories and for
+/// connected directories, while the modelled `DirectoryType` enum carries four values.
+/// The fourth, `SharedMicrosoftAD`, belongs to none of the three: it is a directory
+/// another account shared into this one rather than one created here, and the structure
+/// models no counter for it — hence [`Self::of`] answering `Option`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryLimitCategory {
+    /// A cloud-only directory — [`TYPE_SIMPLE_AD`].
+    CloudOnly,
+    /// A cloud-only AWS Managed Microsoft AD directory — [`TYPE_MICROSOFT_AD`].
+    CloudOnlyMicrosoftAd,
+    /// A directory connected to an on-premises one — [`TYPE_AD_CONNECTOR`].
+    Connected,
+}
+
+impl DirectoryLimitCategory {
+    /// The counter a stored `DirectoryType` counts towards, or `None` when
+    /// `DirectoryLimits` models no counter for that type.
+    pub fn of(directory_type: &str) -> Option<Self> {
+        match directory_type {
+            TYPE_SIMPLE_AD => Some(Self::CloudOnly),
+            TYPE_MICROSOFT_AD => Some(Self::CloudOnlyMicrosoftAd),
+            TYPE_AD_CONNECTOR => Some(Self::Connected),
+            _ => None,
+        }
+    }
+}
 
 /// AWS's tagging limit of 50 tags per resource, the bound
 /// `TagLimitExceededException` reports.
@@ -898,6 +936,17 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
         }
     }
 
+    /// How many stored directories count towards `category` — the current count
+    /// `GetDirectoryLimits` reports for that counter of `DirectoryLimits`.
+    pub fn directories_in_category(&self, category: DirectoryLimitCategory) -> usize {
+        self.directories
+            .values()
+            .filter(|directory| {
+                DirectoryLimitCategory::of(&directory.directory_type) == Some(category)
+            })
+            .count()
+    }
+
     /// Directories in creation order — the order `DescribeDirectories` pages over.
     pub fn directories_in_creation_order(&self) -> Vec<&Directory> {
         let mut ordered: Vec<&Directory> = self.directories.values().collect();
@@ -956,11 +1005,47 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
             manual_snapshots_limit_reached: taken >= MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY,
         }
     }
+
+    /// The Region's directory limits `GetDirectoryLimits` reports, as the modelled
+    /// `DirectoryLimits`.
+    ///
+    /// Every member is derived rather than stored. Each of the three counters the
+    /// structure carries — cloud-only, cloud-only Managed Microsoft AD, connected —
+    /// reports its own current count, [`Self::directories_in_category`] of that
+    /// [`DirectoryLimitCategory`]. The limit each reports is [`MAX_DIRECTORIES`], the
+    /// Region's one directory allowance that every create here draws on whatever the
+    /// directory's type, and the `...LimitReached` flags ("Indicates if the … limit has
+    /// been reached") are that allowance being used up — so the report says exactly when
+    /// a further create is refused with `DirectoryLimitExceededException`, which is what
+    /// that error's own documentation points at this operation for.
+    pub fn directory_limits(&self) -> DirectoryLimits {
+        let limit = clamp_to_i32(MAX_DIRECTORIES);
+        let limit_reached = self.directories.len() >= MAX_DIRECTORIES;
+        let count_in = |category| clamp_to_i32(self.directories_in_category(category));
+        DirectoryLimits {
+            cloud_only_directories_limit: Some(limit),
+            cloud_only_directories_current_count: Some(count_in(
+                DirectoryLimitCategory::CloudOnly,
+            )),
+            cloud_only_directories_limit_reached: limit_reached,
+            cloud_only_microsoft_ad_limit: Some(limit),
+            cloud_only_microsoft_ad_current_count: Some(count_in(
+                DirectoryLimitCategory::CloudOnlyMicrosoftAd,
+            )),
+            cloud_only_microsoft_ad_limit_reached: limit_reached,
+            connected_directories_limit: Some(limit),
+            connected_directories_current_count: Some(count_in(
+                DirectoryLimitCategory::Connected,
+            )),
+            connected_directories_limit_reached: limit_reached,
+        }
+    }
 }
 
-/// A count as the modelled `Limit` integer, which is 32 bits wide: both counts a
-/// `SnapshotLimits` reports are bounded by [`MAX_SNAPSHOTS`], far below the maximum, so
-/// the saturation can never be reached and is here only so no cast can wrap.
+/// A count as the modelled `Limit` integer, which is 32 bits wide: every count a
+/// `SnapshotLimits` or a `DirectoryLimits` reports is bounded by [`MAX_SNAPSHOTS`] or
+/// [`MAX_DIRECTORIES`], far below the maximum, so the saturation can never be reached
+/// and is here only so no cast can wrap.
 fn clamp_to_i32(count: usize) -> i32 {
     i32::try_from(count).unwrap_or(i32::MAX)
 }
