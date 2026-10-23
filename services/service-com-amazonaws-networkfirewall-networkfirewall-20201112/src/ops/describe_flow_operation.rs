@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeFlowOperation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeFlowOperation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeFlowOperation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reads back the `FlowOperationRecord` a start command stored on
+//! the firewall, resolved by `FirewallArn` + `FlowOperationId`. A reporting
+//! operation, which materialises only the `IN_PROGRESS` -> `COMPLETED` move the
+//! clock already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +187,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeFlowOperation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeFlowOperationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeFlowOperation"))
+        let _ = ctx;
+        // The two Availability Zone members name one scope two ways, so naming
+        // both is a bad request on this operation exactly as it is on the start
+        // commands (`AvailabilityZoneId`: "Specify either AvailabilityZone or
+        // AvailabilityZoneId, not both. If you specify both, the request fails").
+        if input.availability_zone.is_some() && input.availability_zone_id.is_some() {
+            return Err(DescribeFlowOperationErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::ZONE_AMBIGUOUS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeFlowOperationErrorModeled::InternalServerError(InternalServerError {
+                    message: Some("the firewall store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        // The operation finishes at `completed_at()` whether or not anybody
+        // asks, so a describe after that instant reports (and records)
+        // `COMPLETED`. Nothing else here writes.
+        let Some((firewall_arn, record)) = state.settled_flow_operation(
+            &input.firewall_arn,
+            &input.flow_operation_id,
+            ::std::time::SystemTime::now(),
+        ) else {
+            return Err(
+                DescribeFlowOperationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every member is read off the record: the scope reported is the one the
+        // start command defined the operation with, not whatever this request
+        // carried. `StatusMessage` stays absent — the model documents it as the
+        // reason an operation FAILED, and this one did not.
+        Ok(DescribeFlowOperationOutput {
+            firewall_arn: Some(firewall_arn),
+            availability_zone: record.availability_zone.clone(),
+            availability_zone_id: record.availability_zone_id.clone(),
+            vpc_endpoint_association_arn: record.vpc_endpoint_association_arn.clone(),
+            vpc_endpoint_id: record.vpc_endpoint_id.clone(),
+            flow_operation_id: Some(record.flow_operation_id.clone()),
+            flow_operation_type: Some(record.flow_operation_type.clone()),
+            flow_operation_status: Some(record.status.clone()),
+            status_message: None,
+            flow_request_timestamp: Some(crate::state::as_date_time(record.requested_at)),
+            flow_operation: Some(record.to_flow_operation()),
+        })
     }
 }

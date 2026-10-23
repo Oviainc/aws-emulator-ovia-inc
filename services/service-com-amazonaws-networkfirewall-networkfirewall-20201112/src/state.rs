@@ -11,9 +11,9 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Address, AnalysisResult, Attachment, EncryptionConfiguration, Firewall, FirewallMetadata,
-    FirewallPolicy, FirewallPolicyMetadata, FirewallPolicyResponse, FirewallStatus, MatchAttributes,
-    PerObjectStatus, PortRange, RuleGroup, RuleGroupResponse, SourceMetadata, SubnetMapping,
-    SummaryConfiguration, SyncState, Tag,
+    FirewallPolicy, FirewallPolicyMetadata, FirewallPolicyResponse, FirewallStatus, FlowFilter,
+    FlowOperation, FlowOperationMetadata, MatchAttributes, PerObjectStatus, PortRange, RuleGroup,
+    RuleGroupResponse, SourceMetadata, SubnetMapping, SummaryConfiguration, SyncState, Tag,
 };
 
 /// The ARN namespace (and SigV4 signing name) this service's ARNs carry, from the
@@ -51,6 +51,29 @@ pub const ATTACHMENT_CREATING: &str = "CREATING";
 pub const ATTACHMENT_READY: &str = "READY";
 /// See [`ATTACHMENT_CREATING`].
 pub const ATTACHMENT_DELETING: &str = "DELETING";
+
+/// `FlowOperationType` members (`smithy_query(query="shape",shape="FlowOperationType")`).
+pub const FLOW_OPERATION_FLUSH: &str = "FLOW_FLUSH";
+/// See [`FLOW_OPERATION_FLUSH`].
+pub const FLOW_OPERATION_CAPTURE: &str = "FLOW_CAPTURE";
+
+/// `FlowOperationStatus` members
+/// (`smithy_query(query="shape",shape="FlowOperationStatus")`).
+pub const FLOW_OPERATION_IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`FLOW_OPERATION_IN_PROGRESS`].
+pub const FLOW_OPERATION_COMPLETED: &str = "COMPLETED";
+
+/// How long after a flow start command (`StartFlowFlush`, `StartFlowCapture`) the
+/// operation leaves `IN_PROGRESS` for `COMPLETED`.
+///
+/// CHOSEN, not documented: AWS publishes no duration for a flow operation — only
+/// that a start command is asynchronous (`DescribeFlowOperation$StatusMessage` is
+/// "if the asynchronous operation fails ... the reason for the error or failure",
+/// and the status a start command reports is what the describe command is then
+/// polled for). It is deliberately non-zero so a caller that describes the
+/// operation immediately still observes `IN_PROGRESS`, and short enough that a
+/// test can wait it out.
+pub const FLOW_OPERATION_SPAN: Duration = Duration::from_millis(500);
 
 /// `ResourceStatus` members (`smithy_query(query="shape",shape="ResourceStatus")`).
 pub const RESOURCE_ACTIVE: &str = "ACTIVE";
@@ -143,6 +166,23 @@ pub const MAX_STORED_FIREWALL_POLICIES: usize = 1_000;
 
 /// How many rule groups this emulator keeps. See [`MAX_STORED_FIREWALLS`].
 pub const MAX_STORED_RULE_GROUPS: usize = 1_000;
+
+/// How many `FlowFilters` entries one flow operation may carry: "You can use up
+/// to 20 filters to configure a single flow operation"
+/// (`StartFlowFlush$FlowFilters`, and the same sentence on every other member
+/// that takes them). The model puts no length constraint on `FlowFilters`, so the
+/// handler is what enforces the documented ceiling.
+pub const MAX_FLOW_FILTERS: usize = 20;
+
+/// How many flow operations this emulator keeps per firewall.
+///
+/// CHOSEN, not an AWS quota: every start command retains a record for as long as
+/// its firewall lives, so without a ceiling a caller that loops grows the
+/// emulator's memory without bound. It is far above any workflow an emulator
+/// serves, and a request past it is refused with the modelled
+/// `ThrottlingException` ("Unable to process the request due to throttling
+/// limitations") — the only volume refusal a flow start command models.
+pub const MAX_STORED_FLOW_OPERATIONS: usize = 1_000;
 
 /// The highest `Capacity` a rule group may be created with here.
 ///
@@ -820,6 +860,10 @@ pub const PAGE_KIND_FIREWALLS: &str = "firewalls";
 /// stamps on its cursors. See [`PAGE_KIND_FIREWALLS`].
 pub const PAGE_KIND_FIREWALL_POLICIES: &str = "firewall-policies";
 
+/// The listing kind [`ListFlowOperations`](crate::ops::list_flow_operations)
+/// stamps on its cursors. See [`PAGE_KIND_FIREWALLS`].
+pub const PAGE_KIND_FLOW_OPERATIONS: &str = "flow-operations";
+
 /// Base64 of `<kind>:<key>` standing for "resume after this key" in that
 /// listing's order.
 ///
@@ -948,6 +992,17 @@ pub const RESOURCE_ALREADY_EXISTS_MESSAGE: &str = "A resource with the specified
 /// HTTP 400, "The token you provided is stale or isn't valid for the operation").
 pub const INVALID_TOKEN_MESSAGE: &str = "Update token isn't valid.";
 
+/// What a flow operation naming BOTH `AvailabilityZone` and
+/// `AvailabilityZoneId` is refused with.
+///
+/// The rule is the documented one, stated on `AvailabilityZoneId` of every
+/// operation that takes the pair: "Specify either AvailabilityZone or
+/// AvailabilityZoneId, not both. If you specify both, the request fails." The two
+/// members name the same scope two ways, so the message names the members and
+/// carries nothing from the request.
+pub const ZONE_AMBIGUOUS_MESSAGE: &str =
+    "Specify either AvailabilityZone or AvailabilityZoneId, not both.";
+
 /// A refusal whose message IS built from the request: a fixed stem, then the
 /// offending value in parameter brackets.
 ///
@@ -981,6 +1036,197 @@ pub struct SyncStateRecord {
     pub endpoint_id: String,
     /// An `AttachmentStatus` member.
     pub attachment_status: String,
+}
+
+/// One flow operation on a firewall, as persisted by a start command
+/// (`StartFlowFlush`, `StartFlowCapture`) and read back by
+/// `DescribeFlowOperation`.
+///
+/// A flow operation is scoped by the Availability Zone and/or the endpoint the
+/// start command named, so those members belong to the record rather than to the
+/// request that reads it: the describe command reports the scope the operation
+/// was started with.
+#[derive(Debug, Clone)]
+pub struct FlowOperationRecord {
+    /// `FlowOperationId`, and the key the record is stored under.
+    pub flow_operation_id: String,
+    /// A `FlowOperationType` member: which start command created this record.
+    pub flow_operation_type: String,
+    /// `AvailabilityZone` — the zone the operation is scoped to, if any.
+    pub availability_zone: Option<String>,
+    /// `AvailabilityZoneId` — the same scope named by zone id instead.
+    pub availability_zone_id: Option<String>,
+    /// `VpcEndpointAssociationArn` the operation is scoped to, if any.
+    pub vpc_endpoint_association_arn: Option<String>,
+    /// `VpcEndpointId` the operation is scoped to, if any.
+    pub vpc_endpoint_id: Option<String>,
+    /// `FlowOperation.MinimumFlowAgeInSeconds`.
+    pub minimum_flow_age_in_seconds: Option<i32>,
+    /// `FlowOperation.FlowFilters`, in the order the start command gave them.
+    pub flow_filters: Vec<FlowFilter>,
+    /// A `FlowOperationStatus` member.
+    pub status: String,
+    /// `FlowRequestTimestamp`: when the start command was accepted, and so the
+    /// instant the clock measures this operation's run from (see
+    /// [`FlowOperationRecord::completed_at`]).
+    pub requested_at: SystemTime,
+}
+
+impl FlowOperationRecord {
+    /// When the clock owes this operation its `IN_PROGRESS` -> `COMPLETED` move:
+    /// [`FLOW_OPERATION_SPAN`] after the start command that began it.
+    pub fn completed_at(&self) -> SystemTime {
+        self.requested_at + FLOW_OPERATION_SPAN
+    }
+
+    /// Apply the status move the clock already made due, and say whether
+    /// anything changed.
+    ///
+    /// A reporting operation calls this so a caller that waits out
+    /// [`FLOW_OPERATION_SPAN`] sees `COMPLETED` — the transition was owed at
+    /// [`FlowOperationRecord::completed_at`] whether or not anybody asked.
+    pub fn settle(&mut self, now: SystemTime) -> bool {
+        if self.status != FLOW_OPERATION_IN_PROGRESS || now < self.completed_at() {
+            return false;
+        }
+        self.status = FLOW_OPERATION_COMPLETED.to_string();
+        true
+    }
+
+    /// The `FlowOperation` shape for this record: the configuration the start
+    /// command defined the operation with.
+    pub fn to_flow_operation(&self) -> FlowOperation {
+        FlowOperation {
+            minimum_flow_age_in_seconds: self.minimum_flow_age_in_seconds,
+            flow_filters: Some(self.flow_filters.clone()),
+        }
+    }
+
+    /// The `FlowOperationMetadata` entry `ListFlowOperations` reports for this
+    /// record.
+    pub fn to_metadata(&self) -> FlowOperationMetadata {
+        FlowOperationMetadata {
+            flow_operation_id: Some(self.flow_operation_id.clone()),
+            flow_operation_type: Some(self.flow_operation_type.clone()),
+            flow_request_timestamp: Some(as_date_time(self.requested_at)),
+            flow_operation_status: Some(self.status.clone()),
+        }
+    }
+
+    /// The key this record is ordered and paginated by: the instant the start
+    /// command was accepted, then the operation's own id.
+    ///
+    /// `ListFlowOperations` "returns a list of all flow operations ran in a
+    /// specific firewall", so the listing order is the order they ran in. The id
+    /// breaks a tie between two operations started in the same nanosecond, which
+    /// makes the key unique and therefore usable as a page cursor.
+    pub fn sort_key(&self) -> String {
+        let nanos = self
+            .requested_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|since_epoch| since_epoch.as_nanos())
+            .unwrap_or_default();
+        format!("{nanos:020}:{}", self.flow_operation_id)
+    }
+}
+
+/// What a flow start command (`StartFlowFlush`, `StartFlowCapture`) defines its
+/// operation with: the firewall whose flow table it acts on, the scope it is
+/// narrowed to, and the filters that scope the flows it touches.
+///
+/// The two start commands take the SAME members, so they share one request
+/// shape here and differ only in the `FlowOperationType` they pass to
+/// [`ComAmazonawsNetworkfirewallNetworkfirewall20201112State::start_flow_operation`].
+#[derive(Debug, Clone)]
+pub struct FlowOperationRequest {
+    /// `FirewallArn` — required, and the firewall must be stored.
+    pub firewall_arn: String,
+    /// `AvailabilityZone`.
+    pub availability_zone: Option<String>,
+    /// `AvailabilityZoneId`.
+    pub availability_zone_id: Option<String>,
+    /// `VpcEndpointAssociationArn`.
+    pub vpc_endpoint_association_arn: Option<String>,
+    /// `VpcEndpointId`.
+    pub vpc_endpoint_id: Option<String>,
+    /// `MinimumFlowAgeInSeconds`.
+    pub minimum_flow_age_in_seconds: Option<i32>,
+    /// `FlowFilters`.
+    pub flow_filters: Vec<FlowFilter>,
+}
+
+/// Why a flow start command was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowStartBreach {
+    /// The request named both `AvailabilityZone` and `AvailabilityZoneId`,
+    /// which name the same scope two ways (see [`ZONE_AMBIGUOUS_MESSAGE`]).
+    ZoneAmbiguous,
+    /// More than [`MAX_FLOW_FILTERS`] filters were given; the count is carried
+    /// so the refusal can name it.
+    TooManyFilters(usize),
+    /// `FirewallArn` names no stored firewall.
+    FirewallNotFound,
+    /// The firewall already holds [`MAX_STORED_FLOW_OPERATIONS`] of them.
+    TooManyOperations,
+}
+
+/// How a `ListFlowOperations` request narrows the firewall's flow operations.
+///
+/// The listing "returns a list of all flow operations ran in a specific
+/// firewall. You can optionally narrow the request scope by specifying the
+/// operation type or Availability Zone associated with a firewall's flow
+/// operations", so each member that is given must agree with what the start
+/// command recorded.
+///
+/// Two rules make that precise, because the service holds no mapping between a
+/// zone NAME, a zone ID and an endpoint — the three ways a scope can be spelled:
+///
+/// * an operation that did not state the member being narrowed on is not
+///   narrowed out. One started without a scope was never narrowed to a zone or
+///   an endpoint at all (it covers the whole firewall), and one started with a
+///   DIFFERENT spelling of a scope cannot be shown to disagree with the request;
+/// * an operation that stated the same member with a different value did not run
+///   in the scope asked for, so it is left out.
+#[derive(Debug, Clone, Default)]
+pub struct FlowOperationFilter {
+    /// Keep only operations of this `FlowOperationType`.
+    pub flow_operation_type: Option<String>,
+    /// Keep only operations scoped to this `AvailabilityZone`, or to none.
+    pub availability_zone: Option<String>,
+    /// Keep only operations scoped to this `AvailabilityZoneId`, or to none.
+    pub availability_zone_id: Option<String>,
+    /// Keep only operations scoped to this `VpcEndpointAssociationArn`, or to none.
+    pub vpc_endpoint_association_arn: Option<String>,
+    /// Keep only operations scoped to this `VpcEndpointId`, or to none.
+    pub vpc_endpoint_id: Option<String>,
+}
+
+impl FlowOperationFilter {
+    /// Whether `record` is in the narrowed listing.
+    pub fn matches(&self, record: &FlowOperationRecord) -> bool {
+        let scopes = [
+            (&self.availability_zone, &record.availability_zone),
+            (&self.availability_zone_id, &record.availability_zone_id),
+            (
+                &self.vpc_endpoint_association_arn,
+                &record.vpc_endpoint_association_arn,
+            ),
+            (&self.vpc_endpoint_id, &record.vpc_endpoint_id),
+        ];
+        self.flow_operation_type
+            .as_ref()
+            .is_none_or(|wanted| *wanted == record.flow_operation_type)
+            && scopes.iter().all(|(wanted, stored)| {
+                match (wanted.as_ref(), stored.as_ref()) {
+                    (Some(wanted), Some(stored)) => wanted == stored,
+                    // An operation that did not state this member is not
+                    // narrowed out by it: either it named no scope at all and
+                    // covers the whole firewall, or it named the scope another
+                    // way, which no mapping here can compare.
+                    _ => true,
+                }
+            })
+    }
 }
 
 /// A firewall, as persisted. Every member `Firewall` / `FirewallStatus` reports
@@ -1024,6 +1270,12 @@ pub struct FirewallRecord {
     /// When `CreateFirewall` stored this record, and so the instant the clock
     /// measures this firewall's provisioning from (see [`FirewallRecord::ready_at`]).
     pub created_at: SystemTime,
+    /// Every flow operation started on this firewall and not yet dropped with
+    /// it, keyed by `FlowOperationId`. A flow operation acts on one firewall's
+    /// flow table and is identified by `FirewallArn` + `FlowOperationId`, so it
+    /// is held inside that firewall's record and deleting the firewall drops its
+    /// flow operations with it.
+    pub flow_operations: HashMap<String, FlowOperationRecord>,
 }
 
 impl FirewallRecord {
@@ -1305,6 +1557,111 @@ impl ComAmazonawsNetworkfirewallNetworkfirewall20201112State {
         resolve(&self.firewall_arn_index, name, arn, |key| {
             self.firewalls.contains_key(key)
         })
+    }
+
+    /// Accept a flow operation of `operation_type` on the firewall `request`
+    /// names, and answer the record it stored.
+    ///
+    /// The checks are the documented ones, in the order a client can observe
+    /// them: the two Availability Zone members name one scope two ways, so
+    /// naming both is a bad request ("Specify either AvailabilityZone or
+    /// AvailabilityZoneId, not both. If you specify both, the request fails");
+    /// `FlowFilters` is capped at [`MAX_FLOW_FILTERS`] ("You can use up to 20
+    /// filters to configure a single flow operation"); and `FirewallArn` is a
+    /// reference to a firewall this service holds, so an ARN no stored firewall
+    /// carries locates no resource.
+    ///
+    /// The operation starts asynchronously, so the record lands
+    /// [`FLOW_OPERATION_IN_PROGRESS`] and the clock owes it its move to
+    /// [`FLOW_OPERATION_COMPLETED`] at [`FlowOperationRecord::completed_at`].
+    pub fn start_flow_operation(
+        &mut self,
+        operation_type: &str,
+        request: FlowOperationRequest,
+        now: SystemTime,
+    ) -> Result<(String, FlowOperationRecord), FlowStartBreach> {
+        if request.availability_zone.is_some() && request.availability_zone_id.is_some() {
+            return Err(FlowStartBreach::ZoneAmbiguous);
+        }
+        if request.flow_filters.len() > MAX_FLOW_FILTERS {
+            return Err(FlowStartBreach::TooManyFilters(request.flow_filters.len()));
+        }
+        let key = self
+            .resolve_firewall(None, Some(&request.firewall_arn))
+            .map_err(|_| FlowStartBreach::FirewallNotFound)?;
+        let firewall = self
+            .firewalls
+            .get_mut(&key)
+            .ok_or(FlowStartBreach::FirewallNotFound)?;
+        if firewall.flow_operations.len() >= MAX_STORED_FLOW_OPERATIONS {
+            return Err(FlowStartBreach::TooManyOperations);
+        }
+
+        let record = FlowOperationRecord {
+            flow_operation_id: new_uuid(),
+            flow_operation_type: operation_type.to_string(),
+            availability_zone: request.availability_zone,
+            availability_zone_id: request.availability_zone_id,
+            vpc_endpoint_association_arn: request.vpc_endpoint_association_arn,
+            vpc_endpoint_id: request.vpc_endpoint_id,
+            minimum_flow_age_in_seconds: request.minimum_flow_age_in_seconds,
+            flow_filters: request.flow_filters,
+            status: FLOW_OPERATION_IN_PROGRESS.to_string(),
+            requested_at: now,
+        };
+        firewall
+            .flow_operations
+            .insert(record.flow_operation_id.clone(), record.clone());
+        Ok((firewall.firewall_arn.clone(), record))
+    }
+
+    /// The flow operation `flow_operation_id` names on the firewall
+    /// `firewall_arn` names, with the status move the clock already made due
+    /// applied, or `None` when either names nothing stored.
+    ///
+    /// A flow operation is identified by the PAIR, so an id that exists on
+    /// another firewall is not found here: `DescribeFlowOperation` takes
+    /// `FirewallArn` as a required member beside the id.
+    pub fn settled_flow_operation(
+        &mut self,
+        firewall_arn: &str,
+        flow_operation_id: &str,
+        now: SystemTime,
+    ) -> Option<(String, FlowOperationRecord)> {
+        let key = self.resolve_firewall(None, Some(firewall_arn)).ok()?;
+        let firewall = self.firewalls.get_mut(&key)?;
+        let stored_arn = firewall.firewall_arn.clone();
+        let operation = firewall.flow_operations.get_mut(flow_operation_id)?;
+        operation.settle(now);
+        Some((stored_arn, operation.clone()))
+    }
+
+    /// The flow operations of the firewall `firewall_arn` names that `filter`
+    /// keeps, ordered by [`FlowOperationRecord::sort_key`] and each with the
+    /// status move the clock already made due applied, or `None` when the ARN
+    /// names no stored firewall.
+    ///
+    /// The pairs are `(cursor key, metadata)`, which is what [`paginate`] cuts
+    /// into a page.
+    pub fn settled_flow_operation_page(
+        &mut self,
+        firewall_arn: &str,
+        filter: &FlowOperationFilter,
+        now: SystemTime,
+    ) -> Option<Vec<(String, FlowOperationMetadata)>> {
+        let key = self.resolve_firewall(None, Some(firewall_arn)).ok()?;
+        let firewall = self.firewalls.get_mut(&key)?;
+        for operation in firewall.flow_operations.values_mut() {
+            operation.settle(now);
+        }
+        let mut entries: Vec<(String, FlowOperationMetadata)> = firewall
+            .flow_operations
+            .values()
+            .filter(|operation| filter.matches(operation))
+            .map(|operation| (operation.sort_key(), operation.to_metadata()))
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        Some(entries)
     }
 
     /// The `FirewallPolicyName` the given name and/or ARN identifies.
