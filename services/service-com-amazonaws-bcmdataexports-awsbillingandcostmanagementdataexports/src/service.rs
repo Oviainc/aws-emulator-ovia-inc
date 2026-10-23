@@ -22,10 +22,11 @@
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   generated routing table; see the note on that method for where this service
+//!   authorizes its callers instead.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. THIS SERVICE words every boundary input-constraint refusal
+//!   through [`validation`], the one renderer for its modelled `ValidationException`.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -40,10 +41,10 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
+
+pub(crate) mod validation;
 
 /// The `com-amazonaws-bcmdataexports-awsbillingandcostmanagementdataexports` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -88,25 +89,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
         // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
+        // correctly; `None` (the default) lets the generated routing table resolve it.
+        //
+        // AUTHORIZATION IS NOT HERE. This service authorizes in the handlers whose model
+        // declares `AccessDeniedException` (403) — `CreateExport`, `TagResource`,
+        // `UntagResource`, `ListTagsForResource` — because the decision is per ACTION and
+        // per RESOURCE, which only the operation knows: see
+        // `crate::state::authorization`, which resolves the caller through STS's own store
+        // and evaluates the IAM store's documents through
+        // `service_common::iam_authorization`. An operation whose model declares no 403 is
+        // not judged, since answering a caller with an error its operation does not model
+        // would be a different divergence.
         let _ = req;
         None
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound). This service words every
+        // one of them through the ONE renderer in [`validation`], so the code
+        // (`ValidationException`) and the message are replaced together and no operation
+        // can word a refusal its own way. `None` from there keeps the framework's
+        // wording, which is what an unworded violation class gets.
+        validation::refused(refusal)
     }
 
     fn override_routing_error(

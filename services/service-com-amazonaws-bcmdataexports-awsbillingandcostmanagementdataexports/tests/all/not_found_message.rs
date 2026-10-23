@@ -118,16 +118,33 @@ fn rows() -> Vec<Row> {
 }
 
 /// Every request that hands an ARN to this service, for the ARN in `row`.
+///
+/// `ListTagsForResource` is included only for an ARN in the caller's OWN account: the
+/// tagging path validates the ARN's account BEFORE any lookup and refuses an ARN of
+/// another account with the modelled `ValidationException` instead of looking it up at
+/// all (`tests/all/tagging_arn_validation.rs` is where that rule is asserted), so a
+/// foreign-account ARN never reaches the lookup THIS rule is about.
 fn requests(row: &Row, export: &Value) -> Vec<(&'static str, Value)> {
-    vec![
+    let mut requests = vec![
         ("GetExport", json!({ "ExportArn": row.arn })),
         ("DeleteExport", json!({ "ExportArn": row.arn })),
         (
             "UpdateExport",
             json!({ "ExportArn": row.arn, "Export": export }),
         ),
-        ("ListTagsForResource", json!({ "ResourceArn": row.arn })),
-    ]
+    ];
+    if names_own_account(&row.arn) {
+        requests.push((
+            "ListTagsForResource",
+            json!({ "ResourceArn": row.arn }),
+        ));
+    }
+    requests
+}
+
+/// Whether `arn`'s account segment is this emulator's one account.
+fn names_own_account(arn: &str) -> bool {
+    arn.split(':').nth(4) == Some(::engine::emulator_account_id())
 }
 
 /// Assert the 404 for `row`/`operation` and return the message it carried.

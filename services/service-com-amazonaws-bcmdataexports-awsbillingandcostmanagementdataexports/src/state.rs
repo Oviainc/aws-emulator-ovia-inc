@@ -20,18 +20,40 @@
 //! nothing to persist and nothing to mutate, and `GetTable` (with `ListTables`, which
 //! reports the same entries) must answer the same catalog on every call. It lives beside
 //! the store, not inside one operation file, for the same reason the ARN rule does: two
-//! operations read it.
+//! operations read it. [`query`] reads a submitted `DataQuery` against that catalog, for
+//! the two operations that accept an export definition.
+//!
+//! Two more things the store holds, each read by a layer rather than by one handler:
+//!
+//! * the recorded EXECUTIONS of an export ([`StoredExecution`]), which `GetExecution`
+//!   reports. Nothing in this emulator creates one — see that type's own note.
+//!
+//! [`authorization`] is beside them: who a request speaks for and whether IAM lets it do
+//! what it asks, for the operations whose model declares `AccessDeniedException`. It holds
+//! nothing itself — the principal comes from STS's store and the policies from IAM's — so
+//! it is a reader of other services' state rather than a field of this one.
 
 use crate::ops::types::{
-    Export, ExportStatus, ResourceNotFoundException, ResourceTag, ValidationException,
-    ValidationExceptionField,
+    ExecutionStatus, Export, ExportStatus, ResourceNotFoundException, ResourceTag,
+    ValidationException, ValidationExceptionField,
 };
 use std::collections::BTreeMap;
 
+pub mod authorization;
 pub mod catalog;
+pub mod query;
 
 // The catalog's types, data and refusals are reached as `crate::state::…` by the two
 // operations that read it, exactly as they were before the catalog grew its own module.
+// The query reader is reached as `crate::state::…` by the two operations that accept an
+// export definition, for the same reason the catalog is: both of them read it.
+pub use query::{query_tables, validate_data_query, QueryRefusal};
+
+// The authorization decision is reached as `crate::state::…` by every operation whose
+// model declares `AccessDeniedException`; see [`authorization`] for why the others are
+// not judged.
+pub use authorization::authorize;
+
 pub use catalog::{
     table_spec, unknown_table, ColumnGroup, ColumnSpec, TablePropertySpec, TableSpec,
     PROPERTY_BILLING_VIEW_ARN, PROPERTY_DEPRECATED, PROPERTY_FALSE, PROPERTY_FILTER,
@@ -55,6 +77,14 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// names nothing: the Smithy shape the ARN identifies.
 pub const EXPORT_RESOURCE_TYPE: &str = "Export";
 
+/// The `ResourceType` a `ResourceNotFoundException` reports for an `ExecutionId` that
+/// names no execution of the export it was asked about.
+pub const EXECUTION_RESOURCE_TYPE: &str = "Execution";
+
+/// The resource-ARN segment every export of this service is named under:
+/// `export/<Export.Name>`.
+pub const EXPORT_RESOURCE_PREFIX: &str = "export/";
+
 /// The `ExportStatusCode` reported for an export that is operating normally. One of
 /// `ExportStatusCode`'s two modelled values (see
 /// `crate::ops::types::EXPORT_STATUS_CODE_VALUES`: `HEALTHY`, `UNHEALTHY`).
@@ -77,6 +107,28 @@ pub const SERVICE_CODE: &str = SIGNING_NAME;
 
 /// The quota a `ServiceQuotaExceededException` from `CreateExport` names.
 pub const EXPORTS_PER_ACCOUNT_QUOTA_CODE: &str = "ExportsPerAccount";
+
+/// One recorded execution of an export: the delivery AWS runs for it, as
+/// `GetExecution`/`ListExecutions` report it.
+///
+/// NOTHING in this emulator creates one: an execution is the record of a data-plane
+/// delivery (a query run against the billing data and a file written to the caller's S3
+/// bucket), and this emulator runs no such delivery — so it reports no execution rather
+/// than a status for work nothing performed. The store is here, and `GetExecution` reads
+/// it, so an execution a delivery records is the one every reader answers from.
+#[derive(Debug, Clone)]
+pub struct StoredExecution {
+    /// The id this execution is addressed by, unique within its export.
+    pub execution_id: String,
+    /// The ARN of the export that generated it.
+    pub export_arn: String,
+    /// The status of this execution.
+    pub status: ExecutionStatus,
+    /// "This export data is a snapshot from when the execution was generated"
+    /// (smithy_query shape `GetExecutionResponse`, member `Export`): the definition as it
+    /// stood then, which a later `UpdateExport` does not change.
+    pub export: Export,
+}
 
 /// One persisted data export: the submitted definition, the server-owned status, and
 /// the tags `CreateExport` associated with it.
@@ -105,6 +157,26 @@ pub struct ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState
     /// The primary store, keyed by the minted export ARN. `BTreeMap` so every list
     /// walks the exports in one stable order and a page token can name a position in it.
     pub exports: BTreeMap<String, StoredExport>,
+    /// The recorded executions, keyed by `(export ARN, execution id)` — the pair
+    /// `GetExecution` addresses one by. `BTreeMap` so the executions of one export are a
+    /// contiguous range in one stable order, which is the order `ListExecutions` will page
+    /// over once it is implemented (it is still a stub, under its own issue).
+    pub executions: BTreeMap<(String, String), StoredExecution>,
+}
+
+impl ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState {
+    /// The recorded execution `execution_id` of the export `export_arn`, if there is one.
+    pub fn execution(&self, export_arn: &str, execution_id: &str) -> Option<&StoredExecution> {
+        self.executions
+            .get(&(export_arn.to_string(), execution_id.to_string()))
+    }
+
+    /// Record `execution`, replacing any earlier record of the same execution of the same
+    /// export.
+    pub fn insert_execution(&mut self, execution: StoredExecution) {
+        let key = (execution.export_arn.clone(), execution.execution_id.clone());
+        self.executions.insert(key, execution);
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -151,7 +223,11 @@ fn is_arn_region_segment(value: &str) -> bool {
 /// Built through `engine::emulator_arn`, so the account segment is the one canonical
 /// emulator account id rather than a literal.
 pub fn export_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn(SIGNING_NAME, region, &format!("export/{name}"))
+    ::engine::emulator_arn(
+        SIGNING_NAME,
+        region,
+        &format!("{EXPORT_RESOURCE_PREFIX}{name}"),
+    )
 }
 
 /// The `Message` every `ResourceNotFoundException` of this service carries.
@@ -174,6 +250,73 @@ pub fn export_not_found(arn: &str) -> ResourceNotFoundException {
         resource_type: EXPORT_RESOURCE_TYPE.to_string(),
     }
 }
+
+/// The modelled 404 for an `ExecutionId` that names no execution of the export it was
+/// asked about.
+///
+/// It carries the same fixed [`EXPORT_NOT_FOUND_MESSAGE`] as every other lookup of this
+/// service that resolves to nothing, for the reason stated there: the identity of what
+/// was not found is reported in the modelled `ResourceId`, not in the prose.
+pub fn execution_not_found(execution_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: EXPORT_NOT_FOUND_MESSAGE.to_string(),
+        resource_id: execution_id.to_string(),
+        resource_type: EXECUTION_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The message a tagging operation refuses a `ResourceArn` of another account with.
+///
+/// Recorded AWS behavior: an ARN that names a different account is refused by the tagging
+/// operations with this sentence — which says nothing about the ARN, because the refusal
+/// is reached BEFORE any lookup and so cannot report on a resource it never consulted.
+/// (The recorded text is an example of the sentence; the requirement is the
+/// `ValidationException` classification and that the refusal does not depend on
+/// existence.)
+pub const RESOURCE_NOT_TAGGABLE_MESSAGE: &str = "Resource doesn't support tagging";
+
+/// The modelled 400 a tagging operation refuses an unusable `ResourceArn` with.
+fn not_taggable() -> ValidationException {
+    ValidationException {
+        message: RESOURCE_NOT_TAGGABLE_MESSAGE.to_string(),
+        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: "ResourceArn".to_string(),
+            message: "Must name a resource of this account.".to_string(),
+        }]),
+    }
+}
+
+/// Refuse `arn` unless it names a resource of THIS account.
+///
+/// AWS validates a tagging ARN's account before any existence lookup, so an ARN naming
+/// another account is a `ValidationException` (400) rather than a
+/// `ResourceNotFoundException`: no caller of this account can tag another account's
+/// resource, whatever this account holds, and deciding it without a lookup is exactly
+/// what keeps the answer from reporting on a resource AWS never consults — the
+/// cross-tenant probe this ordering rules out.
+///
+/// What is left to check is only the ACCOUNT: the modelled `Arn` pattern
+/// (`^arn:aws[-a-z0-9]*:(bcm-data-exports):[-a-z0-9]*:[0-9]{12}:[-a-zA-Z0-9/:_]+$`) is
+/// already enforced at the boundary, so the partition, the service and the shape of the
+/// account and resource segments hold by the time a handler runs. The RESOURCE segment is
+/// deliberately not judged here: an ARN of this account whose resource names no export is
+/// a resource this service looked for and did not find, which is the 404.
+pub fn validate_taggable_resource_arn(arn: &str) -> Result<(), ValidationException> {
+    let names_this_account = arn
+        .split(':')
+        .nth(ARN_ACCOUNT_SEGMENT)
+        .is_some_and(|account| account == ::engine::emulator_account_id());
+    if names_this_account {
+        Ok(())
+    } else {
+        Err(not_taggable())
+    }
+}
+
+/// The 0-based position of the account segment in an ARN
+/// (`arn:<partition>:<service>:<region>:<account>:<resource>`).
+const ARN_ACCOUNT_SEGMENT: usize = 4;
 
 /// The status a freshly created export carries.
 pub fn fresh_status(at: ::aws_smithy_types::DateTime) -> ExportStatus {
@@ -373,7 +516,7 @@ const MESSAGE_VALUE_CLIP: usize = 128;
 
 /// `value` as a refusal message quotes it: itself when short, else its first
 /// [`MESSAGE_VALUE_CLIP`] characters and an ellipsis.
-fn clip_for_message(value: &str) -> String {
+pub(crate) fn clip_for_message(value: &str) -> String {
     if value.chars().count() <= MESSAGE_VALUE_CLIP {
         return value.to_string();
     }

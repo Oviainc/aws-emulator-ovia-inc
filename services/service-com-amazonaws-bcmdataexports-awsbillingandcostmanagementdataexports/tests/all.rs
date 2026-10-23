@@ -15,8 +15,14 @@
 mod catalog_dictionary;
 #[path = "all/catalog_schema.rs"]
 mod catalog_schema;
+#[path = "all/execution_lookup.rs"]
+mod execution_lookup;
+#[path = "all/export_definition_validation.rs"]
+mod export_definition_validation;
 #[path = "all/export_lifecycle.rs"]
 mod export_lifecycle;
+#[path = "all/front_door_authorization.rs"]
+mod front_door_authorization;
 #[path = "all/not_found_message.rs"]
 mod not_found_message;
 #[path = "all/resource_tagging.rs"]
@@ -27,3 +33,7 @@ mod state_roundtrip;
 mod table_catalog;
 #[path = "all/table_listing.rs"]
 mod table_listing;
+#[path = "all/tagging_arn_validation.rs"]
+mod tagging_arn_validation;
+#[path = "all/validation_message_rendering.rs"]
+mod validation_message_rendering;

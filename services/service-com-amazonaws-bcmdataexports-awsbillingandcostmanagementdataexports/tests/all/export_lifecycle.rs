@@ -40,6 +40,10 @@ const SIGNING_NAME: &str = "bcm-data-exports";
 /// service mints for these requests.
 const REGION: &str = "us-east-1";
 
+/// The access-key id these requests present unless a suite varies it: the AWS
+/// documentation's own example id.
+const DEFAULT_ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+
 /// `Export.Name`: `length 1..128`, `pattern ^[0-9A-Za-z\-_]+$`
 /// (smithy_query shape `Export`, member `Name`).
 const NAME_MAX_LEN: usize = 128;
@@ -55,7 +59,14 @@ pub(crate) struct Client {
 
 impl Client {
     pub(crate) fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        Self::with_engine(Arc::new(engine::InMemoryEngine::new()))
+    }
+
+    /// An in-process client over an engine the CALLER holds, so a suite that has to
+    /// inspect or seed this service's store — a record no operation of this service
+    /// writes, such as a permission grant or a recorded execution — reads the SAME store
+    /// the handlers do.
+    pub(crate) fn with_engine(engine: Arc<engine::InMemoryEngine>) -> Self {
         let mut router = MultiServiceRouter::new();
         // The signature itself is not under test here; routing and the handlers are.
         router.set_request_authentication(false);
@@ -77,6 +88,18 @@ impl Client {
         operation: &str,
         body: &Value,
     ) -> (u16, Value) {
+        self.call_signed(DEFAULT_ACCESS_KEY_ID, region, operation, body)
+            .await
+    }
+
+    /// Call `operation` with a credential scope naming `access_key_id` and `region`.
+    async fn call_signed(
+        &self,
+        access_key_id: &str,
+        region: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -88,7 +111,7 @@ impl Client {
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261021/{region}/{SIGNING_NAME}/aws4_request, SignedHeaders=host;x-amz-target, Signature=0"
+                    "AWS4-HMAC-SHA256 Credential={access_key_id}/20261021/{region}/{SIGNING_NAME}/aws4_request, SignedHeaders=host;x-amz-target, Signature=0"
                 ),
             )
             .body(Bytes::from(
