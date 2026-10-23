@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTrail
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTrail`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Changes the settings of a trail already in the shared trail registry
+//! (`crate::state`) and reports the stored trail back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTrail::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every member besides `Name` is optional, and the ones the request carries are the
+//! ones that change: an absent member leaves the stored value alone, which is what
+//! makes the operation `@idempotent`. The trail is addressed the way every trail
+//! operation addresses one (a bare name in the caller's Region, or a trail ARN), and —
+//! as the model documents — the call runs only in the Region the trail was created in.
 //!
 //! ## Shape of an operation
 //!
@@ -362,18 +361,192 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTrail` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTrailErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTrail"))
+        let region = crate::state::request_region(ctx.parts());
+
+        // The identifier is read FIRST, so a malformed one is refused as the form it
+        // was written in whatever else the request carries. `resolve_for_mutation`
+        // below reads it again when it locates the trail; this is the same reading,
+        // which is why both answer the same error for the same value.
+        crate::state::parse_trail_identifier(&input.name).map_err(identifier_error)?;
+
+        // The documented bounds on the members this request may carry. They are the
+        // bounds `CreateTrail` applies, because they come from the same model docs:
+        // the maximum length of an S3 key prefix and of an SNS topic name.
+        if let Some(prefix) = input
+            .s3_key_prefix
+            .as_deref()
+            .filter(|p| p.chars().count() > crate::state::S3_KEY_PREFIX_MAX_LEN)
+        {
+            return Err(UpdateTrailErrorModeled::InvalidS3PrefixException(
+                InvalidS3PrefixException {
+                    message: Some(format!(
+                        "S3KeyPrefix is {} characters long; the maximum length is {} characters",
+                        prefix.chars().count(),
+                        crate::state::S3_KEY_PREFIX_MAX_LEN
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if let Some(topic) = input
+            .sns_topic_name
+            .as_deref()
+            .filter(|t| t.chars().count() > crate::state::SNS_TOPIC_NAME_MAX_LEN)
+        {
+            return Err(UpdateTrailErrorModeled::InvalidSnsTopicNameException(
+                InvalidSnsTopicNameException {
+                    message: Some(format!(
+                        "SnsTopicName is {} characters long; the maximum length is {} characters",
+                        topic.chars().count(),
+                        crate::state::SNS_TOPIC_NAME_MAX_LEN
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateTrailErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "UpdateTrail needs the CloudTrail trail registry, which this engine \
+                     does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // "UpdateTrail must be called from the Region in which the trail was created;
+        // otherwise, an InvalidHomeRegionException is thrown."
+        let located = store
+            .resolve_for_mutation(&input.name, &region)
+            .map_err(identifier_error)?;
+        let record = match located {
+            crate::state::TrailForMutation::Found(record) => record,
+            crate::state::TrailForMutation::AddressedInAnotherRegion { name, addressed } => {
+                return Err(UpdateTrailErrorModeled::InvalidHomeRegionException(
+                    InvalidHomeRegionException {
+                        message: Some(format!(
+                            "Trail {name} was addressed in {addressed}, but this request was \
+                             made in {region}: a trail is updated from the Region it was \
+                             created in"
+                        )),
+                    },
+                )
+                .into());
+            }
+            crate::state::TrailForMutation::HomedInAnotherRegion { name, home_region } => {
+                return Err(UpdateTrailErrorModeled::InvalidHomeRegionException(
+                    InvalidHomeRegionException {
+                        message: Some(format!(
+                            "Trail {name} was created in {home_region}, not in {region}: a \
+                             trail is updated from the Region it was created in"
+                        )),
+                    },
+                )
+                .into());
+            }
+            crate::state::TrailForMutation::Absent => {
+                return Err(UpdateTrailErrorModeled::TrailNotFoundException(
+                    TrailNotFoundException {
+                        message: Some(crate::state::unknown_trail_message(&input.name)),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // Each member the request carries replaces the stored value; each member it
+        // leaves out keeps the one the trail already has. Neither the trail's name,
+        // its ARN nor its home Region is a member of this request, so none of them
+        // moves — and the logging state the Start/StopLogging pair owns is untouched.
+        if let Some(bucket) = input.s3_bucket_name {
+            record.s3_bucket_name = bucket;
+        }
+        replace_optional(&mut record.s3_key_prefix, input.s3_key_prefix);
+        if let Some(topic) = input.sns_topic_name {
+            // The trail keeps the topic's ARN, completed from a bare name the way
+            // `CreateTrail` completes it.
+            record.sns_topic_arn = (!topic.is_empty())
+                .then(|| crate::state::sns_topic_arn(&record.home_region, &topic));
+            record.sns_topic_name = (!topic.is_empty()).then_some(topic);
+        }
+        if let Some(include_global) = input.include_global_service_events {
+            record.include_global_service_events = include_global;
+        }
+        if let Some(multi_region) = input.is_multi_region_trail {
+            record.is_multi_region_trail = multi_region;
+        }
+        // `EnableLogFileValidation` is the request's name for the trail's
+        // `LogFileValidationEnabled`.
+        if let Some(validation) = input.enable_log_file_validation {
+            record.log_file_validation_enabled = validation;
+        }
+        replace_optional(
+            &mut record.cloud_watch_logs_log_group_arn,
+            input.cloud_watch_logs_log_group_arn,
+        );
+        replace_optional(
+            &mut record.cloud_watch_logs_role_arn,
+            input.cloud_watch_logs_role_arn,
+        );
+        replace_optional(&mut record.kms_key_id, input.kms_key_id);
+        if let Some(organization_trail) = input.is_organization_trail {
+            record.is_organization_trail = organization_trail;
+        }
+        if let Some(recursive) = input.recursive_logging {
+            record.recursive_logging = recursive;
+        }
+
+        // Report the stored record, so the response and every later read of this
+        // trail are the same values.
+        Ok(UpdateTrailOutput {
+            name: Some(record.name.clone()),
+            s3_bucket_name: Some(record.s3_bucket_name.clone()),
+            s3_key_prefix: record.s3_key_prefix.clone(),
+            // Deprecated in the model ("This field is no longer in use. Use
+            // SnsTopicARN."), so only the ARN is reported.
+            sns_topic_name: None,
+            sns_topic_arn: record.sns_topic_arn.clone(),
+            include_global_service_events: Some(record.include_global_service_events),
+            is_multi_region_trail: Some(record.is_multi_region_trail),
+            trail_arn: Some(record.trail_arn.clone()),
+            log_file_validation_enabled: Some(record.log_file_validation_enabled),
+            cloud_watch_logs_log_group_arn: record.cloud_watch_logs_log_group_arn.clone(),
+            cloud_watch_logs_role_arn: record.cloud_watch_logs_role_arn.clone(),
+            kms_key_id: record.kms_key_id.clone(),
+            is_organization_trail: Some(record.is_organization_trail),
+            recursive_logging: Some(record.recursive_logging),
+        })
+    }
+}
+
+/// The modelled refusal for an identifier that could not be read at all: a value
+/// shaped like an ARN that is not a trail ARN is refused as a bad ARN, and a bare
+/// name outside the documented name rules as a bad name.
+fn identifier_error(rejection: crate::state::IdentifierRejection) -> UpdateTrailErrorModeled {
+    match rejection {
+        crate::state::IdentifierRejection::InvalidArn(message) => {
+            UpdateTrailErrorModeled::CloudTrailARNInvalidException(CloudTrailARNInvalidException {
+                message: Some(message),
+            })
+        }
+        crate::state::IdentifierRejection::InvalidName(message) => {
+            UpdateTrailErrorModeled::InvalidTrailNameException(InvalidTrailNameException {
+                message: Some(message),
+            })
+        }
+    }
+}
+
+/// Apply an optional string member to the value the trail holds for it.
+///
+/// A member the request leaves out keeps the stored value. A member it carries
+/// replaces it — and an EMPTY value names no bucket prefix, topic, log group, role or
+/// key, so it drops the association rather than storing a blank identifier.
+fn replace_optional(stored: &mut Option<String>, given: Option<String>) {
+    if let Some(value) = given {
+        *stored = (!value.is_empty()).then_some(value);
     }
 }

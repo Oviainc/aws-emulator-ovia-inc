@@ -3,12 +3,13 @@
 //! Engine state for the com-amazonaws-opensearchserverless-opensearchserverless service.
 //!
 //! This holds the resources this slice serves — the OpenSearch Serverless
-//! **collection**, the **collection group**, the **security policy** and the **data access
-//! policy** — plus everything more than one handler of those resources needs: the
-//! server-derived fields (the minted ids, the ARNs, the endpoints derived from a collection
-//! id, the epoch-millisecond timestamps), the clock-owed `CREATING -> ACTIVE` transition a
-//! just-created collection settles through, the opaque page token `ListCollections` hands
-//! out, and the `clientToken` replay index the `@idempotent` creates read.
+//! **collection**, the **collection group**, the **security policy**, the **data access
+//! policy** and the **security configuration** — plus everything more than one handler of
+//! those resources needs: the server-derived fields (the minted ids, the ARNs, the
+//! endpoints derived from a collection id, the epoch-millisecond timestamps), the
+//! clock-owed `CREATING -> ACTIVE` transition a just-created collection settles through,
+//! the opaque page token a listing hands out, and the `clientToken` replay index the
+//! `@idempotent` creates read.
 //!
 //! `src/ops/mod.rs` is generated, so a helper more than one operation reaches lives here
 //! rather than in a second module under `src/ops/`.
@@ -20,7 +21,9 @@ use crate::ops::types::{
     AccessPolicyDetail, CapacityDetails, CollectionDetail, CollectionErrorDetail,
     CollectionGroupCapacityLimits, CollectionGroupDetail, CollectionGroupErrorDetail,
     CollectionSummary, CreateCollectionDetail, CreateCollectionGroupDetail, CurrentCapacity,
-    DeleteCollectionDetail, FipsEndpoints, SecurityPolicyDetail, Tag, VectorOptions,
+    DeleteCollectionDetail, FipsEndpoints, IamFederationConfigOptions,
+    IamIdentityCenterConfigOptions, SamlConfigOptions, SecurityConfigDetail,
+    SecurityConfigSummary, SecurityPolicyDetail, Tag, VectorOptions,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -133,6 +136,29 @@ pub const MAX_COLLECTIONS: usize = 50;
 /// quota page: 20 encryption policies and 20 network policies per account.
 pub const MAX_SECURITY_POLICIES_PER_TYPE: usize = 20;
 
+/// The account's quota for security configurations of ONE type in one Region: 50
+/// (adjustable on request, so this is the DEFAULT quota), which is what the real service's
+/// own refusal names — "Your request exceeds the limit for saml policies in this AWS
+/// account. The limit is 50." — and the same order as the collection quota above, not the
+/// 20 the encryption/network policy rows carry. Counted per `SecurityConfigType`, as the
+/// policy quota above is counted per `SecurityPolicyType`.
+pub const MAX_SECURITY_CONFIGS_PER_TYPE: usize = 50;
+
+/// The `sessionTimeout` a SAML security configuration carries when the create request
+/// names none, from `SamlConfigOptions$sessionTimeout`'s own documentation: "The session
+/// timeout, in minutes. Default is 60 minutes".
+pub const DEFAULT_SAML_SESSION_TIMEOUT: i32 = 60;
+
+/// The `userAttribute` an IAM Identity Center configuration carries when the create
+/// request names none, from `CreateIamIdentityCenterConfigOptions$userAttribute`'s own
+/// documentation: "Defaults to `UserId`".
+pub const DEFAULT_IDENTITY_CENTER_USER_ATTRIBUTE: &str = "UserId";
+
+/// The `groupAttribute` an IAM Identity Center configuration carries when the create
+/// request names none, from `CreateIamIdentityCenterConfigOptions$groupAttribute`'s own
+/// documentation: "Defaults to `GroupId`".
+pub const DEFAULT_IDENTITY_CENTER_GROUP_ATTRIBUTE: &str = "GroupId";
+
 /// The account's data-access-policy quota in one Region, from the same "Quotas for Amazon
 /// OpenSearch Serverless" page: 100 data access policies per account (adjustable on
 /// request, so this is the DEFAULT quota). `AccessPolicyType` has the single value `data`,
@@ -149,12 +175,12 @@ pub const MAX_ACCESS_POLICIES: usize = 100;
 /// fits.
 pub const MAX_COLLECTION_GROUPS: usize = MAX_COLLECTIONS;
 
-/// The page bound `ListCollections` applies when the caller names none, from
-/// `ListCollectionsRequest$maxResults`' own documentation: "The maximum number of results
-/// to return. Default is 20."
+/// The page bound a listing applies when the caller names none, from each listing's own
+/// `maxResults` documentation: "The maximum number of results to return. Default is 20."
+/// (`ListCollectionsRequest`), "The default is 20." (`ListSecurityConfigsRequest`).
 pub const DEFAULT_PAGE_SIZE: i32 = 20;
 
-/// The largest page `ListCollections` serves: the maximum of `maxResults`' own
+/// The largest page a listing serves: the maximum of `maxResults`' own
 /// `@range(min: 1, max: 100)`.
 pub const MAX_PAGE_SIZE: i32 = 100;
 
@@ -567,6 +593,77 @@ impl SecurityPolicyRecord {
     }
 }
 
+/// The `SecurityConfigId` the configuration `name` carries under `kind`:
+/// `<type>/<account-id>/<name>`, the form AWS's own security-configuration ids take (the
+/// `GetSecurityConfig` CLI example addresses one as `saml/123456789012/myprovider`). It is
+/// derived from the type, the account and the name alone, so every reader of a record
+/// reports the same id, and it stays inside `SecurityConfigId`'s `@length(max: 100)`
+/// because `SecurityConfigType` is at most 17 characters and `ConfigName` at most 32.
+pub fn security_config_id(kind: &str, name: &str) -> String {
+    format!("{kind}/{}/{name}", ::engine::emulator_account_id())
+}
+
+/// One stored security configuration, keyed by its [`security_config_id`].
+///
+/// The identity-provider options are held as the shapes a READ reports
+/// (`IamIdentityCenterConfigOptions` rather than the create request's
+/// `CreateIamIdentityCenterConfigOptions`), with every documented default already applied,
+/// so nothing is recomputed from a request when the record is reported.
+#[derive(Debug, Clone)]
+pub struct SecurityConfigRecord {
+    /// The `SecurityConfigId`, which is also this record's key.
+    pub id: String,
+    /// The `ConfigName` the create request carried. Not modelled on either reported shape,
+    /// but it is half of this record's identity: one name may be used once per type.
+    pub name: String,
+    /// The `SecurityConfigType` wire value; named `kind` because `type` is a Rust keyword.
+    pub kind: String,
+    /// The `PolicyVersion` token `configVersion` carries, re-minted on every write; see
+    /// [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::next_policy_version`].
+    pub config_version: String,
+    pub description: Option<String>,
+    /// Set exactly for a `saml` configuration, which is the type whose options are
+    /// required.
+    pub saml_options: Option<SamlConfigOptions>,
+    /// Set exactly for an `iamidentitycenter` configuration.
+    pub iam_identity_center_options: Option<IamIdentityCenterConfigOptions>,
+    /// Set exactly for an `iamfederation` configuration.
+    pub iam_federation_options: Option<IamFederationConfigOptions>,
+    pub created_date: i64,
+    pub last_modified_date: i64,
+}
+
+impl SecurityConfigRecord {
+    /// The `SecurityConfigDetail` body for this record — the one place this crate renders
+    /// that shape, so a create cannot report a record differently from a later read.
+    pub fn detail(&self) -> SecurityConfigDetail {
+        SecurityConfigDetail {
+            id: Some(self.id.clone()),
+            r#type: Some(self.kind.clone()),
+            config_version: Some(self.config_version.clone()),
+            description: self.description.clone(),
+            saml_options: self.saml_options.clone(),
+            iam_identity_center_options: self.iam_identity_center_options.clone(),
+            iam_federation_options: self.iam_federation_options.clone(),
+            created_date: Some(self.created_date),
+            last_modified_date: Some(self.last_modified_date),
+        }
+    }
+
+    /// The `SecurityConfigSummary` body for this record — the shape `ListSecurityConfigs`
+    /// pages over. It is `SecurityConfigDetail` without the identity-provider options.
+    pub fn summary(&self) -> SecurityConfigSummary {
+        SecurityConfigSummary {
+            id: Some(self.id.clone()),
+            r#type: Some(self.kind.clone()),
+            config_version: Some(self.config_version.clone()),
+            description: self.description.clone(),
+            created_date: Some(self.created_date),
+            last_modified_date: Some(self.last_modified_date),
+        }
+    }
+}
+
 /// One stored data access policy, keyed by its `(type, name)` pair.
 ///
 /// Held beside [`SecurityPolicyRecord`] rather than sharing it: the two are different
@@ -674,6 +771,12 @@ pub struct ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     /// Security policies by `(SecurityPolicyType, PolicyName)`: the pair that identifies
     /// one, since the same name may be used once per type.
     pub security_policies: BTreeMap<(String, String), SecurityPolicyRecord>,
+    /// Security configurations by [`security_config_id`], which is the identity this API
+    /// addresses them by (`GetSecurityConfig`/`DeleteSecurityConfig` take `id`). The id
+    /// starts with the type and ends with the name, so this one `BTreeMap` already walks
+    /// each type's configurations in name order — the stable order
+    /// `ListSecurityConfigs`' page token resumes inside.
+    pub security_configs: BTreeMap<String, SecurityConfigRecord>,
     /// Data access policies by `(AccessPolicyType, PolicyName)`, the pair that identifies
     /// one, exactly as `security_policies` is keyed.
     pub access_policies: BTreeMap<(String, String), AccessPolicyRecord>,
@@ -815,6 +918,14 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
         Some(record)
     }
 
+    /// Remove the security configuration `id` names, dropping every idempotency token
+    /// that named it with it.
+    pub fn remove_security_config(&mut self, id: &str) -> Option<SecurityConfigRecord> {
+        let record = self.security_configs.remove(id)?;
+        self.forget_tokens_for(id);
+        Some(record)
+    }
+
     /// The record a replayed `clientToken` on `operation` already created, if any.
     ///
     /// `None` both when the token is new and when the record it created has since been
@@ -922,6 +1033,27 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
             .count()
     }
 
+    /// The security configuration a replayed `clientToken` on `operation` already created,
+    /// if any; see [`Self::replayed_collection`] for why a stale token answers `None`.
+    pub fn replayed_security_config(
+        &self,
+        operation: &str,
+        token: &str,
+    ) -> Option<&SecurityConfigRecord> {
+        let id = self
+            .idempotency_tokens
+            .get(&idempotency_key(operation, token))?;
+        self.security_configs.get(id)
+    }
+
+    /// The number of stored security configurations of `kind`, which its quota bounds.
+    pub fn security_config_count(&self, kind: &str) -> usize {
+        self.security_configs
+            .values()
+            .filter(|record| record.kind == kind)
+            .count()
+    }
+
     /// The number of stored data access policies, which [`MAX_ACCESS_POLICIES`] bounds.
     pub fn access_policy_count(&self) -> usize {
         self.access_policies.len()
@@ -944,29 +1076,51 @@ pub fn policy_token_value(kind: &str, name: &str) -> String {
     format!("{kind}/{name}")
 }
 
+/// A record kind a listing pages over.
+///
+/// The cursor is the key the listing's order is BY, which is also what a page token
+/// resumes after — so one paging implementation serves every listing in this service
+/// rather than one per resource.
+pub trait Paged {
+    /// This record's place in its listing's order.
+    fn page_cursor(&self) -> &str;
+}
+
+impl Paged for CollectionRecord {
+    fn page_cursor(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Paged for SecurityConfigRecord {
+    fn page_cursor(&self) -> &str {
+        &self.id
+    }
+}
+
 /// One page of a listing: the records it carries, and the token that resumes after them.
 #[derive(Debug)]
-pub struct Page<'a> {
-    /// The records of this page, in collection-id order.
-    pub items: Vec<&'a CollectionRecord>,
+pub struct Page<'a, T> {
+    /// The records of this page, in the listing's own cursor order.
+    pub items: Vec<&'a T>,
     /// Set only when at least one more record remains after this page.
     pub next_token: Option<String>,
 }
 
-/// A page token is the collection id the NEXT page resumes after, hex-encoded.
+/// A page token is the cursor the NEXT page resumes after, hex-encoded.
 ///
 /// Hex makes the token opaque in the sense the API promises — it is not an id a client
 /// should read or construct — but it is NOT authenticated: hex is reversible, and a
-/// hand-made token that decodes to UTF-8 is accepted and simply resumes after that id.
-/// That is the same answer a token whose collection has since been deleted gets, which is
+/// hand-made token that decodes to UTF-8 is accepted and simply resumes after that cursor.
+/// That is the same answer a token whose record has since been deleted gets, which is
 /// what lets a listing resume correctly across creates and deletes rather than failing on
-/// them. Nothing a token can say reaches past this listing's own id order, so a forged one
+/// them. Nothing a token can say reaches past this listing's own order, so a forged one
 /// grants no access: it can only start the same listing at a different place.
-fn encode_page_token(id: &str) -> String {
-    hex::encode(id)
+fn encode_page_token(cursor: &str) -> String {
+    hex::encode(cursor)
 }
 
-/// The id a token resumes after, or the reason the token cannot be one this service
+/// The cursor a token resumes after, or the reason the token cannot be one this service
 /// issued (its bytes are not hex, or not UTF-8).
 fn decode_page_token(token: &str) -> Result<String, String> {
     hex::decode(token)
@@ -977,14 +1131,14 @@ fn decode_page_token(token: &str) -> Result<String, String> {
 
 /// The page of `ordered` that `next_token` and `max_results` select.
 ///
-/// `ordered` is the already-filtered record sequence in collection-id order — the stable
+/// `ordered` is the already-filtered record sequence in cursor order — the stable
 /// sequence a token resumes inside. `max_results` is a page BOUND, not a count: a page
 /// holds at most that many records, and `next_token` is returned only while more remain.
-pub fn page<'a>(
-    ordered: Vec<&'a CollectionRecord>,
+pub fn page<'a, T: Paged>(
+    ordered: Vec<&'a T>,
     next_token: Option<&str>,
     max_results: Option<i32>,
-) -> Result<Page<'a>, String> {
+) -> Result<Page<'a, T>, String> {
     let bound = max_results.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE);
     let bound = usize::try_from(bound).unwrap_or(1);
     let after = match next_token {
@@ -992,14 +1146,16 @@ pub fn page<'a>(
         None => None,
     };
 
-    let mut remaining = ordered
-        .into_iter()
-        .filter(|record| after.as_deref().is_none_or(|from| record.id.as_str() > from));
-    let items: Vec<&'a CollectionRecord> = remaining.by_ref().take(bound).collect();
+    let mut remaining = ordered.into_iter().filter(|record| {
+        after
+            .as_deref()
+            .is_none_or(|from| record.page_cursor() > from)
+    });
+    let items: Vec<&'a T> = remaining.by_ref().take(bound).collect();
     // A token only when a record is left over: the last page of a listing carries none.
     let next_token = remaining
         .next()
-        .and_then(|_| items.last().map(|record| encode_page_token(&record.id)));
+        .and_then(|_| items.last().map(|record| encode_page_token(record.page_cursor())));
 
     Ok(Page { items, next_token })
 }

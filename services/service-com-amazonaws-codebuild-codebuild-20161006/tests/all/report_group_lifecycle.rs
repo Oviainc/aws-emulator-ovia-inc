@@ -904,4 +904,81 @@ async fn a_state_changing_call_emits_one_structured_audit_record() {
         "a request-derived value must not carry a line break into the log, got {:?}",
         records[0]
     );
+
+    // The same rule over the PROJECT operations that change state, so the record is not
+    // one operation's habit. These rows live in this test rather than beside the
+    // UpdateProject suite because the capture is this binary's single global
+    // subscriber: two tests draining it in parallel would take each other's records.
+    let project = "audited-project";
+    // (case, operation, request, expected status, expected outcome token)
+    let project_rows: Vec<(&str, &str, Value, u16, &str)> = vec![
+        (
+            "a project was created",
+            "CreateProject",
+            crate::project_build_lifecycle::create_project_body(
+                project,
+                json!({"description": "audit-description"}),
+            ),
+            200,
+            "project-created",
+        ),
+        (
+            "the project's settings were changed",
+            "UpdateProject",
+            json!({"name": project, "description": "audit-replacement"}),
+            200,
+            "project-updated",
+        ),
+        (
+            "the update named no stored project",
+            "UpdateProject",
+            json!({"name": "audited-absent", "description": "audit-description"}),
+            400,
+            "not-found",
+        ),
+        (
+            "the update would leave no buildspec to build from",
+            "UpdateProject",
+            json!({"name": project, "source": {"type": "NO_SOURCE"}}),
+            400,
+            "validation-refused",
+        ),
+    ];
+
+    for (case, operation, body, expected_status, outcome) in project_rows {
+        let name = body["name"].as_str().unwrap_or_default().to_string();
+        let (status, response) = call_as(&router, AUDIT_ACCESS_KEY_ID, operation, body).await;
+        assert_eq!(
+            status, expected_status,
+            "{case}: expected {expected_status}, got {status} with {response}"
+        );
+
+        let records = audit_records(&captured.drain());
+        assert_eq!(
+            records.len(),
+            1,
+            "{case}: expected exactly one audit record, got {records:?}"
+        );
+        let record = &records[0];
+        for expected in [
+            "service=codebuild".to_string(),
+            format!("operation={operation}"),
+            format!("access_key_id={AUDIT_ACCESS_KEY_ID}"),
+            "request_target=POST /".to_string(),
+            format!("resource={}", expected_arn(&format!("project/{name}"))),
+            format!("outcome={outcome}"),
+        ] {
+            assert!(
+                record.contains(&expected),
+                "{case}: expected the record to carry {expected:?}, got {record:?}"
+            );
+        }
+        // Metadata only: the caller's own values never reach the log.
+        for caller_value in ["audit-description", "audit-replacement"] {
+            assert!(
+                !record.contains(caller_value),
+                "{case}: the record must carry none of the caller's data, got {record:?}"
+            );
+        }
+    }
 }
