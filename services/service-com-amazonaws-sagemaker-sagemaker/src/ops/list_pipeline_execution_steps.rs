@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPipelineExecutionSteps
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPipelineExecutionSteps`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: resolves the execution its `PipelineExecutionArn` names in
+//! `crate::state`, materialises the status the clock already owes that execution, and
+//! reports one `PipelineExecutionStep` per step of the run, sorted and paged. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPipelineExecutionSteps::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A step execution belongs to the run that performs it, so what a step reports comes
+//! from the run and from the definition the run was started from, never from this
+//! request: the step's `StepName`, `StepDisplayName` and `StepDescription` are what the
+//! stored pipeline definition declares (restricted to the selected steps when the run is
+//! selective), and its `StepStatus` and `FailureReason` are the execution's own
+//! ([`crate::state::step_status_of_execution`]). An execution still `Executing` has
+//! reached no step, so it lists none.
+//!
+//! Nothing here reports work this emulator did not perform:
+//! [`crate::state::PIPELINE_EXECUTION_NOT_RUN`] says why an accepted execution ends in
+//! the modelled failure state rather than `Succeeded`, and a step of such a run reports
+//! that same failure state with that same reason and NO `StartTime`, `EndTime`,
+//! `Metadata`, `AttemptCount` or `CacheHitResult` — no success, no duration, no job ARN
+//! and no step output for work nothing ran.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +159,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPipelineExecutionSteps` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPipelineExecutionStepsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPipelineExecutionSteps"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // The listing is OF one execution, so the member naming it is what the result set
+        // is resolved from. The model leaves `PipelineExecutionArn` optional, so a request
+        // that names no execution is a bad request rather than a listing of everything:
+        // there is no account-wide set of step executions to answer with.
+        let execution_arn = match input.pipeline_execution_arn.as_deref() {
+            Some(arn) if !arn.is_empty() => arn.to_string(),
+            _ => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "PipelineExecutionArn must name the pipeline execution whose steps are \
+                     to be listed.",
+                ));
+            }
+        };
+
+        // `SortOrder` is modelled as an enum, and its vocabulary here is the generated
+        // member list, so it cannot drift from the model. This operation's own doc names
+        // no default ORDER ("The field by which to sort results. The default is
+        // CreatedTime."), so an absent one takes [`crate::state::DEFAULT_SORT_ORDER`] —
+        // the default every listing of this service applies.
+        let sort_order = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_ORDER);
+        if !SORT_ORDER_VALUES.contains(&sort_order) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}; got \"{sort_order}\".",
+                SORT_ORDER_VALUES.join(", ")
+            )));
+        }
+        let descending = sort_order == crate::state::ORDER_DESCENDING;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The one write this report may make: the execution's own due terminal status,
+        // owed at the stored instant whether or not anybody called — the same move
+        // `DescribePipelineExecution` materialises, so the two readers never disagree
+        // about the run whose steps these are.
+        let Some(execution) = store.pipeline_executions.get_mut(&execution_arn) else {
+            // Never a 200 with an empty list for an execution nothing holds: a caller
+            // cannot tell that from a run that exists and has reached no step. A deleted
+            // pipeline's executions went with it, so they are exactly as unresolvable as
+            // one nobody started.
+            return Err(ListPipelineExecutionStepsErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(crate::state::does_not_exist(
+                        crate::state::PIPELINE_EXECUTION_ENTITY,
+                        &execution_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+        let settled = execution.settle_status(now);
+        let reported = execution.clone();
+        // The steps the run performs are the ones the pipeline it runs declares. The
+        // definition is read from the store rather than from the request, so what is
+        // listed is what the account holds. A pipeline here carries exactly one version
+        // (`state::PIPELINE_INITIAL_VERSION`) because `UpdatePipeline` mints no further
+        // one yet, so the stored definition IS the one the run was started from; a service
+        // that versions definitions would have to keep the run's own.
+        let definition = store
+            .pipelines
+            .get(&reported.pipeline_name)
+            .map(|pipeline| pipeline.definition.clone());
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &reported.arn, ctx);
+        }
+
+        // An execution that has reached no step lists none, and so does one whose status
+        // names no step outcome: a step execution is reported only where the run says
+        // what became of it.
+        let step_status = crate::state::step_status_of_execution(&reported.status);
+        let mut steps: Vec<crate::state::PipelineStepDeclaration> = match (step_status, &definition)
+        {
+            (Some(_), Some(definition)) => {
+                let declared = crate::state::pipeline_definition_step_declarations(definition);
+                match &reported.selective_execution_config {
+                    // `SelectiveExecutionConfig$SelectedSteps` is "a list of pipeline
+                    // steps to run", so a selective run performs those steps and no
+                    // other: the steps it did not select have no step execution in THIS
+                    // run. The selection was resolved against this same definition when
+                    // the run started, so every name in it declares a step.
+                    Some(selective) => {
+                        let selected: ::std::collections::BTreeSet<&str> = selective
+                            .selected_steps
+                            .iter()
+                            .map(|step| step.step_name.as_str())
+                            .collect();
+                        declared
+                            .into_iter()
+                            .filter(|step| selected.contains(step.name.as_str()))
+                            .collect()
+                    }
+                    None => declared,
+                }
+            }
+            // A run still `Executing` has reached no step. The other arm — an execution
+            // whose pipeline record is gone — is unreachable while `remove_pipeline` takes
+            // a pipeline's executions with it, and a store that broke that invariant has
+            // no definition to report steps from either.
+            _ => Vec::new(),
+        };
+        // The declaration order the walk answers is the order the steps are reached, so
+        // `SortOrder` reverses exactly that. Step names are unique within one definition,
+        // so the order is total either way and a `NextToken` resolved against a freshly
+        // computed result set lands on the same boundary.
+        if descending {
+            steps.reverse();
+        }
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|name| steps.iter().position(|step| step.name == name))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(crate::state::STALE_PAGE_TOKEN)
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // `MaxResults` caps the page, and so does the service's own ceiling: an absent or
+        // larger `MaxResults` still cannot make one call serialise every step of a
+        // definition. The token below is emitted whenever anything is left, so a
+        // paginating client walks the full result set exactly once either way.
+        let start = start.min(steps.len());
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(steps.len());
+        let page = &steps[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < steps.len() => Some(crate::state::encode_page_token(&last.name)),
+            _ => None,
+        };
+
+        Ok(ListPipelineExecutionStepsOutput {
+            // The member is always present, the empty list included: a run that has
+            // reached no step answers an empty list rather than omitting the member.
+            pipeline_execution_steps: Some(
+                page.iter()
+                    .map(|step| PipelineExecutionStep {
+                        step_name: Some(step.name.clone()),
+                        step_display_name: step.display_name.clone(),
+                        step_description: step.description.clone(),
+                        // No `StartTime`, `EndTime`, `Metadata`, `AttemptCount` or
+                        // `CacheHitResult`: nothing ran this step, so it spent no time,
+                        // created no job, was attempted no number of times and hit no
+                        // cache. The status and the reason are the run's own — see this
+                        // module's header and `state::PIPELINE_EXECUTION_NOT_RUN`.
+                        step_status: step_status.map(str::to_string),
+                        failure_reason: reported.failure_reason.clone(),
+                        // SageMaker fills this where a selective run REUSED the result of
+                        // the step from its source execution. This run reports only the
+                        // steps it was to perform itself, so no reused result is named.
+                        selective_execution_result: None,
+                        // A `ForEach` step's iterations are step executions of their own,
+                        // which only a performed run has; a declared step is not one.
+                        iteration_context: None,
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

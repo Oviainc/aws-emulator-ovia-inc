@@ -1,0 +1,496 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! A write that names NO server-side encryption inherits the BUCKET's default encryption
+//! configuration, end to end.
+//!
+//! RULE: an object written to a general purpose bucket without any of `PutObject`'s
+//! encryption members (`x-amz-server-side-encryption` and the three that qualify it) is
+//! stored under the bucket's default encryption configuration — the first
+//! `ServerSideEncryptionRule` naming an `ApplyServerSideEncryptionByDefault`, or the SSE-S3
+//! base default for a bucket no `PutBucketEncryption` has configured — and `PutObject`,
+//! `GetObject` and `HeadObject` all report that configuration's algorithm and KMS key in
+//! their bound headers, with the S3 Bucket Key setting only where the algorithm is SSE-KMS.
+//!
+//! The sources:
+//!
+//! * "Amazon S3 encrypts data with server-side encryption by using Amazon S3 managed keys
+//!   (SSE-S3) by default. You can optionally tell Amazon S3 to encrypt data at rest by
+//!   using server-side encryption with other key options"
+//!   (`smithy_query(query="doc",shape="PutObjectRequest",member="ServerSideEncryption")`) —
+//!   the other key options being the ones `PutBucketEncryption` configures for the bucket.
+//! * "By default, all buckets have a default encryption configuration that uses server-side
+//!   encryption with Amazon S3 managed keys (SSE-S3)" (`GetBucketEncryption`'s own
+//!   documentation): the default a never-configured bucket carries, which this crate
+//!   publishes as [`DEFAULT_SSE_ALGORITHM`].
+//! * "You can specify the key ID, key alias, or the Amazon Resource Name (ARN) of the KMS
+//!   key" (`ApplyServerSideEncryptionByDefault$KMSMasterKeyID`): the three forms a
+//!   configured key may take, each a row below.
+//! * "Specifies whether Amazon S3 should use an S3 Bucket Key for object encryption with
+//!   server-side encryption using Key Management Service (KMS) keys (SSE-KMS)"
+//!   (`PutObjectRequest$BucketKeyEnabled`): the Bucket Key belongs to SSE-KMS alone, so a
+//!   non-KMS default reports no Bucket Key header at all.
+//!
+//! The configuration is applied through `PutBucketEncryption` and the objects are written
+//! and read through real HTTP requests to the router, so what is pinned is the wire
+//! behaviour a client sees. The helpers are the ones the suites beside this one own
+//! ([`super::bucket_encryption`] for the configuration, [`super::object_encryption`] for
+//! `HeadObject`).
+
+use service_com_amazonaws_s3_amazons3::state::{DEFAULT_BUCKET_KEY_ENABLED, DEFAULT_SSE_ALGORITHM};
+
+use super::bucket_encryption::{get_encryption, put_encryption, reported_rules, Rule};
+use super::bucket_lifecycle::{router, Answer};
+use super::object_and_tagging_roundtrip::{bucket, get_object, put_object, text};
+use super::object_encryption::head_object;
+
+/// A KMS key in each of the three forms `KMSMasterKeyID` documents.
+const KEY_ID: &str = "1234abcd-12ab-34cd-56ef-1234567890ab";
+const KEY_ARN: &str = "arn:aws:kms:us-west-2:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab";
+const KEY_ALIAS: &str = "alias/compliance-cmk";
+
+/// What an answer about an inherited-encryption object must report: the algorithm, the KMS
+/// key id and the Bucket Key setting, each `None` where the header must be ABSENT.
+#[derive(Debug)]
+struct Reported {
+    algorithm: Option<&'static str>,
+    key_id: Option<&'static str>,
+    bucket_key: Option<&'static str>,
+}
+
+/// One row of the inheritance table: the case, the configuration the bucket carries (`None`
+/// for a bucket left exactly as `CreateBucket` made it), and what every answer about an
+/// object written with no encryption member must then report.
+struct Row {
+    case: &'static str,
+    configuration: Option<Vec<Rule>>,
+    expected: Reported,
+}
+
+/// The table: every row differs along what the rule generalises over — WHICH algorithm the
+/// bucket's default names (every value of the `ServerSideEncryption` enum, including the
+/// three the issue never cited), WHICH form its KMS key takes (key id, ARN, alias), whether
+/// the Bucket Key is on, off or unnamed, whether the configuration names an algorithm at
+/// all, and HOW MANY rules it carries and in which order.
+fn rows() -> Vec<Row> {
+    vec![
+        Row {
+            case: "a bucket no PutBucketEncryption has configured",
+            configuration: None,
+            expected: Reported {
+                algorithm: Some(DEFAULT_SSE_ALGORITHM),
+                key_id: None,
+                bucket_key: None,
+            },
+        },
+        Row {
+            case: "a default of SSE-S3, named explicitly",
+            configuration: Some(vec![Rule::by_default("AES256")]),
+            expected: Reported {
+                algorithm: Some("AES256"),
+                key_id: None,
+                bucket_key: None,
+            },
+        },
+        Row {
+            case: "a default of SSE-S3 with the Bucket Key switched on, which SSE-S3 has none of",
+            configuration: Some(vec![Rule::by_default("AES256").with_bucket_key(true)]),
+            expected: Reported {
+                algorithm: Some("AES256"),
+                key_id: None,
+                bucket_key: None,
+            },
+        },
+        Row {
+            case: "a default of SSE-KMS with a customer managed key by ARN and the Bucket Key off",
+            configuration: Some(vec![Rule::by_default("aws:kms")
+                .with_key(KEY_ARN)
+                .with_bucket_key(false)]),
+            expected: Reported {
+                algorithm: Some("aws:kms"),
+                key_id: Some(KEY_ARN),
+                bucket_key: Some("false"),
+            },
+        },
+        Row {
+            case: "a default of SSE-KMS with the key by alias and the Bucket Key on",
+            configuration: Some(vec![Rule::by_default("aws:kms")
+                .with_key(KEY_ALIAS)
+                .with_bucket_key(true)]),
+            expected: Reported {
+                algorithm: Some("aws:kms"),
+                key_id: Some(KEY_ALIAS),
+                bucket_key: Some("true"),
+            },
+        },
+        Row {
+            case: "a default of SSE-KMS with a bare key id and no Bucket Key named",
+            configuration: Some(vec![Rule::by_default("aws:kms").with_key(KEY_ID)]),
+            expected: Reported {
+                algorithm: Some("aws:kms"),
+                key_id: Some(KEY_ID),
+                bucket_key: None,
+            },
+        },
+        Row {
+            case: "a default of SSE-KMS naming no key, so the object inherits the algorithm alone",
+            configuration: Some(vec![Rule::by_default("aws:kms")]),
+            expected: Reported {
+                algorithm: Some("aws:kms"),
+                key_id: None,
+                bucket_key: None,
+            },
+        },
+        Row {
+            case: "a default of dual-layer SSE-KMS with a key ARN",
+            configuration: Some(vec![Rule::by_default("aws:kms:dsse").with_key(KEY_ARN)]),
+            expected: Reported {
+                algorithm: Some("aws:kms:dsse"),
+                key_id: Some(KEY_ARN),
+                bucket_key: None,
+            },
+        },
+        Row {
+            case: "a default of aws:fsx, a published algorithm the issue never cited",
+            configuration: Some(vec![Rule::by_default("aws:fsx")]),
+            expected: Reported {
+                algorithm: Some("aws:fsx"),
+                key_id: None,
+                bucket_key: None,
+            },
+        },
+        Row {
+            case: "a default of aws:backup, the other algorithm the issue never cited",
+            configuration: Some(vec![Rule::by_default("aws:backup")]),
+            expected: Reported {
+                algorithm: Some("aws:backup"),
+                key_id: None,
+                bucket_key: None,
+            },
+        },
+        Row {
+            case: "a configuration naming only BucketKeyEnabled, so the base SSE-S3 default stands",
+            configuration: Some(vec![Rule::bucket_key_only(true)]),
+            expected: Reported {
+                algorithm: Some(DEFAULT_SSE_ALGORITHM),
+                key_id: None,
+                bucket_key: None,
+            },
+        },
+        Row {
+            case: "two rules, the first of which names the algorithm",
+            configuration: Some(vec![
+                Rule::by_default("aws:kms:dsse").with_key(KEY_ID),
+                Rule::by_default("AES256"),
+            ]),
+            expected: Reported {
+                algorithm: Some("aws:kms:dsse"),
+                key_id: Some(KEY_ID),
+                bucket_key: None,
+            },
+        },
+        Row {
+            case: "two rules, only the second of which names an algorithm",
+            configuration: Some(vec![
+                Rule::bucket_key_only(false),
+                Rule::by_default("aws:kms")
+                    .with_key(KEY_ARN)
+                    .with_bucket_key(true),
+            ]),
+            expected: Reported {
+                algorithm: Some("aws:kms"),
+                key_id: Some(KEY_ARN),
+                bucket_key: Some("true"),
+            },
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_write_naming_no_encryption_inherits_the_bucket_default_and_every_read_reports_it() {
+    let router = router();
+
+    for (index, row) in rows().into_iter().enumerate() {
+        let Row {
+            case,
+            configuration,
+            expected,
+        } = row;
+        let name = format!("default-encryption-{index}");
+        bucket(&router, &name).await;
+
+        if let Some(rules) = &configuration {
+            let configured = put_encryption(&router, &name, rules).await;
+            assert_eq!(
+                configured.status, 200,
+                "case {case:?}: the bucket's default encryption must be configured first, \
+                 got {} with body {:?}",
+                configured.status,
+                text(&configured)
+            );
+        }
+
+        // The payload varies with the row, so the rule is exercised over different writes
+        // rather than one recorded body.
+        let key = format!("inherited/{index}/asset.txt");
+        let payload = format!("row {index}: {case}\n").into_bytes();
+        let written = put_object(&router, &name, &key, &payload, &[]).await;
+        assert_eq!(
+            written.status, 200,
+            "case {case:?}: a write naming no encryption member must answer 200, got {} \
+             with body {:?}",
+            written.status,
+            text(&written)
+        );
+        assert_reported(case, "PutObject", &written, &expected);
+
+        // Both implemented readers report the configuration the object was STORED under.
+        let read = get_object(&router, &name, &key, "", &[]).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: the stored object must read back, got {} with body {:?}",
+            read.status,
+            text(&read)
+        );
+        assert_eq!(
+            read.body.as_ref(),
+            payload.as_slice(),
+            "case {case:?}: the stored bytes must come back unchanged, got {:?}",
+            text(&read)
+        );
+        assert_reported(case, "GetObject", &read, &expected);
+
+        let headed = head_object(&router, &name, &key).await;
+        assert_eq!(
+            headed.status, 200,
+            "case {case:?}: HeadObject of the stored object must answer 200, got {}",
+            headed.status
+        );
+        assert_reported(case, "HeadObject", &headed, &expected);
+
+        // What the object inherited is what the bucket REPORTS as its default: the write
+        // resolved it from the configuration `GetBucketEncryption` answers with, and the
+        // write did not materialise a configuration onto a bucket that had none.
+        let reported = get_encryption(&router, &name).await;
+        assert_eq!(
+            reported.status, 200,
+            "case {case:?}: GetBucketEncryption must still answer 200 after the write, got \
+             {} with body {:?}",
+            reported.status,
+            text(&reported)
+        );
+        let rules = reported_rules(&reported);
+        assert_eq!(
+            rules,
+            configuration.unwrap_or_else(|| vec![Rule::by_default(DEFAULT_SSE_ALGORITHM)
+                .with_bucket_key(DEFAULT_BUCKET_KEY_ENABLED)]),
+            "case {case:?}: the write must leave the bucket's reported configuration \
+             exactly as it was, got {rules:?}"
+        );
+    }
+}
+
+/// One row of the override table: the case, the encryption headers the write carries, and
+/// what every answer about the object must then report.
+type OverrideRow = (
+    &'static str,
+    Vec<(&'static str, &'static str)>,
+    Reported,
+);
+
+#[tokio::test]
+async fn a_write_naming_its_own_encryption_is_stored_under_that_and_not_the_bucket_default() {
+    // The bucket default applies "if and only if" the request names no encryption of its
+    // own: "You can optionally tell Amazon S3 to encrypt data at rest by using server-side
+    // encryption with other key options" — so what the request names stands on its own,
+    // with nothing of the bucket's configuration merged into it.
+    let router = router();
+    bucket(&router, "default-encryption-override").await;
+    let configured = put_encryption(
+        &router,
+        "default-encryption-override",
+        &[Rule::by_default("aws:kms")
+            .with_key(KEY_ARN)
+            .with_bucket_key(true)],
+    )
+    .await;
+    assert_eq!(
+        configured.status, 200,
+        "the bucket's SSE-KMS default must be configured first, got {}",
+        configured.status
+    );
+
+    // The rows differ along WHICH member the write names: the algorithm alone, the
+    // algorithm with a key of its own, and a Bucket Key setting beside it.
+    const OTHER_KEY: &str =
+        "arn:aws:kms:us-west-2:111122223333:key/0000ffff-1111-2222-3333-444455556666";
+    let rows: Vec<OverrideRow> = vec![
+        (
+            "a write naming SSE-S3 on a bucket whose default is SSE-KMS",
+            vec![("x-amz-server-side-encryption", "AES256")],
+            Reported {
+                algorithm: Some("AES256"),
+                key_id: None,
+                bucket_key: None,
+            },
+        ),
+        (
+            "a write naming SSE-KMS with a key of its own",
+            vec![
+                ("x-amz-server-side-encryption", "aws:kms"),
+                ("x-amz-server-side-encryption-aws-kms-key-id", OTHER_KEY),
+            ],
+            Reported {
+                algorithm: Some("aws:kms"),
+                key_id: Some(OTHER_KEY),
+                bucket_key: None,
+            },
+        ),
+        (
+            "a write naming dual-layer SSE-KMS with the Bucket Key off",
+            vec![
+                ("x-amz-server-side-encryption", "aws:kms:dsse"),
+                ("x-amz-server-side-encryption-aws-kms-key-id", OTHER_KEY),
+                ("x-amz-server-side-encryption-bucket-key-enabled", "false"),
+            ],
+            Reported {
+                algorithm: Some("aws:kms:dsse"),
+                key_id: Some(OTHER_KEY),
+                bucket_key: Some("false"),
+            },
+        ),
+    ];
+
+    for (index, (case, headers, expected)) in rows.iter().enumerate() {
+        let key = format!("explicit/{index}.txt");
+        let written = put_object(
+            &router,
+            "default-encryption-override",
+            &key,
+            b"a,b\n1,2\n",
+            headers,
+        )
+        .await;
+        assert_eq!(
+            written.status, 200,
+            "case {case:?}: the write must answer 200, got {} with body {:?}",
+            written.status,
+            text(&written)
+        );
+        assert_reported(case, "PutObject", &written, expected);
+
+        let read = get_object(&router, "default-encryption-override", &key, "", &[]).await;
+        assert_reported(case, "GetObject", &read, expected);
+        let headed = head_object(&router, "default-encryption-override", &key).await;
+        assert_reported(case, "HeadObject", &headed, expected);
+    }
+}
+
+#[tokio::test]
+async fn the_encryption_an_object_inherited_is_the_one_in_force_when_it_was_written() {
+    // The encryption is part of the stored object — "You cannot use PutObject to only
+    // update a single piece of metadata for an existing object" — so a later
+    // `PutBucketEncryption` changes what the NEXT write inherits and nothing about the
+    // object already stored.
+    let router = router();
+    bucket(&router, "default-encryption-in-force").await;
+
+    let before = put_object(
+        &router,
+        "default-encryption-in-force",
+        "before.txt",
+        b"written under the base default\n",
+        &[],
+    )
+    .await;
+    assert_eq!(
+        before.status, 200,
+        "the first write must answer 200, got {} with body {:?}",
+        before.status,
+        text(&before)
+    );
+    assert_reported(
+        "written before any configuration",
+        "PutObject",
+        &before,
+        &Reported {
+            algorithm: Some(DEFAULT_SSE_ALGORITHM),
+            key_id: None,
+            bucket_key: None,
+        },
+    );
+
+    let configured = put_encryption(
+        &router,
+        "default-encryption-in-force",
+        &[Rule::by_default("aws:kms").with_key(KEY_ARN)],
+    )
+    .await;
+    assert_eq!(
+        configured.status, 200,
+        "the configuration must be applied, got {} with body {:?}",
+        configured.status,
+        text(&configured)
+    );
+
+    // The object written earlier still reports what it was stored under.
+    let unchanged = get_object(&router, "default-encryption-in-force", "before.txt", "", &[]).await;
+    assert_reported(
+        "read after the bucket default changed",
+        "GetObject",
+        &unchanged,
+        &Reported {
+            algorithm: Some(DEFAULT_SSE_ALGORITHM),
+            key_id: None,
+            bucket_key: None,
+        },
+    );
+
+    // The next write inherits the configuration now in force.
+    let after = put_object(
+        &router,
+        "default-encryption-in-force",
+        "after.txt",
+        b"written under the CMK default\n",
+        &[],
+    )
+    .await;
+    let expected = Reported {
+        algorithm: Some("aws:kms"),
+        key_id: Some(KEY_ARN),
+        bucket_key: None,
+    };
+    assert_reported("written after the configuration", "PutObject", &after, &expected);
+    let reread = get_object(&router, "default-encryption-in-force", "after.txt", "", &[]).await;
+    assert_reported("written after the configuration", "GetObject", &reread, &expected);
+}
+
+/// Assert that `answer` reports exactly the encryption `expected` names: each header with
+/// that value, and absent where it names `None`.
+fn assert_reported(case: &str, operation: &str, answer: &Answer, expected: &Reported) {
+    for (header, value) in [
+        ("x-amz-server-side-encryption", expected.algorithm),
+        (
+            "x-amz-server-side-encryption-aws-kms-key-id",
+            expected.key_id,
+        ),
+        (
+            "x-amz-server-side-encryption-bucket-key-enabled",
+            expected.bucket_key,
+        ),
+    ] {
+        assert_eq!(
+            answer.header(header).as_deref(),
+            value,
+            "case {case:?}: {operation} must report {header} as {value:?}, got {:?}",
+            answer.header(header)
+        );
+    }
+    // An encryption context is a per-request value no bucket configuration carries, so an
+    // inherited encryption never reports one.
+    assert_eq!(
+        answer.header("x-amz-server-side-encryption-context"),
+        None,
+        "case {case:?}: {operation} must report no encryption context, got {:?}",
+        answer.header("x-amz-server-side-encryption-context")
+    );
+}

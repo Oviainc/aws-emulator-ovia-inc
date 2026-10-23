@@ -573,7 +573,7 @@ fn configure_event_data_store(
         destination_record.logs_event_category(crate::state::INSIGHT_EVENT_CATEGORY);
 
     let source_record = store
-        .addressed_event_data_store_mut(&source_id, region)
+        .addressed_event_data_store_mut(&source_id, region, now)
         .ok_or_else(|| unknown_store("EventDataStore", &source_id.arn(region)))?;
 
     // "To enable Insights on an event data store, the destination event data store

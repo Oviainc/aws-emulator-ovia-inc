@@ -27,6 +27,8 @@ mod locations;
 mod matchmaking;
 #[path = "all/matchmaking_rule_set_persistence.rs"]
 mod matchmaking_rule_set_persistence;
+#[path = "all/scripts.rs"]
+mod scripts;
 #[path = "all/server_process_capacity.rs"]
 mod server_process_capacity;
 #[path = "all/state_roundtrip.rs"]

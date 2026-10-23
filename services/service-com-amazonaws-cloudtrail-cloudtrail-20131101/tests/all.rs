@@ -43,6 +43,8 @@ mod event_data_store_ingestion_start;
 mod event_data_store_lifecycle;
 #[path = "all/event_data_store_reads.rs"]
 mod event_data_store_reads;
+#[path = "all/event_data_store_update.rs"]
+mod event_data_store_update;
 #[path = "all/event_selectors.rs"]
 mod event_selectors;
 #[path = "all/federation_lifecycle.rs"]

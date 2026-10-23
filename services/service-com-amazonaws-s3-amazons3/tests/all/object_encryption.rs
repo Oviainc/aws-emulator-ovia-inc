@@ -12,6 +12,15 @@
 //! `ServerSideEncryption` enum
 //! (`smithy_query(query="shape",shape="ServerSideEncryption")`).
 //!
+//! A write that names NONE of those members is stored under the bucket's default
+//! encryption configuration instead — "Amazon S3 encrypts data with server-side encryption
+//! by using Amazon S3 managed keys (SSE-S3) by default"
+//! (`PutObjectRequest$ServerSideEncryption`) — so on a bucket no `PutBucketEncryption` has
+//! configured the answers report [`DEFAULT_SSE_ALGORITHM`] and no KMS member at all. The
+//! inheritance over a CONFIGURED bucket is the table in
+//! [`super::object_default_encryption`]; what this suite pins is that an explicit member
+//! stands on its own.
+//!
 //! Two refusals belong to the same rule, because they are what the emulator cannot carry
 //! out rather than a member it drops:
 //!
@@ -26,6 +35,7 @@
 //! [`super::bucket_lifecycle`] and [`super::object_and_tagging_roundtrip`] own), so what
 //! is pinned is the wire behaviour a client sees.
 
+use service_com_amazonaws_s3_amazons3::state::DEFAULT_SSE_ALGORITHM;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{router, send_bytes, Answer};
@@ -33,7 +43,10 @@ use super::object_and_tagging_roundtrip::{bucket, get_object, put_object, text};
 
 /// `HEAD /<bucket>/<key>` — `HeadObject`, which reports the stored object's headers and
 /// no body.
-async fn head_object(router: &MultiServiceRouter, bucket: &str, key: &str) -> Answer {
+///
+/// `pub(crate)`: the default-encryption suite beside this one reads its objects back
+/// through the same two readers rather than standing up a second helper.
+pub(crate) async fn head_object(router: &MultiServiceRouter, bucket: &str, key: &str) -> Answer {
     send_bytes(router, "HEAD", &format!("/{bucket}/{key}"), &[], b"").await
 }
 
@@ -78,11 +91,12 @@ async fn a_write_is_stored_under_the_encryption_it_names_and_every_read_reports_
     // and one switched off).
     let rows: &[EncryptionRow<'_>] = &[
         (
-            "no encryption member at all",
+            "no encryption member at all, on a bucket with no configuration of its own",
             &[],
             &[
-                ("x-amz-server-side-encryption", None),
+                ("x-amz-server-side-encryption", Some(DEFAULT_SSE_ALGORITHM)),
                 ("x-amz-server-side-encryption-aws-kms-key-id", None),
+                ("x-amz-server-side-encryption-bucket-key-enabled", None),
             ],
         ),
         (
@@ -207,14 +221,19 @@ async fn a_write_is_stored_under_the_encryption_it_names_and_every_read_reports_
         assert_header_set(case, "HeadObject", &headed, expected);
     }
 
-    // A write with no encryption member reports NONE of the encryption headers — nothing
-    // is invented for an object that asked for nothing.
+    // A write with no encryption member reports the bucket's default algorithm and no
+    // KMS member: the bucket here was never configured, so its default is SSE-S3, which
+    // has no key id, no encryption context and no S3 Bucket Key.
     let plain = put_object(&router, "encryption-bucket", "plain.csv", b"a,b\n", &[]).await;
     for header in ENCRYPTION_HEADERS {
+        let expected = (*header == "x-amz-server-side-encryption")
+            .then_some(DEFAULT_SSE_ALGORITHM)
+            .map(str::to_string);
         assert_eq!(
             plain.header(header),
-            None,
-            "case \"no encryption member at all\": {header} must be absent, got {:?}",
+            expected,
+            "case \"no encryption member at all\": {header} must be reported as \
+             {expected:?}, got {:?}",
             plain.header(header)
         );
     }
@@ -398,7 +417,14 @@ async fn a_replacing_write_replaces_the_encryption_the_key_was_stored_under() {
             &[("x-amz-server-side-encryption", "AES256")],
             Some("AES256"),
         ),
-        ("replaced with no encryption member", &[], None),
+        // The key was under SSE-KMS with a key of its own; replacing it with a write that
+        // names no encryption member puts it back under the bucket's default — SSE-S3 on
+        // this never-configured bucket — rather than leaving the KMS configuration behind.
+        (
+            "replaced with no encryption member",
+            &[],
+            Some(DEFAULT_SSE_ALGORITHM),
+        ),
     ];
 
     for (case, headers, expected) in writes {

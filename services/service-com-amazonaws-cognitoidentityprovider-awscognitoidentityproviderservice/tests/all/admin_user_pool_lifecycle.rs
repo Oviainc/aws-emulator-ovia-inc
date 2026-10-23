@@ -109,9 +109,9 @@ fn matches_client_id_pattern(value: &str) -> bool {
 }
 
 /// The claims of a JWS compact token, which also asserts its shape: three
-/// base64url segments, the third empty, as RFC 7515 §6 defines for the
-/// unsecured JWS this emulator issues (it holds no JWKS key pair and verifies
-/// no token, so it names no algorithm it did not run).
+/// NON-EMPTY base64url segments, as RFC 7515 §3.1 defines for a signed JWS —
+/// the third being the signature a pool's key set verifies (see
+/// `tests/all/token_signing.rs`, which checks that signature).
 fn jwt_claims(token: &str) -> Value {
     let segments: Vec<&str> = token.split('.').collect();
     assert_eq!(
@@ -120,8 +120,8 @@ fn jwt_claims(token: &str) -> Value {
         "a token must have three JWS segments, got {token}"
     );
     assert!(
-        segments[2].is_empty(),
-        "an unsecured JWS carries no signature, got {token}"
+        !segments[2].is_empty(),
+        "a signed JWS carries a signature, got {token}"
     );
     let payload = decode_base64url(segments[1])
         .unwrap_or_else(|| panic!("the claims must be base64url: {token}"));

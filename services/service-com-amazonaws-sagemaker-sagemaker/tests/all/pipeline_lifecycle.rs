@@ -27,7 +27,7 @@ pub(crate) fn token(seed: &str) -> String {
 }
 
 /// A pipeline definition carrying `steps`, in the published schema version.
-fn definition(steps: Value) -> String {
+pub(crate) fn definition(steps: Value) -> String {
     json!({ "Version": DEFINITION_VERSION, "Metadata": {}, "Steps": steps }).to_string()
 }
 
@@ -46,7 +46,7 @@ pub(crate) fn step(name: &str, depends_on: &[&str]) -> Value {
 
 /// A `Condition` step whose branches hold steps of the same pipeline, nested under
 /// `Arguments` the way SageMaker's own definitions nest them.
-fn condition_step(name: &str, if_steps: Value, else_steps: Value) -> Value {
+pub(crate) fn condition_step(name: &str, if_steps: Value, else_steps: Value) -> Value {
     json!({
         "Name": name,
         "Type": "Condition",

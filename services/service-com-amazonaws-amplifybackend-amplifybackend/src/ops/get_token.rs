@@ -2,12 +2,15 @@
 
 //! @op GetToken
 //!
-//! REPORTS the challenge token `(AppId, SessionId)` addresses, exactly as `CreateToken`
-//! minted it: nothing about the token changes because it was read, so a later caller
-//! sees the same code. A session id this service holds no LIVE token for — never
-//! minted, already deleted, or past its `Ttl` — is the modelled `NotFoundException`
-//! (404), and an `AppId` that identifies no registered Amplify app is refused with HTTP
-//! 400 `ValidationException` before the token is looked up at all
+//! REPORTS the challenge token `(AppId, SessionId)` addresses: `AppId`, `SessionId` and
+//! `ChallengeCode` exactly as `CreateToken` minted them, and `Ttl` as the EMPTY STRING —
+//! the read path does not report a lifetime ([`crate::state::READ_PATH_TTL`]). Nothing
+//! about the token changes because it was read, so a later caller sees the same code.
+//! A session id this service holds no LIVE token for — never minted, already deleted, or
+//! past its `Ttl` — is refused with HTTP 404 and the recorded error code
+//! `ResourceNotFoundException` ([`crate::state::resource_not_found`]), and an `AppId`
+//! that identifies no registered Amplify app is refused with HTTP 400
+//! `ValidationException` before the token is looked up at all
 //! ([`crate::state::require_registered_app`]).
 //!
 //! The one write it performs is the expiry the CLOCK already made due
@@ -80,6 +83,17 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The sentence AmplifyBackend's challenge-token read answers a session that does not
+/// resolve with, after this service's fixed [`crate::state::ERROR_MESSAGE_PREFIX`].
+///
+/// Recorded behaviour, not modelled, and NOT built from the request: the refusal is one
+/// fixed sentence whatever app or session id was asked about — the same shape of rule as
+/// the storage read's sentence in `get_backend_storage.rs` and the app-identity refusal's
+/// [`crate::state::invalid_app_id_message`]. It calls the token a "login code" because
+/// that is what the challenge code is: the one-time code that signs a caller in to the
+/// app's Amplify Admin UI.
+const CHALLENGE_TOKEN_NOT_FOUND_SENTENCE: &str = "Login code not found";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -170,24 +184,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // expired code is never reported as usable.
         store.expire_challenge_tokens(now);
 
+        // ONE refusal for the whole lookup, carrying the RECORDED error code: a session
+        // this app holds no live token for — never minted, already deleted, or expired —
+        // is a `ResourceNotFoundException` (404), which is the code a client matches on to
+        // learn that the login code is spent. It is not a shape this service's model
+        // declares, so it is raised through the crate's own channel; the modelled
+        // `NotFoundException` would put a different code on the wire than the service
+        // does. The sentence is fixed, so which identifier failed to resolve is not
+        // leaked to the caller.
         let token = store
             .challenge_token(&input.app_id, &input.session_id)
             .ok_or_else(|| {
-                GetTokenError::from(GetTokenErrorModeled::NotFoundException(
-                    crate::state::not_found(
-                        crate::state::RESOURCE_TYPE_CHALLENGE_TOKEN,
-                        format!(
-                            "no challenge token with session id {} exists for app {}",
-                            input.session_id, input.app_id
-                        ),
-                    ),
-                ))
+                crate::state::resource_not_found::<GetTokenErrorModeled>(
+                    CHALLENGE_TOKEN_NOT_FOUND_SENTENCE,
+                )
             })?;
         Ok(GetTokenOutput {
             app_id: Some(token.app_id.clone()),
             challenge_code: Some(token.challenge_code.clone()),
             session_id: Some(token.session_id.clone()),
-            ttl: Some(token.ttl()),
+            // Present and EMPTY, never the stored lifetime: the read path reports no
+            // lifetime at all (see `crate::state::READ_PATH_TTL`), while `CreateToken`
+            // — the call that GRANTS the lifetime — reports it.
+            ttl: Some(crate::state::READ_PATH_TTL.to_string()),
         })
     }
 }

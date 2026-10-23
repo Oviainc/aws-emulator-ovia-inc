@@ -30,7 +30,10 @@
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
-//!   404, …). Return `Some(resp)` to answer in your own envelope if desired.
+//!   404, …). Return `Some(resp)` to answer in your own envelope if desired. This
+//!   service answers one such request itself: a GET of a pool's
+//!   `/<UserPoolId>/.well-known/jwks.json`, the public key set its tokens are
+//!   verified against, which the Smithy model does not describe.
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
@@ -53,6 +56,11 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The shared engine, so the one non-API route a user-pool endpoint serves
+    /// (the pool's JSON Web Key Set, see [`EmulatedService::override_routing_error`])
+    /// can be answered from this service's stored state. Operations reach the
+    /// engine through the entry that constructed them, not through this field.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,7 +69,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
         }
     }
 }
@@ -146,13 +155,38 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
-        // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // modeled operation. A user-pool endpoint serves ONE route this
+        // service's Smithy model does not describe: the pool's JSON Web Key
+        // Set at `/<UserPoolId>/.well-known/jwks.json`, which every verifier of
+        // a Cognito token fetches to check the token's signature, under the
+        // algorithm the key set itself names (Amazon
+        // Cognito Developer Guide, "Verifying a JSON web token"). It carries
+        // only PUBLIC key parameters and AWS serves it unauthenticated, which
+        // is what this seam gives: the router consults it before it
+        // authenticates anything, so an anonymous GET reaches the document the
+        // same way it does on AWS. Every other unrouted request keeps the
+        // framework's protocol-correct refusal.
+        if req.method() != "GET" {
+            return None;
+        }
+        let user_pool_id = jwks_route_pool_id(req.uri())?.to_string();
+        let state = crate::state::service_state(&*self.engine)?;
+        let document = {
+            let guard = state.lock();
+            // A path naming no stored pool is not this route: it falls through
+            // to the framework's refusal rather than answering an empty key
+            // set. Rendering the stored key is a pure read — no key is
+            // generated here, and nothing is written.
+            guard.pool(&user_pool_id)?.jwks()
+        };
+        let mut response = aws_smithy_runtime_api::http::Response::new(
+            aws_smithy_runtime_api::http::StatusCode::try_from(200).ok()?,
+            ::aws_smithy_types::body::SdkBody::from(document.to_string()),
+        );
+        response
+            .headers_mut()
+            .insert("content-type", "application/json");
+        Some(response)
     }
 
     fn override_framework_error(
@@ -168,6 +202,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// The `UserPoolId` whose key set `uri` addresses, for a request path of the
+/// form `/<UserPoolId>/.well-known/jwks.json`, and `None` for every other path.
+///
+/// This is the only non-modelled route a user-pool endpoint serves; the pool id
+/// is the path segment before it, exactly as the `iss` claim of a token this
+/// service issued states it (`<endpoint>/<UserPoolId>`).
+fn jwks_route_pool_id(uri: &str) -> Option<&str> {
+    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    let (user_pool_id, tail) = path.strip_prefix('/')?.split_once('/')?;
+    (!user_pool_id.is_empty() && tail == ".well-known/jwks.json").then_some(user_pool_id)
 }
 
 /// Whether the routing key the framework resolves for `parts` is `signing_name`.
@@ -224,10 +270,52 @@ fn unsigned_target_names_shape(parts: &http::request::Parts, service_shape_id: &
 #[cfg(test)]
 mod tests {
     //! The two names this ONE `awsJson` endpoint answers on, over the signals a request
-    //! can carry. `tests/all/initiate_auth.rs` asserts the same rule on the wire,
-    //! through the router; this table is the rule itself, row by row.
+    //! can carry, beside the one non-modelled path this endpoint serves a document on.
+    //! `tests/all/initiate_auth.rs` asserts the routing rule on the wire, through the
+    //! router, and `tests/all/token_signing.rs` fetches the key set over it; these
+    //! tables are the rules themselves, row by row.
 
-    use super::{routes_to_signing_name, unsigned_target_names_shape};
+    use super::{jwks_route_pool_id, routes_to_signing_name, unsigned_target_names_shape};
+
+    /// [`jwks_route_pool_id`] over the paths that reach this service: the key-set
+    /// route, and the paths that are not it.
+    #[test]
+    fn only_a_pools_well_known_key_set_path_names_a_pool() {
+        // (case, path, expected)
+        let rows: &[(&str, &str, Option<&str>)] = &[
+            (
+                "a pool's key set",
+                "/us-east-1_abc123def/.well-known/jwks.json",
+                Some("us-east-1_abc123def"),
+            ),
+            (
+                "a pool's key set with a query string",
+                "/us-west-2_0a9b8c7d6/.well-known/jwks.json?cachebust=1",
+                Some("us-west-2_0a9b8c7d6"),
+            ),
+            ("the root path, where every modelled call goes", "/", None),
+            (
+                "another well-known document",
+                "/us-east-1_abc123def/.well-known/openid-configuration",
+                None,
+            ),
+            ("a key set with no pool id", "//.well-known/jwks.json", None),
+            (
+                "a deeper path under a pool",
+                "/us-east-1_abc123def/oauth2/token",
+                None,
+            ),
+            ("a path with no leading slash", "jwks.json", None),
+        ];
+
+        for (case, path, expected) in rows {
+            let actual = jwks_route_pool_id(path);
+            assert_eq!(
+                actual, *expected,
+                "case {case:?} ({path}): expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
 
     /// This service's SigV4 signing name and Smithy shape id, as the generated identity
     /// states them (`smithy_query(query="service_info")`: `sigv4Name` `cognito-idp`,

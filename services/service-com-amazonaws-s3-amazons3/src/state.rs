@@ -2046,6 +2046,63 @@ impl Bucket {
         self.encryption = Some(rules);
     }
 
+    /// The default encryption rules IN FORCE on the bucket: the ones a
+    /// `PutBucketEncryption` associated with it, or the single SSE-S3 rule every bucket
+    /// carries until one does ([`default_encryption_rule`]).
+    ///
+    /// COMPUTED, never stored: a bucket that was never configured keeps [`Self::encryption`]
+    /// at `None`, so reading this changes nothing a later caller sees. This is what
+    /// `GetBucketEncryption` reports and what [`Self::default_object_encryption`] resolves a
+    /// write's inherited encryption from, so the two can never disagree.
+    pub fn effective_encryption_rules(&self) -> Vec<BucketEncryptionRule> {
+        match self.encryption() {
+            Some(configured) => configured.to_vec(),
+            None => vec![default_encryption_rule()],
+        }
+    }
+
+    /// The encryption an object written to this bucket WITHOUT naming any encryption of its
+    /// own is stored under: the bucket's default encryption configuration.
+    ///
+    /// "Amazon S3 encrypts data with server-side encryption by using Amazon S3 managed keys
+    /// (SSE-S3) by default. You can optionally tell Amazon S3 to encrypt data at rest by
+    /// using server-side encryption with other key options"
+    /// (`PutObjectRequest$ServerSideEncryption`) — the other key options being the ones
+    /// `PutBucketEncryption` configures, which is why the rule applied here is the bucket's
+    /// effective one rather than SSE-S3 always.
+    ///
+    /// The rule that decides it is the first of [`Self::effective_encryption_rules`] that
+    /// names an `ApplyServerSideEncryptionByDefault` algorithm; a configuration whose rules
+    /// name none (`ServerSideEncryptionRule` makes that container optional) leaves the
+    /// bucket on the SSE-S3 base default. The Bucket Key setting travels with the algorithm
+    /// only when that algorithm is SSE-KMS, because an S3 Bucket Key is "for object
+    /// encryption with server-side encryption using Key Management Service (KMS) keys
+    /// (SSE-KMS)" (`PutObjectRequest$BucketKeyEnabled`) and nothing else; an encryption
+    /// CONTEXT is never inherited, because it is a per-request value no bucket
+    /// configuration carries.
+    pub fn default_object_encryption(&self) -> ObjectEncryption {
+        let rules = self.effective_encryption_rules();
+        let rule = rules
+            .iter()
+            .find(|rule| rule.sse_algorithm.is_some())
+            .cloned()
+            .unwrap_or_else(default_encryption_rule);
+        let inherited = ObjectEncryption {
+            sse_algorithm: rule.sse_algorithm,
+            kms_key_id: rule.kms_master_key_id,
+            kms_encryption_context: None,
+            bucket_key_enabled: rule.bucket_key_enabled,
+        };
+        if inherited.uses_kms() {
+            inherited
+        } else {
+            ObjectEncryption {
+                sse_algorithm: inherited.sse_algorithm,
+                ..ObjectEncryption::default()
+            }
+        }
+    }
+
     /// The bucket's website configuration, or `None` when no website configuration is
     /// associated with the bucket.
     pub fn website(&self) -> Option<&BucketWebsite> {
@@ -2425,6 +2482,11 @@ pub struct Object {
 /// `BucketKeyEnabled` — the four `PutObject`, `GetObject` and `HeadObject` all report
 /// back as bound response headers.
 ///
+/// A write that names one or more of them is stored under what it named; one that names
+/// none inherits the bucket's default encryption configuration
+/// ([`Bucket::default_object_encryption`]), which is what makes every object in a bucket
+/// encrypted even when no client ever asked.
+///
 /// What this records is an object's encryption CONFIGURATION, not a key and not a
 /// ciphertext: this emulator holds an object's bytes in this process's memory and
 /// performs no cryptography, so the only thing it can answer faithfully is which
@@ -2437,10 +2499,10 @@ pub struct ObjectEncryption {
     /// stored before any encryption state was recorded for it.
     pub sse_algorithm: Option<String>,
     /// `SSEKMSKeyId`, verbatim as the request carried it — "You can specify the key ID,
-    /// key alias, or the Amazon Resource Name (ARN) of the KMS key" — and `None` for a
-    /// write that named none. Only the request's own value: a bucket's DEFAULT encryption
-    /// configuration is not consulted here, which is why a write that names no encryption
-    /// member reports none.
+    /// key alias, or the Amazon Resource Name (ARN) of the KMS key" — or, for a write that
+    /// named no encryption member at all, the `KMSMasterKeyID` of the bucket's default
+    /// encryption configuration ([`Bucket::default_object_encryption`]), and `None` when
+    /// neither names one.
     pub kms_key_id: Option<String>,
     /// `SSEKMSEncryptionContext`: "a Base64-encoded string holding a UTF-8 encoded JSON
     /// of additional encryption context key-value pairs", verbatim.
@@ -2450,6 +2512,14 @@ pub struct ObjectEncryption {
 }
 
 impl ObjectEncryption {
+    /// Whether this record names NO encryption member at all — what a write that leaves
+    /// every one of `PutObject`'s encryption headers off parses to, and exactly the case
+    /// where the bucket's own default encryption configuration is what the object is
+    /// stored under ([`Bucket::default_object_encryption`]).
+    pub fn names_no_member(&self) -> bool {
+        self == &Self::default()
+    }
+
     /// Whether this object's encryption is SSE-KMS — the only kind a KMS key id, an
     /// encryption context or an S3 Bucket Key belongs to
     /// (`ApplyServerSideEncryptionByDefault$KMSMasterKeyID`: "This parameter is allowed if

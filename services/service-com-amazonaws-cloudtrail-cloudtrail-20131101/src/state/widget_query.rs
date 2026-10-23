@@ -80,11 +80,6 @@ const SQL_PLACEHOLDER: &str = "?";
 /// than wording their own.
 pub const INVALID_QUERY_STATEMENT_MESSAGE: &str = "Query is not valid.";
 
-/// The group lengths of the UUID a CloudTrail Lake event data store id is, from the
-/// modelled `UUID` shape every event data store id member targets (`len 36..36`,
-/// `pattern ^[a-f0-9\-]+$` — `smithy_query(query="shape",shape="UUID")`).
-const EVENT_DATA_STORE_ID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
-
 /// The characters a WORD of a statement is made of, for the purpose of finding the
 /// words that name an event data store: the characters an identifier, an id or an ARN
 /// is written with.
@@ -96,23 +91,14 @@ fn is_word_character(character: char) -> bool {
     character.is_alphanumeric() || matches!(character, '_' | '-' | ':' | '/' | '.')
 }
 
-/// Whether `word` has the shape of an event data store id: the UUID of
-/// [`EVENT_DATA_STORE_ID_GROUP_LENGTHS`] groups of hex digits.
-fn is_event_data_store_id(word: &str) -> bool {
-    let groups: Vec<&str> = word.split('-').collect();
-    groups.len() == EVENT_DATA_STORE_ID_GROUP_LENGTHS.len()
-        && groups
-            .iter()
-            .zip(EVENT_DATA_STORE_ID_GROUP_LENGTHS)
-            .all(|(group, length)| {
-                group.len() == length && group.chars().all(|c| c.is_ascii_hexdigit())
-            })
-}
-
 /// Whether `word` names a resource rather than being a bare SQL identifier: an ARN,
 /// or an event data store id.
+///
+/// The id shape is decided by [`super::is_event_data_store_id`], the crate's ONE
+/// reading of an event data store id, so a statement names a store by exactly the
+/// ids every other operation accepts.
 fn names_a_resource(word: &str) -> bool {
-    word.starts_with("arn:") || is_event_data_store_id(word)
+    word.starts_with("arn:") || super::is_event_data_store_id(word)
 }
 
 /// `statement` as SQL: the documented query parameters read as placeholders, and every
