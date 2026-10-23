@@ -174,6 +174,24 @@ impl ResourceKind {
         format!("Invalid ARN for {}: {}", self.resource_type, arn)
     }
 
+    /// The `Message` an ARN that NAMES a resource of this kind, but that this service
+    /// holds nothing under, is refused with: `No resource found <the ARN supplied>`.
+    ///
+    /// Request-derived: Amazon Forecast reports an ARN that resolves to no resource by
+    /// quoting the submitted ARN back verbatim after that one phrase, and adds no other
+    /// prose — not the shape's documentation sentence, and nothing naming the kind of
+    /// resource or the operation. ONE rule for every ARN member of this service, so the
+    /// two operations cannot word the same outcome differently and a caller can parse the
+    /// offending ARN back out of the message it gets.
+    ///
+    /// This is the message of the modelled `ResourceNotFoundException` (HTTP 404), which
+    /// is reached only AFTER [`ResourceKind::names`] has accepted the value — an ARN this
+    /// service cannot read as one of this kind never gets here and is worded by
+    /// [`ResourceKind::invalid_arn_message`] instead.
+    pub fn not_found_message(&self, arn: &str) -> String {
+        format!("No resource found {arn}")
+    }
+
     /// The dotted member path a boundary refusal names this ARN member under.
     ///
     /// Spelled by the framework's OWN path writer (lowerCamel), so this service's table

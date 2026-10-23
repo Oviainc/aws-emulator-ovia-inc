@@ -316,6 +316,7 @@ async fn the_upload_past_the_cap_is_refused() {
                     repository_name: "capped".to_string(),
                     part_size: state::REPORTED_LAYER_PART_SIZE,
                     started_at: std::time::SystemTime::now(),
+                    received_bytes: Vec::new(),
                 },
             );
         }

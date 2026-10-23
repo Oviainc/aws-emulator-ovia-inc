@@ -212,13 +212,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let projection = {
             let state = state.lock();
             let Some(forecast) = state.what_if_forecasts.get(&input.what_if_forecast_arn) else {
+                // Worded by the one rule every ARN member of this service follows: the
+                // submitted ARN quoted back verbatim after `No resource found`, with no
+                // other prose ([`crate::state::ResourceKind::not_found_message`]).
                 return Err(QueryWhatIfForecastErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "We can't find that resource. No what-if forecast with ARN {} \
-                             exists.",
-                            input.what_if_forecast_arn
-                        )),
+                        message: Some(
+                            crate::state::WHAT_IF_FORECAST
+                                .not_found_message(&input.what_if_forecast_arn),
+                        ),
                     },
                 )
                 .into());

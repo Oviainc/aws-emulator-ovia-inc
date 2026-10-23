@@ -161,6 +161,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // Authorization comes first: the model declares `AccessDeniedException` (403) for
+        // this operation, and AWS refuses a caller whose identity holds no permission for
+        // it before anything is looked up, so a refused caller learns nothing about what
+        // this account holds. See `crate::state::authorization`.
+        crate::state::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::LIST_TAGS_FOR_RESOURCE,
+            &input.resource_arn,
+        )
+        .map_err(ListTagsForResourceErrorModeled::AccessDeniedException)?;
+
+        // The ARN's ACCOUNT is validated BEFORE the store is consulted: an ARN naming
+        // another account is unusable whatever this account holds, so it is a
+        // `ValidationException` (400) and not a `ResourceNotFoundException`. Deciding it
+        // without a lookup is also what keeps the answer from reporting on a resource AWS
+        // never looks up. The resource segment is NOT judged here: an ARN of this account
+        // whose resource names no export is a resource this service looked for and did
+        // not find, which is the 404 below.
+        crate::state::validate_taggable_resource_arn(&input.resource_arn)
+            .map_err(ListTagsForResourceErrorModeled::ValidationException)?;
+
         let tags: Vec<(String, ResourceTag)> = {
             let store = state.lock();
             let stored = store.exports.get(&input.resource_arn).ok_or_else(|| {

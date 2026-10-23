@@ -359,8 +359,11 @@ async fn a_duplicated_tag_key_is_refused_and_persists_nothing() {
     }
 }
 
-/// An ARN that names no export is refused with the modelled 404, whether it was never
-/// created or has since been deleted — and a deleted export's tags do not come back.
+/// An ARN of THIS ACCOUNT that names no export is refused with the modelled 404, whether
+/// it was never created or has since been deleted — and a deleted export's tags do not come
+/// back. An ARN of ANOTHER account is refused before any lookup, with the modelled 400:
+/// see `tests/all/tagging_arn_validation.rs` for that rule, which this test's foreign rows
+/// cross-check on `TagResource`.
 #[tokio::test]
 async fn tagging_an_arn_that_names_no_export_is_a_404() {
     let client = Client::new();
@@ -370,13 +373,11 @@ async fn tagging_an_arn_that_names_no_export_is_a_404() {
 
     let absent = vec![
         ("never created, own account", format!("arn:aws:bcm-data-exports:us-east-1:{own}:export/never_created")),
+        // An own-account ARN whose resource is not even an export form: the tagging check
+        // judges the account only, so this is still looked up and not found.
         (
-            "foreign account",
-            "arn:aws:bcm-data-exports:us-east-1:111122223333:export/other_tenant".to_string(),
-        ),
-        (
-            "another partition",
-            "arn:aws-cn:bcm-data-exports:cn-north-1:777788889999:export/absent".to_string(),
+            "own account, another resource class",
+            format!("arn:aws:bcm-data-exports:us-east-1:{own}:table/COST_AND_USAGE_REPORT"),
         ),
         ("deleted export", live.clone()),
     ];

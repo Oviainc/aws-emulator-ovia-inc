@@ -299,12 +299,15 @@ pub fn table_spec(name: &str) -> Option<&'static TableSpec> {
 }
 
 /// The modelled 400 for a `TableName` the catalog does not publish.
+///
+/// The sentence is BUILT FROM THE REQUEST: it names the table that was asked for and
+/// reports that it was not found, which is the whole of what the caller has to act on.
+/// (Recorded AWS behavior shows that form, e.g. "Table NOT_A_REAL_TABLE_XYZ not found";
+/// the requirement is the request-derived form, not that one string.) The tables that ARE
+/// published are what `ListTables` reports, so the message does not restate them.
 pub fn unknown_table(name: &str) -> ValidationException {
     ValidationException {
-        message: format!(
-            "Table {} is not supported. Call ListTables for the tables available in data exports.",
-            clip_for_message(name)
-        ),
+        message: format!("Table {} not found", clip_for_message(name)),
         reason: Some(super::VALIDATION_REASON_FIELD_FAILED.to_string()),
         fields: Some(vec![ValidationExceptionField {
             name: "TableName".to_string(),
