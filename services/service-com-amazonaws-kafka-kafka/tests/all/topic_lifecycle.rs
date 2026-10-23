@@ -20,7 +20,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kafka_kafka::state::{
-    MAX_TOPIC_NAME_LENGTH, TOPIC_ACTIVATION_DELAY, TOPIC_DELETION_DELAY,
+    MAX_TOPIC_NAME_LENGTH, RESOURCE_NOT_FOUND_MESSAGE, TOPIC_ACTIVATION_DELAY,
+    TOPIC_DELETION_DELAY,
 };
 
 use crate::kafka_harness::{pct, ClusterRequest, Emulator, Reply, ACCOUNT, REGION};
@@ -71,6 +72,17 @@ impl Emulator {
             region,
             "DELETE",
             &format!("/v1/clusters/{}/topics/{}", pct(cluster_arn), pct(topic)),
+            None,
+        )
+        .await
+    }
+
+    /// `ListTopics` on `cluster_arn`, with `query` carrying whichever of
+    /// `maxResults` / `nextToken` / `topicNameFilter` the row exercises.
+    async fn list_topics(&self, cluster_arn: &str, query: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!("/v1/clusters/{}/topics{query}", pct(cluster_arn)),
             None,
         )
         .await
@@ -831,4 +843,333 @@ async fn deleting_a_cluster_takes_its_topics_with_it() {
             delete_again.body
         );
     }
+}
+
+/// RULE: every topic operation resolves its cluster FIRST and reports a cluster it
+/// cannot resolve the same way — a `ClusterArn` that is not an MSK cluster ARN is a
+/// `BadRequestException` (400), and a well-formed one this endpoint's region holds
+/// no cluster for is the missing resource it names (404 `NotFoundException`,
+/// carrying the service's own not-found wording) — on a repeat as on the first
+/// call, and without creating anything.
+#[tokio::test]
+async fn every_topic_operation_resolves_the_cluster_first() {
+    let emulator = Emulator::new();
+    // One live cluster, so a 404 below means "this ARN", not "no clusters at all".
+    let live = emulator.cluster("live", 1).await;
+
+    // Rows: well-formed cluster ARNs no live cluster answers for (absent name,
+    // another region, another account, another partition), then one row per way
+    // the ARN grammar itself can fail.
+    let rows: Vec<(&str, String, u16, &str)> = vec![
+        (
+            "absent cluster",
+            format!(
+                "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/does-not-exist/11111111-2222-4333-8444-555555555555-1"
+            ),
+            404,
+            "NotFoundException",
+        ),
+        (
+            "another region's cluster",
+            live.replace(REGION, "eu-west-1"),
+            404,
+            "NotFoundException",
+        ),
+        (
+            "another account's cluster",
+            live.replace(ACCOUNT, "123456789012"),
+            404,
+            "NotFoundException",
+        ),
+        (
+            "another partition",
+            live.replacen("arn:aws:", "arn:aws-cn:", 1),
+            404,
+            "NotFoundException",
+        ),
+        (
+            "not an ARN at all",
+            "my-cluster".to_string(),
+            400,
+            "BadRequestException",
+        ),
+        (
+            "wrong service",
+            format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/c/abc-1"),
+            400,
+            "BadRequestException",
+        ),
+        (
+            "wrong resource type",
+            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/c/abc-1"),
+            400,
+            "BadRequestException",
+        ),
+        (
+            "resource without an id",
+            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/c"),
+            400,
+            "BadRequestException",
+        ),
+        (
+            "empty account",
+            format!("arn:aws:kafka:{REGION}::cluster/c/abc-1"),
+            400,
+            "BadRequestException",
+        ),
+    ];
+
+    for (case, arn, status, code) in &rows {
+        // The create is called twice: a refusal depends on the request and the
+        // registry alone, so a retry answers exactly the same.
+        let create = emulator
+            .create_topic(arn, &TopicRequest::new("whatever", 1, 1))
+            .await;
+        let retry = emulator
+            .create_topic(arn, &TopicRequest::new("whatever", 1, 1))
+            .await;
+        let describe = emulator.describe_topic(arn, "whatever").await;
+        let list = emulator.list_topics(arn, "").await;
+        for (operation, reply) in [
+            ("CreateTopic", &create),
+            ("CreateTopic (retry)", &retry),
+            ("DescribeTopic", &describe),
+            ("ListTopics", &list),
+        ] {
+            assert_eq!(
+                (reply.status, reply.error_code()),
+                (*status, *code),
+                "case {case:?} ({arn:?}): expected {operation} to answer {status} {code}, got {} {}",
+                reply.status,
+                reply.body
+            );
+            if *code == "NotFoundException" {
+                assert_eq!(
+                    reply.at("/message").as_str(),
+                    Some(RESOURCE_NOT_FOUND_MESSAGE),
+                    "case {case:?}: expected {operation}'s 404 to carry the service's \
+                     not-found message, got {}",
+                    reply.body
+                );
+            }
+        }
+    }
+
+    // And none of those refusals created a topic on the cluster that does exist.
+    let listed = emulator.list_topics(&live, "").await;
+    assert_eq!(
+        listed.at("/topics").as_array().map(Vec::len),
+        Some(0),
+        "a refused create must persist nothing, got {}",
+        listed.body
+    );
+}
+
+/// RULE: `ListTopics` pages one cluster's topics in one stable order — every topic
+/// exactly once across the pages, no page longer than `MaxResults`, `NextToken`
+/// present exactly while more pages remain, and a token that was not minted for
+/// THIS listing refused rather than served as a first page.
+#[tokio::test]
+async fn list_topics_pages_every_topic_exactly_once() {
+    // Exhaustive over the small space rather than sampled: every topic count
+    // 1..=4 against every page size 1..=5, which covers a page size below, equal
+    // to, dividing and exceeding the result count.
+    for count in 1..=4usize {
+        let emulator = Emulator::new();
+        let cluster = emulator.cluster("paged", 1).await;
+        let mut created: Vec<String> = Vec::new();
+        for index in 0..count {
+            let name = format!("page-{index:02}");
+            emulator
+                .create_topic_ok(&cluster, &TopicRequest::new(&name, 1, 1))
+                .await;
+            created.push(name);
+        }
+        created.sort();
+
+        for page_size in 1..=5usize {
+            let mut seen: Vec<String> = Vec::new();
+            let mut token: Option<String> = None;
+            let mut pages = 0usize;
+            loop {
+                let mut query = format!("?maxResults={page_size}");
+                if let Some(next) = &token {
+                    query.push_str(&format!("&nextToken={}", pct(next)));
+                }
+                let reply = emulator.list_topics(&cluster, &query).await;
+                assert_eq!(
+                    reply.status, 200,
+                    "case {count} topics / page {page_size}: expected 200, got {} {}",
+                    reply.status, reply.body
+                );
+                let topics = reply.at("/topics").as_array().cloned().unwrap_or_default();
+                assert!(
+                    topics.len() <= page_size,
+                    "case {count} topics / page {page_size}: a page must not exceed \
+                     MaxResults, got {}",
+                    reply.body
+                );
+                for topic in &topics {
+                    seen.push(
+                        topic["topicName"]
+                            .as_str()
+                            .unwrap_or_else(|| {
+                                panic!("a listed topic carries no name: {}", reply.body)
+                            })
+                            .to_string(),
+                    );
+                }
+                pages += 1;
+                assert!(
+                    pages <= count + 1,
+                    "case {count} topics / page {page_size}: paging did not terminate after \
+                     {pages} pages, last {}",
+                    reply.body
+                );
+                match reply.at("/nextToken").as_str() {
+                    Some(next) => token = Some(next.to_string()),
+                    None => break,
+                }
+            }
+            assert_eq!(
+                seen, created,
+                "case {count} topics / page {page_size}: expected every topic exactly once \
+                 in name order, got {seen:?}"
+            );
+        }
+
+        // A token minted for one cluster's listing resumes nothing on another.
+        let other = emulator.cluster("paged-other", 1).await;
+        let first_page = emulator.list_topics(&cluster, "?maxResults=1").await;
+        if let Some(token) = first_page.at("/nextToken").as_str() {
+            let reply = emulator
+                .list_topics(&other, &format!("?nextToken={}", pct(token)))
+                .await;
+            assert_eq!(
+                (reply.status, reply.error_code()),
+                (400, "BadRequestException"),
+                "case {count} topics: a token minted for another cluster must be refused, \
+                 got {} {}",
+                reply.status,
+                reply.body
+            );
+        }
+        // Nor does a token this service never minted.
+        for forged in ["!!!not-base64!!!", "aGVsbG8gd29ybGQ=", "%20"] {
+            let reply = emulator
+                .list_topics(&cluster, &format!("?nextToken={}", pct(forged)))
+                .await;
+            assert_eq!(
+                (reply.status, reply.error_code()),
+                (400, "BadRequestException"),
+                "case token={forged:?}: an unparseable token must be refused, got {} {}",
+                reply.status,
+                reply.body
+            );
+        }
+    }
+}
+
+/// RULE: `TopicNameFilter` keeps exactly the topics whose name starts with it, and
+/// it composes with paging rather than being applied to one page.
+#[tokio::test]
+async fn the_topic_name_filter_keeps_the_matching_prefixes() {
+    let emulator = Emulator::new();
+    let cluster = emulator.cluster("filtered", 1).await;
+    for name in ["alpha-one", "alpha-two", "alphabet", "beta-one"] {
+        emulator
+            .create_topic_ok(&cluster, &TopicRequest::new(name, 1, 1))
+            .await;
+    }
+
+    // Rows: a prefix matching several, one that narrows the same set, a whole
+    // name, the empty prefix, a prefix matching nothing, and one longer than any
+    // name.
+    let rows: Vec<(&str, Vec<&str>)> = vec![
+        ("alpha", vec!["alpha-one", "alpha-two", "alphabet"]),
+        ("alpha-", vec!["alpha-one", "alpha-two"]),
+        ("alphabet", vec!["alphabet"]),
+        ("beta", vec!["beta-one"]),
+        ("", vec!["alpha-one", "alpha-two", "alphabet", "beta-one"]),
+        ("gamma", vec![]),
+        ("alpha-one-more", vec![]),
+    ];
+    for (prefix, expected) in rows {
+        for page_size in [1usize, 2, 100] {
+            let mut seen: Vec<String> = Vec::new();
+            let mut token: Option<String> = None;
+            loop {
+                let mut query = format!("?maxResults={page_size}&topicNameFilter={}", pct(prefix));
+                if let Some(next) = &token {
+                    query.push_str(&format!("&nextToken={}", pct(next)));
+                }
+                let reply = emulator.list_topics(&cluster, &query).await;
+                assert_eq!(
+                    reply.status, 200,
+                    "case {prefix:?} / page {page_size}: expected 200, got {} {}",
+                    reply.status, reply.body
+                );
+                for topic in reply.at("/topics").as_array().cloned().unwrap_or_default() {
+                    seen.push(topic["topicName"].as_str().unwrap_or_default().to_string());
+                }
+                match reply.at("/nextToken").as_str() {
+                    Some(next) => token = Some(next.to_string()),
+                    None => break,
+                }
+            }
+            seen.sort();
+            let mut want: Vec<String> = expected.iter().map(|name| (*name).to_string()).collect();
+            want.sort();
+            assert_eq!(
+                seen, want,
+                "case {prefix:?} / page {page_size}: expected {want:?}, got {seen:?}"
+            );
+        }
+    }
+}
+
+/// RULE: a topic the clock has removed is gone from the listing too, so every
+/// reader of a cluster's topics agrees about which topics it holds.
+#[tokio::test]
+async fn a_removed_topic_leaves_the_listing() {
+    let emulator = Emulator::new();
+    let cluster = emulator.cluster("listed-delete", 1).await;
+    for name in ["kept-one", "kept-two", "doomed"] {
+        emulator
+            .create_topic_ok(&cluster, &TopicRequest::new(name, 1, 1))
+            .await;
+    }
+
+    emulator.delete_topic(&cluster, "doomed").await;
+    // Still DELETING, so still there: the listing reports what the registry holds.
+    let listed = emulator.list_topics(&cluster, "").await;
+    let names = listed_names(&listed);
+    assert_eq!(
+        names,
+        vec!["doomed", "kept-one", "kept-two"],
+        "a topic whose removal is not yet due must still be listed, got {}",
+        listed.body
+    );
+
+    sleep_past_topic_deletion();
+    let listed = emulator.list_topics(&cluster, "").await;
+    let names = listed_names(&listed);
+    assert_eq!(
+        names,
+        vec!["kept-one", "kept-two"],
+        "a topic the clock has removed must leave the listing, got {}",
+        listed.body
+    );
+}
+
+/// The topic names a `ListTopics` reply reports, in the order it reported them.
+fn listed_names(reply: &Reply) -> Vec<String> {
+    reply
+        .at("/topics")
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|topic| topic["topicName"].as_str().unwrap_or_default().to_string())
+        .collect()
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTopics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTopics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTopics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the stored topics of one cluster in name order: the cluster is resolved
+//! first (a `ClusterArn` that is not an MSK cluster ARN is a bad request, a
+//! well-formed one no live cluster holds is a 404), then `TopicNameFilter` keeps
+//! the matching prefixes and `MaxResults` / `NextToken` page what is left.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +75,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The largest page `MaxResults` may ask for, from that member's `range` in the
+// model (1..100), and the size used when the request names none. The crate's own
+// bound, shared with every other listing rather than restated here.
+use crate::state::MAX_RESULTS_LIMIT;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -91,10 +91,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kafka-kafka.json");
 // here — hence the `ListTopicsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kafka#ListTopics")]
+// `NotFoundException` — a shape the SERVICE models and several of its operations
+// declare, but this one does not list — is widened in through `extra_errors`:
+// topics are listed FROM a cluster, so a `ClusterArn` that names no live cluster
+// has to be answered as the missing resource it is (HTTP 404) rather than as an
+// empty page, which would claim the cluster exists and holds nothing.
+#[smithy_macros::operation_error(
+    "com.amazonaws.kafka#ListTopics",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ListTopicsErrorModeled {
     BadRequestException(BadRequestException),
+    NotFoundException(NotFoundException),
     ForbiddenException(ForbiddenException),
     InternalServerErrorException(InternalServerErrorException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -114,6 +123,39 @@ impl From<ListTopicsErrorModeled> for ListTopicsError {
     fn from(modeled: ListTopicsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Marker that prefixes a token's plaintext, so a token minted for some other
+/// list cannot be mistaken for one of these.
+const NEXT_TOKEN_PREFIX: &str = "kafka:topics:";
+
+/// Separates the cluster ARN a token was minted for from the topic name the page
+/// stopped at. Neither an MSK ARN nor a legal Kafka topic name can contain it, so
+/// the plaintext splits back into exactly two fields.
+const NEXT_TOKEN_SEPARATOR: char = '#';
+
+/// Encode the cluster and the topic name a page stopped at as a token. Base64 of a
+/// marked plaintext: the token is ENCODED, not authenticated, so a caller could
+/// decode it or mint one. That is harmless here — the name inside is only used as
+/// a `>` comparison against the keys of the cluster the request already names, so
+/// a forged resume point can only skip or repeat entries the caller may already
+/// list.
+fn encode_next_token(cluster_arn: &str, last_topic: &str) -> String {
+    ::aws_smithy_types::base64::encode(format!(
+        "{NEXT_TOKEN_PREFIX}{cluster_arn}{NEXT_TOKEN_SEPARATOR}{last_topic}"
+    ))
+}
+
+/// The topic name a token resumes after, or `None` when the token is not one this
+/// operation minted FOR THIS CLUSTER: a token carries the list it was minted
+/// from, so one page's token cannot resume another cluster's listing.
+fn decode_next_token(token: &str, cluster_arn: &str) -> Option<String> {
+    let decoded = ::aws_smithy_types::base64::decode(token).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (arn, last_topic) = decoded
+        .strip_prefix(NEXT_TOKEN_PREFIX)?
+        .split_once(NEXT_TOKEN_SEPARATOR)?;
+    (arn == cluster_arn).then(|| last_topic.to_string())
 }
 
 /// The `ListTopics` operation.
@@ -152,18 +194,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTopics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTopicsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTopics"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTopicsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(
+                ListTopicsErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster ARN.",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // A token names the topic the previous page stopped at; the next page
+        // starts after it in the registry's own order, so a topic created or
+        // deleted between pages shifts nothing already returned.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match decode_next_token(token, &input.cluster_arn) {
+                Some(name) => Some(name),
+                None => {
+                    return Err(ListTopicsErrorModeled::BadRequestException(
+                        BadRequestException {
+                            invalid_parameter: Some("NextToken".to_string()),
+                            message: Some("The pagination token is not valid.".to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let state = state.lock();
+
+        // Topics are listed FROM a cluster, so an endpoint that holds no cluster
+        // for this ARN has no list to serve — which is a missing resource, not an
+        // empty page.
+        if state.cluster_in(&region, &input.cluster_arn).is_none() {
+            return Err(
+                ListTopicsErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: None,
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // Absent `MaxResults` pages at the largest size the model allows, and no
+        // request may ask for a longer page than that range permits.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_RESULTS_LIMIT))
+            .unwrap_or(MAX_RESULTS_LIMIT as usize)
+            .clamp(1, MAX_RESULTS_LIMIT as usize);
+
+        // The registry is keyed by (cluster ARN, topic name), so one cluster's
+        // topics are a contiguous range in name order: the page walks that range
+        // from its resume point and stops as soon as it is full. `TopicInfo`
+        // carries no status, so this is a pure read — a topic whose removal the
+        // clock already owes is simply not reported, which is what every other
+        // reader says about it too.
+        let now = std::time::SystemTime::now();
+        let mut page: Vec<TopicInfo> = Vec::with_capacity(page_size);
+        let mut last_name: Option<String> = None;
+        let mut more_remain = false;
+        for topic in state
+            .topics_in(&input.cluster_arn)
+            .filter(|topic| topic.removal_due.is_none_or(|due| now < due))
+            .filter(|topic| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|last| topic.name.as_str() > last)
+            })
+        {
+            if input
+                .topic_name_filter
+                .as_deref()
+                .is_some_and(|prefix| !topic.name.starts_with(prefix))
+            {
+                continue;
+            }
+            if page.len() == page_size {
+                more_remain = true;
+                break;
+            }
+            page.push(topic.to_topic_info());
+            last_name = Some(topic.name.clone());
+        }
+
+        // The token is minted from the REGISTRY KEY the resume comparison uses,
+        // not from the rendered `TopicInfo`, so the two can never disagree and a
+        // full page can never be mistaken for the last one.
+        let next_token = if more_remain {
+            last_name
+                .as_deref()
+                .map(|last| encode_next_token(&input.cluster_arn, last))
+        } else {
+            None
+        };
+
+        Ok(ListTopicsOutput {
+            topics: Some(page),
+            next_token,
+        })
     }
 }

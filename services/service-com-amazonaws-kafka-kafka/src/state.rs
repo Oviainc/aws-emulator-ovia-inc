@@ -12,12 +12,13 @@
 //! cluster the same way.
 //!
 //! The topic registry lives beside it, keyed by (cluster ARN, topic name): a topic
-//! belongs to exactly one cluster, so `CreateTopic`, `DescribeTopic` and
-//! `DeleteTopic` all resolve the cluster first and then the topic, through
-//! [`ComAmazonawsKafkaKafkaState::settled_topic_in`] — the one accessor, so every
-//! caller sees the transitions the clock already owed that topic. A cluster
-//! leaving the registry takes its topics with it, so no topic can outlive the
-//! cluster that holds it.
+//! belongs to exactly one cluster, so `CreateTopic`, `DescribeTopic`, `ListTopics`
+//! and `DeleteTopic` all resolve the cluster first and then the topic, through
+//! [`ComAmazonawsKafkaKafkaState::settled_topic_in`] (or
+//! [`ComAmazonawsKafkaKafkaState::topics_in`] for a listing) — the one
+//! accessor each, so every caller sees the transitions the clock already owed that
+//! topic. A cluster leaving the registry takes its topics with it, so no topic can
+//! outlive the cluster that holds it.
 //!
 //! A cluster's configuration also changes after creation: an update operation
 //! (`UpdateConnectivity`, `UpdateStorage`) records a [`PendingUpdate`] on the
@@ -62,7 +63,7 @@ use crate::ops::types::{
     LoggingInfo, MutableClusterInfo, NodeExporter, NodeExporterInfo, OpenMonitoring,
     OpenMonitoringInfo, Prometheus, PrometheusInfo, Provisioned, ProvisionedThroughput,
     Rebalancing, ReplicationInfo, ReplicationInfoDescription, ReplicationInfoSummary,
-    ReplicatorSummary, S3DestinationConfiguration, StorageInfo, TopicConfiguration,
+    ReplicatorSummary, S3DestinationConfiguration, StorageInfo, TopicConfiguration, TopicInfo,
     ZookeeperAccess,
 };
 
@@ -1199,6 +1200,22 @@ impl Topic {
     pub fn settle(&mut self, now: SystemTime) {
         if self.state == TOPIC_STATE_CREATING && now >= self.active_due {
             self.state = TOPIC_STATE_ACTIVE.to_string();
+        }
+    }
+
+    /// The topic as the `TopicInfo` `ListTopics` reports: its identity and the
+    /// counts it was created with.
+    ///
+    /// `OutOfSyncReplicaCount` is 0 because every replica of an emulated topic is
+    /// in sync: nothing here can put a broker behind, so the count is computed
+    /// from that fact rather than invented.
+    pub fn to_topic_info(&self) -> TopicInfo {
+        TopicInfo {
+            topic_arn: Some(self.arn.clone()),
+            topic_name: Some(self.name.clone()),
+            replication_factor: Some(self.replication_factor),
+            partition_count: Some(self.partition_count),
+            out_of_sync_replica_count: Some(0),
         }
     }
 }

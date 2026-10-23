@@ -8,10 +8,11 @@
 //!
 //! * a `ClusterArn` that is not shaped like an MSK cluster ARN is a
 //!   `BadRequestException`;
-//! * a well-formed one this endpoint's region holds no cluster for is also a
-//!   `BadRequestException` -- this operation models NO `NotFoundException`, so the
-//!   modelled 400 is what reports a cluster the request names and the service does
-//!   not hold;
+//! * a well-formed one this endpoint's region holds no cluster for is a
+//!   `NotFoundException` (HTTP 404), carrying the service's own not-found wording:
+//!   the shape is one the SERVICE models and this operation does not list, so it is
+//!   widened in below, because a cluster the request names and the service does not
+//!   hold is a missing resource rather than an unparseable request;
 //! * a `TopicName` Apache Kafka itself would refuse (see
 //!   [`crate::state::topic_name_error`]) is a `BadRequestException`;
 //! * a `ReplicationFactor` above the cluster's broker count is a
@@ -121,10 +122,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kafka-kafka.json");
 // here — hence the `CreateTopicError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kafka#CreateTopic")]
+// `NotFoundException` — a shape the SERVICE models and several of its operations
+// declare, but this one does not list — is widened in through `extra_errors`: a
+// topic is created ON a cluster, so a `ClusterArn` that names no live cluster has
+// to be answered as the missing resource it is (HTTP 404) rather than as a
+// malformed request.
+#[smithy_macros::operation_error(
+    "com.amazonaws.kafka#CreateTopic",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum CreateTopicErrorModeled {
     BadRequestException(BadRequestException),
+    NotFoundException(NotFoundException),
     ClusterConnectivityException(ClusterConnectivityException),
     ConflictException(ConflictException),
     ControllerMovedException(ControllerMovedException),
@@ -230,16 +240,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = state.lock();
 
+        // A topic is created ON a cluster, so a `ClusterArn` this endpoint's region
+        // holds no cluster for names a resource that is not there: reported as the
+        // 404 every other topic operation answers for it, with the service's own
+        // not-found wording.
         let Some(cluster) = state.cluster_in(&region, &input.cluster_arn) else {
-            // `CreateTopic` models no `NotFoundException`, so the cluster it
-            // cannot resolve is reported through the modelled 400.
             return Err(
-                CreateTopicErrorModeled::BadRequestException(BadRequestException {
+                CreateTopicErrorModeled::NotFoundException(NotFoundException {
                     invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(format!(
-                        "No cluster exists in {region} with the ARN {}",
-                        input.cluster_arn
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 })
                 .into(),
             );
