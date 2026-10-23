@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/data_protection_policies.rs"]
 mod data_protection_policies;
+#[path = "all/data_protection_policy.rs"]
+mod data_protection_policy;
 #[path = "all/deletion_protection.rs"]
 mod deletion_protection;
 #[path = "all/harness.rs"]
