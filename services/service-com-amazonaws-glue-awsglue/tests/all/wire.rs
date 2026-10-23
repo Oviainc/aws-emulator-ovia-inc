@@ -26,6 +26,19 @@ pub const AKID: &str = "AKIDGLUETEST";
 /// emulator`). This is what the catalog records in `Table$CreatedBy`.
 pub const CALLER_PRINCIPAL: &str = "arn:aws:iam::000000000000:user/emulator";
 
+/// The `__type` discriminator the Data Catalog writes onto a nested
+/// `PrincipalPermissions` it returns: the structure's own Smithy shape name.
+///
+/// Source: the `__type` member of `com.amazonaws.glue#PrincipalPermissions` in this
+/// crate's Smithy model (`smithy_query shape=PrincipalPermissions`), whose documentation
+/// states the value is the structure's own shape name. Declared once here so every suite
+/// that asserts the tag reads the same spelling.
+pub const PRINCIPAL_PERMISSIONS_TAG: &str = "PrincipalPermissions";
+
+/// The same discriminator on a nested `ErrorDetail`. Source: the `__type` member of
+/// `com.amazonaws.glue#ErrorDetail` (`smithy_query shape=ErrorDetail`).
+pub const ERROR_DETAIL_TAG: &str = "ErrorDetail";
+
 /// A SigV4 `Authorization` header scoped to `glue`: the routing signal the router
 /// reads first. Authentication is off on the test router, so the signature is not
 /// verified — only the scope is read.
@@ -110,23 +123,44 @@ pub fn table_names(page: &Value) -> Vec<String> {
 }
 
 /// Assert that every member of `sent` reappears, unchanged, on `got`. Recurses into
-/// nested structures so a member the server fills with its own default (an absent
-/// `Compressed`, say) is not read as a mismatch.
+/// nested structures AND into the elements of a nested list, so a member the server
+/// fills with its own default (an absent `Compressed`, say) or ADDS to a nested
+/// structure (the `__type` tag the catalog writes onto a nested `PrincipalPermissions`)
+/// is not read as a mismatch: the rule under test is that what the client sent comes
+/// back, not that the server adds nothing.
 pub fn assert_echoed(case: &str, sent: &Value, got: &Value) {
-    let members = sent.as_object().expect("the sent value is a structure");
-    for (member, value) in members {
-        let actual = got.get(member);
-        if value.is_object() {
-            let Some(actual) = actual else {
-                panic!("case {case}: member {member} is absent from the response {got}");
-            };
-            assert_echoed(case, value, actual);
-        } else {
-            assert_eq!(
-                actual,
-                Some(value),
-                "case {case}: member {member} must round-trip; expected {value}, got {actual:?}"
-            );
+    match sent {
+        Value::Object(members) => {
+            for (member, value) in members {
+                let Some(actual) = got.get(member) else {
+                    if value.is_object() || value.is_array() {
+                        panic!("case {case}: member {member} is absent from the response {got}");
+                    }
+                    panic!(
+                        "case {case}: member {member} must round-trip; expected {value}, got \
+                         nothing in {got}"
+                    );
+                };
+                assert_echoed(case, value, actual);
+            }
         }
+        Value::Array(items) => {
+            let actual = got.as_array().unwrap_or_else(|| {
+                panic!("case {case}: expected a list to round-trip as a list, got {got}")
+            });
+            assert_eq!(
+                items.len(),
+                actual.len(),
+                "case {case}: a list must round-trip element for element; expected {sent}, got \
+                 {got}"
+            );
+            for (element, actual) in items.iter().zip(actual.iter()) {
+                assert_echoed(case, element, actual);
+            }
+        }
+        _ => assert_eq!(
+            got, sent,
+            "case {case}: a scalar must round-trip; expected {sent}, got {got}"
+        ),
     }
 }
