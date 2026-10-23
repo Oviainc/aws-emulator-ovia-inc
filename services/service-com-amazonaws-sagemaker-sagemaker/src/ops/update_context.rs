@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateContext
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateContext`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: edits the stored context's description and properties in
+//! `crate::state`, moves its `LastModifiedTime`, and refuses an unknown one with the
+//! modelled `ResourceNotFound`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateContext::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The modelled `ConflictException` is UNREACHABLE here by design, not by omission: it
+//! reports a SageMaker entity that cannot be modified, and nothing this emulator stores
+//! makes a context non-modifiable (no managed or service-owned contexts are minted), while
+//! `Properties` overwriting the map before `PropertiesToRemove` prunes it leaves no
+//! contradictory request to arbitrate. An operation whose model declares an error it never
+//! raises is correct; the variant stays on the generated enum for when such a context
+//! exists.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +147,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateContext` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateContextErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateContext"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `UpdateContext` takes the bare name, which addresses the context in the Region
+        // this request signed for.
+        let key = crate::state::context_key(ctx, &input.context_name);
+        // The identity behind this call, read before the store is borrowed.
+        let last_modified_by = crate::state::caller_user_context(ctx);
+
+        let mut store = state.lock();
+        let Some(context) = store.contexts.get_mut(&key) else {
+            // An update of something that was never created is refused, and creates
+            // nothing as a side effect: `CreateContext` is the only call that mints one.
+            return Err(UpdateContextErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Context {key} does not exist.")),
+            })
+            .into());
+        };
+
+        if let Some(description) = input.description {
+            context.description = Some(description);
+        }
+        // `Properties` is documented as "the new list of properties. Overwrites the
+        // current property list" (smithy_query doc=UpdateContextRequest$Properties), so a
+        // supplied map REPLACES the stored one rather than merging into it — and
+        // `PropertiesToRemove` is then applied to whatever map is in force, which is how a
+        // caller drops keys without restating the ones it keeps. A key named by both is
+        // therefore removed, with no order to guess at.
+        if let Some(properties) = input.properties {
+            context.properties = Some(properties.into_iter().collect());
+        }
+        if let Some(to_remove) = input.properties_to_remove {
+            // Removing from an absent map leaves it absent: there is nothing to remove,
+            // and an empty map is a different answer from no map at all.
+            if let Some(properties) = context.properties.as_mut() {
+                for key in to_remove {
+                    properties.remove(&key);
+                }
+            }
+        }
+        // This call is a mutation, so the context's `LastModifiedTime` moves to now even
+        // when the request carried no member that changed a value, and
+        // `LastModifiedBy` becomes the identity behind this call.
+        context.last_modified_time = ::std::time::SystemTime::now();
+        context.last_modified_by = last_modified_by;
+        let arn = context.arn.clone();
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(UpdateContextOutput {
+            context_arn: Some(arn),
+        })
     }
 }
