@@ -328,7 +328,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
                 now,
             )
-            .map_err(|refusal| refused(refusal, &region))?;
+            .map_err(refused)?;
 
         if let Some(token) = input.request_id.as_deref() {
             // Bounded, evicting write, keyed by the region the token was
@@ -353,7 +353,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// full store its 429.
 fn refused(
     refusal: crate::state::AlarmTemplateRefusal,
-    region: &str,
 ) -> CreateCloudWatchAlarmTemplateError {
     match refusal {
         crate::state::AlarmTemplateRefusal::GroupNotFound { identifier } => {
@@ -365,11 +364,9 @@ fn refused(
             })
             .into()
         }
-        crate::state::AlarmTemplateRefusal::NameTaken { id, name } => {
+        crate::state::AlarmTemplateRefusal::NameTaken { .. } => {
             CreateCloudWatchAlarmTemplateErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "a cloudwatch alarm template named {name} already exists in {region} (id {id})"
-                )),
+                message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
             })
             .into()
         }
