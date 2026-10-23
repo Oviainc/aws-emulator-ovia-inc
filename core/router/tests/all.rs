@@ -91,8 +91,16 @@ mod marketplace_signing_name_routing;
 mod partnercentral_channel_target_routing;
 #[path = "all/personalize_signing_name_routing.rs"]
 mod personalize_signing_name_routing;
+// `query_wire` and `rds_query_front_door` are declared HERE, in the sorted list,
+// rather than appended at the end: the end of this file is where every new router
+// suite lands, so a line added there collides with every other suite landing in the
+// same window. Their own files are ordinary `tests/all/<name>.rs` suites.
+#[path = "all/query_wire.rs"]
+mod query_wire;
 #[path = "all/rds_docdb_neptune_signing_name_routing.rs"]
 mod rds_docdb_neptune_signing_name_routing;
+#[path = "all/rds_query_front_door.rs"]
+mod rds_query_front_door;
 #[path = "all/rds_shared_query_front_door_routing.rs"]
 mod rds_shared_query_front_door_routing;
 #[path = "all/rds_shared_query_surface_routing.rs"]

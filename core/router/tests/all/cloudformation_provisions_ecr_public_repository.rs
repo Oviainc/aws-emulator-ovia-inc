@@ -29,8 +29,9 @@ use aws_emulator_router::{build_router, InMemoryEngine};
 use smithy_server_runtime::MultiServiceRouter;
 
 // The one percent-encoder these router suites share: an `awsQuery` form body leaves only
-// RFC 3986's unreserved characters literal, which is what an AWS SDK sends.
-use crate::transfer_user_with_iam_role::form_encode;
+// RFC 3986's unreserved characters literal, which is what an AWS SDK sends. It lives in
+// `all/query_wire.rs`, the module every awsQuery suite here reads the wire through.
+use crate::query_wire::form_encode;
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;

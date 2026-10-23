@@ -105,6 +105,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
         // The router reads it through this one accessor. Do not edit the entry.
+        //
+        // It is handed back wrapped in `RdsDefinition`, which adds the `<RequestId>`
+        // an awsQuery `<ErrorResponse>` carries to the framework-level error renderers
+        // (a routing failure, a transport failure, a pre-dispatch refusal) without
+        // restating anything the model owns.
         &self.entry
     }
 

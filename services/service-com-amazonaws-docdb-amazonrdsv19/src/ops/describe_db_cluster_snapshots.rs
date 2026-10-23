@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBClusterSnapshots
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBClusterSnapshots`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the cluster snapshots actually in state, narrowed
+//! by `DBClusterSnapshotIdentifier`, `DBClusterIdentifier` and `SnapshotType` and paged
+//! by `MaxRecords` / `Marker`. An identifier that names no stored snapshot is the modeled
+//! `DBClusterSnapshotNotFoundFault` (404), never an empty page.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBClusterSnapshots::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +166,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBClusterSnapshots` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBClusterSnapshotsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as docdb;
+
+        let _ = ctx;
+
+        // `DBClusterSnapshotIdentifier`: "This parameter can't be used with the
+        // DBClusterIdentifier parameter", and `DBClusterIdentifier` says the same of it,
+        // so naming both is refused rather than one of them silently winning.
+        if input.db_cluster_identifier.is_some() && input.db_cluster_snapshot_identifier.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "DBClusterIdentifier and DBClusterSnapshotIdentifier cannot be used together",
+            ));
+        }
+        // `Filters` doc: "This parameter is not currently supported." A filter is
+        // therefore refused, never applied silently or ignored.
+        if input.filters.iter().flatten().next().is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Filters is not supported by DescribeDBClusterSnapshots",
+            ));
+        }
+        if let Some(snapshot_type) = &input.snapshot_type {
+            docdb::validate_snapshot_type(snapshot_type)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+        let page_size =
+            docdb::page_size(input.max_records).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let mut store = state.lock();
+        // Reporting only: this materialises the snapshot transitions the clock already
+        // owed (`creating`/`copying` -> `available`). Each was due at the same instant
+        // whether or not anybody asked, so settling them here changes nothing a later
+        // caller would not have seen.
+        store.settle_clock();
+
+        // `DBClusterSnapshotIdentifier` names one snapshot by identifier or by ARN; an
+        // identifier that names nothing in state is the modeled 404 rather than an empty
+        // page, which is what lets a client tell "no such snapshot" from "no snapshots".
+        let mut selected: Vec<String> = match &input.db_cluster_snapshot_identifier {
+            Some(requested) => {
+                let Some(key) = store.resolve_snapshot_key(requested) else {
+                    return Err(
+                        DescribeDBClusterSnapshotsErrorModeled::DBClusterSnapshotNotFoundFault(
+                            DBClusterSnapshotNotFoundFault {
+                                message: Some(format!("DBClusterSnapshot not found: {requested}")),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                vec![key]
+            }
+            None => store.snapshots.keys().cloned().collect(),
+        };
+
+        // `DBClusterIdentifier` narrows the page to one cluster's snapshots. This
+        // operation models no cluster-not-found error, so an identifier naming no cluster
+        // matches no snapshot: an empty page, not a refusal.
+        if let Some(requested) = &input.db_cluster_identifier {
+            let wanted = requested.to_ascii_lowercase();
+            selected.retain(|key| {
+                store
+                    .snapshots
+                    .get(key)
+                    .is_some_and(|record| record.cluster_identifier == wanted)
+            });
+        }
+
+        // `SnapshotType` selects by how the snapshot came to be, over the documented
+        // values. Every snapshot this service holds was asked for by a caller, so it is
+        // `manual`: `automated` selects none (this emulator takes no automated backups),
+        // `shared` selects none (a snapshot shared TO this account would have to be owned
+        // by another one, and every record here is this account's), and `public` selects
+        // the manual snapshots whose `restore` attribute carries `all`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBClusterSnapshots"))
+        // `IncludeShared` and `IncludePublic` widen the default (automated + manual) with
+        // those same two classes, so with the store's single owner they add nothing a
+        // caller is not already shown.
+        if let Some(snapshot_type) = &input.snapshot_type {
+            selected.retain(|key| {
+                store
+                    .snapshots
+                    .get(key)
+                    .is_some_and(|record| match snapshot_type.as_str() {
+                        docdb::SNAPSHOT_TYPE_MANUAL => {
+                            record.snapshot_type == docdb::SNAPSHOT_TYPE_MANUAL
+                        }
+                        "public" => record.is_public(),
+                        // "automated" and "shared": see above.
+                        _ => false,
+                    })
+            });
+        }
+
+        let (page, marker) = docdb::paginate(&selected, input.marker.as_deref(), page_size);
+        let db_cluster_snapshots = page
+            .iter()
+            .filter_map(|key| store.snapshots.get(key))
+            .map(docdb::DbClusterSnapshotRecord::to_shape)
+            .collect();
+
+        Ok(DescribeDBClusterSnapshotsOutput {
+            marker,
+            db_cluster_snapshots: Some(db_cluster_snapshots),
+        })
     }
 }

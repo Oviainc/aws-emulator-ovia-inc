@@ -40,7 +40,9 @@ const ACCOUNT: &str = "000000000000";
 
 /// How long a test waits before expecting a transition this service owes to have
 /// settled: the span itself plus slack for a loaded test machine.
-fn wait_for_settle() {
+///
+/// `pub(crate)` so the sibling suites of this one test target wait out the same span.
+pub(crate) fn wait_for_settle() {
     sleep(STATUS_TRANSITION_DELAY + Duration::from_millis(200));
 }
 

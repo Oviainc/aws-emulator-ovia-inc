@@ -32,6 +32,9 @@ pub(crate) const API_VERSION: &str = "2014-10-31";
 
 /// One emulated DocumentDB behind a router, driven over the wire.
 ///
+/// `pub(crate)` so the other suites in this test crate drive the service exactly as this
+/// one does, over one harness rather than a copy per suite.
+///
 /// This router carries ONLY the DocumentDB service, so a request reaches it by naming
 /// DocumentDB itself ([`ROUTE_KEY`]) — the shared `rds` signing name resolves to Amazon RDS
 /// (see `src/service.rs`). The shared front door's own path — an `rds`-signed request whose
@@ -46,9 +49,11 @@ pub(crate) struct Docdb {
 /// its sdkId, lowercased — and the one key this service claims; see `src/service.rs`.
 pub(crate) const ROUTE_KEY: &str = "docdb";
 
-/// What the service answered: the HTTP status and the XML body.
+/// What the service answered: the HTTP status, the `content-type` it was sent under, and
+/// the XML body.
 pub(crate) struct Reply {
     pub(crate) status: u16,
+    pub(crate) content_type: String,
     pub(crate) xml: String,
 }
 
@@ -97,6 +102,12 @@ impl Docdb {
         let response = self.router.dispatch(request).await;
         Reply {
             status: response.status().as_u16(),
+            content_type: response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
             xml: String::from_utf8_lossy(response.body()).into_owned(),
         }
     }
@@ -115,24 +126,17 @@ impl Docdb {
 
 /// Percent-encode one query parameter value for the form body.
 ///
-/// Written out here rather than taken from a crate: adding ANY dependency to this crate
-/// changes the workspace `Cargo.lock`, which every concurrent landing in this repository
-/// also changes, and that collision is what keeps this fix from being squash-merged. The
-/// encoder is three lines and the decoder it feeds is the framework's own.
+/// The encoding is the maintained `percent-encoding` crate's, a dev-dependency of this
+/// crate: `NON_ALPHANUMERIC` escapes every byte outside `[A-Za-z0-9]`, which is a superset
+/// of what an `application/x-www-form-urlencoded` component must escape — and an
+/// over-escaped component decodes to exactly the same bytes, so the framework's own form
+/// decoder reads back what the test sent.
 ///
 /// `pub(crate)` so the sibling suites of this one test target encode their form bodies the
 /// same way rather than each deriving an encoder.
 pub(crate) fn form_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(char::from(byte));
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
+    percent_encoding::percent_encode(value.as_bytes(), percent_encoding::NON_ALPHANUMERIC)
+        .to_string()
 }
 
 /// Wait out the window in which the clock still owes a new resource its `available`
@@ -140,8 +144,8 @@ pub(crate) fn form_encode(value: &str) -> String {
 /// status has to let the clock pass, as it would against the real service.
 ///
 /// `std::thread::sleep` rather than `tokio::time::sleep` because the workspace's tokio
-/// does not enable the `time` feature and enabling it here would change `Cargo.lock`; see
-/// [`form_encode`]. Each test runs on its own thread, so blocking it is harmless.
+/// does not enable the `time` feature. Each test runs on its own thread, so blocking it is
+/// harmless.
 pub(crate) fn let_the_clock_catch_up() {
     std::thread::sleep(state::PROVISIONING_DELAY * 2);
 }

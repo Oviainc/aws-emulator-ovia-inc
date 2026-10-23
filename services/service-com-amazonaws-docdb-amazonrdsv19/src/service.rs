@@ -40,9 +40,10 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+pub mod query_error_envelope;
+
+use query_error_envelope::{DocdbDefinition, RequestIdEnvelopeOperation};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
 /// The routing key that names THIS service, as opposed to the SigV4 signing name it
@@ -83,7 +84,10 @@ const ROUTE_KEY: &str = "docdb";
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    entry: DocdbDefinition<Eng>,
+    /// The envelope wrapper every routable request is served through. Held in a field,
+    /// built once, because `override_operation` hands back a reference to it.
+    envelope: RequestIdEnvelopeOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -92,7 +96,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: DocdbDefinition::new(engine),
+            envelope: RequestIdEnvelopeOperation,
         }
     }
 }
@@ -102,6 +107,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
         // The router reads it through this one accessor. Do not edit the entry.
+        //
+        // It is handed back wrapped in `DocdbDefinition`, which adds the `<RequestId>`
+        // an awsQuery `<ErrorResponse>` carries to the framework-level error renderers
+        // (a routing failure, a transport failure, a pre-dispatch refusal) without
+        // restating anything the model owns.
         &self.entry
     }
 
@@ -122,12 +132,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every request the generated routing table can serve is served through the
+        // envelope wrapper, which delegates to that same table entry and then adds the
+        // `<RequestId>` an awsQuery error envelope carries. The routing stays the
+        // model's: a request whose `Action` names no modelled operation is declined here,
+        // so the framework answers it as the unroutable request it is.
+        self.entry.routes(req).then_some(&self.envelope as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

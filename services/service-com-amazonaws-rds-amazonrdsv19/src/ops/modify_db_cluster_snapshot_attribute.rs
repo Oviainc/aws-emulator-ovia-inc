@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDBClusterSnapshotAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDBClusterSnapshotAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation adds accounts to and removes accounts from the `restore`
+//! attribute of the DB cluster snapshot the request names, and answers with the attribute
+//! as it now stands. An identifier that names no stored snapshot is the modelled
+//! `DBClusterSnapshotNotFoundFault` (404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDBClusterSnapshotAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,6 +141,19 @@ impl From<ModifyDBClusterSnapshotAttributeErrorModeled> for ModifyDBClusterSnaps
     }
 }
 
+/// The modelled `DBClusterSnapshotNotFoundFault` for a snapshot this store does not hold.
+///
+/// The message is built from the request: it names the snapshot that was looked for, in
+/// the phrasing AWS answers for this fault.
+fn not_found(requested: &str) -> ModifyDBClusterSnapshotAttributeError {
+    ModifyDBClusterSnapshotAttributeErrorModeled::DBClusterSnapshotNotFoundFault(
+        DBClusterSnapshotNotFoundFault {
+            message: Some(format!("DBClusterSnapshot not found: {requested}")),
+        },
+    )
+    .into()
+}
+
 /// The `ModifyDBClusterSnapshotAttribute` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -180,18 +190,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDBClusterSnapshotAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDBClusterSnapshotAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDBClusterSnapshotAttribute"))
+        let region = crate::state::request_region(ctx)
+            .map_err(ModifyDBClusterSnapshotAttributeError::validation)?;
+        // `AttributeName`: "To manage authorization for other Amazon Web Services accounts
+        // to copy or restore a manual DB cluster snapshot, set this value to restore." It
+        // is the only attribute AWS defines, so any other name is refused rather than
+        // stored under a name nothing reports.
+        if input.attribute_name != crate::state::SNAPSHOT_RESTORE_ATTRIBUTE {
+            return Err(ModifyDBClusterSnapshotAttributeError::validation(format!(
+                "invalid value '{}' for AttributeName: the only valid value is '{}'",
+                input.attribute_name,
+                crate::state::SNAPSHOT_RESTORE_ATTRIBUTE
+            )));
+        }
+        let to_add = input.values_to_add.unwrap_or_default();
+        let to_remove = input.values_to_remove.unwrap_or_default();
+        // Neither member publishes a `@length`, so their entry counts are the caller's to
+        // choose — and every check below is per-entry, running with this service's one
+        // state lock held. The counts are therefore bounded FIRST, so one request cannot
+        // make this handler's work grow without limit.
+        for (member, count) in [("ValuesToAdd", to_add.len()), ("ValuesToRemove", to_remove.len())]
+        {
+            crate::state::check_request_list_len(
+                member,
+                count,
+                crate::state::MAX_COLLECTION_ENTRIES,
+            )
+            .map_err(ModifyDBClusterSnapshotAttributeError::validation)?;
+        }
+        for value in &to_add {
+            crate::state::check_snapshot_attribute_value("ValuesToAdd", value)
+                .map_err(ModifyDBClusterSnapshotAttributeError::validation)?;
+        }
+        // A set, so the overlap test below costs one lookup per removed value rather than
+        // a scan of the added ones: the work stays the SUM of the two lists, never their
+        // product.
+        let adding: std::collections::BTreeSet<&str> =
+            to_add.iter().map(String::as_str).collect();
+        for value in &to_remove {
+            crate::state::check_snapshot_attribute_value("ValuesToRemove", value)
+                .map_err(ModifyDBClusterSnapshotAttributeError::validation)?;
+            // One call cannot both authorize and de-authorize the same account: the
+            // result would depend on the order the two lists were applied in.
+            if adding.contains(value.as_str()) {
+                return Err(ModifyDBClusterSnapshotAttributeError::validation(format!(
+                    "value '{value}' cannot appear in both ValuesToAdd and ValuesToRemove"
+                )));
+            }
+        }
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        let requested = &input.db_cluster_snapshot_identifier;
+        let key = store
+            .resolve_cluster_snapshot_key(&region, requested)
+            .ok_or_else(|| not_found(requested))?;
+        // A key this store resolved and a lookup under it can only disagree if the record
+        // is not where the resolve said it was, which answers the same modelled 404 as a
+        // snapshot that was never there: a disagreement is a "not found", never a panic.
+        let Some(record) = store.db_cluster_snapshots.get_mut(&(region, key)) else {
+            return Err(not_found(requested));
+        };
+        // Only a finished snapshot can be shared: RDS answers the modelled state fault for
+        // one still being copied.
+        if record.status != crate::state::SNAPSHOT_STATUS_AVAILABLE {
+            return Err(
+                ModifyDBClusterSnapshotAttributeErrorModeled::InvalidDBClusterSnapshotStateFault(
+                    InvalidDBClusterSnapshotStateFault {
+                        message: Some(format!(
+                            "DB cluster snapshot {} is in {} state but must be {} to be shared",
+                            record.snapshot_identifier,
+                            record.status,
+                            crate::state::SNAPSHOT_STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The quota is on the accounts the snapshot ends up authorized for, so it is
+        // checked against the result of this call and the snapshot is left untouched when
+        // the call would exceed it. A value already present is not counted twice:
+        // `restore` is a SET of accounts, so authorizing the same account again changes
+        // nothing.
+        let mut authorized = record.restore_attribute.clone();
+        for value in &to_remove {
+            authorized.remove(value);
+        }
+        authorized.extend(to_add.iter().cloned());
+        if authorized.len() > crate::state::MAX_SNAPSHOT_SHARED_ACCOUNTS {
+            return Err(
+                ModifyDBClusterSnapshotAttributeErrorModeled::SharedSnapshotQuotaExceededFault(
+                    SharedSnapshotQuotaExceededFault {
+                        message: Some(format!(
+                            "a manual DB cluster snapshot cannot be shared with more than {} \
+                             accounts",
+                            crate::state::MAX_SNAPSHOT_SHARED_ACCOUNTS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        record.restore_attribute = authorized;
+
+        // The attribute is reported from the record this call just wrote, so the answer
+        // and a following `DescribeDBClusterSnapshotAttributes` cannot disagree.
+        Ok(ModifyDBClusterSnapshotAttributeOutput {
+            db_cluster_snapshot_attributes_result: Some(crate::state::restore_attribute_to_wire(
+                record,
+            )),
+        })
     }
 }

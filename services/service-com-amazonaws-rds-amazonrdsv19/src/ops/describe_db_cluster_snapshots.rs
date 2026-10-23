@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBClusterSnapshots
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBClusterSnapshots`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the DB cluster snapshots actually in state for the
+//! region the request was signed for, narrowed by `DBClusterSnapshotIdentifier`,
+//! `DBClusterIdentifier`, `DbClusterResourceId` and `SnapshotType` and paged by
+//! `MaxRecords` / `Marker`. An identifier that names no stored snapshot is the modelled
+//! `DBClusterSnapshotNotFoundFault` (404), never an empty page.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBClusterSnapshots::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +180,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBClusterSnapshots` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBClusterSnapshotsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBClusterSnapshots"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeDBClusterSnapshotsError::validation)?;
+        // `DBClusterSnapshotIdentifier`: "This parameter can't be used with the
+        // DBClusterIdentifier parameter", and `DBClusterIdentifier` says the same of it,
+        // so naming both is refused rather than one of them silently winning.
+        if input.db_cluster_identifier.is_some() && input.db_cluster_snapshot_identifier.is_some() {
+            return Err(DescribeDBClusterSnapshotsError::validation(
+                "DBClusterIdentifier and DBClusterSnapshotIdentifier cannot be used together",
+            ));
+        }
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBClusterSnapshotsError::validation)?;
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters).map_err(DescribeDBClusterSnapshotsError::validation)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeDBClusterSnapshotsError::validation)?;
+        if let Some(snapshot_type) = &input.snapshot_type {
+            crate::state::check_snapshot_type(snapshot_type)
+                .map_err(DescribeDBClusterSnapshotsError::validation)?;
+        }
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones
+        // owed at this instant whether or not anybody called.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: a request sees only the cluster snapshots of the region it was
+        // signed for. `DBClusterSnapshotIdentifier` names one of them by identifier or by
+        // ARN; one that names nothing in state is the modelled 404 rather than an empty
+        // page, which is what lets a client tell "no such snapshot" from "no snapshots".
+        let candidates: Vec<&crate::state::DbClusterSnapshotRecord> =
+            match &input.db_cluster_snapshot_identifier {
+                Some(requested) => {
+                    let key = store
+                        .resolve_cluster_snapshot_key(&region, requested)
+                        .ok_or_else(|| snapshot_not_found(requested))?;
+                    // A key this store resolved and a lookup under it can only disagree if
+                    // the record is not where the resolve said it was, which answers the
+                    // same modelled 404 as a snapshot that was never there: a disagreement
+                    // is a "not found", never a panic.
+                    let Some(record) = store.db_cluster_snapshots.get(&(region.clone(), key))
+                    else {
+                        return Err(snapshot_not_found(requested));
+                    };
+                    vec![record]
+                }
+                None => store.cluster_snapshots_in(&region),
+            };
+
+        // `DBClusterIdentifier` narrows the page to one cluster's snapshots, and
+        // `DbClusterResourceId` to one cluster's lifetime. Neither selector models a
+        // cluster-not-found error, so a value naming no cluster matches no snapshot: an
+        // empty page, not a refusal.
+        let source_cluster = input
+            .db_cluster_identifier
+            .as_deref()
+            .map(str::to_ascii_lowercase);
+        let matching: Vec<(String, DBClusterSnapshot)> = candidates
+            .into_iter()
+            .filter(|record| {
+                source_cluster
+                    .as_ref()
+                    .is_none_or(|wanted| record.db_cluster_identifier == *wanted)
+            })
+            .filter(|record| {
+                input
+                    .db_cluster_resource_id
+                    .as_ref()
+                    .is_none_or(|wanted| record.db_cluster_resource_id == *wanted)
+            })
+            // `SnapshotType` selects by how the snapshot came to be. Every snapshot this
+            // store holds was asked for by a caller, so it is `manual`: `automated`
+            // selects none (this emulator schedules no backups), `shared` selects none (a
+            // snapshot shared TO this account would be owned by another one, and every
+            // record here is this account's), and `public` selects the manual snapshots
+            // whose `restore` attribute carries `all`. `IncludeShared` and
+            // `IncludePublic` widen the default with those same two classes, so with the
+            // store's single owner they add nothing a caller is not already shown.
+            .filter(|record| match input.snapshot_type.as_deref() {
+                None => true,
+                Some("manual") => record.snapshot_type == "manual",
+                Some("public") => record.is_public(),
+                Some(_) => false,
+            })
+            .filter(|record| filters.iter().all(|filter| matches_filter(record, filter)))
+            .map(|record| (record.snapshot_identifier.clone(), record.to_wire()))
+            .collect();
+
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBClusterSnapshotsError::invalid_parameter_value)?;
+        Ok(DescribeDBClusterSnapshotsOutput {
+            marker: page.next_marker,
+            db_cluster_snapshots: Some(page.items),
+        })
     }
+}
+
+/// The modelled 404 for an identifier that names no stored cluster snapshot, with the
+/// identifier the request asked for.
+///
+/// The message is built from the request: it names the snapshot that was looked for, in
+/// the phrasing AWS answers for this fault ("DBClusterSnapshot not found: &lt;id&gt;").
+fn snapshot_not_found(requested: &str) -> DescribeDBClusterSnapshotsError {
+    DescribeDBClusterSnapshotsError::from(
+        DescribeDBClusterSnapshotsErrorModeled::DBClusterSnapshotNotFoundFault(
+            DBClusterSnapshotNotFoundFault {
+                message: Some(format!("DBClusterSnapshot not found: {requested}")),
+            },
+        ),
+    )
+}
+
+/// The filter names this operation's `Filters` member documents: "`db-cluster-id`",
+/// "`db-cluster-snapshot-id`", "`snapshot-type`" and "`engine`". RDS refuses any other
+/// name, and so does this operation — with a 400, because quietly ignoring a filter would
+/// report snapshots the caller excluded.
+const SUPPORTED_FILTER_NAMES: [&str; 4] = [
+    "db-cluster-id",
+    "db-cluster-snapshot-id",
+    "engine",
+    "snapshot-type",
+];
+
+/// Refuse a filter this operation does not support. "Filter names are case-sensitive."
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    for filter in filters {
+        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
+            return Err(format!(
+                "unrecognized filter name: {}; supported filters are {}",
+                filter.name,
+                SUPPORTED_FILTER_NAMES.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `record` matches one filter: true when any of the filter's values matches the
+/// member that filter names. "Filter values are case-sensitive."
+fn matches_filter(record: &crate::state::DbClusterSnapshotRecord, filter: &Filter) -> bool {
+    filter.values.iter().any(|value| match filter.name.as_str() {
+        // "db-cluster-id - Accepts DB cluster identifiers and DB cluster Amazon Resource
+        // Names (ARNs)."
+        "db-cluster-id" => {
+            record.db_cluster_identifier == *value
+                || crate::state::db_cluster_arn(&record.region, &record.db_cluster_identifier)
+                    == *value
+        }
+        // "db-cluster-snapshot-id - Accepts DB cluster snapshot identifiers."
+        "db-cluster-snapshot-id" => record.snapshot_identifier == *value || record.arn() == *value,
+        "engine" => record.engine == *value,
+        "snapshot-type" => record.snapshot_type == *value,
+        // Unreachable: `check_filter_names` refused every other name up front.
+        _ => false,
+    })
 }

@@ -120,6 +120,17 @@ impl From<DeleteDBClusterErrorModeled> for DeleteDBClusterError {
     }
 }
 
+/// The modeled `DBClusterNotFoundFault` for a cluster this store does not hold.
+///
+/// The message is built from the request: it names the cluster that was looked for, in the
+/// phrasing AWS answers for this fault.
+fn not_found(requested: &str) -> DeleteDBClusterError {
+    DeleteDBClusterErrorModeled::DBClusterNotFoundFault(DBClusterNotFoundFault {
+        message: Some(format!("DBCluster not found: {requested}")),
+    })
+    .into()
+}
+
 /// The `DeleteDBCluster` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -201,22 +212,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_clock();
 
         let Some(key) = store.resolve_cluster_key(&input.db_cluster_identifier) else {
-            return Err(DeleteDBClusterErrorModeled::DBClusterNotFoundFault(
-                DBClusterNotFoundFault {
-                    message: Some(format!(
-                        "DBCluster not found: {}",
-                        input.db_cluster_identifier
-                    )),
-                },
-            )
-            .into());
+            return Err(not_found(&input.db_cluster_identifier));
         };
 
         {
-            let record = store
-                .clusters
-                .get(&key)
-                .expect("the cluster key was resolved from this same map above");
+            // A key this store resolved and a lookup under it can only disagree if the
+            // record is not where the resolve said it was, which answers the same modeled
+            // 404 as a cluster that was never there: a disagreement is a "not found",
+            // never a panic.
+            let Some(record) = store.clusters.get(&key) else {
+                return Err(not_found(&input.db_cluster_identifier));
+            };
             // `DeletionProtection`: "If DeletionProtection is enabled, the cluster cannot
             // be deleted unless it is modified and DeletionProtection is disabled."
             if record.deletion_protection {
@@ -277,9 +283,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-            // The snapshot store's own cap. It is the one store with no reclamation path
-            // yet (every snapshot operation is still scaffolded), so an over-quota final
-            // snapshot is refused rather than stored, and the cluster is left alone.
+            // The snapshot store's own cap, with `DeleteDBClusterSnapshot` as the
+            // reclamation path: an over-quota final snapshot is refused rather than
+            // stored, and the cluster is left alone.
             if store.snapshots.len() >= docdb::MAX_DB_CLUSTER_SNAPSHOTS {
                 return Err(DeleteDBClusterErrorModeled::SnapshotQuotaExceededFault(
                     SnapshotQuotaExceededFault {
@@ -293,14 +299,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let mut record = store
-            .clusters
-            .remove(&key)
-            .expect("the cluster key was resolved from this same map above");
+        let Some(mut record) = store.clusters.remove(&key) else {
+            return Err(not_found(&input.db_cluster_identifier));
+        };
 
         // The final snapshot the caller asked for is really written to state, so the
-        // snapshot the API says it took exists for the snapshot operations to read once
-        // they are implemented (they are still scaffolded and answer 501).
+        // snapshot the API says it took is there for the snapshot operations to read.
         if let Some(snapshot_identifier) = snapshot_key {
             let snapshot = docdb::DbClusterSnapshotRecord {
                 identifier: snapshot_identifier.clone(),
@@ -317,6 +321,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 kms_key_id: record.kms_key_id.clone(),
                 storage_type: record.storage_type.clone(),
                 snapshot_type: docdb::SNAPSHOT_TYPE_MANUAL.to_string(),
+                // The snapshot AWS returns is still being taken; the clock owes it
+                // `available`, exactly as it does for a cluster.
+                status: docdb::STATUS_CREATING.to_string(),
+                available_at: Some(::std::time::Instant::now() + docdb::PROVISIONING_DELAY),
+                // Taken from the cluster, not copied from another snapshot.
+                source_snapshot_arn: None,
+                // A new snapshot authorizes no other account:
+                // `ModifyDBClusterSnapshotAttribute` is what adds one.
+                restore_attribute: ::std::collections::BTreeSet::new(),
+                // `CopyTagsToSnapshot`: "Set to true to copy all tags from the cluster to
+                // snapshots of the cluster" — so the cluster's tags reach the snapshot
+                // exactly when the cluster carries that setting.
+                tags: if record.copy_tags_to_snapshot {
+                    record.tags.clone()
+                } else {
+                    Vec::new()
+                },
             };
             store.snapshots.insert(snapshot_identifier, snapshot);
         }

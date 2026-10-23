@@ -20,8 +20,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    DBCluster, DBClusterMember, DBClusterParameterGroup, DBClusterSnapshot, DBInstance,
-    DBSubnetGroup, Endpoint, Parameter, ServerlessV2ScalingConfigurationInfo, Subnet, Tag,
+    DBCluster, DBClusterMember, DBClusterParameterGroup, DBClusterSnapshot,
+    DBClusterSnapshotAttribute, DBClusterSnapshotAttributesResult, DBInstance, DBSubnetGroup,
+    Endpoint, Parameter, ServerlessV2ScalingConfigurationInfo, Subnet, Tag,
     VpcSecurityGroupMembership,
 };
 
@@ -111,6 +112,40 @@ pub const SECURITY_GROUP_ACTIVE: &str = "active";
 /// classes a snapshot the caller asked for as `manual`.
 pub const SNAPSHOT_TYPE_MANUAL: &str = "manual";
 
+/// The status a cluster snapshot carries while `CopyDBClusterSnapshot` is still copying
+/// it. `CopyDBClusterSnapshot`'s own documentation names it: "To cancel the copy operation
+/// after it is in progress, delete the target cluster snapshot ... while that cluster
+/// snapshot is in the copying status."
+pub const SNAPSHOT_STATUS_COPYING: &str = "copying";
+
+/// The `SnapshotType` values `DescribeDBClusterSnapshotsMessage$SnapshotType` lists:
+/// "You can specify one of the following values: automated ... manual ... shared ...
+/// public". A request naming anything else is refused rather than silently matching
+/// nothing.
+pub const SNAPSHOT_TYPES: [&str; 4] = ["automated", "manual", "shared", "public"];
+
+/// The one cluster-snapshot attribute AWS defines, as
+/// `DBClusterSnapshotAttribute$AttributeName` states: "The attribute named `restore`
+/// refers to the list of Amazon Web Services accounts that have permission to copy or
+/// restore the manual cluster snapshot."
+pub const SNAPSHOT_RESTORE_ATTRIBUTE: &str = "restore";
+
+/// The `restore` value that makes a manual snapshot public:
+/// `DBClusterSnapshotAttribute$AttributeValues` — "If a value of `all` is in the list,
+/// then the manual cluster snapshot is public and available for any Amazon Web Services
+/// account to copy or restore."
+pub const SNAPSHOT_ATTRIBUTE_ALL: &str = "all";
+
+/// The digits in an Amazon Web Services account id, the other value
+/// `ModifyDBClusterSnapshotAttributeMessage$ValuesToAdd` accepts ("set this list to
+/// include one or more Amazon Web Services account IDs").
+pub const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// How many accounts one manual snapshot may be authorized for: AWS's published limit on
+/// the accounts a manual snapshot can be shared with (20). Reaching it is the modelled
+/// `SharedSnapshotQuotaExceededFault` that `ModifyDBClusterSnapshotAttribute` declares.
+pub const MAX_SNAPSHOT_SHARED_ACCOUNTS: usize = 20;
+
 /// The region used when a request carries no SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
@@ -178,10 +213,10 @@ pub const MAX_DB_INSTANCES_PER_CLUSTER: usize = 16;
 pub const MAX_DB_INSTANCES: usize = 40;
 
 /// Amazon DocumentDB's published default quota "Manual cluster snapshots: 100" per
-/// Region. This also bounds the one store with no reclamation path yet: the snapshot
-/// operations that would delete a snapshot are still scaffolded, so a repeated
-/// create/delete-with-final-snapshot loop stops at this cap with the modelled
-/// `SnapshotQuotaExceededFault` instead of growing without limit.
+/// Region. Both sites that write a snapshot — the final snapshot `DeleteDBCluster` takes
+/// and the copy `CopyDBClusterSnapshot` makes — refuse an over-quota create with the
+/// modelled `SnapshotQuotaExceededFault` rather than growing the store without limit;
+/// `DeleteDBClusterSnapshot` is the reclamation path.
 pub const MAX_DB_CLUSTER_SNAPSHOTS: usize = 100;
 
 /// Amazon DocumentDB's published default quota "Subnet groups: 50" per Region. An
@@ -480,10 +515,11 @@ impl DbInstanceRecord {
 
 /// A persisted cluster snapshot.
 ///
-/// `DeleteDBCluster` writes one when the caller does not skip the final snapshot, so the
-/// snapshot the API says was taken really exists in state. The snapshot-reading
-/// operations (`DescribeDBClusterSnapshots`, `CreateDBClusterSnapshot`, ...) are still
-/// scaffolded and answer 501; they will read these records when they are implemented.
+/// `DeleteDBCluster` writes one when the caller does not skip the final snapshot, and
+/// `CopyDBClusterSnapshot` writes a copy of one, so a snapshot the API says exists really
+/// is in state. `DescribeDBClusterSnapshots`, `DeleteDBClusterSnapshot`,
+/// `DescribeDBClusterSnapshotAttributes` and `ModifyDBClusterSnapshotAttribute` read and
+/// write exactly these records.
 #[derive(Debug, Clone)]
 pub struct DbClusterSnapshotRecord {
     /// `DBClusterSnapshotIdentifier`, lowercased, and this record's key. The member's own
@@ -517,6 +553,22 @@ pub struct DbClusterSnapshotRecord {
     pub storage_type: Option<String>,
     /// `SnapshotType`; see [`SNAPSHOT_TYPE_MANUAL`].
     pub snapshot_type: String,
+    /// `Status`: [`STATUS_CREATING`] for a final snapshot being taken,
+    /// [`SNAPSHOT_STATUS_COPYING`] for a copy still being made, [`STATUS_AVAILABLE`] once
+    /// the clock has made it due.
+    pub status: String,
+    /// When the transition to [`STATUS_AVAILABLE`] falls due; `None` once settled.
+    pub available_at: Option<Instant>,
+    /// `SourceDBClusterSnapshotArn`: the snapshot this one was copied from, absent for a
+    /// snapshot taken from a cluster.
+    pub source_snapshot_arn: Option<String>,
+    /// The accounts the `restore` attribute authorizes, which
+    /// `ModifyDBClusterSnapshotAttribute` adds to and removes from and
+    /// `DescribeDBClusterSnapshotAttributes` reports; see [`SNAPSHOT_RESTORE_ATTRIBUTE`].
+    /// A set, so adding a value already present changes nothing and the report is ordered.
+    pub restore_attribute: BTreeSet<String>,
+    /// The snapshot's tags, as (key, value).
+    pub tags: Vec<(String, String)>,
 }
 
 impl DbClusterSnapshotRecord {
@@ -529,6 +581,36 @@ impl DbClusterSnapshotRecord {
         )
     }
 
+    /// Whether this snapshot is public — its `restore` attribute authorizes every
+    /// account; see [`SNAPSHOT_ATTRIBUTE_ALL`].
+    pub fn is_public(&self) -> bool {
+        self.restore_attribute.contains(SNAPSHOT_ATTRIBUTE_ALL)
+    }
+
+    /// Materialise the transition to `available` if the clock already owes it.
+    fn settle(&mut self, now: Instant) {
+        if self.available_at.is_some_and(|due| now >= due) {
+            self.status = STATUS_AVAILABLE.to_string();
+            self.available_at = None;
+        }
+    }
+
+    /// This record's `restore` attribute as the modeled `DBClusterSnapshotAttributesResult`.
+    ///
+    /// ONE projection, so `DescribeDBClusterSnapshotAttributes` and
+    /// `ModifyDBClusterSnapshotAttribute` cannot report the same record differently. The
+    /// attribute is ALWAYS reported: a snapshot nobody has been authorized for carries it
+    /// with an empty value list, which is how a caller reads "shared with no account".
+    pub fn restore_attribute_to_shape(&self) -> DBClusterSnapshotAttributesResult {
+        DBClusterSnapshotAttributesResult {
+            db_cluster_snapshot_identifier: Some(self.identifier.clone()),
+            db_cluster_snapshot_attributes: Some(vec![DBClusterSnapshotAttribute {
+                attribute_name: Some(SNAPSHOT_RESTORE_ATTRIBUTE.to_string()),
+                attribute_values: Some(self.restore_attribute.iter().cloned().collect()),
+            }]),
+        }
+    }
+
     /// This record as the modeled `DBClusterSnapshot`.
     pub fn to_shape(&self) -> DBClusterSnapshot {
         DBClusterSnapshot {
@@ -537,18 +619,20 @@ impl DbClusterSnapshotRecord {
             db_cluster_identifier: Some(self.cluster_identifier.clone()),
             snapshot_create_time: Some(self.snapshot_create_time),
             engine: Some(self.engine.clone()),
-            status: Some(STATUS_AVAILABLE.to_string()),
+            status: Some(self.status.clone()),
             port: Some(self.port),
             vpc_id: None,
             cluster_create_time: Some(self.cluster_create_time),
             master_username: self.master_username.clone(),
             engine_version: Some(self.engine_version.clone()),
             snapshot_type: Some(self.snapshot_type.clone()),
-            percent_progress: Some(100),
+            // The progress of the copy this record stands for: complete once the snapshot
+            // is available, and not yet begun while it is still being taken.
+            percent_progress: Some(if self.status == STATUS_AVAILABLE { 100 } else { 0 }),
             storage_encrypted: Some(self.storage_encrypted),
             kms_key_id: self.kms_key_id.clone(),
             db_cluster_snapshot_arn: Some(self.arn()),
-            source_db_cluster_snapshot_arn: None,
+            source_db_cluster_snapshot_arn: self.source_snapshot_arn.clone(),
             storage_type: self.storage_type.clone(),
         }
     }
@@ -655,6 +739,9 @@ impl ComAmazonawsDocdbAmazonrdsv19State {
         for instance in self.instances.values_mut() {
             instance.settle(now);
         }
+        for snapshot in self.snapshots.values_mut() {
+            snapshot.settle(now);
+        }
     }
 
     /// The key of the cluster `value` names: either its (case-insensitive) identifier or
@@ -670,6 +757,25 @@ impl ComAmazonawsDocdbAmazonrdsv19State {
             return None;
         }
         self.clusters
+            .values()
+            .find(|record| record.arn() == value)
+            .map(|record| record.identifier.clone())
+    }
+
+    /// The key of the cluster snapshot `value` names: either its (case-insensitive)
+    /// identifier or its ARN, both of which `DBClusterSnapshotIdentifier` and
+    /// `SourceDBClusterSnapshotIdentifier` accept ("you can specify ... a valid cluster
+    /// snapshot ARN").
+    pub fn resolve_snapshot_key(&self, value: &str) -> Option<String> {
+        let lowered = value.to_ascii_lowercase();
+        if self.snapshots.contains_key(&lowered) {
+            return Some(lowered);
+        }
+        // See [`Self::resolve_cluster_key`]: only an ARN can match the scan.
+        if !value.starts_with("arn:") {
+            return None;
+        }
+        self.snapshots
             .values()
             .find(|record| record.arn() == value)
             .map(|record| record.identifier.clone())
@@ -826,6 +932,49 @@ pub fn now() -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
 }
 
+/// The id one response reports as its own: the value of the `<RequestId>` element an
+/// awsQuery `<ErrorResponse>` envelope carries, the counterpart of the
+/// `ResponseMetadata/RequestId` the framework's success renderer writes.
+///
+/// A correlation id, not a security token, and per-response rather than per-resource: two
+/// responses must be distinguishable, which is what a client logs and an SDK's retry and
+/// telemetry layers read. It needs no state, so it is a free function rather than a method
+/// on the store — a request refused before any store is reached still answers with one.
+///
+/// The form is the 8-4-4-4-12 version-4 UUID every AWS request id carries, the same shape
+/// the framework's own success-path minter produces, so a client cannot tell the two apart.
+/// Unique because a monotone counter goes into the digest; the digest is the maintained
+/// `sha2` crate's, so nothing here is hand-rolled.
+pub fn new_request_id() -> String {
+    use ::sha2::{Digest, Sha256};
+    use ::std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The monotone part of a request id, so two ids minted inside one clock tick still
+    /// differ.
+    static MINTED: AtomicU64 = AtomicU64::new(0);
+
+    let counter = MINTED.fetch_add(1, Ordering::Relaxed);
+    let nanos = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_nanos());
+    let digest = Sha256::digest(format!("request:{counter}:{nanos}"));
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // The version (4) and variant (RFC 4122) nibbles, so the id is well formed and not
+    // mistaken for a name-based or time-based one.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = ::hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 /// The fixed-width token behind the `n`th minted resource id, as a base-32 rendering of
 /// `n` over [`TOKEN_ALPHABET`]. Deterministic, so two runs of the same call sequence mint
 /// the same ids.
@@ -897,6 +1046,51 @@ pub fn validate_identifier_within(member: &str, value: &str, max_len: usize) -> 
         "Invalid value '{value}' for {member}: it must contain from 1 to {max_len} \
          letters, numbers, or hyphens, the first character must be a letter, and it cannot end \
          with a hyphen or contain two consecutive hyphens"
+    ))
+}
+
+/// The region an ARN names — its fourth `:`-separated field — or `None` for a value that
+/// is not an ARN.
+///
+/// `CopyDBClusterSnapshotMessage$SourceDBClusterSnapshotIdentifier`: "If the source
+/// cluster snapshot is in the same Region as the copy, specify a valid snapshot
+/// identifier. If the source cluster snapshot is in a different Region ... specify the
+/// snapshot ARN." So the region a copy looked for its source in is the ARN's own when it
+/// was given one, and the request's region otherwise.
+pub fn arn_region(value: &str) -> Option<String> {
+    let mut fields = value.split(':');
+    let (Some("arn"), Some(_partition), Some(_service), Some(region)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    (!region.is_empty()).then(|| region.to_string())
+}
+
+/// Refuse a `restore` attribute value that is neither an Amazon Web Services account id
+/// nor the `all` that makes a snapshot public; see [`SNAPSHOT_ATTRIBUTE_ALL`] and
+/// [`ACCOUNT_ID_DIGITS`] for the documentation this comes from.
+pub fn validate_snapshot_attribute_value(member: &str, value: &str) -> Result<(), String> {
+    let well_formed = value == SNAPSHOT_ATTRIBUTE_ALL
+        || (value.chars().count() == ACCOUNT_ID_DIGITS && value.chars().all(|c| c.is_ascii_digit()));
+    if well_formed {
+        return Ok(());
+    }
+    Err(format!(
+        "Invalid value '{value}' for {member}: each value must be a \
+         {ACCOUNT_ID_DIGITS}-digit Amazon Web Services account id or \
+         '{SNAPSHOT_ATTRIBUTE_ALL}'"
+    ))
+}
+
+/// Refuse a `SnapshotType` outside the documented list; see [`SNAPSHOT_TYPES`].
+pub fn validate_snapshot_type(value: &str) -> Result<(), String> {
+    if SNAPSHOT_TYPES.contains(&value) {
+        return Ok(());
+    }
+    Err(format!(
+        "Invalid value '{value}' for SnapshotType: valid values are {}",
+        SNAPSHOT_TYPES.join(", ")
     ))
 }
 

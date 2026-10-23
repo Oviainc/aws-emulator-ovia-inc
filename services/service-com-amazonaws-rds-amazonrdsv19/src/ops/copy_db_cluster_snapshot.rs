@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyDBClusterSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyDBClusterSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation copies a stored DB cluster snapshot to a new identifier in
+//! the region the request was signed for and answers with the copy it persisted. A source
+//! that names no stored snapshot is the modelled `DBClusterSnapshotNotFoundFault` (404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyDBClusterSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,6 +170,28 @@ impl From<CopyDBClusterSnapshotErrorModeled> for CopyDBClusterSnapshotError {
     }
 }
 
+/// The modelled `DBClusterSnapshotNotFoundFault` for a source this store does not hold.
+///
+/// The message is built from the request: it names BOTH the snapshot asked for and the
+/// region it was looked for in — an ARN is looked for in the region the ARN names, a plain
+/// identifier in the region the request was signed for — because a copy whose source lives
+/// in another region is exactly the case this operation exists for.
+fn source_not_found(requested: &str, request_region: &str) -> CopyDBClusterSnapshotError {
+    // An ARN names the region it was looked for in; a plain identifier (and a region-less
+    // ARN, whose region segment is empty) was looked for in the request's own region.
+    let source_region = crate::state::arn_region(requested)
+        .filter(|region| !region.is_empty())
+        .unwrap_or(request_region);
+    CopyDBClusterSnapshotErrorModeled::DBClusterSnapshotNotFoundFault(
+        DBClusterSnapshotNotFoundFault {
+            message: Some(format!(
+                "Requested snapshot {requested} not found in source region {source_region}"
+            )),
+        },
+    )
+    .into()
+}
+
 /// The `CopyDBClusterSnapshot` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -210,18 +228,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyDBClusterSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyDBClusterSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyDBClusterSnapshot"))
+        let region =
+            crate::state::request_region(ctx).map_err(CopyDBClusterSnapshotError::validation)?;
+        // `TargetDBClusterSnapshotIdentifier` constraints: "Must contain from 1 to 63
+        // letters, numbers, or hyphens. First character must be a letter. Can't end with a
+        // hyphen or contain two consecutive hyphens."
+        crate::state::check_identifier(
+            "TargetDBClusterSnapshotIdentifier",
+            &input.target_db_cluster_snapshot_identifier,
+            63,
+        )
+        .map_err(CopyDBClusterSnapshotError::validation)?;
+        // `TagList` carries no `@length` and the tags are STORED on the copy, so the list
+        // the caller sized is bounded before any of it is kept.
+        crate::state::check_tag_list(input.tags.as_ref())
+            .map_err(CopyDBClusterSnapshotError::validation)?;
+        // The identifier "is stored as a lowercase string", so the key folds the same way
+        // every lookup does.
+        let target_key = input
+            .target_db_cluster_snapshot_identifier
+            .to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated copy.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // `SourceDBClusterSnapshotIdentifier`: "If the source snapshot is in the same
+        // Region as the copy, specify a valid DB snapshot identifier" — otherwise its ARN.
+        // A value that names no stored snapshot is the modelled 404, whichever form it
+        // took, and the message names BOTH the snapshot asked for and the region it was
+        // looked for in: an ARN is looked for in the region the ARN names, a plain
+        // identifier in the region the request was signed for. That is the one fact a
+        // caller needs, because a copy whose source lives in another region is exactly the
+        // case this operation exists for.
+        let requested = &input.source_db_cluster_snapshot_identifier;
+        let source_key = store
+            .resolve_cluster_snapshot_key(&region, requested)
+            .ok_or_else(|| source_not_found(requested, &region))?;
+
+        if store
+            .db_cluster_snapshots
+            .contains_key(&(region.clone(), target_key.clone()))
+        {
+            return Err(
+                CopyDBClusterSnapshotErrorModeled::DBClusterSnapshotAlreadyExistsFault(
+                    DBClusterSnapshotAlreadyExistsFault {
+                        message: Some(format!(
+                            "DB cluster snapshot already exists: {target_key}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The region's manual cluster-snapshot quota, and the number of regions this store
+        // keeps records for at all: the store cannot be grown without bound, and the
+        // modelled fault says exactly this.
+        if store.cluster_snapshots_in(&region).len()
+            >= crate::state::DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(CopyDBClusterSnapshotErrorModeled::SnapshotQuotaExceededFault(
+                SnapshotQuotaExceededFault {
+                    message: Some(format!(
+                        "the request would exceed the allowed number of manual DB cluster \
+                         snapshots ({} per region, in at most {} regions)",
+                        crate::state::DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION,
+                        crate::state::MAX_REGIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The record the key names. A key this store resolved and a lookup under it can
+        // only disagree if the record is not where the resolve said it was, which answers
+        // the same modelled 404 as a source that was never there: a disagreement is a
+        // "not found", never a panic that would take the whole emulator down with it.
+        let Some(source) = store.db_cluster_snapshots.get(&(region.clone(), source_key)) else {
+            return Err(source_not_found(requested, &region));
+        };
+        // `SourceDBClusterSnapshotIdentifier` constraint: "Must specify a valid system
+        // snapshot in the available state." A source still being copied is the modelled
+        // state fault, which is what a caller that acts immediately after starting one
+        // sees.
+        if source.status != crate::state::SNAPSHOT_STATUS_AVAILABLE {
+            return Err(
+                CopyDBClusterSnapshotErrorModeled::InvalidDBClusterSnapshotStateFault(
+                    InvalidDBClusterSnapshotStateFault {
+                        message: Some(format!(
+                            "DB cluster snapshot {} is in {} state but must be {} to be copied",
+                            source.snapshot_identifier,
+                            source.status,
+                            crate::state::SNAPSHOT_STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The copy is a snapshot OF the same cluster, so it carries the source's cluster
+        // and the cluster's own facts; only the identifier, the ARN, the creation time,
+        // the source link, the tags and the status are the copy's own.
+        let copy = crate::state::DbClusterSnapshotRecord {
+            snapshot_identifier: target_key.clone(),
+            region: region.clone(),
+            source_snapshot_arn: Some(source.arn()),
+            snapshot_create_time: crate::state::now_as_wire_timestamp(),
+            // RDS answers a copy in the `copying` status and the clock owes it
+            // `available`, so a caller that reads it straight back sees the copy in
+            // progress, as it would against the real service.
+            status: crate::state::SNAPSHOT_STATUS_COPYING.to_string(),
+            pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::SNAPSHOT_STATUS_AVAILABLE,
+            )),
+            // `KmsKeyId`: "If you don't specify a value for KmsKeyId, then the copy of the
+            // DB cluster snapshot is encrypted with the same KMS key as the source DB
+            // cluster snapshot" — and a copy encrypted under a named key is an encrypted
+            // snapshot even when the source was not.
+            storage_encrypted: source.storage_encrypted || input.kms_key_id.is_some(),
+            kms_key_id: input.kms_key_id.clone().or_else(|| source.kms_key_id.clone()),
+            // `CopyTags`: "Set to true to copy all tags from the source DB cluster snapshot
+            // to the target DB cluster snapshot, and otherwise false. The default is
+            // false."
+            tags: if input.copy_tags.unwrap_or(false) {
+                source.tags.clone()
+            } else {
+                input.tags.clone().unwrap_or_default()
+            },
+            // The copy authorizes nobody: `restore` is not copied, so a snapshot shared
+            // with an account does not silently keep sharing it under a new identifier.
+            restore_attribute: std::collections::BTreeSet::new(),
+            ..source.clone()
+        };
+
+        // The answer is the record this call stored, so a following describe reports the
+        // same snapshot.
+        let db_cluster_snapshot = copy.to_wire();
+        store
+            .db_cluster_snapshots
+            .insert((region, target_key), copy);
+
+        Ok(CopyDBClusterSnapshotOutput {
+            db_cluster_snapshot: Some(db_cluster_snapshot),
+        })
     }
 }

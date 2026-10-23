@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBClusterSnapshotAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBClusterSnapshotAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the `restore` attribute stored for the DB cluster
+//! snapshot the request names — the accounts `ModifyDBClusterSnapshotAttribute`
+//! authorized. An identifier that names no stored snapshot is the modelled
+//! `DBClusterSnapshotNotFoundFault` (404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBClusterSnapshotAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +109,19 @@ impl From<DescribeDBClusterSnapshotAttributesErrorModeled> for DescribeDBCluster
     }
 }
 
+/// The modelled `DBClusterSnapshotNotFoundFault` for a snapshot this store does not hold.
+///
+/// The message is built from the request: it names the snapshot that was looked for, in
+/// the phrasing AWS answers for this fault.
+fn not_found(requested: &str) -> DescribeDBClusterSnapshotAttributesError {
+    DescribeDBClusterSnapshotAttributesErrorModeled::DBClusterSnapshotNotFoundFault(
+        DBClusterSnapshotNotFoundFault {
+            message: Some(format!("DBClusterSnapshot not found: {requested}")),
+        },
+    )
+    .into()
+}
+
 /// The `DescribeDBClusterSnapshotAttributes` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -148,18 +158,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBClusterSnapshotAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBClusterSnapshotAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBClusterSnapshotAttributes"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeDBClusterSnapshotAttributesError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated attribute list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due.
+        store.settle_due_transitions(&region);
+
+        let requested = &input.db_cluster_snapshot_identifier;
+        let key = store
+            .resolve_cluster_snapshot_key(&region, requested)
+            .ok_or_else(|| not_found(requested))?;
+        // A key this store resolved and a lookup under it can only disagree if the record
+        // is not where the resolve said it was, which answers the same modelled 404 as a
+        // snapshot that was never there: a disagreement is a "not found", never a panic.
+        let Some(record) = store.db_cluster_snapshots.get(&(region, key)) else {
+            return Err(not_found(requested));
+        };
+
+        Ok(DescribeDBClusterSnapshotAttributesOutput {
+            db_cluster_snapshot_attributes_result: Some(crate::state::restore_attribute_to_wire(
+                record,
+            )),
+        })
     }
 }

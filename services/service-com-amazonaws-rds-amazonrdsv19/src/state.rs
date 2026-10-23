@@ -47,7 +47,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     Certificate, CertificateDetails, ClusterPendingModifiedValues, DBCluster, DBClusterMember,
-    DBClusterOptionGroupStatus, DBClusterParameterGroup, DBClusterRole, DBInstance,
+    DBClusterOptionGroupStatus, DBClusterParameterGroup, DBClusterRole, DBClusterSnapshot,
+    DBClusterSnapshotAttribute, DBClusterSnapshotAttributesResult, DBInstance,
     DBParameterGroupStatus, DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup,
     DomainMembership, Endpoint, EventCategoriesMap, EventSubscription, GlobalCluster,
     GlobalClusterMember, Option2, OptionGroup, OptionGroupMembership, OptionSetting, Parameter,
@@ -103,6 +104,43 @@ pub const DB_INSTANCE_QUOTA_PER_REGION: usize = 40;
 /// `SnapshotQuotaExceededFault`, which both `CreateDBSnapshot` and `DeleteDBInstance`
 /// declare.
 pub const DB_SNAPSHOT_QUOTA_PER_REGION: usize = 100;
+
+/// How many manual DB CLUSTER snapshots one region may hold: Amazon RDS's published
+/// default quota ("Manual DB cluster snapshots": 100 per Region). Reaching it is the
+/// modelled `SnapshotQuotaExceededFault` that `CopyDBClusterSnapshot` declares;
+/// `DeleteDBClusterSnapshot` is the reclamation path.
+pub const DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION: usize = 100;
+
+/// The one cluster-snapshot attribute AWS defines, as
+/// `DBClusterSnapshotAttribute$AttributeName` states: "The attribute named `restore`
+/// refers to the list of Amazon Web Services accounts that have permission to copy or
+/// restore the manual DB cluster snapshot."
+pub const SNAPSHOT_RESTORE_ATTRIBUTE: &str = "restore";
+
+/// The `restore` value that makes a manual snapshot public:
+/// `DBClusterSnapshotAttribute$AttributeValues` — "If a value of `all` is in the list,
+/// then the manual DB cluster snapshot is public and available for any Amazon Web
+/// Services account to copy or restore."
+pub const SNAPSHOT_ATTRIBUTE_ALL: &str = "all";
+
+/// The digits in an Amazon Web Services account id, the other value
+/// `ModifyDBClusterSnapshotAttributeMessage$ValuesToAdd` accepts ("set this list to
+/// include one or more Amazon Web Services account IDs").
+pub const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// How many accounts one manual snapshot may be authorized for: AWS's published limit on
+/// the accounts a manual snapshot can be shared with (20). Reaching it is the modelled
+/// `SharedSnapshotQuotaExceededFault` that `ModifyDBClusterSnapshotAttribute` declares.
+pub const MAX_SNAPSHOT_SHARED_ACCOUNTS: usize = 20;
+
+/// The status a cluster snapshot carries while `CopyDBClusterSnapshot` is still copying
+/// it. The operation's own documentation names it: "To cancel the copy operation after it
+/// is in progress, delete the target DB cluster snapshot ... while that DB cluster
+/// snapshot is in the copying status."
+pub const SNAPSHOT_STATUS_COPYING: &str = "copying";
+
+/// The status of a snapshot the clock has finished.
+pub const SNAPSHOT_STATUS_AVAILABLE: &str = "available";
 
 /// How many cluster parameter groups one region may hold.
 ///
@@ -721,6 +759,11 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     pub db_instances: BTreeMap<RegionalKey, DbInstanceRecord>,
     /// DB snapshots by `(region, DBSnapshotIdentifier)`. Ordered, for the same reason.
     pub db_snapshots: BTreeMap<RegionalKey, DbSnapshotRecord>,
+    /// DB CLUSTER snapshots by `(region, DBClusterSnapshotIdentifier)` — the identifier
+    /// always stored lowercased, as `DBClusterSnapshotIdentifier` documents ("This value
+    /// is stored as a lowercase string"). Ordered, so `DescribeDBClusterSnapshots` pages
+    /// deterministically within a region.
+    pub db_cluster_snapshots: BTreeMap<RegionalKey, DbClusterSnapshotRecord>,
     /// DB clusters by `(region, DBClusterIdentifier)` — the identifier always stored
     /// lowercased, as the model documents. Ordered, so `DescribeDBClusters` pages
     /// deterministically within a region.
@@ -841,6 +884,21 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         for key in gone.drain(..) {
             self.db_snapshots.remove(&key);
         }
+        let mut gone: Vec<RegionalKey> = Vec::new();
+        for (key, snapshot) in self
+            .db_cluster_snapshots
+            .range_mut((region.to_string(), String::new())..)
+        {
+            if key.0 != region {
+                break;
+            }
+            if snapshot.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone.drain(..) {
+            self.db_cluster_snapshots.remove(&key);
+        }
         for (key, cluster) in self
             .db_clusters
             .range_mut((region.to_string(), String::new())..)
@@ -952,6 +1010,36 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         range_in(&self.db_snapshots, region)
     }
 
+    /// The DB cluster snapshots stored in `region`, in identifier order.
+    ///
+    /// An ordered range rather than a scan of the whole map, so the work is bounded by
+    /// [`DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION`] however many regions the store holds.
+    pub fn cluster_snapshots_in(&self, region: &str) -> Vec<&DbClusterSnapshotRecord> {
+        range_in(&self.db_cluster_snapshots, region)
+    }
+
+    /// The key of the cluster snapshot `value` names IN `region`: either its
+    /// (case-insensitive) identifier or its ARN, both of which
+    /// `DBClusterSnapshotIdentifier` and `SourceDBClusterSnapshotIdentifier` accept.
+    pub fn resolve_cluster_snapshot_key(&self, region: &str, value: &str) -> Option<String> {
+        let lowered = value.to_ascii_lowercase();
+        if self
+            .db_cluster_snapshots
+            .contains_key(&(region.to_string(), lowered.clone()))
+        {
+            return Some(lowered);
+        }
+        // Only an ARN can match the scan below, so a plain identifier that named nothing
+        // does not pay for rendering a region's stored ARNs.
+        if !value.starts_with("arn:") {
+            return None;
+        }
+        self.cluster_snapshots_in(region)
+            .into_iter()
+            .find(|record| record.arn() == value)
+            .map(|record| record.snapshot_identifier.clone())
+    }
+
     /// The cluster parameter groups stored in `region`, in name order.
     pub fn cluster_parameter_groups_in(&self, region: &str) -> Vec<&DbClusterParameterGroupRecord> {
         range_in(&self.db_cluster_parameter_groups, region)
@@ -1025,6 +1113,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .db_instances
             .keys()
             .chain(self.db_snapshots.keys())
+            .chain(self.db_cluster_snapshots.keys())
             .chain(self.db_clusters.keys())
             .chain(self.db_cluster_parameter_groups.keys())
             .chain(self.event_subscriptions.keys())
@@ -1157,12 +1246,19 @@ impl DbInstanceRecord {
     /// gone — an accepted delete that has run its course — so the caller drops it from
     /// the store.
     fn settle(&mut self, now: Instant) -> bool {
-        if self.pending_status.as_ref().is_some_and(|p| now >= p.due_at) {
-            let pending = self.pending_status.take().expect("checked just above");
-            match pending.change {
-                PendingChange::Status(status) => self.status = status,
-                PendingChange::Removal => return true,
-            }
+        let due = self
+            .pending_status
+            .as_ref()
+            .is_some_and(|pending| now >= pending.due_at);
+        if !due {
+            return false;
+        }
+        match self.pending_status.take().map(|pending| pending.change) {
+            Some(PendingChange::Status(status)) => self.status = status,
+            Some(PendingChange::Removal) => return true,
+            // Unreachable: the change was there a line ago, under this one `&mut self`.
+            // Answered as "nothing was due" rather than with a panic in a request path.
+            None => {}
         }
         false
     }
@@ -1768,12 +1864,19 @@ impl DbSnapshotRecord {
     /// Apply a change whose due instant has passed. Returns whether the record is now
     /// gone, exactly as [`DbInstanceRecord::settle`] does.
     fn settle(&mut self, now: Instant) -> bool {
-        if self.pending_status.as_ref().is_some_and(|p| now >= p.due_at) {
-            let pending = self.pending_status.take().expect("checked just above");
-            match pending.change {
-                PendingChange::Status(status) => self.status = status,
-                PendingChange::Removal => return true,
-            }
+        let due = self
+            .pending_status
+            .as_ref()
+            .is_some_and(|pending| now >= pending.due_at);
+        if !due {
+            return false;
+        }
+        match self.pending_status.take().map(|pending| pending.change) {
+            Some(PendingChange::Status(status)) => self.status = status,
+            Some(PendingChange::Removal) => return true,
+            // Unreachable: the change was there a line ago, under this one `&mut self`.
+            // Answered as "nothing was due" rather than with a panic in a request path.
+            None => {}
         }
         false
     }
@@ -2146,6 +2249,129 @@ impl OptionGroupRecord {
     }
 }
 
+/// A stored DB CLUSTER snapshot: the cluster's settings as they stood when the snapshot
+/// was taken, which is why they are copied rather than re-read later.
+///
+/// `CopyDBClusterSnapshot` writes one (a copy of another snapshot) and
+/// `DeleteDBClusterSnapshot` removes one; the operations that take a snapshot OF a
+/// cluster — `CreateDBClusterSnapshot` and the final snapshot `DeleteDBCluster` takes —
+/// are still scaffolded in this crate and are their own stub issues, so they write none
+/// yet. The reading operations are implemented against these records rather than against
+/// a canned answer, so they report exactly what is stored.
+#[derive(Debug, Clone)]
+pub struct DbClusterSnapshotRecord {
+    /// `DBClusterSnapshotIdentifier`, lowercased, and this record's key within its
+    /// region: the member documents "This value is stored as a lowercase string".
+    pub snapshot_identifier: String,
+    /// The region the snapshot lives in; the scope of its ARN.
+    pub region: String,
+    /// `DBClusterIdentifier` of the cluster the snapshot was taken from.
+    pub db_cluster_identifier: String,
+    /// `DbClusterResourceId`, which `DescribeDBClusterSnapshots` can select on.
+    pub db_cluster_resource_id: String,
+    pub engine: String,
+    pub engine_version: Option<String>,
+    pub engine_mode: Option<String>,
+    pub allocated_storage: Option<i32>,
+    pub master_username: Option<String>,
+    pub availability_zones: Vec<String>,
+    pub port: i32,
+    pub storage_type: Option<String>,
+    pub storage_encrypted: bool,
+    pub kms_key_id: Option<String>,
+    pub license_model: Option<String>,
+    /// `SnapshotType`: `manual` for every snapshot a caller asked for.
+    pub snapshot_type: String,
+    /// `Status`: [`SNAPSHOT_STATUS_COPYING`] while a copy is being made,
+    /// [`SNAPSHOT_STATUS_AVAILABLE`] once the clock has made it due.
+    pub status: String,
+    /// The status this record owes, and when; see [`PendingStatus`].
+    pub pending_status: Option<PendingStatus>,
+    pub cluster_create_time: ::aws_smithy_types::DateTime,
+    pub snapshot_create_time: ::aws_smithy_types::DateTime,
+    /// `SourceDBClusterSnapshotArn`: the snapshot this one was copied from, absent for a
+    /// snapshot taken from a cluster.
+    pub source_snapshot_arn: Option<String>,
+    /// The accounts the `restore` attribute authorizes, which
+    /// `ModifyDBClusterSnapshotAttribute` adds to and removes from and
+    /// `DescribeDBClusterSnapshotAttributes` reports; see [`SNAPSHOT_RESTORE_ATTRIBUTE`].
+    /// A set, so authorizing an account twice changes nothing and the report is ordered.
+    pub restore_attribute: BTreeSet<String>,
+    pub tags: Vec<Tag>,
+}
+
+impl DbClusterSnapshotRecord {
+    /// Apply a change whose due instant has passed. Returns whether the record is now
+    /// gone, exactly as [`DbInstanceRecord::settle`] does.
+    fn settle(&mut self, now: Instant) -> bool {
+        let due = self
+            .pending_status
+            .as_ref()
+            .is_some_and(|pending| now >= pending.due_at);
+        if !due {
+            return false;
+        }
+        match self.pending_status.take().map(|pending| pending.change) {
+            Some(PendingChange::Status(status)) => self.status = status,
+            Some(PendingChange::Removal) => return true,
+            // Unreachable: the change was there a line ago, under this one `&mut self`.
+            // Answered as "nothing was due" rather than with a panic in a request path.
+            None => {}
+        }
+        false
+    }
+
+    /// `arn:aws:rds:<region>:<account>:cluster-snapshot:<identifier>`.
+    pub fn arn(&self) -> String {
+        emulator_server::emulator_arn(
+            ARN_NAMESPACE,
+            &self.region,
+            &format!("cluster-snapshot:{}", self.snapshot_identifier),
+        )
+    }
+
+    /// Whether this snapshot is public — its `restore` attribute authorizes every
+    /// account; see [`SNAPSHOT_ATTRIBUTE_ALL`].
+    pub fn is_public(&self) -> bool {
+        self.restore_attribute.contains(SNAPSHOT_ATTRIBUTE_ALL)
+    }
+
+    /// Project the stored record onto the modelled `DBClusterSnapshot` output shape.
+    pub fn to_wire(&self) -> DBClusterSnapshot {
+        DBClusterSnapshot {
+            availability_zones: Some(self.availability_zones.clone()),
+            db_cluster_snapshot_identifier: Some(self.snapshot_identifier.clone()),
+            db_cluster_identifier: Some(self.db_cluster_identifier.clone()),
+            snapshot_create_time: Some(self.snapshot_create_time),
+            engine: Some(self.engine.clone()),
+            engine_mode: self.engine_mode.clone(),
+            allocated_storage: self.allocated_storage,
+            status: Some(self.status.clone()),
+            port: Some(self.port),
+            cluster_create_time: Some(self.cluster_create_time),
+            master_username: self.master_username.clone(),
+            engine_version: self.engine_version.clone(),
+            license_model: self.license_model.clone(),
+            snapshot_type: Some(self.snapshot_type.clone()),
+            // The progress of the copy this record stands for: complete once the
+            // snapshot is available, and not yet begun while it is still being made.
+            percent_progress: Some(if self.status == SNAPSHOT_STATUS_AVAILABLE {
+                100
+            } else {
+                0
+            }),
+            storage_encrypted: Some(self.storage_encrypted),
+            kms_key_id: self.kms_key_id.clone(),
+            db_cluster_snapshot_arn: Some(self.arn()),
+            source_db_cluster_snapshot_arn: self.source_snapshot_arn.clone(),
+            tag_list: Some(self.tags.clone()),
+            storage_type: self.storage_type.clone(),
+            db_cluster_resource_id: Some(self.db_cluster_resource_id.clone()),
+            ..DBClusterSnapshot::default()
+        }
+    }
+}
+
 /// Emulator resource guard, NOT an AWS bound: the longest caller-supplied free-form string
 /// this service stores for a member whose length the API publishes no limit for (a
 /// parameter group's `Description` or `DBParameterGroupFamily`, a parameter's name or
@@ -2201,6 +2427,7 @@ impl DbSubnetGroupRecord {
             tags: Vec::new(),
         }
     }
+
     /// `arn:aws:rds:<region>:<account>:subgrp:<name>` — `subgrp` is the resource type
     /// RDS gives a DB subnet group in its ARN format.
     pub fn arn(&self) -> String {
@@ -2497,6 +2724,58 @@ impl OptionRecord {
     }
 }
 
+/// The `DBClusterSnapshotAttributesResult` a snapshot's `restore` attribute projects onto.
+///
+/// `restore` is the one attribute AWS defines for a cluster snapshot, and it is always
+/// reported: a snapshot nobody has been authorized for carries the attribute with an
+/// empty value list, which is how a caller reads "shared with no account". Both
+/// `DescribeDBClusterSnapshotAttributes` and `ModifyDBClusterSnapshotAttribute` answer
+/// with it, so neither can report it differently from the other.
+pub fn restore_attribute_to_wire(
+    record: &DbClusterSnapshotRecord,
+) -> DBClusterSnapshotAttributesResult {
+    DBClusterSnapshotAttributesResult {
+        db_cluster_snapshot_identifier: Some(record.snapshot_identifier.clone()),
+        db_cluster_snapshot_attributes: Some(vec![DBClusterSnapshotAttribute {
+            attribute_name: Some(SNAPSHOT_RESTORE_ATTRIBUTE.to_string()),
+            attribute_values: Some(record.restore_attribute.iter().cloned().collect()),
+        }]),
+    }
+}
+
+/// Refuse a `restore` attribute value that is neither an Amazon Web Services account id
+/// nor the `all` that makes a snapshot public; see [`SNAPSHOT_ATTRIBUTE_ALL`] and
+/// [`ACCOUNT_ID_DIGITS`] for the documentation this comes from.
+pub fn check_snapshot_attribute_value(member: &str, value: &str) -> Result<(), String> {
+    let well_formed = value == SNAPSHOT_ATTRIBUTE_ALL
+        || (value.chars().count() == ACCOUNT_ID_DIGITS && value.chars().all(|c| c.is_ascii_digit()));
+    if well_formed {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid value '{value}' for {member}: each value must be a \
+         {ACCOUNT_ID_DIGITS}-digit Amazon Web Services account id or \
+         '{SNAPSHOT_ATTRIBUTE_ALL}'"
+    ))
+}
+
+/// The `SnapshotType` values `DescribeDBClusterSnapshotsMessage$SnapshotType` lists:
+/// "You can specify one of the following values: automated ... manual ... shared ...
+/// public". A request naming anything else is refused rather than silently matching
+/// nothing.
+pub const SNAPSHOT_TYPES: [&str; 4] = ["automated", "manual", "shared", "public"];
+
+/// Refuse a `SnapshotType` outside the documented list; see [`SNAPSHOT_TYPES`].
+pub fn check_snapshot_type(value: &str) -> Result<(), String> {
+    if SNAPSHOT_TYPES.contains(&value) {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid value '{value}' for SnapshotType: valid values are {}",
+        SNAPSHOT_TYPES.join(", ")
+    ))
+}
+
 /// Refuse a value that is not of the published EC2 subnet id form: `subnet-` followed
 /// by 8 or 17 lowercase hexadecimal characters. A value that is not a subnet id at all
 /// names no subnet, which is the modelled `InvalidSubnet`.
@@ -2516,9 +2795,16 @@ pub fn check_subnet_id(subnet_id: &str) -> Result<(), String> {
 }
 
 /// The region segment of an ARN (`arn:aws:<service>:<region>:<account>:<resource>`), or
-/// `None` when `value` does not have that shape. Empty for a region-less ARN, which is
-/// how a global resource's ARN reads.
-fn arn_region(value: &str) -> Option<&str> {
+/// `None` when `value` does not have that shape. EMPTY for a region-less ARN, which is how
+/// a global resource's ARN reads.
+///
+/// `CopyDBClusterSnapshotMessage$SourceDBClusterSnapshotIdentifier`: "If the source
+/// snapshot is in the same Amazon Web Services Region as the copy, specify a valid DB
+/// snapshot identifier ... If the source snapshot is in a different Amazon Web Services
+/// Region ... specify a valid DB cluster snapshot ARN." So the region a copy looked for
+/// its source in is the ARN's own when it was given one, and the request's region
+/// otherwise.
+pub fn arn_region(value: &str) -> Option<&str> {
     let mut fields = value.split(':');
     let (Some("arn"), Some(_partition), Some(_service), Some(region)) =
         (fields.next(), fields.next(), fields.next(), fields.next())
@@ -3100,6 +3386,16 @@ pub fn check_filter_terms(filters: &[crate::ops::types::Filter]) -> Result<(), S
     Ok(())
 }
 
+/// Emulator resource guard, NOT an AWS quota: the most entries this emulator accepts in a
+/// caller-sized list whose length the model publishes no `@length` for.
+///
+/// The per-entry work such a list drives runs with this service's one state lock held, so
+/// the count is the caller's to choose and has to be capped. It is comfortably above the
+/// largest useful request: `ValuesToAdd` / `ValuesToRemove` cannot usefully carry more than
+/// [`MAX_SNAPSHOT_SHARED_ACCOUNTS`] account ids plus [`SNAPSHOT_ATTRIBUTE_ALL`]. The check
+/// itself is [`check_request_list_len`], the one this store already states that rule with.
+pub const MAX_COLLECTION_ENTRIES: usize = 50;
+
 /// How many security group memberships one option of an option group may carry.
 ///
 /// `OptionConfiguration$DBSecurityGroupMemberships` and
@@ -3125,6 +3421,19 @@ pub fn check_option_text(member: &str, value: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Refuse a `Tags` list this emulator will not store, for a member that hands them over as
+/// an `Option`: the rule is [`check_tags`]'s, stated once for this store.
+///
+/// `TagList` carries no `@length`, so the list a caller sends is the caller's to size; it
+/// is stored on a record, so the count and each entry are bounded before any of it is
+/// kept. `Err` carries the message, naming the member and the bound it broke.
+pub fn check_tag_list(tags: Option<&Vec<Tag>>) -> Result<(), String> {
+    match tags {
+        None => Ok(()),
+        Some(tags) => check_tags(tags),
+    }
 }
 
 /// Refuse a security group membership list longer than [`MAX_OPTION_SECURITY_GROUPS`],

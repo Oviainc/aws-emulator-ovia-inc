@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDBClusterSnapshotAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDBClusterSnapshotAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation adds accounts to and removes accounts from the `restore`
+//! attribute of the cluster snapshot the request names, and answers with the attribute as
+//! it now stands. An identifier that names no stored snapshot is the modeled
+//! `DBClusterSnapshotNotFoundFault` (404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDBClusterSnapshotAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +131,19 @@ impl From<ModifyDBClusterSnapshotAttributeErrorModeled> for ModifyDBClusterSnaps
     }
 }
 
+/// The modeled `DBClusterSnapshotNotFoundFault` for a snapshot this store does not hold.
+///
+/// The message is built from the request: it names the snapshot that was looked for, in
+/// the phrasing AWS answers for this fault.
+fn not_found(requested: &str) -> ModifyDBClusterSnapshotAttributeError {
+    ModifyDBClusterSnapshotAttributeErrorModeled::DBClusterSnapshotNotFoundFault(
+        DBClusterSnapshotNotFoundFault {
+            message: Some(format!("DBClusterSnapshot not found: {requested}")),
+        },
+    )
+    .into()
+}
+
 /// The `ModifyDBClusterSnapshotAttribute` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -170,18 +180,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDBClusterSnapshotAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDBClusterSnapshotAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDBClusterSnapshotAttribute"))
+        use crate::state as docdb;
+
+        let _ = ctx;
+
+        // `AttributeName` doc: "The name of the cluster snapshot attribute to modify. To
+        // manage authorization for other accounts to copy or restore a manual cluster
+        // snapshot, set this value to restore." It is the only attribute AWS defines, so
+        // any other name is refused rather than stored under a name nothing reports.
+        if input.attribute_name != docdb::SNAPSHOT_RESTORE_ATTRIBUTE {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Invalid value '{}' for AttributeName: the only valid value is '{}'",
+                input.attribute_name,
+                docdb::SNAPSHOT_RESTORE_ATTRIBUTE
+            )));
+        }
+        // The entry counts are bounded FIRST: neither member publishes a `@length`, so
+        // every per-entry check below runs over a list the caller sized.
+        docdb::bound_string_list("ValuesToAdd", input.values_to_add.as_ref())
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        docdb::bound_string_list("ValuesToRemove", input.values_to_remove.as_ref())
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        let to_add = input.values_to_add.clone().unwrap_or_default();
+        let to_remove = input.values_to_remove.clone().unwrap_or_default();
+        for value in &to_add {
+            docdb::validate_snapshot_attribute_value("ValuesToAdd", value)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+        // A set, so the overlap test below costs one lookup per removed value rather than
+        // a scan of the added ones: the work stays the SUM of the two lists, never their
+        // product.
+        let adding: ::std::collections::BTreeSet<&str> =
+            to_add.iter().map(String::as_str).collect();
+        for value in &to_remove {
+            docdb::validate_snapshot_attribute_value("ValuesToRemove", value)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+            // One call cannot both authorize and de-authorize the same account: the
+            // result would depend on the order the two lists were applied in.
+            if adding.contains(value.as_str()) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Value '{value}' cannot appear in both ValuesToAdd and ValuesToRemove"
+                )));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let mut store = state.lock();
+        // The status this operation branches on is the one the clock already owes.
+        store.settle_clock();
+
+        let Some(key) = store.resolve_snapshot_key(&input.db_cluster_snapshot_identifier) else {
+            return Err(not_found(&input.db_cluster_snapshot_identifier));
+        };
+        // A key this store resolved and a lookup under it can only disagree if the record
+        // is not where the resolve said it was, which answers the same modelled 404 as a
+        // snapshot that was never there: a disagreement is a "not found", never a panic.
+        let Some(record) = store.snapshots.get_mut(&key) else {
+            return Err(not_found(&input.db_cluster_snapshot_identifier));
+        };
+        // Only a complete snapshot can be shared: AWS answers the modelled state fault
+        // for one still being taken or copied.
+        if record.status != docdb::STATUS_AVAILABLE {
+            return Err(
+                ModifyDBClusterSnapshotAttributeErrorModeled::InvalidDBClusterSnapshotStateFault(
+                    InvalidDBClusterSnapshotStateFault {
+                        message: Some(format!(
+                            "Cluster snapshot {} is in {} state but must be {} to be shared",
+                            record.identifier,
+                            record.status,
+                            docdb::STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The quota is on the accounts the snapshot ends up authorized for, so it is
+        // checked against the result of this call and the snapshot is left untouched when
+        // the call would exceed it.
+        let mut authorized = record.restore_attribute.clone();
+        for value in &to_remove {
+            authorized.remove(value);
+        }
+        // A value already present is not counted twice: `restore` is a SET of accounts, so
+        // authorizing the same account again changes nothing.
+        authorized.extend(to_add.iter().cloned());
+        if authorized.len() > docdb::MAX_SNAPSHOT_SHARED_ACCOUNTS {
+            return Err(
+                ModifyDBClusterSnapshotAttributeErrorModeled::SharedSnapshotQuotaExceededFault(
+                    SharedSnapshotQuotaExceededFault {
+                        message: Some(format!(
+                            "A manual cluster snapshot cannot be shared with more than {} \
+                             accounts",
+                            docdb::MAX_SNAPSHOT_SHARED_ACCOUNTS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        record.restore_attribute = authorized;
+
+        // The attribute is reported from the record this call just wrote, so the answer
+        // and a following `DescribeDBClusterSnapshotAttributes` cannot disagree: both go
+        // through the record's one projection.
+        Ok(ModifyDBClusterSnapshotAttributeOutput {
+            db_cluster_snapshot_attributes_result: Some(record.restore_attribute_to_shape()),
+        })
     }
 }

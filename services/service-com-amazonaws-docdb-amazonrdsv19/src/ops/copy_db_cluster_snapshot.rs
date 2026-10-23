@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyDBClusterSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyDBClusterSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation copies a stored cluster snapshot to a new identifier and
+//! answers with the copy it persisted. A source that names no stored snapshot is the
+//! modeled `DBClusterSnapshotNotFoundFault` (404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyDBClusterSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,6 +145,25 @@ impl From<CopyDBClusterSnapshotErrorModeled> for CopyDBClusterSnapshotError {
     }
 }
 
+/// The modeled `DBClusterSnapshotNotFoundFault` for a source this store does not hold.
+///
+/// The message is built from the request: it names BOTH the snapshot asked for and the
+/// region it was looked for in — an ARN is looked for in the region the ARN names, a plain
+/// identifier in the region the request was signed for — because a copy whose source lives
+/// in another region is exactly the case this operation exists for.
+fn source_not_found(requested: &str, request_region: &str) -> CopyDBClusterSnapshotError {
+    let source_region =
+        crate::state::arn_region(requested).unwrap_or_else(|| request_region.to_string());
+    CopyDBClusterSnapshotErrorModeled::DBClusterSnapshotNotFoundFault(
+        DBClusterSnapshotNotFoundFault {
+            message: Some(format!(
+                "Requested snapshot {requested} not found in source region {source_region}"
+            )),
+        },
+    )
+    .into()
+}
+
 /// The `CopyDBClusterSnapshot` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -185,18 +200,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyDBClusterSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyDBClusterSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyDBClusterSnapshot"))
+        use crate::state as docdb;
+
+        // `TargetDBClusterSnapshotIdentifier`: "Must contain from 1 to 63 letters,
+        // numbers, or hyphens. The first character must be a letter. Cannot end with a
+        // hyphen or contain two consecutive hyphens."
+        docdb::validate_identifier(
+            "TargetDBClusterSnapshotIdentifier",
+            &input.target_db_cluster_snapshot_identifier,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+        docdb::bound_tags(input.tags.as_ref()).map_err(crate::scaffolded::Scaffolded::validation)?;
+        docdb::bound_optional_string("KmsKeyId", input.kms_key_id.as_ref())
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let region = docdb::request_region(ctx);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let mut store = state.lock();
+        // Reporting the source and writing the copy both read the snapshot's status, so
+        // the transitions the clock already owed are materialised first.
+        store.settle_clock();
+
+        // `SourceDBClusterSnapshotIdentifier`: "If the source cluster snapshot is in the
+        // same Region as the copy, specify a valid snapshot identifier" — otherwise its
+        // ARN. A value that names no stored snapshot is the modeled 404, whichever form
+        // it took, and the message names BOTH the snapshot asked for and the region it
+        // was looked for in: an ARN is looked for in the region the ARN names, a plain
+        // identifier in the region the request was signed for. That is the one fact a
+        // caller needs, because a copy whose source lives in another region is exactly
+        // the case this operation exists for.
+        let Some(source_key) = store.resolve_snapshot_key(&input.source_db_cluster_snapshot_identifier)
+        else {
+            return Err(source_not_found(
+                &input.source_db_cluster_snapshot_identifier,
+                &region,
+            ));
+        };
+
+        // The copy is keyed the way every other identifier here is, lowercased, so the
+        // duplicate check is case-insensitive.
+        let target_key = input
+            .target_db_cluster_snapshot_identifier
+            .to_ascii_lowercase();
+        if store.snapshots.contains_key(&target_key) {
+            return Err(
+                CopyDBClusterSnapshotErrorModeled::DBClusterSnapshotAlreadyExistsFault(
+                    DBClusterSnapshotAlreadyExistsFault {
+                        message: Some(format!(
+                            "DB cluster snapshot already exists: {target_key}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.snapshots.len() >= docdb::MAX_DB_CLUSTER_SNAPSHOTS {
+            return Err(
+                CopyDBClusterSnapshotErrorModeled::SnapshotQuotaExceededFault(
+                    SnapshotQuotaExceededFault {
+                        message: Some(format!(
+                            "Cannot create more than {} manual cluster snapshots in this Region",
+                            docdb::MAX_DB_CLUSTER_SNAPSHOTS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A key this store resolved and a lookup under it can only disagree if the record
+        // is not where the resolve said it was, which answers the same modelled 404 as a
+        // source that was never there: a disagreement is a "not found", never a panic.
+        let Some(source) = store.snapshots.get(&source_key) else {
+            return Err(source_not_found(
+                &input.source_db_cluster_snapshot_identifier,
+                &region,
+            ));
+        };
+        // `SourceDBClusterSnapshotIdentifier` constraint: "Must specify a valid cluster
+        // snapshot in the available state." A source still being taken or copied is the
+        // modelled state fault, which is what a caller that acts immediately after
+        // starting one sees.
+        if source.status != docdb::STATUS_AVAILABLE {
+            return Err(
+                CopyDBClusterSnapshotErrorModeled::InvalidDBClusterSnapshotStateFault(
+                    InvalidDBClusterSnapshotStateFault {
+                        message: Some(format!(
+                            "Cluster snapshot {} is in {} state but must be {} to be copied",
+                            source.identifier,
+                            source.status,
+                            docdb::STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let source_arn = source.arn();
+        let copy = docdb::DbClusterSnapshotRecord {
+            identifier: target_key.clone(),
+            // The copy is a snapshot OF the same cluster, so it carries the source's
+            // cluster and the cluster's own facts; only the identifier, the ARN, the
+            // creation time and the source link are the copy's own.
+            cluster_identifier: source.cluster_identifier.clone(),
+            region: region.clone(),
+            snapshot_create_time: docdb::now(),
+            cluster_create_time: source.cluster_create_time,
+            engine: source.engine.clone(),
+            engine_version: source.engine_version.clone(),
+            master_username: source.master_username.clone(),
+            port: source.port,
+            availability_zones: source.availability_zones.clone(),
+            // `KmsKeyId`: "If you don't specify a value for KmsKeyId, then the copy of the
+            // cluster snapshot is encrypted with the same KMS key as the source cluster
+            // snapshot" — and a copy encrypted under a named key is an encrypted snapshot
+            // even when the source was not.
+            storage_encrypted: source.storage_encrypted || input.kms_key_id.is_some(),
+            kms_key_id: input
+                .kms_key_id
+                .clone()
+                .or_else(|| source.kms_key_id.clone()),
+            storage_type: source.storage_type.clone(),
+            snapshot_type: docdb::SNAPSHOT_TYPE_MANUAL.to_string(),
+            // AWS answers a copy in the `copying` status and the clock owes it
+            // `available`, so a caller that reads it straight back sees the copy in
+            // progress, as it would against the real service.
+            status: docdb::SNAPSHOT_STATUS_COPYING.to_string(),
+            available_at: Some(::std::time::Instant::now() + docdb::PROVISIONING_DELAY),
+            source_snapshot_arn: Some(source_arn),
+            // The copy authorizes nobody: `restore` is not copied, so a snapshot shared
+            // with an account does not silently keep sharing it under a new identifier.
+            restore_attribute: ::std::collections::BTreeSet::new(),
+            // `CopyTags`: "Set to true to copy all tags from the source cluster snapshot to
+            // the target cluster snapshot, and otherwise false. The default is false."
+            tags: if input.copy_tags.unwrap_or(false) {
+                source.tags.clone()
+            } else {
+                docdb::tag_pairs(input.tags.clone())
+            },
+        };
+
+        // The answer is the record this call stored, read back out of the store rather
+        // than from the value that went in, so a following describe reports the same
+        // snapshot. `entry` is what reads it back without a lookup that could fail.
+        let stored = store.snapshots.entry(target_key).or_insert(copy);
+        Ok(CopyDBClusterSnapshotOutput {
+            db_cluster_snapshot: Some(stored.to_shape()),
+        })
     }
 }

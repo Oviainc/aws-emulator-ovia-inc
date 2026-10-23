@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBClusterSnapshotAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBClusterSnapshotAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the `restore` attribute stored for the cluster
+//! snapshot the request names — the accounts `ModifyDBClusterSnapshotAttribute`
+//! authorized. An identifier that names no stored snapshot is the modeled
+//! `DBClusterSnapshotNotFoundFault` (404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBClusterSnapshotAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -107,6 +104,19 @@ impl From<DescribeDBClusterSnapshotAttributesErrorModeled> for DescribeDBCluster
     }
 }
 
+/// The modeled `DBClusterSnapshotNotFoundFault` for a snapshot this store does not hold.
+///
+/// The message is built from the request: it names the snapshot that was looked for, in
+/// the phrasing AWS answers for this fault.
+fn not_found(requested: &str) -> DescribeDBClusterSnapshotAttributesError {
+    DescribeDBClusterSnapshotAttributesErrorModeled::DBClusterSnapshotNotFoundFault(
+        DBClusterSnapshotNotFoundFault {
+            message: Some(format!("DBClusterSnapshot not found: {requested}")),
+        },
+    )
+    .into()
+}
+
 /// The `DescribeDBClusterSnapshotAttributes` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -143,18 +153,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBClusterSnapshotAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBClusterSnapshotAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBClusterSnapshotAttributes"))
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let mut store = state.lock();
+        // Reporting only: this materialises the snapshot transitions the clock already
+        // owed, which decide the status this read reports.
+        store.settle_clock();
+
+        let Some(key) = store.resolve_snapshot_key(&input.db_cluster_snapshot_identifier) else {
+            return Err(not_found(&input.db_cluster_snapshot_identifier));
+        };
+        // A key this store resolved and a lookup under it can only disagree if the record
+        // is not where the resolve said it was, which answers the same modelled 404 as a
+        // snapshot that was never there: a disagreement is a "not found", never a panic.
+        let Some(record) = store.snapshots.get(&key) else {
+            return Err(not_found(&input.db_cluster_snapshot_identifier));
+        };
+
+        // `restore` is the one attribute AWS defines for a cluster snapshot, and it is
+        // always reported: a snapshot nobody has been authorized for carries the attribute
+        // with an empty value list, which is how a caller reads "shared with no account".
+        // The projection is the record's own, shared with
+        // `ModifyDBClusterSnapshotAttribute`, so the two cannot report it differently.
+        Ok(DescribeDBClusterSnapshotAttributesOutput {
+            db_cluster_snapshot_attributes_result: Some(record.restore_attribute_to_shape()),
+        })
     }
 }

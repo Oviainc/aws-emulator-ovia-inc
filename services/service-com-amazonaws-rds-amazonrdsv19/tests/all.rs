@@ -17,6 +17,8 @@ mod certificate_override;
 mod cluster_parameter_groups;
 #[path = "all/db_cluster_deletion.rs"]
 mod db_cluster_deletion;
+#[path = "all/db_cluster_snapshots.rs"]
+mod db_cluster_snapshots;
 #[path = "all/db_clusters.rs"]
 mod db_clusters;
 #[path = "all/db_engine_version_catalog.rs"]

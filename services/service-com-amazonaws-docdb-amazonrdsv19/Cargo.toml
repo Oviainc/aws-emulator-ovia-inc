@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `state::new_request_id`'s digest: a maintained hash, so the per-response request id in an
+# awsQuery `<ErrorResponse>` envelope is shaped by library code rather than by hand.
+sha2 = { workspace = true }
+hex = { workspace = true }
 # `rds_cluster_parameters`: the cluster parameter catalog and the parameter rules the
 # Amazon RDS, DocumentDB and Neptune models of the one `rds` front door share
 # (`src/state.rs`).
@@ -33,8 +37,9 @@ service-common = { path = "../common" }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# The percent-encoder the test harness builds its awsQuery form bodies with
+# (`tests/all/cluster_lifecycle.rs`), rather than hand-writing one.
+percent-encoding = "2"
 
 [lints]
 workspace = true

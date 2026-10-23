@@ -22,6 +22,13 @@ use std::sync::Arc;
 use aws_emulator_router::{build_router, InMemoryEngine};
 use smithy_server_runtime::MultiServiceRouter;
 
+// The awsQuery wire helpers live once, in `all/query_wire.rs`. The re-export is
+// `pub(crate)` because sibling suites written before that module existed reach the
+// encoder through THIS module's path (`crate::transfer_user_with_iam_role::form_encode`),
+// which this one line keeps resolving to the single shared implementation instead of
+// letting a second copy be written.
+pub(crate) use crate::query_wire::{element, form_encode};
+
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
@@ -69,35 +76,6 @@ async fn iam(
     let status = response.status().as_u16();
     let body = String::from_utf8(response.body().to_vec()).expect("a UTF-8 response body");
     (status, body)
-}
-
-/// Percent-encode one `application/x-www-form-urlencoded` component, leaving only
-/// RFC 3986's unreserved characters literal.
-pub(crate) fn form_encode(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char)
-            }
-            other => encoded.push_str(&format!("%{other:02X}")),
-        }
-    }
-    encoded
-}
-
-/// The text of the single `<tag>` leaf element an IAM response carries.
-fn element(body: &str, tag: &str) -> String {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = body
-        .find(&open)
-        .unwrap_or_else(|| panic!("no <{tag}> in {body}"));
-    let rest = &body[start + open.len()..];
-    let end = rest
-        .find(&close)
-        .unwrap_or_else(|| panic!("<{tag}> is never closed in {body}"));
-    rest[..end].to_string()
 }
 
 /// One awsJson1_1 call to Transfer Family, answered with the status and the decoded

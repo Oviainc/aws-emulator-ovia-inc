@@ -27,9 +27,9 @@ aws-smithy-runtime-api = { workspace = true }
 # `addresses_modeled_route`: the empty body the request it asks a service's own protocol
 # to route is built with (that routing key reads the method, URI and headers only).
 aws-smithy-types = { workspace = true }
-# `stable_hex_id`'s mixing function: a maintained digest, so a derived id that
-# travels on the wire is reproducible across builds rather than tied to the
-# algorithm `std`'s default hasher happens to use.
+# `stable_hex_id`'s mixing function: a maintained digest, so a derived id that travels on
+# the wire is reproducible across builds rather than tied to the algorithm `std`'s default
+# hasher happens to use.
 sha2 = { workspace = true }
 # `iam_trust_policy`: an IAM trust policy IS a JSON document, so it is read with a
 # maintained JSON parser rather than by hand.
