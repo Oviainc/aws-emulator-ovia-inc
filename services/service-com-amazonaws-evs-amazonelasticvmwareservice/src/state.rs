@@ -17,9 +17,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    Check, ConnectivityInfo, EipAssociation, Environment, EnvironmentSummary, LicenseInfo,
-    ResourceNotFoundException, ServiceAccessSecurityGroups, ValidationException, VcfHostnames, Vlan,
-    VmEntitlement,
+    Check, ConnectivityInfo, Connector, ConnectorCheck, EipAssociation, Environment,
+    EnvironmentSummary, LicenseInfo, ResourceNotFoundException, ServiceAccessSecurityGroups,
+    ValidationException, VcfHostnames, Vlan, VmEntitlement,
 };
 
 /// The `EnvironmentState` / `VlanState` values this service moves a resource through.
@@ -48,6 +48,28 @@ pub const REASON_OTHER: &str = "other";
 /// The resource type `ResourceNotFoundException` reports for an environment: the
 /// `EnvironmentResource` the model binds these operations to.
 pub const RESOURCE_TYPE_ENVIRONMENT: &str = "environment";
+
+/// The resource type `ResourceNotFoundException` reports for a connector — the other
+/// resource these operations address by id (`Connector`, "An object that represents a
+/// connector for an Amazon EVS environment").
+pub const RESOURCE_TYPE_CONNECTOR: &str = "connector";
+
+/// The `ConnectorState` values a stored connector moves through.
+///
+/// The model declares `CREATING | CREATE_FAILED | ACTIVE | UPDATING | UPDATE_FAILED |
+/// DELETING | DELETED` (`smithy_query(query="shape", shape="ConnectorState")`). The
+/// three named here are the ones the implemented connector operations produce: a
+/// connector is `CREATING` while `CreateEnvironmentConnector`'s connection is being
+/// established, `UPDATING` while `UpdateEnvironmentConnector`'s new metadata is being
+/// applied, and `ACTIVE` once either has settled. The rest belong to the operations
+/// that produce them (`DeleteEnvironmentConnector` still answers 501).
+pub const CONNECTOR_CREATING: &str = "CREATING";
+/// See [`CONNECTOR_CREATING`].
+pub const CONNECTOR_UPDATING: &str = "UPDATING";
+/// See [`CONNECTOR_CREATING`].
+pub const CONNECTOR_ACTIVE: &str = "ACTIVE";
+/// See [`CONNECTOR_CREATING`].
+pub const CONNECTOR_DELETED: &str = "DELETED";
 
 /// The `EntitlementStatus` values a stored entitlement moves through.
 ///
@@ -160,6 +182,20 @@ pub fn environment_not_found(resource_id: &str) -> ResourceNotFoundException {
     }
 }
 
+/// The `ResourceNotFoundException` every operation answers for a connector id the
+/// addressed environment holds no record of.
+///
+/// Built from the request exactly as [`environment_not_found`] is: the service names
+/// the connector the caller asked for, in the form `Connector <requested id> was not
+/// found`, so the text is a function of the lookup key and never of the store.
+pub fn connector_not_found(resource_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("Connector {resource_id} was not found"),
+        resource_id: resource_id.to_string(),
+        resource_type: RESOURCE_TYPE_CONNECTOR.to_string(),
+    }
+}
+
 /// A lifecycle transition the clock owes a stored environment: the instant it
 /// becomes due, the wall-clock time to stamp `modifiedAt` with, and the states the
 /// environment and its VLANs move to.
@@ -212,6 +248,151 @@ impl PendingEntitlementStatus {
             due_at: Instant::now() + TRANSITION_DELAY,
             due_at_ms: now_ms() + TRANSITION_DELAY.as_millis() as i64,
             status,
+        }
+    }
+}
+
+/// The state change the clock owes a stored connector: the instant it becomes due,
+/// the wall-clock time the change is owed at, and the `ConnectorState` the connector
+/// moves to.
+///
+/// Separate from [`PendingTransition`] because a connector runs on its own clock: one
+/// created or updated long after its environment settled still owes the move to
+/// `ACTIVE` that establishing the connection to the appliance takes.
+#[derive(Debug, Clone)]
+pub struct PendingConnectorState {
+    /// When the change becomes due. Compared against `Instant::now()`; never slept on.
+    pub due_at: Instant,
+    /// The wall-clock instant, in epoch milliseconds, the change is owed at.
+    pub due_at_ms: i64,
+    /// The `ConnectorState` the connector moves to.
+    pub state: &'static str,
+}
+
+impl PendingConnectorState {
+    /// The change `CreateEnvironmentConnector`/`UpdateEnvironmentConnector` starts,
+    /// due [`TRANSITION_DELAY`] after the call.
+    pub fn starting_now(state: &'static str) -> Self {
+        Self {
+            due_at: Instant::now() + TRANSITION_DELAY,
+            due_at_ms: now_ms() + TRANSITION_DELAY.as_millis() as i64,
+            state,
+        }
+    }
+}
+
+/// One connector of an environment, as `CreateEnvironmentConnector` stored it: the
+/// record of a connection to one VCF appliance type.
+#[derive(Debug, Clone)]
+pub struct StoredConnector {
+    /// The minted `connectorId` (`cnctr-` + ten alphanumeric characters).
+    pub connector_id: String,
+    /// The `ConnectorType` the connector was created with. At most one live connector
+    /// of each type per environment: "You can create only one connector of each type
+    /// per environment" (`CreateEnvironmentConnector` doc).
+    pub connector_type: String,
+    /// The FQDN of the VCF appliance the connector connects to.
+    pub appliance_fqdn: String,
+    /// The Secrets Manager secret holding the appliance credentials, EXACTLY as the
+    /// request supplied it.
+    ///
+    /// `secretIdentifier` accepts "The ARN or name of the Amazon Web Services Secrets
+    /// Manager secret" and `secretArn` carries that same `SecretIdentifier` shape, so
+    /// a name is reported as a name: this emulator runs no Secrets Manager and cannot
+    /// resolve a name to the ARN of a secret it does not hold.
+    pub secret_arn: String,
+    /// The `ConnectorState` the connector is in.
+    pub state: String,
+    /// A detailed description of `state`, when there is one.
+    pub state_details: Option<String>,
+    /// The checks run on the connector, which [`Self::status`] rolls up.
+    ///
+    /// Always empty here: a connector check is a probe of the appliance named by
+    /// `applianceFqdn`, and this emulator contacts no appliance, so no check has run.
+    pub checks: Vec<ConnectorCheck>,
+    /// Epoch milliseconds the connector was created at.
+    pub created_at_ms: i64,
+    /// Epoch milliseconds the connector was last modified at.
+    pub modified_at_ms: i64,
+    /// The state change the clock owes this connector, if any.
+    pub pending: Option<PendingConnectorState>,
+}
+
+impl StoredConnector {
+    /// A new connector, as `CreateEnvironmentConnector` mints one: `CREATING` until
+    /// the move to `ACTIVE` the clock owes it comes due.
+    pub fn creating(
+        connector_id: String,
+        connector_type: &str,
+        appliance_fqdn: &str,
+        secret_identifier: &str,
+        created_at_ms: i64,
+        pending: PendingConnectorState,
+    ) -> Self {
+        Self {
+            connector_id,
+            connector_type: connector_type.to_string(),
+            appliance_fqdn: appliance_fqdn.to_string(),
+            secret_arn: secret_identifier.to_string(),
+            state: CONNECTOR_CREATING.to_string(),
+            state_details: None,
+            checks: Vec::new(),
+            created_at_ms,
+            modified_at_ms: created_at_ms,
+            pending: Some(pending),
+        }
+    }
+
+    /// Apply the owed state change if `now` has reached its due instant.
+    ///
+    /// The change was owed at that instant whether or not anybody called, so a
+    /// reporting operation may materialise it. The stamp it writes is the stored due
+    /// instant and never the reading instant, so two reads report one `modifiedAt`.
+    pub fn materialise_due_transition(&mut self, now: Instant) {
+        let Some(pending) = self.pending.clone().filter(|pending| now >= pending.due_at) else {
+            return;
+        };
+        self.state = pending.state.to_string();
+        self.modified_at_ms = pending.due_at_ms;
+        self.pending = None;
+    }
+
+    /// `status`: the roll-up of the connector's `checks`, which identify "connectivity
+    /// health". A failed check is `FAILED`; a connector no check has yet run on, or
+    /// one that is not `ACTIVE` so its checks cannot have run, is `UNKNOWN`; anything
+    /// else is `PASSED`.
+    ///
+    /// Nothing in this emulator probes an appliance, so `checks` is empty and this
+    /// reports `UNKNOWN`: `PASSED` would claim a reachability check nothing performed.
+    pub fn status(&self) -> &'static str {
+        if self
+            .checks
+            .iter()
+            .any(|check| check.result.as_deref() == Some(CHECK_FAILED))
+        {
+            CHECK_FAILED
+        } else if self.checks.is_empty() || self.state != CONNECTOR_ACTIVE {
+            CHECK_UNKNOWN
+        } else {
+            CHECK_PASSED
+        }
+    }
+
+    /// This connector as the modelled `Connector` shape, reported for the environment
+    /// that holds it.
+    pub fn to_wire(&self, environment_id: &str) -> Connector {
+        Connector {
+            environment_id: Some(environment_id.to_string()),
+            connector_id: Some(self.connector_id.clone()),
+            r#type: Some(self.connector_type.clone()),
+            appliance_fqdn: Some(self.appliance_fqdn.clone()),
+            secret_arn: Some(self.secret_arn.clone()),
+            state: Some(self.state.clone()),
+            state_details: self.state_details.clone(),
+            status: Some(self.status().to_string()),
+            checks: (!self.checks.is_empty()).then(|| self.checks.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            modified_at: Some(timestamp(self.modified_at_ms)),
         }
     }
 }
@@ -426,6 +607,15 @@ pub struct StoredEnvironment {
     /// [`entitlement_key`]. A `BTreeMap` so `ListVmEntitlements` has one stable order
     /// to page over, and bounded by [`MAX_ENTITLEMENTS_PER_ENVIRONMENT`].
     pub entitlements: BTreeMap<String, StoredEntitlement>,
+    /// The connectors created in this environment, keyed by `connectorId`. A
+    /// `BTreeMap` so `ListEnvironmentConnectors` has one stable order to page over.
+    ///
+    /// Bounded by the connector rule itself rather than by a cap of its own: at most
+    /// one LIVE connector of each `ConnectorType` exists per environment ("You can
+    /// create only one connector of each type per environment",
+    /// `CreateEnvironmentConnector` doc), so the map holds at most as many live
+    /// records as the model declares types.
+    pub connectors: BTreeMap<String, StoredConnector>,
     /// The lifecycle transition the clock owes this environment, if any.
     pub pending: Option<PendingTransition>,
 }
@@ -452,10 +642,14 @@ impl StoredEnvironment {
         for entitlement in self.entitlements.values_mut() {
             entitlement.materialise_due_transition(now);
         }
+        // A connector runs on its own clock for the same reason.
+        for connector in self.connectors.values_mut() {
+            connector.materialise_due_transition(now);
+        }
     }
 
-    /// The earliest instant at which this environment, or one of its entitlements,
-    /// still owes a change — `None` when nothing is owed.
+    /// The earliest instant at which this environment, or one of its entitlements or
+    /// connectors, still owes a change — `None` when nothing is owed.
     pub fn next_transition_at(&self) -> Option<Instant> {
         self.pending
             .iter()
@@ -464,6 +658,12 @@ impl StoredEnvironment {
                 self.entitlements
                     .values()
                     .filter_map(|entitlement| entitlement.pending.as_ref())
+                    .map(|pending| pending.due_at),
+            )
+            .chain(
+                self.connectors
+                    .values()
+                    .filter_map(|connector| connector.pending.as_ref())
                     .map(|pending| pending.due_at),
             )
             .min()
@@ -609,6 +809,15 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
         let seed = self.next_seed();
         let value = (self.id_salt ^ seed) & 0xFF_FFFF_FFFF;
         format!("env-{value:010x}")
+    }
+
+    /// Mint a `connectorId`: `cnctr-` + exactly ten lowercase hex characters, which
+    /// satisfies the modelled `^(cnctr-[a-zA-Z0-9]{10})$`. Distinct seeds XOR to
+    /// distinct 40-bit values, so no two connectors can collide.
+    pub fn mint_connector_id(&mut self) -> String {
+        let seed = self.next_seed();
+        let value = (self.id_salt ^ seed) & 0xFF_FFFF_FFFF;
+        format!("cnctr-{value:010x}")
     }
 
     /// Mint a subnet id: `subnet-` + exactly 17 lowercase hex characters, the long
@@ -807,6 +1016,21 @@ fn is_region_token(region: &str) -> bool {
 /// the modelled `Arn` pattern spells it.
 pub fn environment_arn(region: &str, environment_id: &str) -> String {
     ::engine::emulator_arn("evs", region, &format!("environment/{environment_id}"))
+}
+
+/// The live connector of `connector_type` this environment holds, if any: the record
+/// "You can create only one connector of each type per environment"
+/// (`CreateEnvironmentConnector` doc) allows at most one of.
+///
+/// A connector that has reached `DELETED` does not count, exactly as a deleted
+/// environment does not hold its name: the type is free for a new connector again.
+pub fn live_connector_of_type<'a>(
+    environment: &'a StoredEnvironment,
+    connector_type: &str,
+) -> Option<&'a StoredConnector> {
+    environment.connectors.values().find(|connector| {
+        connector.connector_type == connector_type && connector.state != CONNECTOR_DELETED
+    })
 }
 
 /// The largest page a `@paginated` operation of this service returns when the caller

@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEnvironmentConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEnvironmentConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reconfigures one stored connector of a stored Amazon EVS environment and reports
+//! the record it wrote, which [`crate::ops::list_environment_connectors`] reads back.
+//! An `environmentId` this service holds no live environment for in the request's
+//! Region, or a `connectorId` that environment holds no live connector for, is a
+//! `ResourceNotFoundException`, and nothing is written for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEnvironmentConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "You can update the Amazon Web Services Secrets Manager secret ARN or the appliance
+//! FQDN to reconfigure the connector metadata. You cannot update both the secret and
+//! the FQDN in the same request." So the request names EXACTLY ONE of
+//! `applianceFqdn` and `secretIdentifier`: both is the refusal that sentence spells,
+//! and neither leaves nothing to reconfigure. Either way the answer is the operation's
+//! modelled `ValidationException`, which is also the only client-input error it
+//! declares for a rule no single member can carry.
+//!
+//! A connector whose metadata really changes goes `UPDATING` and the clock owes it the
+//! move back to `ACTIVE`: the new appliance FQDN or secret has to be connected with
+//! before the connector is active again. A request that asks for the value the
+//! connector already carries changes nothing — the operation is `@idempotent`
+//! (`smithy_query(query="operation",operation="UpdateEnvironmentConnector")`), so
+//! repeating it neither restarts the connector nor moves its `modifiedAt`.
 //!
 //! ## Shape of an operation
 //!
@@ -104,12 +115,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `UpdateEnvironmentConnectorError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#UpdateEnvironmentConnector")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#UpdateEnvironmentConnector",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum UpdateEnvironmentConnectorErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -163,18 +180,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEnvironmentConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEnvironmentConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEnvironmentConnector"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateEnvironmentConnectorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "The Amazon EVS environment store is unavailable.".to_string(),
+                },
+            )
+        })?;
+        // `clientToken` is read and ignored on purpose: "This parameter is not used in
+        // Amazon EVS currently. If you supply input for this parameter, it will have no
+        // effect." (`clientToken` doc). The operation is idempotent through the stored
+        // record instead — an update to the value the connector already carries is no
+        // change at all.
+        let _ = &input.client_token;
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut state = state.lock();
+        // Reporting only: this materialises the state changes the clock already owed,
+        // which were due whether or not anybody called, so the connector is in the
+        // state that is due at this instant before the update is applied.
+        state.materialise_due_transitions();
+
+        // Regional resource: an environment exists at the endpoint of the Region it was
+        // created in, so its connectors can only be updated from that Region. An
+        // environment or connector that has reached DELETED is gone as far as an update
+        // is concerned: "The resource might not be specified correctly, or it may have a
+        // state of DELETED" (`ResourceNotFoundException` doc).
+        let environment = state
+            .environment_in_region_mut(&region, &input.environment_id)
+            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .ok_or_else(|| {
+                UpdateEnvironmentConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
+        let environment_id = environment.environment_id.clone();
+        let connector = environment
+            .connectors
+            .get_mut(&input.connector_id)
+            .filter(|connector| connector.state != crate::state::CONNECTOR_DELETED)
+            .ok_or_else(|| {
+                UpdateEnvironmentConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::connector_not_found(&input.connector_id),
+                )
+            })?;
+
+        // "You cannot update both the secret and the FQDN in the same request", and a
+        // request naming neither asks for no new metadata: exactly one of the two
+        // reconfigures the connector.
+        let requested = match (
+            input.appliance_fqdn.as_deref(),
+            input.secret_identifier.as_deref(),
+        ) {
+            (Some(appliance_fqdn), None) => Requested::ApplianceFqdn(appliance_fqdn),
+            (None, Some(secret_identifier)) => Requested::SecretIdentifier(secret_identifier),
+            (Some(_), Some(_)) => {
+                return Err(UpdateEnvironmentConnectorErrorModeled::ValidationException(
+                    crate::state::request_validation_error(
+                        "applianceFqdn and secretIdentifier cannot both be updated in the same \
+                         request",
+                    ),
+                )
+                .into());
+            }
+            (None, None) => {
+                return Err(UpdateEnvironmentConnectorErrorModeled::ValidationException(
+                    crate::state::request_validation_error(
+                        "one of applianceFqdn or secretIdentifier must be supplied to update a \
+                         connector",
+                    ),
+                )
+                .into());
+            }
+        };
+
+        // The reconfiguration itself. A value the connector already carries is NOT a
+        // change: the record keeps its state and its modifiedAt, so repeating the call
+        // neither restarts the connector nor moves a stamp.
+        let changed = match requested {
+            Requested::ApplianceFqdn(appliance_fqdn) => {
+                let changed = connector.appliance_fqdn != appliance_fqdn;
+                connector.appliance_fqdn = appliance_fqdn.to_string();
+                changed
+            }
+            Requested::SecretIdentifier(secret_identifier) => {
+                let changed = connector.secret_arn != secret_identifier;
+                connector.secret_arn = secret_identifier.to_string();
+                changed
+            }
+        };
+        let due_at = if changed {
+            // The new appliance FQDN or secret has to be connected with before the
+            // connector is active again, so it is UPDATING and the clock owes it the
+            // move back to ACTIVE.
+            let pending =
+                crate::state::PendingConnectorState::starting_now(crate::state::CONNECTOR_ACTIVE);
+            connector.state = crate::state::CONNECTOR_UPDATING.to_string();
+            connector.modified_at_ms = crate::state::now_ms();
+            let due_at = pending.due_at;
+            connector.pending = Some(pending);
+            Some(due_at)
+        } else {
+            None
+        };
+        let updated = connector.to_wire(&environment_id);
+        if let Some(due_at) = due_at {
+            state.note_transition_due(due_at);
+        }
+
+        Ok(UpdateEnvironmentConnectorOutput {
+            connector: Some(updated),
+        })
     }
+}
+
+/// The ONE piece of connector metadata a request reconfigures: "You can update the
+/// Amazon Web Services Secrets Manager secret ARN or the appliance FQDN … You cannot
+/// update both the secret and the FQDN in the same request."
+enum Requested<'a> {
+    /// `applianceFqdn`: the new FQDN of the VCF appliance.
+    ApplianceFqdn(&'a str),
+    /// `secretIdentifier`: the new ARN or name of the credential secret.
+    SecretIdentifier(&'a str),
 }
