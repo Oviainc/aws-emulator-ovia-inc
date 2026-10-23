@@ -153,8 +153,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(
                 InternalServerException {
-                    message: "the gameliftstreams emulator holds no state on this engine"
-                        .to_string(),
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
                 },
             )
             .into());
@@ -174,10 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(tags) = state.tags_of_mut(&input.resource_arn) else {
             return Err(TagResourceErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
+                    message: crate::state::with_internal_id(format!(
                         "no Amazon GameLift Streams resource matches ResourceArn {}",
                         input.resource_arn
-                    ),
+                    )),
                 },
             )
             .into());
@@ -192,12 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if merged > crate::state::TAGS_PER_RESOURCE {
             return Err(TagResourceErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
+                    message: crate::state::with_internal_id(format!(
                         "Tags would take resource {} to {merged} tags, past the maximum \
                          of {} tags per resource",
                         input.resource_arn,
                         crate::state::TAGS_PER_RESOURCE
-                    ),
+                    )),
                 },
             )
             .into());

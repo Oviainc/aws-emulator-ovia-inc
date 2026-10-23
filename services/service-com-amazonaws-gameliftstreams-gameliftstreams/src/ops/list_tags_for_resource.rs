@@ -151,8 +151,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServerException(
                 InternalServerException {
-                    message: "the gameliftstreams emulator holds no state on this engine"
-                        .to_string(),
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
                 },
             )
             .into());
@@ -170,10 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(tags) = state.tags_of(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
+                    message: crate::state::with_internal_id(format!(
                         "no Amazon GameLift Streams resource matches ResourceArn {}",
                         input.resource_arn
-                    ),
+                    )),
                 },
             )
             .into());

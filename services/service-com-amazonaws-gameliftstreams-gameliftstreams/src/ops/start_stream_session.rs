@@ -347,17 +347,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let region = crate::state::region_of(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartStreamSessionErrorModeled::InternalServerException(
                 InternalServerException {
-                    message: "the gameliftstreams emulator holds no state on this engine"
-                        .to_string(),
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
                 },
             )
             .into());
         };
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::region_of(ctx.parts());
         let mut state = state.lock();
         state.materialize(now);
 
@@ -375,9 +376,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let group_id = group.id.clone();
 
-        // A replayed `ClientToken` answers with the session the first request
-        // created.
-        let replayed = state.replayed(Self::NAME, input.client_token.as_deref());
+        // The parameters this request's `ClientToken` stands for: a second request
+        // carrying it answers with the session the first one started when they
+        // match, and is refused when they do not.
+        let requested_locations = input.locations.clone().unwrap_or_default();
+        let launch_args = input.additional_launch_args.clone().unwrap_or_default();
+        let environment = input
+            .additional_environment_variables
+            .clone()
+            .unwrap_or_default();
+        let mut fingerprint = crate::state::Fingerprint::new();
+        fingerprint.text("Identifier", &group_id);
+        fingerprint.text("Protocol", &input.protocol);
+        fingerprint.text("SignalRequest", &input.signal_request);
+        fingerprint.text("ApplicationIdentifier", &input.application_identifier);
+        fingerprint.optional("Description", input.description.as_deref());
+        fingerprint.optional("UserId", input.user_id.as_deref());
+        fingerprint.list("Locations", &requested_locations);
+        fingerprint.number("ConnectionTimeoutSeconds", input.connection_timeout_seconds);
+        fingerprint.number("SessionLengthSeconds", input.session_length_seconds);
+        fingerprint.list("AdditionalLaunchArgs", &launch_args);
+        fingerprint.map("AdditionalEnvironmentVariables", &environment);
+        fingerprint.optional(
+            "PerformanceStatsConfiguration.SharedWithClient",
+            input
+                .performance_stats_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.shared_with_client)
+                .map(|shared| shared.to_string())
+                .as_deref(),
+        );
+        fingerprint.optional("RoleArn", input.role_arn.as_deref());
+        fingerprint.optional(
+            "DisplayConfiguration.Resolution",
+            input
+                .display_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.resolution.as_ref())
+                .map(|resolution| format!("{}x{}", resolution.width, resolution.height))
+                .as_deref(),
+        );
+        let fingerprint = fingerprint.finish();
+
+        let replayed = match state.client_token_use(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+        ) {
+            crate::state::TokenUse::Fresh => None,
+            crate::state::TokenUse::Replay(session_id) => Some(session_id),
+            crate::state::TokenUse::Conflict => {
+                return Err(StartStreamSessionErrorModeled::ConflictException(
+                    ConflictException {
+                        message: crate::state::client_token_conflict(),
+                    },
+                )
+                .into());
+            }
+        };
         let replayed = replayed.filter(|session_id| {
             state.stream_groups[&group_id]
                 .sessions
@@ -395,11 +451,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !group.can_host_sessions() {
                     return Err(StartStreamSessionErrorModeled::ConflictException(
                         ConflictException {
-                            message: format!(
+                            message: crate::state::with_internal_id(format!(
                                 "stream group {} is in {} status; a stream session can only \
                                  start in a stream group that is ready to host streams",
                                 group.id, group.status
-                            ),
+                            )),
                         },
                     )
                     .into());
@@ -425,10 +481,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !group.associated_applications.contains(&application_arn) {
                     return Err(StartStreamSessionErrorModeled::ValidationException(
                         ValidationException {
-                            message: format!(
+                            message: crate::state::with_internal_id(format!(
                                 "application {} is not associated with stream group {}",
                                 input.application_identifier, group.id
-                            ),
+                            )),
                         },
                     )
                     .into());
@@ -440,7 +496,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `Locations`, the group's own first available location hosts the
                 // stream. A location that is still being prepared is not available:
                 // "ACTIVATING: ... You cannot stream from ... this location yet."
-                let requested = input.locations.clone().unwrap_or_default();
+                // (`requested_locations` is the same list, read before the
+                // `ClientToken` fingerprint above covered it.)
+                let requested = requested_locations.clone();
                 let location = if requested.is_empty() {
                     group
                         .locations
@@ -456,7 +514,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(location) = location else {
                     return Err(StartStreamSessionErrorModeled::ValidationException(
                         ValidationException {
-                            message: if requested.is_empty() {
+                            message: crate::state::with_internal_id(if requested.is_empty() {
                                 format!(
                                     "stream group {} has no location that can host a stream \
                                      session",
@@ -469,7 +527,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                     group.id,
                                     requested.join(", ")
                                 )
-                            },
+                            }),
                         },
                     )
                     .into());
@@ -488,10 +546,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     if width % 2 != 0 || height % 2 != 0 {
                         return Err(StartStreamSessionErrorModeled::ValidationException(
                             ValidationException {
-                                message: format!(
+                                message: crate::state::with_internal_id(format!(
                                     "DisplayConfiguration.Resolution must have an even Width \
                                      and Height, got {width}x{height}"
-                                ),
+                                )),
                             },
                         )
                         .into());
@@ -499,10 +557,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     if i64::from(width) * i64::from(height) > MAX_RESOLUTION_PIXELS {
                         return Err(StartStreamSessionErrorModeled::ValidationException(
                             ValidationException {
-                                message: format!(
+                                message: crate::state::with_internal_id(format!(
                                     "DisplayConfiguration.Resolution must not exceed \
                                      {MAX_RESOLUTION_PIXELS} pixels, got {width}x{height}"
-                                ),
+                                )),
                             },
                         )
                         .into());
@@ -520,12 +578,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !group.make_room_for_a_session() {
                     return Err(StartStreamSessionErrorModeled::ConflictException(
                         ConflictException {
-                            message: format!(
+                            message: crate::state::with_internal_id(format!(
                                 "stream group {} is already running the maximum of {} stream \
                                  sessions; terminate one before starting another",
                                 group_id,
                                 crate::state::SESSIONS_PER_STREAM_GROUP
-                            ),
+                            )),
                         },
                     )
                     .into());
@@ -568,7 +626,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .get_mut(&group_id)
                     .expect("the stream group was resolved above");
                 group.sessions.insert(session_id.clone(), session);
-                state.remember(Self::NAME, input.client_token.as_deref(), &session_id);
+                state.remember(
+                    Self::NAME,
+                    input.client_token.as_deref(),
+                    &session_id,
+                    &fingerprint,
+                );
                 session_id
             }
         };
