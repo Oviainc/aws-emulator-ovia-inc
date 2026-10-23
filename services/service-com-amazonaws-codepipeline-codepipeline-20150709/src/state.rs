@@ -139,6 +139,21 @@ pub const JOB_STATUS_SUCCEEDED: &str = "Succeeded";
 /// outcome yet, so no result can be reported for it.
 pub const JOB_STATUS_QUEUED: &str = "Queued";
 
+/// The `JobStatus` value a job carries once a job worker has reported failure for
+/// it, from the same enum. Terminal, like [`JOB_STATUS_SUCCEEDED`].
+pub const JOB_STATUS_FAILED: &str = "Failed";
+
+/// The `JobStatus` value a job carries once its worker's window to report an outcome
+/// has run out, from the same enum. Terminal.
+pub const JOB_STATUS_TIMED_OUT: &str = "TimedOut";
+
+/// The `JobStatus` values whose work has ENDED: a job in one of them is being worked
+/// on by nobody, so no worker can acknowledge it and no outcome can be reported for
+/// it any more. The other four values of the enum are the stages of a job that is
+/// still live (`Created`, `Queued`, `Dispatched`, `InProgress`).
+pub const TERMINAL_JOB_STATUSES: [&str; 3] =
+    [JOB_STATUS_SUCCEEDED, JOB_STATUS_FAILED, JOB_STATUS_TIMED_OUT];
+
 /// The `ExecutionType` of an execution that runs the pipeline forward, from the
 /// model's enum (`smithy_query query="shape" shape="ExecutionType"` -> `STANDARD`,
 /// `ROLLBACK`).
@@ -2159,6 +2174,13 @@ pub struct ThirdPartyJobRecord {
     /// job and its details"). `ClientToken` carries no modelled pattern, so this is
     /// an opaque value minted with the job.
     pub client_token: String,
+    /// The job's current `Nonce`: "a system-generated random number that CodePipeline
+    /// uses to ensure that the job is being worked on by only one job worker"
+    /// (`AcknowledgeThirdPartyJob$nonce`), which a worker reads off
+    /// `GetThirdPartyJobDetails` and presents to `AcknowledgeThirdPartyJob`. Minted
+    /// with the job and well inside `Nonce`'s modelled 1..50 length, so a queued job
+    /// always has exactly one value that admits a worker to it.
+    pub nonce: String,
     /// A `JobStatus` value: where the job is between being queued and a worker
     /// reporting its outcome.
     pub status: String,
@@ -2185,12 +2207,21 @@ impl ThirdPartyJobRecord {
     /// The job starts at [`JOB_STATUS_QUEUED`]: it is waiting for a worker, and no
     /// worker owns its outcome until one acknowledges it. The `clientToken` half of
     /// the pair is minted here, so a queued job always has the one token that
-    /// reaches it.
+    /// reaches it, and so is the `nonce` that admits one worker to it.
+    ///
+    /// Both come from [`random_uuid_v4`], whose bits are hash-seed material rather
+    /// than a CSPRNG's: they are FIXTURE-GRADE values that make one queued job's
+    /// token and nonce distinct from another's, not a secret an attacker is kept out
+    /// by. Nothing in this emulator is protected by them — the store is in-memory and
+    /// per-process, and a real worker credential is minted by the emulator's
+    /// credential store, never here — so the `clientToken`/`nonce` check they feed is
+    /// the service's modelled behaviour, not an authorization boundary.
     pub fn new(job_id: impl Into<String>, client_id: impl Into<String>) -> Self {
         Self {
             job_id: job_id.into(),
             client_id: client_id.into(),
             client_token: random_uuid_v4(),
+            nonce: random_uuid_v4(),
             status: JOB_STATUS_QUEUED.to_string(),
             continuation_token: None,
             current_revision: None,
@@ -2215,6 +2246,35 @@ impl ThirdPartyJobRecord {
     /// `Failed`, `TimedOut`) has an outcome that cannot be replaced.
     pub fn accepts_result(&self) -> bool {
         self.status == JOB_STATUS_IN_PROGRESS
+    }
+
+    /// Whether this job's work has ended ([`TERMINAL_JOB_STATUSES`]).
+    pub fn is_terminal(&self) -> bool {
+        TERMINAL_JOB_STATUSES.contains(&self.status.as_str())
+    }
+
+    /// Whether `nonce` is the value that admits a worker to this job.
+    ///
+    /// The job's current nonce, and only while the job is still live: the nonce is
+    /// there to "ensure that the job is being worked on by only one job worker", and a
+    /// job whose work has ended is being worked on by none, so no nonce admits it.
+    pub fn admits_nonce(&self, nonce: &str) -> bool {
+        !self.is_terminal() && self.nonce == nonce
+    }
+
+    /// Record that a job worker has confirmed receipt of this job, which is what
+    /// `AcknowledgeThirdPartyJob` does: the job is now being worked on, so it carries
+    /// [`JOB_STATUS_IN_PROGRESS`] and its outcome is that worker's to report
+    /// ([`Self::accepts_result`]).
+    ///
+    /// Idempotent: the worker holding the nonce may repeat the acknowledgement, and a
+    /// job already `InProgress` stays exactly where it is — including the instant it
+    /// last changed, since nothing about it changed.
+    pub fn acknowledge(&mut self, now: SystemTime) {
+        if self.status != JOB_STATUS_IN_PROGRESS {
+            self.status = JOB_STATUS_IN_PROGRESS.to_string();
+            self.last_status_change = now;
+        }
     }
 
     /// Record a worker's successful result: the job reaches
@@ -2455,6 +2515,20 @@ pub fn run_order(action: &ActionDeclaration) -> i32 {
     action.run_order.unwrap_or(DEFAULT_RUN_ORDER)
 }
 
+/// The most bytes one resolved configuration value may grow to before the
+/// configuration is reported as having no resolved form.
+///
+/// Substitution is a SINGLE pass over the stored text ([`substitute_variables`]), so
+/// the resolved value is bounded by the stored value's own modelled maximum
+/// (`ActionConfigurationValue`, len 1..1000) times the longest replacement one
+/// reference can carry (`PipelineVariableValue`, len 1..1000) — this product. Every
+/// configuration AWS's own constraints allow therefore resolves, while the budget is
+/// still checked as the text is built, so the allocation one request can drive is
+/// bounded by a stated figure rather than by that arithmetic holding. Past it the
+/// configuration has no resolved form, exactly as an unresolvable reference leaves it
+/// with none.
+pub const MAX_RESOLVED_CONFIGURATION_VALUE_BYTES: usize = 1_000 * 1_000;
+
 /// `configuration` with every pipeline-variable reference replaced by the value this
 /// execution resolved for that variable, or `None` when a reference is left that this
 /// emulator cannot resolve.
@@ -2466,31 +2540,76 @@ pub fn run_order(action: &ActionDeclaration) -> i32 {
 /// so they are substituted here.
 ///
 /// Every other namespace is an ACTION's: its values are the output variables the
-/// action produced, and nothing in this emulator runs an action. A configuration still
-/// carrying a reference after substitution therefore has no resolved form at all, and
+/// action produced, and nothing in this emulator runs an action. A reference in the
+/// STORED configuration that this emulator cannot resolve therefore leaves the
+/// configuration with no resolved form at all, and
 /// `ActionExecutionInput$resolvedConfiguration` is reported absent rather than
 /// half-resolved. A configuration with no reference in it resolves to itself.
+///
+/// The resolved variables are indexed by name ONCE and each value is then resolved in
+/// a single pass, so resolution is linear in the configuration's size — not one
+/// `String::replace` over the accumulating text per declared variable, which re-scans
+/// what the previous substitution produced and lets a request-supplied value that
+/// looks like a reference expand transitively. A replacement's OWN text is therefore
+/// never read as a reference: a variable whose resolved value is itself `#{...}` text
+/// is substituted literally, so the reported `resolvedConfiguration` can carry that
+/// text even though no reference of the stored configuration was left unresolved.
 fn resolved_configuration(
     configuration: &HashMap<String, String>,
     variables: &[ResolvedPipelineVariable],
 ) -> Option<HashMap<String, String>> {
+    let by_name: HashMap<&str, &str> = variables
+        .iter()
+        .filter_map(|variable| {
+            Some((
+                variable.name.as_deref()?,
+                variable.resolved_value.as_deref()?,
+            ))
+        })
+        .collect();
+
     let mut resolved = HashMap::with_capacity(configuration.len());
     for (key, value) in configuration {
-        let mut value = value.clone();
-        for variable in variables {
-            let (Some(name), Some(resolved_value)) =
-                (variable.name.as_deref(), variable.resolved_value.as_deref())
-            else {
-                continue;
-            };
-            value = value.replace(&format!("#{{variables.{name}}}"), resolved_value);
-        }
-        if value.contains("#{") {
-            return None;
-        }
-        resolved.insert(key.clone(), value);
+        resolved.insert(key.clone(), substitute_variables(value, &by_name)?);
     }
     Some(resolved)
+}
+
+/// `value` with every `#{variables.<name>}` reference replaced by `by_name`'s entry
+/// for that name, in ONE pass over `value`.
+///
+/// `None` — the configuration has no resolved form — when a reference is not one this
+/// emulator can resolve (an unterminated `#{`, a namespace other than `variables`, or
+/// a name this execution resolved no value for) or when the resolved text would pass
+/// [`MAX_RESOLVED_CONFIGURATION_VALUE_BYTES`].
+///
+/// A replacement is never re-scanned: a variable whose value is itself `#{...}` text
+/// is substituted literally, the way a single-pass substitution does, so no chain of
+/// references can amplify one request into unbounded allocation.
+fn substitute_variables(value: &str, by_name: &HashMap<&str, &str>) -> Option<String> {
+    /// The namespace a pipeline-level variable's references carry.
+    const VARIABLES_NAMESPACE: &str = "variables.";
+
+    let mut resolved = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("#{") {
+        let (before, reference) = (&rest[..start], &rest[start + 2..]);
+        let end = reference.find('}')?;
+        let name = reference[..end].strip_prefix(VARIABLES_NAMESPACE)?;
+        let substitution = *by_name.get(name)?;
+        if resolved.len() + before.len() + substitution.len()
+            > MAX_RESOLVED_CONFIGURATION_VALUE_BYTES
+        {
+            return None;
+        }
+        resolved.push_str(before);
+        resolved.push_str(substitution);
+        rest = &reference[end + 1..];
+    }
+    (resolved.len() + rest.len() <= MAX_RESOLVED_CONFIGURATION_VALUE_BYTES).then(|| {
+        resolved.push_str(rest);
+        resolved
+    })
 }
 
 /// `Some(list)` unless the list is empty, in which case the member is absent —
@@ -2504,11 +2623,16 @@ fn optional_list<T>(list: Vec<T>) -> Option<Vec<T>> {
 ///
 /// The bits come from `RandomState`, the standard library's OS-seeded hash-seed
 /// source: each `RandomState::new()` carries its own keys, so hashing through two of
-/// them yields 128 bits that no caller can predict or repeat, with no random-number
-/// dependency. The version and variant nibbles are then set as RFC 4122 requires, so
-/// the value is a well-formed v4 UUID rather than an arbitrary hex string. An
-/// execution id names an execution for correlation and is not a credential, so a
-/// non-cryptographic source is the right one.
+/// them yields 128 bits that are distinct per value with no random-number dependency.
+/// They are NOT cryptographically strong — std advances its per-thread seed
+/// deterministically, so values minted in sequence are correlated rather than
+/// independent. The version and variant nibbles are then set as RFC 4122 requires, so
+/// the value is a well-formed v4 UUID rather than an arbitrary hex string. Every value
+/// minted here names something for correlation (an execution, a job, a webhook URL,
+/// the fixture-grade `clientToken`/`nonce` of a queued job) and none of them is a
+/// credential this emulator protects anything with, so a non-cryptographic source is
+/// the right one; a credential a caller is given is minted by the emulator's
+/// credential store instead.
 pub fn random_uuid_v4() -> String {
     use ::std::collections::hash_map::RandomState;
     use ::std::fmt::Write as _;

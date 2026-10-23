@@ -53,7 +53,10 @@ fn bogus_execution_ids() -> Vec<String> {
 
 /// An engine and a client over it, so this suite can write the executions the handler
 /// reads.
-fn client_and_engine() -> (Client, Arc<engine::InMemoryEngine>) {
+///
+/// `pub(crate)` so the `execution_listing` suite seeds the SAME store through the SAME
+/// harness instead of growing a second copy of it.
+pub(crate) fn client_and_engine() -> (Client, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     (Client::with_engine(Arc::clone(&engine)), engine)
 }
@@ -70,7 +73,10 @@ async fn create_export(client: &Client, index: usize) -> String {
 
 /// Record one execution of `export_arn` in the store, with the status code
 /// `EXECUTION_STATUS_CODE_VALUES[status]`, and return the `(id, status)` it recorded.
-fn record_execution(
+///
+/// `pub(crate)` for the reason [`client_and_engine`] is: `ListExecutions`'s suite pages
+/// over the executions this records.
+pub(crate) fn record_execution(
     engine: &Arc<engine::InMemoryEngine>,
     export_arn: &str,
     execution_id: &str,

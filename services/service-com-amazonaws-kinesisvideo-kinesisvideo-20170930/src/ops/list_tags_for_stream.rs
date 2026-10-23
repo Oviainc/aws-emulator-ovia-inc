@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -145,7 +136,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for ListTagsForStream<Eng>
 {
     type Input = ListTagsForStreamInput;
-    type Output = ListTagsForStreamOutput;
+    type Output = ListTagsForStreamReport;
     type Error = ListTagsForStreamError;
 
     const NAME: &'static str = "ListTagsForStream";
@@ -158,18 +149,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForStream"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForStreamErrorModeled::ClientLimitExceededException(
+                ClientLimitExceededException {
+                    message: Some("The stream store is unavailable. Try again later.".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // This listing is never truncated, so it issues no resume token and a
+        // non-empty one cannot have come from it. A stream carries at most
+        // `MAX_TAGS_PER_RESOURCE` tags and the modeled `Tags` map holds exactly that
+        // many, so every tag fits in one response and `NextToken` is always absent
+        // from it. An EMPTY token is the modeled "start from the beginning" value
+        // (`NextToken` has a minimum length of 0) and is accepted as such.
+        if input.next_token.as_deref().is_some_and(|token| !token.is_empty()) {
+            return Err(ListTagsForStreamErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(
+                        "The NextToken provided is not valid: a stream's tags are returned \
+                         in a single, untruncated page."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        store.settle_clock();
+
+        let stream = store
+            .resolve(input.stream_name.as_deref(), input.stream_arn.as_deref())
+            .map_err(lookup_error)?;
+
+        Ok(ListTagsForStreamReport::of(ListTagsForStreamOutput {
+            tags: Some(
+                stream
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            // Never truncated, so there is no next page to resume from; the member
+            // still reaches the wire, as JSON `null` (see [`ListTagsForStreamReport`]).
+            next_token: None,
+        }))
     }
+}
+
+/// State the failure to resolve a `StreamName`/`StreamARN` pair as this operation's
+/// own modeled error: absent or contradictory identifiers are a bad argument (400),
+/// a well-formed identifier for no stored stream is a missing resource (404).
+fn lookup_error(error: crate::state::StreamLookupError) -> ListTagsForStreamError {
+    match error {
+        crate::state::StreamLookupError::NoIdentifier => {
+            ListTagsForStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some("Either StreamName or StreamARN must be specified.".to_string()),
+            })
+        }
+        crate::state::StreamLookupError::Mismatch => {
+            ListTagsForStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some("StreamName and StreamARN refer to different streams.".to_string()),
+            })
+        }
+        crate::state::StreamLookupError::NotFound => {
+            ListTagsForStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some("The requested stream is not found or not active.".to_string()),
+            })
+        }
+    }
+    .into()
 }
