@@ -154,9 +154,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         DescribeDeliveryChannelsErrorModeled::NoSuchDeliveryChannelException(
                             NoSuchDeliveryChannelException {
-                                message: Some(format!(
-                                    "there is no delivery channel named '{name}'"
-                                )),
+                                message: Some(
+                                    crate::state::no_such_delivery_channel_message(name),
+                                ),
                             },
                         )
                         .into(),

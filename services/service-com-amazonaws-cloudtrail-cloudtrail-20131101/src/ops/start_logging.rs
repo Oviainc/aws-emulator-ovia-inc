@@ -244,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TrailForMutation::Absent => {
                 Err(StartLoggingErrorModeled::TrailNotFoundException(
                     TrailNotFoundException {
-                        message: Some(format!("Unknown trail: {}", input.name)),
+                        message: Some(crate::state::unknown_trail_message(&input.name)),
                     },
                 )
                 .into())

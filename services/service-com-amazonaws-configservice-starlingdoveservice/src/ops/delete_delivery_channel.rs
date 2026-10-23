@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteDeliveryChannelErrorModeled::NoSuchDeliveryChannelException(
                     NoSuchDeliveryChannelException {
-                        message: Some(format!("there is no delivery channel named '{name}'")),
+                        message: Some(crate::state::no_such_delivery_channel_message(&name)),
                     },
                 )
                 .into(),
@@ -174,10 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteDeliveryChannelErrorModeled::LastDeliveryChannelDeleteFailedException(
                     LastDeliveryChannelDeleteFailedException {
-                        message: Some(format!(
-                            "the delivery channel '{name}' cannot be deleted because the \
-                             customer managed configuration recorder is running"
-                        )),
+                        message: Some(
+                            crate::state::last_delivery_channel_delete_failed_message(&name),
+                        ),
                     },
                 )
                 .into(),

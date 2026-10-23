@@ -17,13 +17,15 @@
 //! requested name the same way, so the fold cannot make a resource unreachable.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use crate::ops::types::{
     Column, Crawler, CrawlerTargets, CreateCrawlerInput, Database, DataLakePrincipal,
-    DatabaseIdentifier, DatabaseInput, FederatedDatabase, FederatedTable,
-    LakeFormationConfiguration, LineageConfiguration, PrincipalPermissions, RecrawlPolicy, Schedule,
-    SchemaChangePolicy, StorageDescriptor, Table, TableIdentifier, TableInput,
+    DatabaseIdentifier, DatabaseInput, ErrorDetail, FederatedDatabase, FederatedTable,
+    LakeFormationConfiguration, LineageConfiguration, PrincipalPermissions, RecrawlPolicy,
+    RLSProperties, Schedule, SchemaChangePolicy, StorageDescriptor, Table, TableIdentifier,
+    TableInput,
 };
 
 /// Ceiling on the databases one catalog may hold.
@@ -105,7 +107,84 @@ pub fn default_create_table_default_permissions() -> Vec<PrincipalPermissions> {
             data_lake_principal_identifier: Some(IAM_ALLOWED_PRINCIPALS.to_string()),
         }),
         permissions: Some(vec![PERMISSION_ALL.to_string()]),
+        // Stamped by the read projection, not stored: see
+        // [`tagged_principal_permissions`].
+        __type: None,
     }]
+}
+
+/// The `__type` tag the Data Catalog writes onto a nested `PrincipalPermissions`.
+///
+/// The Data Catalog's awsJson1.1 serializer tags the nested structures it returns with a
+/// type discriminator whose value is the structure's own Smithy shape name, unqualified,
+/// so a client that dispatches on the tag can identify the entry. The two structures the
+/// recorded wire traffic shows tagged are `PrincipalPermissions` (inside
+/// `Database$CreateTableDefaultPermissions`) and [`ERROR_DETAIL_TYPE_TAG`]'s
+/// `ErrorDetail`; the tag is therefore keyed on the SHAPE, which is why each constant is
+/// spelled exactly like the shape it tags.
+pub const PRINCIPAL_PERMISSIONS_TYPE_TAG: &str = "PrincipalPermissions";
+
+/// The `__type` tag the Data Catalog writes onto a nested `ErrorDetail`. See
+/// [`PRINCIPAL_PERMISSIONS_TYPE_TAG`] for the rule.
+pub const ERROR_DETAIL_TYPE_TAG: &str = "ErrorDetail";
+
+/// A stored grant as the catalog REPORTS it: the stored members plus the `__type` tag.
+///
+/// The tag belongs to the projection, not to the record: a client may send
+/// `CreateTableDefaultPermissions` with or without a tag of its own, and the catalog
+/// answers with its own either way — so the tag is stamped here on the way out rather
+/// than carried over from whatever the request happened to contain.
+pub fn tagged_principal_permissions(stored: &PrincipalPermissions) -> PrincipalPermissions {
+    PrincipalPermissions {
+        __type: Some(PRINCIPAL_PERMISSIONS_TYPE_TAG.to_string()),
+        ..stored.clone()
+    }
+}
+
+/// A per-item `ErrorDetail` the way the Data Catalog reports one: the error's code and
+/// message, plus the `__type` tag ([`ERROR_DETAIL_TYPE_TAG`]).
+///
+/// Every batch operation that reports a per-item failure builds its `ErrorDetail` here,
+/// so the tag cannot be present on one operation's entries and absent from another's.
+pub fn catalog_error_detail(error_code: &str, error_message: String) -> ErrorDetail {
+    ErrorDetail {
+        error_code: Some(error_code.to_string()),
+        error_message: Some(error_message),
+        __type: Some(ERROR_DETAIL_TYPE_TAG.to_string()),
+    }
+}
+
+/// How many database ids this process has minted.
+///
+/// Not catalog state — the id itself is what gets stored, on the [`DatabaseEntry`]. This
+/// is only a nonce source for [`new_database_id`], so that two creates landing in the
+/// same nanosecond are still given different input to mint from.
+static MINTED_DATABASE_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh `DatabaseId`: the opaque id the catalog assigns a database when it is
+/// created.
+///
+/// 32 lowercase hexadecimal characters, i.e. 128 bits, which is the shape a
+/// catalog-assigned Data Catalog id has on the wire. The bits come from three sources:
+/// the OS-seeded randomness a `RandomState` draws, the system clock in nanoseconds, and
+/// [`MINTED_DATABASE_IDS`] — so two creates in the same nanosecond cannot be minted from
+/// the same input. It is minted once, at create, and stored on the [`DatabaseEntry`], so
+/// every later read of that database — and every table in it — reports the same id, and
+/// two databases never share one.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_database_id() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+
+    let sequence = MINTED_DATABASE_IDS.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let high = RandomState::new().hash_one((sequence, nanos));
+    let low = RandomState::new().hash_one((nanos, sequence));
+    format!("{high:016x}{low:016x}")
 }
 
 /// Per-service state for com-amazonaws-glue-awsglue. A handler reaches it through [`service_state`].
@@ -196,6 +275,12 @@ pub struct DatabaseEntry {
     pub target_database: Option<DatabaseIdentifier>,
     pub federated_database: Option<FederatedDatabase>,
     pub catalog_id: String,
+    /// The opaque id the catalog assigned this database at create
+    /// ([`new_database_id`]). Server-set and written once, so every later read of this
+    /// database reports the same id and the tables it holds report it too — an update
+    /// that renames the database does not change it, because it identifies the
+    /// database rather than naming it.
+    pub database_id: String,
     /// Server-set, written once at create so every later read reports the same instant.
     pub create_time: SystemTime,
     pub tags: HashMap<String, String>,
@@ -231,6 +316,7 @@ impl DatabaseEntry {
             target_database: input.target_database.clone(),
             federated_database: input.federated_database.clone(),
             catalog_id: catalog_id.to_string(),
+            database_id: new_database_id(),
             create_time: now,
             tags: tags.cloned().unwrap_or_default(),
             tables: HashMap::new(),
@@ -245,10 +331,22 @@ impl DatabaseEntry {
             location_uri: self.location_uri.clone(),
             parameters: self.parameters.clone(),
             create_time: Some(to_date_time(self.create_time)),
-            create_table_default_permissions: Some(self.create_table_default_permissions.clone()),
+            create_table_default_permissions: Some(
+                self.create_table_default_permissions
+                    .iter()
+                    .map(tagged_principal_permissions)
+                    .collect(),
+            ),
             target_database: self.target_database.clone(),
             catalog_id: Some(self.catalog_id.clone()),
             federated_database: self.federated_database.clone(),
+            // The catalog attributes every database it returns to the catalog that owns
+            // it and to the id it assigned the database, both reported DEFINITELY: a
+            // client builds an ARN or correlates the database across Lake Formation and
+            // Athena from these, so an absent member would leave it with nothing to key
+            // on. Both come from what is stored, so repeated reads agree.
+            catalog_identifier: Some(self.catalog_id.clone()),
+            database_id: Some(self.database_id.clone()),
         }
     }
 
@@ -403,7 +501,18 @@ impl TableEntry {
     }
 
     /// Rebuild the modelled `Table` output shape from what is stored.
-    pub fn to_table(&self) -> Table {
+    ///
+    /// `database_id` is the catalog-assigned id of the database this table belongs to,
+    /// read from that [`DatabaseEntry`] by the caller rather than copied onto the table:
+    /// the id belongs to the database, so there is one place it is stored and the table
+    /// read cannot report an id that has drifted from the database read's.
+    pub fn to_table(&self, database_id: &str) -> Table {
+        // `Table$RLSProperties` is "the default row-level security policy of the table".
+        // No stored table carries one, because no `TableInput` can set one — so the
+        // catalog holds no row filter for any table it serves. Bound once here, because
+        // `IsRowFilteringEnabled` below is derived from it: the flag says exactly whether
+        // such a policy is in force, so the two can never report different things.
+        let rls_properties: Option<RLSProperties> = None;
         Table {
             name: self.name.clone(),
             database_name: Some(self.database_name.clone()),
@@ -441,7 +550,18 @@ impl TableEntry {
             is_materialized_view: Some(false),
             iceberg_table_metadata: None,
             status: None,
-            rls_properties: None,
+            // The catalog attributes every table it returns to the catalog that owns it
+            // and to the database that holds it, by the ids it assigned them — the same
+            // `DatabaseId` the database's own read reports, so the two responses agree.
+            catalog_identifier: Some(self.catalog_id.clone()),
+            database_id: Some(database_id.to_string()),
+            // Row filtering is on exactly when the catalog holds a row-level security
+            // policy for the table, so the flag is derived from `rls_properties` rather
+            // than restated: `false` for every stored table today, and DEFINITELY false
+            // rather than omitted, so a client that distinguishes "no filter" from
+            // "unknown" reads the first — which is what the catalog knows.
+            is_row_filtering_enabled: Some(rls_properties.is_some()),
+            rls_properties,
         }
     }
 }
