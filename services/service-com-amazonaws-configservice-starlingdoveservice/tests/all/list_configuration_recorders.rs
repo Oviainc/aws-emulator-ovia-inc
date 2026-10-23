@@ -23,8 +23,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_configservice_starlingdoveservice::state::{
-    mint_recorder_id, recorder_arn, service_state, RecorderEntry, RECORDING_SCOPE_INTERNAL,
-    RECORDING_SCOPE_PAID,
+    mint_recorder_id, recorder_arn, service_state, RecorderEntry, TagSet,
+    RECORDING_SCOPE_INTERNAL, RECORDING_SCOPE_PAID,
 };
 
 use crate::config_setup_and_rule_loop::{recorder_request, Emulator, ROLE_ARN};
@@ -109,7 +109,7 @@ fn seed(emulator: &Emulator, seeds: &[Seed]) -> Vec<Value> {
                 recording_scope: Some(seed.recording_scope.clone()),
                 service_principal: seed.service_principal.clone(),
                 provider: seed.provider.clone(),
-                tags: Vec::new(),
+                tags: TagSet::new(),
             },
         );
 
