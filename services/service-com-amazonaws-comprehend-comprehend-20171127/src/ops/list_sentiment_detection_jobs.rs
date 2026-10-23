@@ -5,6 +5,9 @@
 //! IMPLEMENTED. Enumerates the persisted job records in the order the filter's own
 //! documentation states, honours the filter, truncates at `MaxResults` and hands
 //! back an opaque `NextToken` that resumes exactly after the last job on the page.
+//! Selection, ordering and paging are
+//! [`crate::state::ComAmazonawsComprehendComprehend20171127State::analysis_job_page`],
+//! shared with every other family's `List*DetectionJobs`.
 //!
 //! ## Shape of an operation
 //!
@@ -76,93 +79,10 @@ use super::types::*;
 
 use std::time::SystemTime;
 
-use crate::state::{datetime_parts, epoch_parts, AnalysisJob, JobFamily};
+use crate::state::{JobFamily, JobFilterParts, DEFAULT_JOB_PAGE_SIZE, MAX_JOB_PAGE_SIZE};
 
 /// The family this operation enumerates.
 const FAMILY: JobFamily = JobFamily::SentimentDetection;
-
-/// The page size used when the request sets no `MaxResults`.
-///
-/// From the modelled member documentation of
-/// `ListSentimentDetectionJobsRequest$MaxResults`: "The maximum number of results
-/// to return in each page. The default is 100."
-const DEFAULT_MAX_RESULTS: usize = 100;
-
-/// The ceiling a page is clamped to: the modelled `MaxResults` maximum (`@range`
-/// 1..500), so one request can never render an unbounded number of records into one
-/// response even if a value reaches here outside that range.
-const MAX_RESULTS_CEILING: usize = 500;
-
-/// Does `job` satisfy `filter`?
-///
-/// Each set member narrows the list the way its own documentation states: `JobName`
-/// and `JobStatus` match exactly, and the submit-time bounds are read strictly —
-/// "submitted before"/"submitted after" exclude a job submitted at the bound
-/// itself, which the model leaves unstated.
-fn matches(job: &AnalysisJob, filter: &SentimentDetectionJobFilter) -> bool {
-    if let Some(name) = filter.job_name.as_ref() {
-        if job.job_name.as_deref() != Some(name.as_str()) {
-            return false;
-        }
-    }
-    if let Some(status) = filter.job_status.as_ref() {
-        if &job.job_status != status {
-            return false;
-        }
-    }
-    let submitted = epoch_parts(job.submit_time);
-    if let Some(before) = filter.submit_time_before.as_ref() {
-        if submitted >= datetime_parts(before) {
-            return false;
-        }
-    }
-    if let Some(after) = filter.submit_time_after.as_ref() {
-        if submitted <= datetime_parts(after) {
-            return false;
-        }
-    }
-    true
-}
-
-/// How many of `filter`'s members are set.
-///
-/// The operation documents "You can only set one filter at a time", so more than
-/// one is refused with the `InvalidFilterException` it declares.
-fn filters_set(filter: &SentimentDetectionJobFilter) -> usize {
-    usize::from(filter.job_name.is_some())
-        + usize::from(filter.job_status.is_some())
-        + usize::from(filter.submit_time_before.is_some())
-        + usize::from(filter.submit_time_after.is_some())
-}
-
-/// Does this filter ask for newest-to-oldest?
-///
-/// The model states the order per filter member, and the two submit-time members
-/// state OPPOSITE orders: `SubmitTimeBefore` is "Jobs are returned in ascending
-/// order, oldest to newest" and `SubmitTimeAfter` is "Jobs are returned in
-/// descending order, newest to oldest". Only one filter may be set at a time, so
-/// the order each page is served in is unambiguous: `SubmitTimeAfter` reverses it,
-/// every other request keeps the ascending default.
-fn newest_first(filter: &SentimentDetectionJobFilter) -> bool {
-    filter.submit_time_after.is_some()
-}
-
-/// Render the page cursor that resumes after the job with submission sequence
-/// `seq`, in whichever direction the page was served. Opaque to the caller: the
-/// sequence number is not a member of any modelled shape.
-fn encode_token(seq: u64) -> String {
-    hex::encode(seq.to_be_bytes())
-}
-
-/// Read back a cursor produced by [`encode_token`]; `None` when the string is not
-/// of that form. The caller also checks that the sequence number it carries is one
-/// this service has minted, so a well-formed string naming no page it ever issued
-/// is refused too.
-fn decode_token(token: &str) -> Option<u64> {
-    let bytes = hex::decode(token).ok()?;
-    let bytes: [u8; 8] = bytes.try_into().ok()?;
-    Some(u64::from_be_bytes(bytes))
-}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -246,8 +166,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let filter = input.filter.unwrap_or_default();
-        if filters_set(&filter) > 1 {
+        let requested = input.filter.unwrap_or_default();
+        let filter = JobFilterParts {
+            job_name: requested.job_name.as_deref(),
+            job_status: requested.job_status.as_deref(),
+            submit_time_before: requested.submit_time_before.as_ref(),
+            submit_time_after: requested.submit_time_after.as_ref(),
+        };
+        // "You can only set one filter at a time", so more than one is refused with
+        // the `InvalidFilterException` this operation declares.
+        if filter.count_set() > 1 {
             return Err(ListSentimentDetectionJobsErrorModeled::InvalidFilterException(
                 InvalidFilterException {
                     message: Some(
@@ -265,79 +193,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = input
             .max_results
             .and_then(|max| usize::try_from(max).ok())
-            .unwrap_or(DEFAULT_MAX_RESULTS)
-            .clamp(1, MAX_RESULTS_CEILING);
+            .unwrap_or(DEFAULT_JOB_PAGE_SIZE)
+            .clamp(1, MAX_JOB_PAGE_SIZE);
 
         let now = SystemTime::now();
         let mut store = state.lock();
 
-        // A cursor is a submission sequence number this service has actually
-        // minted, so a well-formed string that names no page it ever issued —
-        // zero, or a sequence past the newest submission — is refused rather than
-        // silently read as "from the beginning".
-        let descending = newest_first(&filter);
-        let cursor = match input.next_token.as_deref() {
-            // No cursor: start outside the whole range, at whichever end this
-            // page's order begins from.
-            None => {
-                if descending {
-                    u64::MAX
-                } else {
-                    0
-                }
-            }
-            Some(token) => decode_token(token)
-                .filter(|seq| (1..=store.job_id_seq).contains(seq))
-                .ok_or_else(|| {
-                    ListSentimentDetectionJobsErrorModeled::InvalidRequestException(
-                        InvalidRequestException {
-                            message: Some(
-                                "NextToken is not a token this service issued.".to_string(),
-                            ),
-                            reason: None,
-                            detail: None,
-                        },
-                    )
-                })?,
-        };
+        // Materialise the status changes the clock already owed FIRST, so the
+        // cursor, the selection and the status the page reports — the one
+        // `Filter.JobStatus` selects on — all read one settled view of the store at
+        // `now`.
+        store.settle_analysis_jobs(FAMILY, now);
 
-        // Materialise the status changes the clock already owed, so the status the
-        // page reports — and the one `Filter.JobStatus` selects on — is the status
-        // each job already had at `now`.
-        for ((family, _), job) in store.analysis_jobs.iter_mut() {
-            if *family == FAMILY {
-                job.settle(now);
-            }
-        }
+        let cursor = store
+            .job_page_cursor(input.next_token.as_deref(), filter.newest_first())
+            .ok_or_else(|| {
+                ListSentimentDetectionJobsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some("NextToken is not a token this service issued.".to_string()),
+                        reason: None,
+                        detail: None,
+                    },
+                )
+            })?;
 
-        // The order the filter's own documentation states (see `newest_first`),
-        // over submission order, which is what the record's sequence number is.
-        // `sort_by_key` is load-bearing: the store is keyed by `JobId`, whose order
-        // is not submission order.
-        let mut selected: Vec<&AnalysisJob> = store
-            .analysis_jobs
-            .iter()
-            .filter(|((family, _), _)| *family == FAMILY)
-            .map(|(_, job)| job)
-            .filter(|job| {
-                let past_cursor = if descending {
-                    job.seq < cursor
-                } else {
-                    job.seq > cursor
-                };
-                past_cursor && matches(job, &filter)
-            })
-            .collect();
-        selected.sort_by_key(|job| job.seq);
-        if descending {
-            selected.reverse();
-        }
-
-        let page: Vec<&AnalysisJob> = selected.iter().copied().take(page_size).collect();
-        let next_token = match page.last() {
-            Some(last) if selected.len() > page.len() => Some(encode_token(last.seq)),
-            _ => None,
-        };
+        let (page, next_token) = store.analysis_job_page(FAMILY, &filter, cursor, page_size);
 
         Ok(ListSentimentDetectionJobsOutput {
             sentiment_detection_job_properties_list: Some(
@@ -349,3 +229,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+

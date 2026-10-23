@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListKeyPhrasesDetectionJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListKeyPhrasesDetectionJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListKeyPhrasesDetectionJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Enumerates the persisted key-phrases job records in the order the
+//! filter's own documentation states, honours the filter, truncates at `MaxResults`
+//! and hands back an opaque `NextToken` that resumes exactly after the last job on
+//! the page. Selection, ordering and paging are
+//! [`crate::state::ComAmazonawsComprehendComprehend20171127State::analysis_job_page`],
+//! shared with every other family's `List*DetectionJobs`.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +76,13 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::{JobFamily, JobFilterParts, DEFAULT_JOB_PAGE_SIZE, MAX_JOB_PAGE_SIZE};
+
+/// The family this operation enumerates.
+const FAMILY: JobFamily = JobFamily::KeyPhrasesDetection;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,18 +155,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListKeyPhrasesDetectionJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListKeyPhrasesDetectionJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListKeyPhrasesDetectionJobs"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListKeyPhrasesDetectionJobsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The service store is unavailable. Retry your request.".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let requested = input.filter.unwrap_or_default();
+        let filter = JobFilterParts {
+            job_name: requested.job_name.as_deref(),
+            job_status: requested.job_status.as_deref(),
+            submit_time_before: requested.submit_time_before.as_ref(),
+            submit_time_after: requested.submit_time_after.as_ref(),
+        };
+        // "You can only set one filter at a time", so more than one is refused with
+        // the `InvalidFilterException` this operation declares.
+        if filter.count_set() > 1 {
+            return Err(
+                ListKeyPhrasesDetectionJobsErrorModeled::InvalidFilterException(
+                    InvalidFilterException {
+                        message: Some(
+                            "Only one filter can be set at a time. Specify a different filter."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The modelled `@range` of 1..500 is enforced at the boundary, so a value
+        // that reaches here is already inside it; the clamp keeps the page bounded
+        // regardless.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(DEFAULT_JOB_PAGE_SIZE)
+            .clamp(1, MAX_JOB_PAGE_SIZE);
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+
+        // Materialise the status changes the clock already owed FIRST, so the
+        // cursor, the selection and the status the page reports — the one
+        // `Filter.JobStatus` selects on — all read one settled view of the store at
+        // `now`.
+        store.settle_analysis_jobs(FAMILY, now);
+
+        let cursor = store
+            .job_page_cursor(input.next_token.as_deref(), filter.newest_first())
+            .ok_or_else(|| {
+                ListKeyPhrasesDetectionJobsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some("NextToken is not a token this service issued.".to_string()),
+                        reason: None,
+                        detail: None,
+                    },
+                )
+            })?;
+
+        let (page, next_token) = store.analysis_job_page(FAMILY, &filter, cursor, page_size);
+
+        Ok(ListKeyPhrasesDetectionJobsOutput {
+            key_phrases_detection_job_properties_list: Some(
+                page.iter()
+                    .map(|job| job.key_phrases_detection_job_properties())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

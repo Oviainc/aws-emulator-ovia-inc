@@ -44,9 +44,18 @@
 //! * `classifier_idempotency_tokens` — an entry is dropped together with the
 //!   classifier it points at, so this index cannot outgrow `document_classifiers`.
 //!
-//! `ops::list_sentiment_detection_jobs` and `ops::list_document_classifiers` bound
-//! the RESPONSE the same way, with their `DEFAULT_MAX_RESULTS` and the modelled
-//! `MaxResults` ceiling.
+//! Every analysis-job `List*DetectionJobs` bounds the RESPONSE the same way, with
+//! [`DEFAULT_JOB_PAGE_SIZE`] and the modelled [`MAX_JOB_PAGE_SIZE`] ceiling, and
+//! `ops::list_document_classifiers` does the same with its own `DEFAULT_MAX_RESULTS`.
+//!
+//! ## Enumerating a family's jobs
+//!
+//! [`JobFilterParts`] is the ONE reading of the filter members every family's
+//! `List*DetectionJobs` shares, and
+//! [`ComAmazonawsComprehendComprehend20171127State::analysis_job_page`] is the ONE
+//! place selection, ordering and paging over [`AnalysisJob`] records happen, so no
+//! two families can disagree about any of them. Its cursor is a submission sequence
+//! number, rendered opaque by [`encode_job_page_token`].
 //!
 //! ## Custom models
 //!
@@ -1002,6 +1011,113 @@ pub fn document_classifier_arn(region: &str, name: &str, version_name: Option<&s
     ::emulator_server::emulator_arn("comprehend", region, &resource)
 }
 
+/// How many job records a `List*DetectionJobs` page carries when the request sets
+/// no `MaxResults`.
+///
+/// From the modelled `MaxResults` documentation every analysis-job `List*` request
+/// shares: "The maximum number of results to return in each page. The default is
+/// 100."
+pub const DEFAULT_JOB_PAGE_SIZE: usize = 100;
+
+/// The ceiling a `List*DetectionJobs` page is clamped to: the modelled `MaxResults`
+/// maximum (`@range` 1..500), so one request can never render an unbounded number of
+/// records into one response even if a value reaches a handler outside that range.
+pub const MAX_JOB_PAGE_SIZE: usize = 500;
+
+/// One `List*DetectionJobs` request's filter, lifted out of the family's own
+/// modelled filter shape.
+///
+/// Comprehend models a separate filter structure per job family, and every one of
+/// them declares the same four members with the same documented meaning — `JobName`,
+/// `JobStatus`, `SubmitTimeBefore`, `SubmitTimeAfter` — so the selection and the
+/// ordering rules live here ONCE rather than once per family's handler, exactly as
+/// `job_properties_projections!` holds the record -> properties projection once. A
+/// family's handler borrows its own filter shape's members into this struct and
+/// nothing else.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct JobFilterParts<'a> {
+    pub job_name: Option<&'a str>,
+    pub job_status: Option<&'a str>,
+    pub submit_time_before: Option<&'a ::aws_smithy_types::DateTime>,
+    pub submit_time_after: Option<&'a ::aws_smithy_types::DateTime>,
+}
+
+impl JobFilterParts<'_> {
+    /// How many of this filter's members are set.
+    ///
+    /// Every `List*DetectionJobs` operation documents "You can only set one filter
+    /// at a time", so a handler refuses more than one with the
+    /// `InvalidFilterException` its model declares.
+    pub fn count_set(&self) -> usize {
+        usize::from(self.job_name.is_some())
+            + usize::from(self.job_status.is_some())
+            + usize::from(self.submit_time_before.is_some())
+            + usize::from(self.submit_time_after.is_some())
+    }
+
+    /// Does this filter ask for newest-to-oldest?
+    ///
+    /// The model states the order per filter member, and the two submit-time members
+    /// state OPPOSITE orders: `SubmitTimeBefore` is "Jobs are returned in ascending
+    /// order, oldest to newest" and `SubmitTimeAfter` is "Jobs are returned in
+    /// descending order, newest to oldest". Only one filter may be set at a time, so
+    /// the order each page is served in is unambiguous: `SubmitTimeAfter` reverses
+    /// it, every other request keeps the ascending default.
+    pub fn newest_first(&self) -> bool {
+        self.submit_time_after.is_some()
+    }
+
+    /// Does `job` satisfy this filter?
+    ///
+    /// Each set member narrows the list the way its own documentation states:
+    /// `JobName` and `JobStatus` match exactly, and the submit-time bounds are read
+    /// strictly — "submitted before"/"submitted after" exclude a job submitted at
+    /// the bound itself, which the model leaves unstated.
+    pub fn matches(&self, job: &AnalysisJob) -> bool {
+        if let Some(name) = self.job_name {
+            if job.job_name.as_deref() != Some(name) {
+                return false;
+            }
+        }
+        if let Some(status) = self.job_status {
+            if job.job_status != status {
+                return false;
+            }
+        }
+        let submitted = epoch_parts(job.submit_time);
+        if let Some(before) = self.submit_time_before {
+            if submitted >= datetime_parts(before) {
+                return false;
+            }
+        }
+        if let Some(after) = self.submit_time_after {
+            if submitted <= datetime_parts(after) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Render the page cursor that resumes after the job with submission sequence `seq`,
+/// in whichever direction the page was served. Opaque to the caller: the sequence
+/// number is not a member of any modelled shape.
+pub fn encode_job_page_token(seq: u64) -> String {
+    hex::encode(seq.to_be_bytes())
+}
+
+/// Read back a cursor produced by [`encode_job_page_token`]; `None` when the string
+/// is not of that form.
+///
+/// [`ComAmazonawsComprehendComprehend20171127State::job_page_cursor`] also checks
+/// that the sequence number it carries is one this service has minted, so a
+/// well-formed string naming no page it ever issued is refused too.
+pub fn decode_job_page_token(token: &str) -> Option<u64> {
+    let bytes = hex::decode(token).ok()?;
+    let bytes: [u8; 8] = bytes.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
+}
+
 /// Per-service state for com-amazonaws-comprehend-comprehend-20171127. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsComprehendComprehend20171127State {
@@ -1143,6 +1259,85 @@ impl ComAmazonawsComprehendComprehend20171127State {
                 }
             }
         }
+    }
+
+    /// Materialise the clock-owed status change of every job of `family`.
+    ///
+    /// The sweep a reporting operation over a whole family performs before it
+    /// reports: the transitions were due at `now` whether or not anybody called, so
+    /// applying them on read reports the status each job already had rather than
+    /// advancing it. Bounded by [`MAX_ANALYSIS_JOB_RECORDS`], like the store itself.
+    pub fn settle_analysis_jobs(&mut self, family: JobFamily, now: SystemTime) {
+        for ((job_family, _), job) in self.analysis_jobs.iter_mut() {
+            if *job_family == family {
+                job.settle(now);
+            }
+        }
+    }
+
+    /// Where a `List*DetectionJobs` page starts: the submission sequence number the
+    /// page is served AFTER.
+    ///
+    /// `None` means `token` is not a cursor this service issued, which the caller
+    /// refuses with the `InvalidRequestException` its model declares: a cursor is a
+    /// submission sequence number this service has actually minted, so a well-formed
+    /// string that names no page it ever issued — zero, or a sequence past the newest
+    /// submission — is refused rather than silently read as "from the beginning".
+    /// A request carrying NO token starts outside the whole range, at whichever end
+    /// the page's order (`newest_first`) begins from.
+    pub fn job_page_cursor(&self, token: Option<&str>, newest_first: bool) -> Option<u64> {
+        match token {
+            None => Some(if newest_first { u64::MAX } else { 0 }),
+            Some(token) => {
+                decode_job_page_token(token).filter(|seq| (1..=self.job_id_seq).contains(seq))
+            }
+        }
+    }
+
+    /// One page of `family`'s jobs: the records `filter` selects that lie past
+    /// `cursor`, in the order the filter's own documentation states, truncated to
+    /// `page_size`, together with the cursor that resumes after the last of them
+    /// (`None` when this page is the last).
+    ///
+    /// The ONE place a family's `List*DetectionJobs` selection, ordering and paging
+    /// happen, so no two families can disagree about them. Call
+    /// [`Self::settle_analysis_jobs`] first: the status this reports — and the one
+    /// `Filter.JobStatus` selects on — is then the status each job already had.
+    pub fn analysis_job_page(
+        &self,
+        family: JobFamily,
+        filter: &JobFilterParts<'_>,
+        cursor: u64,
+        page_size: usize,
+    ) -> (Vec<&AnalysisJob>, Option<String>) {
+        let descending = filter.newest_first();
+        // `sort_by_key` is load-bearing: the store is keyed by `JobId`, whose order
+        // is not submission order, and a job's `seq` is its submission order.
+        let mut selected: Vec<&AnalysisJob> = self
+            .analysis_jobs
+            .iter()
+            .filter(|((job_family, _), _)| *job_family == family)
+            .map(|(_, job)| job)
+            .filter(|job| {
+                let past_cursor = if descending {
+                    job.seq < cursor
+                } else {
+                    job.seq > cursor
+                };
+                past_cursor && filter.matches(job)
+            })
+            .collect();
+        selected.sort_by_key(|job| job.seq);
+        if descending {
+            selected.reverse();
+        }
+
+        let page: Vec<&AnalysisJob> = selected.iter().copied().take(page_size).collect();
+        let next_token = match page.last() {
+            Some(last) if selected.len() > page.len() => Some(encode_job_page_token(last.seq)),
+            _ => None,
+        };
+        (page, next_token)
     }
 
     /// Mint the next classifier creation sequence number.
