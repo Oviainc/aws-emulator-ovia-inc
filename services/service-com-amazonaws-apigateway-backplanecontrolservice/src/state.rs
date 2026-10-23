@@ -1088,6 +1088,24 @@ pub fn non_empty_map<V>(
     map.filter(|entries| !entries.is_empty())
 }
 
+/// A stored caller-supplied map as the shared map-patch helpers take it: the modelled
+/// shapes carry `HashMap`s that are absent when empty, while a patch is applied to a
+/// `BTreeMap` that is present-or-empty, so this is the one place the two spellings meet.
+pub fn ordered_map<V>(
+    stored: Option<::std::collections::HashMap<String, V>>,
+) -> BTreeMap<String, V> {
+    stored.unwrap_or_default().into_iter().collect()
+}
+
+/// The inverse of [`ordered_map`]: a patched map as it is STORED and reported — absent
+/// once its last entry is removed, which is what [`non_empty_map`] means by an empty
+/// caller-supplied map.
+pub fn stored_map<V>(
+    patched: BTreeMap<String, V>,
+) -> Option<::std::collections::HashMap<String, V>> {
+    non_empty_map(Some(patched.into_iter().collect()))
+}
+
 /// One page of an ordered id sequence, as a `position`/`limit` paginated collection
 /// reports it.
 #[derive(Debug, Clone)]
@@ -1413,6 +1431,17 @@ pub fn parse_patches(
     operations.iter().map(Patch::parse).collect()
 }
 
+/// The map key a patch names, refused when it is longer than a stored key may be.
+///
+/// `depth` is how many reference tokens the map member itself takes, so the key is what
+/// the path carries beyond it. One copy for every handler that patches a map member, so
+/// two of them cannot disagree about how a key is read or how long one may be.
+pub fn bounded_map_key(patch: &Patch, depth: usize) -> Result<String, PatchFailure> {
+    let key = patch.map_key(depth)?;
+    bound_chars(&patch.path, &key, MAX_STRING_CHARS).map_err(PatchFailure::BadRequest)?;
+    Ok(key)
+}
+
 /// Apply `patch` to a single-valued OPTIONAL string member.
 ///
 /// `add` and `replace` set it to the op's value — `value` is "applicable for the add or
@@ -1495,6 +1524,22 @@ pub fn patch_bool(current: &mut bool, patch: &Patch) -> Result<(), PatchFailure>
     Ok(())
 }
 
+/// Apply `patch` to an integer member bounded by `range` that always has a value: `add`
+/// and `replace` set it, and `remove` is refused, because a member declared with a
+/// default is never absent from the record.
+pub fn patch_i32(
+    current: &mut i32,
+    patch: &Patch,
+    range: ::std::ops::RangeInclusive<i32>,
+) -> Result<(), PatchFailure> {
+    patch.require_single_valued()?;
+    match patch.op {
+        PatchOpKind::Add | PatchOpKind::Replace => *current = patch.require_i32_in(range)?,
+        _ => return Err(patch.unsupported_op()),
+    }
+    Ok(())
+}
+
 /// Apply `patch` to a nullable integer member bounded by `range`; `remove` clears it.
 pub fn patch_optional_i32(
     current: &mut Option<i32>,
@@ -1539,16 +1584,21 @@ pub fn patch_string_set(
 
 /// Apply `patch` to a map member whose values are strings: `add` and `replace` set
 /// `key` to the op's value, `remove` drops the key.
+///
+/// `max_chars` bounds one entry's VALUE, which differs by member — a mapping template is
+/// far longer than a model name — so each caller passes the bound its own member carries,
+/// the same one the create operation for that member enforces.
 pub fn patch_string_map(
     current: &mut BTreeMap<String, String>,
     patch: &Patch,
     key: String,
     max_entries: usize,
+    max_chars: usize,
 ) -> Result<(), PatchFailure> {
     match patch.op {
         PatchOpKind::Add | PatchOpKind::Replace => {
             let value = patch.require_value()?;
-            bound_chars(&patch.path, value, MAX_STRING_CHARS).map_err(PatchFailure::BadRequest)?;
+            bound_chars(&patch.path, value, max_chars).map_err(PatchFailure::BadRequest)?;
             if !current.contains_key(&key) {
                 bound_entries(&patch.path, current.len() + 1, max_entries)
                     .map_err(PatchFailure::BadRequest)?;

@@ -185,6 +185,7 @@ fn apply_patch(entry: &mut MethodEntry, patch: &Patch) -> Result<(), PatchFailur
                 patch,
                 content_type,
                 MAX_COLLECTION_ENTRIES,
+                MAX_STRING_CHARS,
             )
         }
         _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
