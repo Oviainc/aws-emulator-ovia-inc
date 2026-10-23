@@ -9,7 +9,9 @@
 //! if the export was updated since" — smithy_query shape `GetExecutionResponse`, member
 //! `Export`) — and otherwise answers the modelled `ResourceNotFoundException` (at the
 //! status this service answers the not-found condition with,
-//! `export_lifecycle::NOT_FOUND_STATUS`):
+//! `export_lifecycle::NOT_FOUND_STATUS`), reporting the EXECUTION as absent — the resource
+//! it addresses — while the modelled `ResourceId` / `ResourceType` name whichever
+//! identifier resolved to nothing:
 //! for an `ExportArn` that names no export, and for an `ExecutionId` that names no
 //! execution OF THAT export. It never answers an error the operation does not model, and
 //! reading an execution changes nothing a later caller sees. `ListExecutions` reports the
@@ -37,7 +39,7 @@ use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports:
     ExecutionStatus, EXECUTION_STATUS_CODE_VALUES,
 };
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::{
-    StoredExecution, EXPORT_NOT_FOUND_MESSAGE,
+    StoredExecution, EXECUTION_NOT_FOUND_MESSAGE,
 };
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState as State;
 
@@ -147,7 +149,7 @@ async fn an_execution_id_that_names_nothing_is_a_modelled_not_found() {
                 body["ResourceType"].as_str(),
             ),
             (
-                Some(EXPORT_NOT_FOUND_MESSAGE),
+                Some(EXECUTION_NOT_FOUND_MESSAGE),
                 Some(id.as_str()),
                 Some("Execution"),
             ),
@@ -155,7 +157,9 @@ async fn an_execution_id_that_names_nothing_is_a_modelled_not_found() {
         );
     }
 
-    // An ARN that names no export is a not-found about the EXPORT, reported as such.
+    // An ARN that names no export leaves the pair naming no execution, so the refusal is
+    // worded as the absent EXECUTION while its members name the ARN that resolved to
+    // nothing.
     let absent = ::engine::emulator_arn("bcm-data-exports", "us-east-1", "export/never_created");
     let (status, body) = client
         .call(
@@ -167,16 +171,18 @@ async fn an_execution_id_that_names_nothing_is_a_modelled_not_found() {
         (
             status,
             error_code(&body).as_str(),
+            body["Message"].as_str(),
             body["ResourceId"].as_str(),
             body["ResourceType"].as_str(),
         ),
         (
             NOT_FOUND_STATUS,
             "ResourceNotFoundException",
+            Some(EXECUTION_NOT_FOUND_MESSAGE),
             Some(absent.as_str()),
             Some("Export"),
         ),
-        "an ARN naming no export must be reported as the absent export, got {body}"
+        "an ARN naming no export must report the execution as absent while naming the ARN, got {body}"
     );
 }
 
