@@ -140,6 +140,23 @@ pub const GLOSSARY_STATUS_DISABLED: &str = "DISABLED";
 /// revisioned resource carries: DataZone numbers revisions from 1, as a decimal string.
 pub const FIRST_REVISION: &str = "1";
 
+/// [`FIRST_REVISION`] as the number a revision map is keyed by: revisions are numbered
+/// from 1 and [`FIRST_REVISION`] is that number rendered, so the two are defined
+/// together here rather than one being parsed out of the other.
+pub const FIRST_REVISION_NUMBER: u32 = 1;
+
+/// The revision number a modelled `Revision` string addresses, when it addresses one.
+///
+/// Addressing is EXACT: a revision is addressed by the decimal number the call that
+/// recorded it returned, so only the canonical decimal resolves and `"01"` or `"+1"`
+/// name no revision. The one rule every revisioned resource in this store applies
+/// ([`Asset::revision`], [`FormType::revision`], [`Listing::revision`]), so they cannot
+/// read one revision string differently.
+pub fn revision_number(revision: &str) -> Option<u32> {
+    let number = revision.parse::<u32>().ok()?;
+    (number.to_string() == revision).then_some(number)
+}
+
 /// The `ListingStatus` members (model enum `com.amazonaws.datazone#ListingStatus`:
 /// CREATING | ACTIVE | INACTIVE).
 pub const LISTING_STATUS_CREATING: &str = "CREATING";
@@ -298,9 +315,14 @@ impl Domain {
             self.assets
                 .values()
                 .find(|asset| {
+                    // EVERY recorded revision counts: a revision is a record this store
+                    // still serves (`GetAsset` reads one by number), so a form type one
+                    // of them binds is still in use even when the newest revision
+                    // dropped the form.
                     asset
-                        .forms
-                        .iter()
+                        .revisions
+                        .values()
+                        .flat_map(|revision| revision.forms.iter())
                         .any(|form| form.type_name.as_deref().is_some_and(binds_it))
                 })
                 .map(|asset| DeletionBlocker {
@@ -399,16 +421,10 @@ impl Listing {
         self.revisions.values().next_back()
     }
 
-    /// The revision addressed by a `listingRevision` string, which is the decimal
-    /// number the change set that recorded it returned. Addressing is exact: only the
-    /// canonical decimal resolves, so `"01"` and `"+1"` name no revision — the same
-    /// rule [`FormType::revision`] applies.
+    /// The revision addressed by a `listingRevision` string, by the rule
+    /// [`revision_number`] states.
     pub fn revision(&self, revision: &str) -> Option<&ListingRevision> {
-        let number = revision.parse::<u32>().ok()?;
-        if number.to_string() != revision {
-            return None;
-        }
-        self.revisions.get(&number)
+        self.revisions.get(&revision_number(revision)?)
     }
 
     /// The number the NEXT recorded revision gets: one past the greatest ever recorded,
@@ -661,16 +677,10 @@ impl FormType {
         self.revisions.values().next_back()
     }
 
-    /// The revision addressed by a `revision` string, which is the decimal number the
-    /// create that minted it returned. Addressing is exact: only the canonical decimal
-    /// resolves, so `"01"` and `"+1"` name no revision. `None` when this form type has
-    /// no such revision.
+    /// The revision addressed by a `revision` string, by the rule [`revision_number`]
+    /// states. `None` when this form type has no such revision.
     pub fn revision(&self, revision: &str) -> Option<&FormTypeRevision> {
-        let number = revision.parse::<u32>().ok()?;
-        if number.to_string() != revision {
-            return None;
-        }
-        self.revisions.get(&number)
+        self.revisions.get(&revision_number(revision)?)
     }
 }
 
@@ -920,34 +930,170 @@ pub fn membership_from_request(
     ))
 }
 
-/// One stored DataZone catalog asset.
+/// One stored DataZone catalog asset: the identity the catalog addresses it by, plus
+/// every recorded revision of its metadata.
 ///
-/// An asset is versioned: `revision` is the newest revision's number and the
-/// `first_revision_*` fields remember who made revision one. This slice stores the
-/// latest revision only — `CreateAssetRevision` and `ListAssetRevisions` are still
-/// scaffolds — so the two agree until a revision is added.
+/// An asset is versioned. `CreateAsset` records revision [`FIRST_REVISION`] and each
+/// `CreateAssetRevision` records the next number, so what a revision CHANGES lives on
+/// the [`AssetRevision`] and what identifies the asset — its id, the domain and project
+/// it belongs to, its type, the identifier of the system it was imported from — stays
+/// here, unchanged by any revision (`CreateAssetRevisionInput` names none of them,
+/// smithy_query operation="CreateAssetRevision"). A revision already recorded is never
+/// rewritten, so an earlier one stays readable by number after a later one is added.
 #[derive(Debug, Clone)]
 pub struct Asset {
     pub id: String,
     pub domain_id: String,
     pub owning_project_id: String,
-    pub name: String,
-    pub description: Option<String>,
     pub external_identifier: Option<String>,
     pub type_identifier: String,
+    /// Every recorded revision, keyed by its number so the greatest key is the latest
+    /// and the least is the first. NEVER empty: a created asset is its own first
+    /// revision. Bounded by [`MAX_ASSET_REVISIONS`].
+    pub revisions: BTreeMap<u32, AssetRevision>,
+}
+
+impl Asset {
+    /// The greatest revision number recorded: the revision a call that names none
+    /// reads, and the one a new revision supersedes.
+    pub fn latest_revision(&self) -> Option<&AssetRevision> {
+        self.revisions.values().next_back()
+    }
+
+    /// The least revision number recorded — the one `CreateAsset` minted — which is
+    /// what the `firstRevisionCreatedBy`/`firstRevisionCreatedAt` members report.
+    pub fn first_revision(&self) -> Option<&AssetRevision> {
+        self.revisions.values().next()
+    }
+
+    /// The revision addressed by a `Revision` string, by the rule [`revision_number`]
+    /// states. `None` when this asset has no such revision.
+    pub fn revision(&self, revision: &str) -> Option<&AssetRevision> {
+        self.revisions.get(&revision_number(revision)?)
+    }
+
+    /// The number the NEXT recorded revision gets: one past the greatest ever recorded,
+    /// so revision numbers never go backwards.
+    pub fn next_revision_number(&self) -> u32 {
+        self.revisions.keys().next_back().copied().unwrap_or(0) + 1
+    }
+
+    /// The revision carrying `token`, if a `CreateAssetRevision` with that
+    /// `clientToken` already recorded one of this asset's revisions.
+    pub fn revision_with_token(&self, token: &str) -> Option<&AssetRevision> {
+        self.revisions
+            .values()
+            .find(|revision| revision.client_token.as_deref() == Some(token))
+    }
+}
+
+/// One recorded revision of an asset: the asset's metadata as the call that recorded
+/// that revision set it.
+#[derive(Debug, Clone)]
+pub struct AssetRevision {
+    /// The revision number, rendered as the modelled `Revision` string: the revision
+    /// `CreateAsset` records renders as [`FIRST_REVISION`].
+    pub revision: u32,
+    pub name: String,
+    pub description: Option<String>,
+    /// The revision of the asset TYPE this revision of the asset is bound to.
     pub type_revision: String,
-    pub revision: String,
-    pub created_by: String,
-    pub created_at_ms: i64,
-    pub first_revision_created_by: String,
-    pub first_revision_created_at_ms: i64,
     pub glossary_terms: Vec<String>,
-    /// The metadata forms attached to the asset, in the order the request listed them
-    /// and keyed by form name (a name appears at most once).
+    /// The metadata forms attached at this revision, in the order the request listed
+    /// them and keyed by form name (a name appears at most once).
     pub forms: Vec<StoredForm>,
     /// The `predictionConfiguration` the request set, mirrored member for member so a
     /// read reports exactly what was written.
     pub prediction_configuration: Option<StoredPredictionConfiguration>,
+    /// The caller that recorded this revision, and when — the `createdBy`/`createdAt`
+    /// an asset read at this revision reports.
+    pub created_by: String,
+    pub created_at_ms: i64,
+    /// The `clientToken` of the `CreateAssetRevision` that recorded this revision, so a
+    /// replay of that request answers with it instead of recording a second one.
+    /// `None` on the revision `CreateAsset` records: that token created the ASSET, so it
+    /// is remembered in the store's own idempotency map ([`IdempotencyKey::asset`]).
+    pub client_token: Option<String>,
+}
+
+impl AssetRevision {
+    /// This revision as the modelled `Revision` string.
+    pub fn revision_string(&self) -> String {
+        self.revision.to_string()
+    }
+}
+
+/// The metadata forms a request's `formsInput` attaches to a revision of an asset, in
+/// stored form, or the message a bad `formsInput` is refused with.
+///
+/// A form is identified on the asset by its `formName` — that is the only way
+/// `formsOutput` names one — so two forms in one request cannot share a name. A form
+/// bound to a type whose revision the request did not name is bound to that type's
+/// first revision, and a form that names no type has no type revision either. Shared by
+/// `CreateAsset` and `CreateAssetRevision` so the two cannot read one `formsInput`
+/// differently.
+pub fn stored_forms(
+    forms_input: Vec<crate::ops::types::FormInput>,
+) -> Result<Vec<StoredForm>, String> {
+    let mut seen_form_names = std::collections::BTreeSet::new();
+    for form in &forms_input {
+        if !seen_form_names.insert(form.form_name.as_str()) {
+            return Err(format!(
+                "formsInput names the form {} more than once; a form name is unique within an asset",
+                form.form_name
+            ));
+        }
+    }
+    Ok(forms_input
+        .into_iter()
+        .map(|form| StoredForm {
+            type_name: form.type_identifier.clone(),
+            type_revision: form.type_revision.or_else(|| {
+                form.type_identifier
+                    .as_ref()
+                    .map(|_| FIRST_REVISION.to_string())
+            }),
+            form_name: form.form_name,
+            content: form.content,
+        })
+        .collect())
+}
+
+/// The asset-type revision an asset (or a new revision of one) is bound to, or the
+/// message a `typeRevision` that names no revision of that type is refused with.
+///
+/// "--type-revision (if used) must match a valid revision of the asset type"
+/// (smithy_query query="doc" shape="CreateAsset"): a pinned revision is checked against
+/// the revision the STORED type is at, and a type no store holds — one the SERVICE
+/// defines, such as `amazon.datazone.RelationalTable` — carries no revision to check
+/// against, so a pin on it is taken as given. A request that pins none keeps `fallback`
+/// (the revision the asset is already bound to, for a new revision of an existing
+/// asset), else takes the revision the stored type is at, else the first revision.
+///
+/// Shared by `CreateAsset` and `CreateAssetRevision` so the two cannot read one
+/// `typeRevision` differently.
+pub fn asset_type_revision(
+    domain: &Domain,
+    type_identifier: &str,
+    pinned: Option<&str>,
+    fallback: Option<&str>,
+) -> Result<String, String> {
+    let stored = domain
+        .asset_types
+        .get(type_identifier)
+        .map(|asset_type| asset_type.revision.as_str());
+    if let (Some(pinned), Some(stored)) = (pinned, stored) {
+        if pinned != stored {
+            return Err(format!(
+                "typeRevision {pinned} is not a revision of asset type {type_identifier}, which is at revision {stored}"
+            ));
+        }
+    }
+    Ok(pinned
+        .or(fallback)
+        .or(stored)
+        .unwrap_or(FIRST_REVISION)
+        .to_string())
 }
 
 /// One metadata form attached to an asset: the stored form of the modelled
@@ -1151,6 +1297,13 @@ pub const MAX_OWNERS_PER_ENTITY: usize = 100;
 /// The most assets this emulator stores in one domain, for the same reason and with the
 /// same refusal (`CreateAsset` models `ServiceQuotaExceededException` too).
 pub const MAX_ASSETS_PER_DOMAIN: usize = 500;
+
+/// The most revisions this emulator records for one asset. Each `CreateAssetRevision`
+/// appends one, so this is the bound on that caller-driven growth; `CreateAssetRevision`
+/// models no `ServiceQuotaExceededException` (smithy_query
+/// operation="CreateAssetRevision"), so the refusal past it is its `ValidationException`
+/// — the rule `CreateProjectMembership` follows for a bound its own model does not name.
+pub const MAX_ASSET_REVISIONS: usize = 100;
 
 /// The most policy grants this emulator stores in one domain, for the same reason and
 /// with the same refusal (`AddPolicyGrant` models `ServiceQuotaExceededException` too).

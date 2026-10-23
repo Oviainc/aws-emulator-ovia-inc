@@ -266,29 +266,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         // A revision the entity does not have names no stored resource, so there is
-        // nothing to record and nothing to take out of the catalog.
-        if let Some(pinned) = input.entity_revision.as_deref() {
-            if pinned != entity.revision {
-                return Err(CreateListingChangeSetErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: ResourceKind::Asset.not_found_message(),
-                    },
-                )
-                .into());
-            }
-        }
+        // nothing to record and nothing to take out of the catalog. A revision the
+        // entity DOES have — including one a later revision superseded — is a record
+        // this store holds, so the snapshot is taken from the revision addressed.
+        let entity_revision = match input.entity_revision.as_deref() {
+            Some(pinned) => entity.revision(pinned),
+            None => entity.latest_revision(),
+        };
+        let Some(entity_revision) = entity_revision else {
+            return Err(CreateListingChangeSetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: ResourceKind::Asset.not_found_message(),
+                },
+            )
+            .into());
+        };
         // The snapshot this change set would record, read off the stored entity before
         // the store is borrowed mutably to mint into.
         let snapshot = ListingRevision {
             // Replaced below with the number the listing actually gets.
             revision: 0,
-            entity_revision: entity.revision.clone(),
-            name: listing_name(&entity.name),
-            description: entity.description.clone(),
+            entity_revision: entity_revision.revision_string(),
+            name: listing_name(&entity_revision.name),
+            description: entity_revision.description.clone(),
             entity_type_name: entity.type_identifier.clone(),
             owning_project_id: entity.owning_project_id.clone(),
-            entity_created_at_ms: entity.created_at_ms,
-            forms: listing_forms(&entity.forms),
+            // When the published ENTITY was created, which is the instant its FIRST
+            // revision was recorded, whichever revision this change set records.
+            entity_created_at_ms: entity
+                .first_revision()
+                .unwrap_or(entity_revision)
+                .created_at_ms,
+            forms: listing_forms(&entity_revision.forms),
             created_by: caller_principal(ctx),
             created_at_ms: now,
             client_token: input.client_token.clone(),

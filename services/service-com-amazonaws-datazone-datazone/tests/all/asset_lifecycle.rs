@@ -128,9 +128,10 @@ fn asset_cases() -> Vec<AssetCase> {
 }
 
 /// One metadata form as the wire carries it, so the forms a request asked for and the
-/// forms a response reports compare directly.
+/// forms a response reports compare directly. Shared with the `asset_revisions` suite,
+/// which compares the same two shapes for a revision of an asset.
 #[derive(Debug, PartialEq, Eq)]
-struct ReportedForm {
+pub(crate) struct ReportedForm {
     form_name: String,
     type_name: Option<String>,
     type_revision: Option<String>,
@@ -145,7 +146,7 @@ fn member(form: &Value, name: &str) -> Option<String> {
 /// The forms a case's request asked for, with the defaults the service applies: a form
 /// that names a type but no revision of it is bound to that type's first revision, and
 /// a form that names no type has no type revision either.
-fn expected_forms(body: &Value) -> Vec<ReportedForm> {
+pub(crate) fn expected_forms(body: &Value) -> Vec<ReportedForm> {
     body.get("formsInput")
         .and_then(Value::as_array)
         .map(|forms| {
@@ -167,7 +168,7 @@ fn expected_forms(body: &Value) -> Vec<ReportedForm> {
 }
 
 /// The `formsOutput` a response reported.
-fn reported_forms(body: &Value) -> Vec<ReportedForm> {
+pub(crate) fn reported_forms(body: &Value) -> Vec<ReportedForm> {
     body.get("formsOutput")
         .and_then(Value::as_array)
         .map(|forms| {

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/asset_lifecycle.rs"]
 mod asset_lifecycle;
+#[path = "all/asset_revisions.rs"]
+mod asset_revisions;
 #[path = "all/asset_types.rs"]
 mod asset_types;
 #[path = "all/domain_name_conflict_and_not_found.rs"]
