@@ -131,75 +131,6 @@ fn cannot_create(message: impl Into<String>) -> CreateFlowError {
     .into()
 }
 
-/// Materialise one `SetSourceRequest` into the source record the flow keeps.
-fn materialise_source(
-    request: &SetSourceRequest,
-    index: usize,
-    flow_name: &str,
-    region: &str,
-    suffix: u64,
-) -> StoredSource {
-    let name = request
-        .name
-        .clone()
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| {
-            if index == 0 {
-                flow_name.to_string()
-            } else {
-                format!("{flow_name}-{}", index + 1)
-            }
-        });
-    // A source reached through another account's entitlement is fed by that account's
-    // flow, so this service assigns it no ingest endpoint of its own; an owned source
-    // listens on the address and port the service assigns it.
-    let entitled = request.entitlement_arn.is_some();
-    StoredSource {
-        source_arn: ::engine::emulator_arn(
-            SERVICE_NAMESPACE,
-            region,
-            &format!("source:1-{suffix:08x}:{name}"),
-        ),
-        name,
-        description: request.description.clone(),
-        ingest_ip: (!entitled).then(|| crate::state::assigned_ingest_ip(suffix)),
-        ingest_port: (!entitled).then(|| {
-            request
-                .ingest_port
-                .unwrap_or_else(|| crate::state::assigned_ingest_port(suffix))
-        }),
-        whitelist_cidr: request.whitelist_cidr.clone(),
-        entitlement_arn: request.entitlement_arn.clone(),
-        vpc_interface_name: request.vpc_interface_name.clone(),
-        sender_ip_address: request.sender_ip_address.clone(),
-        sender_control_port: request.sender_control_port,
-        decryption: request.decryption.clone(),
-        // What the request asked for; the state the source REPORTS is resolved by
-        // `crate::state::reported_router_integration_state`, which gives a source whose
-        // request never mentioned router integration the disabled state.
-        router_integration_state: request.router_integration_state.clone(),
-        router_integration_transit_decryption: request
-            .router_integration_transit_decryption
-            .clone(),
-        // `Transport.Protocol` is required, so a source that names no protocol (an
-        // entitled one, say) carries no transport rather than an empty one.
-        transport: request.protocol.clone().map(|protocol| Transport {
-            max_bitrate: crate::state::assigned_source_max_bitrate(&protocol, request.max_bitrate),
-            protocol,
-            max_latency: request.max_latency,
-            max_sync_buffer: request.max_sync_buffer,
-            min_latency: request.min_latency,
-            sender_control_port: request.sender_control_port,
-            sender_ip_address: request.sender_ip_address.clone(),
-            source_listener_address: request.source_listener_address.clone(),
-            source_listener_port: request.source_listener_port,
-            stream_id: request.stream_id.clone(),
-            ndi_source_settings: request.ndi_source_settings.clone(),
-            ..Transport::default()
-        }),
-    }
-}
-
 /// Materialise one `VpcInterfaceRequest` into the VPC interface the flow carries.
 fn materialise_vpc_interface(request: &VpcInterfaceRequest, suffix: u64) -> VpcInterface {
     VpcInterface {
@@ -376,16 +307,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::flow_resource_fragment(flow_suffix, &input.name),
         );
 
-        let mut sources = Vec::with_capacity(requested_sources.len());
+        // A source's name is resolved — and the source materialised — through
+        // `crate::state`, so a source this create stores is indistinguishable from one
+        // AddFlowSources appends later.
+        let mut sources: Vec<StoredSource> = Vec::with_capacity(requested_sources.len());
+        let mut source_names: ::std::collections::BTreeSet<String> =
+            ::std::collections::BTreeSet::new();
         for (index, request) in requested_sources.iter().enumerate() {
-            let suffix = store.next_suffix();
-            sources.push(materialise_source(
-                request,
-                index,
+            let name = crate::state::resolve_source_name(
+                request.name.as_deref(),
                 &input.name,
-                &region,
-                suffix,
-            ));
+                index,
+                &source_names,
+            );
+            let suffix = store.next_suffix();
+            source_names.insert(name.clone());
+            sources.push(StoredSource::from_set_request(request, name, &region, suffix));
         }
 
         // An output's name is unique within its flow, so the outputs this request
