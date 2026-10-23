@@ -19,6 +19,8 @@ mod application_mutations;
 mod application_policies;
 #[path = "all/applications.rs"]
 mod applications;
+#[path = "all/artifact_document_plane.rs"]
+mod artifact_document_plane;
 #[path = "all/cloudformation_templates.rs"]
 mod cloudformation_templates;
 #[path = "all/error_bodies.rs"]

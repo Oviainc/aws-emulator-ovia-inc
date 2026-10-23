@@ -9,10 +9,8 @@
 //! 1. preparing a template persists one record of the version it was prepared from — the
 //!    version the request names, or the application's latest when it names none — under a
 //!    freshly minted UUID `TemplateId`, and reports it: the `TemplateUrl` is the location
-//!    of the template body PUBLISHED with that version, and the template expires one hour
-//!    after it was created ("Templates expire 1 hour after creation",
-//!    `smithy_query(query="doc", shape="CreateCloudFormationTemplateResponse",
-//!    member="ExpirationTime")`);
+//!    of the template body PUBLISHED with that version, and the template expires exactly
+//!    [`EXPIRY_WINDOW`] after it was created;
 //! 2. `Status` is the state of the "template creation workflow" at the instant of the
 //!    read, a function of the stored instants and the clock: `PREPARING` until the
 //!    preparation span is up, `ACTIVE` until the template expires, `EXPIRED` after that —
@@ -39,6 +37,18 @@ use service_com_amazonaws_serverlessapplicationrepository_serverlessapplicationr
 use super::application_policies::is_uuid_shaped;
 use super::applications::{created, path_label, Answer, Repo};
 use super::version_templates::SAM_TRANSFORM;
+
+/// The window a prepared template lives for: six hours from its `CreationTime` to its
+/// `ExpirationTime`.
+///
+/// Recorded behavior — the service reports an `ExpirationTime` exactly six hours after
+/// the `CreationTime` of an `ACTIVE` prepared template. The model's own doc sentence on
+/// the member says one hour ("Templates expire 1 hour after creation",
+/// `smithy_query(query="doc", shape="CreateCloudFormationTemplateResponse",
+/// member="ExpirationTime")`), which the service contradicts; the window clients observe
+/// is the one asserted here, and it is the service's own published duration rather than a
+/// span this emulator chose.
+const EXPIRY_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Prepare a template of `application_id`, naming `semantic_version` when there is one.
 async fn prepare(repo: &Repo, application_id: &str, semantic_version: Option<&str>) -> Answer {
@@ -142,8 +152,8 @@ fn reported(answer: &Answer) -> Value {
 }
 
 /// RULE 1 and 3: a prepared template records the version it was prepared from, serves the
-/// template body published with that version, expires an hour after it was created, and is
-/// read back member for member.
+/// template body published with that version, expires [`EXPIRY_WINDOW`] after it was
+/// created, and is read back member for member.
 ///
 /// The rows differ along what the rule generalises over: whether the request names a
 /// version or takes the latest, how the named version published its template (inline, or
@@ -241,8 +251,8 @@ async fn a_prepared_template_reports_the_version_it_was_prepared_from() {
         let expires_at = epoch_seconds(case, &prepared, "expirationTime");
         assert_eq!(
             expires_at - created_at,
-            3_600,
-            "case {case:?}: a template expires 1 hour after creation, got {} then {}",
+            EXPIRY_WINDOW.as_secs() as i64,
+            "case {case:?}: a template expires {EXPIRY_WINDOW:?} after creation, got {} then {}",
             prepared.at("creationTime"),
             prepared.at("expirationTime")
         );
@@ -326,9 +336,8 @@ async fn the_status_of_a_template_is_its_place_in_the_expiry_window() {
         state::TEMPLATE_PREPARATION_SPAN
     );
     assert_eq!(
-        state::TEMPLATE_LIFETIME,
-        Duration::from_secs(3_600),
-        "templates expire 1 hour after creation, got {:?}",
+        state::TEMPLATE_LIFETIME, EXPIRY_WINDOW,
+        "a prepared template lives {EXPIRY_WINDOW:?}, got {:?}",
         state::TEMPLATE_LIFETIME
     );
 
@@ -377,8 +386,8 @@ async fn the_status_of_a_template_is_its_place_in_the_expiry_window() {
         let expires_at = epoch_seconds(case, &read, "expirationTime");
         assert_eq!(
             expires_at - created_at,
-            3_600,
-            "case {case:?}: the expiry window stays one hour, got {} then {}",
+            EXPIRY_WINDOW.as_secs() as i64,
+            "case {case:?}: the expiry window stays {EXPIRY_WINDOW:?}, got {} then {}",
             read.at("creationTime"),
             read.at("expirationTime")
         );
