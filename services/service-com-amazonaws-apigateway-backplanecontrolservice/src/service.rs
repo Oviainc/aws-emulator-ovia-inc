@@ -58,7 +58,37 @@
 //! ([`violations_of`]) and states them through [`validation`], which also owns the two
 //! renderings this service does not share with the framework (an unanchored
 //! `@pattern`, an enum value set in the service's declared order).
+//!
+//! ## This service's other edited seam: the `execute-api` data plane
+//!
+//! API Gateway publishes TWO kinds of hostname. The CONTROL plane is
+//! `apigateway.{region}.amazonaws.com`, whose first label names the service, and that is
+//! what the framework's route key resolves. The DATA plane is the per-api invoke endpoint
+//! `{rest-api-id}.execute-api.{region}.amazonaws.com`, whose first label is the api's own
+//! id: it names no service, so the front door can resolve no target service from such a
+//! request and answers `404 UnknownService` for a URL this service told the caller to use.
+//!
+//! Three seams carry it, and nothing else changes — the same shape
+//! `services/service-com-amazonaws-mediapackagev2-mediapackagev2` uses for its data plane:
+//!
+//! - [`Service::can_handle`] also claims a request addressed to the invoke endpoint of an
+//!   api this service HOLDS ([`invoke::invoke_api_id`]), which is what routes it here at
+//!   all;
+//! - [`Service::override_routing_error`] serves the invoke that presents NO credential. An
+//!   invoke names no modelled operation by construction (`/{stage}/{path}` is not in the
+//!   model), so the router reaches exactly this seam for it, and reaches it BEFORE
+//!   authentication — which is what lets a method whose `authorizationType` is `NONE` be
+//!   reached by an anonymous client;
+//! - [`Service::override_operation`] serves the invoke that DOES present a SigV4
+//!   credential, through [`CredentialedDataPlane`], so the emulator's own signature
+//!   verification runs in front of it (the router authenticates whatever it names an
+//!   operation for). A method whose `authorizationType` is `AWS_IAM` is therefore reached
+//!   with a verified signature rather than with a second check written into this service.
+//!
+//! What the data plane resolves, and what it answers for an integration it cannot perform,
+//! is [`invoke`]'s own documentation.
 
+pub mod invoke;
 pub mod query_coercion;
 mod validation;
 
@@ -109,6 +139,17 @@ fn can_handle_parts(parts: &http::request::Parts) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because the `execute-api` data plane ([`invoke`]) is served from
+    /// [`Service::override_routing_error`], which is not an operation and so has no
+    /// `self.engine` of its own; it must read the one store the control-plane operations
+    /// write, not a second copy.
+    engine: Arc<Eng>,
+    /// The data-plane handler the router names as an OPERATION for an invoke request that
+    /// presents a SigV4 credential, so the emulator authenticates it before anything is
+    /// served. See [`CredentialedDataPlane`].
+    credentialed_data_plane: CredentialedDataPlane<Eng>,
     /// The same modelled operations the generated table holds, each wrapped in
     /// [`StatedPerOperation`] so a refused request names the violated member by its path
     /// from THAT operation's input shape. Keyed by the routing key the protocol resolves
@@ -274,9 +315,58 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             update_vpc_link::UpdateVpcLink,
         );
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            credentialed_data_plane: CredentialedDataPlane {
+                engine: Arc::clone(&engine),
+            },
+            engine,
             stated,
         }
+    }
+}
+
+/// The auth schemes a credentialed `execute-api` invoke is verified under.
+///
+/// SigV4 is the only scheme this service's model declares (`aws.auth#sigv4` name
+/// `apigateway`), and it is the one a method whose `authorizationType` is `AWS_IAM` is
+/// reached with, so an invoke arrives either anonymously — which the routing-error seam
+/// answers without the router authenticating anything — or with a SigV4 credential, which
+/// this names so the router's own authenticator verifies it.
+const DATA_PLANE_AUTH_SCHEMES: &[&str] = &[::emulator_server::aws_credentials::SIGV4_SCHEME];
+
+/// The `execute-api` data plane for a request that PRESENTS a SigV4 credential, as an
+/// [`ErasedOperation`] so the router authenticates it.
+///
+/// It holds the SAME shared engine the generated entry threads into every operation, and
+/// serves the request through exactly the function the routing-error seam uses
+/// ([`invoke::serve`]), so the credentialed and the anonymous path cannot diverge in what
+/// they serve — only in whether a signature was verified on the way in.
+struct CredentialedDataPlane<Eng> {
+    engine: Arc<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for CredentialedDataPlane<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        _ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            if invoke::invoke_api_id_of_request(req).is_none() {
+                // Unreachable: `override_operation` names this only for a request whose
+                // host is an api's own `execute-api` endpoint.
+                return svc.definition().routing_error_response(req);
+            }
+            invoke::serve(&*self.engine, req)
+        })
+    }
+
+    /// This is NOT a modelled operation, so there is no modelled operation for the router
+    /// to read schemes off: without this the router would find no scheme for an invoke and
+    /// could not verify the credential it carries.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        Some(DATA_PLANE_AUTH_SCHEMES)
     }
 }
 
@@ -415,13 +505,48 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // model-derived path space — see [`can_handle_parts`]. `/v2` is in neither of
         // this model's segments, so the V2 endpoint alone claims its traffic and each
         // service answers only its own.
-        can_handle_parts(parts)
+        if can_handle_parts(parts) {
+            return true;
+        }
+        // And the DATA plane: a request addressed to the `execute-api` invoke endpoint of
+        // an api THIS service holds a record for. That host's first label is the api's own
+        // id, which names no service, so the front door can resolve no target service from
+        // it and answers `404 UnknownService` for a URL this service told the caller to
+        // use (`crate::service::invoke`).
+        //
+        // The claim is narrowed to an api this service HOLDS, read from the one shared
+        // store, rather than to the host shape alone, because the same host shape is the
+        // invoke endpoint of an HTTP or WebSocket api of the V2 service too: each service
+        // claiming only the ids it minted keeps one claimant per request. `@connections`
+        // is excluded for the same reason — it is ApiGatewayManagementApi's modelled path
+        // space on this host.
+        invoke::invoke_api_id(parts).is_some_and(|api_id| {
+            crate::state::service_state(&*self.engine)
+                .is_some_and(|state| state.lock().rest_apis.contains_key(api_id))
+        })
     }
 
     fn override_operation(
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
+        // An invoke that PRESENTS a SigV4 credential is named as an operation, so the
+        // router verifies that credential's signature before anything is served — the
+        // router authenticates only what it names an operation for. An invoke carrying no
+        // credential is left unnamed on purpose: it is answered by `override_routing_error`
+        // below, which the router reaches before authentication, so a method whose
+        // `authorizationType` is `NONE` is reachable by an anonymous client, as it is on
+        // AWS.
+        //
+        // The predicate is [`invoke::carries_sigv4_credential`], the SAME one that admits
+        // an `AWS_IAM` method: a credential this names is verified by the router before the
+        // method is served, so the two cannot disagree about what counts as a credential
+        // (a presigned URL carries its scope in the query string, not in a header).
+        if invoke::invoke_api_id_of_request(req).is_some()
+            && invoke::carries_sigv4_credential(req)
+        {
+            return Some(&self.credentialed_data_plane);
+        }
         // NOT a re-route: the key is the one the generated table's own protocol
         // resolves, and the operation it names is the one served — wrapped in
         // `StatedPerOperation` so a refused request names the violated member by its
@@ -452,12 +577,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // routing table resolved it. An invoke of a deployed stage carrying no SigV4
+        // credential is exactly that case by construction (`override_operation` names an
+        // operation only for the credentialed ones, and no modelled operation is bound at
+        // `/{stage}/{path}`), so this is where an anonymous client of a method whose
+        // `authorizationType` is `NONE` is served — BEFORE authentication, which is what
+        // lets it be answered at all.
+        //
+        // Anything else keeps the protocol-correct default for this service's envelope
+        // (query -> 400 InvalidAction text/xml, awsJson -> 404, rpcv2Cbor -> 404,
+        // rest -> 501) by returning `None`.
+        invoke::invoke_api_id_of_request(req).map(|_| invoke::serve(&*self.engine, req))
     }
 
     fn override_framework_error(
