@@ -19,6 +19,8 @@ mod data_transformation_profile;
 mod error_envelopes;
 #[path = "all/fhir_datastore_lifecycle.rs"]
 mod fhir_datastore_lifecycle;
+#[path = "all/fhir_rest_and_validate_source.rs"]
+mod fhir_rest_and_validate_source;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_fhir_datastore.rs"]

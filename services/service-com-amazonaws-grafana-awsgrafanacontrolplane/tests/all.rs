@@ -14,6 +14,9 @@
 #[path = "all/list_versions.rs"]
 mod list_versions;
 
+#[path = "all/list_workspace_service_accounts.rs"]
+mod list_workspace_service_accounts;
+
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 

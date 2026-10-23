@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConfigurationProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConfigurationProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConfigurationProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: updates the members of a stored configuration profile that the request
+//! carries, leaves every member it omits alone, and answers the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -182,20 +175,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConfigurationProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConfigurationProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConfigurationProfile"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateConfigurationProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // A profile is addressed under its application, so the parent is resolved first:
+        // an update naming an application this service does not hold is not found.
+        let Some(application) = store.applications.get_mut(&input.application_id) else {
+            return Err(UpdateConfigurationProfileErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No application with id {} exists.",
+                        input.application_id
+                    )),
+                    resource_name: Some(input.application_id),
+                },
+            )
+            .into());
+        };
+        let Some(profile) = application.profiles.get_mut(&input.configuration_profile_id) else {
+            return Err(UpdateConfigurationProfileErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No configuration profile with id {} exists in application {}.",
+                        input.configuration_profile_id, input.application_id
+                    )),
+                    resource_name: Some(input.configuration_profile_id),
+                },
+            )
+            .into());
+        };
+
+        // An update carries only the members the caller means to change, so a member the
+        // request omits keeps the value the profile already holds. `LocationUri` and
+        // `Type` are not members of this request at all — where a configuration lives
+        // and what kind of configuration it is are fixed when the profile is created —
+        // so both are reported back out of the stored record untouched.
+        if let Some(name) = input.name {
+            profile.name = name;
+        }
+        if let Some(description) = input.description {
+            profile.description = Some(description);
+        }
+        if let Some(retrieval_role_arn) = input.retrieval_role_arn {
+            profile.retrieval_role_arn = Some(retrieval_role_arn);
+        }
+        // Supplying `Validators` replaces the whole list, so an empty list removes the
+        // validators the profile had: the member is the list itself, not a set of edits
+        // to it.
+        if let Some(validators) = input.validators {
+            profile.validators = validators;
+        }
+        // This request's `KmsKeyIdentifier` targets `KmsKeyIdentifierOrEmpty` (length
+        // 0..2048) while a profile reports it as `KmsKeyIdentifier` (length 1..2048):
+        // the empty string is accepted here and cannot be reported, so it clears the key
+        // new hosted configuration versions are encrypted with.
+        if let Some(kms_key_identifier) = input.kms_key_identifier {
+            profile.kms_key_identifier =
+                (!kms_key_identifier.is_empty()).then_some(kms_key_identifier);
+        }
+
+        // Answered from the stored record, so this response and a later
+        // `GetConfigurationProfile` report the same profile. `KmsKeyArn` is deliberately
+        // left unset, not overlooked: it is the ARN of the key `KmsKeyIdentifier`
+        // resolves to, and this emulator resolves no KMS key, so any ARN here would be
+        // fabricated.
+        Ok(UpdateConfigurationProfileOutput {
+            application_id: Some(profile.application_id.clone()),
+            id: Some(profile.id.clone()),
+            name: Some(profile.name.clone()),
+            description: profile.description.clone(),
+            location_uri: Some(profile.location_uri.clone()),
+            retrieval_role_arn: profile.retrieval_role_arn.clone(),
+            validators: (!profile.validators.is_empty()).then(|| profile.validators.clone()),
+            r#type: profile.profile_type.clone(),
+            kms_key_arn: None,
+            kms_key_identifier: profile.kms_key_identifier.clone(),
+        })
     }
 }

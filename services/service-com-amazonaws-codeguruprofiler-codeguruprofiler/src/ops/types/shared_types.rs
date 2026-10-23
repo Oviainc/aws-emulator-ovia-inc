@@ -11,7 +11,13 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-codeguruprofiler-codeguruprofiler.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#FindingsReportSummary")]
+/// `FindingsReportSummary`. Its schema and codec come from
+/// [`profiler_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `profileStartTime` and `profileEndTime` carry `@timestampFormat("date-time")`
+/// — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct FindingsReportSummary {
     pub id: Option<String>,
@@ -20,6 +26,47 @@ pub struct FindingsReportSummary {
     pub profile_end_time: Option<::aws_smithy_types::DateTime>,
     pub total_number_of_findings: Option<i32>,
 }
+
+profiler_schema_and_codec!(
+    FindingsReportSummary,
+    FINDINGS_REPORT_SUMMARY_SCHEMA,
+    "com.amazonaws.codeguruprofiler#FindingsReportSummary",
+    "com.amazonaws.codeguruprofiler",
+    "FindingsReportSummary",
+    (M_ID, id, "id", 0, opt, string),
+    (
+        M_PROFILING_GROUP_NAME,
+        profiling_group_name,
+        "profilingGroupName",
+        1,
+        opt,
+        string
+    ),
+    (
+        M_PROFILE_START_TIME,
+        profile_start_time,
+        "profileStartTime",
+        2,
+        opt,
+        date_time
+    ),
+    (
+        M_PROFILE_END_TIME,
+        profile_end_time,
+        "profileEndTime",
+        3,
+        opt,
+        date_time
+    ),
+    (
+        M_TOTAL_NUMBER_OF_FINDINGS,
+        total_number_of_findings,
+        "totalNumberOfFindings",
+        4,
+        opt,
+        integer
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#InternalServerException")]
 #[derive(Debug, Clone, Default)]
@@ -51,7 +98,13 @@ pub struct AgentOrchestrationConfig {
     pub profiling_enabled: bool,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#ProfilingGroupDescription")]
+/// `ProfilingGroupDescription`. Its schema and codec come from
+/// [`profiler_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `updatedAt` carry `@timestampFormat("date-time")` — see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct ProfilingGroupDescription {
     pub name: Option<String>,
@@ -64,7 +117,45 @@ pub struct ProfilingGroupDescription {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#ProfilingStatus")]
+profiler_schema_and_codec!(
+    ProfilingGroupDescription,
+    PROFILING_GROUP_DESCRIPTION_SCHEMA,
+    "com.amazonaws.codeguruprofiler#ProfilingGroupDescription",
+    "com.amazonaws.codeguruprofiler",
+    "ProfilingGroupDescription",
+    (M_NAME, name, "name", 0, opt, string),
+    (
+        M_AGENT_ORCHESTRATION_CONFIG,
+        agent_orchestration_config,
+        "agentOrchestrationConfig",
+        1,
+        opt,
+        struct_of(AgentOrchestrationConfig)
+    ),
+    (M_ARN, arn, "arn", 2, opt, string),
+    (M_CREATED_AT, created_at, "createdAt", 3, opt, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 4, opt, date_time),
+    (
+        M_PROFILING_STATUS,
+        profiling_status,
+        "profilingStatus",
+        5,
+        opt,
+        struct_of(ProfilingStatus)
+    ),
+    (
+        M_COMPUTE_PLATFORM,
+        compute_platform,
+        "computePlatform",
+        6,
+        opt,
+        string
+    ),
+    (M_TAGS, tags, "tags", 7, opt, map_of_string),
+);
+
+/// `ProfilingStatus`. Hand-written for the same reason: both of its instants carry
+/// `@timestampFormat("date-time")`.
 #[derive(Debug, Clone, Default)]
 pub struct ProfilingStatus {
     pub latest_agent_profile_reported_at: Option<::aws_smithy_types::DateTime>,
@@ -72,12 +163,55 @@ pub struct ProfilingStatus {
     pub latest_agent_orchestrated_at: Option<::aws_smithy_types::DateTime>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#AggregatedProfileTime")]
+profiler_schema_and_codec!(
+    ProfilingStatus,
+    PROFILING_STATUS_SCHEMA,
+    "com.amazonaws.codeguruprofiler#ProfilingStatus",
+    "com.amazonaws.codeguruprofiler",
+    "ProfilingStatus",
+    (
+        M_LATEST_AGENT_PROFILE_REPORTED_AT,
+        latest_agent_profile_reported_at,
+        "latestAgentProfileReportedAt",
+        0,
+        opt,
+        date_time
+    ),
+    (
+        M_LATEST_AGGREGATED_PROFILE,
+        latest_aggregated_profile,
+        "latestAggregatedProfile",
+        1,
+        opt,
+        struct_of(AggregatedProfileTime)
+    ),
+    (
+        M_LATEST_AGENT_ORCHESTRATED_AT,
+        latest_agent_orchestrated_at,
+        "latestAgentOrchestratedAt",
+        2,
+        opt,
+        date_time
+    ),
+);
+
+/// `AggregatedProfileTime`. Hand-written because `start` carries
+/// `@timestampFormat("date-time")`.
 #[derive(Debug, Clone, Default)]
 pub struct AggregatedProfileTime {
     pub start: Option<::aws_smithy_types::DateTime>,
     pub period: Option<String>,
 }
+
+profiler_schema_and_codec!(
+    AggregatedProfileTime,
+    AGGREGATED_PROFILE_TIME_SCHEMA,
+    "com.amazonaws.codeguruprofiler#AggregatedProfileTime",
+    "com.amazonaws.codeguruprofiler",
+    "AggregatedProfileTime",
+    (M_START, start, "start", 0, opt, date_time),
+    (M_PERIOD, period, "period", 1, opt, string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#ConflictException")]
 #[derive(Debug, Clone, Default)]

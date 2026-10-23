@@ -116,6 +116,17 @@ fn mapping_of(count: usize) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// A mapping just past `bytes` bytes of keys and values together, built from entries
+/// each INSIDE its own modelled bound (a 100 000-character value is under the
+/// modelled 102 400 maximum), for the retained-byte ceiling.
+fn mapping_of_bytes(bytes: usize) -> BTreeMap<String, String> {
+    let content = "v".repeat(100_000);
+    let entries = bytes / content.len() + 1;
+    (0..entries)
+        .map(|index| (format!("mappings/bulk-{index:04}.map"), content.clone()))
+        .collect()
+}
+
 /// The `ProfileMapping` a response reports, as a comparable map.
 fn reported_mapping(case: &str, body: &Value) -> BTreeMap<String, String> {
     body["ProfileMapping"]
@@ -471,6 +482,19 @@ fn refusal_cases() -> Vec<(&'static str, Value, u16, &'static str)> {
                     "sections/huge.map",
                     "v".repeat(102_401).as_str(),
                 )])),
+            }),
+            400,
+            "ValidationException",
+        ),
+        (
+            // Every entry below is inside its own modelled bound; together they are
+            // past the retained-byte ceiling this emulator holds for one mapping
+            // (`state::MAX_PROFILE_MAPPING_BYTES`, 1 MiB).
+            "mapping whose entries together pass the retained-byte ceiling",
+            json!({
+                "ProfileName": "past-mapping-bytes",
+                "SourceFormat": "CCDA",
+                "Source": profile_mapping_source(&mapping_of_bytes(1 << 20)),
             }),
             400,
             "ValidationException",
