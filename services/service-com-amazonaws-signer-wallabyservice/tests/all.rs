@@ -20,6 +20,9 @@ mod profile_revocation_and_identity;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 
+#[path = "all/signing_platform_catalog.rs"]
+mod signing_platform_catalog;
+
 #[path = "all/signing_profile_lifecycle.rs"]
 mod signing_profile_lifecycle;
 

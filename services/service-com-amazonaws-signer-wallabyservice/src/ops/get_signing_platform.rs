@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSigningPlatform
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSigningPlatform`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSigningPlatform::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE signing platform out of the catalog this service publishes
+//! ([`crate::state::SIGNING_PLATFORM_CATALOG`]): a reporting operation, so it
+//! writes nothing — a signing platform is published by AWS Signer, never created
+//! by a caller. A `platformId` the catalog does not publish is a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +115,20 @@ impl From<GetSigningPlatformErrorModeled> for GetSigningPlatformError {
     }
 }
 
+/// The modelled 404 for a `platformId` this service publishes no platform for.
+///
+/// `code` carries the condition a client branches on — the platform named by the
+/// request is not one this service publishes — which is the only
+/// machine-readable discriminator a 404 body has; the message is prose built from
+/// the request.
+fn platform_not_found(platform_id: &str) -> GetSigningPlatformError {
+    GetSigningPlatformErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::platform_not_found_message(platform_id)),
+        code: Some(crate::state::ERROR_CODE_PLATFORM_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
 /// The `GetSigningPlatform` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -155,18 +165,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSigningPlatform` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSigningPlatformErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSigningPlatform"))
+        // A platform is a published fact about the service, not a stored resource:
+        // this call reads the catalog and writes nothing, so a later reader of any
+        // platform sees exactly what this one saw.
+        let _ = (ctx, &self.engine);
+
+        // The SAME catalog the profile/job slice resolves a platform's display name
+        // and signing-material rule against, so what this call reports about a
+        // platform and what a profile on it recorded cannot drift apart.
+        let Some(platform) = crate::state::signing_platform(&input.platform_id) else {
+            return Err(platform_not_found(&input.platform_id));
+        };
+
+        Ok(GetSigningPlatformOutput {
+            // The id the catalog publishes the platform under, not the request's
+            // own spelling of it.
+            platform_id: Some(platform.platform_id.to_string()),
+            // Absent for a platform AWS Signer publishes no display name for.
+            display_name: platform.display_name.map(str::to_string),
+            partner: Some(platform.partner.to_string()),
+            target: Some(platform.target().to_string()),
+            category: Some(platform.category.to_string()),
+            signing_configuration: Some(platform.signing_configuration()),
+            signing_image_format: Some(platform.signing_image_format()),
+            max_size_in_mb: platform.max_size_in_mb,
+            revocation_supported: platform.revocation_supported,
+        })
     }
 }
