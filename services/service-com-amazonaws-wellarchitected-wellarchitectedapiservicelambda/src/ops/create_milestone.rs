@@ -211,15 +211,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Milestone names must be unique within a workload"
-        // (`CreateMilestoneInput$MilestoneName` doc).
-        if let Some(existing) = store
-            .milestones
-            .get(&input.workload_id)
-            .and_then(|recorded| {
-                recorded
-                    .values()
-                    .find(|record| record.milestone_name == input.milestone_name)
-            })
+        // (`smithy_query(query="shape", shape="MilestoneName")`), compared the way this
+        // service compares a name it meters for uniqueness: capitalization and
+        // whitespace are ignored (`crate::state::normalize_unique_name`), so a spelling
+        // that differs only in either collides with the stored milestone and consumes no
+        // milestone number.
+        if let Some(existing) = store.milestone_holding_name(&input.workload_id, &input.milestone_name)
         {
             return Err(CreateMilestoneErrorModeled::ConflictException(
                 crate::state::milestone_name_conflict(

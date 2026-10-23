@@ -150,7 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if deployment_id.trim().is_empty() {
             return Err(GetDeploymentErrorModeled::DeploymentIdRequiredException(
                 DeploymentIdRequiredException {
-                    message: Some("The deployment ID was not specified".to_string()),
+                    message: Some(crate::state::DEPLOYMENT_ID_MISSING.to_string()),
                 },
             )
             .into());
@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .ok_or_else(|| {
             GetDeploymentErrorModeled::DeploymentDoesNotExistException(
                 DeploymentDoesNotExistException {
-                    message: Some(format!("No deployment found for ID {deployment_id}")),
+                    message: Some(crate::state::deployment_not_found(&deployment_id)),
                 },
             )
         })?;

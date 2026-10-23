@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(application) = state.applications.get(&application_name) else {
                 return Err(GetDeploymentGroupErrorModeled::ApplicationDoesNotExistException(
                     ApplicationDoesNotExistException {
-                        message: Some(format!("No application found for name {application_name}")),
+                        message: Some(crate::state::application_not_found(&application_name)),
                     },
                 ));
             };
@@ -169,9 +169,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     GetDeploymentGroupErrorModeled::DeploymentGroupDoesNotExistException(
                         DeploymentGroupDoesNotExistException {
-                            message: Some(format!(
-                                "No deployment group found for name {deployment_group_name} in \
-                                 application {application_name}"
+                            message: Some(crate::state::deployment_group_not_found(
+                                &deployment_group_name,
                             )),
                         },
                     ),

@@ -194,16 +194,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         // A deployment group only names a group WITHIN an application, so filtering on
-        // one without the other cannot be resolved.
+        // one without the other cannot be resolved. What the request is missing is the
+        // application name, so this is that member's `ApplicationNameRequiredException`
+        // carrying the one sentence that shape owns: the sentence is DELIBERATELY the
+        // same one every other site answers, and says nothing about the paired
+        // `deploymentGroupName` that made the name necessary — a client branches on the
+        // code, and one error shape may not be worded two ways.
         if input.deployment_group_name.is_some() && input.application_name.is_none() {
             return Err(
                 ListDeploymentsErrorModeled::ApplicationNameRequiredException(
                     ApplicationNameRequiredException {
-                        message: Some(
-                            "The application name must be specified alongside a deployment group \
-                             name"
-                                .to_string(),
-                        ),
+                        message: Some(crate::state::APPLICATION_NAME_MISSING.to_string()),
                     },
                 )
                 .into(),
@@ -226,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(application) = state.applications.get(name) else {
                     return Err(ListDeploymentsErrorModeled::ApplicationDoesNotExistException(
                         ApplicationDoesNotExistException {
-                            message: Some(format!("No application found for name {name}")),
+                            message: Some(crate::state::application_not_found(name)),
                         },
                     ));
                 };
@@ -235,10 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         return Err(
                             ListDeploymentsErrorModeled::DeploymentGroupDoesNotExistException(
                                 DeploymentGroupDoesNotExistException {
-                                    message: Some(format!(
-                                        "No deployment group found for name {group} in \
-                                         application {name}"
-                                    )),
+                                    message: Some(crate::state::deployment_group_not_found(group)),
                                 },
                             ),
                         );

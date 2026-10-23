@@ -22,7 +22,10 @@
 //! the store, not inside one operation file, for the same reason the ARN rule does: two
 //! operations read it.
 
-use crate::ops::types::{Export, ExportStatus, ResourceNotFoundException, ResourceTag};
+use crate::ops::types::{
+    Export, ExportStatus, ResourceNotFoundException, ResourceTag, ValidationException,
+    ValidationExceptionField,
+};
 use std::collections::BTreeMap;
 
 pub mod catalog;
@@ -286,6 +289,63 @@ pub fn page<T: Clone>(
         .get(end)
         .map(|(key, _)| encode_page_token(kind, key));
     Some((values, next))
+}
+
+/// The most tags one export holds.
+///
+/// The modelled `ResourceTagList` is `@length 0..200` (smithy_query shape
+/// `ResourceTagList`), and that list is both what a tagging request submits and what
+/// `ListTagsForResource` reports for an export — so an export holding more than this many
+/// tags could not be reported within its own modelled bound. A request that would take an
+/// export past it is refused with the modelled `ValidationException` instead.
+pub const MAX_RESOURCE_TAGS: usize = 200;
+
+/// A submitted `ResourceTagList` collapsed into the keyed map the store holds, or the
+/// modelled refusal for a list that names one key twice.
+///
+/// "Each tag consists of a key and a value, and each key must be unique for the resource"
+/// (the modelled doc for `ResourceTags`), so a list carrying one key twice names two
+/// values for one tag and cannot be satisfied. Lives here because every operation that
+/// accepts a `ResourceTagList` — `CreateExport` and `TagResource` — must read it the same
+/// way, or one of them would silently keep the last value for a duplicated key.
+pub fn tag_map(tags: Vec<ResourceTag>) -> Result<BTreeMap<String, String>, ValidationException> {
+    let mut map: BTreeMap<String, String> = BTreeMap::new();
+    for tag in tags {
+        if map.insert(tag.key.clone(), tag.value).is_some() {
+            return Err(duplicate_tag_key(&tag.key));
+        }
+    }
+    Ok(map)
+}
+
+/// The modelled 400 for a `ResourceTags` list that carries `key` more than once.
+pub fn duplicate_tag_key(key: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "ResourceTags carries the key {} more than once; each tag key must be unique for the resource.",
+            clip_for_message(key)
+        ),
+        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: "ResourceTags".to_string(),
+            message: "Each tag key must be unique for the resource.".to_string(),
+        }]),
+    }
+}
+
+/// The modelled 400 for a request that would leave an export holding `total` tags, past
+/// [`MAX_RESOURCE_TAGS`].
+pub fn too_many_tags(total: usize) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "The request would leave the resource with {total} tags; a resource holds at most {MAX_RESOURCE_TAGS}."
+        ),
+        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: "ResourceTags".to_string(),
+            message: format!("A resource holds at most {MAX_RESOURCE_TAGS} tags."),
+        }]),
+    }
 }
 
 /// The tags of an export as the modelled list, ordered by key.

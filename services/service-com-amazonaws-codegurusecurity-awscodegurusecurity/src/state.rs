@@ -55,6 +55,28 @@ pub const ANALYSIS_TYPE_SECURITY: &str = "Security";
 
 /// `Status`, from `types::shared_types::STATUS_VALUES` (`All | Closed | Open`).
 pub const STATUS_ALL: &str = "All";
+/// `Status`; see [`STATUS_ALL`]. The status an OPEN finding carries, which is what the
+/// metrics operations count.
+pub const STATUS_OPEN: &str = "Open";
+
+/// `Severity`, from `types::shared_types::SEVERITY_VALUES`
+/// (`Critical | High | Info | Low | Medium`). One constant per value, because the
+/// metrics operations report one count per severity
+/// (`FindingMetricsValuePerSeverity`).
+pub const SEVERITY_INFO: &str = "Info";
+/// `Severity`; see [`SEVERITY_INFO`].
+pub const SEVERITY_LOW: &str = "Low";
+/// `Severity`; see [`SEVERITY_INFO`].
+pub const SEVERITY_MEDIUM: &str = "Medium";
+/// `Severity`; see [`SEVERITY_INFO`].
+pub const SEVERITY_HIGH: &str = "High";
+/// `Severity`; see [`SEVERITY_INFO`].
+pub const SEVERITY_CRITICAL: &str = "Critical";
+
+/// Milliseconds in a day, on the scale [`now_millis`] reads. Unix time counts no leap
+/// seconds, so every day on this scale is exactly this long — which is what lets
+/// [`start_of_utc_day_millis`] floor an instant to its day arithmetically.
+pub const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 
 /// `ErrorCode`, from `types::shared_types::ERROR_CODE_VALUES`. `BatchGetFindings`
 /// classifies each identifier it cannot resolve with one of these.
@@ -433,6 +455,30 @@ pub fn now_millis() -> i64 {
 /// Render stored epoch milliseconds as the modelled `Timestamp`.
 pub fn to_timestamp(epoch_millis: i64) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs_f64(epoch_millis as f64 / 1000.0)
+}
+
+/// Read a modelled `Timestamp` as epoch milliseconds, the scale every instant this
+/// service stores is on. The inverse of [`to_timestamp`], so an instant that went out
+/// on the wire comes back on the same scale.
+pub fn from_timestamp(at: &::aws_smithy_types::DateTime) -> i64 {
+    at.to_millis()
+        .unwrap_or_else(|_| at.secs().saturating_mul(1_000))
+}
+
+/// The start of the UTC day `epoch_millis` falls in: the instant itself floored to a
+/// whole multiple of [`MILLIS_PER_DAY`]. `div_euclid`, so an instant before the epoch
+/// floors to the start of ITS day rather than towards the epoch.
+pub fn start_of_utc_day_millis(epoch_millis: i64) -> i64 {
+    epoch_millis
+        .div_euclid(MILLIS_PER_DAY)
+        .saturating_mul(MILLIS_PER_DAY)
+}
+
+/// The last instant of the UTC day `epoch_millis` falls in — the instant a day's
+/// metrics are reported "as of" (`MetricsSummary`: "A summary of metrics for an account
+/// as of a specified date").
+pub fn end_of_utc_day_millis(epoch_millis: i64) -> i64 {
+    start_of_utc_day_millis(epoch_millis).saturating_add(MILLIS_PER_DAY - 1)
 }
 
 /// The region this request is for, read from its SigV4 credential scope.

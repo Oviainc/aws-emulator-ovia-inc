@@ -23,6 +23,8 @@ mod connectivity_update;
 mod describe_cluster_v2;
 #[path = "all/kafka_harness.rs"]
 mod kafka_harness;
+#[path = "all/kafka_versions.rs"]
+mod kafka_versions;
 #[path = "all/list_clusters_v2.rs"]
 mod list_clusters_v2;
 #[path = "all/replicator_lifecycle.rs"]

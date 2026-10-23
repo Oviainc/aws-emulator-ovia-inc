@@ -68,7 +68,7 @@ impl Client {
             let workload_id = store.mint_workload_id();
             let workload_name = format!("seeded-{index:06}");
             store.workload_name_index.insert(
-                service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::normalize_workload_name(
+                service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::normalize_unique_name(
                     &workload_name,
                 ),
                 workload_id.clone(),

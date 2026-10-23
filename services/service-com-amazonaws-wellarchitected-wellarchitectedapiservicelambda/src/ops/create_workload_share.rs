@@ -244,14 +244,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A share GRANTS access to a principal that does not have it: the sharer already
         // has it, so sharing with the sharer's own principal is not a share at all. The
         // comparison is against the identity that shares the workload — the owning account
-        // this request is attributed to — never against a literal account id.
+        // this request is attributed to — never against a literal account id, and the
+        // refusal states the PRINCIPAL RELATIONSHIP that was refused rather than a
+        // constraint on the member's value, so it discloses no account id
+        // (`crate::state::SELF_SHARE_MESSAGE`).
         if input.shared_with == shared_by {
-            return Err(field_validation(
-                "SharedWith",
-                &format!(
-                    "Member must not be the principal sharing the workload ({shared_by})"
-                ),
-            ));
+            return Err(CreateWorkloadShareErrorModeled::ValidationException(
+                crate::state::self_share_exception(),
+            )
+            .into());
         }
 
         // One principal holds at most one share of one workload: the permission a second

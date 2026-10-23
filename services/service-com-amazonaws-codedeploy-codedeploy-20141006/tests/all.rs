@@ -15,6 +15,8 @@
 mod batch_get_applications;
 #[path = "all/batch_get_deployments.rs"]
 mod batch_get_deployments;
+#[path = "all/client_error_messages.rs"]
+mod client_error_messages;
 #[path = "all/codedeploy_deployment_outcome.rs"]
 mod codedeploy_deployment_outcome;
 #[path = "all/codedeploy_lifecycle.rs"]

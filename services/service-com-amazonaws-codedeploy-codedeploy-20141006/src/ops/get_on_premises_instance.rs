@@ -143,7 +143,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(crate::state::NameRefusal::Missing) => {
                 return Err(GetOnPremisesInstanceErrorModeled::InstanceNameRequiredException(
                     InstanceNameRequiredException {
-                        message: Some("An on-premises instance name was not specified".to_string()),
+                        message: Some(crate::state::INSTANCE_NAME_MISSING.to_string()),
                     },
                 )
                 .into())

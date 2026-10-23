@@ -317,7 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }));
 
         let region = crate::state::request_region(ctx.parts());
-        let normalized_name = crate::state::normalize_workload_name(&input.workload_name);
+        let normalized_name = crate::state::normalize_unique_name(&input.workload_name);
 
         let mut store = state.lock();
 

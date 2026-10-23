@@ -52,3 +52,6 @@ mod theme_lifecycle;
 
 #[path = "all/theme_update.rs"]
 mod theme_update;
+
+#[path = "all/theme_updates.rs"]
+mod theme_updates;

@@ -766,6 +766,30 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
         access_points
     }
 
+    /// Accept a delete of the access point `access_point_id` names: the record moves
+    /// into its `deleting` phase and keeps answering reads until the clock removes it
+    /// ([`DELETING_FOR`]), which is what makes every delete that reaches a still-present
+    /// record succeed. The due instant is pinned by the FIRST accepted delete and is
+    /// never postponed by a later one, so repeated or concurrent deletes converge on
+    /// exactly one deletion at one instant.
+    ///
+    /// `false` when no record is present — the id was never minted, or its deletion has
+    /// already been materialised — which is the caller's `AccessPointNotFound`.
+    pub fn begin_access_point_deletion(
+        &mut self,
+        access_point_id: &str,
+        now: SystemTime,
+    ) -> bool {
+        let Some(access_point) = self.access_points.get_mut(access_point_id) else {
+            return false;
+        };
+        access_point.life_cycle_state = LIFE_CYCLE_DELETING.to_string();
+        if access_point.deleted_at.is_none() {
+            access_point.deleted_at = Some(now + DELETING_FOR);
+        }
+        true
+    }
+
     /// The tag set the resource a `ResourceId` names holds, or `None` when this store
     /// holds no such resource. The one way a tag set is read, so every reporting
     /// operation reads the set the writes left.
@@ -1092,21 +1116,6 @@ pub fn file_system_already_exists_message(
         "{FILE_SYSTEM_NOUN} {} already exists with creation token {}",
         quoted(existing_file_system_id),
         quoted(creation_token)
-    )
-}
-
-/// `AccessPointAlreadyExists`' message — "Returned if the access point that you are
-/// trying to create already exists, with the creation token you provided in the
-/// request": the same construction as [`file_system_already_exists_message`], over the
-/// existing access point's id and the `ClientToken` the request carried.
-pub fn access_point_already_exists_message(
-    existing_access_point_id: &str,
-    client_token: &str,
-) -> String {
-    format!(
-        "{ACCESS_POINT_NOUN} {} already exists with creation token {}",
-        quoted(existing_access_point_id),
-        quoted(client_token)
     )
 }
 

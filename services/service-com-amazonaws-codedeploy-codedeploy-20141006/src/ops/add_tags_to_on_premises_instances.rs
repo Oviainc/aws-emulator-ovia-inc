@@ -133,12 +133,15 @@ impl From<AddTagsToOnPremisesInstancesErrorModeled> for AddTagsToOnPremisesInsta
     }
 }
 
-/// This operation's `InstanceNameRequiredException` ("An on-premises instance
-/// name was not specified"), carrying `message`.
-fn name_required(message: &str) -> AddTagsToOnPremisesInstancesError {
+/// This operation's `InstanceNameRequiredException`, carrying the one sentence
+/// that error shape owns ([`crate::state::INSTANCE_NAME_MISSING`]): an empty
+/// list and a blank name are both "you did not give me an instance name", so
+/// they are worded the same here as at the boundary and in the other operations
+/// that raise this shape.
+fn name_required() -> AddTagsToOnPremisesInstancesError {
     AddTagsToOnPremisesInstancesErrorModeled::InstanceNameRequiredException(
         InstanceNameRequiredException {
-            message: Some(message.to_string()),
+            message: Some(crate::state::INSTANCE_NAME_MISSING.to_string()),
         },
     )
     .into()
@@ -187,9 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // did not give me a name / a tag" refusal.
         let names = input.instance_names;
         if names.is_empty() {
-            return Err(name_required(
-                "instanceNames must name at least one on-premises instance",
-            ));
+            return Err(name_required());
         }
         if names.len() > crate::state::MAX_INSTANCE_NAMES_PER_CALL {
             return Err(
@@ -210,9 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match crate::state::check_instance_name(name) {
                 Ok(()) => {}
                 Err(crate::state::NameRefusal::Missing) => {
-                    return Err(name_required(
-                        "An on-premises instance name was not specified",
-                    ));
+                    return Err(name_required());
                 }
                 Err(crate::state::NameRefusal::Malformed) => {
                     return Err(

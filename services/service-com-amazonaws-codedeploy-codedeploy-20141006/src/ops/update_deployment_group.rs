@@ -457,8 +457,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         return Err(
                             UpdateDeploymentGroupErrorModeled::DeploymentConfigDoesNotExistException(
                                 DeploymentConfigDoesNotExistException {
-                                    message: Some(format!(
-                                        "No deployment configuration found for name {name}"
+                                    message: Some(crate::state::deployment_config_not_found(
+                                        name,
                                     )),
                                 },
                             ),
@@ -475,8 +475,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     UpdateDeploymentGroupErrorModeled::ApplicationDoesNotExistException(
                         ApplicationDoesNotExistException {
-                            message: Some(format!(
-                                "No application found for name {application_name}"
+                            message: Some(crate::state::application_not_found(
+                                &application_name,
                             )),
                         },
                     ),
@@ -486,9 +486,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     UpdateDeploymentGroupErrorModeled::DeploymentGroupDoesNotExistException(
                         DeploymentGroupDoesNotExistException {
-                            message: Some(format!(
-                                "No deployment group found for name {current_name} in application \
-                                 {application_name}"
+                            message: Some(crate::state::deployment_group_not_found(
+                                &current_name,
                             )),
                         },
                     ),
@@ -505,9 +504,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         UpdateDeploymentGroupErrorModeled::DeploymentGroupAlreadyExistsException(
                             DeploymentGroupAlreadyExistsException {
-                                message: Some(format!(
-                                    "A deployment group named {new_name} already exists for \
-                                     application {application_name}"
+                                message: Some(crate::state::deployment_group_already_exists(
+                                    new_name,
                                 )),
                             },
                         ),

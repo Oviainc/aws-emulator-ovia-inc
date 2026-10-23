@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     RegisterApplicationRevisionErrorModeled::ApplicationDoesNotExistException(
                         ApplicationDoesNotExistException {
-                            message: Some(format!("No application found for name {name}")),
+                            message: Some(crate::state::application_not_found(&name)),
                         },
                     ),
                 );

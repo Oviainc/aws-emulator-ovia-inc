@@ -114,3 +114,5 @@ mod connectcampaigns_signing_name_routing;
 mod pi_data_source_ownership;
 #[path = "all/lex_signing_name_routing.rs"]
 mod lex_signing_name_routing;
+#[path = "all/lex_models_v2_runtime_v2_cross_service.rs"]
+mod lex_models_v2_runtime_v2_cross_service;

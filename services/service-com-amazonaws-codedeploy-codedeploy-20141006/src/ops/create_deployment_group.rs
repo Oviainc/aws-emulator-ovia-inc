@@ -312,7 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.service_role_arn.trim().is_empty() {
             return Err(CreateDeploymentGroupErrorModeled::RoleRequiredException(
                 RoleRequiredException {
-                    message: Some("The service role ARN was not specified".to_string()),
+                    message: Some(crate::state::ROLE_MISSING.to_string()),
                 },
             )
             .into());
@@ -367,8 +367,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         return Err(
                             CreateDeploymentGroupErrorModeled::DeploymentConfigDoesNotExistException(
                                 DeploymentConfigDoesNotExistException {
-                                    message: Some(format!(
-                                        "No deployment configuration found for name {name}"
+                                    message: Some(crate::state::deployment_config_not_found(
+                                        &name,
                                     )),
                                 },
                             ),
@@ -387,8 +387,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     CreateDeploymentGroupErrorModeled::ApplicationDoesNotExistException(
                         ApplicationDoesNotExistException {
-                            message: Some(format!(
-                                "No application found for name {application_name}"
+                            message: Some(crate::state::application_not_found(
+                                &application_name,
                             )),
                         },
                     ),
@@ -401,9 +401,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     CreateDeploymentGroupErrorModeled::DeploymentGroupAlreadyExistsException(
                         DeploymentGroupAlreadyExistsException {
-                            message: Some(format!(
-                                "A deployment group named {deployment_group_name} already exists \
-                                 for application {application_name}"
+                            message: Some(crate::state::deployment_group_already_exists(
+                                &deployment_group_name,
                             )),
                         },
                     ),
