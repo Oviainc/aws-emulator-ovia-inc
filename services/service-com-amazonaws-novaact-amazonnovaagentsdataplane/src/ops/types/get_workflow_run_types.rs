@@ -18,7 +18,15 @@ pub struct GetWorkflowRunInput {
     pub workflow_run_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.novaact#GetWorkflowRunResponse")]
+/// `GetWorkflowRunResponse`. Its schema and codec come from
+/// [`nova_act_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `startedAt` and `endedAt` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="operation",
+/// operation="GetWorkflowRun")`), and the derive does not put that trait on a member
+/// schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetWorkflowRunOutput {
     pub workflow_run_arn: String,
@@ -29,4 +37,19 @@ pub struct GetWorkflowRunOutput {
     pub model_id: String,
     pub log_group_name: Option<String>,
 }
+
+nova_act_schema_and_codec!(
+    GetWorkflowRunOutput,
+    GET_WORKFLOW_RUN_OUTPUT_SCHEMA,
+    "com.amazonaws.novaact#GetWorkflowRunResponse",
+    "com.amazonaws.novaact",
+    "GetWorkflowRunResponse",
+    (M_WORKFLOW_RUN_ARN, workflow_run_arn, "workflowRunArn", 0, req, string),
+    (M_WORKFLOW_RUN_ID, workflow_run_id, "workflowRunId", 1, req, string),
+    (M_STATUS, status, "status", 2, req, string),
+    (M_STARTED_AT, started_at, "startedAt", 3, req, date_time),
+    (M_ENDED_AT, ended_at, "endedAt", 4, opt, date_time),
+    (M_MODEL_ID, model_id, "modelId", 5, req, string),
+    (M_LOG_GROUP_NAME, log_group_name, "logGroupName", 6, opt, string),
+);
 
