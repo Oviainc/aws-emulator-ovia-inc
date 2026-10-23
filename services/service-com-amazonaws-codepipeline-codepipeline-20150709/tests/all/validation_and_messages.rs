@@ -467,6 +467,52 @@ async fn a_declaration_past_a_quota_is_refused_before_it_is_walked() {
         "an action past the configuration-entry limit is refused, got {status} {code} \
          {message:?}"
     );
+
+    // So are an action's artifact lists, on each of the two members and at the bound:
+    // the walk that pairs produced names with consumed ones is sized by these counts.
+    let artifacts = service_com_amazonaws_codepipeline_codepipeline_20150709::state::MAX_ARTIFACTS_PER_ACTION;
+    for (case, count, accepted) in [
+        ("at the per-action artifact limit", artifacts, true),
+        ("one past the per-action artifact limit", artifacts + 1, false),
+    ] {
+        let outputs: Vec<Value> = (0..count)
+            .map(|index| json!({"name": format!("{}Out{index}", case.len())}))
+            .collect();
+        let body = declaration(
+            &format!("quota-artifacts-{count}"),
+            json!([{
+                "name": "Source",
+                "actions": [{
+                    "name": "Src",
+                    "actionTypeId": {
+                        "category": "Source", "owner": "AWS", "provider": "S3", "version": "1"
+                    },
+                    "configuration": {"S3Bucket": "b", "S3ObjectKey": "k"},
+                    "outputArtifacts": outputs,
+                }],
+            }]),
+        );
+        if accepted {
+            let (status, answer) = emulator.cp("CreatePipeline", &body).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a declaration inside the artifact limit is accepted, got \
+                 {status} with {answer}"
+            );
+            continue;
+        }
+        let (status, code, message) = emulator.refusal("CreatePipeline", &body).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "LimitExceededException"),
+            "case {case:?}: expected a 400 LimitExceededException, got {status} {code} \
+             {message:?}"
+        );
+        assert!(
+            message.contains("outputArtifacts") && message.contains("limit of"),
+            "case {case:?}: the refusal names the member and the limit, got {message:?}"
+        );
+    }
 }
 
 #[tokio::test]
