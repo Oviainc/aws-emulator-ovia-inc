@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a rule group and persists it, so `GetRuleGroup` reads it back and a web
+//! ACL rule can reference it by ARN. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -218,18 +213,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRuleGroup"))
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(CreateRuleGroupErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_SCOPE_VALUE,
+                    &input.scope,
+                    "the scope names the namespace the rule group lives in, and is one of CLOUDFRONT or REGIONAL",
+                ),
+            )
+            .into());
+        }
+
+        // The rule tree comes straight off the wire and nests, so its depth is
+        // bounded here, before anything walks or stores it.
+        if let Err(reason) =
+            crate::state::validate_statement_nesting(input.rules.as_deref().unwrap_or_default())
+        {
+            return Err(CreateRuleGroupErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_STATEMENT,
+                    "Rules",
+                    &reason,
+                ),
+            )
+            .into());
+        }
+
+        // "You cannot use a rule group reference statement inside another rule
+        // group" (`RuleGroupReferenceStatement`'s own doc), so no rule of THIS rule
+        // group may carry one, nested or not.
+        if let Some(reason) = crate::state::misplaced_rule_group_reference(
+            input.rules.as_deref().unwrap_or_default(),
+            false,
+        ) {
+            return Err(CreateRuleGroupErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_RULE_GROUP_REFERENCE_STATEMENT,
+                    "Rules",
+                    &reason,
+                ),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRuleGroupErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+
+        // Every reference the rule tree carries must name an entity this service
+        // holds, in this scope: a dangling reference is refused, not stored.
+        if let Some(reason) = state
+            .unresolvable_rule_reference(&input.scope, input.rules.as_deref().unwrap_or_default())
+        {
+            crate::state::audit(
+                "CreateRuleGroup",
+                &input.scope,
+                &input.name,
+                "",
+                // The reference that could not be resolved is a diagnostic, so it is
+                // recorded here; the refusal itself carries the exception type's
+                // constant sentence.
+                &format!("WAFNonexistentItemException: {reason}"),
+            );
+            return Err(CreateRuleGroupErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
+            )
+            .into());
+        }
+
+        // "You cannot change the name of a rule group after you create it"
+        // (`Name`'s doc), and a scope is a namespace, so a name already taken in
+        // this scope is a duplicate.
+        let name_key = (input.scope.clone(), input.name.clone());
+        if state.rule_group_names.contains_key(&name_key) {
+            crate::state::audit(
+                "CreateRuleGroup",
+                &input.scope,
+                &input.name,
+                "",
+                "WAFDuplicateItemException",
+            );
+            return Err(CreateRuleGroupErrorModeled::WAFDuplicateItemException(
+                crate::state::duplicate_item_exception(),
+            )
+            .into());
+        }
+
+        if state.rule_groups_in_scope(&input.scope) >= crate::state::MAX_RULE_GROUPS_PER_SCOPE {
+            crate::state::audit(
+                "CreateRuleGroup",
+                &input.scope,
+                &input.name,
+                "",
+                "WAFLimitsExceededException",
+            );
+            return Err(CreateRuleGroupErrorModeled::WAFLimitsExceededException(
+                crate::state::limits_exceeded_exception(),
+            )
+            .into());
+        }
+
+        let id = crate::state::new_uuid();
+        let lock_token = crate::state::new_uuid();
+        let arn = crate::state::resource_arn(
+            &input.scope,
+            &region,
+            crate::state::RULE_GROUP_ARN_KIND,
+            &input.name,
+            &id,
+        );
+        let mut rule_group = RuleGroup {
+            name: input.name.clone(),
+            id: id.clone(),
+            // "When you create your own rule group, you define this, and you cannot
+            // change it after creation" (`Capacity`'s doc): the declared value is
+            // stored verbatim, unlike `WebACL$Capacity`, which is derived from the
+            // rules. The rules are NOT priced against it here — the WCU table this
+            // crate carries is pinned from the Developer Guide and a few recorded
+            // responses rather than published per statement, so refusing a save on
+            // it would invent refusals WAF does not make (`CheckCapacity`, which
+            // reports that price, is its own gap issue).
+            capacity: input.capacity,
+            arn: arn.clone(),
+            description: input.description.clone(),
+            rules: input.rules.clone(),
+            visibility_config: input.visibility_config.clone(),
+            label_namespace: Some(crate::state::label_namespace(
+                crate::state::RULE_GROUP_ARN_KIND,
+                &input.name,
+            )),
+            custom_response_bodies: input.custom_response_bodies.clone(),
+            // Derived from the stored rules by `apply_rule_group_defaults` below.
+            available_labels: None,
+            consumed_labels: None,
+            monetization_config: input.monetization_config.clone(),
+        };
+        crate::state::apply_rule_group_defaults(&mut rule_group);
+        let summary = RuleGroupSummary {
+            name: Some(rule_group.name.clone()),
+            id: Some(rule_group.id.clone()),
+            description: rule_group.description.clone(),
+            lock_token: Some(lock_token.clone()),
+            arn: Some(rule_group.arn.clone()),
+        };
+
+        state.arn_index.insert(
+            arn,
+            crate::state::ResourceRef::RuleGroup {
+                scope: input.scope.clone(),
+                id: id.clone(),
+            },
+        );
+        state.rule_group_names.insert(name_key, id.clone());
+        state.rule_groups.insert(
+            (input.scope.clone(), id.clone()),
+            crate::state::RuleGroupEntry {
+                scope: input.scope.clone(),
+                rule_group,
+                lock_token,
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+        crate::state::audit("CreateRuleGroup", &input.scope, &input.name, &id, "created");
+
+        Ok(CreateRuleGroupOutput {
+            summary: Some(summary),
+        })
     }
 }

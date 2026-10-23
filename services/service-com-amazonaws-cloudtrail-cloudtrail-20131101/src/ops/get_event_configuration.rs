@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEventConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEventConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEventConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the event configuration of ONE resource: the maximum event size and
+//! the context key selectors of an event data store, or the aggregation
+//! configuration of a trail. `TrailName` and `EventDataStore` are both optional in
+//! the model and name resources of different kinds, so exactly one of them
+//! addresses the call ([`crate::state::event_configuration_target`]) — the same
+//! rule `PutEventConfiguration` reads the pair by.
+//!
+//! It is a pure read: every member of the answer is the value
+//! `PutEventConfiguration` persisted, and nothing in either registry changes.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +195,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEventConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEventConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEventConfiguration"))
+        let region = crate::state::request_region(ctx.parts());
+
+        // Which resource this call reports on — the rule `PutEventConfiguration`
+        // writes by.
+        let target = crate::state::event_configuration_target(
+            input.trail_name.as_deref(),
+            input.event_data_store.as_deref(),
+        )
+        .map_err(refuse_target)?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetEventConfigurationErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "GetEventConfiguration needs the CloudTrail trail and event data \
+                         store registries, which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        match target {
+            crate::state::EventConfigurationTarget::EventDataStore(identifier) => {
+                let parsed = crate::state::parse_event_data_store_identifier(&identifier)
+                    .map_err(|rejection| {
+                        GetEventConfigurationErrorModeled::EventDataStoreARNInvalidException(
+                            EventDataStoreARNInvalidException {
+                                message: Some(rejection.message(&region)),
+                            },
+                        )
+                    })?;
+                let Some(record) = store.addressed_event_data_store(&parsed, &region) else {
+                    return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                        GetEventConfigurationErrorModeled::EventDataStoreNotFoundException(
+                            EventDataStoreNotFoundException {
+                                message: Some(crate::state::event_data_store_not_found_message(
+                                    &parsed.arn(&region),
+                                )),
+                            },
+                        ),
+                        EVENT_DATA_STORE_NOT_FOUND_STATUS,
+                    ));
+                };
+                // Every store has a maximum event size, so it is always reported;
+                // selectors nobody has configured stay absent rather than
+                // becoming an empty list.
+                Ok(GetEventConfigurationOutput {
+                    event_data_store_arn: Some(record.arn()),
+                    max_event_size: Some(record.max_event_size.as_wire().to_string()),
+                    context_key_selectors: (!record.context_key_selectors.is_empty())
+                        .then(|| record.context_key_selectors.clone()),
+                    trail_arn: None,
+                    aggregation_configurations: None,
+                })
+            }
+            crate::state::EventConfigurationTarget::Trail(identifier) => {
+                // A malformed identifier is refused as the form it was written
+                // in, the way every other trail operation refuses it.
+                let Some(record) = store.resolve(&identifier, &region).map_err(|rejection| {
+                    match rejection {
+                        crate::state::IdentifierRejection::InvalidArn(message) => {
+                            GetEventConfigurationErrorModeled::CloudTrailARNInvalidException(
+                                CloudTrailARNInvalidException {
+                                    message: Some(message),
+                                },
+                            )
+                        }
+                        crate::state::IdentifierRejection::InvalidName(message) => {
+                            GetEventConfigurationErrorModeled::InvalidTrailNameException(
+                                InvalidTrailNameException {
+                                    message: Some(message),
+                                },
+                            )
+                        }
+                    }
+                })?
+                else {
+                    return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                        GetEventConfigurationErrorModeled::TrailNotFoundException(
+                            TrailNotFoundException {
+                                message: Some(crate::state::unknown_trail_message(&identifier)),
+                            },
+                        ),
+                        TRAIL_NOT_FOUND_STATUS,
+                    ));
+                };
+                Ok(GetEventConfigurationOutput {
+                    trail_arn: Some(record.trail_arn.clone()),
+                    aggregation_configurations: (!record.aggregation_configurations.is_empty())
+                        .then(|| record.aggregation_configurations.clone()),
+                    event_data_store_arn: None,
+                    max_event_size: None,
+                    context_key_selectors: None,
+                })
+            }
+        }
     }
 }
+
+/// The HTTP status this service answers an event data store not-found refusal
+/// with: the model annotates `EventDataStoreNotFoundException` `@httpError(404)`
+/// and the recorded CloudTrail response carries 400, which is the status
+/// `get_event_data_store` states for the same error from the same evidence.
+const EVENT_DATA_STORE_NOT_FOUND_STATUS: u16 = 400;
+
+/// The HTTP status this service answers a trail not-found refusal with: the model
+/// annotates `TrailNotFoundException` `@httpError(404)` and the recorded
+/// CloudTrail response for an awsJson1_1 trail operation on an absent trail is
+/// HTTP 400 with `__type` `TrailNotFoundException` (issue
+/// `20261022T230533Z-cloudtrail-trail-validation-and-not-found-rejections-answer.md`,
+/// cause 6).
+const TRAIL_NOT_FOUND_STATUS: u16 = 400;
+
+/// Refuse a request that does not address exactly one resource, the way
+/// `PutEventConfiguration` refuses it: naming both resources, and naming
+/// neither, are both combinations of parameters that cannot hold together, which
+/// is the modelled `InvalidParameterCombinationException`.
+fn refuse_target(
+    rejection: crate::state::EventConfigurationTargetRejection,
+) -> GetEventConfigurationError {
+    GetEventConfigurationErrorModeled::InvalidParameterCombinationException(
+        InvalidParameterCombinationException {
+            message: Some(rejection.message()),
+        },
+    )
+    .into()
+}
+

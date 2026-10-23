@@ -9,6 +9,10 @@
 //! The workload estimate is the other root resource, kept in its own insertion-ordered
 //! collection beside the scenarios, and sharing their id space (every `ResourceId` this
 //! service mints is unique across both) and their idempotency map.
+//!
+//! Beside the resources, the store carries the two facts about the ACCOUNT this service
+//! answers for: its rate-type [`Preferences`], and its [`AccountClass`], which decides
+//! whether the bill-planning surface is open to the caller at all.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -16,7 +20,7 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     BillInterval, Expression, HistoricalUsageEntity, UsageAmount, UsageQuantity,
-    WorkloadEstimateUsageQuantity,
+    ValidationException, WorkloadEstimateUsageQuantity,
 };
 
 /// The region an ARN carries when the request's SigV4 credential scope names none.
@@ -549,6 +553,65 @@ impl BillScenario {
     }
 }
 
+/// The rate-type selection an account that has never written one has in effect.
+///
+/// CHOSEN, not documented: neither the Smithy model nor the API reference states the
+/// selection the service applies before anybody writes one. A selection there has to be,
+/// though, and it cannot be the empty list: `GetPreferences` is a read of the account's
+/// EFFECTIVE preferences — the rate types Pricing Calculator quotes with, which exist
+/// from the moment the account does — and `RateTypes` is `@length 1..3` (smithy_query:
+/// `shape="RateTypes"`), so an empty or absent selection is not a value the service can
+/// legitimately report. The value picked is the un-discounted list rate, `RateType`'s
+/// `BEFORE_DISCOUNTS`: the only rate a calculator can quote knowing nothing about an
+/// account's discounts or commitments.
+pub const DEFAULT_RATE_TYPE_SELECTION: &str = "BEFORE_DISCOUNTS";
+
+/// Which kind of account, in AWS Organizations terms, this service presents its caller
+/// as. It decides the account-class gate in
+/// [`ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::member_account_refusal`],
+/// so it is stored rather than re-derived per call: every operation of one store answers
+/// for the same account.
+///
+/// The model carries this three-way split itself — `GetPreferences` and
+/// `UpdatePreferences` report one rate-type selection per account class
+/// (management/member/standalone), and `ValidationExceptionReason` has the value
+/// `invalidRequestFromMember` for a request a member account may not make.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AccountClass {
+    /// An account whose bills another account in its organization pays. This is the
+    /// DEFAULT, and it is what this emulator presents unless a store is built stating
+    /// otherwise: it is the account class the recorded behaviour of this service was
+    /// observed in, so the refusals a member account gets are the ones a caller of an
+    /// unconfigured emulator sees.
+    #[default]
+    Member,
+    /// The payer (management) account of an organization: it pays its members' bills, so
+    /// it may plan them.
+    Management,
+    /// An account in no organization at all, which pays only for itself.
+    Standalone,
+}
+
+impl AccountClass {
+    /// Whether an account of this class may reach the bill-planning surface — the bill
+    /// scenarios and the bill estimates derived from them, and the write of the
+    /// account-level rate-type preferences.
+    ///
+    /// A member account may not: those subjects belong to whichever account pays the
+    /// bill being modelled, which is the organization's payer account or, for an account
+    /// in no organization, itself.
+    pub fn may_plan_bills(self) -> bool {
+        matches!(self, Self::Management | Self::Standalone)
+    }
+}
+
+/// `ValidationExceptionReason`'s value for a request the caller's account class does not
+/// permit (smithy_query: `shape="ValidationExceptionReason"` → `unknownOperation |
+/// cannotParse | fieldValidationFailed | invalidRequestFromMember | disallowedRate |
+/// other`). The wire value is the model's own spelling, so a client that matches on the
+/// modelled enum recognises it.
+pub const VALIDATION_REASON_INVALID_REQUEST_FROM_MEMBER: &str = "invalidRequestFromMember";
+
 /// The account's Pricing Calculator preferences: the preferred rate types for each
 /// kind of account, written by `UpdatePreferences` and reported by `GetPreferences`.
 ///
@@ -556,19 +619,31 @@ impl BillScenario {
 /// is made for, and this emulator serves a single account (`engine::mock_account_id`),
 /// so a second key would only ever hold that one record.
 ///
-/// Every selection is optional because an account that has never stated a preference
-/// for that kind of account has none — `RateTypes` is an optional member of both the
-/// `GetPreferences` and the `UpdatePreferences` response precisely so it can be
-/// absent. Neither the Smithy model nor the API reference states a selection the
-/// service applies in the account's place, so this emulator invents none: a
-/// preference nobody set reads back unset rather than as a fabricated default.
-#[derive(Debug, Clone, Default)]
+/// Every selection is held as a NON-EMPTY list rather than an option, because the
+/// account's effective preferences exist whether or not anybody wrote them: the record a
+/// fresh store holds is [`DEFAULT_RATE_TYPE_SELECTION`] for each of the three account
+/// classes, and a write replaces a selection rather than bringing it into being. That is
+/// what lets `GetPreferences` report all three members for an account that never called
+/// `UpdatePreferences`, which a `@length 1..3` list could not do with an empty or absent
+/// value.
+#[derive(Debug, Clone)]
 pub struct Preferences {
     /// `RateTypes` (len 1..3, of `RateType`: `BEFORE_DISCOUNTS` | `AFTER_DISCOUNTS` |
     /// `AFTER_DISCOUNTS_AND_COMMITMENTS`) — smithy_query: `shape="RateType"`.
-    pub management_account_rate_type_selections: Option<Vec<String>>,
-    pub member_account_rate_type_selections: Option<Vec<String>>,
-    pub standalone_account_rate_type_selections: Option<Vec<String>>,
+    pub management_account_rate_type_selections: Vec<String>,
+    pub member_account_rate_type_selections: Vec<String>,
+    pub standalone_account_rate_type_selections: Vec<String>,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        let default_selection = || vec![DEFAULT_RATE_TYPE_SELECTION.to_string()];
+        Self {
+            management_account_rate_type_selections: default_selection(),
+            member_account_rate_type_selections: default_selection(),
+            standalone_account_rate_type_selections: default_selection(),
+        }
+    }
 }
 
 impl Preferences {
@@ -584,13 +659,13 @@ impl Preferences {
         standalone_account_rate_type_selections: Option<Vec<String>>,
     ) {
         if let Some(selections) = management_account_rate_type_selections {
-            self.management_account_rate_type_selections = Some(selections);
+            self.management_account_rate_type_selections = selections;
         }
         if let Some(selections) = member_account_rate_type_selections {
-            self.member_account_rate_type_selections = Some(selections);
+            self.member_account_rate_type_selections = selections;
         }
         if let Some(selections) = standalone_account_rate_type_selections {
-            self.standalone_account_rate_type_selections = Some(selections);
+            self.standalone_account_rate_type_selections = selections;
         }
     }
 }
@@ -633,11 +708,40 @@ pub struct ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
     pub idempotency: HashMap<String, IdempotentRecord>,
     /// The rate-type preferences `UpdatePreferences` last stored, which
     /// `GetPreferences` reports. Default-constructed: an account that never called
-    /// `UpdatePreferences` has stated no preference at all.
+    /// `UpdatePreferences` has the effective selections [`Preferences::default`] holds.
     pub preferences: Preferences,
+    /// Which kind of account this store answers for; see [`AccountClass`].
+    pub account_class: AccountClass,
 }
 
 impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
+    /// The refusal the caller's account class owes this request, or `None` when that
+    /// class may make it.
+    ///
+    /// The bill-planning surface — the bill scenarios, the bill estimates derived from
+    /// them, and the write of the account-level rate-type preferences — belongs to the
+    /// account that pays the bill being modelled
+    /// ([`AccountClass::may_plan_bills`]). A request for one of those subjects from a
+    /// member account is refused whatever it carries, so the refusal is answered BEFORE
+    /// the request is read and before anything is written, and reports the modelled
+    /// `reason` ([`VALIDATION_REASON_INVALID_REQUEST_FROM_MEMBER`]) so a client can tell
+    /// an account-class refusal from a malformed-field one.
+    ///
+    /// `fieldList` is left unset: no field of the request is at fault.
+    pub fn member_account_refusal(&self, operation: &str) -> Option<ValidationException> {
+        if self.account_class.may_plan_bills() {
+            return None;
+        }
+        Some(ValidationException {
+            message: format!(
+                "Operation {operation} is not permitted for member accounts. This API is \
+                 only allowed for regular or payer accounts."
+            ),
+            reason: Some(VALIDATION_REASON_INVALID_REQUEST_FROM_MEMBER.to_string()),
+            field_list: None,
+        })
+    }
+
     /// The scenario with this id, or `None` when it was never created or was deleted.
     pub fn bill_scenario(&self, id: &str) -> Option<&BillScenario> {
         self.bill_scenarios.iter().find(|s| s.id == id)
@@ -829,6 +933,7 @@ impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
             workload_estimates,
             idempotency,
             preferences: _,
+            account_class: _,
         } = self;
         let live: std::collections::HashSet<&str> = bill_scenarios
             .iter()

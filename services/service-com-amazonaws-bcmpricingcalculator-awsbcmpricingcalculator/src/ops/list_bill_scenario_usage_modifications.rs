@@ -11,6 +11,12 @@
 //! the page size and `nextToken` is emitted only while items remain. A `billScenarioId`
 //! no live scenario carries is `ResourceNotFoundException` (HTTP 404).
 //!
+//! WHICH ACCOUNTS MAY CALL: a usage modification only exists inside a bill scenario, so
+//! it belongs to the same account class that may plan one — a member account's request is
+//! refused with the modelled `ValidationException` (HTTP 400) carrying `reason`
+//! `invalidRequestFromMember` before anything is read (the store's own
+//! `member_account_refusal`).
+//!
 //! One limitation worth stating: `LOCATION` (and `HISTORICAL_LOCATION` for an entry
 //! that sent no `historicalUsage.location`) selects on a value this emulator never
 //! has, because a usage type's pricing location comes from the pricing catalog it does
@@ -94,11 +100,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-bcmpricingcalculator-aw
 // here — hence the `ListBillScenarioUsageModificationsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.bcmpricingcalculator#ListBillScenarioUsageModifications")]
+// `ValidationException` is widened in through `extra_errors`: this SERVICE models it
+// (smithy_query `query="service_info"`: `common_errors`) but this operation does not
+// list it, and it is the modelled answer to a request the caller's account class does
+// not permit — the only one of this operation's errors that carries a `reason`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.bcmpricingcalculator#ListBillScenarioUsageModifications",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum ListBillScenarioUsageModificationsErrorModeled {
     DataUnavailableException(DataUnavailableException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -182,6 +196,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let mut state = store.lock();
+        // The account-class gate, before anything is read: a usage modification only
+        // exists inside a bill scenario, so it belongs to the same account class that
+        // may plan one — the read of it as much as the write.
+        if let Some(refusal) = state.member_account_refusal(Self::NAME) {
+            return Err(
+                ListBillScenarioUsageModificationsErrorModeled::ValidationException(refusal).into(),
+            );
+        }
         // Materialise the expiry the clock has already made due, so a scenario past its
         // `expiresAt` reads as gone rather than lingering for the life of the process.
         state.purge_expired(crate::state::now_secs());

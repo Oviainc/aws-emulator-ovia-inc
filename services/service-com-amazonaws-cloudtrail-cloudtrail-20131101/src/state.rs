@@ -23,8 +23,9 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AdvancedEventSelector, EventSelector, ImportSource, ImportStatistics, PartitionKey,
-    RefreshSchedule, RequestWidget, Tag, Trail, TrailInfo, Widget,
+    AdvancedEventSelector, AggregationConfiguration, ContextKeySelector, EventSelector,
+    ImportSource, ImportStatistics, PartitionKey, RefreshSchedule, RequestWidget, Tag, Trail,
+    TrailInfo, Widget,
 };
 
 /// The Region a request is served in when it carries no SigV4 credential scope to
@@ -194,6 +195,11 @@ pub struct TrailRecord {
     /// Set by `PutInsightSelectors`, which is not implemented yet, so a trail is
     /// created without Insights selectors.
     pub has_insight_selectors: bool,
+    /// The event aggregation this trail is configured with, as
+    /// `PutEventConfiguration` sets it and `GetEventConfiguration` reports it.
+    /// Empty for a trail nobody has configured aggregation for; the model bounds
+    /// `AggregationConfigurations` to 0..=1 entries.
+    pub aggregation_configurations: Vec<AggregationConfiguration>,
     pub tags: Vec<Tag>,
     pub status: TrailStatus,
 }
@@ -724,6 +730,43 @@ impl FederationState {
     }
 }
 
+/// The maximum size an event stored in an event data store may have: one variant
+/// per value of the model's `MaxEventSize` enum
+/// (`ops::types::MAX_EVENT_SIZE_VALUES`).
+///
+/// `Standard` is the default because `Large` is reachable only by asking for it:
+/// "If you are using context key selectors, MaxEventSize must be set to Large"
+/// (model doc for `PutEventConfigurationRequest$MaxEventSize`), so a store nobody
+/// has configured carries the smaller limit.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MaxEventSizeSetting {
+    #[default]
+    Standard,
+    Large,
+}
+
+impl MaxEventSizeSetting {
+    /// The value this setting carries on the wire.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard",
+            Self::Large => "Large",
+        }
+    }
+
+    /// Read a wire value of the model's `MaxEventSize` enum.
+    ///
+    /// `None` is a value outside the enum, which the boundary validator refuses
+    /// before a handler sees it.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "Standard" => Some(Self::Standard),
+            "Large" => Some(Self::Large),
+            _ => None,
+        }
+    }
+}
+
 /// How long an event data store reads `ENABLING` / `DISABLING` before the clock
 /// settles it into `ENABLED` / `DISABLED`.
 ///
@@ -780,6 +823,14 @@ pub struct EventDataStoreRecord {
     /// The keys CloudTrail Lake partitions the store's event data by. The model
     /// bounds `PartitionKeyList` to 0..=2 entries.
     pub partition_keys: Vec<PartitionKey>,
+    /// The largest event the store accepts, as `PutEventConfiguration` sets it
+    /// and `GetEventConfiguration` reports it.
+    pub max_event_size: MaxEventSizeSetting,
+    /// The context keys CloudTrail includes in this store's enriched events, as
+    /// `PutEventConfiguration` sets them and `GetEventConfiguration` reports
+    /// them. Empty for a store nobody has configured; the model bounds
+    /// `ContextKeySelectors` to 0..=2 entries.
+    pub context_key_selectors: Vec<ContextKeySelector>,
     pub tags: Vec<Tag>,
 }
 
@@ -1044,6 +1095,78 @@ pub fn event_data_store_arn_invalid_message(value: &str, request_region: &str) -
     };
     format!("The event data store ARN {addressed} format is not valid.")
 }
+
+// ---------------------------------------------------------------------------
+// Event configuration (`PutEventConfiguration` / `GetEventConfiguration`)
+// ---------------------------------------------------------------------------
+
+/// Which resource an event-configuration call addresses.
+///
+/// `TrailName` and `EventDataStore` are both optional in the model and name
+/// different resources, so the two operations that carry them —
+/// `PutEventConfiguration` and `GetEventConfiguration` — read the pair the same
+/// way: exactly one of them addresses the call's resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventConfigurationTarget {
+    /// The call addresses a trail, by name or by trail ARN.
+    Trail(String),
+    /// The call addresses an event data store, by ARN or by the id suffix of
+    /// one.
+    EventDataStore(String),
+}
+
+/// Why a request names no single event-configuration resource.
+///
+/// Both halves of the rule — naming neither resource and naming both — are the
+/// modelled `InvalidParameterCombinationException` ("This exception is thrown
+/// when the combination of parameters provided is not valid"), worded the way the
+/// recorded response of the real service words it, so the rejection carries only
+/// that text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventConfigurationTargetRejection(pub String);
+
+impl EventConfigurationTargetRejection {
+    /// The refusal text: it states the rule the request broke.
+    pub fn message(self) -> String {
+        self.0
+    }
+}
+
+/// The refusal text for a call that does not address exactly one resource, as the
+/// recorded response of the real service words it.
+pub const NO_SINGLE_EVENT_CONFIGURATION_RESOURCE_MESSAGE: &str =
+    "You must specify either a trail or an event data store.";
+
+/// Read the resource an event-configuration call addresses from the `TrailName`
+/// / `EventDataStore` pair.
+pub fn event_configuration_target(
+    trail_name: Option<&str>,
+    event_data_store: Option<&str>,
+) -> Result<EventConfigurationTarget, EventConfigurationTargetRejection> {
+    match (trail_name, event_data_store) {
+        (Some(name), None) => Ok(EventConfigurationTarget::Trail(name.to_string())),
+        (None, Some(store)) => Ok(EventConfigurationTarget::EventDataStore(store.to_string())),
+        // Neither resource leaves the call with nothing to address; both address
+        // two resources of different kinds. Either way the pair cannot hold
+        // together.
+        (Some(_), Some(_)) | (None, None) => Err(EventConfigurationTargetRejection(
+            NO_SINGLE_EVENT_CONFIGURATION_RESOURCE_MESSAGE.to_string(),
+        )),
+    }
+}
+
+/// The refusal text for a `PutEventConfiguration` call that addresses an event
+/// data store without stating the configuration to apply to it, as the recorded
+/// response of the real service words it.
+pub const MISSING_EVENT_DATA_STORE_CONFIGURATION_MESSAGE: &str =
+    "You must specify the maximum event size and context key selectors.";
+
+/// The refusal text for a `PutEventConfiguration` call that addresses a trail
+/// without stating the configuration to apply to it. `AggregationConfigurations`
+/// is the only trail-level setting this operation carries ("The list of
+/// aggregation configurations that you want to configure for the trail").
+pub const MISSING_TRAIL_CONFIGURATION_MESSAGE: &str =
+    "You must specify the aggregation configurations.";
 
 /// Per-service state for com-amazonaws-cloudtrail-cloudtrail-20131101. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
