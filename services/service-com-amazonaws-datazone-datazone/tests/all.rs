@@ -27,6 +27,8 @@ mod form_type_revisions;
 mod glossary_lifecycle;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/listing_change_set.rs"]
+mod listing_change_set;
 #[path = "all/policy_grants.rs"]
 mod policy_grants;
 #[path = "all/project_memberships.rs"]
