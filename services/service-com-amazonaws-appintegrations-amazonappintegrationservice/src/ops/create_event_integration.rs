@@ -195,6 +195,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Checked BEFORE the write, so this in-memory store cannot be grown without end
+        // one request at a time; a caller's `DeleteEventIntegration` frees a slot again.
+        if !state.has_room_for_another_event_integration() {
+            return Err(
+                CreateEventIntegrationErrorModeled::ResourceQuotaExceededException(
+                    ResourceQuotaExceededException {
+                        message: Some(format!(
+                            "The allowed quota for the resource has been exceeded: at most \
+                             {} EventIntegrations can exist.",
+                            crate::state::MAX_STORED_EVENT_INTEGRATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::event_integration_arn(&region, &input.name);
         let now = ::std::time::SystemTime::now();
@@ -216,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_modified_time: now,
         };
         if let Some(token) = input.client_token {
-            state.idempotency.insert(token, input.name.clone());
+            state.remember_event_client_token(token, input.name.clone());
         }
         state.event_integrations.insert(input.name, record);
 

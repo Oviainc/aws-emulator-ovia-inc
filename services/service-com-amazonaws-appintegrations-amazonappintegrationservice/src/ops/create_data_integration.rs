@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates and persists one DataIntegration: the service mints its `Id` and `Arn`,
+//! resolves the required `KmsKey` against KMS, and stores everything the request
+//! carried so `GetDataIntegration` reports the identical values this call returned.
 //!
 //! ## Shape of an operation
 //!
@@ -169,6 +164,119 @@ pub struct CreateDataIntegration<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// What KMS answered about the `KmsKey` this request named.
+#[derive(Debug, PartialEq, Eq)]
+enum KeyLookup {
+    /// KMS reported the key: it exists and this caller can read it.
+    Resolved,
+    /// KMS reported that the value names no key it can resolve — the key does not
+    /// exist, or is not an ARN KMS can read at all. The reason it gave, for the
+    /// refusal's text.
+    Unresolvable(String),
+    /// KMS gave no answer about this key (it was unreachable, or failed for a reason
+    /// that says nothing about the key itself). Not a negative, so not a refusal.
+    Indeterminate,
+}
+
+/// A KMS client over the in-process callback into this same emulator.
+///
+/// The callback is the framework's documented seam for calling another emulated
+/// service: it routes in process, so no network client is configured here and this
+/// service names no other service's crate. `region` is the request's own signing
+/// region, so the key is looked up where this DataIntegration's ARN says it lives.
+fn kms_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_kms::Client {
+    let config = ::aws_sdk_kms::Config::builder()
+        .behavior_version(::aws_sdk_kms::config::BehaviorVersion::latest())
+        .region(::aws_sdk_kms::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://kms.{region}.amazonaws.com"))
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or watch
+        // for a stalled stream, and each of those would need a sleep implementation
+        // this client is not given. The same goes for caching the identity: the
+        // credentials are handed over directly.
+        .retry_config(::aws_sdk_kms::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_kms::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_kms::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_kms::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_kms::Client::from_conf(config)
+}
+
+/// Ask KMS about `kms_key`.
+///
+/// `DescribeKey` is the read AWS itself performs here: the DataIntegration is encrypted
+/// with the caller's key, so the service resolves it before it persists anything (the
+/// recorded refusal even carries the request id of that failed KMS lookup).
+///
+/// The answer is a definite negative only when KMS names one of
+/// [`KEY_NEGATIVE_KMS_ERROR_CODES`] with a client status: those codes say the key
+/// cannot be read at all — it does not exist, the value is not a key ARN, this caller
+/// may not read it. Anything else is reported as [`KeyLookup::Indeterminate`] and the create proceeds rather than refusing a key
+/// nothing said was bad: a server fault, a throttle or another key-agnostic condition,
+/// a reply carrying no KMS error code at all (a routing failure rather than a KMS
+/// answer, as when KMS is not mounted beside this service), or a lookup that never
+/// reached KMS.
+async fn describe_kms_key(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kms_key: &str,
+) -> KeyLookup {
+    let err = match kms_client(ctx, region)
+        .describe_key()
+        .key_id(kms_key)
+        .send()
+        .await
+    {
+        Ok(_) => return KeyLookup::Resolved,
+        Err(err) => err,
+    };
+    let reason = ::aws_smithy_types::error::display::DisplayErrorContext(&err).to_string();
+    // The status KMS answered with, when it answered at all: a 5xx is about KMS, not
+    // about the key, whatever code travels with it.
+    let client_error = err
+        .raw_response()
+        .is_some_and(|response| response.status().is_client_error());
+    let code = ::aws_sdk_kms::error::ProvideErrorMetadata::code(&err).unwrap_or_default();
+    let about_the_key = KEY_NEGATIVE_KMS_ERROR_CODES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(code));
+    if client_error && about_the_key {
+        return KeyLookup::Unresolvable(reason);
+    }
+    // Visible to an operator: an indeterminate lookup is accepted, so without this line
+    // it would be indistinguishable from a key KMS resolved.
+    ::tracing::warn!(
+        kms_key,
+        error = %reason,
+        "KMS gave no answer about this DataIntegration's KmsKey; accepting it"
+    );
+    KeyLookup::Indeterminate
+}
+
+/// The KMS error codes that say the `KmsKey` the lookup named cannot be read at all,
+/// rather than something about the call, about KMS, or about the key's current state:
+/// the two codes `DescribeKey` models for an identifier it cannot resolve
+/// (`NotFoundException` for a key ARN naming no key, `InvalidArnException` for a value
+/// that is not a key ARN), and the authorization refusal for a key this caller may not
+/// read.
+///
+/// Deliberately NOT the state codes (`DisabledException`, `KMSInvalidStateException`):
+/// those describe a key that DOES resolve, and no recording says this service refuses a
+/// create for one — AWS can accept such a key and fail only when it comes to use it. A
+/// code outside this list, or no code at all, leaves the lookup indeterminate, so a
+/// condition nobody attributed to the key's existence never refuses a create.
+const KEY_NEGATIVE_KMS_ERROR_CODES: &[&str] = &[
+    "AccessDeniedException",
+    "InvalidArnException",
+    "NotFoundException",
+];
+
 impl<Eng> CreateDataIntegration<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -195,18 +303,175 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataIntegration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDataIntegrationErrorModeled::InternalServiceError(InternalServiceError {
+                message: Some("the AppIntegrations store is unavailable".to_string()),
+            })
+        })?;
+
+        // The checks that only read state run under the lock and then release it: the
+        // KMS lookup below is awaited, and a store guard is not held across an await.
+        // Every one is made again after it, under a second lock, because the store can
+        // have moved while this request was asking KMS about the key.
+        if let Some(answer) = {
+            let state = state.lock();
+            refusal_from_state(&state, &input)
+        } {
+            return answer;
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        if let KeyLookup::Unresolvable(reason) =
+            describe_kms_key(ctx, &region, &input.kms_key).await
+        {
+            // Nothing was written: an unusable key means no DataIntegration, so the
+            // name this call asked for is still free and `ListDataIntegrations` never
+            // reports it.
+            return Err(CreateDataIntegrationErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "The KMS key {} could not be resolved: {reason}",
+                        input.kms_key
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut state = state.lock();
+        if let Some(answer) = refusal_from_state(&state, &input) {
+            return answer;
+        }
+
+        let id = ::uuid::Uuid::new_v4().to_string();
+        let arn = crate::state::data_integration_arn(&region, &id);
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::DataIntegrationRecord {
+            id: id.clone(),
+            arn,
+            name: input.name,
+            description: input.description,
+            kms_key: input.kms_key,
+            source_uri: input.source_uri,
+            // `ScheduleConfig` on the way in is `ScheduleConfiguration` on the way out:
+            // one stored value, reported under the name each shape gives it.
+            schedule_configuration: input.schedule_config,
+            file_configuration: input.file_configuration,
+            object_configuration: input.object_configuration,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<String, String>>(),
+            client_token: input.client_token.clone(),
+            created_time: now,
+            last_modified_time: now,
+        };
+        if let Some(token) = input.client_token {
+            state.remember_client_token(token, id.clone());
+        }
+        // The response is built from the RECORD, before it is handed to the store, so
+        // the create reports exactly what `GetDataIntegration` will read back.
+        let response = created_response(&record);
+        state.data_integrations.insert(id, record);
+
+        Ok(response)
     }
+}
+
+/// The response a `CreateDataIntegration` answers with for the record it stored, so the
+/// create reports exactly what is persisted rather than what the request carried.
+fn created_response(record: &crate::state::DataIntegrationRecord) -> CreateDataIntegrationOutput {
+    CreateDataIntegrationOutput {
+        arn: Some(record.arn.clone()),
+        id: Some(record.id.clone()),
+        name: Some(record.name.clone()),
+        description: record.description.clone(),
+        kms_key: Some(record.kms_key.clone()),
+        source_uri: record.source_uri.clone(),
+        schedule_configuration: record.schedule_configuration.clone(),
+        tags: record.modeled_tags(),
+        client_token: record.client_token.clone(),
+        file_configuration: record.file_configuration.clone(),
+        object_configuration: record.object_configuration.clone(),
+    }
+}
+
+/// What the STORE says about this request before anything is written: the resource a
+/// replayed `ClientToken` already minted, the duplicate-name refusal, or the quota
+/// refusal for a store that is full. `None` when the create may proceed.
+///
+/// One function so the check before the awaited KMS lookup and the check under the
+/// write lock cannot disagree.
+fn refusal_from_state(
+    state: &crate::state::ComAmazonawsAppintegrationsAmazonappintegrationserviceState,
+    input: &CreateDataIntegrationInput,
+) -> Option<Result<CreateDataIntegrationOutput, CreateDataIntegrationError>> {
+    idempotent_replay(state, input.client_token.as_deref())
+        .or_else(|| duplicate_name(state, &input.name).map(Err))
+        .or_else(|| quota_exceeded(state).map(Err))
+}
+
+/// The modelled refusal for a store that already holds this emulator's maximum number
+/// of data integrations: `ResourceQuotaExceededException` (HTTP 429), documented as
+/// "the allowed quota for the resource has been exceeded". `None` while there is room.
+///
+/// Checked BEFORE the write, so the in-memory store cannot be grown without end one
+/// request at a time; a caller's `DeleteDataIntegration` frees a slot again.
+fn quota_exceeded(
+    state: &crate::state::ComAmazonawsAppintegrationsAmazonappintegrationserviceState,
+) -> Option<CreateDataIntegrationError> {
+    if state.has_room_for_another_data_integration() {
+        return None;
+    }
+    Some(
+        CreateDataIntegrationErrorModeled::ResourceQuotaExceededException(
+            ResourceQuotaExceededException {
+                message: Some(format!(
+                    "The allowed quota for the resource has been exceeded: at most {} \
+                     DataIntegrations can exist.",
+                    crate::state::MAX_STORED_DATA_INTEGRATIONS
+                )),
+            },
+        )
+        .into(),
+    )
+}
+
+/// The answer to a retry carrying the `ClientToken` of a DataIntegration this service
+/// already created: the resource it minted then, rather than a second resource or a
+/// duplicate-name refusal. `None` when this token created nothing.
+///
+/// `ClientToken` is an `@idempotencyToken` (`smithy_query(query="operation",
+/// operation="CreateDataIntegration")`), which is what makes the call repeatable.
+fn idempotent_replay(
+    state: &crate::state::ComAmazonawsAppintegrationsAmazonappintegrationserviceState,
+    client_token: Option<&str>,
+) -> Option<Result<CreateDataIntegrationOutput, CreateDataIntegrationError>> {
+    let record = state
+        .data_integration_idempotency
+        .get(client_token?)
+        .and_then(|id| state.data_integrations.get(id))?;
+    Some(Ok(created_response(record)))
+}
+
+/// The modelled refusal for a name this account already holds a DataIntegration under:
+/// `DuplicateResourceException` (HTTP 409), documented as "a resource with the specified
+/// name already exists". `None` when the name is free.
+fn duplicate_name(
+    state: &crate::state::ComAmazonawsAppintegrationsAmazonappintegrationserviceState,
+    name: &str,
+) -> Option<CreateDataIntegrationError> {
+    state
+        .data_integrations
+        .values()
+        .any(|record| record.name == name)
+        .then(|| {
+            CreateDataIntegrationErrorModeled::DuplicateResourceException(
+                DuplicateResourceException {
+                    message: Some(format!("A data integration named {name} already exists.")),
+                },
+            )
+            .into()
+        })
 }
