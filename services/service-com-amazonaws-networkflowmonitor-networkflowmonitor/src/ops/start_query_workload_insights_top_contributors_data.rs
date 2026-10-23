@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartQueryWorkloadInsightsTopContributorsData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartQueryWorkloadInsightsTopContributorsData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a workload-insights top-contributors DATA query over one scope — the
+//! time-series form of the same question — and answers with the `queryId` the caller
+//! polls it with.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartQueryWorkloadInsightsTopContributorsData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The window the request names has to BE a window: a request whose `endTime`
+//! precedes its `startTime` is refused with the modelled `ValidationException`
+//! (HTTP 400) before anything is minted. The scope also has to be one this service's
+//! store holds — `ValidationException` is the only client refusal this operation
+//! models, so an unknown `scopeId` is named in one.
+//!
+//! The accepted query is minted into the store ([`crate::state::Query`]), so
+//! `GetQueryStatusWorkloadInsightsTopContributorsData`,
+//! `GetQueryResultsWorkloadInsightsTopContributorsData` and
+//! `StopQueryWorkloadInsightsTopContributorsData` all answer from this one record.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +178,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartQueryWorkloadInsightsTopContributorsData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartQueryWorkloadInsightsTopContributorsDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartQueryWorkloadInsightsTopContributorsData"))
+        let _ = ctx;
+
+        // The window first: it is a property of the request alone, so it is answered
+        // before the store is reached and whatever else the request names.
+        if let Some(refusal) = crate::state::inverted_window(input.start_time, input.end_time) {
+            return Err(
+                StartQueryWorkloadInsightsTopContributorsDataErrorModeled::ValidationException(
+                    refusal,
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                StartQueryWorkloadInsightsTopContributorsDataErrorModeled::InternalServerException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.settle(now);
+
+        if !state.scopes.contains_key(&input.scope_id) {
+            return Err(
+                StartQueryWorkloadInsightsTopContributorsDataErrorModeled::ValidationException(
+                    crate::state::field_validation(
+                        "scopeId",
+                        format!("scope {} was not found", input.scope_id),
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        if state.queries.len() >= crate::state::MAX_QUERIES {
+            return Err(
+                StartQueryWorkloadInsightsTopContributorsDataErrorModeled::ServiceQuotaExceededException(
+                    crate::state::quota_exceeded(
+                        crate::state::QUERY_RESOURCE,
+                        crate::state::MAX_QUERIES,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // This operation models no `limit`: the data query returns the whole series
+        // for the window, so the record carries none.
+        let query_id = state.start_query(
+            crate::state::QueryKind::WorkloadInsightsTopContributorsData,
+            &input.scope_id,
+            &input.metric_name,
+            &input.destination_category,
+            input.start_time,
+            input.end_time,
+            ::std::option::Option::None,
+            now,
+        );
+
+        Ok(StartQueryWorkloadInsightsTopContributorsDataOutput { query_id })
     }
 }

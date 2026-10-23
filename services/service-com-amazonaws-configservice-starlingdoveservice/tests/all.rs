@@ -25,6 +25,8 @@ mod config_read_shape_and_compliance;
 mod config_remediation_configurations;
 #[path = "all/config_retention_configuration_lifecycle.rs"]
 mod config_retention_configuration_lifecycle;
+#[path = "all/config_rule_evaluation_status.rs"]
+mod config_rule_evaluation_status;
 #[path = "all/config_setup_and_rule_loop.rs"]
 mod config_setup_and_rule_loop;
 #[path = "all/config_tagging.rs"]

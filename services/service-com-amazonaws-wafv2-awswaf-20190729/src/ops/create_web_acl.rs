@@ -356,8 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = crate::state::new_uuid();
         let lock_token = crate::state::new_uuid();
         let arn = crate::state::resource_arn(&input.scope, &region, "webacl", &input.name, &id);
-        let rules = input.rules.clone().unwrap_or_default();
-        let web_acl = WebACL {
+        let mut web_acl = WebACL {
             name: input.name.clone(),
             id: id.clone(),
             arn: arn.clone(),
@@ -366,7 +365,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             rules: input.rules.clone(),
             visibility_config: input.visibility_config.clone(),
             data_protection_config: input.data_protection_config.clone(),
-            capacity: crate::state::web_acl_capacity(&rules),
+            // Derived from the stored rules by `apply_web_acl_defaults` below,
+            // which also materialises the members WAF defaults server-side.
+            capacity: 0,
             // Firewall Manager cannot reach this emulator, so a web ACL created
             // through the API carries neither of its rule-group sets and neither of
             // its ownership flags.
@@ -384,6 +385,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             application_config: input.application_config.clone(),
             monetization_config: input.monetization_config.clone(),
         };
+        crate::state::apply_web_acl_defaults(&mut web_acl);
         let summary = WebACLSummary {
             name: Some(web_acl.name.clone()),
             id: Some(web_acl.id.clone()),

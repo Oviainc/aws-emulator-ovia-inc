@@ -20,10 +20,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::{
-    self, AnswerRecord, ChoiceAnswerRecord,
+    self, AnswerRecord,
 };
 
-use super::workload_harness::{encode_path_segment, Answer, Client};
+use super::workload_harness::{answered, encode_path_segment, Answer, Client};
 
 /// The published question numbering of the AWS Well-Architected Framework lens, pillar
 /// by pillar in the order the framework presents them: OPS 1-11, SEC 1-11, REL 1-13,
@@ -208,33 +208,6 @@ async fn collect_answers(
     }
 
     (collected, pages)
-}
-
-/// An answer that records `selected` as the best practices in place and `choices` as the
-/// status of each choice it speaks about.
-fn answered(
-    selected: &[&str],
-    choices: &[(&str, &str)],
-    is_applicable: bool,
-    reason: Option<&str>,
-) -> AnswerRecord {
-    AnswerRecord {
-        selected_choices: selected.iter().map(ToString::to_string).collect(),
-        choice_answers: choices
-            .iter()
-            .map(|(choice_id, status)| {
-                (
-                    (*choice_id).to_string(),
-                    ChoiceAnswerRecord {
-                        status: (*status).to_string(),
-                        reason: None,
-                    },
-                )
-            })
-            .collect(),
-        is_applicable,
-        reason: reason.map(ToString::to_string),
-    }
 }
 
 /// The `QuestionCounts` `GetReviewTemplate` reports for a template, as a sorted map: the

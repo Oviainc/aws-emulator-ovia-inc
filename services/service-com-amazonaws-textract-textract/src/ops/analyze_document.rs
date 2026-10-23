@@ -234,6 +234,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         };
 
+        // Cross-member input validation comes FIRST, before every feature dispatch and
+        // before the 501s below: an inconsistent FeatureTypes / QueriesConfig pair is a
+        // bad request whatever else the request asks for, so it is never hidden behind
+        // "not implemented here".
+        let queries = match crate::state::queries_of(
+            &input.feature_types,
+            input.queries_config.as_ref(),
+            // The SYNCHRONOUS quota: this operation's own ceiling, not the asynchronous
+            // path's.
+            crate::state::MAX_QUERIES_PER_REQUEST,
+        ) {
+            Ok(queries) => queries,
+            Err(message) => return Err(invalid(message)),
+        };
+
         // A human loop and an adapter are resources this slice does not model, so a
         // request that asks for one is answered 501 rather than with a 200 that
         // silently drops it.
@@ -245,11 +260,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.adapters_config.is_some() {
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "AnalyzeDocument with AdaptersConfig",
-            ));
-        }
-        if input.queries_config.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "AnalyzeDocument with QueriesConfig",
             ));
         }
 
@@ -302,7 +312,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         };
-        let blocks = crate::state::blocks(&key, &content, features);
+        // The QUERY blocks, and the QUERY_RESULT blocks that answer them, are blocks this
+        // response carries, so they count against the same ceiling the document's own
+        // blocks were checked against when it was read.
+        if crate::state::exceeds_block_ceiling(&content.pages, queries.len()) {
+            return Err(AnalyzeDocumentErrorModeled::DocumentTooLargeException(
+                DocumentTooLargeException {
+                    message: Some(format!(
+                        "the document and the {} queries asked of it would expand into more \
+                         than the {} blocks this emulator derives for one document",
+                        queries.len(),
+                        crate::state::MAX_BLOCKS_PER_DOCUMENT
+                    )),
+                    code: None,
+                },
+            )
+            .into());
+        }
+        let mut blocks = crate::state::blocks(&key, &content, features);
+        blocks.extend(crate::state::query_blocks(&key, &content, &queries));
 
         Ok(AnalyzeDocumentOutput {
             document_metadata: Some(content.metadata()),

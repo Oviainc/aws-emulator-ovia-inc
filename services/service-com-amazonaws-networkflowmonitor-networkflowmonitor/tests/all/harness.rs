@@ -164,6 +164,26 @@ impl Emulator {
     }
 }
 
+/// Whether `value` is one of the UUID-shaped ids this service mints: 8-4-4-4-12
+/// lowercase hex.
+///
+/// Neither `ScopeId` nor `queryId` carries a pattern, but both are minted
+/// UUID-shaped (`state::scope_id`, `state::query_id`), so every suite that asserts
+/// a minted id asserts it through this one predicate.
+pub fn is_uuid_shaped(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && [8usize, 4, 4, 4, 12]
+            .iter()
+            .zip(&groups)
+            .all(|(len, group)| {
+                group.len() == *len
+                    && group
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            })
+}
+
 /// A `clientToken` matching `UuidString`'s pattern
 /// `^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`, derived from
 /// `seed` so each one in a test is distinct.

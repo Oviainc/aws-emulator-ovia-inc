@@ -29,7 +29,15 @@ pub struct CreateGatewayInput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#CreateGatewayResponse")]
+/// `CreateGatewayResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `updatedAt` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="operation",
+/// operation="CreateGateway")`), and the derive does not put that trait on a member schema
+/// — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct CreateGatewayOutput {
     pub gateway_arn: String,
@@ -55,4 +63,90 @@ pub struct CreateGatewayOutput {
     pub web_acl_arn: Option<String>,
     pub waf_configuration: Option<WafConfiguration>,
 }
+
+agentcore_schema_and_codec!(
+    CreateGatewayOutput,
+    CREATE_GATEWAY_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#CreateGatewayResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "CreateGatewayResponse",
+    (M_GATEWAY_ARN, gateway_arn, "gatewayArn", 0, req, string),
+    (M_GATEWAY_ID, gateway_id, "gatewayId", 1, req, string),
+    (M_GATEWAY_URL, gateway_url, "gatewayUrl", 2, opt, string),
+    (M_CREATED_AT, created_at, "createdAt", 3, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 4, req, date_time),
+    (M_STATUS, status, "status", 5, req, string),
+    (
+        M_STATUS_REASONS,
+        status_reasons,
+        "statusReasons",
+        6,
+        opt,
+        list_of_string
+    ),
+    (M_NAME, name, "name", 7, req, string),
+    (M_DESCRIPTION, description, "description", 8, opt, string),
+    (M_ROLE_ARN, role_arn, "roleArn", 9, opt, string),
+    (M_PROTOCOL_TYPE, protocol_type, "protocolType", 10, opt, string),
+    (
+        M_PROTOCOL_CONFIGURATION,
+        protocol_configuration,
+        "protocolConfiguration",
+        11,
+        opt,
+        union_of(GatewayProtocolConfiguration)
+    ),
+    (M_AUTHORIZER_TYPE, authorizer_type, "authorizerType", 12, req, string),
+    (
+        M_AUTHORIZER_CONFIGURATION,
+        authorizer_configuration,
+        "authorizerConfiguration",
+        13,
+        opt,
+        union_of(AuthorizerConfiguration)
+    ),
+    (M_KMS_KEY_ARN, kms_key_arn, "kmsKeyArn", 14, opt, string),
+    (
+        M_CUSTOM_TRANSFORM_CONFIGURATION,
+        custom_transform_configuration,
+        "customTransformConfiguration",
+        15,
+        opt,
+        struct_of(CustomTransformConfiguration)
+    ),
+    (
+        M_INTERCEPTOR_CONFIGURATIONS,
+        interceptor_configurations,
+        "interceptorConfigurations",
+        16,
+        opt,
+        list_of_struct(GatewayInterceptorConfiguration)
+    ),
+    (
+        M_POLICY_ENGINE_CONFIGURATION,
+        policy_engine_configuration,
+        "policyEngineConfiguration",
+        17,
+        opt,
+        struct_of(GatewayPolicyEngineConfiguration)
+    ),
+    (
+        M_WORKLOAD_IDENTITY_DETAILS,
+        workload_identity_details,
+        "workloadIdentityDetails",
+        18,
+        opt,
+        struct_of(WorkloadIdentityDetails)
+    ),
+    (M_EXCEPTION_LEVEL, exception_level, "exceptionLevel", 19, opt, string),
+    (M_WEB_ACL_ARN, web_acl_arn, "webAclArn", 20, opt, string),
+    (
+        M_WAF_CONFIGURATION,
+        waf_configuration,
+        "wafConfiguration",
+        21,
+        opt,
+        struct_of(WafConfiguration)
+    ),
+);
 

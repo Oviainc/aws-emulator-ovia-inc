@@ -2,8 +2,12 @@
 
 //! @op ListWebACLs
 //! Enumerates the WebACLs stored under the requested `Scope`, ordered by name, one
-//! page at a time: at most `Limit` summaries, resuming after `NextMarker`, and
-//! answering a `NextMarker` only while a further page remains.
+//! page at a time: at most `Limit` summaries, resuming after `NextMarker`. EVERY
+//! non-empty page answers a `NextMarker` — the name of its LAST summary, whether or
+//! not the page is full, which is what the recorded wire responses carry — and only
+//! the empty page that follows the last one carries none
+//! (`ListWebACLsResponse$NextMarker` is `length 1..256`, and a page with no last
+//! name has no marker), which is what ends a paginator's loop.
 //!
 //! ## Shape of an operation
 //!
@@ -216,12 +220,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
         let page_size = usize::try_from(page_size).unwrap_or(0);
-        let has_more = entries.len() > page_size;
         entries.truncate(page_size);
 
-        let next_marker = has_more
-            .then(|| entries.last().map(|entry| entry.web_acl.name.clone()))
-            .flatten();
+        // WAF answers every non-empty page with a `NextMarker`: the recorded
+        // responses carry the name of the LAST summary on the page even when the
+        // page is not full, so a client resumes from it and learns it reached the
+        // end from the empty page that follows. `ListWebACLsResponse$NextMarker` is
+        // `length 1..256`, so a page with no last name — an empty one — carries no
+        // marker, which is also what ends the paginator's loop.
+        let next_marker = entries.last().map(|entry| entry.web_acl.name.clone());
         let web_ac_ls = entries
             .into_iter()
             .map(|entry| WebACLSummary {

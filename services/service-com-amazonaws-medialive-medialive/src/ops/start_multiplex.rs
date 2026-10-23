@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartMultiplex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartMultiplex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartMultiplex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the start is a transition on the stored multiplex (the `multiplexes`
+//! slice of [`crate::state`]) — it moves a stopped multiplex into `STARTING` and owes
+//! `RUNNING`, and every value the response carries is read back out of that stored
+//! record, never built from the request in flight. The multiplex's state is the only
+//! precondition: a multiplex holding no program starts like any other, which is what
+//! the real service does. A multiplex in any other state is refused with
+//! `ConflictException`, and an id no multiplex has with `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +162,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartMultiplex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartMultiplexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartMultiplex"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Transitions the clock had already made due were owed whether or not
+        // this start ran, so they are materialised before anything is read: a
+        // multiplex whose `CREATING` span has passed is `IDLE`, and that is the
+        // state this start is judged against.
+        state.settle(now);
+
+        // The state a start needs and the transition are one step in the state
+        // slice, so this handler cannot check it and start past it.
+        state
+            .start_multiplex(&input.multiplex_id, now)
+            .map_err(|refusal| refused(refusal, &input.multiplex_id))?;
+
+        let multiplex = state
+            .multiplex_description(&input.multiplex_id)
+            .ok_or_else(unavailable)?;
+
+        Ok(crate::state::multiplex_description_output!(
+            StartMultiplexOutput,
+            multiplex
+        ))
     }
+}
+
+/// Turn a store refusal into this operation's own modelled error.
+///
+/// A multiplex the account does not hold is a 404. A multiplex in a state a
+/// start does not accept is the resource being in a condition that prevents the
+/// action, which is the 409 `ConflictException` this operation models — the same
+/// answer `StartChannel` gives a channel it cannot start. Each message names the
+/// multiplex, its state and the state a start needs, so the caller can fix the
+/// call from that text alone.
+fn refused(refusal: crate::state::MultiplexStartRefusal, multiplex_id: &str) -> StartMultiplexError {
+    match refusal {
+        crate::state::MultiplexStartRefusal::NotFound => {
+            StartMultiplexErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("Multiplex", multiplex_id)),
+            })
+        }
+        crate::state::MultiplexStartRefusal::NotStartable(state) => {
+            StartMultiplexErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Multiplex {multiplex_id} is in state {state} and can only be started from {}",
+                    crate::state::multiplex_state::IDLE
+                )),
+            })
+        }
+    }
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no multiplex store to start a multiplex in. A modelled server
+/// error, never a fresh engine (which would drop the transition on return).
+fn unavailable() -> StartMultiplexError {
+    StartMultiplexErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

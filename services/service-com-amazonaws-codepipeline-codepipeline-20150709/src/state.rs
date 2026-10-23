@@ -17,12 +17,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    ActionConfigurationProperty, ActionState, ActionType, ActionTypeId, ActionTypeSettings,
-    ArtifactDetails, Condition, ConditionState, CurrentRevision, ExecutionDetails,
-    ExecutionTrigger, ListWebhookItem, PipelineDeclaration, PipelineExecution,
-    PipelineExecutionSummary, PipelineMetadata, PipelineSummary, ResolvedPipelineVariable,
-    RuleState, SourceRevision, StageConditionState, StageState, Tag, ThirdPartyJob,
-    TransitionState, WebhookDefinition,
+    ActionConfigurationProperty, ActionRevision, ActionState, ActionType, ActionTypeId,
+    ActionTypeSettings, ArtifactDetails, Condition, ConditionState, CurrentRevision,
+    ExecutionDetails, ExecutionTrigger, ListWebhookItem, PipelineDeclaration, PipelineExecution,
+    PipelineExecutionSummary, PipelineMetadata, PipelineSummary, PipelineVariable,
+    ResolvedPipelineVariable, RuleState, SourceRevision, StageConditionState, StageState, Tag,
+    ThirdPartyJob, TransitionState, WebhookDefinition,
 };
 
 /// The region an ARN carries when the request names none.
@@ -60,6 +60,16 @@ pub const DEFAULT_EXECUTION_MODE: &str = "SUPERSEDED";
 /// (`smithy_query query="shape" shape="PipelineExecutionStatus"` -> `Cancelled`,
 /// `InProgress`, `Stopped`, `Stopping`, `Succeeded`, `Superseded`, `Failed`).
 pub const STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// The `PipelineExecutionStatus` value an execution carries while it is being
+/// stopped: it has been asked to stop but has not reached a terminal status yet.
+pub const STATUS_STOPPING: &str = "Stopping";
+
+/// The `PipelineExecutionStatus` values an execution can still leave, so an
+/// execution carrying one of them still occupies one of its pipeline's concurrent
+/// execution slots. Every other value the model declares (`Cancelled`, `Stopped`,
+/// `Succeeded`, `Superseded`, `Failed`) is terminal.
+pub const NON_TERMINAL_STATUSES: [&str; 2] = [STATUS_IN_PROGRESS, STATUS_STOPPING];
 
 /// The `TriggerType` a `StartPipelineExecution` call records, from the model's enum
 /// (`smithy_query query="shape" shape="TriggerType"`), whose member names the
@@ -143,6 +153,36 @@ pub const MAX_PIPELINE_VERSIONS_RETAINED: usize = 1000;
 /// pipelines per Region per account. AWS adjusts that quota per account, so the
 /// value here is this emulator's bound rather than a universal constant.
 pub const MAX_PIPELINES_PER_ACCOUNT: usize = 1000;
+
+/// The `TriggerType` an execution started by a new action revision records, from
+/// the same enum (`smithy_query query="shape" shape="TriggerType"` lists
+/// `PutActionRevision` among its members, which is what makes reporting a new source
+/// revision a way for an execution to begin).
+pub const TRIGGER_TYPE_PUT_ACTION_REVISION: &str = "PutActionRevision";
+
+/// How many executions a pipeline in `SUPERSEDED` mode runs at once.
+///
+/// `SUPERSEDED` is the mode in which a newer execution takes the place of the one
+/// already running — `PipelineDeclaration$executionMode` documents it as "the method
+/// that the pipeline will use to handle multiple executions" and names this the
+/// default — so such a pipeline is running exactly one execution at any instant.
+/// Superseding the running execution is not something this emulator can do: it does
+/// not run a pipeline's stages, so nothing here could tell how far the running
+/// execution has got or move it to `Superseded` without reporting a transition for
+/// work nothing ran. A trigger that would start a second concurrent execution is
+/// therefore refused with the error the model declares for exactly this condition,
+/// `ConcurrentPipelineExecutionsLimitExceededException` ("The pipeline has reached
+/// the limit for concurrent pipeline executions").
+pub const MAX_CONCURRENT_EXECUTIONS_SUPERSEDED: usize = 1;
+
+/// How many executions a pipeline in `QUEUED` or `PARALLEL` mode runs at once.
+///
+/// Those two modes exist to hold more than one execution, so the bound is not 1; AWS
+/// publishes the figure as an adjustable per-account quota rather than as part of the
+/// API, so the value here is this emulator's bound. A bound is required all the same:
+/// every accepted trigger adds a non-terminal execution and this slice runs no stage
+/// that would ever complete one.
+pub const MAX_CONCURRENT_EXECUTIONS_PARALLEL: usize = 50;
 
 /// The most action types this emulator registers for the account before another
 /// registration is refused.
@@ -244,6 +284,11 @@ pub struct ComAmazonawsCodepipelineCodepipeline20150709State {
     /// Execution ids per pipeline name, oldest first (so newest-first listing is
     /// this sequence reversed).
     pub executions_by_pipeline: BTreeMap<String, Vec<String>>,
+    /// The revision each action currently carries, keyed by `(pipeline name, stage
+    /// name, action name)` — what `PutActionRevision` reports about a source and what
+    /// the next report of the same source is compared against. Bounded by the stored
+    /// declarations, and dropped with the pipeline in [`Self::forget_pipeline`].
+    pub action_revisions: BTreeMap<(String, String, String), ActionRevision>,
     /// `(pipeline name, clientRequestToken)` -> the execution id that token minted,
     /// so repeating an idempotency token returns the same execution. An entry lives
     /// exactly as long as the execution it names.
@@ -402,8 +447,8 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
             .collect()
     }
 
-    /// Forget a pipeline: the declaration, the executions still retained for it, and
-    /// the idempotency tokens that named them.
+    /// Forget a pipeline: the declaration, the executions still retained for it, the
+    /// idempotency tokens that named them, and the revisions its actions carried.
     pub fn forget_pipeline(&mut self, name: &str) {
         self.pipelines.remove(name);
         for id in self.executions_by_pipeline.remove(name).unwrap_or_default() {
@@ -411,6 +456,36 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
         }
         self.idempotency
             .retain(|(pipeline_name, _), _| pipeline_name != name);
+        self.action_revisions
+            .retain(|(pipeline_name, _, _), _| pipeline_name != name);
+    }
+
+    /// The pipeline's current execution — the most recently started one still
+    /// retained — or `None` when the pipeline has never run.
+    ///
+    /// `executions_by_pipeline` is kept oldest-first, so the current execution is the
+    /// last entry.
+    pub fn current_execution_id(&self, pipeline_name: &str) -> Option<&String> {
+        self.executions_by_pipeline
+            .get(pipeline_name)?
+            .last()
+    }
+
+    /// How many of the pipeline's retained executions are still in a non-terminal
+    /// status ([`NON_TERMINAL_STATUSES`]), i.e. how many concurrent execution slots
+    /// the pipeline currently occupies.
+    pub fn concurrent_execution_count(&self, pipeline_name: &str) -> usize {
+        self.executions_by_pipeline
+            .get(pipeline_name)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| self.executions.get(id))
+                    .filter(|record| {
+                        NON_TERMINAL_STATUSES.contains(&record.status.as_str())
+                    })
+                    .count()
+            })
+            .unwrap_or_default()
     }
 
     /// The tags of the resource `arn` names.
@@ -1632,12 +1707,17 @@ impl Pipeline {
     ///
     /// Every member is read from stored state: the stage and action names from the
     /// stored declaration, the inbound transition state from what the transition
-    /// calls persisted, and each condition set's rules from the conditions the stage
-    /// declares. The members the stage-, action- and rule-execution plane owns
-    /// (`latestExecution`, `inboundExecution(s)`, an action's revision and execution,
-    /// a condition's or a rule's execution) are absent, because this slice runs no
-    /// such plane and so has no outcome to report for them.
-    pub fn stage_states(&self) -> Vec<StageState> {
+    /// calls persisted, each condition set's rules from the conditions the stage
+    /// declares, and an action's `currentRevision` from `revisions` — the revision
+    /// `PutActionRevision` recorded for it, keyed by `(pipeline, stage, action)`. The
+    /// members the stage-, action- and rule-execution plane owns (`latestExecution`,
+    /// `inboundExecution(s)`, an action's execution, a condition's or a rule's
+    /// execution) are absent, because this slice runs no such plane and so has no
+    /// outcome to report for them.
+    pub fn stage_states(
+        &self,
+        revisions: &BTreeMap<(String, String, String), ActionRevision>,
+    ) -> Vec<StageState> {
         self.declaration
             .stages
             .iter()
@@ -1653,7 +1733,13 @@ impl Pipeline {
                         .iter()
                         .map(|action| ActionState {
                             action_name: Some(action.name.clone()),
-                            current_revision: None,
+                            current_revision: revisions
+                                .get(&(
+                                    self.declaration.name.clone(),
+                                    stage.name.clone(),
+                                    action.name.clone(),
+                                ))
+                                .cloned(),
                             latest_execution: None,
                             entity_url: None,
                             revision_url: None,
@@ -2164,6 +2250,71 @@ pub fn resolved_execution_mode(declaration: &PipelineDeclaration) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_EXECUTION_MODE)
         .to_string()
+}
+
+/// How many executions a pipeline whose `executionMode` is `execution_mode` runs
+/// concurrently: one in `SUPERSEDED` mode, [`MAX_CONCURRENT_EXECUTIONS_PARALLEL`] in
+/// the modes that hold several (`QUEUED`, `PARALLEL`).
+///
+/// An unrecognised value cannot reach here through the wire — `ExecutionMode` is a
+/// modelled enum and the boundary validator refuses anything else — and is treated as
+/// the default mode, which is what a declaration carrying no mode resolves to.
+pub fn max_concurrent_executions(execution_mode: &str) -> usize {
+    if execution_mode == EXECUTION_MODES[0] || execution_mode == EXECUTION_MODES[2] {
+        MAX_CONCURRENT_EXECUTIONS_PARALLEL
+    } else {
+        MAX_CONCURRENT_EXECUTIONS_SUPERSEDED
+    }
+}
+
+/// The variables an execution of `declaration` runs with: every variable the
+/// declaration declares takes `overrides`'s value for it when there is one, else its
+/// declared `defaultValue`.
+///
+/// `Err` carries the message the caller refuses the request with, for the two cases
+/// that cannot be resolved at all:
+///
+/// * an override naming a variable the declaration does not carry — there is nothing
+///   for it to override;
+/// * a declared variable with neither a `defaultValue` nor an override — the
+///   execution would have no value for a variable its pipeline declares.
+///
+/// Both are refused rather than quietly leaving a variable out of the execution, and
+/// both are refused the same way whichever call starts the execution.
+pub fn resolve_execution_variables(
+    declaration: &PipelineDeclaration,
+    overrides: &[PipelineVariable],
+) -> Result<Vec<ResolvedPipelineVariable>, String> {
+    let declared = declaration.variables.clone().unwrap_or_default();
+    if let Some(unknown) = overrides
+        .iter()
+        .find(|variable| !declared.iter().any(|d| d.name == variable.name))
+    {
+        return Err(format!(
+            "variables: pipeline {} declares no variable named {}",
+            declaration.name, unknown.name
+        ));
+    }
+    let mut variables: Vec<ResolvedPipelineVariable> = Vec::with_capacity(declared.len());
+    for declared_variable in &declared {
+        let Some(resolved) = overrides
+            .iter()
+            .find(|variable| variable.name == declared_variable.name)
+            .map(|variable| variable.value.clone())
+            .or_else(|| declared_variable.default_value.clone())
+        else {
+            return Err(format!(
+                "variables: pipeline {} declares variable {} with no defaultValue, \
+                 so a value must be given for it",
+                declaration.name, declared_variable.name
+            ));
+        };
+        variables.push(ResolvedPipelineVariable {
+            name: Some(declared_variable.name.clone()),
+            resolved_value: Some(resolved),
+        });
+    }
+    Ok(variables)
 }
 
 /// A structural defect in a `PipelineDeclaration` that the model's own constraints

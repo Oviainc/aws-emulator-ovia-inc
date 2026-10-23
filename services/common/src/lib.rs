@@ -30,6 +30,10 @@
 //! * [`iam_trust_policy`], the ONE reading of an IAM trust policy, for every service that
 //!   resolves a caller-supplied execution role before it writes — so two services asked
 //!   whether a document lets them assume a role cannot answer differently;
+//! * [`iam_authorization`], the ONE evaluation of IAM policy documents against a request,
+//!   for every service that decides server-side whether the calling principal may perform
+//!   an action on a resource — so two services handed the same identity-based and
+//!   resource-based documents reach the same decision;
 //! * [`stable_hex_id`], the one deterministic mixing function a service derives a
 //!   wire-visible id with;
 //! * [`network`], the contract the account's EC2 network — which subnets a Region has —
@@ -138,6 +142,7 @@ pub mod arn;
 pub mod bedrock;
 pub mod db_data_sources;
 pub mod front_door;
+pub mod iam_authorization;
 pub mod iam_trust_policy;
 pub mod iot_commands;
 pub mod iot_job_executions;

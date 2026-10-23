@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQueryResultsWorkloadInsightsTopContributors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetQueryResultsWorkloadInsightsTopContributors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the results of one workload-insights top-contributors query of a scope,
+//! from the record `StartQueryWorkloadInsightsTopContributors` minted in this
+//! service's store ([`crate::state::Query`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetQueryResultsWorkloadInsightsTopContributors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `topContributors` is EMPTY, and that is the computed answer rather than a
+//! placeholder: a top contributor is a network flow a Network Flow Monitor agent
+//! reported, nothing reports flow telemetry to this emulator, so no window has a
+//! contributing flow in it. The page is therefore the only page and `nextToken` is
+//! absent; a request carrying a `nextToken` is refused, because no page of these
+//! results ever issued one. This output shape models no `unit`.
+//!
+//! A query that has not SUCCEEDED has no results to report at all — one still
+//! `QUEUED` or `RUNNING` has not produced them and a `CANCELED` one never will — so
+//! that read is refused with the modelled `ValidationException`
+//! ([`crate::state::results_unavailable`]) rather than answered with an empty
+//! success that a caller could not tell from a finished query's.
+//!
+//! `@readonly`: the only write it makes is materializing the status change the clock
+//! has already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +179,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetQueryResultsWorkloadInsightsTopContributors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetQueryResultsWorkloadInsightsTopContributorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetQueryResultsWorkloadInsightsTopContributors"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetQueryResultsWorkloadInsightsTopContributorsErrorModeled::InternalServerException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let mut state = state.lock();
+        state.settle(::std::time::SystemTime::now());
+
+        let Some(query) = state.query(
+            crate::state::QueryKind::WorkloadInsightsTopContributors,
+            &input.scope_id,
+            &input.query_id,
+        ) else {
+            return Err(
+                GetQueryResultsWorkloadInsightsTopContributorsErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::QUERY_RESOURCE, &input.query_id),
+                )
+                .into(),
+            );
+        };
+
+        // No page of these results issues a `nextToken`, so a request carrying one
+        // carries a token this listing did not mint.
+        if input.next_token.is_some() {
+            return Err(
+                GetQueryResultsWorkloadInsightsTopContributorsErrorModeled::ValidationException(
+                    crate::state::field_validation(
+                        "nextToken",
+                        "no page of these query results issued a resume token",
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        if let Some(refusal) = crate::state::results_unavailable(query) {
+            return Err(
+                GetQueryResultsWorkloadInsightsTopContributorsErrorModeled::ValidationException(
+                    refusal,
+                )
+                .into(),
+            );
+        }
+
+        Ok(GetQueryResultsWorkloadInsightsTopContributorsOutput {
+            top_contributors: Some(Vec::new()),
+            next_token: None,
+        })
     }
 }

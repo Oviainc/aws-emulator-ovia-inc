@@ -292,7 +292,15 @@ pub struct RuntimeMetadataConfiguration {
     pub require_mmdsv2: bool,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#AgentRuntime")]
+/// `AgentRuntime`, the row `ListAgentRuntimes` carries. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `lastUpdatedAt` targets `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape", shape="AgentRuntime")`),
+/// and the derive does not put that trait on a member schema — see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct AgentRuntime {
     pub agent_runtime_arn: String,
@@ -303,6 +311,56 @@ pub struct AgentRuntime {
     pub last_updated_at: ::aws_smithy_types::DateTime,
     pub status: String,
 }
+
+agentcore_schema_and_codec!(
+    AgentRuntime,
+    AGENT_RUNTIME_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#AgentRuntime",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "AgentRuntime",
+    (
+        M_AGENT_RUNTIME_ARN,
+        agent_runtime_arn,
+        "agentRuntimeArn",
+        0,
+        req,
+        string
+    ),
+    (
+        M_AGENT_RUNTIME_ID,
+        agent_runtime_id,
+        "agentRuntimeId",
+        1,
+        req,
+        string
+    ),
+    (
+        M_AGENT_RUNTIME_VERSION,
+        agent_runtime_version,
+        "agentRuntimeVersion",
+        2,
+        req,
+        string
+    ),
+    (
+        M_AGENT_RUNTIME_NAME,
+        agent_runtime_name,
+        "agentRuntimeName",
+        3,
+        req,
+        string
+    ),
+    (M_DESCRIPTION, description, "description", 4, req, string),
+    (
+        M_LAST_UPDATED_AT,
+        last_updated_at,
+        "lastUpdatedAt",
+        5,
+        req,
+        date_time
+    ),
+    (M_STATUS, status, "status", 6, req, string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#SecretReference")]
 #[derive(Debug, Clone, Default)]

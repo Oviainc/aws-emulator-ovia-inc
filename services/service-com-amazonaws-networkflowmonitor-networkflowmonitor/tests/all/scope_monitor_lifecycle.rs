@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 // The ONE harness every suite in this crate dispatches through
 // (`tests/all/harness.rs`).
 use crate::harness::{
-    client_token, targets, Emulator, ACCOUNT_ID, PAST_PROVISIONING, REGION, SIGNING_NAME,
+    client_token, is_uuid_shaped, targets, Emulator, ACCOUNT_ID, PAST_PROVISIONING, REGION,
+    SIGNING_NAME,
 };
 
 /// The statuses `MonitorStatus` declares, from the model
@@ -33,19 +34,6 @@ const LOCAL_RESOURCE_TYPES: &[&str] = &[
     "AWS::EKS::Cluster",
     "AWS::Region",
 ];
-
-/// `ScopeId` carries no pattern, but the ids this service mints are UUID-shaped:
-/// 8-4-4-4-12 lowercase hex.
-fn is_uuid_shaped(value: &str) -> bool {
-    let groups: Vec<&str> = value.split('-').collect();
-    groups.len() == 5
-        && [8usize, 4, 4, 4, 12]
-            .iter()
-            .zip(&groups)
-            .all(|(len, group)| {
-                group.len() == *len && group.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-            })
-}
 
 /// One row of the scope create-and-read-back table.
 struct ScopeRow {
