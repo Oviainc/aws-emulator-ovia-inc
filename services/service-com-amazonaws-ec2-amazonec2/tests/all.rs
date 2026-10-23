@@ -74,6 +74,8 @@ mod mac_dedicated_hosts;
 mod modify_subnet_attribute;
 #[path = "all/network_performance_data.rs"]
 mod network_performance_data;
+#[path = "all/placement_groups.rs"]
+mod placement_groups;
 #[path = "all/secondary_networks.rs"]
 mod secondary_networks;
 #[path = "all/secondary_subnets.rs"]

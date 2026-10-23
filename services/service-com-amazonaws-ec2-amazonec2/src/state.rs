@@ -408,6 +408,16 @@
 //! [`ComAmazonawsEc2Amazonec2State::complete_due_import_image_tasks`]; only the PERCENTAGE
 //! of progress an active task reports is derived per read, being a fact of elapsed time
 //! that no store could hold.
+//!
+//! ## Placement groups
+//!
+//! [`ComAmazonawsEc2Amazonec2State::placement_groups`] holds the account's placement
+//! groups as the modelled [`PlacementGroup`] shape itself, keyed by `GroupId`, for the
+//! reason [`ComAmazonawsEc2Amazonec2State::vpcs`] holds VPCs that way: `CreatePlacementGroup`
+//! and `DescribePlacementGroups` answer the same shape, so storing it is what stops them
+//! reporting one group differently. A placement group is "a logical grouping of instances"
+//! (`CreatePlacementGroup`) with nothing to provision, so it is stored `available` and no
+//! clock-owed move is recorded for it.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -425,6 +435,7 @@ use crate::ops::types::{
     ImageCriterion, Instance, InstanceApplicationStatus, IpamPool,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, Monitoring, OperatorResponse, PeeringAttachmentStatus, Placement,
+    PlacementGroup,
     PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry,
     RequestLaunchTemplateData, RunInstancesOutput, SecondaryNetwork,
@@ -1331,6 +1342,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// same request answers with that task instead of starting a second import: "The token
     /// to enable idempotency for VM import requests" (`ImportImageRequest$ClientToken`).
     pub import_image_task_client_tokens: HashMap<String, String>,
+    /// The account's placement groups, as the modelled [`PlacementGroup`] shape every
+    /// operation that reports one answers with, keyed by `GroupId` in a [`BTreeMap`] — the
+    /// same stable order the other stores are kept in, which is the order
+    /// `DescribePlacementGroups` reports them in. A placement group is a Region-scoped
+    /// logical grouping with no network of its own, so nothing is stored beside the
+    /// modelled shape: every fact a reader needs ("the name", "the state", "the strategy",
+    /// "the number of partitions", "the spread level", "the ARN", "any tags applied to the
+    /// placement group" — [`PlacementGroup`]) is a member of it.
+    pub placement_groups: BTreeMap<String, PlacementGroup>,
     /// The state of the account's *block public access for snapshots* setting — see the
     /// module docs.
     ///
@@ -1406,6 +1426,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_block_public_access_exclusions: BTreeMap::new(),
             import_image_tasks: BTreeMap::new(),
             import_image_task_client_tokens: HashMap::new(),
+            placement_groups: BTreeMap::new(),
             // "Public sharing is not blocked" is where an account that has never called
             // `EnableSnapshotBlockPublicAccess` sits.
             snapshot_block_public_access: SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED,
@@ -11151,6 +11172,273 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 // ---------------------------------------------------------------------------
+// Placement groups
+// ---------------------------------------------------------------------------
+
+/// The id prefix of a placement group, as AWS mints one: `pg-<hex>`.
+///
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] appends the 17 lowercase hexadecimal digits
+/// every EC2 resource id of the long form carries.
+pub const PLACEMENT_GROUP_ID_PREFIX: &str = "pg";
+
+/// A placement group that can be launched into: the `PlacementGroupState` enum's
+/// `available` member.
+///
+/// A placement group is "a logical grouping of instances" (`CreatePlacementGroup`) — there
+/// is no hardware to bring up for it — so it is the state a group is created in and the
+/// only state this emulator ever reports one in.
+pub const PLACEMENT_GROUP_STATE_AVAILABLE: &str = "available";
+
+/// The `ResourceType` a `CreatePlacementGroup` tag specification may name: the placement
+/// group it creates (the modelled `ResourceType` enum's `placement-group` member).
+pub const RESOURCE_TYPE_PLACEMENT_GROUP: &str = "placement-group";
+
+/// The `PlacementStrategy` member a partition placement group is created with: the one
+/// strategy `CreatePlacementGroupRequest$PartitionCount` is "valid only when" set to.
+pub const PLACEMENT_STRATEGY_PARTITION: &str = "partition";
+
+/// The `PlacementStrategy` member a spread placement group is created with: the strategy
+/// `SpreadLevel` — "determines how placement groups spread instances" — belongs to.
+pub const PLACEMENT_STRATEGY_SPREAD: &str = "spread";
+
+/// The `PlacementStrategy` member a cluster placement group is created with: the one
+/// strategy `CreatePlacementGroupRequest$ParentGroupId` is "valid only when" set to.
+pub const PLACEMENT_STRATEGY_CLUSTER: &str = "cluster";
+
+/// The `SpreadLevel` member a spread placement group gets when the request names none:
+/// `rack`, the level with "no usage restrictions", as opposed to `host`, which "you can use
+/// only with Outpost placement groups" (`CreatePlacementGroupRequest$SpreadLevel`).
+pub const SPREAD_LEVEL_RACK: &str = "rack";
+
+/// "Up to 255 ASCII characters" (`CreatePlacementGroupRequest$GroupName`).
+pub const MAX_PLACEMENT_GROUP_NAME_CHARS: usize = 255;
+
+/// The most partitions a partition placement group may be created with.
+///
+/// "A partition placement group can have a maximum of seven partitions per Availability
+/// Zone" (Amazon EC2 User Guide, "Partition placement groups").
+pub const MAX_PLACEMENT_GROUP_PARTITION_COUNT: i32 = 7;
+
+/// The fewest partitions a partition placement group may be created with: a count of
+/// partitions is a count, so it is at least one.
+pub const MIN_PLACEMENT_GROUP_PARTITION_COUNT: i32 = 1;
+
+/// The partition count a partition placement group gets when the request names none.
+///
+/// AWS documents no default for `CreatePlacementGroupRequest$PartitionCount`, so this is
+/// the emulator's choice: the smallest count that actually partitions the group, since a
+/// partition group "places groups of instances in different partitions, where instances in
+/// one partition do not share the same hardware with instances in another partition"
+/// (`CreatePlacementGroup`) and one partition has no other partition to differ from.
+pub const DEFAULT_PLACEMENT_GROUP_PARTITION_COUNT: i32 = 2;
+
+/// The largest number of placement groups this store holds.
+///
+/// "Placement groups per Region: 500" (Amazon EC2 service quotas).
+/// [`ComAmazonawsEc2Amazonec2State::has_placement_group_capacity`] is the predicate a
+/// writer asks before inserting; a create past it refuses with
+/// [`placement_group_limit_exceeded`].
+pub const MAX_PLACEMENT_GROUPS: usize = 500;
+
+/// The code EC2 answers for a placement group name the account already holds a group
+/// under: "the specified placement group already exists in your account" (AWS's
+/// `InvalidPlacementGroup.Duplicate` error-code entry).
+pub const INVALID_PLACEMENT_GROUP_DUPLICATE: &str = "InvalidPlacementGroup.Duplicate";
+
+/// The code EC2 answers for a placement group a request named that the account holds
+/// none of: "the specified placement group cannot be found" (AWS's
+/// `InvalidPlacementGroup.Unknown` error-code entry).
+pub const INVALID_PLACEMENT_GROUP_UNKNOWN: &str = "InvalidPlacementGroup.Unknown";
+
+/// The code a create past [`MAX_PLACEMENT_GROUPS`] answers with: "you've reached the limit
+/// on the number of placement groups you can have" (AWS's `PlacementGroupLimitExceeded`
+/// error-code entry).
+pub const PLACEMENT_GROUP_LIMIT_EXCEEDED: &str = "PlacementGroupLimitExceeded";
+
+/// Refuse a second placement group with a name the account already holds: HTTP 400
+/// [`INVALID_PLACEMENT_GROUP_DUPLICATE`]. The name "must be unique within the scope of your
+/// account for the Region" (`CreatePlacementGroupRequest$GroupName`).
+pub fn invalid_placement_group_duplicate<E>(group_name: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PLACEMENT_GROUP_DUPLICATE,
+        400,
+        format!("The placement group '{group_name}' already exists"),
+    )
+}
+
+/// Refuse a placement group a request named that the account holds none of: HTTP 400
+/// [`INVALID_PLACEMENT_GROUP_UNKNOWN`]. `group` is the name or the id the request named,
+/// whichever could not be resolved.
+pub fn invalid_placement_group_unknown<E>(group: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PLACEMENT_GROUP_UNKNOWN,
+        400,
+        format!("The placement group '{group}' does not exist"),
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_PLACEMENT_GROUPS`]: HTTP 400
+/// [`PLACEMENT_GROUP_LIMIT_EXCEEDED`].
+pub fn placement_group_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        PLACEMENT_GROUP_LIMIT_EXCEEDED,
+        400,
+        format!("The maximum number of placement groups has been reached ({MAX_PLACEMENT_GROUPS})"),
+    )
+}
+
+/// The caller-chosen bytes one stored placement group holds, plus the fixed overhead the
+/// record itself costs.
+///
+/// Only the members whose length the REQUEST chose are counted on top of
+/// [`STORED_RECORD_OVERHEAD_BYTES`]: the id and the ARN are minted by
+/// [`ComAmazonawsEc2Amazonec2State::insert_placement_group`], and the state, strategy and
+/// spread level are words out of this module's own catalogs. The ONE definition of that
+/// charge, the way [`vpc_endpoint_connection_payload_bytes`] is for a connection: the
+/// writer charges exactly it and `CreatePlacementGroup` reserves exactly it, so the budget
+/// a create checks cannot drift from what the insert takes, and a group with no tags is not
+/// free against [`MAX_STORED_BYTES`].
+pub fn placement_group_spec_bytes(spec: &PlacementGroupSpec) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(spec.group_name.len())
+        .saturating_add(tag_list_bytes(&spec.tags))
+        .saturating_add(spec.parent_group_id.as_ref().map_or(0, String::len))
+}
+
+/// What a writer must say to store a placement group; everything else about the record —
+/// the id, the ARN, the state — is derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_placement_group`].
+#[derive(Debug, Clone)]
+pub struct PlacementGroupSpec {
+    /// "A name for the placement group" (`CreatePlacementGroupRequest$GroupName`).
+    pub group_name: String,
+    /// "The placement strategy" (`CreatePlacementGroupRequest$Strategy`), as a
+    /// `&'static str` out of the modelled `PlacementStrategy` catalog
+    /// ([`placement_strategy`]), so the stored word is never the request's own text.
+    pub strategy: &'static str,
+    /// "The number of partitions" a partition group was created with, and `None` for every
+    /// other strategy: `PartitionCount` is "valid only when Strategy is set to partition"
+    /// (`CreatePlacementGroupRequest$PartitionCount`).
+    pub partition_count: Option<i32>,
+    /// "The spread level for the placement group" a spread group was created with, and
+    /// `None` for every other strategy, out of the modelled `SpreadLevel` catalog
+    /// ([`spread_level`]).
+    pub spread_level: Option<&'static str>,
+    /// "The ID of the parent placement group" (`PlacementGroup$ParentGroupId`), resolved
+    /// against this store, when the request named one.
+    pub parent_group_id: Option<String>,
+    /// The Region the request was signed for, which the group's ARN names.
+    pub region: String,
+    /// The tags the request's `TagSpecifications` assign to the group.
+    pub tags: Vec<Tag>,
+}
+
+/// The modelled `PlacementStrategy` member `requested` names, or `None` when it names
+/// none.
+///
+/// The catalog is the generated [`crate::ops::types::PLACEMENT_STRATEGY_VALUES`], so this
+/// crate holds no second copy of it. Answering a `&'static str` out of that catalog is what
+/// keeps request text out of the store.
+pub fn placement_strategy(requested: &str) -> Option<&'static str> {
+    crate::ops::types::PLACEMENT_STRATEGY_VALUES
+        .iter()
+        .copied()
+        .find(|strategy| *strategy == requested)
+}
+
+/// The modelled `SpreadLevel` member `requested` names, or `None` when it names none.
+///
+/// The catalog is the generated [`crate::ops::types::SPREAD_LEVEL_VALUES`], for the reason
+/// [`placement_strategy`] gives.
+pub fn spread_level(requested: &str) -> Option<&'static str> {
+    crate::ops::types::SPREAD_LEVEL_VALUES
+        .iter()
+        .copied()
+        .find(|level| *level == requested)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another placement group fits inside the store's ceiling
+    /// ([`MAX_PLACEMENT_GROUPS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
+    /// with [`placement_group_limit_exceeded`] when it answers `false`.
+    pub fn has_placement_group_capacity(&self) -> bool {
+        self.placement_groups.len() < MAX_PLACEMENT_GROUPS
+    }
+
+    /// The id of the placement group named `group_name`, if the account holds one.
+    ///
+    /// A name "must be unique within the scope of your account for the Region"
+    /// (`CreatePlacementGroupRequest$GroupName`), so this answers at most one group: it is
+    /// both what a create asks before storing a duplicate and how a request that names a
+    /// group by name (`DeletePlacementGroup`, `DescribePlacementGroups$GroupNames`)
+    /// resolves it. Compared byte for byte, the name being an opaque identifier the model
+    /// publishes no case rule for.
+    pub fn placement_group_id_for_name(&self, group_name: &str) -> Option<String> {
+        self.placement_groups
+            .iter()
+            .find(|(_, group)| group.group_name.as_deref() == Some(group_name))
+            .map(|(group_id, _)| group_id.clone())
+    }
+
+    /// Store a placement group and answer it as it was stored — or `None` when the store is
+    /// at [`MAX_PLACEMENT_GROUPS`] and nothing was stored.
+    ///
+    /// The one way a placement group is stored, so the id it carries, the ARN it reports,
+    /// the state it starts in and the bytes it charges cannot be built two ways, and the
+    /// ceiling is asked HERE as well as by the caller — the contract every writer of this
+    /// module follows, so a writer that forgets the gate cannot grow the store without
+    /// bound. What comes back is the stored view itself, so a create answers exactly what a
+    /// later `DescribePlacementGroups` reports without reading the store a second time.
+    pub fn insert_placement_group(
+        &mut self,
+        spec: PlacementGroupSpec,
+    ) -> Option<PlacementGroup> {
+        if !self.has_placement_group_capacity() {
+            return None;
+        }
+        let group_id = self.next_id(PLACEMENT_GROUP_ID_PREFIX);
+        // Charged from the spec, so the quantity is exactly the one `CreatePlacementGroup`
+        // reserved against the byte budget before calling this.
+        self.add_stored_bytes(placement_group_spec_bytes(&spec));
+        let group = PlacementGroup {
+            group_id: Some(group_id.clone()),
+            group_name: Some(spec.group_name.clone()),
+            // "A logical grouping of instances" has nothing to provision, so it is
+            // available as soon as it exists.
+            state: Some(PLACEMENT_GROUP_STATE_AVAILABLE.to_string()),
+            strategy: Some(spec.strategy.to_string()),
+            partition_count: spec.partition_count,
+            spread_level: spec.spread_level.map(str::to_string),
+            // "The Amazon Resource Name (ARN) of the placement group"
+            // (`PlacementGroup$GroupArn`): an EC2 ARN in the Region the request was signed
+            // for, under the `placement-group` resource type, naming the group by NAME —
+            // the form `PlacementGroupArn`'s own pattern publishes
+            // (`arn:aws:ec2:<region>:<account>:placement-group/<name>`).
+            group_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("{RESOURCE_TYPE_PLACEMENT_GROUP}/{group_name}", group_name = spec.group_name),
+            )),
+            // "Reserved for future use" (`PlacementGroup$LinkedGroupId`), and "the service
+            // provider that manages the Placement Group" (`PlacementGroup$Operator`), whose
+            // request member is "reserved for internal use": AWS publishes no rule by which
+            // a customer request gives a group either, and no service provider manages a
+            // group an account created for itself, so this emulator reports neither rather
+            // than inventing a meaning for them.
+            linked_group_id: None,
+            operator: None,
+            parent_group_id: spec.parent_group_id,
+            tags: Some(spec.tags),
+        };
+        let stored = group.clone();
+        self.placement_groups.insert(group_id, group);
+        Some(stored)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Allowed AMIs: the account's image-criteria setting in one Region
 // ---------------------------------------------------------------------------
 //
@@ -11456,4 +11744,3 @@ pub fn allowed_images_settings_full<E>(region: &str, full: AllowedImagesSettings
         )),
     }
 }
-
