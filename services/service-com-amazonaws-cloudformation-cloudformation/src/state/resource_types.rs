@@ -794,6 +794,24 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::WAF::SqlInjectionMatchSet",
     "AWS::WAF::WebACL",
     "AWS::WAF::XssMatchSet",
+    // AWS WAF classic for regional resources, whose own model carries
+    // `cloudFormationName: WAFRegional` (`smithy_query(query="service_info",
+    // model_path="services/service-com-amazonaws-wafregional-awswaf-regional-20161128/\
+    // smithy-model/com-amazonaws-wafregional-awswaf-regional-20161128.json")`). The
+    // regional service publishes the four types the global one does not: a geo match set,
+    // a rate-based rule, a regex pattern set and the association of a web ACL with a
+    // regional resource.
+    "AWS::WAFRegional::ByteMatchSet",
+    "AWS::WAFRegional::GeoMatchSet",
+    "AWS::WAFRegional::IPSet",
+    "AWS::WAFRegional::RateBasedRule",
+    "AWS::WAFRegional::RegexPatternSet",
+    "AWS::WAFRegional::Rule",
+    "AWS::WAFRegional::SizeConstraintSet",
+    "AWS::WAFRegional::SqlInjectionMatchSet",
+    "AWS::WAFRegional::WebACL",
+    "AWS::WAFRegional::WebACLAssociation",
+    "AWS::WAFRegional::XssMatchSet",
     // AWS WAF v2
     "AWS::WAFv2::IPSet",
     "AWS::WAFv2::RegexPatternSet",

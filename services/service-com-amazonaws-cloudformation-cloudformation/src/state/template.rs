@@ -1599,14 +1599,9 @@ fn conventional_attributes(
     // A resource type is `AWS::<Service>::<Type>`: the service segment is the ARN
     // namespace and the last segment is the resource's own type. Anything else (a
     // malformed `Type`) carries no convention at all.
-    let segments: Vec<&str> = resource_type.split("::").collect();
-    let (Some(service), Some(segment)) = (segments.get(1), segments.last()) else {
+    let Some((service, segment)) = type_segments(resource_type) else {
         return Vec::new();
     };
-    if segments.len() < 3 || service.is_empty() || segment.is_empty() {
-        return Vec::new();
-    }
-    let physical_resource_id = resource.physical_resource_id.clone();
     let arn = known_arn(resource).unwrap_or_else(|| {
         ::emulator_server::emulator_arn(
             &service.to_lowercase(),
@@ -1614,14 +1609,53 @@ fn conventional_attributes(
             &format!("{}/{name}", hyphenated(segment)),
         )
     });
-    vec![
+    let mut conventional = vec![
         ("Arn".to_string(), arn.clone()),
         (format!("{segment}Arn"), arn),
-        ("Id".to_string(), physical_resource_id.clone()),
-        (format!("{segment}Id"), physical_resource_id),
-        ("Name".to_string(), name.to_string()),
-        (format!("{segment}Name"), name.to_string()),
+    ];
+    conventional.extend(identity_attributes(
+        resource_type,
+        &resource.physical_resource_id,
+    ));
+    conventional.push(("Name".to_string(), name.to_string()));
+    conventional.push((format!("{segment}Name"), name.to_string()));
+    conventional
+}
+
+/// The attributes the uniform convention reads off a resource's PHYSICAL ID: its
+/// `Id`/`<Type>Id` names, which are "the physical id `Ref` returns"
+/// ([`conventional_attributes`]).
+///
+/// Public because the physical id is not always CloudFormation's own to compute: where the
+/// OWNING service mints a resource's identity — AWS WAF Classic answers `CreateIPSet` with
+/// the `IPSetId` that type's `Ref` returns — the id is the one that service answered, which
+/// only [`super::provisioning`](crate::state::provisioning) learns. It re-points these
+/// attributes through this one function, so the `Id` a resource reports and the id its
+/// `Ref` resolves to cannot drift apart.
+pub fn identity_attributes(
+    resource_type: &str,
+    physical_resource_id: &str,
+) -> Vec<(String, String)> {
+    let Some((_, segment)) = type_segments(resource_type) else {
+        return Vec::new();
+    };
+    vec![
+        ("Id".to_string(), physical_resource_id.to_string()),
+        (format!("{segment}Id"), physical_resource_id.to_string()),
     ]
+}
+
+/// The `(service, type)` segments of a resource type spelled `AWS::<Service>::<Type>`, or
+/// `None` for anything else — a malformed `Type`, which carries no convention at all.
+fn type_segments(resource_type: &str) -> Option<(&str, &str)> {
+    let segments: Vec<&str> = resource_type.split("::").collect();
+    let (Some(service), Some(segment)) = (segments.get(1), segments.last()) else {
+        return None;
+    };
+    if segments.len() < 3 || service.is_empty() || segment.is_empty() {
+        return None;
+    }
+    Some((service, segment))
 }
 
 /// The ARN a resource ALREADY carries: its physical resource id where that is an ARN
@@ -2710,10 +2744,12 @@ fn return_values(
 /// ([`super::StoredStack::deploy_template`]). Every other type's physical id is a function
 /// of its declared or generated name, which any deployment recomputes identically.
 ///
-/// One type this emulator provisions is in that position: an experiment template's id is
-/// minted by FIS (`Ref` returns it, and the type has no name property at all).
+/// Two types this emulator provisions are in that position: an experiment template's id is
+/// minted by FIS (`Ref` returns it, and the type has no name property at all), and an AWS
+/// WAF Classic regional IPSet's id is minted by `CreateIPSet` ("Ref returns the IPSet ID"),
+/// where that type's `Name` is only what the create asks for.
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
-    resource_type == FIS_EXPERIMENT_TEMPLATE
+    resource_type == FIS_EXPERIMENT_TEMPLATE || resource_type == WAF_REGIONAL_IP_SET
 }
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
@@ -2764,6 +2800,12 @@ pub const ELB_TARGET_GROUP: &str = "AWS::ElasticLoadBalancingV2::TargetGroup";
 /// `cloudFormationName: FIS`). This is the type `super::provisioning` creates in FIS
 /// itself, so the id a stack's output reports for it is the id FIS minted.
 pub const FIS_EXPERIMENT_TEMPLATE: &str = "AWS::FIS::ExperimentTemplate";
+
+/// An AWS WAF Classic regional IPSet's resource type (the AWS WAF Regional model:
+/// `cloudFormationName: WAFRegional`). This is a type `super::provisioning` creates in that
+/// service itself, and "Ref returns the IPSet ID" — an id only AWS WAF Classic mints — so
+/// the id a stack's output reports for it is the one that service answered with.
+pub const WAF_REGIONAL_IP_SET: &str = "AWS::WAFRegional::IPSet";
 
 /// The prefix of an experiment-template id, as FIS mints one (`EXT` + a base-36 suffix;
 /// FIS's own `TEMPLATE_ID_PREFIX`).

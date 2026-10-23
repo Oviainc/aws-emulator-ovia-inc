@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The two things every awsQuery suite in this test crate needs: the percent-encoder that
-//! builds a form body, and the reader that pulls one element's text out of the XML answer.
+//! builds a form body, and the readers that pull one element's text — or every occurrence
+//! of a repeated one — out of the XML answer.
 //!
 //! They live here, ONCE, because a suite that writes its own drifts from the others: an
 //! encoder that leaves one more byte literal, or a reader that stops at a different tag,

@@ -93,6 +93,24 @@
 //! [`provisioner_for`](super::provisioner::provisioner_for) and the create/delete pair it
 //! names, and that type's resources then really are created and deleted.
 //!
+//! ## Whose the resource's IDENTITY is
+//!
+//! For most types CloudFormation decides it: "Ref returns the bucket name", the queue url
+//! it built, the stream name the template asked for — [`super::template`] computes the
+//! physical resource id from the template and the stack, and the create call carries it
+//! OUT to the owning service as the name of the resource to make.
+//!
+//! For a type whose owning service ASSIGNS the resource's identity it is the other way
+//! round ([`super::template::identity_is_service_assigned`]): FIS mints an experiment
+//! template's id and AWS WAF Classic answers `CreateIPSet` with an `IPSetId` of its own, and
+//! "Ref returns the IPSet ID" — so the id a stack's `Ref`, its `Outputs` and its
+//! per-resource reads report is the one that service answered, and the name CloudFormation
+//! computed is only what the create asked for. [`reconcile`] adopts that id ([`Created`])
+//! and the `Id`/`<Type>Id` attributes are re-pointed at it
+//! ([`adopt_minted_identity`]), while a later deployment of the same resource keeps it
+//! rather than recomputing one ([`super::StoredStack::deploy_template`]): the stack's own
+//! deletion has to address the resource by the id its service knows it by.
+//!
 //! A type that DOES have an entry is never passed off as created: whatever its owning
 //! service answers short of success — a modelled refusal, the 501 of an operation this
 //! emulator has not implemented, or an answer that identifies nothing at all — leaves the
@@ -163,10 +181,11 @@ pub(super) const REST_JSON: &str = "application/json";
 /// What the service that owns a resource answered when it created it.
 ///
 /// `physical_resource_id` is set only by a type whose id that service ASSIGNS (an FIS
-/// experiment template's `EXT…`), which no naming rule could have computed: it replaces
-/// the computed id, because it is what `Ref` resolves to and what a client calls the
-/// service with. For every other type the computed id IS the one the resource was created
-/// under (a queue's name, a cluster's name), so the arm leaves it alone.
+/// experiment template's `EXT…`, an AWS WAF Classic IPSet's `IPSetId`), which no naming rule
+/// could have computed: it replaces the computed id, because it is what `Ref` resolves to
+/// and what a client calls the service with. For every other type the computed id IS the one
+/// the resource was created under (a queue's name, a cluster's name), so the arm leaves it
+/// alone.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Created {
     pub(super) physical_resource_id: Option<String>,
@@ -267,9 +286,7 @@ pub async fn reconcile(
             // itself, where that service ASSIGNS the id rather than taking it from a name
             // the template or CloudFormation decided.
             Ok(created) => {
-                if let Some(id) = created.physical_resource_id {
-                    resource.physical_resource_id = id;
-                }
+                adopt_minted_identity(&mut resource, created.physical_resource_id);
                 resource.attributes.extend(created.attributes);
                 resource.materialised = true;
             }
@@ -338,6 +355,32 @@ pub async fn reconcile(
     outcome
 }
 
+/// Record the identity an owning service ASSIGNED to a resource it created: the id its
+/// `Ref` resolves to from here on, and the `Id`/`<Type>Id` attributes read off that id
+/// ([`super::template::identity_attributes`]), which the naming rules had computed from the
+/// name instead.
+///
+/// `None` is every type whose physical id CloudFormation computes, which the create already
+/// carried out to that service: nothing to adopt.
+fn adopt_minted_identity(resource: &mut StoredResource, assigned: Option<String>) {
+    let Some(assigned) = assigned else {
+        return;
+    };
+    for (attribute, value) in
+        super::template::identity_attributes(&resource.resource_type, &assigned)
+    {
+        // An attribute the convention already gave the resource is re-pointed; a new one
+        // is added only while the resource is under its attribute bound, which is what
+        // caps the map.
+        if resource.attributes.contains_key(&attribute)
+            || resource.attributes.len() < super::template::MAX_ATTRIBUTES_PER_RESOURCE
+        {
+            resource.attributes.insert(attribute, value);
+        }
+    }
+    resource.physical_resource_id = assigned;
+}
+
 /// Record what an owning service already created: the resource exists there with the
 /// identity and the configuration it was created with, so the new record carries both
 /// rather than the deployment's own idea of them.
@@ -357,6 +400,11 @@ fn carry_forward(existing: &StoredResource, resource: &mut StoredResource) {
 /// resource or replaces it. The one place that rule is written, so the record a re-deploy
 /// carries forward ([`super::StoredStack::deploy_template`]) and the resource
 /// [`reconcile`] leaves alone cannot drift apart.
+///
+/// A resource whose physical id its owning service ASSIGNED is matched by the same rule:
+/// the deploying record already carries the id that service minted, because
+/// [`super::StoredStack::deploy_template`] carried it forward — nothing here could
+/// recompute it.
 pub fn is_same_resource(left: &StoredResource, right: &StoredResource) -> bool {
     left.logical_id == right.logical_id
         && left.resource_type == right.resource_type

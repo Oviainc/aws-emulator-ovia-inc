@@ -181,3 +181,5 @@ mod apigatewayv2_websocket_deploy_then_connections;
 mod cloudformation_provisions_fis_experiment_templates;
 #[path = "all/cloudformation_provisions_sns_topics.rs"]
 mod cloudformation_provisions_sns_topics;
+#[path = "all/cloudformation_provisions_waf_regional_ip_sets.rs"]
+mod cloudformation_provisions_waf_regional_ip_sets;

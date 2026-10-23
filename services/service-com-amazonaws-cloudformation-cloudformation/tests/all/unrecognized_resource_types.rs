@@ -134,6 +134,16 @@ fn cases() -> Vec<Case> {
             unrecognized: &["AWS::S3::Buckets"],
         },
         Case {
+            // The regional AWS WAF Classic namespace publishes resource types of its own,
+            // beside the global `AWS::WAF::` ones: a template declaring one is accepted,
+            // and a name that namespace does not publish still is not.
+            case: "a resource name that does not exist in the AWS WAF Regional namespace",
+            stack_name: "misspelled-wafregional-resource",
+            template: r#"{"Resources":{"S":{"Type":"AWS::WAFRegional::IPSets","Properties":{"Name":"s"}}}}"#
+                .to_string(),
+            unrecognized: &["AWS::WAFRegional::IPSets"],
+        },
+        Case {
             case: "a namespace that is no service at all",
             stack_name: "not-a-service",
             template: r#"{"Resources":{"X":{"Type":"AWS::NotAService::NotAType"}}}"#.to_string(),
@@ -208,6 +218,23 @@ fn cases() -> Vec<Case> {
                            "Vault":{"Type":"AWS::Backup::BackupVault","Properties":{"BackupVaultName":"v"}},
                            "Pool":{"Type":"AWS::Cognito::UserPool"},
                            "Zone":{"Type":"AWS::Route53::HostedZone"}}}"#
+                .to_string(),
+            unrecognized: &[],
+        },
+        Case {
+            // The regional AWS WAF Classic types, which the global `AWS::WAF::` namespace
+            // does not publish: the four this one adds, beside two it shares. None of
+            // them is provisioned by THIS crate's suites — the IPSet is, in the router's
+            // own cross-service suite — so a stack here records them as declared.
+            case: "the AWS WAF Regional types, the namespace the reported case cited",
+            stack_name: "wafregional-types",
+            template: r#"{"Resources":{
+                           "Geo":{"Type":"AWS::WAFRegional::GeoMatchSet","Properties":{"Name":"g"}},
+                           "Rate":{"Type":"AWS::WAFRegional::RateBasedRule","Properties":{"Name":"r","MetricName":"r","RateKey":"IP","RateLimit":2000}},
+                           "Patterns":{"Type":"AWS::WAFRegional::RegexPatternSet","Properties":{"Name":"p"}},
+                           "Association":{"Type":"AWS::WAFRegional::WebACLAssociation","Properties":{"ResourceArn":"arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/a/0123456789abcdef","WebACLId":"an-id"}},
+                           "Acl":{"Type":"AWS::WAFRegional::WebACL","Properties":{"Name":"a","MetricName":"a","DefaultAction":{"Type":"ALLOW"}}},
+                           "Sizes":{"Type":"AWS::WAFRegional::SizeConstraintSet","Properties":{"Name":"s"}}}}"#
                 .to_string(),
             unrecognized: &[],
         },
@@ -492,4 +519,14 @@ fn the_catalogue_recognises_what_it_publishes_and_nothing_else() {
         swf.is_empty(),
         "expected no AWS::SWF:: resource type in the catalogue, found {swf:?}"
     );
+    // AWS WAF Classic publishes two namespaces, one per endpoint: the global `AWS::WAF::`
+    // types and the regional `AWS::WAFRegional::` ones (the `cloudFormationName` of the
+    // regional service's own model). A template may declare either.
+    for resource_type in ["AWS::WAF::IPSet", "AWS::WAFRegional::IPSet"] {
+        assert!(
+            is_recognized(resource_type),
+            "type {resource_type:?}: expected a published AWS WAF Classic type to be \
+             recognized, it is not"
+        );
+    }
 }

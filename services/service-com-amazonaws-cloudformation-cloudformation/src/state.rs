@@ -818,8 +818,9 @@ impl StoredStack {
                 // the properties the resource was created with, and this record's
                 // properties are what `reconcile` compares against them to see whether
                 // the deployment asks for a DIFFERENT configuration of a resource that
-                // already exists. Only the fact that it exists, and what the owning
-                // service reported about it, carry forward here.
+                // already exists. Only the fact that it exists, what the owning service
+                // reported about it, and an identity that service MINTED (which no
+                // deployment recomputes) carry forward here.
                 resource.materialised = true;
                 if template::identity_is_service_assigned(&resource.resource_type) {
                     // The identifier in force is the one that service minted, so the

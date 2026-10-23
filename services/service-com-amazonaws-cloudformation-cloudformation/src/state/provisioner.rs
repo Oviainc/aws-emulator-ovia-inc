@@ -49,9 +49,14 @@
 //!   `Targets` and `Actions` are MAPS keyed by names the template chose (as are a target's
 //!   `ResourceTags` and `Parameters` and an action's `Parameters` and `Targets`), so its
 //!   arm maps each modelled structure member by member and passes every caller-keyed map
-//!   through as written. It is also the one type here whose physical id the owning service
-//!   ASSIGNS: FIS mints the experiment template's id, so that id — not a computed name — is
-//!   what the stack reports for the resource.
+//!   through as written. Its physical id is one the owning service ASSIGNS: FIS mints the
+//!   experiment template's id, so that id — not a computed name — is what the stack reports
+//!   for the resource;
+//! * `AWS::WAFRegional::IPSet`'s two properties reach AWS WAF Classic through TWO calls,
+//!   because that is how its API takes them: `CreateIPSet` takes the `Name`, each declared
+//!   `IPSetDescriptors` entry is INSERTed by an `UpdateIPSet`, and both carry a change
+//!   token of their own. Its identity is its owning service's too ("Ref returns the IPSet
+//!   ID"), so its arm answers the `IPSetId` AWS WAF returned as the resource's physical id.
 //!
 //! No arm invents a value: a property the template does not declare is absent from the
 //! request, and what the owning service answers is what the stack records. A property an
@@ -71,7 +76,7 @@ use super::provisioning::{
 };
 use super::template::{
     ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
-    SNS_TOPIC, SQS_QUEUE,
+    SNS_TOPIC, SQS_QUEUE, WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
 
@@ -97,6 +102,7 @@ pub(super) enum Provisioner {
     SqsQueue,
     SnsTopic,
     FisExperimentTemplate,
+    WafRegionalIpSet,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -112,14 +118,18 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         SQS_QUEUE => Some(Provisioner::SqsQueue),
         SNS_TOPIC => Some(Provisioner::SnsTopic),
         FIS_EXPERIMENT_TEMPLATE => Some(Provisioner::FisExperimentTemplate),
+        WAF_REGIONAL_IP_SET => Some(Provisioner::WafRegionalIpSet),
         _ => None,
     }
 }
 
 impl Provisioner {
     /// Create one resource in the service that owns it, and report back what that service
-    /// decided (an ARN it minted, or the identifier it ASSIGNED), which replaces what
-    /// CloudFormation's naming rules computed. `Err` is that service's own refusal.
+    /// decided about it ([`Created`]): the attributes it reported (an ARN it minted, say),
+    /// which replace the ones CloudFormation's naming rules computed, and — for a type
+    /// whose identity is that service's
+    /// ([`super::template::identity_is_service_assigned`]) — the physical id it assigned.
+    /// `Err` is that service's own refusal.
     pub(super) async fn create(
         self,
         ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -138,6 +148,7 @@ impl Provisioner {
             Self::FisExperimentTemplate => {
                 create_experiment_template(ctx, region, resource).await
             }
+            Self::WafRegionalIpSet => create_ip_set(ctx, region, resource).await,
         }
     }
 
@@ -172,6 +183,7 @@ impl Provisioner {
             Self::FisExperimentTemplate => {
                 delete_experiment_template(ctx, region, physical_resource_id).await
             }
+            Self::WafRegionalIpSet => delete_ip_set(ctx, region, physical_resource_id).await,
         }
     }
 
@@ -210,6 +222,7 @@ impl Provisioner {
             Self::FisExperimentTemplate => {
                 describe_experiment_template(ctx, region, physical_resource_id).await
             }
+            Self::WafRegionalIpSet => describe_ip_set(ctx, region, physical_resource_id).await,
         }
     }
 }
@@ -2160,6 +2173,238 @@ fn copy_members(
             request.insert((*member).to_string(), value.clone());
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// AWS WAF Classic, regional: AWS::WAFRegional::IPSet
+// ---------------------------------------------------------------------------
+
+/// AWS WAF Classic Regional's signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: waf-regional`, service shape `AWSWAF_Regional_20161128`), which speaks
+/// `awsJson1_1`.
+const WAF_REGIONAL_SIGNING_NAME: &str = "waf-regional";
+const WAF_REGIONAL_TARGET_PREFIX: &str = "AWSWAF_Regional_20161128";
+
+/// The error code AWS WAF Classic answers for an object it does not hold
+/// (`WAFNonexistentItemException`: "the referenced object doesn't exist"), and the one
+/// `UpdateIPSet` answers when the IPSet the updates are for is not there at all
+/// (`WAFNonexistentContainerException`: "you tried to add an IP address to or delete an IP
+/// address from an IPSet that doesn't exist").
+const WAF_NONEXISTENT_ITEM: &str = "WAFNonexistentItemException";
+const WAF_NONEXISTENT_CONTAINER: &str = "WAFNonexistentContainerException";
+
+/// The two `ChangeAction` values an `UpdateIPSet` update carries: "whether to insert or
+/// delete the IP address".
+const WAF_INSERT: &str = "INSERT";
+const WAF_DELETE: &str = "DELETE";
+
+/// Create the IPSet an `AWS::WAFRegional::IPSet` declares, and answer the `IPSetId` AWS WAF
+/// Classic minted as the resource's physical id — "Ref returns the IPSet ID", which is a
+/// value only that service produces.
+///
+/// The type's properties are `Name` and `IPSetDescriptors`, and AWS WAF Classic takes them
+/// through the two calls its own documentation sequences: "Submit a CreateIPSet request …
+/// Submit an UpdateIPSet request to specify the IP addresses that you want AWS WAF to watch
+/// for". So the create carries the name, and each declared descriptor is INSERTed by one
+/// update. Every mutating call carries its own change token ("Use GetChangeToken to get the
+/// change token that you provide in the ChangeToken parameter"), so a resource whose
+/// descriptors the template declares is created with them rather than with the name alone.
+async fn create_ip_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let request = serde_json::json!({
+        "Name": ip_set_name(resource),
+        "ChangeToken": waf_regional_change_token(ctx, region).await?,
+    });
+    let reported = call_waf_regional(ctx, region, "CreateIPSet", &request).await?;
+    let Some(ip_set_id) = reported
+        .pointer("/IPSet/IPSetId")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+    else {
+        // The create answered success and identified nothing, so there is no id to address
+        // the IPSet by: not something this stack can report as a created resource.
+        return Err(Refusal {
+            code: "InternalFailure".to_string(),
+            message: "CreateIPSet answered no IPSet.IPSetId".to_string(),
+        });
+    };
+    let descriptors = declared_ip_set_descriptors(&resource.properties);
+    if !descriptors.is_empty() {
+        let updates: Vec<Value> = descriptors
+            .into_iter()
+            .map(|descriptor| {
+                serde_json::json!({ "Action": WAF_INSERT, "IPSetDescriptor": descriptor })
+            })
+            .collect();
+        if let Err(refusal) = update_ip_set(ctx, region, &ip_set_id, updates).await {
+            // The resource the template declares is the IPSet WITH its addresses, and this
+            // create could not make it. The empty IPSet the first call left is deleted
+            // again, so a create the stack reports as failed leaves nothing behind in the
+            // owning service; the refusal reported is the one that failed.
+            let _ = delete_ip_set(ctx, region, &ip_set_id).await;
+            return Err(refusal);
+        }
+    }
+    Ok(Created {
+        physical_resource_id: Some(ip_set_id),
+        attributes: BTreeMap::new(),
+    })
+}
+
+/// Delete the IPSet a stack created.
+///
+/// "You can't delete an IPSet if it still includes any IP addresses", so the addresses go
+/// first, which is the sequence AWS WAF Classic documents for permanently deleting one:
+/// "Update the IPSet to remove IP address ranges, if any. Submit a DeleteIPSet request".
+/// The IPSet is read back, every descriptor it still holds is DELETEd by one update, and
+/// the IPSet itself is then deleted.
+///
+/// An IPSet AWS WAF Classic no longer holds is already in the state the delete asks for,
+/// judged on its own not-found CODES (`WAFNonexistentItemException` from the read and the
+/// delete, `WAFNonexistentContainerException` from the update that empties it) and never on
+/// a message, which carries the request's own id. One a Rule still references is NOT
+/// deleted (`WAFReferencedItemException`), and that refusal is what the stack reports.
+async fn delete_ip_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let Some(ip_set) = describe_ip_set(ctx, region, physical_resource_id).await? else {
+        return Ok(());
+    };
+    let descriptors = ip_set
+        .get("IPSetDescriptors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !descriptors.is_empty() {
+        let updates: Vec<Value> = descriptors
+            .into_iter()
+            .map(|descriptor| {
+                serde_json::json!({ "Action": WAF_DELETE, "IPSetDescriptor": descriptor })
+            })
+            .collect();
+        match update_ip_set(ctx, region, physical_resource_id, updates).await {
+            Ok(()) => {}
+            Err(refusal) if refusal.code == WAF_NONEXISTENT_CONTAINER => return Ok(()),
+            Err(refusal) => return Err(refusal),
+        }
+    }
+    let request = serde_json::json!({
+        "IPSetId": physical_resource_id,
+        "ChangeToken": waf_regional_change_token(ctx, region).await?,
+    });
+    match call_waf_regional(ctx, region, "DeleteIPSet", &request).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == WAF_NONEXISTENT_ITEM => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The IPSet as AWS WAF Classic reports it, for drift detection and for the delete that has
+/// to empty it first. An IPSet it no longer holds (`WAFNonexistentItemException`) was
+/// deleted.
+///
+/// The `IPSet` the read answers carries `Name` and `IPSetDescriptors` under exactly the
+/// names the type's properties have, so it is the actual configuration the declared one is
+/// compared against.
+async fn describe_ip_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "IPSetId": physical_resource_id });
+    match call_waf_regional(ctx, region, "GetIPSet", &request).await {
+        Ok(answer) => Ok(Some(reported_member(&answer, "IPSet"))),
+        Err(refusal) if refusal.code == WAF_NONEXISTENT_ITEM => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Apply one batch of `Updates` to an IPSet, under a change token of its own.
+async fn update_ip_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    ip_set_id: &str,
+    updates: Vec<Value>,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({
+        "IPSetId": ip_set_id,
+        "ChangeToken": waf_regional_change_token(ctx, region).await?,
+        "Updates": updates,
+    });
+    call_waf_regional(ctx, region, "UpdateIPSet", &request)
+        .await
+        .map(|_| ())
+}
+
+/// The `IPSetDescriptors` an `AWS::WAFRegional::IPSet` declares, as `UpdateIPSet` takes
+/// them.
+///
+/// An `IPSetDescriptor` is `{Type, Value}` on both sides — the property's members are the
+/// API shape's own — so each entry goes through as the template wrote it. A declaration
+/// AWS WAF Classic will not take is not filtered out here: that service's own validation is
+/// what judges a descriptor, and its refusal leaves the stack `CREATE_FAILED` rather than
+/// an IPSet configured differently from the template.
+fn declared_ip_set_descriptors(properties: &Value) -> Vec<Value> {
+    properties
+        .get("IPSetDescriptors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The NAME of the IPSet a resource record declares: the `Name` its type's property
+/// carries, which is the name the template asked for or the `<stack>-<logical id>-<suffix>`
+/// name CloudFormation generated for it — never the physical id, which for this type is the
+/// id AWS WAF Classic minted once the create went through.
+///
+/// A record with no such attribute (one whose attribute budget was spent) falls back to the
+/// physical id, which before the create IS that computed name.
+fn ip_set_name(resource: &StoredResource) -> String {
+    resource
+        .attributes
+        .get("Name")
+        .cloned()
+        .unwrap_or_else(|| resource.physical_resource_id.clone())
+}
+
+/// A change token for one mutating AWS WAF Classic call. "Each create, update, or delete
+/// request must use a unique change token", so one is fetched per call rather than reused.
+async fn waf_regional_change_token(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> Result<String, Refusal> {
+    let answer = call_waf_regional(ctx, region, "GetChangeToken", &serde_json::json!({})).await?;
+    answer
+        .get("ChangeToken")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| Refusal {
+            code: "InternalFailure".to_string(),
+            message: "GetChangeToken answered no ChangeToken".to_string(),
+        })
+}
+
+/// Call one AWS WAF Classic Regional operation on the awsJson1_1 wire its model declares.
+async fn call_waf_regional(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_json_rpc(
+        ctx,
+        WAF_REGIONAL_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{WAF_REGIONAL_TARGET_PREFIX}.{operation}"),
+        request,
+    )
+    .await
 }
 
 #[cfg(test)]
