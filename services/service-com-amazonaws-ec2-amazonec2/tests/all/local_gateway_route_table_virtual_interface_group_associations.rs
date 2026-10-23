@@ -163,19 +163,24 @@ fn seed(engine: &engine::InMemoryEngine) -> Vec<String> {
     let mut guard = store.lock();
     let mut ids = Vec::new();
     for row in seeded_rows() {
+        let case = row.state;
         ids.push(
-            guard.insert_local_gateway_route_table_virtual_interface_group_association(
-                AssociationSpec {
-                    local_gateway_route_table_id: row.route_table_id.to_string(),
-                    local_gateway_virtual_interface_group_id: row
-                        .virtual_interface_group_id
-                        .to_string(),
-                    local_gateway_id: row.local_gateway_id.to_string(),
-                    region: row.region.to_string(),
-                    state: row.state.to_string(),
-                    tags: row.tags,
-                },
-            ),
+            guard
+                .insert_local_gateway_route_table_virtual_interface_group_association(
+                    AssociationSpec {
+                        local_gateway_route_table_id: row.route_table_id.to_string(),
+                        local_gateway_virtual_interface_group_id: row
+                            .virtual_interface_group_id
+                            .to_string(),
+                        local_gateway_id: row.local_gateway_id.to_string(),
+                        region: row.region.to_string(),
+                        state: row.state.to_string(),
+                        tags: row.tags,
+                    },
+                )
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: the store must take the seeded association")
+                }),
         );
     }
     ids
@@ -310,7 +315,8 @@ async fn every_stored_association_is_reported_and_a_later_write_is_visible() {
             region: REGION.to_string(),
             state: "available".to_string(),
             tags: vec![tag("Name", "late")],
-        });
+        })
+        .expect("after a later write: the store must take the association");
     let after = described_ids(&router, "after a later write", &[]).await;
     let mut expected = seeded.clone();
     expected.push(late_id.clone());

@@ -47,6 +47,13 @@ mod dynamodb_streams_routing;
 // those appends.
 #[path = "all/elb_classic_and_v2_signing_name_routing.rs"]
 mod elb_classic_and_v2_signing_name_routing;
+// Declared HERE too, in the sorted list rather than appended at the tail, for the reason
+// the note above gives: the appended region at the end of this file is where every
+// concurrent router suite lands, so a line added there conflicts with every other suite
+// in the same window — this fix lost four serialized squash merges to exactly that. These
+// neighbouring lines are stable.
+#[path = "all/es_opensearch_and_elasticsearch_signing_name_routing.rs"]
+mod es_opensearch_and_elasticsearch_signing_name_routing;
 #[path = "all/events_signing_name_routing.rs"]
 mod events_signing_name_routing;
 #[path = "all/events_store_ownership.rs"]

@@ -138,8 +138,10 @@ fn stretch_m(line: &[[f64; 2]], from: usize, to: usize) -> f64 {
         .sum()
 }
 
-/// A route request over the grid, with the leg summary and the `Simple` geometry the
-/// assertions below read.
+/// A route request over the grid, with the leg summary, the per-step narration and the
+/// `Simple` geometry the assertions below read. `TravelStepInstructions` is what asks for
+/// a step's `Instruction`, `CurrentRoad` and `NextRoad`, so a suite that reads those must
+/// ask for it.
 fn request(origin: [f64; 2], destination: [f64; 2], travel_mode: &str, waypoints: Vec<Value>) -> Value {
     json!({
         "Origin": origin,
@@ -147,7 +149,7 @@ fn request(origin: [f64; 2], destination: [f64; 2], travel_mode: &str, waypoints
         "TravelMode": travel_mode,
         "Waypoints": waypoints,
         "LegGeometryFormat": "Simple",
-        "LegAdditionalFeatures": ["Summary"],
+        "LegAdditionalFeatures": ["Summary", "TravelStepInstructions"],
     })
 }
 
@@ -735,31 +737,35 @@ async fn a_waypoint_stop_is_the_after_travel_step_of_its_leg() {
     }
 }
 
-/// `TravelStepInstructions` is a leg feature this slice computes, so a request naming it is
-/// answered with the steps it asks for rather than declined; a feature the road model holds
-/// no data for is still declined.
+/// `TravelStepInstructions` is the leg feature that asks for the per-step narration, so a
+/// request naming it is answered with the instructions it asks for and one that does not
+/// gets the members the model requires and nothing more; a feature the road model holds no
+/// data for is still declined.
 #[tokio::test]
 async fn the_travel_step_instructions_leg_feature_is_answered() {
     let router = routes_service();
-    // Rows differ along the feature list: the step instructions alone, beside a feature
-    // that is computed, and beside one that is not.
-    let cases: [(&str, Value, u16); 5] = [
-        ("no feature asked for", json!([]), 200),
-        ("the step instructions alone", json!(["TravelStepInstructions"]), 200),
+    // Rows differ along the feature list: nothing, the step instructions alone, beside
+    // another feature that is computed, and beside ones that are not.
+    let cases: [(&str, Value, u16, bool); 6] = [
+        ("no feature asked for", json!([]), 200, false),
+        ("a feature that is not the step instructions", json!(["Summary"]), 200, false),
+        ("the step instructions alone", json!(["TravelStepInstructions"]), 200, true),
         (
             "the step instructions beside the summary",
             json!(["Summary", "TravelStepInstructions"]),
             200,
+            true,
         ),
-        ("a feature the road model has no data for", json!(["Elevation"]), 501),
+        ("a feature the road model has no data for", json!(["Elevation"]), 501, false),
         (
             "the step instructions beside one it has no data for",
             json!(["TravelStepInstructions", "Zones"]),
             501,
+            false,
         ),
     ];
 
-    for (case, features, expected) in cases {
+    for (case, features, expected, narrated) in cases {
         let mut body = request([-123.1, 49.28], [-123.12, 49.26], "Car", Vec::new());
         body["LegAdditionalFeatures"] = features.clone();
         let (status, answer, _) = post(&router, ROUTES, &body).await;
@@ -775,11 +781,21 @@ async fn the_travel_step_instructions_leg_feature_is_answered() {
             .unwrap_or_else(|| panic!("case {case:?}: Legs is required, got {answer:?}"))
         {
             let steps = travel_steps(&leg_details(leg, case), case);
-            assert!(
+            assert_eq!(
                 steps
                     .iter()
                     .all(|step| step["Instruction"].as_str().is_some_and(|text| !text.is_empty())),
-                "case {case:?}: every step of a Default answer carries its instruction, got {steps:?}"
+                narrated,
+                "case {case:?}: expected the steps of a Default answer to be narrated={narrated}, got {steps:?}"
+            );
+            assert_eq!(
+                steps.iter().any(|step| step["CurrentRoad"].is_object()),
+                narrated,
+                "case {case:?}: the road detail of a step follows the same feature, got {steps:?}"
+            );
+            assert!(
+                steps.iter().all(|step| step["ExitNumber"].as_array().is_some()),
+                "case {case:?}: ExitNumber is reported whatever was asked for, got {steps:?}"
             );
         }
     }

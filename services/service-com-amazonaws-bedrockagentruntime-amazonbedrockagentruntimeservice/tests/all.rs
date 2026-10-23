@@ -15,6 +15,8 @@
 mod date_time_wire_form;
 #[path = "all/invocations.rs"]
 mod invocations;
+#[path = "all/reranking.rs"]
+mod reranking;
 #[path = "all/sessions.rs"]
 mod sessions;
 #[path = "all/state_roundtrip.rs"]

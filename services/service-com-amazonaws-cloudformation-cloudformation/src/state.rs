@@ -317,6 +317,16 @@ pub struct StoredResource {
     pub physical_resource_id: String,
     /// The attributes `Fn::GetAtt` reads off this resource, keyed by attribute name.
     pub attributes: BTreeMap<String, String>,
+    /// The content of the `Metadata` resource attribute the template declared for this
+    /// resource, as JSON — what `StackResourceDetail$Metadata` reports ("The content of
+    /// the `Metadata` attribute declared for the resource"). `None` for a resource whose
+    /// declaration carries no `Metadata`, since the member is optional and this emulator
+    /// reports what the template declared rather than an invented value.
+    ///
+    /// Captured where the template is DEPLOYED ([`template::provision`]), not on a read:
+    /// a read must not re-parse a caller-sized body under the store lock, and the value
+    /// belongs to the template that finished deploying rather than to the one in force.
+    pub metadata: Option<String>,
     /// The resource's declared `Properties` with every intrinsic function EVALUATED — the
     /// request the owning service's create API takes
     /// ([`provisioning`](crate::state::provisioning)). `Null` for a resource that declared
@@ -1614,6 +1624,14 @@ pub fn new_request_id() -> String {
 /// addressable: no live stack has that name and no stack has that id.
 pub fn stack_does_not_exist(name_or_id: &str) -> String {
     format!("Stack with id {name_or_id} does not exist")
+}
+
+/// The message answered when a request names a `LogicalResourceId` the stack it selected
+/// has not deployed: the stack is addressable, so what does not exist is the resource
+/// under that logical id in that stack. Built from what the request named, the way
+/// [`stack_does_not_exist`] is.
+pub fn resource_does_not_exist(logical_resource_id: &str, stack_name: &str) -> String {
+    format!("Resource {logical_resource_id} does not exist for stack {stack_name}")
 }
 
 /// The message answered when a request names an extension the registry of this account and

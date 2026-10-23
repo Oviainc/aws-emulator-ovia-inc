@@ -350,18 +350,14 @@ fn validation_challenge(
     }
 }
 
-/// The byte that separates a token's two keys. Outside both the `CertificateArn`
-/// pattern and a domain name, so it cannot occur inside either value it joins.
-const CURSOR_SEPARATOR: char = '\u{1f}';
-
 /// The opaque `NextToken` for the last domain a page emitted.
 ///
-/// It carries the certificate the page was cut from as well as that domain, so a token
-/// issued for one certificate cannot resume a list of another's domains. Hex-encoded
-/// so the token is opaque to the caller and satisfies the member's
-/// `^[\u0009\u000A\u000D\u0020-\u00FF]*$` pattern whatever the values contain.
+/// Rendered through [`crate::state::encode_page_cursor`], the one token form every
+/// parent-scoped paginated read in this service issues: it carries the certificate the
+/// page was cut from as well as that domain, so a token issued for one certificate
+/// cannot resume a list of another's domains.
 fn encode_next_token(certificate_arn: &str, domain_name: &str) -> String {
-    hex::encode(format!("{certificate_arn}{CURSOR_SEPARATOR}{domain_name}"))
+    crate::state::encode_page_cursor(certificate_arn, domain_name)
 }
 
 /// This operation's refusal of its own request parameters: a value it cannot use, in
@@ -384,21 +380,11 @@ fn invalid_next_token() -> ListCertificateDomainValidationsErrorModeled {
 }
 
 /// The domain name a `NextToken` resumes after, or [`invalid_next_token`] when the
-/// token did not come from [`encode_next_token`] for `certificate_arn`.
-///
-/// Every step is fallible on purpose: the token is caller-supplied, so no value read
-/// out of it may panic the handler or silently resume somebody else's list.
+/// token did not come from [`crate::state::encode_page_cursor`] for `certificate_arn`.
 fn decode_next_token(
     token: &str,
     certificate_arn: &str,
 ) -> Result<String, ListCertificateDomainValidationsError> {
-    let bytes = hex::decode(token).map_err(|_| invalid_next_token())?;
-    let decoded = String::from_utf8(bytes).map_err(|_| invalid_next_token())?;
-    let (arn, domain_name) = decoded
-        .split_once(CURSOR_SEPARATOR)
-        .ok_or_else(invalid_next_token)?;
-    if arn != certificate_arn || domain_name.is_empty() {
-        return Err(invalid_next_token().into());
-    }
-    Ok(domain_name.to_string())
+    crate::state::decode_page_cursor(token, certificate_arn)
+        .ok_or_else(|| invalid_next_token().into())
 }
