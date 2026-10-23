@@ -75,7 +75,7 @@ pub(crate) fn great_circle_m(a: [f64; 2], b: [f64; 2]) -> f64 {
 }
 
 /// `[longitude, latitude]` read off a response member.
-fn position(value: &Value, case: &str) -> [f64; 2] {
+pub(crate) fn position(value: &Value, case: &str) -> [f64; 2] {
     let values = value
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected a position array, got {value:?}"));
@@ -99,7 +99,7 @@ pub(crate) fn int(value: &Value, member: &str, case: &str) -> i64 {
 
 pub(crate) const ROUTES: &str = "/v2/routes";
 const MATRIX: &str = "/v2/route-matrix";
-const SNAP: &str = "/v2/snap-to-roads";
+pub(crate) const SNAP: &str = "/v2/snap-to-roads";
 const OPTIMIZE: &str = "/v2/optimize-waypoints";
 const ISOLINES: &str = "/v2/isolines";
 
@@ -257,7 +257,10 @@ async fn calculate_routes_returns_one_leg_per_stop_for_every_shape_of_request() 
         }
 
         // The first leg leaves the origin and the last one reaches the destination,
-        // whatever happens in between.
+        // whatever happens in between. The place reports the SUBMITTED position in
+        // `OriginalPosition` ("Position provided in the request"); `Position` is that
+        // position matched onto the road network, which `the_places_of_a_leg_report_the_
+        // submitted_position_and_its_match` pins.
         let first = &legs[0];
         let last = &legs[legs.len() - 1];
         let place = |leg: &Value, which: &str| -> [f64; 2] {
@@ -266,7 +269,7 @@ async fn calculate_routes_returns_one_leg_per_stop_for_every_shape_of_request() 
             } else {
                 &leg["VehicleLegDetails"]
             };
-            position(&details[which]["Place"]["Position"], case)
+            position(&details[which]["Place"]["OriginalPosition"], case)
         };
         assert_eq!(
             place(first, "Departure"), origin,
@@ -689,20 +692,23 @@ async fn the_leg_times_follow_the_time_the_request_pins() {
     }
 }
 
-/// The leg summary is an additional feature: it is reported when `LegAdditionalFeatures`
-/// asks for it, left out when it does not, and a feature this slice does not compute is
+/// The leg summary summarises the leg that was computed, so every leg carries it whatever
+/// the request asked for; a `LegAdditionalFeature` this slice does not compute is still
 /// declined rather than answered with an empty value.
 #[tokio::test]
-async fn the_leg_summary_follows_the_requested_additional_features() {
+async fn the_leg_summary_is_reported_for_every_leg() {
     let router = routes_service();
-    let cases: [(&str, Value, u16, bool); 4] = [
-        ("no features", json!([]), 200, false),
-        ("summary asked for", json!(["Summary"]), 200, true),
-        ("a feature this slice does not compute", json!(["TypicalDuration"]), 501, false),
-        ("summary beside one it does not compute", json!(["Summary", "Tolls"]), 501, false),
+    // Rows span the feature list: none at all, the summary itself, the step instructions
+    // (which ask for other detail entirely), and a feature the road model has no data for.
+    let cases: [(&str, Value, u16); 5] = [
+        ("no features", json!([]), 200),
+        ("summary asked for", json!(["Summary"]), 200),
+        ("the step instructions instead", json!(["TravelStepInstructions"]), 200),
+        ("a feature this slice does not compute", json!(["TypicalDuration"]), 501),
+        ("summary beside one it does not compute", json!(["Summary", "Tolls"]), 501),
     ];
 
-    for (case, features, expected, has_summary) in cases {
+    for (case, features, expected) in cases {
         let body = json!({
             "Origin": [-123.1, 49.28],
             "Destination": [-123.12, 49.26],
@@ -717,16 +723,20 @@ async fn the_leg_summary_follows_the_requested_additional_features() {
             continue;
         }
         let summary = &answer["Routes"][0]["Legs"][0]["VehicleLegDetails"]["Summary"];
-        assert_eq!(
-            summary.is_object(), has_summary,
-            "case {case:?}: expected the leg summary to be present={has_summary}, got {summary:?}"
+        assert!(
+            summary.is_object(),
+            "case {case:?}: the leg summary is reported for every leg, got {summary:?}"
         );
-        if has_summary {
-            assert!(
-                int(&summary["Overview"], "Distance", case) > 0,
-                "case {case:?}: the leg summary must carry the computed distance, got {summary:?}"
-            );
-        }
+        assert!(
+            int(&summary["Overview"], "Distance", case) > 0
+                && int(&summary["Overview"], "Duration", case) > 0,
+            "case {case:?}: the leg summary must carry the computed distance and duration, got {summary:?}"
+        );
+        assert_eq!(
+            int(&summary["TravelOnly"], "Duration", case),
+            int(&summary["Overview"], "Duration", case),
+            "case {case:?}: nothing but travel happens on a leg with no stop at its end, got {summary:?}"
+        );
     }
 }
 
