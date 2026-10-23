@@ -15,5 +15,7 @@
 mod agent_lifecycle;
 #[path = "all/flow_lifecycle.rs"]
 mod flow_lifecycle;
+#[path = "all/knowledge_base_lifecycle.rs"]
+mod knowledge_base_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
