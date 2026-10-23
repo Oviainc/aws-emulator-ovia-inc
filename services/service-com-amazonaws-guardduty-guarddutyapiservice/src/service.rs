@@ -98,15 +98,34 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // GuardDuty needs it reworded, because the framework's default names
+        // `ValidationException` — a shape this service's model does not declare
+        // for any operation. Its only client error is `BadRequestException`
+        // (`httpError` 400), which `smithy_query(query="service_info")` reports as
+        // one of just two common errors, so a refusal under any other code is one
+        // no GuardDuty client can catch: an SDK builds its exception classes from
+        // the error code, and a caller's `BadRequestException` branch would fall
+        // through to "unmodeled error" for a plainly fixable input.
+        //
+        // BOTH the code and the message are replaced, as the seam requires. The
+        // code is the modelled error SHAPE rather than the narrower
+        // `InvalidInputException` CLASS a handler rejection carries
+        // (`crate::scaffolded::Scaffolded::invalid_input`): this path renders ONE
+        // code into both the body's `__type` and the `x-amzn-errortype` header,
+        // and the header is what restJson1 resolves the error shape from, so the
+        // shape is the name that has to be there.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: crate::scaffolded::BAD_REQUEST_EXCEPTION.to_string(),
+                message: crate::state::constraint_rejection(violations),
+            }),
+            // An authentication refusal is the emulator's, not this service's:
+            // the model declares no 403 error for any operation, so the
+            // framework's own wording stands.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

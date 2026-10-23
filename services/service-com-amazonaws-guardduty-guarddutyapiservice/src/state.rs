@@ -348,6 +348,140 @@ pub fn detector_id_rejection(detector_id: &str) -> String {
     }
 }
 
+/// The wire name of the filter-name member on the operations that carry it as a
+/// URI label — `GetFilter`, `UpdateFilter` and `DeleteFilter` bind
+/// `FilterName` to `/detector/{DetectorId}/filter/{FilterName}`
+/// (`smithy_query(operation="GetFilter")`).
+pub const FILTER_NAME_MEMBER: &str = "filterName";
+
+/// The wire name `CreateFilter` carries the filter name under: its `Name` member
+/// has `jsonName` `name` (`smithy_query(operation="CreateFilter")`). A rejection
+/// names the member AS THE REQUEST CARRIES IT, which is why creating and reading
+/// a filter name it differently.
+pub const CREATE_FILTER_NAME_MEMBER: &str = "name";
+
+/// The `FilterName` length bounds (`smithy_query(shape="FilterName")`: len
+/// 3..64). `GetFilter`/`UpdateFilter`/`DeleteFilter` take the name as a plain
+/// `String` URI label with no constraint of its own, so a name outside these
+/// bounds reaches the handler there and is classified by [`is_filter_name`].
+pub const FILTER_NAME_MIN_LEN: usize = 3;
+/// See [`FILTER_NAME_MIN_LEN`].
+pub const FILTER_NAME_MAX_LEN: usize = 64;
+
+/// Is `name` a syntactically well-formed `FilterName`?
+///
+/// "Valid characters include period (.), underscore (_), dash (-), and
+/// alphanumeric characters. A whitespace is considered to be an invalid
+/// character" (`smithy_query(query="doc",shape="CreateFilterRequest",member="Name")`),
+/// within the modelled length bounds. Form only: a well-formed name need not
+/// exist.
+pub fn is_filter_name(name: &str) -> bool {
+    (FILTER_NAME_MIN_LEN..=FILTER_NAME_MAX_LEN).contains(&name.chars().count())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Classify a filter name the detector does not hold, the way
+/// [`detector_id_rejection`] classifies a detector id: a value that cannot be a
+/// filter name at all is a parameter failure, a well-formed one this account
+/// does not hold is an ownership failure.
+pub fn filter_name_rejection(name: &str) -> String {
+    if is_filter_name(name) {
+        not_owned_message(FILTER_NAME_MEMBER)
+    } else {
+        invalid_parameter_message(FILTER_NAME_MEMBER)
+    }
+}
+
+/// The message a second `CreateFilter` under a name the detector already holds
+/// is refused with. Creating is not updating — `UpdateFilter` is the operation
+/// that changes an existing filter — and the rejection does not quote the name
+/// back at the caller.
+pub const FILTER_ALREADY_EXISTS_MESSAGE: &str =
+    "The request is rejected because a filter with the same name already exists.";
+
+/// "The maximum number of saved filters per Amazon Web Services account per
+/// Region is 100" (`smithy_query(query="doc",shape="CreateFilter")`). A detector
+/// is itself one per account per Region, so the per-detector count IS the
+/// per-account-per-Region count.
+pub const MAX_FILTERS_PER_ACCOUNT_PER_REGION: usize = 100;
+
+/// The message a `CreateFilter` past [`MAX_FILTERS_PER_ACCOUNT_PER_REGION`] is
+/// refused with.
+pub const FILTER_QUOTA_EXCEEDED_MESSAGE: &str =
+    "The request is rejected because the maximum number of saved filters per account per Region has been reached.";
+
+/// The `FilterAction` a filter gets when the request names none: "Default: NOOP"
+/// (`smithy_query(query="doc",shape="CreateFilterRequest",member="Action")`).
+pub const FILTER_ACTION_NOOP: &str = "NOOP";
+
+/// The `FilterVersion` a freshly created filter carries. `FilterVersion` is
+/// `range min 1` (`smithy_query(shape="FilterVersion")`), so a filter nothing has
+/// updated is at version 1.
+pub const FILTER_INITIAL_VERSION: i64 = 1;
+
+// ---------------------------------------------------------------------------
+// Modelled-constraint refusals
+// ---------------------------------------------------------------------------
+
+/// How GuardDuty states a refusal the request boundary made: a member the model
+/// requires was absent, or a value fell outside a bound the model declares.
+///
+/// GuardDuty's model declares exactly two errors for every operation —
+/// `BadRequestException` (`httpError` 400) and `InternalServerErrorException`
+/// (500) (`smithy_query(query="service_info")` lists them as the service's common
+/// errors) — and NO `ValidationException` shape. So a modelled-constraint
+/// violation is the same refusal as any other unacceptable input, and is worded
+/// the same way: the parameter at fault and the rule it broke, built from the
+/// REQUEST, with the caller's value never quoted back.
+///
+/// `service.rs` routes the framework's pre-handler refusal through here, so a
+/// constraint the model declares on ANY member of ANY operation in this service
+/// is refused under the modelled error rather than under a shape no GuardDuty
+/// client can catch.
+pub fn constraint_rejection(violations: &[::aws_smithy_schema_server::Violation]) -> String {
+    let clauses: Vec<String> = violations.iter().map(violation_clause).collect();
+    if clauses.is_empty() {
+        // The framework describes every refusal it hands us with at least one
+        // violation; an empty list has no member to name, so it falls back to the
+        // service's parameter wording without one.
+        return "The request is rejected because it contains an invalid parameter.".to_string();
+    }
+    clauses.join(" ")
+}
+
+/// One violation, as a GuardDuty sentence.
+fn violation_clause(violation: &::aws_smithy_schema_server::Violation) -> String {
+    use ::aws_smithy_schema_server::ViolationKind;
+
+    // The path is already the member's wire spelling (lowerCamel, with
+    // `.member` steps for collections), which is how the caller named it.
+    let member = violation.path.as_str();
+    let requirement = match &violation.kind {
+        ViolationKind::MissingRequiredMember => {
+            return format!(
+                "The request is rejected because the parameter {member} is required."
+            )
+        }
+        ViolationKind::MinLength(min) => format!("it must have a length of at least {min}"),
+        ViolationKind::MaxLength(max) => format!("it must have a length of at most {max}"),
+        ViolationKind::MinValue(min) => format!("it must be greater than or equal to {min}"),
+        ViolationKind::MaxValue(max) => format!("it must be less than or equal to {max}"),
+        ViolationKind::Pattern(pattern) => {
+            format!("it must satisfy the pattern {pattern}")
+        }
+        ViolationKind::EnumValue(allowed) => format!("it must be one of {}", allowed.join(", ")),
+        ViolationKind::UniqueItems => "its values must be unique".to_string(),
+        // `ViolationKind` is `#[non_exhaustive]`: a class this service has no
+        // specific wording for still states the member at fault.
+        _ => return invalid_parameter_message(member),
+    };
+    format!(
+        "The request is rejected because the parameter {member} has an invalid value: {requirement}."
+    )
+}
+
 /// The modelled server fault a handler answers when the engine it was built over
 /// holds no state for this service.
 ///
@@ -645,15 +779,27 @@ impl InvestigationRecord {
     }
 }
 
-/// A finding filter. Only `DeleteDetector`'s cascade needs it in this slice;
-/// `CreateFilter` / `GetFilter` / `ListFilters` are still scaffolded.
+/// A saved finding filter. `CreateFilter` writes it, `GetFilter` reports it and
+/// `DeleteDetector`'s cascade drops it with its detector; `ListFilters` /
+/// `UpdateFilter` / `DeleteFilter` are still scaffolded.
 #[derive(Debug, Clone, Default)]
 pub struct FilterRecord {
     pub name: String,
     pub description: Option<String>,
+    /// `FilterAction`: `ARCHIVE` or [`FILTER_ACTION_NOOP`].
     pub action: Option<String>,
     pub rank: Option<i32>,
+    /// The criteria the filter selects findings by, kept as the modelled shape so
+    /// a read reports exactly what the create stored.
+    pub finding_criteria: crate::ops::types::FindingCriteria,
     pub tags: BTreeMap<String, String>,
+    /// The `@idempotencyToken` the create carried, so a replayed `CreateFilter`
+    /// returns the filter the first call saved instead of refusing the name.
+    pub client_token: Option<String>,
+    pub created_at_millis: i64,
+    pub updated_at_millis: i64,
+    /// `FilterVersion`: 1 for a filter nothing has updated.
+    pub version: i64,
 }
 
 /// One stored finding. Timestamps are kept as epoch milliseconds — the single

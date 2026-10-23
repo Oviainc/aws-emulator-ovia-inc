@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the filter `CreateFilter` saved, read straight off the stored
+//! record. A name the detector does not hold is refused with `BadRequestException`,
+//! never a hollow 200. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +151,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFilter"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFilterErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        // A pure report: nothing below writes to the store.
+        let state = state.lock();
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        };
+        let Some(filter) = detector.filters.get(&input.filter_name) else {
+            // `FilterName` is a plain `String` URI label here
+            // (`smithy_query(operation="GetFilter")`), so it carries no modelled
+            // constraint and a malformed name reaches this handler: classified from
+            // the REQUEST the same way a detector id is.
+            return Err(bad_request(crate::state::filter_name_rejection(
+                &input.filter_name,
+            )));
+        };
+
+        Ok(GetFilterOutput {
+            name: filter.name.clone(),
+            description: filter.description.clone(),
+            // `Action` is required on the response, and every saved filter has one:
+            // a create that named none stored the documented default.
+            action: filter
+                .action
+                .clone()
+                .unwrap_or_else(|| crate::state::FILTER_ACTION_NOOP.to_string()),
+            rank: filter.rank,
+            finding_criteria: filter.finding_criteria.clone(),
+            // `TagMap` is `len 1..200` (`smithy_query(operation="GetFilter")`), so an
+            // untagged filter reports no map rather than an empty one.
+            tags: (!filter.tags.is_empty()).then(|| {
+                filter
+                    .tags
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            }),
+            created_at: Some(::aws_smithy_types::DateTime::from_millis(
+                filter.created_at_millis,
+            )),
+            updated_at: Some(::aws_smithy_types::DateTime::from_millis(
+                filter.updated_at_millis,
+            )),
+            version: Some(filter.version),
+        })
     }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member.
+fn bad_request(message: impl Into<String>) -> GetFilterError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }

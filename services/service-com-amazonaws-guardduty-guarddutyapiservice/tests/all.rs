@@ -21,6 +21,8 @@ mod detector_lifecycle;
 mod findings_feedback;
 #[path = "all/investigation_lifecycle.rs"]
 mod investigation_lifecycle;
+#[path = "all/modeled_constraint_refusals.rs"]
+mod modeled_constraint_refusals;
 #[path = "all/sample_finding_catalog.rs"]
 mod sample_finding_catalog;
 #[path = "all/state_roundtrip.rs"]
