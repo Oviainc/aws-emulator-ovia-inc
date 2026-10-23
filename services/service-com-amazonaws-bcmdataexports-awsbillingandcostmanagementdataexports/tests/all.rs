@@ -17,6 +17,8 @@ mod catalog_dictionary;
 mod catalog_published_text;
 #[path = "all/catalog_schema.rs"]
 mod catalog_schema;
+#[path = "all/data_query.rs"]
+mod data_query;
 #[path = "all/execution_listing.rs"]
 mod execution_listing;
 #[path = "all/execution_lookup.rs"]
@@ -33,11 +35,17 @@ mod not_found_message;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/status_timestamp_wire_form.rs"]
+mod status_timestamp_wire_form;
 #[path = "all/table_catalog.rs"]
 mod table_catalog;
 #[path = "all/table_listing.rs"]
 mod table_listing;
+#[path = "all/tagging.rs"]
+mod tagging;
 #[path = "all/tagging_arn_validation.rs"]
 mod tagging_arn_validation;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;
+#[path = "all/validation_messages.rs"]
+mod validation_messages;

@@ -458,7 +458,8 @@ fn estimated_monthly_savings(value: f64) -> EstimatedMonthlySavings {
 }
 
 /// A money (or percentage) figure to the cent, so summing stored prices cannot report a
-/// figure like `140.16000000000003`.
+/// figure like `140.16000000000003`. One cent-rounding rule for the whole service, in
+/// `crate::state` beside the analysis whose prices it rounds.
 fn rounded_money(value: f64) -> f64 {
-    (value * 100.0).round() / 100.0
+    crate::state::round_hundredths(value)
 }

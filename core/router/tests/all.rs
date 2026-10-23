@@ -66,6 +66,11 @@ mod es_opensearch_and_elasticsearch_signing_name_routing;
 mod events_signing_name_routing;
 #[path = "all/events_store_ownership.rs"]
 mod events_store_ownership;
+// In the sorted list rather than appended at the end of the file: every new suite appends
+// there, so that is the contended region now and the sorted position this file's header
+// asks for is the quiet one.
+#[path = "all/firehose_destination_role.rs"]
+mod firehose_destination_role;
 // Declared HERE, beside the trust suite it is the sibling of, rather than appended at the
 // end of this file: the tail is where every landing in the same window appends, so it is
 // the contended region, while this span of the sorted list is untouched by those appends.

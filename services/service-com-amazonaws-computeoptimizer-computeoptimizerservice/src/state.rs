@@ -22,15 +22,17 @@
 //! once, here.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
 use ::aws_smithy_types::DateTime;
 use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    CustomizableMetricParameters, EffectivePreferredResource, ExternalMetricsPreference,
-    IdleRecommendation, IdleRecommendationFilter, PreferredResource,
-    PutRecommendationPreferencesInput, RecommendationPreferencesDetail, Scope, UtilizationPreference,
-    IDLE_FINDING_VALUES, IDLE_RECOMMENDATION_FILTER_NAME_VALUES,
+    AutoScalingGroupConfiguration, CustomizableMetricParameters, EffectivePreferredResource,
+    EffectiveRecommendationPreferences, ExternalMetricsPreference, IdleRecommendation,
+    IdleRecommendationFilter, InstanceSavingsEstimationMode, PreferredResource,
+    PutRecommendationPreferencesInput, RecommendationPreferencesDetail, Scope, UtilizationMetric,
+    UtilizationPreference, IDLE_FINDING_VALUES, IDLE_RECOMMENDATION_FILTER_NAME_VALUES,
     IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES,
 };
 
@@ -47,14 +49,14 @@ pub const DEFAULT_LOOK_BACK_PERIOD: &str = "DAYS_14";
 /// updating a key the store already holds stays allowed, because it allocates no record.
 pub const MAX_PREFERENCE_RECORDS: usize = 1_000;
 
-/// The largest page `GetRecommendationPreferences` will build, whatever `maxResults` asks
-/// for: the ceiling the model itself puts on `maxResults` (`MaxResults` range 0..1000).
-/// Applied in the handler, so no number a request carries can size a response or the
-/// allocation that builds it, whatever any other layer does or does not refuse.
+/// The largest page a paginated reader in this service will build, whatever `maxResults`
+/// asks for: the ceiling the model itself puts on `maxResults` (`MaxResults` range
+/// 0..1000). Applied in the handler, so no number a request carries can size a response or
+/// the allocation that builds it, whatever any other layer does or does not refuse.
 pub const MAX_PAGE_SIZE: usize = 1_000;
 
-/// The page size `GetRecommendationPreferences` uses when the request names none (or names
-/// the range's lower bound `0`, which the service documents no meaning for). The service
+/// The page size a paginated reader uses when the request names none (or names the
+/// range's lower bound `0`, which the service documents no meaning for). The service
 /// documents no default page size, so this is the emulator's own: a request that asks for
 /// no particular size gets one bounded page plus a `nextToken` to walk the rest, rather
 /// than the whole store serialised into one response.
@@ -119,6 +121,19 @@ impl Enrollment {
     /// answer it whenever this is false.
     pub fn is_opted_in(&self) -> bool {
         self.status == STATUS_ACTIVE
+    }
+
+    /// Whether the analysis this enrollment started is due, i.e. whether
+    /// [`ANALYSIS_DELAY`] has elapsed since the enrollment record was last written.
+    /// An account that never enrolled has no analysis owed at all.
+    ///
+    /// The due instant is DERIVED from the stored `lastUpdatedTimestamp` and compared
+    /// against the clock; nothing waits for it and no reader writes it.
+    pub fn analysis_due(&self) -> bool {
+        let now = DateTime::from(::std::time::SystemTime::now()).as_secs_f64();
+        self.last_updated_timestamp
+            .as_ref()
+            .is_some_and(|written| now - written.as_secs_f64() >= ANALYSIS_DELAY.as_secs_f64())
     }
 }
 
@@ -503,6 +518,632 @@ pub fn decode_page_token(token: &str) -> Option<PreferenceKey> {
     })
 }
 
+/// The opaque `nextToken` a recommendation reader hands out: the ARN of the resource the
+/// next page starts at, hex-encoded so a client can neither read nor construct one.
+pub fn encode_resource_page_token(resource_arn: &str) -> String {
+    ::hex::encode(::serde_json::json!({ "startAt": resource_arn }).to_string())
+}
+
+/// The resource ARN a `nextToken` this service issued stands for, or `None` for a token
+/// it did not — including a token issued for a different page sequence, whose encoded
+/// shape is not this one.
+pub fn decode_resource_page_token(token: &str) -> Option<String> {
+    let bytes = ::hex::decode(token).ok()?;
+    let decoded = ::serde_json::from_slice::<::serde_json::Value>(&bytes).ok()?;
+    decoded
+        .get("startAt")?
+        .as_str()
+        .map(::std::string::ToString::to_string)
+}
+
+// ===========================================================================
+// The Auto Scaling group analysis the recommendation readers report
+// ===========================================================================
+
+/// How long after an account opts in the analysis of its resources is due.
+///
+/// Compute Optimizer derives recommendations from the utilization metrics it observes
+/// AFTER an account enrolls — "after you opt in, it can take up to 24 hours for
+/// Compute Optimizer to deliver your recommendations" — so an account that has just
+/// enrolled has none yet. The emulator owes that transition on an emulator-scale span
+/// rather than a real day (chosen, not documented), so a caller that reads straight
+/// after opting in still observes the pre-analysis state. The instant is DERIVED from
+/// the enrollment record's `lastUpdatedTimestamp` and never waited for.
+pub const ANALYSIS_DELAY: Duration = Duration::from_millis(500);
+
+/// Hours in a month, the factor that turns an hourly on-demand price into the monthly
+/// figures Compute Optimizer reports (`estimatedMonthlySavings`). 730 = 365 × 24 / 12,
+/// the convention Amazon Web Services' own pricing pages use.
+pub const HOURS_PER_MONTH: f64 = 730.0;
+
+/// The `MetricName` values an Auto Scaling group recommendation reports. "The `Cpu` and
+/// `Memory` metrics are the only projected utilization metrics returned"
+/// (`AutoScalingGroupRecommendationOption$projectedUtilizationMetrics`), and both are
+/// percentages ("Units: Percent", `UtilizationMetric$name`).
+pub const METRIC_CPU: &str = "Cpu";
+/// See [`METRIC_CPU`].
+pub const METRIC_MEMORY: &str = "Memory";
+
+/// The one `MetricStatistic` this API reports: "The Compute Optimizer API, Command Line
+/// Interface (CLI), and SDKs return utilization metrics using only the `Maximum`
+/// statistic" (`UtilizationMetric$statistic`).
+pub const METRIC_STATISTIC_MAXIMUM: &str = "Maximum";
+
+/// The `AsgType` values, from the model's enum of the same name: "whether the EC2 Auto
+/// Scaling group has a single instance type or a mixed instance type configuration".
+pub const ASG_TYPE_SINGLE_INSTANCE_TYPE: &str = "SingleInstanceType";
+/// See [`ASG_TYPE_SINGLE_INSTANCE_TYPE`].
+pub const ASG_TYPE_MIXED_INSTANCE_TYPES: &str = "MixedInstanceTypes";
+
+/// The `CpuVendorArchitecture` values (`shared_types::CPU_VENDOR_ARCHITECTURE_VALUES`).
+/// `CURRENT` is a candidate of the same CPU vendor and architecture as the group runs
+/// today; `AWS_ARM64` is a Graviton candidate — "when you specify `AWS_ARM64` with a
+/// `GetAutoScalingGroupRecommendations` request, Compute Optimizer returns
+/// recommendations that consist of Graviton instance types only".
+pub const CPU_ARCHITECTURE_CURRENT: &str = "CURRENT";
+/// See [`CPU_ARCHITECTURE_CURRENT`].
+pub const CPU_ARCHITECTURE_AWS_ARM64: &str = "AWS_ARM64";
+
+/// The `SavingsEstimationMode` preference value that activates reporting savings net of
+/// Savings Plans and Reserved Instances discounts: "Specify the `AfterDiscounts` status
+/// to activate the preference, or specify `BeforeDiscounts` to deactivate" it.
+pub const SAVINGS_ESTIMATION_AFTER_DISCOUNTS: &str = "AfterDiscounts";
+
+/// The `InstanceSavingsEstimationModeSource` the emulator's figures come from: every
+/// money figure a recommendation reports is computed from the public on-demand prices
+/// stored with the analysis ([`GroupConfiguration::hourly_price`]), not from an
+/// account's own Cost Explorer or Cost Optimization Hub data.
+pub const SAVINGS_ESTIMATION_SOURCE: &str = "PublicPricing";
+
+/// The `InferredWorkloadTypesPreference` value that leaves the inference ON: "The
+/// inferred workload type feature is active by default. To deactivate it, create a
+/// recommendation preference" (`PutRecommendationPreferences$inferredWorkloadTypes`).
+pub const INFERRED_WORKLOAD_TYPES_ACTIVE: &str = "Active";
+
+/// One configuration of an Auto Scaling group: the configuration it runs today, or one
+/// the analysis found as a candidate for it. Both sides are the same shape because the
+/// service reports them through the same `AutoScalingGroupConfiguration`, and because
+/// every derived figure (cost, saving, projected utilization, migration effort) is a
+/// comparison BETWEEN two of them.
+#[derive(Debug, Clone)]
+pub struct GroupConfiguration {
+    /// The instance type(s) of the configuration: one for a `SingleInstanceType` group,
+    /// several for a `MixedInstanceTypes` one.
+    pub instance_types: Vec<String>,
+    /// The `AllocationStrategy`, which "is only available for EC2 Auto Scaling groups
+    /// with mixed instance types", so a single-instance-type configuration has none.
+    pub allocation_strategy: Option<String>,
+    /// `desiredCapacity`: the number of instances the configuration runs.
+    pub desired_capacity: i32,
+    /// `minSize`.
+    pub min_size: i32,
+    /// `maxSize`.
+    pub max_size: i32,
+    /// vCPUs of ONE instance of this configuration.
+    pub vcpus: f64,
+    /// Memory, in GiB, of ONE instance of this configuration.
+    pub memory_gib: f64,
+    /// The public on-demand price of ONE instance-hour, in [`CURRENCY_CODE`].
+    pub hourly_price: f64,
+    /// The configuration's `CpuVendorArchitecture`: [`CPU_ARCHITECTURE_CURRENT`] or
+    /// [`CPU_ARCHITECTURE_AWS_ARM64`].
+    pub architecture: String,
+    /// `PerformanceRisk` (0-4) of running the analysed workload on this configuration:
+    /// "the likelihood of the recommended instance type not meeting the resource needs
+    /// of your workload", 0 meaning it "is predicted to always provide enough hardware
+    /// capability".
+    pub performance_risk: f64,
+}
+
+impl GroupConfiguration {
+    /// Whether this configuration mixes instance types, which is what
+    /// `AutoScalingGroupConfiguration$type` reports.
+    pub fn is_mixed(&self) -> bool {
+        self.instance_types.len() > 1
+    }
+
+    /// The `AsgType` of this configuration.
+    pub fn asg_type(&self) -> &'static str {
+        if self.is_mixed() {
+            ASG_TYPE_MIXED_INSTANCE_TYPES
+        } else {
+            ASG_TYPE_SINGLE_INSTANCE_TYPE
+        }
+    }
+
+    /// The estimated monthly on-demand cost of running this configuration: the price of
+    /// one instance-hour × the instances it runs × [`HOURS_PER_MONTH`].
+    pub fn monthly_cost(&self) -> f64 {
+        round_hundredths(self.hourly_price * f64::from(self.desired_capacity) * HOURS_PER_MONTH)
+    }
+
+    /// The vCPUs the whole group runs on this configuration.
+    pub fn total_vcpus(&self) -> f64 {
+        self.vcpus * f64::from(self.desired_capacity)
+    }
+
+    /// The memory, in GiB, the whole group runs on this configuration.
+    pub fn total_memory_gib(&self) -> f64 {
+        self.memory_gib * f64::from(self.desired_capacity)
+    }
+
+    /// Whether `other` is a different configuration of the same group — a different set
+    /// of instance types or a different capacity. A candidate that differs from the
+    /// group's own configuration IS a recommendation, which is what makes the group
+    /// `NotOptimized` ([`AnalyzedAutoScalingGroup::finding`]).
+    pub fn differs_from(&self, other: &Self) -> bool {
+        self.instance_types != other.instance_types
+            || self.desired_capacity != other.desired_capacity
+            || self.min_size != other.min_size
+            || self.max_size != other.max_size
+    }
+
+    /// This configuration as the modelled `AutoScalingGroupConfiguration`.
+    ///
+    /// `estimatedInstanceHourReductionPercentage` is left unreported: it "is only
+    /// available for EC2 Auto Scaling groups with scaling policies", and this emulator
+    /// records no scaling policy for a group, so there is no reduction to project.
+    pub fn to_wire(&self) -> AutoScalingGroupConfiguration {
+        AutoScalingGroupConfiguration {
+            desired_capacity: self.desired_capacity,
+            min_size: self.min_size,
+            max_size: self.max_size,
+            instance_type: (!self.is_mixed())
+                .then(|| self.instance_types.first().cloned())
+                .flatten(),
+            allocation_strategy: self.allocation_strategy.clone(),
+            estimated_instance_hour_reduction_percentage: None,
+            r#type: Some(self.asg_type().to_string()),
+            mixed_instance_types: self.is_mixed().then(|| self.instance_types.clone()),
+        }
+    }
+}
+
+/// One Auto Scaling group Compute Optimizer has analysed: the group as it is configured,
+/// the utilization it observed, and the candidate configurations the analysis found for
+/// it. Every value a recommendation REPORTS is either one of these stored observations
+/// or a figure computed from them, so two readers of the same row cannot disagree.
+#[derive(Debug, Clone)]
+pub struct AnalyzedAutoScalingGroup {
+    /// The account that owns the group.
+    pub account_id: String,
+    /// `autoScalingGroupArn`.
+    pub arn: String,
+    /// `autoScalingGroupName`.
+    pub name: String,
+    /// The group's current configuration.
+    pub current: GroupConfiguration,
+    /// The utilization the analysis observed, as (`MetricName`, value) pairs at the
+    /// [`METRIC_STATISTIC_MAXIMUM`] statistic — the only statistic this API reports.
+    pub utilization: Vec<(String, f64)>,
+    /// `currentPerformanceRisk`: "the risk of the current Auto Scaling group not meeting
+    /// the performance needs of its workloads", a `CurrentPerformanceRisk` value.
+    pub current_performance_risk: String,
+    /// The workload types the analysis inferred for the instances in the group
+    /// (`InferredWorkloadType` values), empty where it inferred none.
+    pub inferred_workload_types: Vec<String>,
+    /// The candidate configurations the analysis found, best first — so the reported
+    /// `rank` is a candidate's position in this list ("the top recommendation option is
+    /// ranked as 1").
+    pub candidates: Vec<GroupConfiguration>,
+    /// The Savings Plans / Reserved Instances discount rate that applies to this
+    /// group's compute spend, as a fraction of the on-demand price, or `0.0` where none
+    /// does. It is what separates `savingsOpportunityAfterDiscounts` from the on-demand
+    /// `savingsOpportunity`.
+    pub savings_plans_discount_rate: f64,
+}
+
+impl AnalyzedAutoScalingGroup {
+    /// The group's `Finding`.
+    ///
+    /// "An Auto Scaling group is considered not optimized when Compute Optimizer
+    /// identifies a recommendation that can provide better performance for your
+    /// workload", and "optimized when Compute Optimizer determines that the group is
+    /// correctly provisioned to run your workload based on the chosen instance type" —
+    /// so the group is `NotOptimized` exactly when the analysis found a candidate that
+    /// is not the group's own configuration, and `Optimized` when its own configuration
+    /// is the best the analysis found.
+    pub fn finding(&self) -> &'static str {
+        if self
+            .candidates
+            .iter()
+            .any(|candidate| candidate.differs_from(&self.current))
+        {
+            FINDING_NOT_OPTIMIZED
+        } else {
+            FINDING_OPTIMIZED
+        }
+    }
+
+    /// The observed utilization as the modelled `UtilizationMetrics`.
+    pub fn utilization_metrics(&self) -> Vec<UtilizationMetric> {
+        self.utilization
+            .iter()
+            .map(|(name, value)| UtilizationMetric {
+                name: Some(name.clone()),
+                statistic: Some(METRIC_STATISTIC_MAXIMUM.to_string()),
+                value: round_hundredths(*value),
+            })
+            .collect()
+    }
+
+    /// The utilization the observed workload is projected to reach on `candidate`.
+    ///
+    /// The same work runs on whatever capacity the configuration provides, so each
+    /// percentage scales with the ratio of the capacity it was observed on to the
+    /// capacity it is projected onto — CPU by the group's total vCPUs, memory by the
+    /// group's total memory — and is reported as a percentage, so it is capped at 100.
+    pub fn projected_utilization_metrics(
+        &self,
+        candidate: &GroupConfiguration,
+    ) -> Vec<UtilizationMetric> {
+        self.utilization
+            .iter()
+            .map(|(name, observed)| {
+                let (from, to) = if name == METRIC_MEMORY {
+                    (self.current.total_memory_gib(), candidate.total_memory_gib())
+                } else {
+                    (self.current.total_vcpus(), candidate.total_vcpus())
+                };
+                let projected = if to <= 0.0 {
+                    *observed
+                } else {
+                    (observed * from / to).min(100.0)
+                };
+                UtilizationMetric {
+                    name: Some(name.clone()),
+                    statistic: Some(METRIC_STATISTIC_MAXIMUM.to_string()),
+                    value: round_hundredths(projected),
+                }
+            })
+            .collect()
+    }
+
+    /// The `MigrationEffort` of moving this group onto `candidate`, by the rule the
+    /// model states: "The migration effort is `VeryLow` if both the current and
+    /// recommended instance types are of the same CPU architecture", `Low` "if Amazon
+    /// EMR is the inferred workload type and an Amazon Web Services Graviton instance
+    /// type is recommended", and `Medium` "if a workload type couldn't be inferred but
+    /// an Amazon Web Services Graviton instance type is recommended".
+    ///
+    /// The model names Amazon EMR as the example of an inferred workload and states no
+    /// rule for any other, so the emulator generalises its `Low` case to ANY workload type
+    /// the analysis inferred: what the two documented Graviton cases differ on is whether
+    /// a workload type was inferred at all, and naming one of the nine
+    /// `InferredWorkloadType` values would make the effort of a Kafka or a Redis group
+    /// depend on a value the rule says nothing about.
+    ///
+    /// `infers_workload_types` is whether the account leaves the workload-type inference
+    /// active: with the inference deactivated no workload type is inferred for the
+    /// group, which is the `Medium` case.
+    pub fn migration_effort(
+        &self,
+        candidate: &GroupConfiguration,
+        infers_workload_types: bool,
+    ) -> &'static str {
+        if candidate.architecture != CPU_ARCHITECTURE_AWS_ARM64 {
+            "VeryLow"
+        } else if !infers_workload_types || self.inferred_workload_types.is_empty() {
+            "Medium"
+        } else {
+            "Low"
+        }
+    }
+
+    /// The saving `candidate` offers against the group's own configuration, on the
+    /// public on-demand prices stored with the analysis: the monthly cost it removes,
+    /// and that saving as a percentage of the group's current monthly cost.
+    ///
+    /// `discount_rate` nets both sides of the comparison down by a Savings Plans /
+    /// Reserved Instances discount, which is how `savingsOpportunityAfterDiscounts` is
+    /// computed; pass `0.0` for the on-demand `savingsOpportunity`.
+    pub fn savings(&self, candidate: &GroupConfiguration, discount_rate: f64) -> (f64, f64) {
+        let retained = 1.0 - discount_rate;
+        let current = round_hundredths(self.current.monthly_cost() * retained);
+        let projected = round_hundredths(candidate.monthly_cost() * retained);
+        let saving = round_hundredths((current - projected).max(0.0));
+        (saving, percentage_of(saving, current))
+    }
+
+    /// This group as a row of the findings catalog, i.e. as `GetRecommendationSummaries`
+    /// aggregates it: the finding and the costs the analysis reached, with the RECOMMENDED
+    /// cost being the top-ranked candidate's — "the top recommendation option is ranked as
+    /// 1" — or the group's own cost where the analysis found no other candidate.
+    ///
+    /// The projection is what keeps one group's analysis in ONE place: the summary reader
+    /// and `GetAutoScalingGroupRecommendations` both answer from this row's source, so
+    /// they cannot disagree about a group's finding, its performance risk or what adopting
+    /// its recommendation saves. An Auto Scaling group recommendation reports no finding
+    /// reason codes (`AutoScalingGroupRecommendation` declares no such member), so the
+    /// row carries none.
+    pub fn to_analysed_resource(&self) -> AnalysedResource {
+        AnalysedResource {
+            account_id: self.account_id.clone(),
+            resource_type: SOURCE_TYPE_AUTO_SCALING_GROUP.to_string(),
+            resource_arn: self.arn.clone(),
+            finding: self.finding().to_string(),
+            finding_reason_codes: Vec::new(),
+            current_performance_risk: self.current_performance_risk.clone(),
+            current_monthly_cost: self.current.monthly_cost(),
+            recommended_monthly_cost: self
+                .candidates
+                .first()
+                .unwrap_or(&self.current)
+                .monthly_cost(),
+            inferred_workload_types: self.inferred_workload_types.clone(),
+        }
+    }
+}
+
+/// `part` as a percentage of `whole`, to two decimal places; zero when `whole` is zero,
+/// because no percentage of nothing is defined.
+pub fn percentage_of(part: f64, whole: f64) -> f64 {
+    if whole == 0.0 {
+        return 0.0;
+    }
+    round_hundredths(part / whole * 100.0)
+}
+
+/// Round a derived figure to two decimal places, so a money amount lands on whole cents
+/// and a percentage does not report binary-float noise.
+pub fn round_hundredths(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+/// The number of days a `LookBackPeriodPreference` names
+/// (`LOOK_BACK_PERIOD_PREFERENCE_VALUES` are `DAYS_14` | `DAYS_32` | `DAYS_93`), which is
+/// what `lookBackPeriodInDays` reports: "the number of days for which utilization metrics
+/// were analyzed". Falls back to the service default's length for a value outside that
+/// vocabulary, which no stored preference can be.
+pub fn look_back_period_in_days(preference: &str) -> f64 {
+    preference
+        .strip_prefix("DAYS_")
+        .and_then(|days| days.parse::<f64>().ok())
+        .unwrap_or(14.0)
+}
+
+/// The preferences in force for one resource: what the account stored for it, with the
+/// service's documented default for every preference it never set.
+///
+/// This is the same resolution `GetEffectiveRecommendationPreferences` reports, applied
+/// to the resource a recommendation is about, so the preferences a recommendation says it
+/// was generated under are the preferences a read of that resource reports.
+#[derive(Debug, Clone)]
+pub struct EffectivePreferences {
+    /// `EnhancedInfrastructureMetrics`, reported only where a record sets it.
+    pub enhanced_infrastructure_metrics: Option<String>,
+    /// `InferredWorkloadTypesPreference`, which defaults to
+    /// [`INFERRED_WORKLOAD_TYPES_ACTIVE`] because "the inferred workload type feature is
+    /// active by default".
+    pub inferred_workload_types: String,
+    /// `ExternalMetricsPreference`, reported only where a record sets it.
+    pub external_metrics_preference: Option<ExternalMetricsPreference>,
+    /// `LookBackPeriodPreference`, which defaults to [`DEFAULT_LOOK_BACK_PERIOD`].
+    pub look_back_period: String,
+    /// `UtilizationPreferences`: the stored preference, or the service's documented
+    /// default for a resource type that HAS one — "you can only set CPU and memory
+    /// utilization preferences for the Amazon EC2 instance resource type", so the list is
+    /// empty for every other resource type.
+    pub utilization_preferences: Vec<UtilizationPreference>,
+    /// `PreferredResources`, which default to [`default_preferred_resources`].
+    pub preferred_resources: Vec<EffectivePreferredResource>,
+    /// `SavingsEstimationMode`, reported only where a record sets it: the preference is
+    /// what "activates" savings net of discounts.
+    pub savings_estimation_mode: Option<String>,
+}
+
+impl EffectivePreferences {
+    /// Whether savings are reported net of Savings Plans and Reserved Instances
+    /// discounts, i.e. whether the account activated the preference.
+    pub fn after_discounts(&self) -> bool {
+        self.savings_estimation_mode.as_deref() == Some(SAVINGS_ESTIMATION_AFTER_DISCOUNTS)
+    }
+
+    /// Whether Compute Optimizer infers workload types for the resource.
+    pub fn infers_workload_types(&self) -> bool {
+        self.inferred_workload_types == INFERRED_WORKLOAD_TYPES_ACTIVE
+    }
+
+    /// These preferences as the modelled `EffectiveRecommendationPreferences` a
+    /// recommendation carries, under the CPU vendor architectures the request asked for.
+    ///
+    /// `utilizationPreferences` is reported only where the resource type has one at all
+    /// (see the field's doc), so an Auto Scaling group's recommendation carries none.
+    /// `savingsEstimationMode` names where the money figures came from
+    /// ([`SAVINGS_ESTIMATION_SOURCE`]).
+    pub fn to_wire(
+        &self,
+        cpu_vendor_architectures: Vec<String>,
+    ) -> EffectiveRecommendationPreferences {
+        EffectiveRecommendationPreferences {
+            cpu_vendor_architectures: Some(cpu_vendor_architectures),
+            enhanced_infrastructure_metrics: self.enhanced_infrastructure_metrics.clone(),
+            inferred_workload_types: Some(self.inferred_workload_types.clone()),
+            external_metrics_preference: self.external_metrics_preference.clone(),
+            look_back_period: Some(self.look_back_period.clone()),
+            utilization_preferences: (!self.utilization_preferences.is_empty())
+                .then(|| self.utilization_preferences.clone()),
+            preferred_resources: Some(self.preferred_resources.clone()),
+            savings_estimation_mode: Some(InstanceSavingsEstimationMode {
+                source: Some(SAVINGS_ESTIMATION_SOURCE.to_string()),
+            }),
+        }
+    }
+}
+
+/// The Auto Scaling group analysis this emulator holds, built once with the store.
+///
+/// The emulator observes no real workload, so WHICH groups are analysed is a fixed set
+/// rather than something derived from traffic; every figure a recommendation reports is
+/// nevertheless computed from the observations stored here (cost, saving, percentage,
+/// projected utilization, finding, rank and migration effort all follow from these rows),
+/// and a reader of a row never writes to it.
+///
+/// The rows span the shapes a client must handle: a single-instance-type group that is
+/// over-provisioned (two candidates, one of them Graviton), a group that is correctly
+/// provisioned (its own configuration is the only candidate, so no saving), and a
+/// mixed-instance-type group with a Savings Plans discount against its spend.
+fn seed_auto_scaling_group_analyses() -> Vec<AnalyzedAutoScalingGroup> {
+    let account_id = ::engine::emulator_account_id().to_string();
+    let region = "us-east-1";
+    let arn = |group_id: &str, name: &str| {
+        ::engine::emulator_arn(
+            "autoscaling",
+            region,
+            &format!("autoScalingGroup:{group_id}:autoScalingGroupName/{name}"),
+        )
+    };
+
+    vec![
+        AnalyzedAutoScalingGroup {
+            account_id: account_id.clone(),
+            arn: arn("6f3a7a2c-0d6c-4a3e-9c2b-0a1b2c3d4e51", "web-tier-asg"),
+            name: "web-tier-asg".to_string(),
+            current: GroupConfiguration {
+                instance_types: vec!["m5.2xlarge".to_string()],
+                allocation_strategy: None,
+                desired_capacity: 4,
+                min_size: 2,
+                max_size: 8,
+                vcpus: 8.0,
+                memory_gib: 32.0,
+                hourly_price: 0.384,
+                architecture: CPU_ARCHITECTURE_CURRENT.to_string(),
+                performance_risk: 0.0,
+            },
+            utilization: vec![
+                (METRIC_CPU.to_string(), 12.4),
+                (METRIC_MEMORY.to_string(), 28.6),
+            ],
+            current_performance_risk: PERFORMANCE_RISK_VERY_LOW.to_string(),
+            inferred_workload_types: vec!["Nginx".to_string()],
+            candidates: vec![
+                GroupConfiguration {
+                    instance_types: vec!["m5.xlarge".to_string()],
+                    allocation_strategy: None,
+                    desired_capacity: 4,
+                    min_size: 2,
+                    max_size: 8,
+                    vcpus: 4.0,
+                    memory_gib: 16.0,
+                    hourly_price: 0.192,
+                    architecture: CPU_ARCHITECTURE_CURRENT.to_string(),
+                    performance_risk: 1.0,
+                },
+                GroupConfiguration {
+                    instance_types: vec!["m6g.xlarge".to_string()],
+                    allocation_strategy: None,
+                    desired_capacity: 4,
+                    min_size: 2,
+                    max_size: 8,
+                    vcpus: 4.0,
+                    memory_gib: 16.0,
+                    hourly_price: 0.154,
+                    architecture: CPU_ARCHITECTURE_AWS_ARM64.to_string(),
+                    performance_risk: 1.0,
+                },
+            ],
+            savings_plans_discount_rate: 0.0,
+        },
+        AnalyzedAutoScalingGroup {
+            account_id: account_id.clone(),
+            arn: arn("6f3a7a2c-0d6c-4a3e-9c2b-0a1b2c3d4e52", "batch-worker-asg"),
+            name: "batch-worker-asg".to_string(),
+            current: GroupConfiguration {
+                instance_types: vec!["c5.4xlarge".to_string()],
+                allocation_strategy: None,
+                desired_capacity: 6,
+                min_size: 6,
+                max_size: 12,
+                vcpus: 16.0,
+                memory_gib: 32.0,
+                hourly_price: 0.68,
+                architecture: CPU_ARCHITECTURE_CURRENT.to_string(),
+                performance_risk: 1.0,
+            },
+            utilization: vec![
+                (METRIC_CPU.to_string(), 86.5),
+                (METRIC_MEMORY.to_string(), 71.2),
+            ],
+            current_performance_risk: PERFORMANCE_RISK_LOW.to_string(),
+            inferred_workload_types: Vec::new(),
+            // The group's own configuration is the only candidate the analysis found,
+            // which is what makes it `Optimized`: there is no saving to report.
+            candidates: vec![GroupConfiguration {
+                instance_types: vec!["c5.4xlarge".to_string()],
+                allocation_strategy: None,
+                desired_capacity: 6,
+                min_size: 6,
+                max_size: 12,
+                vcpus: 16.0,
+                memory_gib: 32.0,
+                hourly_price: 0.68,
+                architecture: CPU_ARCHITECTURE_CURRENT.to_string(),
+                performance_risk: 1.0,
+            }],
+            savings_plans_discount_rate: 0.0,
+        },
+        AnalyzedAutoScalingGroup {
+            account_id,
+            arn: arn("6f3a7a2c-0d6c-4a3e-9c2b-0a1b2c3d4e53", "mixed-fleet-asg"),
+            name: "mixed-fleet-asg".to_string(),
+            current: GroupConfiguration {
+                instance_types: vec![
+                    "m5.large".to_string(),
+                    "m5a.large".to_string(),
+                    "m6i.large".to_string(),
+                ],
+                allocation_strategy: Some("LowestPrice".to_string()),
+                desired_capacity: 10,
+                min_size: 4,
+                max_size: 20,
+                vcpus: 2.0,
+                memory_gib: 8.0,
+                hourly_price: 0.096,
+                architecture: CPU_ARCHITECTURE_CURRENT.to_string(),
+                performance_risk: 0.0,
+            },
+            utilization: vec![
+                (METRIC_CPU.to_string(), 9.1),
+                (METRIC_MEMORY.to_string(), 22.3),
+            ],
+            current_performance_risk: PERFORMANCE_RISK_VERY_LOW.to_string(),
+            inferred_workload_types: vec!["AmazonEmr".to_string()],
+            candidates: vec![
+                GroupConfiguration {
+                    instance_types: vec!["m6g.large".to_string(), "m6gd.large".to_string()],
+                    allocation_strategy: Some("LowestPrice".to_string()),
+                    desired_capacity: 6,
+                    min_size: 4,
+                    max_size: 20,
+                    vcpus: 2.0,
+                    memory_gib: 8.0,
+                    hourly_price: 0.077,
+                    architecture: CPU_ARCHITECTURE_AWS_ARM64.to_string(),
+                    performance_risk: 1.0,
+                },
+                GroupConfiguration {
+                    instance_types: vec![
+                        "m5.large".to_string(),
+                        "m5a.large".to_string(),
+                        "m6i.large".to_string(),
+                    ],
+                    allocation_strategy: Some("LowestPrice".to_string()),
+                    desired_capacity: 6,
+                    min_size: 4,
+                    max_size: 20,
+                    vcpus: 2.0,
+                    memory_gib: 8.0,
+                    hourly_price: 0.096,
+                    architecture: CPU_ARCHITECTURE_CURRENT.to_string(),
+                    performance_risk: 1.0,
+                },
+            ],
+            savings_plans_discount_rate: 0.28,
+        },
+    ]
+}
+
 /// The currency every monetary figure in the findings catalog is denominated in, one of
 /// the model's `Currency` values (`crate::ops::types::CURRENCY_VALUES`).
 pub const CURRENCY_USD: &str = "USD";
@@ -618,7 +1259,6 @@ impl AnalysedResource {
     pub fn monthly_savings(&self) -> f64 {
         (self.current_monthly_cost - self.recommended_monthly_cost).max(0.0)
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -888,9 +1528,19 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// Every stored recommendation preference, ordered by key so a page boundary is
     /// stable across calls.
     pub preferences: BTreeMap<PreferenceKey, PreferenceRecord>,
+    /// Every Auto Scaling group Compute Optimizer has analysed, in analysis order, so a
+    /// page boundary is stable across calls. Part of the store's initial value rather than
+    /// something a reader writes on first use: `GetAutoScalingGroupRecommendations` REPORTS
+    /// this analysis and must not mutate the store (see
+    /// [`seed_auto_scaling_group_analyses`]). It is the SINGLE source for a group: the Auto
+    /// Scaling group rows of [`Self::analysed_resources`] are projected from it.
+    pub auto_scaling_group_analyses: Vec<AnalyzedAutoScalingGroup>,
     /// The resources Compute Optimizer has analysed, in catalog order. Part of the
     /// store's initial value rather than something a reader writes on first use, so every
-    /// findings reader serves the same rows and none of them mutates the store.
+    /// findings reader serves the same rows and none of them mutates the store. The Auto
+    /// Scaling group rows are PROJECTED from [`Self::auto_scaling_group_analyses`]
+    /// ([`seed_analysed_resources`]), so the two readers of a group cannot disagree about
+    /// its finding, its risk or what it costs.
     pub analysed_resources: Vec<AnalysedResource>,
     /// The idle resource recommendations this service holds, which
     /// `GetIdleRecommendations` reports. See [`IdleRecommendationStore`]: no operation of
@@ -900,12 +1550,14 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
 
 impl Default for ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// The store's initial value: the account is not opted in, nobody has written a
-    /// preference, the findings catalog this emulator analysed, and no idle resource
-    /// recommendation (only an analysis records one).
+    /// preference, the Auto Scaling group analysis and the findings catalog this emulator
+    /// analysed — which a reader only sees once the account is enrolled — and no idle
+    /// resource recommendation (only an analysis records one).
     fn default() -> Self {
         Self {
             enrollment: Enrollment::default(),
             preferences: BTreeMap::new(),
+            auto_scaling_group_analyses: seed_auto_scaling_group_analyses(),
             analysed_resources: seed_analysed_resources(),
             idle_recommendations: IdleRecommendationStore::default(),
         }
@@ -989,21 +1641,6 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
             &[],
         ),
         row(
-            SOURCE_TYPE_AUTO_SCALING_GROUP,
-            ::engine::emulator_arn(
-                "autoscaling",
-                east,
-                "autoScalingGroup:12345678-1234-1234-1234-123456789012:\
-                 autoScalingGroupName/web-tier",
-            ),
-            FINDING_NOT_OPTIMIZED,
-            &[],
-            PERFORMANCE_RISK_LOW,
-            560.64,
-            420.48,
-            &[],
-        ),
-        row(
             SOURCE_TYPE_EBS_VOLUME,
             ::engine::emulator_arn("ec2", east, "volume/vol-00112233445566001"),
             FINDING_NOT_OPTIMIZED,
@@ -1056,6 +1693,18 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
             &[],
         ),
     ]
+    .into_iter()
+    // The Auto Scaling group rows are the SAME analysis
+    // `GetAutoScalingGroupRecommendations` reports, projected onto the findings row
+    // ([`AnalyzedAutoScalingGroup::to_analysed_resource`]) rather than stated a second
+    // time here, so a summary of the account's Auto Scaling groups counts exactly the
+    // groups that reader reports and agrees with it on each one's finding, risk and cost.
+    .chain(
+        seed_auto_scaling_group_analyses()
+            .iter()
+            .map(AnalyzedAutoScalingGroup::to_analysed_resource),
+    )
+    .collect()
 }
 
 /// The `FindingReasonCode` values (`crate::ops::types::FINDING_REASON_CODE_VALUES`) — the
@@ -1109,6 +1758,78 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             .collect();
         applicable.sort_by_key(|(rank, _)| *rank);
         applicable.into_iter().map(|(_, record)| record).collect()
+    }
+
+    /// The preferences in force for one resource: the value from the most specific scope
+    /// that sets each field, and the service's documented default for every field no
+    /// record sets — "considers all applicable preferences that you might have set at the
+    /// resource, account, and organization level", each field independently, so a
+    /// resource-level record that sets one preference still inherits the rest.
+    ///
+    /// The ONE resolution in this service: `GetEffectiveRecommendationPreferences` reports
+    /// it and every recommendation reader states the preferences it was generated under
+    /// from it, so the two cannot disagree.
+    pub fn effective_preferences(
+        &self,
+        resource_arn: &str,
+        arn: ParsedResourceArn<'_>,
+    ) -> EffectivePreferences {
+        let applicable = self.records_applying_to(resource_arn, arn);
+        let effective = |field: fn(&PreferenceRecord) -> bool| {
+            applicable.iter().copied().find(|record| field(record))
+        };
+        EffectivePreferences {
+            enhanced_infrastructure_metrics: effective(|record| {
+                record.enhanced_infrastructure_metrics.is_some()
+            })
+            .and_then(|record| record.enhanced_infrastructure_metrics.clone()),
+            inferred_workload_types: effective(|record| record.inferred_workload_types.is_some())
+                .and_then(|record| record.inferred_workload_types.clone())
+                .unwrap_or_else(|| INFERRED_WORKLOAD_TYPES_ACTIVE.to_string()),
+            external_metrics_preference: effective(|record| {
+                record.external_metrics_preference.is_some()
+            })
+            .and_then(|record| record.external_metrics_preference.clone()),
+            look_back_period: effective(|record| record.look_back_period.is_some())
+                .and_then(|record| record.look_back_period.clone())
+                .unwrap_or_else(|| DEFAULT_LOOK_BACK_PERIOD.to_string()),
+            // "You can only set CPU and memory utilization preferences for the Amazon EC2
+            // instance resource type", so for any other resource type there is no default
+            // to report and the list is empty.
+            utilization_preferences: effective(|record| !record.utilization_preferences.is_empty())
+                .map(|record| record.utilization_preferences.clone())
+                .unwrap_or_else(|| {
+                    if arn.resource_type == RESOURCE_TYPE_EC2_INSTANCE {
+                        default_utilization_preferences()
+                    } else {
+                        Vec::new()
+                    }
+                }),
+            preferred_resources: effective(|record| !record.preferred_resources.is_empty())
+                .map(|record| {
+                    record
+                        .preferred_resources
+                        .iter()
+                        .map(effective_preferred_resource)
+                        .collect()
+                })
+                .unwrap_or_else(default_preferred_resources),
+            savings_estimation_mode: effective(|record| record.savings_estimation_mode.is_some())
+                .and_then(|record| record.savings_estimation_mode.clone()),
+        }
+    }
+
+    /// The Auto Scaling groups whose analysis a caller can read, in analysis order.
+    ///
+    /// Compute Optimizer reports recommendations for an ENROLLED account only, and only
+    /// once the analysis that enrollment starts is due ([`ANALYSIS_DELAY`]), so an
+    /// account that never opted in, one that opted out, and one that has just opted in
+    /// all read the empty set rather than an analysis nothing has produced yet.
+    pub fn visible_auto_scaling_group_analyses(&self) -> &[AnalyzedAutoScalingGroup] {
+        if !self.enrollment.is_opted_in() || !self.enrollment.analysis_due() {
+            return &[];
+        }
+        &self.auto_scaling_group_analyses
     }
 
     /// The analysed resources `account_id` owns, grouped by `RecommendationSourceType` and

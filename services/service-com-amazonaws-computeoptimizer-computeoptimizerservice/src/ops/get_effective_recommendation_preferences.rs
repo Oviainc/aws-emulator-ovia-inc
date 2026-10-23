@@ -249,58 +249,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Considers all applicable preferences that you might have set at the resource,
         // account, and organization level": each field independently takes the value from
-        // the most specific scope that sets it, so a resource-level record that sets one
-        // preference still inherits the rest.
-        let applicable = guard.records_applying_to(&input.resource_arn, resource);
-        let effective = |field: fn(&crate::state::PreferenceRecord) -> bool| {
-            applicable.iter().copied().find(|record| field(record))
-        };
+        // the most specific scope that sets it, and the service's documented default where
+        // no record sets it. The resolution lives in `crate::state`
+        // ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::effective_preferences`])
+        // so the preferences this operation REPORTS are the same ones a recommendation
+        // says it was generated under.
+        let effective = guard.effective_preferences(&input.resource_arn, resource);
 
         Ok(GetEffectiveRecommendationPreferencesOutput {
-            enhanced_infrastructure_metrics: effective(|record| {
-                record.enhanced_infrastructure_metrics.is_some()
-            })
-            .and_then(|record| record.enhanced_infrastructure_metrics.clone()),
-            external_metrics_preference: effective(|record| {
-                record.external_metrics_preference.is_some()
-            })
-            .and_then(|record| record.external_metrics_preference.clone()),
+            enhanced_infrastructure_metrics: effective.enhanced_infrastructure_metrics,
+            external_metrics_preference: effective.external_metrics_preference,
             // "When this preference isn't specified, we use the default value DAYS_14."
-            look_back_period: Some(
-                effective(|record| record.look_back_period.is_some())
-                    .and_then(|record| record.look_back_period.clone())
-                    .unwrap_or_else(|| crate::state::DEFAULT_LOOK_BACK_PERIOD.to_string()),
-            ),
+            look_back_period: Some(effective.look_back_period),
             // Every list member is reported, with the service's documented default when no
             // record sets it — the same reporting rule `lookBackPeriod` follows above.
             // "You can only set CPU and memory utilization preferences for the Amazon EC2
             // instance resource type", so for any other resource type there is no default
             // to report and the list is empty.
-            utilization_preferences: Some(
-                effective(|record| !record.utilization_preferences.is_empty())
-                    .map(|record| record.utilization_preferences.clone())
-                    .unwrap_or_else(|| {
-                        if resource.resource_type == crate::state::RESOURCE_TYPE_EC2_INSTANCE {
-                            crate::state::default_utilization_preferences()
-                        } else {
-                            Vec::new()
-                        }
-                    }),
-            ),
+            utilization_preferences: Some(effective.utilization_preferences),
             // `PreferredResource` "is only available for the Amazon EC2 instance and Auto
             // Scaling group resource types" — both of the types a `resourceArn` can name —
             // so the default applies to every resource this operation accepts.
-            preferred_resources: Some(
-                effective(|record| !record.preferred_resources.is_empty())
-                    .map(|record| {
-                        record
-                            .preferred_resources
-                            .iter()
-                            .map(crate::state::effective_preferred_resource)
-                            .collect()
-                    })
-                    .unwrap_or_else(crate::state::default_preferred_resources),
-            ),
+            preferred_resources: Some(effective.preferred_resources),
         })
     }
 }

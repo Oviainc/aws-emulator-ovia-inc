@@ -170,18 +170,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         // The export is resolved first: an `ExecutionId` is only ever an id WITHIN an
-        // export, so an ARN naming no export has no execution namespace to look in.
+        // export, so an ARN naming no export has no execution namespace to look in. The
+        // miss goes through `crate::state::export_not_found_error`, the one place that
+        // states the status this service answers the not-found condition with.
         if !store.exports.contains_key(&input.export_arn) {
-            return Err(GetExecutionErrorModeled::ResourceNotFoundException(
-                crate::state::export_not_found(&input.export_arn),
-            )
-            .into());
+            return Err(crate::state::export_not_found_error(
+                &input.export_arn,
+                GetExecutionErrorModeled::ResourceNotFoundException,
+            ));
         }
         let execution = store
             .execution(&input.export_arn, &input.execution_id)
             .ok_or_else(|| {
-                GetExecutionErrorModeled::ResourceNotFoundException(
+                crate::state::not_found_error(
                     crate::state::execution_not_found(&input.execution_id),
+                    GetExecutionErrorModeled::ResourceNotFoundException,
                 )
             })?;
 

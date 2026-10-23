@@ -219,10 +219,20 @@ pub const CONNECTOR_ACTIVATION_WINDOW: Duration = Duration::from_secs(3 * 24 * 6
 /// the default one.
 pub const DEFAULT_KUBERNETES_VERSION: &str = "1.36";
 
-/// The platform version a freshly created cluster carries. EKS platform versions
-/// are `eks.<n>`, numbered from 1 within each Kubernetes minor version, so a
-/// cluster created now starts at the first one.
-pub const INITIAL_PLATFORM_VERSION: &str = "eks.1";
+/// The platform version this service publishes for a Kubernetes version.
+///
+/// EKS platform versions are `eks.<n>`, the n-th platform revision Amazon EKS has
+/// published for one Kubernetes minor version. Neither the model nor the EKS
+/// documentation states which revision a version sits at — it is whatever the
+/// service's catalogue publishes — and this emulator patches no control plane, so
+/// it publishes ONE revision, the one the recorded catalogue publishes.
+///
+/// It is the single source for both places a platform version appears, so they
+/// cannot disagree: `DescribeClusterVersions` reports it as a row's
+/// `defaultPlatformVersion` ("Default platform version for this Kubernetes
+/// version"), and `CreateCluster` stamps it on the control plane of a cluster it
+/// creates — a new cluster runs the default platform version of its version.
+pub const PLATFORM_VERSION: &str = "eks.4";
 
 /// The `ipFamily` a cluster gets when `kubernetesNetworkConfig.ipFamily` is
 /// absent: "If you don't specify a value, `ipv4` is used by default"
@@ -992,14 +1002,17 @@ impl IdentityProviderConfigRecord {
 /// of Amazon EKS access policies lists the whole managed catalogue — the four
 /// policies whose permissions mirror the Kubernetes `cluster-admin`, `admin`,
 /// `edit` and `view` cluster roles that `AccessPolicy`'s own documentation points
-/// at, the read-only mirror of `admin`, and the policies Amazon EKS publishes for
-/// the controllers and Amazon Web Services services that work on a cluster (EKS
-/// Auto Mode's node lifecycle, the EKS compute, block-storage, load-balancing and
-/// networking controllers, hybrid nodes, the AWS Controllers for Kubernetes, Argo
-/// CD, AWS Batch, the AI operations and DevOps agents and Application Recovery
-/// Controller's region switch). The catalogue is what a caller discovers through
-/// `ListAccessPolicies` INSTEAD of hardcoding ARNs, so a policy missing here is a
-/// policy no caller can associate.
+/// at, the read-only mirror of `admin`, the policies Amazon EKS publishes for the
+/// controllers and Amazon Web Services services that work on a cluster (EKS Auto
+/// Mode's node lifecycle, the EKS compute, block-storage, load-balancing and
+/// networking controllers — each published both namespace-scoped and
+/// cluster-scoped — hybrid nodes, the AWS Controllers for Kubernetes, Argo CD,
+/// AWS Batch, the AI operations and DevOps agents and Application Recovery
+/// Controller's region switch), and the policies for the cluster capabilities EKS
+/// manages (event forwarding, the Kube Resource Orchestrator, EKS Pod Identity
+/// and secret admin/reader access). The catalogue is what a caller discovers
+/// through `ListAccessPolicies` INSTEAD of hardcoding ARNs, so a policy missing
+/// here is a policy no caller can associate.
 ///
 /// Sorted by name, so a page token can name the entry to resume after; the unit
 /// tests at the bottom of this module pin the order and the uniqueness.
@@ -1027,17 +1040,34 @@ pub const ACCESS_POLICY_NAMES: &[&str] = &[
     "AmazonEKSArgoCDPolicy",
     // The Amazon EKS controllers that run against a cluster: EKS Auto Mode's node
     // lifecycle and the block-storage, compute, load-balancing and networking
-    // controllers, plus hybrid nodes.
+    // controllers, plus hybrid nodes. Each of the four Auto Mode capability
+    // controllers is published TWICE — the namespace-scoped policy the controller
+    // is granted on the workloads it manages (`AmazonEKS<Capability>Policy`) and
+    // the cluster-scoped one it is granted on the cluster's own objects
+    // (`AmazonEKS<Capability>ClusterPolicy`) — so a caller that discovers the
+    // catalogue finds both halves of the pair rather than only one.
     "AmazonEKSAutoNodePolicy",
     "AmazonEKSBlockStorageClusterPolicy",
+    "AmazonEKSBlockStoragePolicy",
     // `cluster-admin`.
     "AmazonEKSClusterAdminPolicy",
     "AmazonEKSComputeClusterPolicy",
+    "AmazonEKSComputePolicy",
     // `edit`.
     "AmazonEKSEditPolicy",
+    // The policies Amazon EKS publishes for the capabilities a cluster can run:
+    // event forwarding, the Kube Resource Orchestrator, EKS Pod Identity, and
+    // read/write and read-only access to Kubernetes secrets.
+    "AmazonEKSEventPolicy",
     "AmazonEKSHybridPolicy",
+    "AmazonEKSKROPolicy",
     "AmazonEKSLoadBalancingClusterPolicy",
+    "AmazonEKSLoadBalancingPolicy",
     "AmazonEKSNetworkingClusterPolicy",
+    "AmazonEKSNetworkingPolicy",
+    "AmazonEKSPodIdentityPolicy",
+    "AmazonEKSSecretAdminPolicy",
+    "AmazonEKSSecretReaderPolicy",
     // `view`.
     "AmazonEKSViewPolicy",
 ];
@@ -2108,11 +2138,8 @@ impl ClusterVersionRecord {
             cluster_type: Some(self.cluster_type.clone()),
             // The platform version a cluster of this Kubernetes version is created
             // at — the same constant `CreateCluster` writes onto a new record, so
-            // the catalog and the cluster slice cannot disagree. Amazon EKS moves
-            // this number on as it patches the control planes of a minor version;
-            // this emulator patches nothing, so it publishes the INITIAL platform
-            // version rather than a number it would have to invent per row.
-            default_platform_version: Some(INITIAL_PLATFORM_VERSION.to_string()),
+            // the catalog and the cluster slice cannot disagree.
+            default_platform_version: Some(PLATFORM_VERSION.to_string()),
             default_version: self.default_version,
             release_date: Some(::aws_smithy_types::DateTime::from(self.release_date)),
             end_of_standard_support_date: Some(::aws_smithy_types::DateTime::from(
@@ -2121,8 +2148,14 @@ impl ClusterVersionRecord {
             end_of_extended_support_date: Some(::aws_smithy_types::DateTime::from(
                 self.end_of_extended_support,
             )),
-            // The deprecated spelling and the current one, from the same state.
-            status: Some(status.cluster_version_status().to_string()),
+            // Both members report the same lifecycle state, and on the WIRE both
+            // report it in the `VersionStatus` spelling: `status` "is deprecated.
+            // Use `versionStatus` instead, as that field matches for input and
+            // output of this action" — the note says the CURRENT member is the one
+            // whose tokens match in both directions, so the deprecated member's
+            // output tokens are not the ones its own filter accepts. The filter
+            // side keeps the `ClusterVersionStatus` spelling (see the handler).
+            status: Some(status.version_status().to_string()),
             version_status: Some(status.version_status().to_string()),
             kubernetes_patch_version: Some(self.kubernetes_patch_version()),
             // The provisioned control-plane catalogs. They do not depend on the
@@ -2141,9 +2174,8 @@ impl ClusterVersionRecord {
     /// Kubernetes for this cluster version". This emulator runs no Kubernetes
     /// control plane, so there is no later patch build of a minor version to
     /// report: it publishes each minor version at its INITIAL patch level, the
-    /// same way it publishes the initial platform version
-    /// ([`INITIAL_PLATFORM_VERSION`]) for the control plane of a cluster it has
-    /// just created.
+    /// same way it publishes one platform revision ([`PLATFORM_VERSION`]) for
+    /// every version it carries.
     pub fn kubernetes_patch_version(&self) -> String {
         format!("{}.0", self.cluster_version)
     }
@@ -2179,11 +2211,14 @@ const CONTROL_PLANE_SCALING_TIERS: &[(&str, i32, i32, i32)] = &[
 
 /// The provisioned control-plane scaling tiers, as the modelled shape.
 ///
-/// Each tier carries no `controlPlaneComponentConfigOverrides`: that member is
-/// "The control plane component configuration overrides specific to this scaling
-/// tier", and the component defaults and constraints this service publishes
-/// ([`control_plane_component_config`]) are the same on every tier — so there is
-/// nothing a tier overrides, rather than a value invented per tier.
+/// Each tier reports the component configuration a control plane on it runs with
+/// as its `controlPlaneComponentConfigOverrides` ("The control plane component
+/// configuration overrides specific to this scaling tier"). This service
+/// publishes ONE set of component defaults and constraints
+/// ([`control_plane_component_config`]), so every tier reports that same set
+/// rather than a per-tier value this emulator would have to invent: a caller
+/// reading a tier learns the window it may configure a cluster on that tier in
+/// without having to merge the tier against the version.
 fn control_plane_scaling_tiers() -> Vec<ControlPlaneScalingTierInfo> {
     CONTROL_PLANE_SCALING_TIERS
         .iter()
@@ -2194,7 +2229,9 @@ fn control_plane_scaling_tiers() -> Vec<ControlPlaneScalingTierInfo> {
                     api_request_concurrency: Some(*api_request_concurrency),
                     pod_scheduling_rate_per_second: Some(*pod_scheduling_rate),
                     cluster_database_size_gb: Some(*database_size_gb),
-                    control_plane_component_config_overrides: None,
+                    control_plane_component_config_overrides: Some(
+                        control_plane_component_config(),
+                    ),
                 }
             },
         )

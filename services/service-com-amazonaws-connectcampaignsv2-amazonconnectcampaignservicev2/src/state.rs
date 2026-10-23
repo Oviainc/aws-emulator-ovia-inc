@@ -7,12 +7,18 @@
 //! `GetCampaignState` project it, `Start`/`Pause`/`StopCampaign` move its
 //! [`CampaignState`], and `DeleteCampaign` removes it. No handler keeps a copy of
 //! its own, so every response describes what the store holds.
+//!
+//! The instance-onboarding store does the same for a Connect instance's onboarding
+//! job: `StartInstanceOnboardingJob` writes a record here with the encryption
+//! config it was given, and `GetInstanceOnboardingJobStatus` reports the status
+//! that record is at.
 
 use std::collections::{BTreeMap, HashMap};
 
 use crate::ops::types::{
     Campaign, CampaignSummary, ChannelSubtypeConfig, CommunicationLimitsConfig,
-    CommunicationTimeConfig, EntryLimitsConfig, Schedule, Source,
+    CommunicationTimeConfig, EncryptionConfig, EntryLimitsConfig, InstanceOnboardingJobStatus,
+    Schedule, Source,
 };
 
 /// The ARN namespace (and SigV4 signing name) this service's ARNs carry, as the
@@ -234,6 +240,106 @@ impl StoredCampaign {
     }
 }
 
+/// Record one state-changing instance-onboarding operation: who asked (the access
+/// key id the request presented), which Connect instance it named and how the call
+/// ended.
+///
+/// The one place this service writes an onboarding audit record, so a later
+/// onboarding mutator records the same fields. Only wire metadata and the request's
+/// instance id go in: never the stored encryption config, a key ARN or any
+/// credential material.
+pub fn audit_onboarding_change(
+    parts: &::http::request::Parts,
+    operation: &'static str,
+    connect_instance_id: &str,
+    outcome: &str,
+) {
+    ::tracing::info!(
+        audit = true,
+        operation,
+        outcome,
+        caller_akid = %::emulator_server::extract_akid(&parts.headers),
+        connect_instance_id,
+        "connect instance onboarding changed"
+    );
+}
+
+/// The `InstanceOnboardingJobStatusCode` value a job that has not finished
+/// onboarding the instance yet reports, as the model's catalog declares it (see
+/// `INSTANCE_ONBOARDING_JOB_STATUS_CODE_VALUES` in [`crate::ops::types`]).
+pub const ONBOARDING_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The `InstanceOnboardingJobStatusCode` value a finished onboarding job reports,
+/// from the same catalog.
+pub const ONBOARDING_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// How long after the `StartInstanceOnboardingJob` call that started it an
+/// onboarding job is due to reach `SUCCEEDED`.
+///
+/// AWS documents no duration for the job, so this is the emulator's own: long
+/// enough that a caller which polls immediately still observes `IN_PROGRESS` (the
+/// transient state the real job has), short enough that a poller reaches
+/// `SUCCEEDED` straight away. Nothing sleeps for it — the due instant is stored
+/// and the status is read off the clock.
+pub const ONBOARDING_JOB_DURATION: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The onboarding job of one Connect instance: the encryption config the
+/// `StartInstanceOnboardingJob` call persisted, and the instant its job is due to
+/// have finished.
+#[derive(Debug, Clone)]
+pub struct StoredInstanceOnboarding {
+    pub connect_instance_id: String,
+    /// What the instance's campaign data is encrypted with, exactly as the call
+    /// that started the job supplied it.
+    pub encryption_config: EncryptionConfig,
+    /// The instant this job reaches `SUCCEEDED`: the start instant plus
+    /// [`ONBOARDING_JOB_DURATION`]. Before it the job reports `IN_PROGRESS`.
+    pub succeeds_at: std::time::SystemTime,
+}
+
+impl StoredInstanceOnboarding {
+    /// A job just started for `connect_instance_id` at `now`, due to succeed one
+    /// [`ONBOARDING_JOB_DURATION`] later.
+    pub fn starting(
+        connect_instance_id: String,
+        encryption_config: EncryptionConfig,
+        now: std::time::SystemTime,
+    ) -> Self {
+        Self {
+            connect_instance_id,
+            encryption_config,
+            succeeds_at: now + ONBOARDING_JOB_DURATION,
+        }
+    }
+
+    /// The job's status at `now`: `SUCCEEDED` once the clock has passed the due
+    /// instant, `IN_PROGRESS` until then.
+    ///
+    /// A pure read of the stored instant, so reporting the status writes nothing
+    /// and two callers reading at the same moment see the same value.
+    pub fn status_at(&self, now: std::time::SystemTime) -> &'static str {
+        if now < self.succeeds_at {
+            ONBOARDING_STATUS_IN_PROGRESS
+        } else {
+            ONBOARDING_STATUS_SUCCEEDED
+        }
+    }
+
+    /// This record as the modelled `InstanceOnboardingJobStatus` shape the
+    /// onboarding operations return.
+    ///
+    /// `failureCode` is absent: the onboarding this emulator performs is writing
+    /// the record, which either happened or was refused before the job started, so
+    /// no stored job is in the modelled `FAILED` state.
+    pub fn to_job_status(&self, now: std::time::SystemTime) -> InstanceOnboardingJobStatus {
+        InstanceOnboardingJobStatus {
+            connect_instance_id: self.connect_instance_id.clone(),
+            status: self.status_at(now).to_string(),
+            failure_code: None,
+        }
+    }
+}
+
 /// The most campaigns this emulator's store holds, after which `CreateCampaign`
 /// refuses with the modelled `ServiceQuotaExceededException` (HTTP 402) — the
 /// error the model declares for "Request would cause a service quota to be
@@ -246,6 +352,18 @@ impl StoredCampaign {
 /// faithful to it; this one is the emulator's own, set far above any plausible
 /// workload and enforced through the error AWS answers a quota breach with.
 pub const MAX_CAMPAIGNS: usize = 1_000;
+
+/// The most Connect instances this emulator's store holds onboarding records for,
+/// after which `StartInstanceOnboardingJob` refuses to take another with the
+/// modelled `ConflictException` (HTTP 409) — of the errors that operation declares,
+/// the one that fits a refusal the service's own state and not the request causes.
+/// A later fix that models a real onboarding quota should answer it the same way.
+///
+/// The store grows one record per newly onboarded instance, so without a ceiling a
+/// caller could repeat the call with fresh instance ids until the process runs out
+/// of memory. AWS publishes no such limit, so this is the emulator's own, set far
+/// above any plausible workload.
+pub const MAX_ONBOARDED_INSTANCES: usize = 1_000;
 
 /// Why the store refused to take a campaign, as
 /// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::insert_new_campaign`]
@@ -273,6 +391,9 @@ pub struct ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     campaigns: HashMap<String, StoredCampaign>,
     order: Vec<(u64, String)>,
     next_sequence: u64,
+    /// One onboarding record per Connect instance, keyed by instance id. Bounded by
+    /// [`MAX_ONBOARDED_INSTANCES`], enforced by [`Self::start_instance_onboarding`].
+    instance_onboarding: HashMap<String, StoredInstanceOnboarding>,
 }
 
 impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
@@ -340,6 +461,48 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         self.order
             .iter()
             .filter_map(|(sequence, id)| self.campaigns.get(id).map(|c| (*sequence, c)))
+    }
+
+    /// Start the onboarding job for `connect_instance_id` with `encryption_config`,
+    /// and hand back the record now in the store.
+    ///
+    /// An instance with no record gets a job that starts at `now`. An instance that
+    /// already has one keeps that job — repeating the call does not re-onboard an
+    /// instance, which is what makes the operation idempotent — and takes the
+    /// request's encryption config, since the call carries the instance's config.
+    ///
+    /// `None` means the store already holds [`MAX_ONBOARDED_INSTANCES`] instances
+    /// and nothing was written.
+    pub fn start_instance_onboarding(
+        &mut self,
+        connect_instance_id: &str,
+        encryption_config: EncryptionConfig,
+        now: std::time::SystemTime,
+    ) -> Option<StoredInstanceOnboarding> {
+        if let Some(existing) = self.instance_onboarding.get_mut(connect_instance_id) {
+            existing.encryption_config = encryption_config;
+            return Some(existing.clone());
+        }
+        if self.instance_onboarding.len() >= MAX_ONBOARDED_INSTANCES {
+            return None;
+        }
+        let record = StoredInstanceOnboarding::starting(
+            connect_instance_id.to_string(),
+            encryption_config,
+            now,
+        );
+        self.instance_onboarding
+            .insert(connect_instance_id.to_string(), record.clone());
+        Some(record)
+    }
+
+    /// The onboarding record of `connect_instance_id`, or `None` when the instance
+    /// has never been onboarded.
+    pub fn instance_onboarding(
+        &self,
+        connect_instance_id: &str,
+    ) -> Option<&StoredInstanceOnboarding> {
+        self.instance_onboarding.get(connect_instance_id)
     }
 }
 

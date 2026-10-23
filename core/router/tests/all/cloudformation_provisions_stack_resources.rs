@@ -16,6 +16,12 @@
 //! outputs are written with (`Ref`, `Fn::GetAtt`, `Fn::Sub`, `Fn::Join`, a `Ref` to a
 //! parameter and to a pseudo parameter). Every expected value is computed here from what
 //! the row declares, never read back out of the answer being checked.
+//!
+//! Firehose resolves the IAM role a stream's destination names against IAM before it writes
+//! the stream, so a template that NAMES a delivery role without DECLARING it has that role
+//! created in IAM first ([`given_delivery_role`]) — the account a stack like that is
+//! deployed into holds the role already. A template declaring its own `AWS::IAM::Role`
+//! needs nothing: CloudFormation provisions it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -141,6 +147,56 @@ async fn firehose(
     (status, payload)
 }
 
+/// Call one IAM operation over its awsQuery wire. IAM is global, so the request is signed
+/// for this suite's Region only because that is what routes it.
+async fn iam(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]) -> (u16, String) {
+    let mut body = format!("Action={action}&Version=2010-05-08");
+    for (key, value) in members {
+        body.push('&');
+        body.push_str(&form_encode(key));
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", "iam.amazonaws.com")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("authorization", authorization("iam"))
+        .body(Bytes::from(body))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload = String::from_utf8_lossy(response.body()).to_string();
+    (status, payload)
+}
+
+/// Create the IAM role `role_name`, trusting Firehose, for a template that NAMES a
+/// delivery role it does not DECLARE.
+///
+/// Firehose assumes every `RoleARN` a stream is configured with, so it resolves each of
+/// them against IAM before it writes the stream and refuses one this account does not hold
+/// — which is why a template pointing at a role that lives OUTSIDE the stack needs that
+/// role to exist first, exactly as it would in an account. A template that declares its own
+/// `AWS::IAM::Role` needs none of this: CloudFormation provisions the role itself, and
+/// creating a second role under the same name would be refused.
+async fn given_delivery_role(router: &MultiServiceRouter, case: &str, role_name: &str) {
+    let (status, body) = iam(
+        router,
+        "CreateRole",
+        &[
+            ("RoleName", role_name),
+            ("AssumeRolePolicyDocument", &trust_policy().to_string()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from CreateRole for {role_name:?}, got {status} \
+         with body {body}"
+    );
+}
+
 /// Every `<tag>` text of an XML body, in document order, with the serializer's escaping
 /// undone.
 fn xml_texts(xml: &str, tag: &str) -> Vec<String> {
@@ -253,6 +309,10 @@ struct Row {
     /// `ListTagsForDeliveryStream` is still a 501 stub in this emulator, so a template's
     /// tags are passed to the create and have no reader yet.
     expected_encryption_key_type: Option<&'static str>,
+    /// Whether the row's template names the delivery role `<stack>-role` WITHOUT declaring
+    /// it, so that role has to exist in IAM before the stack is created (see
+    /// [`given_delivery_role`]).
+    role_outside_the_stack: bool,
 }
 
 /// The ARN a Firehose stream of `name` carries in this emulator.
@@ -272,7 +332,9 @@ fn role_arn(name: &str) -> String {
     format!("arn:aws:iam::{ACCOUNT_ID}:role/{name}")
 }
 
-/// A trust policy for the delivery role the templates declare.
+/// A trust policy for a delivery role: Firehose has to be able to assume the role a stream
+/// is configured with, so every role here — declared by a template or created beside it —
+/// trusts the Firehose service principal.
 fn trust_policy() -> Value {
     json!({
         "Version": "2012-10-17",
@@ -365,6 +427,7 @@ const ROWS: &[Row] = &[
         },
         absent_outputs: &[],
         expected_encryption_key_type: None,
+        role_outside_the_stack: false,
     },
     Row {
         case: "an unnamed stream with an S3 destination, outputs by Fn::Sub and Fn::Join",
@@ -434,6 +497,7 @@ const ROWS: &[Row] = &[
         },
         absent_outputs: &["Imported"],
         expected_encryption_key_type: None,
+        role_outside_the_stack: false,
     },
     Row {
         case: "a stream with tags and server-side encryption, an output exporting its name",
@@ -494,6 +558,9 @@ const ROWS: &[Row] = &[
         },
         absent_outputs: &[],
         expected_encryption_key_type: Some("AWS_OWNED_CMK"),
+        // The `Fn::Sub` above points at `<stack>-role`, a role this template does not
+        // declare.
+        role_outside_the_stack: true,
     },
     Row {
         case: "the same thing declared in YAML, with the short-form intrinsic tags",
@@ -580,6 +647,7 @@ Outputs:
         },
         absent_outputs: &[],
         expected_encryption_key_type: None,
+        role_outside_the_stack: false,
     },
 ];
 
@@ -594,6 +662,9 @@ async fn a_stack_provisions_the_firehose_stream_its_template_declares() {
         let case = row.case;
         let stack_name = format!("provisioning-{index}");
         let template = (row.template)(&stack_name);
+        if row.role_outside_the_stack {
+            given_delivery_role(&router, case, &format!("{stack_name}-role")).await;
+        }
         let stack_id = create_stack(&router, case, &stack_name, &template, row.parameters).await;
         assert!(
             stack_id.contains(&format!("stack/{stack_name}/")),
@@ -792,6 +863,7 @@ async fn a_resource_the_owning_service_refuses_fails_the_stack() {
     let router = build_router();
     let case = "a template naming a stream that already exists";
     let stream_name = "already-taken-stream";
+    given_delivery_role(&router, case, "some-role").await;
 
     let (status, created) = firehose(
         &router,
@@ -873,6 +945,7 @@ async fn a_resource_the_owning_service_refuses_fails_the_stack() {
 async fn one_stacks_deletion_leaves_another_stacks_resources_untouched() {
     let router = build_router();
     let case = "two stacks from one template, one deleted";
+    given_delivery_role(&router, case, "shared-role").await;
     let template = |stack: &str| {
         json!({
             "Resources": {
@@ -957,6 +1030,7 @@ async fn an_update_creates_the_streams_it_declares_and_deletes_the_ones_it_drops
     let router = build_router();
     let case = "an update that replaces one stream and keeps another";
     let stack_name = "updated-stack";
+    given_delivery_role(&router, case, "update-role").await;
     // Both templates declare `Kept` identically; only the second declares `Replaced`'s
     // stream under a new name, which is what the update has to create and clean up after.
     let template = |replaced: &str| {
@@ -1064,6 +1138,7 @@ async fn an_update_that_would_change_an_existing_resource_in_place_fails_the_sta
     let case = "an update that changes a kept stream's compression";
     let stack_name = "in-place-stack";
     let stream_name = "in-place-stack-stream";
+    given_delivery_role(&router, case, "in-place-role").await;
     let template = |compression: &str| {
         json!({
             "Resources": {
@@ -1168,6 +1243,7 @@ async fn a_deletion_the_owning_service_refuses_fails_the_stack_and_can_be_retrie
     let case = "a stack deleted while its stream is still creating";
     let stack_name = "retried-deletion";
     let stream_name = format!("{stack_name}-stream");
+    given_delivery_role(&router, case, "retry-role").await;
     let template = json!({
         "Resources": {
             "Stream": {
