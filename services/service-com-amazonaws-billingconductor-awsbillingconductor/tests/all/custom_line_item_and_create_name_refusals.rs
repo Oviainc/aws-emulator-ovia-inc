@@ -45,6 +45,10 @@ struct Emulator {
 }
 
 impl Emulator {
+    /// A router over this service's DEFAULT store, which records no payer account — so
+    /// every answer here is one the payer-account gate does NOT reach: a request that
+    /// breaks a constraint the model declares is refused at the boundary first, which is
+    /// the order `tests/all/payer_account_gate.rs` pins.
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();

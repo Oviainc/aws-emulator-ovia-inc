@@ -11,7 +11,13 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-billingconductor-awsbillingconductor.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.billingconductor#UntagResourceRequest")]
+// `skip_validation = ["ResourceArn"]`: the same member, the same pattern and the same
+// reason as `TagResourceInput` — AWS resolves the ARN and answers 404 for a resource it
+// does not hold rather than refusing the request at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.billingconductor#UntagResourceRequest",
+    skip_validation = ["ResourceArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct UntagResourceInput {
     pub resource_arn: String,

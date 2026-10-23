@@ -11,7 +11,13 @@
 //! A `ResourceArn` naming no resource this service holds is answered 404 through
 //! [`crate::state::tagging_not_found`]; that constant documents why the code it carries
 //! is the recorded `NotFoundException` rather than the model's
-//! `ResourceNotFoundException`.
+//! `ResourceNotFoundException`. The member's own `@pattern` is NOT enforced at the
+//! boundary (`skip_validation` on `TagResourceInput`) for the same recorded reason: AWS
+//! resolves the ARN and answers that 404 even for a value the pattern refuses.
+//!
+//! This operation is NOT payer-account-gated
+//! (`crate::service::PAYER_UNGATED_OPERATIONS`): a recorded call from a non-payer
+//! account is answered by resolution.
 //!
 //! ## Shape of an operation
 //!
@@ -149,8 +155,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The modelled `ResourceArn` pattern and the `Tags` map's own length bound are
-        // refused by the boundary before this runs.
+        // The `Tags` map's own length bound is refused by the boundary before this runs;
+        // the `ResourceArn` pattern is not (see this module's header), so the ARN is
+        // resolved here.
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(

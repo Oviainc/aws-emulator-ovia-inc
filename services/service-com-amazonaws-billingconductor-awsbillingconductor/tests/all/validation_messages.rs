@@ -20,20 +20,27 @@
 //!
 //! The rows span what the rule generalises over rather than one recorded call: the
 //! operation (ten of them), the HTTP binding the offending member travels in (JSON body,
-//! `@httpLabel`, `@httpHeader`), the constraint class (`@pattern`, `@length` maximum,
+//! `@httpHeader`), the constraint class (`@pattern`, `@length` maximum,
 //! `@range` at each published bound and one step past it, an absent `@required` member),
-//! the member's name (`arn`, `pricingPlanArn`, `pricingRuleArn`, `resourceArn`,
+//! the member's name (`arn`, `pricingPlanArn`, `pricingRuleArn`,
 //! `maxResults`, `clientToken`, `name`, and a list member's elements), how many elements
 //! of a list are at fault, and how many violations one request carries (one, two, three).
 //! The recorded cases (`UpdatePricingPlan` with a non-conforming `Arn`, and
 //! `AssociatePricingRules` with both a bad plan ARN and a bad rule ARN) are two rows.
+//!
+//! This service's only `@httpLabel` member is the tagging operations' `ResourceArn`,
+//! which is NOT among the rows: AWS does not enforce that member's `@pattern` as a
+//! request-rejecting constraint but resolves the ARN instead, so it is covered by
+//! `tests/all/payer_account_gate.rs` rather than here.
 //!
 //! Every assertion goes over the service's real `restJson1` wire through
 //! [`MultiServiceRouter::dispatch`] — the same path the production router serves.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_billingconductor_awsbillingconductor::EmulatedService;
+use service_com_amazonaws_billingconductor_awsbillingconductor::{
+    ComAmazonawsBillingconductorAwsbillingconductorState as BillingConductorState, EmulatedService,
+};
 use smithy_server_runtime::MultiServiceRouter;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -60,17 +67,6 @@ const PRICING_NAME: &str = r"[a-zA-Z0-9_\+=\.\-@]+";
 /// (`smithy_query(query="shape",shape="ClientToken")`).
 const CLIENT_TOKEN: &str = "[a-zA-Z0-9-]+";
 
-/// The tagging operations' `ResourceArn` `@pattern`, with only the OUTER anchors stripped
-/// (`smithy_query(query="operation",operation="ListTagsForResource")`): each alternative
-/// of this expression carries its own `^`/`$`, and only the expression's own leading `^`
-/// and trailing `$` are the anchoring the model adds to make the match total.
-const RESOURCE_ARN: &str = concat!(
-    r"arn:aws(-cn)?:billingconductor::[0-9]{12}:billinggroup/?[0-9]{12}$",
-    r"|^arn:aws(-cn)?:billingconductor::[0-9]{12}:pricingplan/[a-zA-Z0-9]{10}$",
-    r"|^arn:aws(-cn)?:billingconductor::[0-9]{12}:pricingrule/[a-zA-Z0-9]{10}$",
-    r"|^(arn:aws(-cn)?:billingconductor::[0-9]{12}:customlineitem/)?[a-zA-Z0-9]{10}",
-);
-
 /// A pricing-plan ARN the `PricingPlanArn` pattern admits, in its full-ARN form.
 const VALID_PLAN_ARN: &str = "arn:aws:billingconductor::123456789012:pricingplan/ABCDEFGHIJ";
 
@@ -90,8 +86,19 @@ struct Emulator {
 }
 
 impl Emulator {
+    /// A router over ONE shared engine, with the emulated account designated the
+    /// organization's PAYER account — see the note on `billing_group_core_loop`'s
+    /// harness for why a payer-gated service needs one designated, and
+    /// `tests/all/payer_account_gate.rs` for the denial every other caller gets. The
+    /// designation does not affect the refusals this suite is about: a modelled
+    /// constraint is refused at the boundary AHEAD of that gate. It is what makes the
+    /// rows that assert a CONFORMING request is served reachable.
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        engine
+            .state::<BillingConductorState>()
+            .lock()
+            .payer_account_id = Some(::engine::emulator_account_id().to_string());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(engine));
         Self { router }
@@ -372,19 +379,7 @@ async fn a_pricing_constraint_violation_is_refused_with_the_required_message() {
                  expression pattern: {BILLING_PERIOD}"
             ),
         },
-        // A member bound to the request URI rather than the body.
-        Case {
-            label: "ListTagsForResource with a non-conforming resource ARN label",
-            method: "GET",
-            uri: "/tags/short".to_string(),
-            body: None,
-            headers: Vec::new(),
-            message: format!(
-                "1 validation error detected: Value 'short' at 'resourceArn' failed to satisfy \
-                 constraint: Member must satisfy regular expression pattern: {RESOURCE_ARN}"
-            ),
-        },
-        // …and one bound to a request HEADER.
+        // A member bound to a request HEADER.
         Case {
             label: "CreatePricingPlan with a client token the pattern refuses",
             method: "POST",
