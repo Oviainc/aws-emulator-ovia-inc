@@ -678,6 +678,26 @@ impl Repository {
         self.last_modified_date = renamed;
     }
 
+    /// Point this repository at another KMS encryption key, answering the key it
+    /// was encrypted under before — the `originalKmsKeyId` a rotation reports,
+    /// absent for a repository that carried no key of its own.
+    ///
+    /// Only which key the repository DEPENDS on changes: its identity, its
+    /// metadata and its whole history carry over, and the last-modified instant
+    /// records the change. A request naming the key already in effect changes
+    /// nothing at all, so it leaves that instant where it is too.
+    pub fn rotate_encryption_key(
+        &mut self,
+        kms_key_id: &str,
+        rotated: SystemTime,
+    ) -> Option<String> {
+        let original = self.kms_key_id.replace(kms_key_id.to_string());
+        if original.as_deref() != Some(kms_key_id) {
+            self.last_modified_date = rotated;
+        }
+        original
+    }
+
     /// The commit a `commitSpecifier` names. `CommitName` documents the forms as
     /// "the branch, tag, HEAD, or other fully qualified reference used to identify
     /// a commit", so a branch name, the fully qualified reference of a branch
@@ -947,6 +967,82 @@ fn uuid_v8(seed: &str) -> String {
 /// prohibited too.
 pub fn has_prohibited_git_suffix(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".git")
+}
+
+/// The widths of the dash-separated groups in the id KMS mints for a
+/// single-region key: a UUID, written 8-4-4-4-12, as every KMS `KeyId` example
+/// is (`1234abcd-12ab-34cd-56ef-1234567890ab`).
+const KEY_ID_GROUP_WIDTHS: &[usize] = &[8, 4, 4, 4, 12];
+
+/// The number of hexadecimal digits after the `mrk-` prefix of the id KMS mints
+/// for a multi-region key.
+const MULTI_REGION_KEY_ID_DIGITS: usize = 32;
+
+/// Is this a KMS key id — hexadecimal digits grouped [`KEY_ID_GROUP_WIDTHS`] for
+/// a single-region key, or `mrk-` and [`MULTI_REGION_KEY_ID_DIGITS`] of them for
+/// a multi-region key?
+///
+/// This emulator resolves no KMS key, so only the FORM of the selector is
+/// judged — but that form is the id's two shapes exactly, the same way
+/// [`is_comment_id`] judges the UUID this service mints a comment id as.
+fn is_kms_key_id(candidate: &str) -> bool {
+    let hexadecimal = |group: &str| group.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if let Some(digits) = candidate.strip_prefix("mrk-") {
+        return digits.len() == MULTI_REGION_KEY_ID_DIGITS && hexadecimal(digits);
+    }
+    let groups: Vec<&str> = candidate.split('-').collect();
+    groups.len() == KEY_ID_GROUP_WIDTHS.len()
+        && KEY_ID_GROUP_WIDTHS
+            .iter()
+            .zip(&groups)
+            .all(|(width, group)| group.len() == *width && hexadecimal(group))
+}
+
+/// Is this a KMS alias path — `alias/` followed by a non-empty name of the
+/// characters `KmsKeyId`'s modelled pattern `^[a-zA-Z0-9:/_-]+$` allows?
+fn is_kms_alias(candidate: &str) -> bool {
+    candidate.strip_prefix("alias/").is_some_and(|name| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b":/_-".contains(&byte))
+    })
+}
+
+/// Is this the full ARN of a KMS key or alias
+/// (`arn:<partition>:kms:<region>:<account>:key/<key id>` or `…:alias/<name>`)?
+///
+/// Read with the same six-field `splitn` this module's
+/// [`repository_name_of_resource_arn`] uses, so one file has one way of reading an
+/// ARN; this adds only which vendor and resource the value has to name.
+fn is_kms_arn(candidate: &str) -> bool {
+    let [prefix, partition, vendor, region, account, resource] =
+        candidate.splitn(6, ':').collect::<Vec<_>>()[..]
+    else {
+        return false;
+    };
+    prefix == "arn"
+        && !partition.is_empty()
+        && vendor == "kms"
+        && !region.is_empty()
+        && account.len() == ACCOUNT_ID_DIGITS
+        && account.bytes().all(|byte| byte.is_ascii_digit())
+        && (is_kms_alias(resource) || resource.strip_prefix("key/").is_some_and(is_kms_key_id))
+}
+
+/// Does `key_id` select a KMS key at all?
+///
+/// `KmsKeyId`'s documentation sends a caller to KMS for the acceptable values —
+/// "For more information about acceptable values for keyID, see KeyId in the
+/// Decrypt API description in the Key Management Service API Reference"
+/// (`smithy_query(query="doc",shape="UpdateRepositoryEncryptionKeyInput",member="kmsKeyId")`)
+/// — and that description lists four forms: a key id, a key ARN, an alias name
+/// and an alias ARN. The modelled pattern `^[a-zA-Z0-9:/_-]+$` admits text that
+/// is none of them, so this is the rule a handler is left to apply; a value
+/// outside every form names no key, and the operation answers the modelled
+/// `EncryptionKeyInvalidIdException`.
+pub fn is_kms_key_selector(key_id: &str) -> bool {
+    is_kms_alias(key_id) || is_kms_key_id(key_id) || is_kms_arn(key_id)
 }
 
 /// The HTTPS clone URL CodeCommit publishes for a repository in a region.
