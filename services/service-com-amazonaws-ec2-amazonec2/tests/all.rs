@@ -70,6 +70,8 @@ mod local_gateway_route_table_virtual_interface_group_associations;
 mod mac_dedicated_hosts;
 #[path = "all/modify_subnet_attribute.rs"]
 mod modify_subnet_attribute;
+#[path = "all/network_performance_data.rs"]
+mod network_performance_data;
 #[path = "all/secondary_networks.rs"]
 mod secondary_networks;
 #[path = "all/secondary_subnets.rs"]

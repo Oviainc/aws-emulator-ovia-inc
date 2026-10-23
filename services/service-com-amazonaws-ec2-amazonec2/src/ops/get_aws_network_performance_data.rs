@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAwsNetworkPerformanceData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAwsNetworkPerformanceData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAwsNetworkPerformanceData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers one `DataResponse` per `DataQuery` the request carries, identifying the query
+//! it answers ("A user-defined ID associated with a data query that's returned in the
+//! `dataResponse` identifying the query" — `DataQuery$Id`) and carrying the metric points
+//! this emulator holds for the series that query names, one `MaxResults`-sized page of
+//! responses at a time.
+//!
+//! A REPORTING operation: it writes nothing, so two identical calls answer identically.
+//!
+//! A series is a pair of locations, a metric, a statistic and an aggregation period, and
+//! each of its metric points is a MEASUREMENT of the Amazon network between those two
+//! locations over one window of that period — "aggregate-latency" is the latency actually
+//! observed between them, reduced to its `p50`.
+//!
+//! This emulator is one process. There is no network between a source and a destination
+//! for it to observe, and no operation of this service records an observation of one, so no
+//! window of any series ever had a measurement taken in it and every series is reported
+//! with an EMPTY `MetricPoints`, which is also what the service itself answers for a window
+//! it holds no data for. A latency derived from the request's two locations — however
+//! physical the derivation — would be a measurement of work nothing performed, which a
+//! client could not tell from a real one; this operation reports no such value.
+//!
+//! What the request does determine is computed here: which series are reported, in which
+//! order, how they page, and which requests are refused.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +159,268 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAwsNetworkPerformanceData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAwsNetworkPerformanceDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAwsNetworkPerformanceData"))
+        // `ctx` carries request metadata only, and nothing this operation reports comes
+        // from it: a data query names the two locations it is about, so the answer does
+        // not depend on the Region the request happened to be signed for.
+        let _ = ctx;
+
+        // This operation reports the network between two locations and persists nothing,
+        // and a location is a fact of the Region it names rather than a resource of the
+        // account — nothing in the EC2 API creates, renames or withdraws a Region or an
+        // Availability Zone — so, exactly like `DescribeAvailabilityZones`, it never
+        // reaches the engine on `self`.
+        let _ = &self.engine;
+
+        // "The token for the next page of results"
+        // (`GetAwsNetworkPerformanceDataRequest$NextToken`) — anything else is refused
+        // rather than read as a cursor, and it is refused before any other member is
+        // looked at, so whether a bogus token is caught never depends on the rest of the
+        // request.
+        let start_at = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => crate::state::decode_page_token(token)
+                .and_then(|cursor| cursor.parse::<usize>().ok())
+                .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+        };
+
+        // "The starting time for the performance data request" / "The ending time for the
+        // performance data request": the data is asked for OVER a window, and a window is
+        // both of its ends, so a request naming one of them — or neither — is missing the
+        // other rather than asking about all of time.
+        let (Some(start), Some(end)) = (input.start_time.as_ref(), input.end_time.as_ref()) else {
+            let missing = if input.start_time.is_none() {
+                "StartTime"
+            } else {
+                "EndTime"
+            };
+            return Err(crate::state::missing_parameter(format!(
+                "The request must contain the parameter {missing}"
+            )));
+        };
+
+        // A window whose end does not follow its start is no window at all, so no
+        // aggregation period of it could be reported.
+        if start.as_secs_f64() >= end.as_secs_f64() {
+            return Err(crate::state::invalid_parameter_value(
+                "EndTime must be later than StartTime",
+            ));
+        }
+
+        // "The maximum number of results to return with a single call"
+        // (`GetAwsNetworkPerformanceDataRequest$MaxResults`). The model publishes no range
+        // for it, and a page holds at least one result, so a request asking for fewer asks
+        // for no page at all. Above [`MAX_RESPONSES_PER_PAGE`] it is taken as that ceiling
+        // rather than refused with a maximum the API does not publish — the rest of the
+        // queries are reported through `NextToken` — which is also what a request naming no
+        // `MaxResults` gets.
+        let limit = match input.max_results {
+            None => MAX_RESPONSES_PER_PAGE,
+            Some(max_results) => usize::try_from(max_results)
+                .ok()
+                .filter(|max_results| *max_results >= MIN_PAGE_SIZE)
+                .ok_or_else(|| {
+                    crate::state::invalid_parameter_value(format!(
+                        "Value ({max_results}) for parameter MaxResults is invalid. \
+                         A page holds at least {MIN_PAGE_SIZE} result"
+                    ))
+                })?
+                .min(MAX_RESPONSES_PER_PAGE),
+        };
+
+        // "A list of network performance data queries"
+        // (`GetAwsNetworkPerformanceDataRequest$DataQueries`). A call carrying no query
+        // asks for no series, so it is missing the one member the answer is built from;
+        // and every query is checked before any is answered, so a request carrying one
+        // unanswerable query is refused whichever page of it was asked for.
+        let queries: &[DataQuery] = input.data_queries.as_deref().unwrap_or_default();
+        if queries.is_empty() {
+            return Err(crate::state::missing_parameter(
+                "The request must contain the parameter DataQueries",
+            ));
+        }
+        for query in queries {
+            validate_query(query)?;
+        }
+
+        // The queries are answered in the order the request gave them, which is both the
+        // stable paging order and the cursor: a token names the position of the first query
+        // the next page answers, so a walk always advances. A token is only ever minted for
+        // a position a query stands at, so a cursor past the end of this call's list is a
+        // token this call cannot resume from rather than a silently empty last page.
+        if start_at >= queries.len() {
+            return Err(crate::state::invalid_pagination_token_for(
+                input.next_token.as_deref().unwrap_or_default(),
+            ));
+        }
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`GetAwsNetworkPerformanceDataRequest$DryRun`). Every caller of this emulator is
+        // permitted, so a dry run reports that outcome and reads nothing — but only for a
+        // request that would otherwise have been answered: the probe is the LAST check, the
+        // way `GetSpotPlacementScores` orders it, so a dry run of a request that names no
+        // series earns the refusal that request has coming instead of reporting that it
+        // would have succeeded.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+        let page: Vec<DataResponse> = queries
+            .get(start_at..)
+            .unwrap_or_default()
+            .iter()
+            .take(limit)
+            .map(data_response)
+            .collect();
+
+        // "The token to use to retrieve the next page of results. This value is null when
+        // there are no more results to return"
+        // (`GetAwsNetworkPerformanceDataResult$NextToken`): a token only when a query of
+        // this request is still unanswered.
+        let answered = start_at.saturating_add(page.len());
+        let next_token = (answered < queries.len())
+            .then(|| crate::state::encode_page_token(&answered.to_string()));
+
+        Ok(GetAwsNetworkPerformanceDataOutput {
+            data_responses: Some(page),
+            next_token,
+        })
     }
+}
+
+/// The smallest page a `MaxResults` can ask for: a page that holds no result is not a
+/// page of results.
+const MIN_PAGE_SIZE: usize = 1;
+
+/// How many data responses one page holds.
+///
+/// CHOSEN: nothing in the API documents a limit on `DataQueries` or a range for
+/// `MaxResults`, and every query is answered with a data response, so without a ceiling one
+/// request could ask for a response bounded only by the request's own size. It bounds the
+/// PAGE, not the request: a call carrying more queries than this is answered with this many
+/// and a `NextToken` for the rest, so the ceiling cannot turn a request the real service
+/// would answer into a refusal. It is far above the handful of series a caller plots
+/// together.
+const MAX_RESPONSES_PER_PAGE: usize = 20;
+
+/// The `DataResponse` that answers one query.
+///
+/// Every member of the query is reported back on it — `DataResponse` carries exactly the
+/// members of `DataQuery` plus `MetricPoints`, and `DataQuery$Id` is documented as being
+/// "returned in the `dataResponse` identifying the query" — so a caller that sent several
+/// queries can tell which series each response is.
+fn data_response(query: &DataQuery) -> DataResponse {
+    DataResponse {
+        id: query.id.clone(),
+        source: query.source.clone(),
+        destination: query.destination.clone(),
+        metric: query.metric.clone(),
+        statistic: query.statistic.clone(),
+        period: query.period.clone(),
+        // The metric points this emulator holds for the series: NONE, for every series,
+        // every period and every window.
+        //
+        // A metric point is a MEASUREMENT — "aggregate-latency" is the latency actually
+        // observed on the Amazon network between the two locations over one window of the
+        // period, reduced to its `p50`. This emulator is one process: there is no network
+        // between a source and a destination for it to observe, and no operation of this
+        // service records an observation of one, so no window of any series ever had a
+        // measurement taken in it.
+        //
+        // An empty `MetricPoints` says exactly that, and is what the service itself
+        // answers for a window it holds no data for. A latency derived from the request's
+        // two locations — even one derived from where those Regions are and the speed of
+        // light in a fibre — would be a measurement of work nothing performed, which a
+        // client could not tell from a real one; and a point carrying dates but no `Value`
+        // would need a `Status` word for "nothing was measured" that neither the model nor
+        // the documentation gives (`MetricPoint$Status` is only "The status of the metric
+        // point"). The `Statistic` and `Period` the query named select OVER the points, so
+        // with no points there is nothing for them to aggregate.
+        metric_points: Some(Vec::new()),
+    }
+}
+
+/// Refuse a query this service cannot answer.
+///
+/// "A query used for retrieving network health data" (`DataQuery`) names ONE series: the
+/// source and destination it is between (`DataQuery$Source`: "The Region or Availability
+/// Zone that's the source for the data query"), the `Metric` measured, the `Statistic`
+/// that metric is reduced by, and the `Period` it is aggregated over. A query that leaves
+/// one of those out names no series, and one whose source or destination is not a location
+/// of this service names a series that cannot exist — neither is answered as if the series
+/// were simply empty.
+///
+/// `Metric`, `Statistic` and `Period` target the modelled `MetricType`, `StatisticType` and
+/// `PeriodType` enums, so a value outside one of them was already refused by the
+/// centralized request walk before this ran; what is left for here is the one thing the
+/// model cannot express, that a series needs all five of its members.
+fn validate_query(query: &DataQuery) -> Result<(), GetAwsNetworkPerformanceDataError> {
+    for (parameter, location) in [
+        ("Source", required(query.source.as_deref(), "Source")?),
+        (
+            "Destination",
+            required(query.destination.as_deref(), "Destination")?,
+        ),
+    ] {
+        if !is_location(location) {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "Value ({location}) for parameter {parameter} is invalid. \
+                 It must be a Region, an Availability Zone or an Availability Zone ID"
+            )));
+        }
+    }
+
+    required(query.metric.as_deref(), "Metric")?;
+    required(query.statistic.as_deref(), "Statistic")?;
+    required(query.period.as_deref(), "Period")?;
+    Ok(())
+}
+
+/// The value of a member a query must carry, or EC2's HTTP 400 `MissingParameter`. An
+/// empty value names nothing, so it is as absent as no value at all.
+fn required<'a>(
+    value: Option<&'a str>,
+    parameter: &str,
+) -> Result<&'a str, GetAwsNetworkPerformanceDataError> {
+    value.filter(|value| !value.is_empty()).ok_or_else(|| {
+        crate::state::missing_parameter(format!(
+            "The request must contain the parameter {parameter}"
+        ))
+    })
+}
+
+/// Is `value` a location a series can be between — "the Region or Availability Zone"
+/// (`DataQuery$Source`, whose example is `us-east-1`)?
+fn is_location(value: &str) -> bool {
+    region_of_location(value).is_some()
+}
+
+/// The Region a location names: the Region itself, or the Region whose Availability Zone
+/// it names under either of the two names EC2 gives a zone — its zone name (`us-east-1a`)
+/// or its zone ID (`use1-az1`). `None` for anything that is none of the three.
+///
+/// A location is held to the Region CATALOG, not to the Region grammar alone: a data query
+/// NAMES the locations it is about, the way `GetSpotPlacementScores`'s `RegionNames` does,
+/// so the Region it names has to exist — and the catalog is the one
+/// `crate::state::region_name_is_well_formed` names as the source of truth for exactly that
+/// case (`emulator_telemetry::policy::KNOWN_REGIONS`, "every AWS region the wire may
+/// carry", sorted, which `crate::state::commercial_regions` filters by partition for the
+/// subset that operation scores over). Every partition's Regions count here: this emulator
+/// answers for whatever Region a request is signed for
+/// (`crate::state::request_region`), so a GovCloud or China location is a location.
+///
+/// Both zone forms are resolved through [`crate::state::availability_zones_in_region`], the
+/// one place a Region's zone names and zone ids are derived, so neither form re-derives
+/// the shape of a zone id and neither can drift from what `DescribeAvailabilityZones`
+/// reports.
+fn region_of_location(location: &str) -> Option<&'static str> {
+    let catalog = ::emulator_telemetry::policy::KNOWN_REGIONS;
+    if let Ok(position) = catalog.binary_search(&location) {
+        return Some(catalog[position]);
+    }
+    catalog.iter().copied().find(|region| {
+        crate::state::availability_zones_in_region(region)
+            .iter()
+            .any(|zone| zone.zone_name == location || zone.zone_id == location)
+    })
 }
