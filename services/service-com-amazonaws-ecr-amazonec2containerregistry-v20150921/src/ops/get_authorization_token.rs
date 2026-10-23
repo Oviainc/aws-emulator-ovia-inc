@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAuthorizationToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAuthorizationToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAuthorizationToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does here
+//!
+//! It MINTS a `docker login` credential for the private registry this emulator serves.
+//! The model documents the operation as "Retrieves an authorization token. An
+//! authorization token represents your IAM authentication credentials", so the call
+//! itself is what produces the credential; there is no stored token for it to report.
+//! The token is the base64 of `user:password`
+//! (`AuthorizationData$authorizationToken`: "When the string is decoded, it is presented
+//! in the format `user:password` for private registry authentication using `docker
+//! login`"), it expires [`AUTHORIZATION_TOKEN_LIFETIME`] after this call, and it is
+//! reported beside the registry URL a `docker login` points at
+//! ([`crate::state::registry_proxy_endpoint`], built for the Region the request was
+//! signed for).
+//!
+//! `registryIds` selects nothing. The model marks the member `@deprecated` with the
+//! reason spelled out — "This field is deprecated. The returned authorization token can
+//! be used to access any Amazon ECR registry that the IAM principal has access to,
+//! specifying a registry ID doesn't change the permissions scope of the authorization
+//! token." — so a value for it makes no difference to what is issued, and a request
+//! carrying one is therefore neither refused nor answered differently: every call
+//! reports exactly one `authorizationData`, for the one registry this emulator serves.
+//! The member's modelled `@length(1..10)` and the 12-digit shape of its entries are
+//! still refused centrally, before this handler runs.
+//!
+//! Nothing is written to the store: a token is a secret handed to the caller, no
+//! operation of this service accepts one back, so there is nothing about an issued token
+//! that a later call could read. The password is therefore minted by the emulator's
+//! credential store (never constructed here) and removed from it again: the caller gets a
+//! secret, and the emulator keeps no credential it would accept as SigV4.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +170,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAuthorizationToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAuthorizationTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAuthorizationToken"))
+        // `registryIds` is `@deprecated` and selects nothing; see the module docs.
+        let _ = &input.registry_ids;
+
+        // The token authorizes `docker login` against the registry this store holds, so
+        // an unreachable store means there is no registry to authorize access to. The
+        // router builds the one engine that carries the store, so this is unreachable
+        // there. Nothing is read out of the store and nothing is written to it: see the
+        // module docs for why an issued token leaves no record behind.
+        if crate::state::service_state(&*self.engine).is_none() {
+            return Err(server_error());
+        }
+
+        let Some(password) = mint_registry_password(ctx.credential_store()) else {
+            // The credential store minted no secret, and this operation will not invent
+            // one: a token nothing generated is not a credential.
+            return Err(server_error());
+        };
+        // The codec is `aws_smithy_types::base64`, the standard-alphabet encoder the
+        // wire serializer already uses for every Smithy blob, so the token carries the
+        // same alphabet a client's base64 decoder expects.
+        let token =
+            ::aws_smithy_types::base64::encode(format!("{AUTHORIZATION_TOKEN_USER}:{password}"));
+        let expires_at = ::std::time::SystemTime::now() + AUTHORIZATION_TOKEN_LIFETIME;
+        // The registry is regional, so the endpoint a `docker login` is pointed at is the
+        // one in the Region this request was signed for.
+        let proxy_endpoint =
+            crate::state::registry_proxy_endpoint(&crate::state::request_region(ctx.parts()));
+
+        // Issuing a registry credential is the security-relevant event of this
+        // operation, so it is attributable in the emulator's log: which operation, the
+        // access key id the request presented, the endpoint and expiry of what was
+        // issued, and the outcome. Neither the token nor the password is logged — only
+        // the caller gets those.
+        ::tracing::info!(
+            operation = Self::NAME,
+            presented_access_key_id = %::engine::extract_akid(&ctx.parts().headers),
+            proxy_endpoint = %proxy_endpoint,
+            expires_at_unix_seconds = expires_at
+                .duration_since(::std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            outcome = "issued",
+            "issued a private registry authorization token"
+        );
+
+        Ok(GetAuthorizationTokenOutput {
+            // One object, for the one registry this emulator serves: `registryIds` is
+            // deprecated and selects nothing, so there is no other registry an entry
+            // could describe.
+            authorization_data: Some(vec![AuthorizationData {
+                authorization_token: Some(token),
+                expires_at: Some(::aws_smithy_types::DateTime::from(expires_at)),
+                proxy_endpoint: Some(proxy_endpoint),
+            }]),
+        })
     }
+}
+
+/// The user half of the `user:password` pair an ECR authorization token decodes to.
+///
+/// `AuthorizationData$authorizationToken` documents the decoded form as `user:password`
+/// "for private registry authentication using `docker login`", and ECR publishes that
+/// user as the literal `AWS`: the documented login is
+/// `docker login --username AWS --password <token> <proxyEndpoint>`.
+pub const AUTHORIZATION_TOKEN_USER: &str = "AWS";
+
+/// How long an authorization token this registry issues stays valid.
+///
+/// `AuthorizationData$expiresAt` states the duration itself — "The Unix time in seconds
+/// and milliseconds when the authorization token expires. Authorization tokens are valid
+/// for 12 hours." — so this is a duration the service documents, not a chosen one.
+pub const AUTHORIZATION_TOKEN_LIFETIME: ::std::time::Duration =
+    ::std::time::Duration::from_secs(12 * 60 * 60);
+
+/// A fresh registry password for this token's `user:password` pair.
+///
+/// It is minted by the emulator's credential store, the one component that generates
+/// secrets, and then removed from that store again: the password authenticates
+/// `docker login` to a container registry, NOT a SigV4 request to this emulator, so the
+/// emulator must not go on accepting it as one, and nothing accumulates per call.
+///
+/// `None` when the store minted no session-token secret, or when the minted credential
+/// could not be removed from the store again — a password the emulator would still
+/// accept as SigV4 is not the credential this operation promises, so it is refused
+/// rather than handed out, and the failed removal is logged.
+fn mint_registry_password(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let password = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .map(str::to_string);
+    // The password is not a credential of this emulator; see above.
+    if let Err(error) = store.delete(&minted.id) {
+        ::tracing::warn!(
+            operation = "GetAuthorizationToken",
+            access_key_id = %minted.id,
+            error = ?error,
+            "a credential minted for an authorization token could not be deleted"
+        );
+        return None;
+    }
+    password
+}
+
+/// The modelled server fault for a token this emulator could not produce.
+fn server_error() -> GetAuthorizationTokenError {
+    GetAuthorizationTokenErrorModeled::ServerException(ServerException {
+        message: Some("The ECR emulator could not issue an authorization token.".to_string()),
+    })
+    .into()
 }
