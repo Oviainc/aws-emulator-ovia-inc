@@ -111,6 +111,45 @@ pub struct Identity {
     pub last_modified_date: SystemTime,
 }
 
+/// The most OpenID Connect tokens this emulator holds outstanding at once. Not an AWS
+/// quota: THIS emulator's own ceiling on a store that grows by one record per successful
+/// `GetOpenIdTokenForDeveloperIdentity` call — including the calls that resolve an
+/// identity the pool already has — and whose records live as long as the window the
+/// caller asked for, up to the modelled `TokenDuration` maximum of 24 hours. Expiry alone
+/// would bound only how long a record lives, not how many exist, so the count is capped
+/// too: see
+/// [`ComAmazonawsCognitoidentityAwscognitoidentityserviceState::record_open_id_token`],
+/// which forgets the oldest issuances to stay inside it.
+pub const MAX_OUTSTANDING_OPEN_ID_TOKENS: usize = 10_000;
+
+/// The issuer every OpenID Connect token this service mints names in its `iss` claim.
+/// Amazon Cognito Identity's OIDC tokens are issued by
+/// `https://cognito-identity.amazonaws.com`, which is also the principal an IAM role's
+/// trust policy names to let an identity pool's users assume it
+/// (`AssumeRoleWithWebIdentity$RoleArn`: "The trust policies of these roles must accept
+/// the cognito-identity.amazonaws.com service principal").
+pub const OIDC_TOKEN_ISSUER: &str = "https://cognito-identity.amazonaws.com";
+
+/// The Cognito Identity service principal, which an issued token names among the
+/// authentication methods (`amr`) that produced it, beside the providers that
+/// authenticated the user.
+pub const COGNITO_IDENTITY_PRINCIPAL: &str = "cognito-identity.amazonaws.com";
+
+/// An OpenID Connect token this service issued, keyed by the token itself in
+/// [`ComAmazonawsCognitoidentityAwscognitoidentityserviceState::open_id_tokens`]: the
+/// identity it names, the pool that issued it, the window it is valid in and the
+/// principal tags the issuing call asked for.
+#[derive(Debug, Clone)]
+pub struct IssuedOpenIdToken {
+    pub identity_id: String,
+    pub identity_pool_id: String,
+    pub issued_at: SystemTime,
+    pub expiration: SystemTime,
+    /// The `PrincipalTags` the issuing call carried, ordered so a read reports the same
+    /// map twice. `None` when the caller sent none, so nothing invents an empty map.
+    pub principal_tags: Option<BTreeMap<String, String>>,
+}
+
 /// The credentials `GetCredentialsForIdentity` issued for one identity. The id and the
 /// secrets are the emulator's own credential store's: a handler never constructs them.
 #[derive(Debug, Clone)]
@@ -143,6 +182,11 @@ pub struct ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     pub login_index: HashMap<(String, String, String), String>,
     /// The credentials outstanding for an identity, by `IdentityId`.
     pub credentials: HashMap<String, IssuedCredentials>,
+    /// The OpenID Connect tokens outstanding, by the token itself, as
+    /// `GetOpenIdTokenForDeveloperIdentity` minted them. A token is a bearer of the
+    /// identity it names, so the record is what tells this service which identity and
+    /// pool a token presented later belongs to, and whether its window is still open.
+    pub open_id_tokens: HashMap<String, IssuedOpenIdToken>,
 }
 
 impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
@@ -250,6 +294,58 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         revoked
     }
 
+    /// Forget every OpenID Connect token whose validity window has closed. The clock made
+    /// these due: an expired token names nothing, so the sweep runs whenever a token is
+    /// issued and no expired token is held for the life of the process.
+    pub fn purge_expired_open_id_tokens(&mut self, now: SystemTime) {
+        self.open_id_tokens
+            .retain(|_, issued| issued.expiration > now);
+    }
+
+    /// Record an issued OpenID Connect token, keeping the store within
+    /// [`MAX_OUTSTANDING_OPEN_ID_TOKENS`]: what the clock has already expired is swept
+    /// first, and if the ceiling is still reached the OLDEST issuances are forgotten to
+    /// make room. Eviction rather than refusal, because every call mints a token and a
+    /// caller must not be locked out of its own next token by its own history; a token
+    /// this emulator has forgotten is simply one it can no longer resolve.
+    pub fn record_open_id_token(
+        &mut self,
+        token: String,
+        issued: IssuedOpenIdToken,
+        now: SystemTime,
+    ) {
+        self.purge_expired_open_id_tokens(now);
+        while self.open_id_tokens.len() >= MAX_OUTSTANDING_OPEN_ID_TOKENS {
+            // Oldest first, with the token itself breaking a tie, so the eviction order is
+            // the same whatever order the map iterates in.
+            let oldest = self
+                .open_id_tokens
+                .iter()
+                .min_by(|(left, left_issued), (right, right_issued)| {
+                    left_issued
+                        .issued_at
+                        .cmp(&right_issued.issued_at)
+                        .then_with(|| left.cmp(right))
+                })
+                .map(|(token, _)| token.clone());
+            let Some(oldest) = oldest else { break };
+            self.open_id_tokens.remove(&oldest);
+        }
+        self.open_id_tokens.insert(token, issued);
+    }
+
+    /// The record of a token this service issued, while its window is still open. `None`
+    /// for a token this service did not issue, and for one whose window has closed.
+    pub fn open_id_token_record(
+        &self,
+        token: &str,
+        now: SystemTime,
+    ) -> Option<&IssuedOpenIdToken> {
+        self.open_id_tokens
+            .get(token)
+            .filter(|issued| issued.expiration > now)
+    }
+
     /// Mint an `IdentityPoolId` in `region` that no stored pool already uses.
     pub fn new_identity_pool_id(&self, region: &str) -> String {
         std::iter::repeat_with(|| cognito_id(region))
@@ -265,8 +361,9 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     }
 
     /// Remove a pool with everything that belongs to it — its identities, their login
-    /// index entries and their outstanding credentials — and report the access key ids
-    /// whose credentials the caller must now forget. `None` when no such pool is stored.
+    /// index entries, their outstanding credentials and the OIDC tokens it issued — and
+    /// report the access key ids whose credentials the caller must now forget. `None` when
+    /// no such pool is stored.
     pub fn delete_identity_pool(&mut self, identity_pool_id: &str) -> Option<Vec<String>> {
         self.identity_pools.remove(identity_pool_id)?;
         self.identity_pool_roles.remove(identity_pool_id);
@@ -283,6 +380,10 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         }
         self.login_index
             .retain(|(pool, _, _), _| pool != identity_pool_id);
+        // A token names an identity of this pool, and neither the pool nor the identity
+        // exists any more, so the token names nothing.
+        self.open_id_tokens
+            .retain(|_, issued| issued.identity_pool_id != identity_pool_id);
         Some(revoked)
     }
 }
@@ -414,6 +515,84 @@ pub fn decode_pagination_token(identity_pool_id: &str, token: &str) -> Option<St
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
     let (minted_for, cursor) = decoded.split_once('#')?;
     (minted_for == identity_pool_id).then(|| cursor.to_string())
+}
+
+/// The OpenID Connect token for `identity_id` in `identity_pool_id`, valid from
+/// `issued_at` until `expiration` and authenticated by `authenticated_by` (the provider
+/// names the issuing call presented).
+///
+/// The claims are the OIDC registered ones (RFC 7519 §4.1) an Amazon Cognito Identity
+/// token carries: the service's own `iss`, the identity pool as the audience, the
+/// identity as the subject, the validity window, the `amr` authentication-methods
+/// reference — `authenticated`, the Cognito service principal and each provider that
+/// authenticated the user — and a `jti` that makes every issued token distinct, so two
+/// calls in the same second never produce one token.
+pub fn open_id_token(
+    identity_pool_id: &str,
+    identity_id: &str,
+    authenticated_by: &[String],
+    issued_at: SystemTime,
+    expiration: SystemTime,
+) -> String {
+    let mut amr: Vec<::serde_json::Value> = vec![
+        ::serde_json::Value::from("authenticated"),
+        ::serde_json::Value::from(COGNITO_IDENTITY_PRINCIPAL),
+    ];
+    amr.extend(
+        authenticated_by
+            .iter()
+            .map(|provider| ::serde_json::Value::from(provider.as_str())),
+    );
+    let claims = ::serde_json::json!({
+        "iss": OIDC_TOKEN_ISSUER,
+        "aud": identity_pool_id,
+        "sub": identity_id,
+        "amr": amr,
+        "iat": unix_seconds(issued_at),
+        "exp": unix_seconds(expiration),
+        "jti": guid(),
+    });
+    unsecured_jws(&claims)
+}
+
+/// `claims` as an UNSECURED JWS in compact serialization (RFC 7515 §6, "Using the
+/// Algorithm none"): `base64url(header) '.' base64url(claims) '.'`, with an empty
+/// signature segment.
+///
+/// Amazon Cognito Identity signs its OIDC tokens with a key pair whose public half it
+/// publishes. This emulator holds no such key pair, so it issues the form RFC 7515
+/// defines for a JWS that carries no signature rather than filling the third segment with
+/// bytes that would only look like one. The token is still this emulator's own: its claims
+/// come from stored state and every token issued is recorded in
+/// [`ComAmazonawsCognitoidentityAwscognitoidentityserviceState::open_id_tokens`], so the
+/// service can say which identity a token it handed out names.
+fn unsecured_jws(claims: &::serde_json::Value) -> String {
+    let header = ::serde_json::json!({ "alg": "none", "typ": "JWT" });
+    format!(
+        "{}.{}.",
+        base64_url(header.to_string().as_bytes()),
+        base64_url(claims.to_string().as_bytes())
+    )
+}
+
+/// `bytes` in base64url without padding, as a JWS segment is encoded (RFC 7515 §2): the
+/// standard-alphabet codec this workspace already uses for every Smithy blob
+/// (`aws_smithy_types::base64`), with `+` and `/` replaced by `-` and `_` and the padding
+/// removed.
+pub fn base64_url(bytes: &[u8]) -> String {
+    ::aws_smithy_types::base64::encode(bytes)
+        .replace('+', "-")
+        .replace('/', "_")
+        .trim_end_matches('=')
+        .to_string()
+}
+
+/// `time` as whole seconds since the epoch, which is how a token claim carries an instant
+/// (RFC 7519 §2's NumericDate).
+fn unix_seconds(time: SystemTime) -> i64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since_epoch| i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
