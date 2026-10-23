@@ -80,6 +80,13 @@ const ORGANIZATION_IDENTITY_STORE_ID: &str = "d-1a2b3c4d5e";
 /// seeds the account instance — through the SAME `state::Instance` constructor the
 /// handlers use — and the calls below all go over the wire.
 pub(crate) fn organization_router() -> (MultiServiceRouter, String) {
+    let (engine, instance_arn) = organization_engine();
+    (router_over(engine), instance_arn)
+}
+
+/// The ENGINE behind [`organization_router`], for a test that has to read or write the
+/// store directly (to move a stored due instant, say) as well as call over the wire.
+pub(crate) fn organization_engine() -> (Arc<engine::InMemoryEngine>, String) {
     use service_com_amazonaws_ssoadmin_swbexternalservice::state;
 
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -100,7 +107,7 @@ pub(crate) fn organization_router() -> (MultiServiceRouter, String) {
         store.instances.insert(instance_arn.clone(), instance);
         instance_arn
     };
-    (router_over(engine), instance_arn)
+    (engine, instance_arn)
 }
 
 /// Call one operation and return `(http status, parsed body)`.

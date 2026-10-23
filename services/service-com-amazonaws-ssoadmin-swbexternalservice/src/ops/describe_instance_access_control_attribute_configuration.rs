@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceAccessControlAttributeConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceAccessControlAttributeConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceAccessControlAttributeConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A READ of the instance's ABAC configuration: it reports the attribute mapping
+//! `CreateInstanceAccessControlAttributeConfiguration` stored (and
+//! `UpdateInstanceAccessControlAttributeConfiguration` replaced) together with the status
+//! derived from the instant its enabling falls due. ABAC is a feature of the ORGANIZATION
+//! instance, so on an ACCOUNT instance the whole surface is refused with the modelled
+//! `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +157,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceAccessControlAttributeConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceAccessControlAttributeConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceAccessControlAttributeConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeInstanceAccessControlAttributeConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+        // A READ, except for what the CLOCK already owes the instances themselves
+        // (`materialize_due`); the ABAC status is DERIVED from the stored due instant, so
+        // this read writes nothing of its own.
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: on an
+        // account instance no ABAC configuration can ever exist, so the answer is this
+        // refusal rather than a 404 that would tell a client to create one and retry.
+        if store.abac_surface_withdrawn(&input.instance_arn) {
+            return Err(
+                DescribeInstanceAccessControlAttributeConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                        ),
+                        // The model's `ValidationExceptionReason` enum carries only KMS
+                        // key states, none of which this refusal is.
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let configuration = store
+            .instance(&input.instance_arn)
+            .ok_or_else(|| {
+                DescribeInstanceAccessControlAttributeConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No instance found with the ARN {}",
+                            input.instance_arn
+                        )),
+                        reason: None,
+                    },
+                )
+            })?
+            .access_control_attributes
+            .clone()
+            // An instance nobody has enabled ABAC on holds no configuration, and the
+            // model gives this operation no "disabled" status to report: the resource the
+            // request names does not exist.
+            .ok_or_else(|| {
+                DescribeInstanceAccessControlAttributeConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No access control attribute configuration exists for the instance {}",
+                            input.instance_arn
+                        )),
+                        reason: None,
+                    },
+                )
+            })?;
+
+        Ok(DescribeInstanceAccessControlAttributeConfigurationOutput {
+            status: Some(configuration.status(now).to_string()),
+            // "Provides more details about the current status of the specified
+            // attribute": there is none to give — a CREATION_IN_PROGRESS configuration is
+            // on its way to ENABLED, which the status already says, and nothing here
+            // fails an enabling.
+            status_reason: None,
+            instance_access_control_attribute_configuration: Some(configuration.to_shape()),
+        })
     }
 }

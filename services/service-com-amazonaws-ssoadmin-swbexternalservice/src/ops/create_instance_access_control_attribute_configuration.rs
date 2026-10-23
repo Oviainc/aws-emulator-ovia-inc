@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInstanceAccessControlAttributeConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInstanceAccessControlAttributeConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInstanceAccessControlAttributeConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enables ABAC on an instance: it stores the caller's attribute mapping on the instance
+//! and starts the enabling the model's `CREATION_IN_PROGRESS` status reports, so
+//! `DescribeInstanceAccessControlAttributeConfiguration` answers from the stored mapping.
+//! ABAC is a feature of the ORGANIZATION instance of IAM Identity Center, so on an
+//! ACCOUNT instance the whole surface is refused with the modelled `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +160,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInstanceAccessControlAttributeConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInstanceAccessControlAttributeConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInstanceAccessControlAttributeConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateInstanceAccessControlAttributeConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // What the CLOCK already owes every instance, so this create resolves the same
+        // instance a read at this instant would resolve.
+        store.materialize_due(now);
+
+        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: ABAC is a
+        // feature of the organization instance, so on an account instance no attribute
+        // configuration can ever exist, whatever the rest of the request says. An ARN
+        // this account holds no instance for is NOT this refusal — it falls through to
+        // the 404 below.
+        if store.abac_surface_withdrawn(&input.instance_arn) {
+            return Err(
+                CreateInstanceAccessControlAttributeConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                        ),
+                        // The model's `ValidationExceptionReason` enum carries only KMS
+                        // key states, none of which this refusal is.
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The request's own consistency, checked where the modeled constraints leave off
+        // and before any resource is resolved: a mapping cannot give one key two values.
+        let attributes = input
+            .instance_access_control_attribute_configuration
+            .access_control_attributes;
+        if let Some(duplicate) = crate::state::duplicate_attribute_key(&attributes) {
+            return Err(
+                CreateInstanceAccessControlAttributeConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::duplicate_attribute_key_message(duplicate)),
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The instance ABAC is enabled on must exist: a syntactically valid ARN for an
+        // instance that does not is a missing resource, not a bad request.
+        let Some(instance) = store.instance_mut(&input.instance_arn) else {
+            return Err(
+                CreateInstanceAccessControlAttributeConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No instance found with the ARN {}",
+                            input.instance_arn
+                        )),
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A CREATE of a resource that already exists: the instance carries at most one
+        // ABAC configuration, so enabling ABAC on an instance that already has one is the
+        // conflict with a previous successful write rather than a silent overwrite of the
+        // mapping that write stored — `UpdateInstanceAccessControlAttributeConfiguration`
+        // is the operation that replaces it.
+        if instance.access_control_attributes.is_some() {
+            return Err(
+                CreateInstanceAccessControlAttributeConfigurationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "An access control attribute configuration already exists for the \
+                             instance {}",
+                            input.instance_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Stored as the caller sent it, with the instant its enabling falls due; the
+        // status every later describe reports is derived from that instant, so nothing
+        // sleeps and no read has to write.
+        instance.access_control_attributes = Some(
+            crate::state::AccessControlAttributeConfigurationRecord::new(attributes, now),
+        );
+        // The response carries no members: the model's
+        // `CreateInstanceAccessControlAttributeConfigurationResponse` is empty, and the
+        // configuration is read back through
+        // `DescribeInstanceAccessControlAttributeConfiguration`.
+        Ok(CreateInstanceAccessControlAttributeConfigurationOutput {})
     }
 }

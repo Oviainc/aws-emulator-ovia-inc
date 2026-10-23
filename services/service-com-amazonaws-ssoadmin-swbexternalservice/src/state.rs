@@ -20,9 +20,10 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AccountAssignment, AccountAssignmentOperationStatus, ApplicationProvider, DisplayData,
-    EncryptionConfigurationDetails, InstanceMetadata, PermissionSet, RegionMetadata, Tag,
-    TrustedTokenIssuerConfiguration,
+    AccessControlAttribute, AccountAssignment, AccountAssignmentOperationStatus,
+    ApplicationProvider, DisplayData, EncryptionConfigurationDetails,
+    InstanceAccessControlAttributeConfiguration, InstanceMetadata, PermissionSet, RegionMetadata,
+    Tag, TrustedTokenIssuerConfiguration,
 };
 
 /// The identity-store instance every `InstanceArn`-taking operation resolves against.
@@ -162,6 +163,29 @@ pub const KMS_KEY_STATUS_ENABLED: &str = "ENABLED";
 /// sees `UPDATING`, and short enough that a test can wait it out.
 pub const ENCRYPTION_UPDATE_DELAY: Duration = Duration::from_millis(500);
 
+/// `InstanceAccessControlAttributeConfigurationStatus::ENABLED` — the terminal status of
+/// an ABAC configuration whose enabling has finished.
+pub const ABAC_STATUS_ENABLED: &str = "ENABLED";
+
+/// `InstanceAccessControlAttributeConfigurationStatus::CREATION_IN_PROGRESS` — the status
+/// an ABAC configuration carries between the create that enabled it and the instant the
+/// clock makes its enablement due (see [`ABAC_ENABLE_SPAN`]).
+pub const ABAC_STATUS_CREATION_IN_PROGRESS: &str = "CREATION_IN_PROGRESS";
+
+/// How long after `CreateInstanceAccessControlAttributeConfiguration` the configuration
+/// reports `ENABLED` rather than `CREATION_IN_PROGRESS`.
+///
+/// Enabling ABAC is asynchronous — the model carries the non-terminal
+/// `CREATION_IN_PROGRESS` status and the operation's own documentation says "After a
+/// successful response, call DescribeInstanceAccessControlAttributeConfiguration to
+/// validate that InstanceAccessControlAttributeConfiguration was created", so the caller
+/// can observe the enabling in flight — and AWS publishes no duration for it, so this
+/// span is the emulator's OWN choice: non-zero, so a caller that describes straight after
+/// the create still sees the transient status, and short enough that a test can wait it
+/// out. It is held as the instant the change falls due and the status is DERIVED from it
+/// (see [`AccessControlAttributeConfigurationRecord::status`]); nothing sleeps for it.
+pub const ABAC_ENABLE_SPAN: Duration = Duration::from_millis(500);
+
 /// `StatusValues::SUCCEEDED` — the terminal status of an assignment operation this
 /// emulator has already applied in full.
 pub const STATUS_SUCCEEDED: &str = "SUCCEEDED";
@@ -192,6 +216,83 @@ pub fn quota_exceeded_message(store: &str) -> String {
     format!(
         "The principal has crossed the permitted number of resources that can be \
          created: this emulator holds at most {MAX_RECORDS_PER_STORE} {store}"
+    )
+}
+
+/// The attribute-based access control (ABAC) configuration of an instance, as the
+/// `CreateInstanceAccessControlAttributeConfiguration` that enabled ABAC — and any later
+/// `UpdateInstanceAccessControlAttributeConfiguration` — set it.
+///
+/// The attributes are held EXACTLY as the caller sent them (same order, same
+/// `Source` list), because `DescribeInstanceAccessControlAttributeConfiguration` reports
+/// "the list of IAM Identity Center identity store attributes that have been added to
+/// your ABAC configuration" — a round trip of the caller's own mapping.
+///
+/// `Status` is DERIVED from [`enabled_at`](Self::enabled_at) rather than stored, so a
+/// read never has to write to move the status on.
+#[derive(Debug, Clone)]
+pub struct AccessControlAttributeConfigurationRecord {
+    /// `InstanceAccessControlAttributeConfiguration$AccessControlAttributes`, in the
+    /// order the caller sent.
+    pub attributes: Vec<AccessControlAttribute>,
+    /// When the configuration stops being `CREATION_IN_PROGRESS` and becomes `ENABLED`:
+    /// [`ABAC_ENABLE_SPAN`] after the create that enabled ABAC was accepted.
+    pub enabled_at: SystemTime,
+}
+
+impl AccessControlAttributeConfigurationRecord {
+    /// The configuration a create accepted at `accepted_at` writes.
+    pub fn new(attributes: Vec<AccessControlAttribute>, accepted_at: SystemTime) -> Self {
+        Self {
+            attributes,
+            enabled_at: accepted_at + ABAC_ENABLE_SPAN,
+        }
+    }
+
+    /// `InstanceAccessControlAttributeConfigurationStatus` as of `now`:
+    /// `CREATION_IN_PROGRESS` until the enablement is due, `ENABLED` after.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.enabled_at {
+            ABAC_STATUS_CREATION_IN_PROGRESS
+        } else {
+            ABAC_STATUS_ENABLED
+        }
+    }
+
+    /// This configuration as the modeled `InstanceAccessControlAttributeConfiguration`
+    /// shape — what a describe reports, attribute for attribute.
+    pub fn to_shape(&self) -> InstanceAccessControlAttributeConfiguration {
+        InstanceAccessControlAttributeConfiguration {
+            access_control_attributes: self.attributes.clone(),
+        }
+    }
+}
+
+/// The first attribute KEY that `attributes` carries twice, if any.
+///
+/// An ABAC configuration MAPS a key to an identity-source value
+/// (`AccessControlAttribute$Key`: "The name of the attribute associated with your
+/// identities in your identity source. This is used to map a specified attribute in your
+/// identity source with an attribute in IAM Identity Center"), so one key cannot carry
+/// two mappings: a request that sends the same key twice is refused rather than stored
+/// with one of its two values silently winning. The comparison is case-sensitive, as the
+/// key is an opaque identity-source attribute name.
+pub fn duplicate_attribute_key(attributes: &[AccessControlAttribute]) -> Option<&str> {
+    let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+    attributes
+        .iter()
+        .find(|attribute| !seen.insert(attribute.key.as_str()))
+        .map(|attribute| attribute.key.as_str())
+}
+
+/// The refusal a request carrying one attribute key twice earns, as the message of the
+/// modelled `ValidationException` (HTTP 400). Built from the request: it names the
+/// member and the key that breaks the constraint.
+pub fn duplicate_attribute_key_message(key: &str) -> String {
+    format!(
+        "InstanceAccessControlAttributeConfiguration.AccessControlAttributes carries the \
+         attribute key {key} more than once; each key maps exactly one identity source \
+         attribute"
     )
 }
 
@@ -303,6 +404,13 @@ pub struct Instance {
     /// `DescribeInstance$EncryptionConfigurationDetails` the only one that reports it, so
     /// an instance no caller has configured reports no details rather than invented ones.
     pub encryption: Option<EncryptionConfigurationRecord>,
+    /// The instance's ABAC configuration, or `None` while ABAC is not enabled on it:
+    /// `CreateInstanceAccessControlAttributeConfiguration` is what enables it,
+    /// `UpdateInstanceAccessControlAttributeConfiguration` replaces the attributes it
+    /// holds and `DeleteInstanceAccessControlAttributeConfiguration` disables it again,
+    /// so an instance nobody has enabled ABAC on holds no attribute mapping rather than
+    /// an invented one.
+    pub access_control_attributes: Option<AccessControlAttributeConfigurationRecord>,
     /// The `ClientToken` of the `CreateInstance` call that minted this instance, when
     /// it sent one. The model marks that member `@idempotencyToken`, so a retry of the
     /// same call must answer with this instance rather than refusing it as a duplicate.
@@ -349,6 +457,10 @@ impl Instance {
             // encryption configuration, so there is none to report until an
             // `UpdateInstance` writes one.
             encryption: None,
+            // ABAC is off until a caller enables it: `CreateInstance` takes no attribute
+            // configuration, so there is none to report until a
+            // `CreateInstanceAccessControlAttributeConfiguration` writes one.
+            access_control_attributes: None,
             client_token: None,
             tags: Vec::new(),
             active_due: None,
@@ -631,6 +743,22 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     pub fn permission_set_surface_withdrawn(&self, instance_arn: &str) -> bool {
         self.instance(instance_arn)
             .is_some_and(|instance| !instance.permission_sets_enabled)
+    }
+
+    /// Whether the attribute-based access control (ABAC) surface is WITHDRAWN on the
+    /// instance `instance_arn` names, i.e. it is an account instance.
+    ///
+    /// ABAC maps identity-store attributes into the session tags that the policies of
+    /// multi-account AWS access are evaluated against (`AccessControlAttribute`: "You can
+    /// create permissions policies that determine who can access your Amazon Web Services
+    /// resources based upon the configured attribute values"), so it is a feature of the
+    /// SAME organization-instance surface as permission sets and the account assignments
+    /// built from them — which is why this asks exactly
+    /// [`Self::permission_set_surface_withdrawn`] rather than a second flag. As there, an
+    /// ARN this account holds no instance for is NOT this refusal: it is a missing
+    /// resource.
+    pub fn abac_surface_withdrawn(&self, instance_arn: &str) -> bool {
+        self.permission_set_surface_withdrawn(instance_arn)
     }
 
     /// The instance a previous `CreateInstance` minted under `client_token`, if that
