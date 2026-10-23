@@ -364,6 +364,18 @@
 //! the seeded subnets are the ones of [`DEFAULT_REGION`]. Everything a later writer
 //! stores names the Region its own request was signed for.
 //!
+//! ## Route servers
+//!
+//! [`ComAmazonawsEc2Amazonec2State::route_servers`] holds the account's VPC route servers
+//! as [`RouteServerRecord`]s: the modelled [`RouteServer`] shape every operation that
+//! reports one answers with, plus the instants the clock owes it its `pending` ->
+//! `available` move and, when the create asked for route persistence, its `enabling` ->
+//! `enabled` move. Those two words are facts of the record's age, so
+//! [`RouteServerRecord::view_at`] derives them on read instead of letting two writers
+//! store two different ones. Keyed by `RouteServerId` in a [`BTreeMap`], the same stable
+//! order the VPC and volume stores are kept in, so a pagination token can name the id the
+//! next page starts at.
+//!
 //! ## Account-level settings
 //!
 //! A setting is not a resource: it has no id, nothing creates or deletes it, and an
@@ -573,7 +585,7 @@ use crate::ops::types::{
     PlacementGroup,
     PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry,
-    Region, RequestLaunchTemplateData, RunInstancesOutput, SecondaryNetwork,
+    Region, RequestLaunchTemplateData, RouteServer, RunInstancesOutput, SecondaryNetwork,
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
     SpotPlacementScore, StateReason,
@@ -1403,6 +1415,13 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Monotonic source of the Elastic IP addresses [`Self::mint_elastic_ip`] hands out,
     /// so one allocation can never be given an address another still holds.
     next_elastic_ip: u64,
+    /// Every route server the account holds, by `RouteServerId` — see the module docs.
+    /// Ordered by id, which is the order `DescribeRouteServers` reports and pages over.
+    pub route_servers: BTreeMap<String, RouteServerRecord>,
+    /// A `CreateRouteServer` `ClientToken` and the route server id it minted, so a repeat
+    /// of the same request answers with that route server instead of creating a second
+    /// one.
+    pub route_server_client_tokens: HashMap<String, String>,
     /// Every Elastic IP address transfer the source account can see, by the `AllocationId`
     /// of the address being transferred — see the module docs. Ordered by that id, which is
     /// the order `DescribeAddressTransfers` reports and pages over.
@@ -1638,6 +1657,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             fast_launch_images: BTreeMap::new(),
             addresses: BTreeMap::new(),
             next_elastic_ip: 0,
+            route_servers: BTreeMap::new(),
+            route_server_client_tokens: HashMap::new(),
             address_transfers: BTreeMap::new(),
             transit_gateways: BTreeMap::new(),
             transit_gateway_available_at: BTreeMap::new(),
@@ -10811,6 +10832,208 @@ impl ComAmazonawsEc2Amazonec2State {
         self.dedicated_hosts.insert(host_id.clone(), host);
         host_id
     }
+}
+
+// =============================================================================
+// Route servers
+// =============================================================================
+
+/// The state a route server AWS has just created is in: `RouteServerState`'s `pending`
+/// (`smithy_query(query="shape",shape="RouteServerState")`).
+pub const ROUTE_SERVER_STATE_PENDING: &str = "pending";
+
+/// The state a created route server reaches: `RouteServerState`'s `available`.
+pub const ROUTE_SERVER_STATE_AVAILABLE: &str = "available";
+
+/// Route persistence being turned on: `RouteServerPersistRoutesState`'s `enabling`
+/// (`smithy_query(query="shape",shape="RouteServerPersistRoutesState")`).
+pub const PERSIST_ROUTES_STATE_ENABLING: &str = "enabling";
+
+/// Route persistence on: `RouteServerPersistRoutesState`'s `enabled`.
+pub const PERSIST_ROUTES_STATE_ENABLED: &str = "enabled";
+
+/// Route persistence off: `RouteServerPersistRoutesState`'s `disabled`.
+pub const PERSIST_ROUTES_STATE_DISABLED: &str = "disabled";
+
+/// `RouteServerPersistRoutesAction`'s `enable` — "Indicates whether routes should be
+/// persisted after all BGP sessions are terminated"
+/// (`CreateRouteServerRequest$PersistRoutes`).
+pub const PERSIST_ROUTES_ENABLE: &str = "enable";
+
+/// The ASN range the Amazon side of the BGP session accepts: "Valid values are from 1 to
+/// 4294967295" (`CreateRouteServerRequest$AmazonSideAsn`). The model declares no `@range`
+/// on the member, so the handler is the only place the published bounds can exist.
+pub const AMAZON_SIDE_ASN_RANGE: (i64, i64) = (1, 4_294_967_295);
+
+/// The range `PersistRoutesDuration` accepts, in minutes: "Value must be in the range of
+/// 1-5" (`CreateRouteServerRequest$PersistRoutesDuration`). The model declares no `@range`
+/// on the member either.
+pub const PERSIST_ROUTES_DURATION_RANGE: (i64, i64) = (1, 5);
+
+/// The one resource type a route server create's `TagSpecifications` can name: "The tags to
+/// apply to the route server during creation"
+/// (`CreateRouteServerRequest$TagSpecifications`), which is the `route-server` member of
+/// `ResourceType`.
+pub const ROUTE_SERVER_TAGGABLE_RESOURCE: &str = "route-server";
+
+/// How many route servers this emulator stores before a create is refused.
+///
+/// CHOSEN, like [`MAX_STORED_VOLUMES`] and for the same reason: nothing in this emulator
+/// reclaims a stored route server unless a caller deletes it, so the store needs a ceiling
+/// that is not the process's memory. It is well above any published per-VPC route server
+/// quota a test would exercise.
+pub const MAX_STORED_ROUTE_SERVERS: usize = 1_024;
+
+/// `InvalidRouteServerId.NotFound` (HTTP 400): the request named a route server id this
+/// account holds no route server for. EC2 spells a per-resource lookup failure
+/// `Invalid<Resource>Id.NotFound` (`InvalidLaunchTemplateId.NotFound`,
+/// `InvalidVpcID.NotFound`).
+pub const INVALID_ROUTE_SERVER_ID_NOT_FOUND: &str = "InvalidRouteServerId.NotFound";
+
+/// `InvalidRouteServerId.Malformed` (HTTP 400): the request named something that is not a
+/// route server id at all, so there is nothing to look up — the same pairing
+/// [`INVALID_LAUNCH_TEMPLATE_ID_MALFORMED`] has.
+pub const INVALID_ROUTE_SERVER_ID_MALFORMED: &str = "InvalidRouteServerId.Malformed";
+
+/// `RouteServerLimitExceeded` (HTTP 400): the create would take the account past the number
+/// of route servers it may hold, EC2's `<Resource>LimitExceeded` quota spelling
+/// ([`LAUNCH_TEMPLATE_LIMIT_EXCEEDED`], [`VOLUME_LIMIT_EXCEEDED`]).
+pub const ROUTE_SERVER_LIMIT_EXCEEDED: &str = "RouteServerLimitExceeded";
+
+/// The resource-id prefix a route server id carries, as the VPC Route Server
+/// documentation's own ids read (`rs-0123456789abcdef0`).
+pub const ROUTE_SERVER_ID_PREFIX: &str = "rs";
+
+/// One stored route server: the modelled [`RouteServer`] every operation that reports one
+/// answers with, plus the instants the clock owes its two non-terminal states.
+///
+/// The view holds no `State` and no `PersistRoutesState`: both are facts of the record's
+/// age, so [`RouteServerRecord::view_at`] derives them rather than letting two writers
+/// store two different words for one route server.
+#[derive(Debug, Clone)]
+pub struct RouteServerRecord {
+    /// The route server as the model shapes it, with `State` and `PersistRoutesState` left
+    /// for [`RouteServerRecord::view_at`] to fill.
+    pub view: RouteServer,
+    /// The instant from which this route server's `pending` -> `available` move is due.
+    /// Monotonic ([`Instant`]), because it is only ever compared against the clock and
+    /// never reported, so a wall-clock adjustment cannot move a route server back to
+    /// `pending`.
+    pub available_at: Instant,
+    /// Whether route persistence was asked for: "Indicates whether routes should be
+    /// persisted after all BGP sessions are terminated"
+    /// (`CreateRouteServerRequest$PersistRoutes`).
+    pub persist_routes_enabled: bool,
+    /// The instant from which the persistence state is settled — `enabling` -> `enabled`
+    /// for a route server that asked for persistence. A route server that did not is
+    /// `disabled` from the start, so its instant is the create's own.
+    pub persist_routes_settled_at: Instant,
+}
+
+impl RouteServerRecord {
+    /// This route server as of `now`: the stored view with the two states the clock has
+    /// reached. A read observes the transitions the clock already owed without writing
+    /// anything.
+    pub fn view_at(&self, now: Instant) -> RouteServer {
+        RouteServer {
+            state: Some(self.state_at(now).to_string()),
+            persist_routes_state: Some(self.persist_routes_state_at(now).to_string()),
+            ..self.view.clone()
+        }
+    }
+
+    /// The route server's `RouteServerState` at `now`.
+    pub fn state_at(&self, now: Instant) -> &'static str {
+        if now < self.available_at {
+            ROUTE_SERVER_STATE_PENDING
+        } else {
+            ROUTE_SERVER_STATE_AVAILABLE
+        }
+    }
+
+    /// The route server's `RouteServerPersistRoutesState` at `now`.
+    ///
+    /// A route server that was not asked to persist routes has nothing to turn off, so it
+    /// is `disabled` with no transient state of its own.
+    pub fn persist_routes_state_at(&self, now: Instant) -> &'static str {
+        if !self.persist_routes_enabled {
+            return PERSIST_ROUTES_STATE_DISABLED;
+        }
+        if now < self.persist_routes_settled_at {
+            PERSIST_ROUTES_STATE_ENABLING
+        } else {
+            PERSIST_ROUTES_STATE_ENABLED
+        }
+    }
+}
+
+/// The caller-chosen bytes one stored route server holds: its tags and the `ClientToken`
+/// the token map keeps for it. Everything else on the record — the id, the ASN, the states,
+/// the SNS topic ARN built from the id — is derived by this module or bounded by the model,
+/// so it is fixed-size.
+///
+/// The ONE definition of that charge: a create asks it before the write and charges exactly
+/// it, and a removal path must give back the same number.
+pub fn route_server_payload_bytes(tags: &[Tag], client_token: Option<&str>) -> usize {
+    tag_list_bytes(tags).saturating_add(client_token.map_or(0, str::len))
+}
+
+/// Whether `id` is a well-formed route server id: [`ROUTE_SERVER_ID_PREFIX`] followed by 8
+/// or 17 lowercase hexadecimal digits — the short and the long EC2 id form. The id shape
+/// itself is defined in exactly one place, [`prefixed_id_is_well_formed`], which this names
+/// the prefix for.
+pub fn route_server_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(ROUTE_SERVER_ID_PREFIX, id)
+}
+
+/// Refuse a route server id the request named that this service cannot resolve: a malformed
+/// one before an unknown one, the way the service orders the two.
+pub fn require_known_route_server<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    route_server_id: &str,
+) -> Result<(), Scaffolded<E>> {
+    if !route_server_id_is_well_formed(route_server_id) {
+        return Err(invalid_route_server_id_malformed(route_server_id));
+    }
+    if !store.route_servers.contains_key(route_server_id) {
+        return Err(invalid_route_server_id_not_found(route_server_id));
+    }
+    Ok(())
+}
+
+/// Refuse a request that named something that is not a route server id: HTTP 400
+/// `InvalidRouteServerId.Malformed`.
+pub fn invalid_route_server_id_malformed<E>(route_server_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ROUTE_SERVER_ID_MALFORMED,
+        400,
+        format!("Invalid id: '{route_server_id}'"),
+    )
+}
+
+/// Refuse a request that named a route server id no route server of the account has: HTTP
+/// 400 `InvalidRouteServerId.NotFound`.
+pub fn invalid_route_server_id_not_found<E>(route_server_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ROUTE_SERVER_ID_NOT_FOUND,
+        400,
+        format!("The route server ID '{route_server_id}' does not exist"),
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_STORED_ROUTE_SERVERS`]: HTTP 400
+/// `RouteServerLimitExceeded`.
+pub fn route_server_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(ROUTE_SERVER_LIMIT_EXCEEDED, 400, message)
+}
+
+/// The ARN of the SNS topic a route server publishes its BGP status changes to: "Enabling
+/// SNS notifications persists BGP status changes to an SNS topic provisioned by Amazon Web
+/// Services" (`RouteServer$SnsNotificationsEnabled`) — so the topic is the service's, named
+/// for the route server it belongs to, and it exists only for a route server whose
+/// notifications are enabled.
+pub fn route_server_sns_topic_arn(region: &str, route_server_id: &str) -> String {
+    ::engine::emulator_arn("sns", region, &format!("RouteServer-{route_server_id}"))
 }
 
 // =============================================================================
