@@ -40,6 +40,16 @@
 //! * `BadRequestException` (HTTP 400), `ConflictException` (HTTP 409),
 //!   `InternalFailureException` (HTTP 500), `LimitExceededException` (HTTP 429),
 //!   `ServiceUnavailableException` (HTTP 503).
+//!
+//! ## The WebSocket transport
+//!
+//! Like `StartStreamTranscription`, this operation is also reachable at
+//! [`WEBSOCKET_PATH`] — its modeled URI plus `-websocket` — with the input above
+//! carried as query parameters (`sample-rate`, `media-encoding`, `specialty`,
+//! `type`, …) instead of `x-amzn-transcribe-*` headers. The parameters are read back
+//! onto the same modeled shape and validated against the same constraints, and the
+//! stream itself is refused with the modeled `ServiceUnavailableException` — see
+//! [`NO_WEBSOCKET_TRANSPORT`].
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -50,6 +60,15 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-transcribestreaming-transcribe.json");
+
+/// The URI the model binds this operation to
+/// (smithy_query(query="operation", operation="StartMedicalStreamTranscription"):
+/// `POST /medical-stream-transcription`). Its WebSocket transport is this path plus
+/// [`WEBSOCKET_PATH_SUFFIX`].
+pub const MODELED_PATH: &str = "/medical-stream-transcription";
+
+/// Where the WebSocket transport of this operation is reached.
+pub const WEBSOCKET_PATH: &str = "/medical-stream-transcription-websocket";
 
 /// The operation's MODELED errors; `#[operation_error]` accepts only variants the
 /// model declares for it.
@@ -118,6 +137,49 @@ fn conflict(session_id: &str) -> StartMedicalStreamTranscriptionErrorModeled {
     })
 }
 
+/// A stream this service cannot carry: the modeled error the model declares for
+/// exactly that, HTTP 503.
+fn service_unavailable(message: impl Into<String>) -> StartMedicalStreamTranscriptionErrorModeled {
+    StartMedicalStreamTranscriptionErrorModeled::ServiceUnavailableException(
+        ServiceUnavailableException {
+            message: Some(message.into()),
+        },
+    )
+}
+
+/// The rules this operation's input must satisfy ACROSS its members. This operation
+/// binds the channel-identification pair that `StartStreamTranscription` binds, with
+/// the same model-stated rule, so it applies the same check; it binds no
+/// partial-results stabilization members, so there is nothing else to check here.
+fn cross_member_refusal(settings: &StartMedicalStreamTranscriptionSettings) -> Option<String> {
+    channel_identification_refusal(
+        settings.enable_channel_identification,
+        settings.number_of_channels,
+    )
+}
+
+/// Answer the WebSocket transport of this operation: the input off the query string,
+/// validated as the header transport's is, and the stream refused with the modeled
+/// `ServiceUnavailableException` ([`NO_WEBSOCKET_TRANSPORT`] says why). Nothing is
+/// stored: no stream was carried, so no session exists.
+fn websocket_refusal(
+    protocol: &dyn ServerHttpProtocol,
+    req: &Request,
+) -> StartMedicalStreamTranscriptionErrorModeled {
+    let settings: StartMedicalStreamTranscriptionSettings = match settings_from_query(
+        protocol,
+        req,
+        &StartMedicalStreamTranscriptionSettings::SCHEMA,
+    ) {
+        Ok(settings) => settings,
+        Err(message) => return bad_request(message),
+    };
+    match cross_member_refusal(&settings) {
+        Some(message) => bad_request(message),
+        None => service_unavailable(NO_WEBSOCKET_TRANSPORT),
+    }
+}
+
 impl<Eng: Send + Sync + 'static> StartMedicalStreamTranscription<Eng> {
     fn respond(
         &self,
@@ -130,6 +192,9 @@ impl<Eng: Send + Sync + 'static> StartMedicalStreamTranscription<Eng> {
             &StartMedicalStreamTranscriptionSettings::SCHEMA,
         )
         .map_err(bad_request)?;
+        if let Some(message) = cross_member_refusal(&settings) {
+            return Err(bad_request(message));
+        }
         let body = req
             .body()
             .bytes()
@@ -268,9 +333,16 @@ impl<Eng: Send + Sync + 'static> EventStreamOperation for StartMedicalStreamTran
     ) -> BoxFuture<'r, Response> {
         Box::pin(async move {
             let protocol = svc.definition().protocol();
-            let response = match self.respond(protocol, req) {
-                Ok(response) => response,
-                Err(error) => error_response(protocol, &error),
+            // The transport decides where the input is read from: query parameters on
+            // the WebSocket spelling, `x-amzn-transcribe-*` headers on the modeled
+            // HTTP/2 one.
+            let response = if is_websocket_transport_of(req.uri(), MODELED_PATH) {
+                error_response(protocol, &websocket_refusal(protocol, req))
+            } else {
+                match self.respond(protocol, req) {
+                    Ok(response) => response,
+                    Err(error) => error_response(protocol, &error),
+                }
             };
             // One access record per request, so a refused stream is diagnosable.
             // No request payload and no credential reaches it.

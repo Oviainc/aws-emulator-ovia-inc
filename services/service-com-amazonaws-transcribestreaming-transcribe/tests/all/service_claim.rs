@@ -13,10 +13,12 @@
 //!
 //! The claim is therefore the routing key AND the request's first URI path segment,
 //! matched by exact equality against this service's model-derived
-//! `ROUTE_PATH_SEGMENTS` — the four URIs its `restJson1` operations are bound to. This
-//! suite pins that rule over the class of requests it generalises over: both routing
-//! tiers, each of its own bound URIs, the peer's root path and modelled segments,
-//! near-miss spellings, and requests that name no service at all.
+//! `ROUTE_PATH_SEGMENTS` — the four URIs its `restJson1` operations are bound to — or
+//! against the data-plane paths of their WebSocket transport, which the model does not
+//! describe (each modeled URI plus `-websocket`). This suite pins that rule over the
+//! class of requests it generalises over: both routing tiers, each of its own bound
+//! URIs, each WebSocket path, the peer's root path and modelled segments, near-miss
+//! spellings, and requests that name no service at all.
 
 use std::sync::Arc;
 
@@ -125,6 +127,46 @@ const CASES: &[Case] = &[
         signing_name: Some("TRANSCRIBE"),
         target: None,
         claimed: true,
+    },
+    // The WebSocket transport of the two operations AWS documents one for: the same
+    // operation at the same URI plus `-websocket`, which the model does not describe,
+    // so it is claimed from this service's own data-plane path set.
+    Case {
+        name: "StartStreamTranscription's WebSocket URI, query-signed",
+        path_and_query: "/stream-transcription-websocket?language-code=en-US&media-encoding=pcm",
+        signing_name: Some("transcribe"),
+        target: None,
+        claimed: true,
+    },
+    Case {
+        name: "StartMedicalStreamTranscription's WebSocket URI",
+        path_and_query: "/medical-stream-transcription-websocket?sample-rate=16000",
+        signing_name: Some("transcribe"),
+        target: None,
+        claimed: true,
+    },
+    Case {
+        // Exact segment equality again: a WebSocket path AWS does not publish is not
+        // this service's to claim.
+        name: "near miss /stream-transcriptions-websocket",
+        path_and_query: "/stream-transcriptions-websocket",
+        signing_name: Some("transcribe"),
+        target: None,
+        claimed: false,
+    },
+    Case {
+        name: "a WebSocket path for an operation AWS publishes no WebSocket transport for",
+        path_and_query: "/medical-scribe-stream-websocket",
+        signing_name: Some("transcribe"),
+        target: None,
+        claimed: false,
+    },
+    Case {
+        name: "another service's signing name on this service's WebSocket URI",
+        path_and_query: "/stream-transcription-websocket",
+        signing_name: Some("polly"),
+        target: None,
+        claimed: false,
     },
     // The peer's path space: this service must claim NONE of it, or the router is
     // ambiguous again.
