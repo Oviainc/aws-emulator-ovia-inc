@@ -236,6 +236,65 @@ impl SerializableStruct for BadRequestException {
     }
 }
 
+/// The `message` member of the synthetic `NotFoundException` error shape.
+static NOT_FOUND_EXCEPTION_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#NotFoundException$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `NotFoundException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the three above: the
+/// shape is in no service's model, so it must not collide with a modeled one. The
+/// wire `__type` is `NotFoundException` all the same, from
+/// [`OperationError::shape_name`].
+pub static NOT_FOUND_EXCEPTION_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#NotFoundException",
+        "smithy.framework",
+        "NotFoundException",
+    ),
+    ShapeType::Structure,
+    &[&NOT_FOUND_EXCEPTION_MESSAGE],
+);
+
+/// The payload of a `NotFoundException`: that the addressed resource is absent.
+#[derive(Debug, Clone)]
+pub struct NotFoundException {
+    pub message: String,
+}
+
+impl NotFoundException {
+    /// A `NotFoundException` carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for NotFoundException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NotFoundException: {}", self.message)
+    }
+}
+
+impl std::error::Error for NotFoundException {}
+
+impl SerializableStruct for NotFoundException {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&NOT_FOUND_EXCEPTION_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -265,6 +324,17 @@ pub enum Scaffolded<E> {
     /// [`crate::state::tag_capacity_rejection`] for the rule and the recording it
     /// comes from.
     BadRequestException(BadRequestException),
+    /// The resource a TAGGING call addressed is absent. Renders as HTTP 404 with the
+    /// error code `NotFoundException`.
+    ///
+    /// The same reason as the variant above: a tagging call is served by the tagging
+    /// frontend, not by this service's own resource surface, and the code its
+    /// not-found answer carries — `NotFoundException` — is in no operation's modeled
+    /// error set, so it cannot live on the generated enum. See
+    /// [`crate::state::TAGGING_RESOURCE_NOT_FOUND`] for the rule and the recording it
+    /// comes from; an absent resource reported by a resource-level operation is this
+    /// service's own modeled `ResourceNotFoundException` instead.
+    NotFoundException(NotFoundException),
 }
 
 impl<E> Scaffolded<E> {
@@ -299,6 +369,16 @@ impl<E> Scaffolded<E> {
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::BadRequestException(BadRequestException::new(message))
     }
+
+    /// Report the resource a TAGGING call addressed absent, with HTTP 404
+    /// `NotFoundException`.
+    ///
+    /// Only for the tagging frontend's own not-found answer. Every resource-level
+    /// operation reports an absent resource as this service's modeled
+    /// `ResourceNotFoundException`.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::NotFoundException(NotFoundException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -308,6 +388,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::BadRequestException(e) => write!(f, "{e}"),
+            Self::NotFoundException(e) => write!(f, "{e}"),
         }
     }
 }
@@ -321,6 +402,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::BadRequestException(e) => e.source(),
+            Self::NotFoundException(e) => e.source(),
         }
     }
 }
@@ -336,6 +418,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
             Self::BadRequestException(e) => e,
+            Self::NotFoundException(e) => e,
         }
     }
 
@@ -345,6 +428,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::BadRequestException(_) => &BAD_REQUEST_EXCEPTION_SCHEMA,
+            Self::NotFoundException(_) => &NOT_FOUND_EXCEPTION_SCHEMA,
         }
     }
 
@@ -358,6 +442,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
             Self::BadRequestException(_) => "BadRequestException",
+            Self::NotFoundException(_) => "NotFoundException",
         }
     }
 
@@ -371,6 +456,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
             Self::BadRequestException(_) => 400,
+            // The tagging frontend's not-found answer, the status every recorded
+            // tagging call on an absent resource carries.
+            Self::NotFoundException(_) => 404,
         }
     }
 
@@ -385,6 +473,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => None,
             // Same again for the tagging refusal.
             Self::BadRequestException(_) => None,
+            // Same again for the tagging frontend's not-found answer.
+            Self::NotFoundException(_) => None,
         }
     }
 }
