@@ -87,12 +87,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // This service's awsJson1_0 RPC target prefix is the service shape's FULL
+        // id, namespace included (`com.amazonaws.codeconnections` +
+        // `CodeConnections_20231201`), so an SDK sends
+        // `x-amz-target: com.amazonaws.codeconnections.CodeConnections_20231201.<Operation>`.
+        // The framework resolves an awsJson routing key as everything after the FIRST
+        // dot of that header, which for a DOTTED prefix is
+        // `amazonaws.codeconnections.CodeConnections_20231201.<Operation>` — a key no
+        // modeled operation is wired under, so every such request would be refused as
+        // an unknown operation before any handler ran.
+        //
+        // An RPC target names its operation in the segment after the LAST dot, whatever
+        // the prefix in front of it, so that is the segment resolved here; it is the
+        // same answer for the short prefix (`CodeConnections_20231201.<Operation>`), so
+        // one rule serves both forms. A target whose final segment names no modeled
+        // operation resolves to `None` and is left to the generated routing table,
+        // which renders the protocol's own routing failure.
+        let target = req.headers().get("x-amz-target")?;
+        let operation = target.rsplit_once('.').map_or(target, |(_, op)| op);
+        self.entry.routing_table().get(operation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

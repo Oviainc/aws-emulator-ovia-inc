@@ -21,3 +21,5 @@ mod host_association;
 mod modeled_input_refusals;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/sync_blocker_summary.rs"]
+mod sync_blocker_summary;
