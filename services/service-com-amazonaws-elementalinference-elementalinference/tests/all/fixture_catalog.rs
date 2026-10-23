@@ -15,13 +15,18 @@
 //! `GetFixture` answers for a held id and refuses any other.
 //!
 //! The catalog is STATE: no modelled operation creates a fixture (AWS relays them from
-//! an external sports data source), so these suites install records through the state
-//! seam `ComAmazonawsElementalinferenceElementalinferenceState::seed_fixtures` and then
-//! assert the wire answers against exactly what they installed. The ids below are
+//! an external sports data source), so a store comes up holding this emulator's own
+//! schedule (`state::default_fixture_catalog`, the days around the present one) and the
+//! state seam
+//! (`ComAmazonawsElementalinferenceElementalinferenceState::seed_fixtures` /
+//! `clear_fixtures`) is what installs or drops records. Every suite below EMPTIES the
+//! catalog first and installs exactly the rows it asserts against, so what it asserts
+//! is the selection rule and nothing else; that the store comes up holding a schedule at
+//! all is `fixture_data_source.rs`. The ids below are
 //! deliberately opaque and sort in a different order from the fixtures' scheduled
 //! starts, so no case can pass by deriving a fixture from the shape of an id.
 
-use crate::harness::{call, router, router_with_engine};
+use crate::harness::{call, router_with_engine};
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::ops::types::Competitor;
 use service_com_amazonaws_elementalinference_elementalinference::state::{
@@ -207,11 +212,22 @@ fn row_of(id: &str) -> SeedRow {
 /// A router over a catalog holding exactly [`seed_rows`].
 fn seeded_router() -> MultiServiceRouter {
     let (router, engine) = router_with_engine();
+    clear(&engine);
     seed(&engine, seed_rows());
     router
 }
 
+/// Empty the catalog of the schedule a store comes up with, so a suite asserts against
+/// exactly the rows it installs.
+fn clear(engine: &Arc<engine::InMemoryEngine>) {
+    engine
+        .state::<ComAmazonawsElementalinferenceElementalinferenceState>()
+        .lock()
+        .clear_fixtures();
+}
+
 /// Install `rows` through the state seam — the only authoring path a fixture has.
+/// ADDITIVE, as the seam is: a held id is replaced, everything else is left alone.
 fn seed(engine: &Arc<engine::InMemoryEngine>, rows: Vec<SeedRow>) {
     let state = engine.state::<ComAmazonawsElementalinferenceElementalinferenceState>();
     state
@@ -462,14 +478,16 @@ fn sports_are_the_modelled_enum() {
     );
 }
 
-/// A catalog nothing has seeded selects NOTHING: every window answers 200 with an
+/// A catalog that holds NOTHING selects nothing: every window answers 200 with an
 /// empty `fixtures` list and no `nextToken`, and no id can be retrieved.
 ///
-/// This is the recorded behaviour the emulator has to match — a search of a window the
-/// service has no events in reports no rows at all, rather than a card of its own.
+/// "The array is empty if no fixtures match" (`SearchFixturesResponse$fixtures`): a
+/// search of a data source with no events reports no rows at all, rather than a card of
+/// its own.
 #[tokio::test]
-async fn an_unseeded_catalog_selects_nothing() {
-    let router = router();
+async fn a_catalog_that_holds_nothing_selects_nothing() {
+    let (router, engine) = router_with_engine();
+    clear(&engine);
 
     for case in window_cases() {
         let body = window_body(case.sport, case.start, case.end);
@@ -889,6 +907,7 @@ fn a_held_start_instant_must_be_a_time_of_the_day_it_names() {
 #[tokio::test]
 async fn clearing_the_catalog_returns_every_window_to_an_empty_selection() {
     let (router, engine) = router_with_engine();
+    clear(&engine);
     seed(&engine, seed_rows());
     let held = window_body("basketball", "2024-02-29", Some("2024-03-01"));
     let (status, before) = search(&router, held).await;
@@ -949,6 +968,7 @@ async fn clearing_the_catalog_returns_every_window_to_an_empty_selection() {
 #[tokio::test]
 async fn reads_leave_the_catalog_as_it_was_and_re_seeding_replaces_in_place() {
     let (router, engine) = router_with_engine();
+    clear(&engine);
     seed(&engine, seed_rows());
     let window = window_body("basketball", "2024-02-29", Some("2024-03-01"));
 

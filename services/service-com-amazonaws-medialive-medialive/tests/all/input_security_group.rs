@@ -74,7 +74,7 @@ async fn state_of(router: &MultiServiceRouter, case: &str, id: &str) -> String {
 /// `UpdateInputSecurityGroup` on one group, as a client calls it: PUT on the
 /// group's own path (`smithy_query(query="operation",
 /// operation="UpdateInputSecurityGroup")`: PUT /prod/inputSecurityGroups/{InputSecurityGroupId}).
-async fn update_group(router: &MultiServiceRouter, id: &str, body: Value) -> (u16, Value) {
+pub async fn update_group(router: &MultiServiceRouter, id: &str, body: Value) -> (u16, Value) {
     call(
         router,
         "PUT",
