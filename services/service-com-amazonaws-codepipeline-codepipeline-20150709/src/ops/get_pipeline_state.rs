@@ -8,14 +8,19 @@
 //! transition state the transition calls persisted, and the rules of every condition
 //! set the stage declares.
 //!
-//! Reporting only: the answer is computed from the store and nothing is written, so
-//! two consecutive calls on an untouched store answer the same thing.
+//! Reporting: the answer is computed from the store. The one thing this call WRITES is
+//! the steps of the pipeline's executions the clock has already made due, materialised
+//! before the report (`crate::state::advance`) — the sanctioned "a read may write only
+//! to materialise a change the clock already made due" case, which is also why two
+//! consecutive calls agree once no step is owed.
 //!
-//! The members the stage-, action- and rule-execution plane owns (`latestExecution`,
-//! `inboundExecution(s)`, an action's `currentRevision` / `latestExecution`, a
-//! condition's or a rule's `latestExecution`) stay ABSENT: this slice runs no such
-//! plane, so there is no outcome to report for them and inventing one would claim
-//! work nothing ran.
+//! The members the stage- and action-execution plane owns (`latestExecution`,
+//! `inboundExecution`, an action's `latestExecution`, its approval token and its error
+//! details) are reported from the execution plane this crate now runs
+//! (`crate::state::driver`). What the RULE plane owns stays ABSENT — a condition's or a
+//! rule's `latestExecution`, and an action's `currentRevision` — because no condition is
+//! evaluated and no revision recorded here, and inventing an outcome would claim work
+//! nothing ran.
 //!
 //! ## Shape of an operation
 //!
@@ -155,24 +160,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::require_state(&*self.engine)?;
+        // The state reported is the state as of NOW, so every step the clock has
+        // already made due is materialised first (see `state::driver`).
+        crate::state::advance(&*self.engine, ctx, &input.name).await;
         let state = state.lock();
 
         let pipeline = state.pipelines.get(&input.name).ok_or_else(|| {
-            GetPipelineStateError::from(
-                GetPipelineStateErrorModeled::PipelineNotFoundException(
-                    PipelineNotFoundException {
-                        message: Some(format!("pipeline {} does not exist", input.name)),
-                    },
-                ),
-            )
+            GetPipelineStateError::from(GetPipelineStateErrorModeled::PipelineNotFoundException(
+                PipelineNotFoundException {
+                    message: Some(crate::state::pipeline_not_found_message(&input.name)),
+                },
+            ))
         })?;
+
+        // Newest execution first: each stage reports the newest execution that has
+        // entered it, and the one held at its inbound transition.
+        let executions: Vec<&crate::state::PipelineExecutionRecord> = state
+            .executions_by_pipeline
+            .get(&input.name)
+            .map(|ids| {
+                ids.iter()
+                    .rev()
+                    .filter_map(|id| state.executions.get(id))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         Ok(GetPipelineStateOutput {
             pipeline_name: Some(pipeline.declaration.name.clone()),
             pipeline_version: Some(pipeline.version),
-            stage_states: Some(pipeline.stage_states(&state.action_revisions)),
+            stage_states: Some(crate::state::stage_states(
+                pipeline,
+                &executions,
+                &state.action_revisions,
+            )),
             created: Some(crate::state::to_date_time(pipeline.created)),
             updated: Some(crate::state::to_date_time(pipeline.updated)),
         })

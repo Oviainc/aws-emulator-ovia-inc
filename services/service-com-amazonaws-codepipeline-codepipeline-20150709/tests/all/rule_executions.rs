@@ -16,7 +16,7 @@
 
 use serde_json::{json, Value};
 
-use crate::pipeline_lifecycle::{declaration, source_stage, Emulator, ROLE_ARN};
+use crate::pipeline_lifecycle::{build_stage, declaration, source_stage, Emulator, ROLE_ARN};
 use service_com_amazonaws_codepipeline_codepipeline_20150709::state::{
     encode_page_token, CURSOR_EXECUTION, CURSOR_PIPELINE,
 };
@@ -113,9 +113,14 @@ async fn a_pipeline_with_no_condition_rules_reports_no_rule_execution() {
                 "roleArn": ROLE_ARN,
                 "artifactStore": {"type": "S3", "location": "my-bucket"},
                 "stages": [
+                    // A pipeline's first stage is its SOURCE stage and only it may
+                    // carry source actions (AWS: "the first stage must contain at least
+                    // one source action, and can only contain source actions", enforced
+                    // by `state::validate_declaration`), so the later stages of this
+                    // three-stage row are build stages.
                     source_stage("Source"),
-                    source_stage("Mirror"),
-                    source_stage("Archive"),
+                    build_stage("Mirror", 1),
+                    build_stage("Archive", 1),
                 ],
             }),
             2,

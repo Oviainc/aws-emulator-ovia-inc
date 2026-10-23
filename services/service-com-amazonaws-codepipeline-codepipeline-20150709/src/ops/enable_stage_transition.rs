@@ -162,7 +162,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // `transitionType` targets the `StageTransitionType` enum, so a value outside
         // it names no transition at all: refused with the modelled
         // `ValidationException` naming the member and the values it accepts.
@@ -178,43 +177,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let state = crate::state::require_state(&*self.engine)?;
-        let mut state = state.lock();
+        {
+            let mut state = state.lock();
+            let pipeline = state
+                .pipelines
+                .get_mut(&input.pipeline_name)
+                .ok_or_else(|| {
+                    EnableStageTransitionError::from(
+                        EnableStageTransitionErrorModeled::PipelineNotFoundException(
+                            PipelineNotFoundException {
+                                message: Some(crate::state::pipeline_not_found_message(
+                                    &input.pipeline_name,
+                                )),
+                            },
+                        ),
+                    )
+                })?;
 
-        let pipeline = state
-            .pipelines
-            .get_mut(&input.pipeline_name)
-            .ok_or_else(|| {
-                EnableStageTransitionError::from(
-                    EnableStageTransitionErrorModeled::PipelineNotFoundException(
-                        PipelineNotFoundException {
-                            message: Some(format!(
-                                "pipeline {} does not exist",
-                                input.pipeline_name
-                            )),
-                        },
-                    ),
+            if !pipeline.declares_stage(&input.stage_name) {
+                return Err(EnableStageTransitionErrorModeled::StageNotFoundException(
+                    StageNotFoundException {
+                        message: Some(format!(
+                            "pipeline {} has no stage named {}",
+                            input.pipeline_name, input.stage_name
+                        )),
+                    },
                 )
-            })?;
+                .into());
+            }
 
-        if !pipeline.declares_stage(&input.stage_name) {
-            return Err(EnableStageTransitionErrorModeled::StageNotFoundException(
-                StageNotFoundException {
-                    message: Some(format!(
-                        "pipeline {} has no stage named {}",
-                        input.pipeline_name, input.stage_name
-                    )),
-                },
-            )
-            .into());
+            // Releasing the hold on the transition the request NAMES is all this
+            // operation does; the other transition of that stage is untouched.
+            pipeline.set_transition(
+                &input.stage_name,
+                &input.transition_type,
+                true,
+                None,
+                ::std::time::SystemTime::now(),
+            );
         }
 
-        pipeline.set_transition(
-            &input.stage_name,
-            &input.transition_type,
-            true,
-            None,
-            ::std::time::SystemTime::now(),
-        );
+        // An execution held at this transition can now cross it, which is a step the
+        // clock owes from here on (see `state::driver`).
+        crate::state::advance(&*self.engine, ctx, &input.pipeline_name).await;
 
         Ok(EnableStageTransitionOutput)
     }

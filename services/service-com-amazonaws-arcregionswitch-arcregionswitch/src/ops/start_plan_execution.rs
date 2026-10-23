@@ -13,15 +13,19 @@
 //! execution named by `recoveryExecutionId`, which the model documents as "Required when
 //! starting a post-recovery execution" — so it reports neither Region.
 //!
-//! The execution is stored `pending` and the clock owes it its outcome after
-//! [`crate::state::EXECUTION_START_SPAN`]. That outcome is the service's modelled FAILURE
-//! state ([`crate::state::FAILED`]), with
-//! [`crate::state::UNSUPPORTED_EXECUTION_REASON`] recorded on an `executionFailed` event
-//! that `ListPlanExecutionEvents` reports: this emulator does not run a workflow's
-//! execution blocks (they drive other services' resources), so nothing performed the
-//! work, every step stays `notStarted`, and claiming `completed` would be an outcome
-//! nothing produced. Failing releases the plan — it becomes deletable again and can be
-//! executed again — rather than wedging it in a run that is not running.
+//! The execution is stored `pending`, with every step of the workflow the requested
+//! action runs recorded `notStarted`, and the clock owes it its first step transition
+//! after [`crate::state::EXECUTION_START_SPAN`]. From there the workflow progresses one
+//! step at a time in the service state's settle path
+//! ([`crate::state::ComAmazonawsArcregionswitchArcregionswitchState::settle`]): a
+//! manual-approval step stops the execution at `pendingManualApproval` with that step
+//! `pendingApproval`, waiting for `ApprovePlanExecutionStep`, while any other execution
+//! block drives other services' resources, which this emulator does not run — so the
+//! step fails with [`crate::state::UNSUPPORTED_EXECUTION_REASON`] on an
+//! `executionFailed` event and the execution reaches the modelled FAILURE state
+//! ([`crate::state::FAILED`]) rather than claiming an outcome nothing produced. A
+//! terminal execution releases the plan — it becomes deletable again and can be executed
+//! again — rather than wedging it in a run that is not running.
 //!
 //! ## Reaching this service's state
 //!
@@ -103,13 +107,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-
-/// The modelled `ExecutionState` a new execution starts in, before the clock owes it
-/// `inProgress`.
-const INITIAL_EXECUTION_STATE: &str = "pending";
-
-/// The modelled `StepStatus` of a step this emulator has not run.
-const UNRUN_STEP_STATUS: &str = "notStarted";
 
 /// The `ExecutionAction` values, as the model's `ExecutionAction` enum declares them.
 const ACTION_ACTIVATE: &str = "activate";
@@ -280,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(plan) = store.plans.get(&input.plan_arn) else {
             return Err(StartPlanExecutionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("No plan found for arn {}", input.plan_arn),
+                    message: crate::state::plan_not_found_message(&input.plan_arn),
                 },
             )
             .into());
@@ -326,11 +323,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .get(&(input.plan_arn.clone(), id.clone()))
                 .is_some_and(|execution| !execution.is_terminal())
         });
-        if let Some(holder) = holder {
+        if holder.is_some() {
             return Err(StartPlanExecutionErrorModeled::IllegalStateException(
                 IllegalStateException {
                     message: format!(
-                        "The plan {} already has execution {holder} in progress",
+                        "There is already an execution ongoing for plan {}",
                         input.plan_arn
                     ),
                 },
@@ -369,20 +366,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => (None, None),
         };
 
-        // The steps of the workflow this action runs, every one of them not started: this
-        // emulator does not run a workflow's execution blocks.
-        let step_states: Vec<StepState> = workflows
+        // The steps of the workflow this action runs, in order and none of them reached
+        // yet: the clock, not this call, is what starts the first one. `step_states` is
+        // the modelled projection the API reports; `planned_steps` is what the clock
+        // needs to decide each transition, captured now so a later edit of the plan
+        // cannot change what this execution does.
+        let steps: Vec<&Step> = workflows
             .iter()
             .filter(|workflow| workflow.workflow_target_action == input.action)
             .flat_map(|workflow| workflow.steps.iter().flatten())
-            .map(|step| StepState {
+            .collect();
+        let mut step_states: Vec<StepState> = Vec::with_capacity(steps.len());
+        let mut planned_steps: Vec<crate::state::PlannedStep> = Vec::with_capacity(steps.len());
+        for step in steps {
+            step_states.push(StepState {
                 name: Some(step.name.clone()),
-                status: Some(UNRUN_STEP_STATUS.to_string()),
+                status: Some(crate::state::STEP_NOT_STARTED.to_string()),
                 start_time: None,
                 end_time: None,
                 step_mode: Some(input.mode.clone()),
-            })
-            .collect();
+            });
+            planned_steps.push(crate::state::PlannedStep::of(step));
+        }
 
         let seed = store.next_seed();
         let execution_id = crate::state::execution_id(&input.target_region, seed);
@@ -394,7 +399,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             comment: input.comment,
             mode: input.mode,
             action: input.action,
-            execution_state: INITIAL_EXECUTION_STATE.to_string(),
+            execution_state: crate::state::PENDING.to_string(),
             execution_region: input.target_region,
             activate_region,
             deactivate_region,
@@ -403,6 +408,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             end_time: None,
             updated_at: started_at,
             step_states,
+            planned_steps,
             events: Vec::new(),
             outcome_due_at: Some(now + crate::state::EXECUTION_START_SPAN),
         };

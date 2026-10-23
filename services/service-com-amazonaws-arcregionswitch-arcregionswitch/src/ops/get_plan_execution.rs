@@ -7,8 +7,8 @@
 //! store. `stepStates` pages on `maxResults`/`nextToken`, as the operation's
 //! `@paginated` trait declares.
 //!
-//! The only write this reporting operation makes is to materialise the
-//! `pending` -> `inProgress` move the clock already owed the execution (see
+//! The only write this reporting operation makes is to materialise the step progression
+//! the clock already owed the execution (see
 //! [`crate::state::ComAmazonawsArcregionswitchArcregionswitchState::settle`]) — a change
 //! that was due at the same instant whether or not anybody called.
 //!

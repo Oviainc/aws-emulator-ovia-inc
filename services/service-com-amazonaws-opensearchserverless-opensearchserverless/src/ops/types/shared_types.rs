@@ -45,6 +45,29 @@ pub struct CollectionGroupCapacityLimits {
     pub min_search_capacity_in_ocu: Option<f32>,
 }
 
+/// The `storageConfiguration` block every collection-group detail reports.
+///
+/// Reached by both `CreateCollectionGroupDetail` and `CollectionGroupDetail`, so it
+/// lives here rather than beside one operation.
+///
+/// **LOCAL MODEL ADDITION — re-apply after a model refresh.** Neither this shape nor the
+/// `storageConfiguration` member on the two detail shapes is in the Smithy model as
+/// shipped: the live OpenSearch Serverless API returns the block on every
+/// collection-group detail (recorded behaviour), and
+/// `smithy-model/com-amazonaws-opensearchserverless-opensearchserverless.json` carries
+/// both additions locally, with the same note on the shape's own `documentation` trait,
+/// because this crate's response serializer can only emit MODELLED members. A refresh
+/// from upstream that still predates the member will drop them, and the two details will
+/// silently stop reporting `storageConfiguration` — which the
+/// `collection_group_capacity` integration suite is what catches.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.opensearchserverless#CollectionGroupStorageConfiguration"
+)]
+#[derive(Debug, Clone, Default)]
+pub struct CollectionGroupStorageConfiguration {
+    pub v2_enabled: Option<bool>,
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.opensearchserverless#LifecyclePolicyDetail")]
 #[derive(Debug, Clone, Default)]
 pub struct LifecyclePolicyDetail {

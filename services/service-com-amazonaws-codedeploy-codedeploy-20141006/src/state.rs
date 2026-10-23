@@ -975,6 +975,14 @@ pub struct ComAmazonawsCodedeployCodedeploy20141006State {
     pending_deployments: Vec<String>,
     /// Deployment configurations by `deploymentConfigName`.
     pub deployment_configs: HashMap<String, DeploymentConfig>,
+    /// The order the configurations entered the store — the `CodeDeployDefault.*`
+    /// built-ins first, then each one a client created — so
+    /// `ListDeploymentConfigs` is deterministic and pages stably.
+    ///
+    /// Maintained alongside [`Self::deployment_configs`] by
+    /// [`Self::insert_deployment_config`], so the index can never name a
+    /// configuration the map does not carry.
+    pub deployment_config_order: Vec<String>,
     /// The names of this account's stored connections to GitHub accounts, in the
     /// order they were linked, so `ListGitHubAccountTokenNames` is deterministic
     /// and pages stably.
@@ -1067,29 +1075,54 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
         self.seeded = true;
         for builtin in BUILTIN_DEPLOYMENT_CONFIGS {
             let id = self.mint_uuid("deployment-config");
-            self.deployment_configs.insert(
-                builtin.name.to_string(),
-                DeploymentConfig {
-                    deployment_config_id: id,
-                    deployment_config_name: builtin.name.to_string(),
-                    minimum_healthy_hosts: builtin.minimum_healthy_hosts.map(|(kind, value)| {
-                        MinimumHealthyHosts {
-                            r#type: Some(kind.to_string()),
-                            value,
-                        }
-                    }),
-                    traffic_routing_config: builtin.traffic_routing.map(|kind| {
-                        TrafficRoutingConfig {
-                            r#type: Some(kind.to_string()),
-                            ..Default::default()
-                        }
-                    }),
-                    zonal_config: None,
-                    compute_platform: builtin.compute_platform.to_string(),
-                    create_time_ms: now_ms,
-                },
-            );
+            self.insert_deployment_config(DeploymentConfig {
+                deployment_config_id: id,
+                deployment_config_name: builtin.name.to_string(),
+                minimum_healthy_hosts: builtin.minimum_healthy_hosts.map(|(kind, value)| {
+                    MinimumHealthyHosts {
+                        r#type: Some(kind.to_string()),
+                        value,
+                    }
+                }),
+                traffic_routing_config: builtin.traffic_routing.map(|kind| {
+                    TrafficRoutingConfig {
+                        r#type: Some(kind.to_string()),
+                        ..Default::default()
+                    }
+                }),
+                zonal_config: None,
+                compute_platform: builtin.compute_platform.to_string(),
+                create_time_ms: now_ms,
+            });
         }
+    }
+
+    /// Store `config` under its name, appending it to
+    /// [`Self::deployment_config_order`] the first time that name is stored.
+    ///
+    /// The one way a configuration enters the store, so the listing index and the
+    /// map stay in step: a built-in seeded here and a configuration a client
+    /// created both go through it, and re-storing a name already present keeps
+    /// the position it already holds rather than listing it twice.
+    pub fn insert_deployment_config(&mut self, config: DeploymentConfig) {
+        let name = config.deployment_config_name.clone();
+        if self.deployment_configs.insert(name.clone(), config).is_none() {
+            self.deployment_config_order.push(name);
+        }
+    }
+
+    /// The names of the stored deployment configurations, in the order they
+    /// entered the store: `ListDeploymentConfigs`'s listing.
+    ///
+    /// Filtered by what [`Self::deployment_configs`] still carries, so a
+    /// configuration dropped from the map is gone from the listing too and the
+    /// listing can never name a record a reader would answer as absent.
+    pub fn deployment_config_names(&self) -> Vec<String> {
+        self.deployment_config_order
+            .iter()
+            .filter(|name| self.deployment_configs.contains_key(*name))
+            .cloned()
+            .collect()
     }
 
     /// Materialise every deployment transition that was already due at `now_ms`:

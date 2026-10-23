@@ -456,18 +456,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             let deployment_config_id =
                 crate::state::mint_uuid_from(&mut state.next_id, "deployment-config");
-            state.deployment_configs.insert(
-                name.clone(),
-                crate::state::DeploymentConfig {
-                    deployment_config_id: deployment_config_id.clone(),
-                    deployment_config_name: name.clone(),
-                    minimum_healthy_hosts: input.minimum_healthy_hosts,
-                    traffic_routing_config: input.traffic_routing_config,
-                    zonal_config: input.zonal_config,
-                    compute_platform,
-                    create_time_ms: crate::state::now_ms(),
-                },
-            );
+            // Through the store's own insert, so the listing index
+            // `ListDeploymentConfigs` walks gains this name in creation order.
+            state.insert_deployment_config(crate::state::DeploymentConfig {
+                deployment_config_id: deployment_config_id.clone(),
+                deployment_config_name: name.clone(),
+                minimum_healthy_hosts: input.minimum_healthy_hosts,
+                traffic_routing_config: input.traffic_routing_config,
+                zonal_config: input.zonal_config,
+                compute_platform,
+                create_time_ms: crate::state::now_ms(),
+            });
             Ok(deployment_config_id)
         })
         .ok_or_else(|| {

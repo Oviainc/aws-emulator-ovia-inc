@@ -6,7 +6,10 @@
 //! app monitor whose ARN is that one (app monitors are RUM's only taggable resource), or
 //! HTTP 404 when no stored resource has it. The tag map it writes is the one
 //! `CreateAppMonitor` seeds and `GetAppMonitor` reports, so a removal is visible to every
-//! other operation that reads the monitor.
+//! other operation that reads the monitor. A successful removal answers HTTP 204 with no
+//! content, and a request naming NO keys — `TagKeys` targets a `TagKeyList` whose
+//! `@length` is `min: 0`, so the empty list is a modelled value — succeeds having removed
+//! nothing (see [`UntagResourceWireInput`]).
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +98,84 @@ pub enum UntagResourceErrorModeled {
 /// `ResourceNotFoundException`. A client branches on the code it is SENT, so the emulator
 /// sends the one the service sends rather than the one the model lists.
 const NOT_FOUND_ERROR_CODE: &str = "NotFoundException";
+
+/// The Smithy member names of `UntagResourceRequest`, as
+/// `smithy_query(query="operation", operation="UntagResource")` lists them: `ResourceArn`
+/// (`@httpLabel`, `@required`) and `TagKeys` (`@httpQuery("tagKeys")`, `@required`,
+/// `TagKeyList` with `@length(min: 0, max: 50)`).
+const RESOURCE_ARN_MEMBER: &str = "ResourceArn";
+const TAG_KEYS_MEMBER: &str = "TagKeys";
+
+/// This operation's input, read with an ABSENT `tagKeys` query taken as the EMPTY key
+/// list rather than as a missing member.
+///
+/// `TagKeys` is `@required`, so the generated `UntagResourceInput` deserializer refuses a
+/// request that binds no `tagKeys` value — but the member targets `TagKeyList`, whose
+/// `@length` is `min: 0`, so the empty list is a value the model admits, and a client
+/// sending `TagKeys=[]` sends exactly that: a `DELETE /tags/{ResourceArn}` with no
+/// `tagKeys` in the query string, because a list binds to the query string one value per
+/// element. RUM accepts it and removes nothing. The request therefore carries the member
+/// — as its empty value — and the only question is how an empty list is spelled on the
+/// wire, which for a query-bound list is "no values at all".
+///
+/// Only the ABSENT case is defaulted; everything else is read exactly as the generated
+/// deserializer reads it, including `ResourceArn`, which is still refused when absent
+/// (the framework's own missing-member refusal), and the `@length`/`@pattern` constraints
+/// on the keys, which the centralized walk validates after this step against the SAME
+/// input schema.
+#[derive(Debug, Clone)]
+pub struct UntagResourceWireInput(pub UntagResourceInput);
+
+impl ::aws_smithy_schema_server::DeserializableStruct for UntagResourceWireInput {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut resource_arn: Option<String> = None;
+        // The empty list the model admits: left as it is when the request binds no
+        // `tagKeys` value, which is how a query-bound list spells "no elements".
+        let mut tag_keys: Vec<String> = Vec::new();
+        deserializer.read_struct(
+            super::types::UNTAG_RESOURCE_INPUT_SCHEMA,
+            &mut |member, member_deserializer| {
+                match member.member_name() {
+                    Some(RESOURCE_ARN_MEMBER) => {
+                        resource_arn = Some(member_deserializer.read_string(member)?);
+                    }
+                    Some(TAG_KEYS_MEMBER) => {
+                        let mut keys: Vec<String> = Vec::new();
+                        member_deserializer.read_list(member, &mut |element| {
+                            keys.push(element.read_string(member)?);
+                            Ok(())
+                        })?;
+                        tag_keys = keys;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        )?;
+        Ok(Self(UntagResourceInput {
+            // `ResourceArn` is a path label, not a query value: it is absent only from a
+            // request that named no resource at all, which stays the framework's refusal.
+            resource_arn: resource_arn.ok_or_else(|| {
+                ::aws_smithy_schema_server::missing_member(RESOURCE_ARN_MEMBER)
+            })?,
+            tag_keys,
+        }))
+    }
+}
+
+/// The modelled input's own member writing, so the centralized walk's constraint
+/// validation — which drives the input as a serializer over
+/// `UNTAG_RESOURCE_INPUT_SCHEMA` — sees exactly the members the model declares.
+impl ::aws_smithy_schema::serde::SerializableStruct for UntagResourceWireInput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        ::aws_smithy_schema::serde::SerializableStruct::serialize_members(&self.0, serializer)
+    }
+}
 
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::untag_resource::UntagResourceError`).
@@ -200,20 +281,27 @@ impl<Eng> UntagResource<Eng> {
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for UntagResource<Eng>
 {
-    type Input = UntagResourceInput;
+    type Input = UntagResourceWireInput;
     type Output = UntagResourceOutput;
     type Error = UntagResourceError;
 
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// A successful tag removal reports NO CONTENT: HTTP 204, the status the service sends
+    /// for an operation whose modelled output declares no member. See
+    /// [`crate::state::TAGGING_NO_CONTENT_STATUS`] for the evidence and for the sibling
+    /// `TagResource`, which answers through the same constant.
+    const SUCCESS_STATUS: u16 = crate::state::TAGGING_NO_CONTENT_STATUS;
 
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The modelled input, with an absent `tagKeys` already read as the empty key list
+        // (see [`UntagResourceWireInput`]); everything below is the modelled member.
+        let UntagResourceWireInput(input) = input;
         // The ARN in the request is the whole identity of the resource; nothing about
         // this call depends on how the request was signed.
         let _ = ctx;

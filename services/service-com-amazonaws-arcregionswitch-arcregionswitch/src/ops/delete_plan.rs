@@ -141,23 +141,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.plans.get(&input.arn) else {
             return Err(DeletePlanErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("No plan found for arn {}", input.arn),
+                    message: crate::state::plan_not_found_message(&input.arn),
                 },
             )
             .into());
         };
-        let holder = record.active_execution.clone().filter(|id| {
+        let holder = record.active_execution.clone().and_then(|id| {
             store
                 .executions
-                .get(&(input.arn.clone(), id.clone()))
-                .is_some_and(|execution| !execution.is_terminal())
+                .get(&(input.arn.clone(), id))
+                .filter(|execution| !execution.is_terminal())
         });
         if let Some(holder) = holder {
+            // The refusal names what is holding the plan: the plan the request named, and
+            // the Region and id of the execution still running against it.
             return Err(DeletePlanErrorModeled::IllegalStateException(
                 IllegalStateException {
                     message: format!(
-                        "The plan {} cannot be deleted while execution {holder} is in progress",
-                        input.arn
+                        "Active executions found for {}: {}: {}",
+                        input.arn, holder.execution_region, holder.execution_id
                     ),
                 },
             )

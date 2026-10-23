@@ -9,15 +9,16 @@
 //! answers 501 again.
 //!
 //! A request that satisfies every precondition still answers HTTP 501
-//! `NotImplemented`, because recognising entities means running a trained
-//! named-entity recognition model and this emulator has no in-process engine for
-//! one: no maintained offline crate does it, and an invented `ResultList` — entities
-//! matched out of the request, or an empty `Entities` list claiming the document
-//! holds none — would be output nothing computed. The marker line above therefore
-//! STAYS: entity recognition is still unwritten, so this operation belongs in the
-//! stub census (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`) until an
-//! engine for it exists. `DetectEntities`, the single-document sibling, is a stub
-//! for the same reason and carries its own issue.
+//! `NotImplemented`, because the BATCH projection itself — one
+//! `BatchDetectEntitiesItemResult` per `TextList` index, with the per-document
+//! failures the modelled `ErrorList` carries — is unwritten. The recognition engine
+//! it needs now EXISTS in this crate: the single-document sibling `DetectEntities`
+//! is implemented and exports its in-process rule-and-lexicon recogniser as
+//! [`crate::ops::detect_entities::detect_entities`], so whoever implements this
+//! operation under its own issue calls that per document rather than inventing a
+//! `ResultList`. Until that wrapper is written the marker line above STAYS: this
+//! operation computes no result yet, so it belongs in the stub census
+//! (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`).
 //!
 //! ## Shape of an operation
 //!

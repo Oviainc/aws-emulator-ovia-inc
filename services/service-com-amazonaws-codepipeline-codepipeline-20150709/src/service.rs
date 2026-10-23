@@ -41,9 +41,182 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code CodePipeline answers an input-constraint violation with: the modelled
+/// `ValidationException`, which every operation of this service declares with
+/// `@httpError 400` (the framework's own default code for a refusal, restated here
+/// because `override_refusal` replaces code and message together).
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// One map member of this service's input surface whose ENTRIES carry constraints.
+///
+/// A constraint a map's key or value SHAPE declares is a property of the map member,
+/// not of the one entry that happened to violate it, so the refusal names the map
+/// member and states that shape's whole constraint set. The bounds are the model's:
+/// `smithy_query query="shape" shape="ActionConfigurationMap"` reports
+/// `key ActionConfigurationKey length 1..50` and
+/// `value ActionConfigurationValue length 1..1000`.
+///
+/// Hand-maintained, and only as far as it can be: `Violation` (the framework's
+/// constraint-walk output, `vendor/smithy-schema-server/src/constraints.rs`) carries a
+/// path, a kind and the rejected value — NOT which shape of the map the constraint came
+/// from, nor that shape's other constraints — so a service cannot derive either from
+/// the violation it is handed. That is the gap filed as
+/// `issues/things-that-do-not-work/20261022T133000Z-gap-smithy-schema-server-constraint-violation-stores-only-the-elided-rejected-value.md`'s
+/// neighbourhood in the frozen crate; until a violation says so, the table is the only
+/// place that knows. Consequences, stated rather than hidden:
+///
+/// * a map NOT listed here keeps the framework's wording, reported at the entry's own
+///   path. The other maps this service's inputs carry are `artifactStores`
+///   (`key AWSRegionName length 4..30`, value a structure) and the job-result
+///   `outputVariables` (`key OutputVariablesKey`, pattern only); neither appears in a
+///   recorded divergence, so neither is listed until one does.
+/// * key-vs-value is inferred from the bound the violation names, so a map whose key
+///   and value share an upper bound would be reported as a key violation.
+struct ConstrainedMap {
+    /// The member name the map is bound to, at any depth in the input.
+    member: &'static str,
+    /// The key shape's `@length` bounds.
+    key_length: (i64, i64),
+    /// The value shape's `@length` bounds.
+    value_length: (i64, i64),
+}
+
+/// Every constrained-entry map this service's inputs carry.
+const CONSTRAINED_MAPS: &[ConstrainedMap] = &[ConstrainedMap {
+    member: "configuration",
+    key_length: (1, 50),
+    value_length: (1, 1000),
+}];
+
+/// The map member a violation path names an ENTRY of, if any.
+///
+/// The framework walks into the entry, so the path it reports ends in the caller's own
+/// map KEY (`….actions.1.member.configuration.CustomData`). A map member followed by
+/// exactly one further segment is therefore an entry of that map, and the path AWS
+/// states is the map member's own.
+///
+/// The path is REQUEST-derived text (that last segment is the caller's key, which may be
+/// empty or non-ASCII), so it is taken apart with `split`/`rsplit_once` only: no byte
+/// index is computed from it, and a path this rule does not match yields `None`, which
+/// keeps the framework's own wording.
+fn map_entry(path: &str) -> Option<(&'static ConstrainedMap, String)> {
+    let (head, key) = path.rsplit_once('.')?;
+    if key.contains('.') {
+        return None;
+    }
+    let map = CONSTRAINED_MAPS
+        .iter()
+        .find(|map| head == map.member || head.ends_with(&format!(".{}", map.member)))?;
+    Some((map, head.to_string()))
+}
+
+/// The requirement clause for a constraint violated by one entry of `map`.
+///
+/// Both bounds of the entry shape are listed, because the requirement reported is that
+/// shape's constraint set rather than the single bound this value fell outside of. A
+/// violation naming the KEY shape's upper bound is a key violation; everything else is
+/// reported against the value, whose lower bound the key's happens to share.
+fn map_entry_requirement(map: &ConstrainedMap, kind: &ViolationKind) -> Option<String> {
+    let names_key = matches!(kind, ViolationKind::MaxLength(max) if *max == map.key_length.1);
+    let (subject, (min, max)) = if names_key {
+        ("Map key", map.key_length)
+    } else {
+        ("Map value", map.value_length)
+    };
+    matches!(
+        kind,
+        ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
+    )
+    .then(|| {
+        format!(
+            "{subject} must satisfy constraint: [Member must have length less than or \
+             equal to {max}, Member must have length greater than or equal to {min}]"
+        )
+    })
+}
+
+/// Render one constraint violation the way CodePipeline states it: the member path and
+/// the violated constraint, and NOTHING of the value that was rejected.
+///
+/// Returns `None` for a violation class this service has no wording for, which lets
+/// [`constraint_envelope`] decline the whole refusal and keep the framework's wording
+/// rather than invent a sentence for it ([`ViolationKind`] is `#[non_exhaustive]`, so a
+/// class can be added upstream).
+pub(crate) fn constraint_clause(violation: &Violation) -> Option<String> {
+    // A constraint the entry shape of a map declares is reported against the map
+    // member, with that shape's whole constraint set.
+    if let Some((map, path)) = map_entry(&violation.path) {
+        if let Some(requirement) = map_entry_requirement(map, &violation.kind) {
+            return Some(format!(
+                "Value at '{path}' failed to satisfy constraint: {requirement}"
+            ));
+        }
+    }
+    let requirement = match &violation.kind {
+        ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
+        ViolationKind::MinLength(min) => {
+            format!("Member must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => {
+            format!("Member must have length less than or equal to {max}")
+        }
+        ViolationKind::MinValue(min) => {
+            format!("Member must have value greater than or equal to {min}")
+        }
+        ViolationKind::MaxValue(max) => {
+            format!("Member must have value less than or equal to {max}")
+        }
+        // The requirement reported is the expression itself, without the `^` / `$` the
+        // model spells it with: AWS states the character class a value must satisfy,
+        // not the anchoring the model uses to make the match total. The rendering is
+        // the shared one (`service_common::validation::unanchored`), which is the
+        // staged home for this rule rather than a copy per service.
+        ViolationKind::Pattern(pattern) => format!(
+            "Member must satisfy regular expression pattern: {}",
+            ::service_common::validation::unanchored(pattern)
+        ),
+        ViolationKind::EnumValue(allowed) => {
+            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+        }
+        ViolationKind::UniqueItems => "Member must have unique values".to_string(),
+        _ => return None,
+    };
+    // An absent member has no submitted value at all, so it is reported as the null it
+    // was: that is a fact of the request's shape, not a rendering of a value the caller
+    // sent. Every other violation names the member only — the rejected value is the
+    // caller's own content and AWS does not echo it back.
+    let subject = match &violation.kind {
+        ViolationKind::MissingRequiredMember => "Value null",
+        _ => "Value",
+    };
+    Some(format!(
+        "{subject} at '{}' failed to satisfy constraint: {requirement}",
+        violation.path
+    ))
+}
+
+/// The `ValidationException` message for a refusal: the AWS envelope
+/// (`N validation error(s) detected: `) over one clause per violation.
+///
+/// `None` declines the whole refusal — see [`constraint_clause`].
+pub(crate) fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(constraint_clause)
+        .collect::<Option<Vec<_>>>()?;
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
 
 /// The `com-amazonaws-codepipeline-codepipeline-20150709` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -97,16 +270,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // CodePipeline states a constraint violation WITHOUT the value that violated it
+        // — the message names the member path and the constraint only — a `@pattern` as
+        // the expression a value must satisfy rather than as the model's anchored form,
+        // and a map entry's constraint against the map member. The code stays the
+        // modelled `ValidationException` (HTTP 400), which is what the framework would
+        // have answered: only the wording changes.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: constraint_envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

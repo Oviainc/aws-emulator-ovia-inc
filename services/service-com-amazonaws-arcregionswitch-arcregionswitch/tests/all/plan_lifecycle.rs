@@ -121,6 +121,41 @@ fn default_workflows() -> Value {
     ])
 }
 
+/// One workflow whose `step_names` steps are each a Lambda execution block — a block that
+/// drives ANOTHER service's resources, which this emulator does not run, so the clock
+/// fails the execution when it reaches the first of them.
+///
+/// Members from `smithy_query(query="shape", shape="CustomActionLambdaConfiguration",
+/// model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`:
+/// `lambdas`, `retryIntervalMinutes` and `regionToRun` are required, `timeoutMinutes`
+/// carries `@default: 60`.
+fn unrunnable_workflow(action: &str, step_names: &[&str]) -> Value {
+    let steps: Vec<Value> = step_names
+        .iter()
+        .map(|name| {
+            json!({
+                "name": name,
+                "executionBlockType": "CustomActionLambda",
+                "executionBlockConfiguration": {
+                    "customActionLambdaConfig": {
+                        "timeoutMinutes": 60,
+                        "retryIntervalMinutes": 1.0,
+                        "regionToRun": "activatingRegion",
+                        "lambdas": [{
+                            "arn": format!("arn:aws:lambda:us-west-2:{ACCOUNT}:function:switch"),
+                        }],
+                    }
+                }
+            })
+        })
+        .collect();
+    json!({
+        "workflowTargetAction": action,
+        "workflowDescription": format!("the {action} workflow"),
+        "steps": steps,
+    })
+}
+
 /// A `CreatePlan` request carrying only the required members plus `workflows`.
 fn create_request(name: &str, regions: [&str; 2], approach: &str, workflows: Value) -> Value {
     json!({
@@ -135,6 +170,34 @@ fn create_request(name: &str, regions: [&str; 2], approach: &str, workflows: Val
 /// Create a plan and return its ARN.
 async fn create_plan(router: &MultiServiceRouter, name: &str, regions: [&str; 2]) -> String {
     let request = create_request(name, regions, "activePassive", default_workflows());
+    let (status, created) = call(router, "CreatePlan", &request).await;
+    assert_eq!(
+        status, 200,
+        "case {name:?}: CreatePlan expected 200, got {status} with {created}"
+    );
+    created["plan"]["arn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Create a plan whose workflows this emulator cannot run a single step of, and return
+/// its ARN: an execution of it reaches a state it never leaves, which is what a case
+/// about a FINISHED execution needs.
+async fn create_unrunnable_plan(
+    router: &MultiServiceRouter,
+    name: &str,
+    regions: [&str; 2],
+) -> String {
+    let request = create_request(
+        name,
+        regions,
+        "activePassive",
+        json!([
+            unrunnable_workflow("activate", &["scale-up", "shift-traffic"]),
+            unrunnable_workflow("deactivate", &["shift-traffic", "scale-down"]),
+        ]),
+    );
     let (status, created) = call(router, "CreatePlan", &request).await;
     assert_eq!(
         status, 200,
@@ -670,7 +733,9 @@ async fn start_plan_execution_refuses_what_the_model_declares_an_error_for() {
 #[tokio::test]
 async fn a_client_token_maps_to_one_execution_and_a_plan_runs_one_at_a_time() {
     let router = router();
-    let plan_arn = create_plan(&router, "idempotent", ["us-east-1", "us-west-2"]).await;
+    // A plan whose steps this emulator cannot run, so the first execution reaches a state
+    // it never leaves and releases the plan.
+    let plan_arn = create_unrunnable_plan(&router, "idempotent", ["us-east-1", "us-west-2"]).await;
     let request = json!({
         "planArn": plan_arn,
         "targetRegion": "us-west-2",
@@ -766,7 +831,7 @@ async fn a_client_token_maps_to_one_execution_and_a_plan_runs_one_at_a_time() {
 #[tokio::test]
 async fn an_execution_starts_pending_and_the_clock_settles_it_into_the_failure_state() {
     let router = router();
-    let plan_arn = create_plan(&router, "clock", ["us-east-1", "us-west-2"]).await;
+    let plan_arn = create_unrunnable_plan(&router, "clock", ["us-east-1", "us-west-2"]).await;
     let (status, started) = call(
         &router,
         "StartPlanExecution",
@@ -1050,7 +1115,7 @@ async fn delete_plan_removes_the_plan_from_every_reader() {
 #[tokio::test]
 async fn a_plan_held_by_an_execution_cannot_be_deleted() {
     let router = router();
-    let plan_arn = create_plan(&router, "held", ["us-east-1", "us-west-2"]).await;
+    let plan_arn = create_unrunnable_plan(&router, "held", ["us-east-1", "us-west-2"]).await;
     let (status, started) = call(
         &router,
         "StartPlanExecution",
@@ -1099,7 +1164,7 @@ async fn a_plan_held_by_an_execution_cannot_be_deleted() {
 #[tokio::test]
 async fn list_plan_execution_events_reports_the_timeline_the_execution_recorded() {
     let router = router();
-    let plan_arn = create_plan(&router, "timeline", ["us-east-1", "us-west-2"]).await;
+    let plan_arn = create_unrunnable_plan(&router, "timeline", ["us-east-1", "us-west-2"]).await;
     let (status, started) = call(
         &router,
         "StartPlanExecution",
