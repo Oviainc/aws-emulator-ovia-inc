@@ -29,6 +29,8 @@ mod domain_tag_resource;
 mod domain_tagging;
 #[path = "all/list_open_workflow_executions.rs"]
 mod list_open_workflow_executions;
+#[path = "all/pending_activity_task_count.rs"]
+mod pending_activity_task_count;
 #[path = "all/request_cancel_workflow_execution.rs"]
 mod request_cancel_workflow_execution;
 #[path = "all/state_roundtrip.rs"]

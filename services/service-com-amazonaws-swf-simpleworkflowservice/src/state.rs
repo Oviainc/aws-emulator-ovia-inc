@@ -13,7 +13,7 @@ use ::aws_smithy_types::DateTime;
 use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ActivityType, ActivityTypeConfiguration, ActivityTypeInfo,
+    ActivityTaskScheduledEventAttributes, ActivityType, ActivityTypeConfiguration, ActivityTypeInfo,
     DecisionTaskScheduledEventAttributes, DomainConfiguration, DomainInfo, ExecutionTimeFilter,
     HistoryEvent, ResourceTag, TagFilter, TaskList, WorkflowExecution,
     WorkflowExecutionCancelRequestedEventAttributes,
@@ -286,6 +286,10 @@ pub enum EventAttributes {
     /// the other variants, and every stored history event pays for the largest one.
     WorkflowExecutionStarted(Box<WorkflowExecutionStartedEventAttributes>),
     DecisionTaskScheduled(DecisionTaskScheduledEventAttributes),
+    /// Boxed for the same reason as the started attributes above:
+    /// `ActivityTaskScheduledEventAttributes` carries eleven members, several times the
+    /// size of the other variants.
+    ActivityTaskScheduled(Box<ActivityTaskScheduledEventAttributes>),
     WorkflowExecutionTerminated(WorkflowExecutionTerminatedEventAttributes),
     WorkflowExecutionCancelRequested(WorkflowExecutionCancelRequestedEventAttributes),
 }
@@ -297,6 +301,7 @@ impl EventAttributes {
         match self {
             Self::WorkflowExecutionStarted(_) => "WorkflowExecutionStarted",
             Self::DecisionTaskScheduled(_) => "DecisionTaskScheduled",
+            Self::ActivityTaskScheduled(_) => "ActivityTaskScheduled",
             Self::WorkflowExecutionTerminated(_) => "WorkflowExecutionTerminated",
             Self::WorkflowExecutionCancelRequested(_) => "WorkflowExecutionCancelRequested",
         }
@@ -318,6 +323,29 @@ impl EventAttributes {
         match self {
             Self::WorkflowExecutionStarted(_)
             | Self::DecisionTaskScheduled(_)
+            | Self::ActivityTaskScheduled(_)
+            | Self::WorkflowExecutionTerminated(_)
+            | Self::WorkflowExecutionCancelRequested(_) => None,
+        }
+    }
+
+    /// The `scheduledEventId` of the activity task these attributes take OUT of its
+    /// task list, when that is what the event records.
+    ///
+    /// A scheduled activity task waits in its task list until a worker is handed it
+    /// (`ActivityTaskStarted`, whose `scheduledEventId` names the task it started), it
+    /// times out there first (`ActivityTaskTimedOut`, same member) or the scheduling is
+    /// cancelled (`ActivityTaskCanceled`, same member). No stored variant records any of
+    /// them yet — the operations that would write them (`PollForActivityTask`, the
+    /// activity-task responders and the schedule-to-start sweep behind them) are still
+    /// scaffolds tracked by their own gap issues — so every event answers `None` today.
+    /// This exhaustive match is the single place that enumerates them, so a variant
+    /// added later cannot be forgotten by [`Execution::pending_activity_tasks_on`].
+    pub fn activity_task_left_task_list(&self) -> Option<i64> {
+        match self {
+            Self::WorkflowExecutionStarted(_)
+            | Self::DecisionTaskScheduled(_)
+            | Self::ActivityTaskScheduled(_)
             | Self::WorkflowExecutionTerminated(_)
             | Self::WorkflowExecutionCancelRequested(_) => None,
         }
@@ -349,6 +377,9 @@ impl HistoryEventRecord {
             }
             EventAttributes::DecisionTaskScheduled(attributes) => {
                 event.decision_task_scheduled_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::ActivityTaskScheduled(attributes) => {
+                event.activity_task_scheduled_event_attributes = Some(attributes.as_ref().clone());
             }
             EventAttributes::WorkflowExecutionTerminated(attributes) => {
                 event.workflow_execution_terminated_event_attributes = Some(attributes.clone());
@@ -548,6 +579,33 @@ impl Execution {
             })
             .count()
     }
+
+    /// How many of this run's activity tasks are still WAITING in `task_list`: one per
+    /// `ActivityTaskScheduled` event of its history that names that list and that no
+    /// later event has taken out of it (see
+    /// [`EventAttributes::activity_task_left_task_list`]).
+    ///
+    /// The same record and the same reasoning as
+    /// [`Execution::pending_decision_tasks_on`]: the history IS the record of which
+    /// tasks were scheduled where, each scheduling event carrying its own `taskList`, so
+    /// a run that scheduled activity tasks on more than one list contributes to each
+    /// list separately.
+    pub fn pending_activity_tasks_on(&self, task_list: &str) -> usize {
+        let taken: HashSet<i64> = self
+            .history
+            .iter()
+            .filter_map(|event| event.attributes.activity_task_left_task_list())
+            .collect();
+        self.history
+            .iter()
+            .filter(|event| match &event.attributes {
+                EventAttributes::ActivityTaskScheduled(scheduled) => {
+                    scheduled.task_list.name == task_list && !taken.contains(&event.event_id)
+                }
+                _ => false,
+            })
+            .count()
+    }
 }
 
 /// One registered domain and everything scoped to it.
@@ -651,6 +709,19 @@ impl Domain {
             .values()
             .filter(|execution| execution.is_open())
             .map(|execution| execution.pending_decision_tasks_on(task_list))
+            .sum()
+    }
+
+    /// How many activity tasks are waiting in `task_list` across this domain — what
+    /// `CountPendingActivityTasks` answers with. The same scoping as
+    /// [`Domain::pending_decision_tasks_on`]: a task list lives inside its domain, so
+    /// only this domain's runs contribute, a list no activity task was ever scheduled in
+    /// holds none, and only an OPEN run has tasks waiting in a list.
+    pub fn pending_activity_tasks_on(&self, task_list: &str) -> usize {
+        self.executions
+            .values()
+            .filter(|execution| execution.is_open())
+            .map(|execution| execution.pending_activity_tasks_on(task_list))
             .sum()
     }
 
