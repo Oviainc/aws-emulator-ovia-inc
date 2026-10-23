@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceEvaluations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceEvaluations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceEvaluations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the proactive resource evaluations read back out of [`crate::state`],
+//! filtered by the evaluation mode, the time window and the deployment context the
+//! request asked for, most recent execution first, paged at the requested `Limit`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +143,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceEvaluations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceEvaluationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceEvaluations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let filters = input.filters.clone().unwrap_or_default();
+
+        // PROACTIVE is the only evaluation mode this filter accepts
+        // (`ResourceEvaluationFilters$EvaluationMode`: "Currently, DECTECTIVE is not
+        // supported as a valid value"), so another modelled mode is an invalid
+        // parameter value rather than an empty page.
+        if let Some(mode) = filters
+            .evaluation_mode
+            .as_deref()
+            .filter(|mode| !mode.is_empty())
+        {
+            if mode != crate::state::EVALUATION_MODE_PROACTIVE {
+                return Err(
+                    ListResourceEvaluationsErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(crate::state::unsupported_evaluation_mode_message(
+                                mode,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A time window runs from the earlier instant to the later one, so a window
+        // whose start is after its end bounds nothing and is not a valid range. Equal
+        // bounds are a valid (degenerate) window: the inclusive bounds then select the
+        // executions at exactly that instant.
+        let window = filters.time_window.clone().unwrap_or_default();
+        let started_after = window.start_time.map(crate::state::epoch_nanos);
+        let started_before = window.end_time.map(crate::state::epoch_nanos);
+        if let (Some(after), Some(before)) = (started_after, started_before) {
+            if after > before {
+                return Err(
+                    ListResourceEvaluationsErrorModeled::InvalidTimeRangeException(
+                        InvalidTimeRangeException {
+                            message: Some(
+                                "The specified time range is not valid. \
+                                 Filters.TimeWindow.StartTime must not be after \
+                                 Filters.TimeWindow.EndTime."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input
+            .next_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+        {
+            None => None,
+            Some(token) => match crate::state::decode_resource_evaluation_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        ListResourceEvaluationsErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified NextToken is not valid; use the NextToken \
+                                     a previous ListResourceEvaluations response returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // "The maximum number of evaluations returned on each page. The default is 10.
+        // ... If you specify 0, Config uses the default." The 0..100 band is the
+        // member's modelled range, already enforced before this handler runs.
+        let limit = if input.limit == 0 {
+            crate::state::LIST_RESOURCE_EVALUATIONS_DEFAULT_LIMIT
+        } else {
+            usize::try_from(input.limit)
+                .unwrap_or(crate::state::LIST_RESOURCE_EVALUATIONS_DEFAULT_LIMIT)
+        };
+
+        let selects = |entry: &crate::state::ResourceEvaluationEntry| -> bool {
+            // Selection is computed from the mode each evaluation was STARTED in, not
+            // from the fact that the start path accepts only one mode: the filter
+            // selects out of state, so it keeps holding if another mode is ever
+            // persisted.
+            if let Some(mode) = filters
+                .evaluation_mode
+                .as_deref()
+                .filter(|mode| !mode.is_empty())
+            {
+                if entry.evaluation_mode != mode {
+                    return false;
+                }
+            }
+            if let Some(identifier) = filters
+                .evaluation_context_identifier
+                .as_deref()
+                .filter(|identifier| !identifier.is_empty())
+            {
+                if entry.evaluation_context_identifier.as_deref() != Some(identifier) {
+                    return false;
+                }
+            }
+            let started_at = entry.started_at_nanos();
+            if started_after.is_some_and(|after| started_at < after) {
+                return false;
+            }
+            if started_before.is_some_and(|before| started_at > before) {
+                return false;
+            }
+            true
+        };
+
+        let store = state.lock();
+        let mut selected: Vec<&crate::state::ResourceEvaluationEntry> = store
+            .resource_evaluations
+            .values()
+            .filter(|entry| selects(entry))
+            .collect();
+        // Most recent execution first, ties broken by id, so the ordering is total and
+        // a page token resumes at exactly one evaluation.
+        selected.sort_by_key(|entry| entry.page_key());
+
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for entry in selected {
+            let key = entry.page_key();
+            if resume_at.as_ref().is_some_and(|resume_at| &key < resume_at) {
+                continue;
+            }
+            if page.len() == limit {
+                next_token = Some(crate::state::encode_resource_evaluation_token(&key));
+                break;
+            }
+            page.push(entry.to_shape());
+        }
+
+        Ok(ListResourceEvaluationsOutput {
+            resource_evaluations: Some(page),
+            next_token,
+        })
     }
 }
