@@ -16,6 +16,18 @@
 //! app, so an `AppId` that identifies no registered app is refused with HTTP 400
 //! `ValidationException` before anything is minted — the rule
 //! `app_registration_gate.rs` is about.
+//!
+//! Three recorded rules of the slice have their own tables below, because each is a rule
+//! about a CLASS of request rather than about one session id:
+//!
+//! * the READ path reports no lifetime — `GetToken` answers `Ttl` as the empty string
+//!   whatever lifetime the token it reports carries, while the MINT (`CreateToken`)
+//!   reports the lifetime it granted;
+//! * `DeleteToken` validates app identity ONLY, so it is idempotent over session ids: a
+//!   session this app holds no live token for is `IsSuccess: true`, not a refusal;
+//! * a `GetToken` whose session does not resolve — never minted, deleted, expired, or
+//!   minted under another app — is HTTP 404 with the error code
+//!   `ResourceNotFoundException` and this service's fixed prefixed message.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -25,8 +37,8 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_amplifybackend_amplifybackend::state::{
     ChallengeToken, ComAmazonawsAmplifybackendAmplifybackendState, CHALLENGE_CODE_CHARS,
-    CHALLENGE_TOKEN_TTL, LIMIT_TYPE_CHALLENGE_TOKENS, MAX_CHALLENGE_TOKENS_PER_APP,
-    MAX_IDENTIFIER_CHARS, RESOURCE_TYPE_CHALLENGE_TOKEN,
+    CHALLENGE_TOKEN_TTL, ERROR_MESSAGE_PREFIX, LIMIT_TYPE_CHALLENGE_TOKENS,
+    MAX_CHALLENGE_TOKENS_PER_APP, MAX_IDENTIFIER_CHARS, READ_PATH_TTL,
 };
 use service_com_amazonaws_amplifybackend_amplifybackend::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -34,6 +46,10 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The endpoint host an AmplifyBackend request addresses; its first label is the routing
 /// key the router claims the request by.
 const HOST: &str = "amplifybackend.us-east-1.amazonaws.com";
+
+/// The wire error code a challenge-token read that does not resolve answers with
+/// (recorded behaviour; not a shape this service's model declares).
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
 /// A router with just this service mounted, and the shared engine it was mounted on.
 fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
@@ -141,9 +157,60 @@ async fn register_app(router: &MultiServiceRouter, app_id: &str) {
     );
 }
 
-/// The `Ttl` every token reports: [`CHALLENGE_TOKEN_TTL`] in whole seconds, as a string.
+/// The `Ttl` the MINT reports: [`CHALLENGE_TOKEN_TTL`] in whole seconds, as a string.
+/// The read path reports [`READ_PATH_TTL`] instead.
 fn expected_ttl() -> String {
     CHALLENGE_TOKEN_TTL.as_secs().to_string()
+}
+
+/// Seed one challenge token straight into the shared store, with a lifetime and an age of
+/// its own, and hand back the record as stored.
+///
+/// The only way to place a token at a chosen point in its own lifetime without waiting
+/// the lifetime out.
+fn seed_token(
+    engine: &engine::InMemoryEngine,
+    app_id: &str,
+    session_id: &str,
+    lifetime: Duration,
+    age: Duration,
+) -> ChallengeToken {
+    let created_at = SystemTime::now() - age;
+    let token = ChallengeToken {
+        app_id: app_id.to_string(),
+        session_id: session_id.to_string(),
+        challenge_code: format!("seeded-{session_id}"),
+        created_at,
+        expires_at: created_at + lifetime,
+    };
+    engine
+        .state::<ComAmazonawsAmplifybackendAmplifybackendState>()
+        .lock()
+        .store_challenge_token(token)
+        .clone()
+}
+
+/// Assert one refusal of the challenge-token read path: HTTP 404, the recorded error
+/// code, and this service's fixed prefixed message, which names NOTHING from the request.
+fn assert_token_not_found(case: &str, app_id: &str, session_id: &str, status: u16, body: &Value) {
+    assert_eq!(
+        status, 404,
+        "case {case:?}: GetToken on a session that does not resolve expected 404, got {status} {body}"
+    );
+    assert_eq!(
+        field(body, "code"),
+        RESOURCE_NOT_FOUND_EXCEPTION,
+        "case {case:?}: expected code {RESOURCE_NOT_FOUND_EXCEPTION:?}, got {body}"
+    );
+    let message = field(body, "message");
+    assert!(
+        message.starts_with(ERROR_MESSAGE_PREFIX) && message.len() > ERROR_MESSAGE_PREFIX.len(),
+        "case {case:?}: the refusal carries this service's fixed prefix and a sentence, got {body}"
+    );
+    assert!(
+        !message.contains(session_id) && !message.contains(app_id),
+        "case {case:?}: the refusal is a fixed sentence and leaks no identifier, got {body}"
+    );
 }
 
 /// One round-trip case: the app a token is minted for, whether that app has a backend
@@ -198,8 +265,10 @@ struct Minted {
     body: Value,
 }
 
-/// `CreateToken` mints a token, stores it, and `GetToken` reports the SAME token back;
-/// `DeleteToken` reclaims it, after which both answer the modelled `NotFoundException`.
+/// `CreateToken` mints a token, stores it, and `GetToken` reports the SAME token back
+/// (every member but the lifetime, which the read path does not report); `DeleteToken`
+/// reclaims it, after which `GetToken` answers `ResourceNotFoundException` and
+/// `DeleteToken` still answers `IsSuccess: true`.
 #[tokio::test]
 async fn a_challenge_token_round_trips_and_is_reclaimed_by_delete() {
     for case in cases() {
@@ -274,8 +343,11 @@ async fn a_challenge_token_round_trips_and_is_reclaimed_by_delete() {
         );
 
         // Read each token back, TWICE: `GetToken` reports what was stored and reading it
-        // changes nothing a later caller sees.
+        // changes nothing a later caller sees. The MINT's own document is the expected
+        // one with its lifetime blanked: the read path reports no lifetime.
         for token in &minted {
+            let mut expected = token.body.clone();
+            expected["ttl"] = json!(READ_PATH_TTL);
             for read in 1..=2 {
                 let (status, body) = get_token(&router, &app_id, &token.session_id).await;
                 assert_eq!(
@@ -283,9 +355,8 @@ async fn a_challenge_token_round_trips_and_is_reclaimed_by_delete() {
                     "case {name:?} read {read}: GetToken expected 200, got {status} {body}"
                 );
                 assert_eq!(
-                    body, token.body,
-                    "case {name:?} read {read}: GetToken reports the minted token, expected {}, got {body}",
-                    token.body
+                    body, expected,
+                    "case {name:?} read {read}: GetToken reports the minted token with an empty ttl, expected {expected}, got {body}"
                 );
             }
         }
@@ -302,30 +373,21 @@ async fn a_challenge_token_round_trips_and_is_reclaimed_by_delete() {
             Some(true),
             "case {name:?}: DeleteToken reports isSuccess true, got {body}"
         );
-        for (operation, (status, body)) in [
-            (
-                "GetToken",
-                get_token(&router, &app_id, &reclaimed.session_id).await,
-            ),
-            (
-                "DeleteToken",
-                delete_token(&router, &app_id, &reclaimed.session_id).await,
-            ),
-        ] {
-            assert_eq!(
-                status, 404,
-                "case {name:?}: {operation} on a deleted token expected 404, got {status} {body}"
-            );
-            assert_eq!(
-                field(&body, "resourceType"),
-                RESOURCE_TYPE_CHALLENGE_TOKEN,
-                "case {name:?}: {operation} names the resource type, got {body}"
-            );
-            assert!(
-                field(&body, "message").contains(&reclaimed.session_id),
-                "case {name:?}: {operation}'s message names the session asked for, got {body}"
-            );
-        }
+        let (status, body) = get_token(&router, &app_id, &reclaimed.session_id).await;
+        assert_token_not_found(
+            &format!("{name}: GetToken after the delete"),
+            &app_id,
+            &reclaimed.session_id,
+            status,
+            &body,
+        );
+        // Deleting it again is the SAME answer: the postcondition already holds.
+        let (status, body) = delete_token(&router, &app_id, &reclaimed.session_id).await;
+        assert_eq!(
+            (status, body.get("isSuccess").and_then(Value::as_bool)),
+            (200, Some(true)),
+            "case {name:?}: a repeated DeleteToken is the same success, got {status} {body}"
+        );
         for token in minted.iter().skip(1) {
             let (status, body) = get_token(&router, &app_id, &token.session_id).await;
             assert_eq!(
@@ -384,13 +446,13 @@ async fn every_minted_session_id_is_unique() {
     }
 }
 
-/// A token is addressed by (app id, session id): a session minted under one app is not
-/// found under another, and the mismatched lookup leaves it alone.
+/// A token is addressed by (app id, session id): a session minted under one app does not
+/// resolve under another, and the mismatched call — read or delete — leaves it alone.
 #[tokio::test]
 async fn a_token_lookup_is_scoped_to_its_app() {
     let router = router();
     let (owner, other) = ("downerapp0001", "dotherapp0002");
-    // BOTH apps are registered: the lookup under `other` must fail on the TOKEN, which
+    // BOTH apps are registered: the lookup under `other` must miss on the TOKEN, which
     // is what this case is about, not on the app's identity.
     register_app(&router, owner).await;
     register_app(&router, other).await;
@@ -398,27 +460,28 @@ async fn a_token_lookup_is_scoped_to_its_app() {
     assert_eq!(status, 200, "seeding CreateToken expected 200, got {body}");
     let session_id = field(&body, "sessionId").to_string();
 
-    for (operation, (status, body)) in [
-        ("GetToken", get_token(&router, other, &session_id).await),
-        (
-            "DeleteToken",
-            delete_token(&router, other, &session_id).await,
-        ),
-    ] {
-        assert_eq!(
-            status, 404,
-            "case {operation:?} under the wrong app: expected 404, got {status} {body}"
-        );
-        assert_eq!(
-            field(&body, "resourceType"),
-            RESOURCE_TYPE_CHALLENGE_TOKEN,
-            "case {operation:?} under the wrong app: names the resource type, got {body}"
-        );
-    }
+    // The read misses, as a read of a session this app holds no token for.
+    let (status, body) = get_token(&router, other, &session_id).await;
+    assert_token_not_found(
+        "GetToken under the wrong app",
+        other,
+        &session_id,
+        status,
+        &body,
+    );
+    // The delete succeeds — it validates app identity only — and must not reach into the
+    // owning app's tokens.
+    let (status, body) = delete_token(&router, other, &session_id).await;
+    assert_eq!(
+        (status, body.get("isSuccess").and_then(Value::as_bool)),
+        (200, Some(true)),
+        "case DeleteToken under the wrong app: expected 200 isSuccess true, got {status} {body}"
+    );
+
     let (status, body) = get_token(&router, owner, &session_id).await;
     assert_eq!(
         status, 200,
-        "the owner's token survives a lookup under another app, got {status} {body}"
+        "the owner's token survives a lookup and a delete under another app, got {status} {body}"
     );
 }
 
@@ -474,10 +537,13 @@ async fn a_token_stops_resolving_once_its_ttl_has_passed() {
             status, expected,
             "case {case:?}: GetToken expected {expected}, got {status} {body}"
         );
+        // Whether the clock retired the token or not, the delete is the same success:
+        // only app identity is validated on that path.
         let (status, body) = delete_token(&router, app_id, &session_id).await;
         assert_eq!(
-            status, expected,
-            "case {case:?}: DeleteToken expected {expected}, got {status} {body}"
+            (status, body.get("isSuccess").and_then(Value::as_bool)),
+            (200, Some(true)),
+            "case {case:?}: DeleteToken expected 200 isSuccess true, got {status} {body}"
         );
     }
 
@@ -548,5 +614,280 @@ async fn the_token_store_is_bounded() {
     assert_eq!(
         status, 200,
         "case minting after a reclaim: expected 200, got {status} {body}"
+    );
+}
+
+/// One row of the read-path `Ttl` table: a token placed in the store with a LIFETIME and
+/// an AGE of its own, so a read that echoed any stored lifetime would show it.
+struct TtlCase {
+    name: &'static str,
+    /// `expires_at - created_at` — the span the MINT reports as `Ttl`.
+    lifetime: Duration,
+    /// How long ago the token was minted, so the rows differ in how much of the lifetime
+    /// is left when the read happens.
+    age: Duration,
+    reads: usize,
+}
+
+/// The read path reports NO lifetime: `GetToken` answers `Ttl` as the empty string
+/// whatever lifetime the token it reports carries and however late it is read, while
+/// `CreateToken` — the call that grants the lifetime — reports it.
+///
+/// The rows differ along what the rule generalises over: the token's lifetime (this
+/// service's own, a much longer one, a much shorter one), how far into that lifetime the
+/// read happens, and how many times the token is read. Each row is seeded directly into
+/// the shared store, which is the only way to give a token a lifetime other than the one
+/// the mint grants.
+#[tokio::test]
+async fn the_read_path_reports_no_ttl() {
+    let (router, engine) = router_with_engine();
+    let app_id = "dreadpathttl01";
+    register_app(&router, app_id).await;
+
+    // The MINT half of the rule: `CreateToken` reports the lifetime it granted.
+    let (status, body) = create_token(&router, app_id).await;
+    assert_eq!(
+        status, 200,
+        "case the mint: CreateToken expected 200, got {status} {body}"
+    );
+    assert_eq!(
+        field(&body, "ttl"),
+        expected_ttl(),
+        "case the mint: CreateToken reports the lifetime it granted ({:?}), got {body}",
+        expected_ttl()
+    );
+    let minted_session = field(&body, "sessionId").to_string();
+    let (status, body) = get_token(&router, app_id, &minted_session).await;
+    assert_eq!(
+        status, 200,
+        "case the mint: GetToken expected 200, got {status} {body}"
+    );
+    assert_eq!(
+        body.get("ttl"),
+        Some(&json!(READ_PATH_TTL)),
+        "case the mint: the read of a freshly minted token reports an empty ttl, got {body}"
+    );
+
+    let rows = [
+        TtlCase {
+            name: "this service's own lifetime, read at once",
+            lifetime: CHALLENGE_TOKEN_TTL,
+            age: Duration::ZERO,
+            reads: 1,
+        },
+        TtlCase {
+            name: "this service's own lifetime, nearly run out",
+            lifetime: CHALLENGE_TOKEN_TTL,
+            age: CHALLENGE_TOKEN_TTL - Duration::from_secs(2),
+            reads: 3,
+        },
+        TtlCase {
+            name: "an hour-long lifetime, read a minute in",
+            lifetime: Duration::from_secs(3_600),
+            age: Duration::from_secs(60),
+            reads: 2,
+        },
+        TtlCase {
+            name: "a thirty-second lifetime",
+            lifetime: Duration::from_secs(30),
+            age: Duration::ZERO,
+            reads: 1,
+        },
+    ];
+
+    for (index, case) in rows.iter().enumerate() {
+        let session_id = format!("ttlcase-{index}-{:08x}", case.lifetime.as_secs());
+        let stored = seed_token(&engine, app_id, &session_id, case.lifetime, case.age);
+        // The stored record DOES carry a lifetime: the read declines to report it, it is
+        // not missing from the store.
+        assert_eq!(
+            stored.ttl(),
+            case.lifetime.as_secs().to_string(),
+            "case {:?}: the seeded token carries its own lifetime, got {:?}",
+            case.name,
+            stored.ttl()
+        );
+        for read in 1..=case.reads {
+            let (status, body) = get_token(&router, app_id, &session_id).await;
+            assert_eq!(
+                status, 200,
+                "case {:?} read {read}: GetToken expected 200, got {status} {body}",
+                case.name
+            );
+            assert_eq!(
+                body.get("ttl"),
+                Some(&json!(READ_PATH_TTL)),
+                "case {:?} read {read}: the read reports ttl as the empty string, got {body}",
+                case.name
+            );
+            // The identity members still round-trip: only the lifetime is withheld.
+            assert_eq!(
+                (
+                    field(&body, "appId"),
+                    field(&body, "sessionId"),
+                    field(&body, "challengeCode")
+                ),
+                (
+                    app_id,
+                    session_id.as_str(),
+                    stored.challenge_code.as_str()
+                ),
+                "case {:?} read {read}: the read round-trips the token's identity, got {body}",
+                case.name
+            );
+        }
+    }
+}
+
+/// Session ids no app in these cases holds a token for. They differ along what the rule
+/// generalises over — the FORM and the SIZE of the session id — and none of them is
+/// special in the handler: `SessionId` is a bare `__string` `@httpLabel` with no pattern
+/// and no length in the model, so every row is a well-formed request that simply names
+/// no live session.
+fn unheld_session_ids() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "the all-zero uuid",
+            "00000000-0000-0000-0000-000000000000".to_string(),
+        ),
+        (
+            "a uuid no mint produced",
+            "9f8e7d6c-5b4a-3928-1716-050403020100".to_string(),
+        ),
+        (
+            "a session id in the form this emulator's own mint produces",
+            "emulatorabcdefghijkl-0000000000000009".to_string(),
+        ),
+        ("a single character", "x".to_string()),
+        ("not a uuid at all", "not-a-session-id".to_string()),
+        (
+            "a session id at this emulator's identifier length bound",
+            "s".repeat(MAX_IDENTIFIER_CHARS),
+        ),
+        (
+            "a session id one past that bound",
+            "s".repeat(MAX_IDENTIFIER_CHARS + 1),
+        ),
+    ]
+}
+
+/// `DeleteToken` validates app identity ONLY, so it is idempotent over session ids: a
+/// session this app holds no live token for answers HTTP 200 with `IsSuccess: true`,
+/// twice over, and reclaims nothing else.
+///
+/// The unheld rows span the forms a client can address — including one at this emulator's
+/// identifier length bound and one past it, which the store's bound does not refuse
+/// because this path inserts nothing.
+#[tokio::test]
+async fn delete_token_is_idempotent_over_session_ids() {
+    let router = router();
+    let app_id = "didempotent001";
+    register_app(&router, app_id).await;
+    // A live token of the same app, so every row also proves the no-op reclaims nothing.
+    let (status, body) = create_token(&router, app_id).await;
+    assert_eq!(status, 200, "seeding CreateToken expected 200, got {body}");
+    let held = field(&body, "sessionId").to_string();
+
+    for (form, session_id) in unheld_session_ids() {
+        for attempt in 1..=2 {
+            let (status, body) = delete_token(&router, app_id, &session_id).await;
+            assert_eq!(
+                (status, body.get("isSuccess").and_then(Value::as_bool)),
+                (200, Some(true)),
+                "case {form:?} attempt {attempt}: expected 200 isSuccess true, got {status} {body}"
+            );
+        }
+        let (status, body) = get_token(&router, app_id, &session_id).await;
+        assert_token_not_found(
+            &format!("{form}: the no-op delete created nothing"),
+            app_id,
+            &session_id,
+            status,
+            &body,
+        );
+        let (status, body) = get_token(&router, app_id, &held).await;
+        assert_eq!(
+            status, 200,
+            "case {form:?}: the app's live token survives the no-op delete, got {status} {body}"
+        );
+    }
+
+    // The held session is the positive control: it is reclaimed once, and a repeat is the
+    // same success as every unheld row.
+    for attempt in 1..=2 {
+        let (status, body) = delete_token(&router, app_id, &held).await;
+        assert_eq!(
+            (status, body.get("isSuccess").and_then(Value::as_bool)),
+            (200, Some(true)),
+            "case the held session attempt {attempt}: expected 200 isSuccess true, got {status} {body}"
+        );
+    }
+    let (status, body) = get_token(&router, app_id, &held).await;
+    assert_token_not_found(
+        "the held session, after it was reclaimed",
+        app_id,
+        &held,
+        status,
+        &body,
+    );
+}
+
+/// Every reason a challenge-token read does not resolve is ONE refusal: HTTP 404 with the
+/// error code `ResourceNotFoundException` and this service's fixed prefixed message.
+///
+/// The rows differ in WHY the session does not resolve — never minted (in several forms),
+/// deleted, expired, minted under another app — and every one of them answers the same
+/// message, so which branch missed is not leaked to the caller.
+#[tokio::test]
+async fn a_session_that_does_not_resolve_is_one_resource_not_found() {
+    let (router, engine) = router_with_engine();
+    let app_id = "dnotfound00001";
+    let other_app = "dotherowner001";
+    register_app(&router, app_id).await;
+    register_app(&router, other_app).await;
+
+    let mut rows: Vec<(String, String)> = unheld_session_ids()
+        .into_iter()
+        .map(|(form, session_id)| (format!("never minted: {form}"), session_id))
+        .collect();
+
+    // Deleted: minted, then reclaimed.
+    let (status, body) = create_token(&router, app_id).await;
+    assert_eq!(status, 200, "seeding CreateToken expected 200, got {body}");
+    let deleted = field(&body, "sessionId").to_string();
+    let (status, body) = delete_token(&router, app_id, &deleted).await;
+    assert_eq!(
+        status, 200,
+        "seeding DeleteToken expected 200, got {status} {body}"
+    );
+    rows.push(("deleted by a previous call".to_string(), deleted));
+
+    // Expired: seeded with a lifetime the clock has already run through.
+    let expired = "expired-session-0001".to_string();
+    seed_token(
+        &engine,
+        app_id,
+        &expired,
+        CHALLENGE_TOKEN_TTL,
+        CHALLENGE_TOKEN_TTL + Duration::from_secs(1),
+    );
+    rows.push(("past its lifetime".to_string(), expired));
+
+    // Live, but under ANOTHER app: this app holds no token for it.
+    let (status, body) = create_token(&router, other_app).await;
+    assert_eq!(status, 200, "seeding CreateToken expected 200, got {body}");
+    let elsewhere = field(&body, "sessionId").to_string();
+    rows.push(("minted under another app".to_string(), elsewhere));
+
+    let mut messages = BTreeSet::new();
+    for (case, session_id) in &rows {
+        let (status, body) = get_token(&router, app_id, session_id).await;
+        assert_token_not_found(case, app_id, session_id, status, &body);
+        messages.insert(field(&body, "message").to_string());
+    }
+    assert_eq!(
+        messages.len(),
+        1,
+        "every unresolved session answers ONE fixed message, got {messages:?}"
     );
 }

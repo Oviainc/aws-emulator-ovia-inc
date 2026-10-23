@@ -256,17 +256,21 @@ fn operations(app_id: &str) -> Vec<Op> {
             method: "GET",
             path: format!("/backend/{app_id}/challenge/sess-1"),
             body: None,
-            // The app exists; no token with that session id was minted.
+            // The app exists; no token with that session id was minted. That read
+            // answers the recorded `ResourceNotFoundException`, not the modelled shape —
+            // see `src/ops/get_token.rs`.
             registered_status: 404,
-            registered_code: "NotFoundException",
+            registered_code: "ResourceNotFoundException",
         },
         Op {
             name: "DeleteToken",
             method: "POST",
             path: format!("/backend/{app_id}/challenge/sess-1/remove"),
             body: Some(json!({})),
-            registered_status: 404,
-            registered_code: "NotFoundException",
+            // Session existence is not validated on this path — only app identity — so
+            // deleting a session the app holds no token for SUCCEEDS as a no-op.
+            registered_status: 200,
+            registered_code: "",
         },
     ]
 }
@@ -431,8 +435,8 @@ async fn a_refused_request_stores_nothing() {
 }
 
 /// A REGISTERED app reaches its own resources: the same calls answer the success or the
-/// per-resource `NotFoundException` they earn, never the app-identity refusal — so the
-/// gate narrows nothing but the app id.
+/// per-resource refusal they earn, never the app-identity refusal — so the gate narrows
+/// nothing but the app id.
 #[tokio::test]
 async fn a_registered_app_reaches_its_own_resources() {
     for op in operations(REGISTERED_APP) {

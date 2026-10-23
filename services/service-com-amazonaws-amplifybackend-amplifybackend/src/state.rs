@@ -32,9 +32,6 @@ pub const RESOURCE_TYPE_BACKEND_ENVIRONMENT: &str = "backend-environment";
 pub const RESOURCE_TYPE_BACKEND_AUTH: &str = "backend-auth";
 /// `NotFoundException::ResourceType` for a job id this app never minted.
 pub const RESOURCE_TYPE_BACKEND_JOB: &str = "backend-job";
-/// `NotFoundException::ResourceType` for a challenge token (app id + session id) this
-/// service does not hold: one that was never created, already deleted, or expired.
-pub const RESOURCE_TYPE_CHALLENGE_TOKEN: &str = "challenge-token";
 
 /// The modelled `NotFoundException` payload for a resource that does not exist.
 ///
@@ -129,8 +126,10 @@ pub fn resource_not_found<E>(sentence: impl AsRef<str>) -> crate::scaffolded::Sc
 /// It is deliberately a registry LOOKUP and not "does this resource exist": the two
 /// answers differ, which is the whole point of the gate. An app id the map does not hold
 /// is refused as invalid INPUT (see [`require_registered_app`]), while a resource missing
-/// INSIDE a registered app — an environment, a job, an auth resource, a challenge token —
-/// is the modelled `NotFoundException`.
+/// INSIDE a registered app is answered as the missing resource it is — the modelled
+/// `NotFoundException` for an environment, a job or an auth resource, the recorded
+/// `ResourceNotFoundException` ([`resource_not_found`]) for the reads that answer it, and
+/// `IsSuccess: true` on `DeleteToken`, which validates nothing but the app.
 ///
 /// What it is NOT, and the one known gap: an `AppId` is minted by Amplify's `CreateApp`,
 /// so the authoritative registry is the Amplify service's app store, and an app that
@@ -348,7 +347,8 @@ pub fn format_time(at: SystemTime) -> String {
 // Admin UI challenge tokens
 //
 // `CreateToken` mints a one-time challenge code for signing in to an app's Amplify
-// Admin UI, `GetToken` reports the minted token back, and `DeleteToken` reclaims it.
+// Admin UI, `GetToken` reports the minted token back (every member but the lifetime —
+// see [`READ_PATH_TTL`]), and `DeleteToken` reclaims it.
 // A token is NOT part of a backend environment — it addresses an app directly
 // (`/backend/{AppId}/challenge`) and AmplifyBackend mints one whether or not a backend
 // was ever created for that app — so the tokens live in their own map rather than on
@@ -356,7 +356,7 @@ pub fn format_time(at: SystemTime) -> String {
 // ---------------------------------------------------------------------------
 
 /// How long a challenge code minted by `CreateToken` stays usable, and the value
-/// reported as `Ttl`.
+/// `CreateToken` reports as `Ttl` (the READ path reports none — see [`READ_PATH_TTL`]).
 ///
 /// CHOSEN, not documented: AWS publishes no lifetime for an Amplify Admin UI challenge
 /// code. The span is short, the way a one-time sign-in code's is, and long enough that a
@@ -369,6 +369,21 @@ pub const CHALLENGE_TOKEN_TTL: Duration = Duration::from_secs(300);
 /// CHOSEN: AWS publishes no length for the code. 20 characters of the credential store's
 /// 64-symbol alphabet is ~120 bits, so a code cannot be guessed inside its lifetime.
 pub const CHALLENGE_CODE_CHARS: usize = 20;
+
+/// The `Ttl` a challenge-token READ reports: the empty string.
+///
+/// Recorded behaviour, not modelled: `GetToken` and `CreateToken` share an output shape
+/// whose `Ttl` is a bare `__string` with no constraint and no documented read-path value,
+/// and the recording shows the read NOT echoing the lifetime — `AppId`, `SessionId` and
+/// `ChallengeCode` round-trip unchanged while `Ttl` comes back empty. Only the call that
+/// GRANTS the lifetime reports it ([`ChallengeToken::ttl`], used by `CreateToken`), so a
+/// client cannot read a fresh-looking lifetime off a read and mistake it for a liveness
+/// guarantee.
+///
+/// PRESENT and empty, not absent: the recorded member is the empty string, so the read
+/// path writes `Some(READ_PATH_TTL.to_string())` rather than `None`, which would omit the
+/// member from the document altogether.
+pub const READ_PATH_TTL: &str = "";
 
 /// One live Admin UI challenge token: the code itself and when it stops being usable.
 #[derive(Debug, Clone)]
@@ -409,20 +424,21 @@ impl ChallengeToken {
         now < self.expires_at
     }
 
-    /// The `Ttl` member: this code's LIFETIME — the whole seconds between the instant it
-    /// was minted and the instant it expires — as a decimal string.
+    /// The `Ttl` member AS THE MINT REPORTS IT: this code's LIFETIME — the whole seconds
+    /// between the instant it was minted and the instant it expires — as a decimal
+    /// string. `CreateToken` is the only caller: the READ path reports no lifetime at all
+    /// ([`READ_PATH_TTL`]).
     ///
     /// A lifetime, not a countdown. The model does NOT fix this: it documents the member
     /// only as "The expiry time for the one-time generated token code" and gives it no
     /// format, no pattern and no units, so the member's NAME — `Ttl`, a time to live — is
     /// the ground for reporting a span in seconds, and this emulator's choice is recorded
     /// here rather than claimed from the model. The value is read from the token's own two
-    /// instants, so every report of one token carries the same value however long after
-    /// the mint it is read. What this service enforces is the EXPIRY INSTANT
+    /// instants, so every mint of one token carries the same value. What this service
+    /// enforces is the EXPIRY INSTANT
     /// ([`Self::expires_at`], applied by
     /// [`ComAmazonawsAmplifybackendAmplifybackendState::expire_challenge_tokens`]) —
-    /// `created_at + ttl` — so a caller reading a token late is told how long the code
-    /// lives in total, not how much of that is left.
+    /// `created_at + ttl`.
     pub fn ttl(&self) -> String {
         self.expires_at
             .duration_since(self.created_at)
