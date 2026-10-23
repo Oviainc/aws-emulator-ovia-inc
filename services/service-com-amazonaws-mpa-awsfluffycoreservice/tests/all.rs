@@ -19,6 +19,8 @@ mod authorization_gate;
 mod inactive_team_version_deletion;
 #[path = "all/policy_catalog.rs"]
 mod policy_catalog;
+#[path = "all/policy_version_detail.rs"]
+mod policy_version_detail;
 #[path = "all/policy_versions.rs"]
 mod policy_versions;
 #[path = "all/resource_policies.rs"]

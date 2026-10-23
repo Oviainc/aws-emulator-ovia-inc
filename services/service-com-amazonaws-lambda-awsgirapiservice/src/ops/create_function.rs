@@ -530,6 +530,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             aliases: ::std::collections::BTreeMap::new(),
             // ... and nothing queued for it until an invocation is accepted.
             async_invocations: ::std::collections::VecDeque::new(),
+            // ... and no stored runtime management configuration until
+            // `PutRuntimeManagementConfig` stores one, so every version reports the
+            // documented `Auto` default until then.
+            runtime_management_configs: ::std::collections::BTreeMap::new(),
         };
 
         // "Use the Publish parameter to create version 1 of your function from its

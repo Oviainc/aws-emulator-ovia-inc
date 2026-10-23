@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -159,20 +150,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartJob"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartJobErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the Amplify emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // `jobId` is modelled `length 0..255` with `pattern ^[0-9]+$`, so the empty
+        // string is the one value that satisfies the length bound and names no job;
+        // it is "absent" here, exactly like an omitted member.
+        let requested_job_id = input
+            .job_id
+            .as_deref()
+            .filter(|job_id| !job_id.is_empty())
+            .map(str::to_string);
+
+        // `StartJobRequest$jobId` is "the unique ID for an existing job. This is
+        // required if the value of jobType is RETRY" — a RETRY re-runs a job that
+        // already exists, so a RETRY without an id names nothing to re-run and the
+        // request is refused with the modelled 400 rather than starting a new job.
+        let retry = input.job_type == RETRY_JOB_TYPE;
+        if retry && requested_job_id.is_none() {
+            return Err(StartJobErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "jobId is required when jobType is {RETRY_JOB_TYPE}."
+                )),
+            })
+            .into());
+        }
+
+        let started = crate::state::now();
+        let mut store = state.lock();
+
+        // A job runs on a branch of an app, so neither an unknown app nor a branch
+        // this app does not carry is created on the way: the 404 names the entity that
+        // is actually absent.
+        let app = store.apps.get_mut(&input.app_id).ok_or_else(|| {
+            StartJobErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::APP_ENTITY,
+                    &input.app_id,
+                )),
+            })
+        })?;
+        let branch = app.branches.get_mut(&input.branch_name).ok_or_else(|| {
+            StartJobErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::BRANCH_ENTITY,
+                    &input.branch_name,
+                )),
+            })
+        })?;
+
+        // A RETRY runs the job the request named, so that job must exist on this
+        // branch; every other job type starts a NEW job and the branch mints its id.
+        // `jobId` is documented only as the id a RETRY re-runs, so on any other job
+        // type it names nothing and the new job keeps its own minted id.
+        let job_id = if retry {
+            let job_id = requested_job_id.unwrap_or_default();
+            if !branch.jobs.contains_key(&job_id) {
+                return Err(StartJobErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::not_found_message(
+                        crate::state::JOB_ENTITY,
+                        &job_id,
+                    )),
+                })
+                .into());
+            }
+            job_id
+        } else {
+            // A new job is one more entry in the branch's BOUNDED job history, so the
+            // room for it is made (the oldest finished job retired) before the id is
+            // minted. A branch at its cap with every job still running has nothing to
+            // retire: that start is refused with the modelled quota error instead of
+            // growing the map, which is the only way this store can grow.
+            if !branch.make_room_for_a_job() {
+                return Err(StartJobErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Number of running jobs exceeds the limit of {} for branch {}",
+                            crate::state::MAX_JOBS_PER_BRANCH,
+                            input.branch_name
+                        )),
+                    },
+                )
+                .into());
+            }
+            branch.mint_job_id()
+        };
+
+        // The commit a job builds is whatever the request carries; a RETRY that does
+        // not re-state it rebuilds the SAME commit the job it re-runs was started for.
+        // Each member is @required on `JobSummary` with a length minimum of 0, so a
+        // job started for no particular commit carries the empty value rather than
+        // none — and `commitTime` has no empty value, so a request that states none
+        // records the instant the job was started for.
+        let retried = branch.jobs.get(&job_id).map(|stored| stored.job.summary.clone());
+        let summary = JobSummary {
+            job_arn: format!("{}/jobs/{job_id}", branch.branch.branch_arn),
+            commit_id: input
+                .commit_id
+                .or_else(|| retried.as_ref().map(|summary| summary.commit_id.clone()))
+                .unwrap_or_default(),
+            commit_message: input
+                .commit_message
+                .or_else(|| retried.as_ref().map(|summary| summary.commit_message.clone()))
+                .unwrap_or_default(),
+            commit_time: input
+                .commit_time
+                .or_else(|| retried.as_ref().map(|summary| summary.commit_time))
+                .unwrap_or(started),
+            // A started job has run nothing yet: it is PENDING, it has no end, and
+            // the clock settles it (see `crate::state::BranchJob::settle`).
+            start_time: started,
+            status: crate::state::JOB_STATUS_PENDING.to_string(),
+            end_time: None,
+            job_type: input.job_type,
+            // `sourceUrl`/`sourceUrlType` describe the files a DEPLOYMENT uploaded,
+            // which is `StartDeployment`'s job and not this one's.
+            source_url: None,
+            source_url_type: None,
+            job_id,
+        };
+
+        // `jobReason` is "a descriptive reason for starting the job"; neither
+        // `JobSummary` nor `Job` models a member to report it on, so it is accepted
+        // and nothing claims to echo it back.
+        let job = Job {
+            summary: summary.clone(),
+            steps: Vec::new(),
+        };
+        branch.jobs.insert(
+            summary.job_id.clone(),
+            crate::state::BranchJob::started(job),
+        );
+
+        // The branch's own view of its jobs: the job just started is the active one,
+        // and `totalNumberOfJobs` counts the jobs this branch has STARTED — which a
+        // RETRY, re-running an existing job, leaves where it was, and which retiring
+        // old history does not rewrite.
+        branch.branch.active_job_id = summary.job_id.clone();
+        branch.branch.total_number_of_jobs = branch.jobs_started().to_string();
+
+        Ok(StartJobOutput {
+            job_summary: summary,
+        })
     }
 }
+
+/// The `jobType` whose job is an existing one, re-run.
+///
+/// `JobType` is modelled `RELEASE | RETRY | MANUAL | WEB_HOOK`
+/// (`smithy_query(query="shape",shape="JobType")`), and `RETRY` is the one value that
+/// addresses a job that already exists — hence the modelled requirement that a RETRY
+/// carry the `jobId` of that job.
+const RETRY_JOB_TYPE: &str = "RETRY";

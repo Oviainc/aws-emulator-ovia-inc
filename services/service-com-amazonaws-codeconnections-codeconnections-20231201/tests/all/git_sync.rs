@@ -24,11 +24,11 @@ use super::connection_lifecycle::{PROVIDER_TYPES, REGION, call, create, router, 
 
 /// The only value the modeled `SyncConfigurationType` enum accepts, from
 /// `smithy_query(query="shape", shape="SyncConfigurationType")`.
-const SYNC_TYPE: &str = "CFN_STACK_SYNC";
+pub(crate) const SYNC_TYPE: &str = "CFN_STACK_SYNC";
 
 /// A `RoleArn` matching the modeled `IamRoleArn` pattern
 /// `^arn:aws(-[\w]+)*:iam::\d{12}:role/[a-zA-Z_0-9+=,.@\-_/]+$`.
-fn role_arn(name: &str) -> String {
+pub(crate) fn role_arn(name: &str) -> String {
     format!(
         "arn:aws:iam::{}:role/{name}",
         engine::emulator_account_id()
@@ -45,18 +45,18 @@ fn kms_key_arn(key: &str) -> String {
 }
 
 /// One `CreateRepositoryLink` request whose round trip a suite asserts.
-struct LinkCase {
+pub(crate) struct LinkCase {
     /// What a failing assertion names this row by.
-    label: &'static str,
+    pub(crate) label: &'static str,
     /// The provider type of the connection the link is created on — and therefore the
     /// `ProviderType` the link must report, since `RepositoryLinkInfo.ProviderType` is
     /// the provider type OF THE CONNECTION.
-    provider_type: &'static str,
-    owner_id: String,
-    repository_name: String,
-    encryption_key_arn: Option<String>,
+    pub(crate) provider_type: &'static str,
+    pub(crate) owner_id: String,
+    pub(crate) repository_name: String,
+    pub(crate) encryption_key_arn: Option<String>,
     /// Tags as `(Key, Value)`, in the order the create supplies them.
-    tags: Vec<(&'static str, &'static str)>,
+    pub(crate) tags: Vec<(&'static str, &'static str)>,
 }
 
 /// The table: one row per modeled `ProviderType`, differing also in owner-id and
@@ -175,7 +175,7 @@ fn assert_repository_link_arn(case: &str, arn: &str, id: &str) {
 }
 
 /// Create a repository link for one row and return `(RepositoryLinkId, connection ARN)`.
-async fn create_link(
+pub(crate) async fn create_link(
     router: &MultiServiceRouter,
     case: &LinkCase,
     connection_name: &str,
@@ -524,16 +524,16 @@ async fn updating_a_repository_link_replaces_only_what_it_names() {
 }
 
 /// One `CreateSyncConfiguration` request, and the member an update then replaces.
-struct SyncCase {
-    label: &'static str,
-    resource_name: String,
-    branch: String,
-    config_file: String,
-    publish_deployment_status: Option<&'static str>,
-    trigger_resource_update_on: Option<&'static str>,
-    pull_request_comment: Option<&'static str>,
+pub(crate) struct SyncCase {
+    pub(crate) label: &'static str,
+    pub(crate) resource_name: String,
+    pub(crate) branch: String,
+    pub(crate) config_file: String,
+    pub(crate) publish_deployment_status: Option<&'static str>,
+    pub(crate) trigger_resource_update_on: Option<&'static str>,
+    pub(crate) pull_request_comment: Option<&'static str>,
     /// The `UpdateSyncConfiguration` members this row then replaces, as wire fields.
-    update: serde_json::Value,
+    pub(crate) update: serde_json::Value,
 }
 
 /// The table: configurations differing in resource-name form, branch length (each
@@ -614,7 +614,7 @@ fn sync_cases() -> Vec<SyncCase> {
 }
 
 /// The `CreateSyncConfiguration` body for one row, against `repository_link_id`.
-fn create_sync_body(case: &SyncCase, repository_link_id: &str) -> serde_json::Value {
+pub(crate) fn create_sync_body(case: &SyncCase, repository_link_id: &str) -> serde_json::Value {
     let mut body = serde_json::json!({
         "Branch": case.branch,
         "ConfigFile": case.config_file,
@@ -906,7 +906,7 @@ async fn repointing_a_sync_configuration_re_derives_the_repository_members() {
 
 /// Well-formed `RepositoryLinkId` values the store does not hold: UUID-shaped labels
 /// the modeled pattern admits, including both hex cases and the all-zero id.
-const ABSENT_LINK_IDS: &[&str] = &[
+pub(crate) const ABSENT_LINK_IDS: &[&str] = &[
     "00000000-0000-0000-0000-000000000000",
     "deadbeef-dead-beef-dead-beefdeadbeef",
     "DEADBEEF-DEAD-BEEF-DEAD-BEEFDEADBEEF",

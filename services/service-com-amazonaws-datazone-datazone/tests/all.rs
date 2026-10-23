@@ -25,6 +25,8 @@ mod domain_unit_hierarchy;
 mod domain_units_for_parent;
 #[path = "all/entity_owners.rs"]
 mod entity_owners;
+#[path = "all/form_type_deletion.rs"]
+mod form_type_deletion;
 #[path = "all/form_type_revisions.rs"]
 mod form_type_revisions;
 #[path = "all/glossary_lifecycle.rs"]

@@ -284,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(CreateSchemaOutput {
             description: stored.description.clone(),
             last_modified: Some(stored.last_modified.into()),
-            schema_arn: Some(registry.schema_arn_in(&region, stored)),
+            schema_arn: Some(registry.reported_schema_arn_in(&region, stored)),
             schema_name: Some(stored.name.clone()),
             schema_version: Some(version.version.to_string()),
             tags: crate::state::tags_to_output(&stored.tags),

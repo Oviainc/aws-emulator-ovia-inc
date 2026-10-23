@@ -15,6 +15,13 @@
 //! actually changed — the operation is `@idempotent`, so a repeat of the same
 //! update leaves the record exactly as it was.
 //!
+//! `state` is the documented activate/deactivate toggle, so only the states a
+//! CALLER may ask for ([`crate::state::SETTABLE_PROBE_STATES`]) are accepted:
+//! the modelled `ProbeState` enum also carries the values the SERVICE assigns
+//! over a probe's lifecycle (`PENDING`, `ERROR`, `DELETING`, `DELETED`), and a
+//! request naming one of those is refused with `ValidationException` before any
+//! member is written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -159,7 +166,9 @@ impl From<UpdateProbeErrorModeled> for UpdateProbeError {
 ///
 /// Used for the probe rules the model documents in prose but its constraints
 /// cannot express — the `destination`, `destinationPort` and `protocol` rules
-/// checked by [`crate::state::validate_probe_spec`] on the MERGED record.
+/// checked by [`crate::state::validate_probe_spec`] on the MERGED record, and
+/// the settable-`state` allow-list
+/// ([`crate::state::validate_settable_probe_state`]).
 fn validation(message: String) -> UpdateProbeError {
     UpdateProbeErrorModeled::ValidationException(ValidationException {
         message: Some(message),
@@ -229,6 +238,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // `state` is the activate/deactivate toggle: the enum admits every
+        // state a probe can be REPORTED in, including the ones the service
+        // assigns itself, so the settable allow-list is checked here. Refused
+        // before the store is even reached, so nothing is written.
+        if let Some(requested_state) = input.state.as_deref() {
+            crate::state::validate_settable_probe_state(requested_state).map_err(validation)?;
+        }
         // `monitorName`'s and `probeId`'s `@pattern`s, `destination`'s
         // `@length`, `destinationPort`'s and `packetSize`'s `@range`s and the
         // `state` / `protocol` enums are refused by the framework BEFORE this
@@ -297,16 +313,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // never a value the caller sets.
         probe.address_family = address_family.to_string();
 
+        // Checked against the settable allow-list above, so what is stored here
+        // is one of the two states a caller may ask for and never a
+        // service-assigned lifecycle value.
         if let Some(requested_state) = input.state {
             if probe.state != requested_state {
                 changed = true;
-                if requested_state == crate::state::PROBE_STATE_PENDING {
-                    // A probe the caller puts back into `PENDING` is
-                    // provisioning again, so the clock owes it `ACTIVE` afresh.
-                    probe.schedule_activation(now);
-                } else {
-                    probe.state = requested_state;
-                }
+                probe.state = requested_state;
             }
         }
         if changed {

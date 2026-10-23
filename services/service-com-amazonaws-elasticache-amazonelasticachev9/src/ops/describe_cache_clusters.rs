@@ -243,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(cluster) = store.cache_clusters.get(&key) else {
                 return Err(DescribeCacheClustersErrorModeled::CacheClusterNotFoundFault(
                     CacheClusterNotFoundFault {
-                        message: Some(format!("Cache cluster {id} not found.")),
+                        message: Some(crate::state::cache_cluster_not_found_message(id)),
                     },
                 )
                 .into());

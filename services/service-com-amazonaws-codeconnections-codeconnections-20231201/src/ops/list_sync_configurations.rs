@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSyncConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSyncConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSyncConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +149,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSyncConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSyncConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSyncConfigurations"))
+        // A pure report over the stored sync configurations of one repository link.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSyncConfigurationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The CodeConnections resource store is unavailable. Try again.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A token this service did not issue names no position, so the request is
+        // refused rather than silently answered from the top of the list. The refusal is
+        // this operation's modeled `InvalidInputException` (400): the input is what is
+        // wrong, and nothing is missing.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_resource_name_page_token(token).ok_or_else(|| {
+                    ListSyncConfigurationsErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(format!(
+                                "NextToken is not a token this service issued: '{token}'"
+                            )),
+                        },
+                    )
+                })?,
+            ),
+            None => None,
+        };
+
+        let store = state.lock();
+        // The report is "the sync configurations OF a repository link", so the link id is
+        // RESOLVED against the repository-link store first: a well-formed id naming no
+        // link is not the same answer as "this link has no sync configurations". A link
+        // id that resolves to nothing makes THIS request invalid rather than naming a
+        // missing report, so it is refused with the modeled `InvalidInputException`
+        // (400) — the same code and request-built message every other operation that
+        // resolves a repository link applies (`GetRepositorySyncStatus`,
+        // `CreateSyncConfiguration`), and the code the recorded AWS behaviour shows for
+        // this call.
+        if !store.repository_links.contains_key(&input.repository_link_id) {
+            return Err(ListSyncConfigurationsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Repository Link with id {} was not found",
+                        input.repository_link_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Walked in `(SyncType, ResourceName)` key order; with the sync type fixed by the
+        // request that is `ResourceName` order, so the page a token resumes is the
+        // continuation of the page that issued it.
+        let matching: Vec<&crate::state::StoredSyncConfiguration> = store
+            .sync_configurations
+            .values()
+            .filter(|configuration| {
+                configuration.sync_type == input.sync_type
+                    && configuration.repository_link_id == input.repository_link_id
+            })
+            .filter(|configuration| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| configuration.resource_name.as_str() > after)
+            })
+            .collect();
+
+        // Server-side page bound and token: the one rule `state::page_of` holds for every
+        // paginated report of this service — the modelled `MaxResults` maximum is the
+        // page size whatever the caller asked for, and the remainder is reported through
+        // `NextToken`.
+        let (page, next_token) =
+            crate::state::page_of(&matching, input.max_results, |configuration| {
+                configuration.resource_name.as_str()
+            });
+
+        Ok(ListSyncConfigurationsOutput {
+            sync_configurations: page
+                .iter()
+                .map(|configuration| configuration.to_modeled())
+                .collect(),
+            next_token,
+        })
     }
 }

@@ -205,6 +205,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        // A summary carries only the members the schema HAS — see
+        // `Registry::schema_arn_in`.
         let schema_arn = registry.schema_arn_in(&region, schema);
         Ok(ListSchemaVersionsOutput {
             next_token: page.next_token,
@@ -212,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 page.items
                     .into_iter()
                     .map(|version| SchemaVersionSummary {
-                        schema_arn: Some(schema_arn.clone()),
+                        schema_arn: schema_arn.clone(),
                         schema_name: Some(schema.name.clone()),
                         schema_version: Some(version.version.to_string()),
                         // The type of THIS version's content: a later version can be

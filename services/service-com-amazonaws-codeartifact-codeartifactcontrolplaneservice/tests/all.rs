@@ -51,3 +51,5 @@ mod error_message_composition;
 mod error_envelopes;
 #[path = "all/removals_and_copies.rs"]
 mod removals_and_copies;
+#[path = "all/package_version_description.rs"]
+mod package_version_description;

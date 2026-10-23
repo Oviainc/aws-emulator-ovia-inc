@@ -36,17 +36,22 @@
 //! FEEDBACK is the other record a caller writes onto an inquiry:
 //! `PutComplianceInquiryFeedback` records a rating on one of the inquiry's queries (or on
 //! the inquiry's response as a whole when the request names no query), so an
-//! [`InquiryFeedback`] lives on the inquiry record beside its tags, keyed by the query it
-//! was given on — a `Put` replaces the feedback already held for that key, and the record
-//! is reported back in the document [`ComplianceInquiry::export_document`] renders. That
+//! [`InquiryFeedback`] lives on the inquiry record beside its tags, keyed by the
+//! [`FeedbackTarget`] it was given on — the query AND the response revision of it. One
+//! target carries at most ONE feedback ever: a second submission against a target that
+//! already carries feedback is refused with [`feedback_already_submitted`] rather than
+//! replacing it, which is the guard `PutComplianceInquiryFeedbackRequest$responseRevisionId`
+//! advertises ("use this value to prevent submitting feedback on a stale response"), and
+//! the record is reported back in the document [`ComplianceInquiry::export_document`]
+//! renders. That
 //! document's `feedback` key is this EMULATOR's rendering of what it holds, not modelled
 //! content: AWS publishes an export as an opaque S3 object whose format the API does not
 //! state (see [`INQUIRY_EXPORT_OBJECT`]), and the key is what makes the stored feedback
 //! readable at all — the model declares no operation that reports it back. The
 //! `clientToken` that call carries is remembered in
 //! [`ComAmazonawsArtifactArtifactState::inquiry_feedback_tokens`], so a repeat of one
-//! request replays its first answer and the same token on a different request is a
-//! conflict.
+//! request replays its first answer — the idempotency layer ON TOP of the per-target rule,
+//! never the rule itself.
 //!
 //! An inquiry EXPORT is the second thing a caller creates: `ExportComplianceInquiry`
 //! produces a document from one inquiry, so each call mints an [`InquiryExport`] whose id
@@ -149,6 +154,16 @@ pub const INQUIRY_CAPACITY: usize = 1_000;
 /// [`INQUIRY_CAPACITY`]: AWS documents no lifetime for this token, so the records are
 /// bounded by count rather than expired on a span this emulator would be inventing.
 pub const INQUIRY_IDEMPOTENCY_CAPACITY: usize = 1_000;
+
+/// How many FEEDBACK records one inquiry holds before `PutComplianceInquiryFeedback`
+/// refuses another.
+///
+/// One record per [`FeedbackTarget`], and a request may name any `responseRevisionId` an
+/// `Integer` carries, so the set an inquiry can hold is otherwise unbounded. The same kind
+/// of emulator-owned bound as [`INQUIRY_CAPACITY`], and refused the same way rather than
+/// evicted: a record that was forgotten would let a response revision be rated a second
+/// time, which is exactly what a feedback record exists to prevent.
+pub const FEEDBACK_PER_INQUIRY_CAPACITY: usize = 1_000;
 
 /// How many compliance-inquiry EXPORTS the store holds before the oldest is released.
 ///
@@ -614,13 +629,24 @@ impl InquiryQuery {
     }
 }
 
+/// WHAT one piece of feedback is about: the query it was given on — `None` for the
+/// inquiry's response as a whole, which the request names no `queryIdentifier` for — and
+/// the response revision of that query the request named, `None` when it named none.
+///
+/// This pair is the uniqueness key of a feedback record: a response revision accepts
+/// exactly one submitted feedback, so the pair is what a second submission is refused
+/// against. A revision the inquiry has no feedback for yet is a target of its own, which
+/// is what makes feedback on a LATER revision of the same query a new record rather than a
+/// conflict.
+pub type FeedbackTarget = (Option<i32>, Option<i32>);
+
 /// One piece of feedback a caller submitted on a compliance inquiry, as
 /// `PutComplianceInquiryFeedback` persists it.
 ///
-/// The record is keyed on the inquiry by the query it was given on, so a later `Put` on
-/// that query REPLACES it: feedback is the caller's current rating of one response, not an
-/// append-only log, which is also what bounds the set an inquiry can hold to its queries
-/// plus the one entry for the inquiry as a whole.
+/// The record is keyed on the inquiry by its [`FeedbackTarget`], and a target that already
+/// carries a record is REFUSED a second one: feedback is submitted once per response
+/// revision, never replaced, which is also what bounds the set an inquiry can hold to one
+/// record per (query, revision) it has been rated on.
 #[derive(Debug, Clone)]
 pub struct InquiryFeedback {
     /// "The sequential identifier of the query to provide feedback on", or `None` when the
@@ -637,13 +663,25 @@ pub struct InquiryFeedback {
     pub comment: Option<String>,
     /// "The response revision ID", as the request named it.
     ///
-    /// Recorded rather than compared: nothing in this emulator generates a response or an
-    /// edit to one (see [`InquiryQuery::response`]), so no stored revision exists for a
-    /// request's value to be stale against, and no staleness refusal is synthesised for a
-    /// comparison nothing could make.
+    /// Part of the record's [`FeedbackTarget`]: the revision is what feedback is submitted
+    /// once per, so two submissions naming different revisions of one query are two
+    /// records and a second submission naming the same one is refused.
+    ///
+    /// It is not compared against a GENERATED revision, though: nothing in this emulator
+    /// generates a response or an edit to one (see [`InquiryQuery::response`]), so no
+    /// stored revision exists for a request's value to be stale against, and no staleness
+    /// refusal is synthesised for a comparison nothing could make.
     pub response_revision_id: Option<i32>,
     /// "The timestamp when the feedback was submitted" — what the call answered with.
     pub submitted_at: SystemTime,
+}
+
+impl InquiryFeedback {
+    /// The [`FeedbackTarget`] this record was submitted against, so the key a stored record
+    /// is held under is read off the record itself rather than rebuilt beside it.
+    pub fn target(&self) -> FeedbackTarget {
+        (self.query_identifier, self.response_revision_id)
+    }
 }
 
 /// One compliance inquiry a caller created, as this emulator persists it.
@@ -678,9 +716,10 @@ pub struct ComplianceInquiry {
     pub processing_due_at: Option<SystemTime>,
     pub tags: BTreeMap<String, String>,
     /// The feedback `PutComplianceInquiryFeedback` has recorded on this inquiry, keyed by
-    /// the `queryIdentifier` it was given on — `None` for the feedback on the inquiry's
-    /// response as a whole, which a `BTreeMap` orders first.
-    pub feedback: BTreeMap<Option<i32>, InquiryFeedback>,
+    /// the [`FeedbackTarget`] it was given on — the query and the response revision — so
+    /// one revision holds at most one record. A `BTreeMap` orders the inquiry-wide entries
+    /// first, then by ascending query identifier and revision.
+    pub feedback: BTreeMap<FeedbackTarget, InquiryFeedback>,
 }
 
 impl ComplianceInquiry {
@@ -736,6 +775,28 @@ impl ComplianceInquiry {
             self.status = INQUIRY_STATUS_COMPLETED.to_string();
             self.status_message = INQUIRY_MESSAGE_COMPLETE.to_string();
         }
+    }
+
+    /// The feedback this inquiry already holds for `target`, if any.
+    ///
+    /// What makes a second submission against ONE response revision a conflict rather than
+    /// a replacement: the record's presence is the state condition the refusal is keyed on.
+    pub fn feedback_for(&self, target: FeedbackTarget) -> Option<&InquiryFeedback> {
+        self.feedback.get(&target)
+    }
+
+    /// Whether this inquiry can hold another feedback record — [`FEEDBACK_PER_INQUIRY_CAPACITY`].
+    pub fn accepts_another_feedback(&self) -> bool {
+        self.feedback.len() < FEEDBACK_PER_INQUIRY_CAPACITY
+    }
+
+    /// Record `feedback` against its own [`FeedbackTarget`], so the key a record is stored
+    /// under is always the one the record itself names.
+    ///
+    /// Only ever called for a target this inquiry holds no record for
+    /// ([`feedback_for`](Self::feedback_for)): one revision is rated once.
+    pub fn record_feedback(&mut self, feedback: InquiryFeedback) {
+        self.feedback.insert(feedback.target(), feedback);
     }
 
     /// The name every read of this inquiry reports — `InquirySummary$name`,
@@ -846,8 +907,8 @@ impl ComplianceInquiry {
 
     /// The feedback this inquiry holds for the queries `covered` names, as the exported
     /// document reports it — read off the stored [`InquiryFeedback`] records, in the key
-    /// order the store holds them in (the inquiry-wide entry first, then by ascending
-    /// query identifier).
+    /// order the store holds them in (the inquiry-wide entries first, then by ascending
+    /// query identifier and response revision).
     ///
     /// Filtered to `covered` for the same reason the `queries` list is: the document is a
     /// report on the queries the export covers, so feedback on a query it does not cover
@@ -1692,8 +1753,40 @@ pub fn inquiry_token_mismatch(inquiry_id: &str) -> ConflictException {
     }
 }
 
+/// The modelled `ConflictException` for a feedback submission against a response revision
+/// that already carries feedback.
+///
+/// The STATE condition is the rule: a response revision of a compliance inquiry query
+/// accepts exactly one submitted feedback, so a second submission against one is refused
+/// whatever `clientToken` it carries — that is the guard
+/// `PutComplianceInquiryFeedbackRequest$responseRevisionId` advertises ("use this value to
+/// prevent submitting feedback on a stale response"), and it is what lets a client tell
+/// "this revision has been rated" (terminal) from a token collision (retry with a new
+/// token).
+///
+/// The message is the service's own fixed text for this condition, as AWS states it; the
+/// requirement is the condition, not the wording. `resourceId` and `resourceType` are the
+/// `@required` members of the modelled error, naming the inquiry the conflicting record
+/// lives on, exactly as every other conflict of this service names its resource.
+pub fn feedback_already_submitted(inquiry_id: &str) -> ConflictException {
+    ConflictException {
+        message: FEEDBACK_ALREADY_SUBMITTED_MESSAGE.to_string(),
+        resource_id: inquiry_id.to_string(),
+        resource_type: INQUIRY_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The message [`feedback_already_submitted`] states, as AWS states it for this condition.
+pub const FEEDBACK_ALREADY_SUBMITTED_MESSAGE: &str =
+    "Feedback already submitted for this response version.";
+
 /// The modelled `ConflictException` for a `clientToken` replayed on a feedback submission
 /// that is not the one it recorded feedback for.
+///
+/// This is the IDEMPOTENCY layer, not the per-revision rule above: it refuses a token
+/// reused on a request that targets something else, and a submission against an
+/// already-rated revision is refused by [`feedback_already_submitted`] first, whatever
+/// token it carries.
 ///
 /// The same judgement [`inquiry_token_mismatch`] states for a create, for the same reason:
 /// an `@idempotencyToken` identifies ONE call, so honouring it on a different request would

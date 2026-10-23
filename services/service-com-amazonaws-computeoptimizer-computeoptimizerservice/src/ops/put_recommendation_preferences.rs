@@ -439,7 +439,7 @@ const UTILIZATION_PREFERENCES_RESOURCE_TYPES: &[&str] =
 const PREFERENCE_AT_RESOURCE_LEVEL_RESOURCE_TYPES: &[&str] = &[
     crate::state::RESOURCE_TYPE_EC2_INSTANCE,
     crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP,
-    "EbsVolume",
+    crate::state::RESOURCE_TYPE_EBS_VOLUME,
     "EcsService",
     "RdsDBInstance",
     "AuroraDBClusterStorage",

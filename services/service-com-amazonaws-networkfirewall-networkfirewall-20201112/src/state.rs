@@ -924,6 +924,54 @@ pub enum RuleGroupLookupError {
 pub const TYPE_REQUIRED_MESSAGE: &str =
     "Type is required for requests that do not include the RuleGroupArn.";
 
+/// What EVERY `ResourceNotFoundException` this service answers carries.
+///
+/// Network Firewall's exception messages are a property of the exception, not of
+/// the request: the same text answers a missing firewall, firewall policy, rule
+/// group or resource policy, and it names neither the resource, nor its type, nor
+/// its ARN. The model fixes the classification and the status only
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`: client error,
+/// HTTP 400, member `Message`), so the text is the recorded one, which is
+/// byte-identical across the operations the corpus exercises.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str =
+    "No object with the provided name or resource identifier was found";
+
+/// What a create whose name is already taken is refused with — resource-agnostic
+/// in the same way [`RESOURCE_NOT_FOUND_MESSAGE`] is: it names neither the kind
+/// of resource, nor its type, nor the name the request asked for.
+pub const RESOURCE_ALREADY_EXISTS_MESSAGE: &str = "A resource with the specified name already exists";
+
+/// What EVERY `InvalidTokenException` this service answers carries: the token
+/// check is the same optimistic-locking rule on every resource, so the message
+/// names neither the resource nor the token
+/// (`smithy_query(query="shape",shape="InvalidTokenException")`: client error,
+/// HTTP 400, "The token you provided is stale or isn't valid for the operation").
+pub const INVALID_TOKEN_MESSAGE: &str = "Update token isn't valid.";
+
+/// A refusal whose message IS built from the request: a fixed stem, then the
+/// offending value in parameter brackets.
+///
+/// This is the one shape Network Firewall's request-derived error text takes, and
+/// it is parseable by construction — a client matches the stem to tell which
+/// check failed and reads the bracketed value to learn which input tripped it.
+pub fn parameter_message(stem: &str, parameter: &str) -> String {
+    format!("{stem}, parameter: [{parameter}]")
+}
+
+/// The refusal for a reference naming an ARN no stored resource of `kind`
+/// carries: the stem names the referenced resource KIND and the defect — never
+/// the input member the reference arrived in — and the offending ARN rides in the
+/// parameter brackets (see [`parameter_message`]).
+pub fn missing_arn_message(kind: &str, arn: &str) -> String {
+    parameter_message(&format!("{kind} ARN does not exist"), arn)
+}
+
+/// How [`missing_arn_message`] and friends name a rule group.
+pub const KIND_RULE_GROUP: &str = "rule group";
+
+/// How [`missing_arn_message`] and friends name a firewall policy.
+pub const KIND_FIREWALL_POLICY: &str = "firewall policy";
+
 /// The status of one firewall endpoint, as persisted.
 #[derive(Debug, Clone)]
 pub struct SyncStateRecord {
@@ -1341,43 +1389,43 @@ impl ComAmazonawsNetworkfirewallNetworkfirewall20201112State {
             .stateless_rule_group_references
             .iter()
             .flatten()
-            .map(|reference| {
-                (
-                    "StatelessRuleGroupReferences",
-                    &reference.resource_arn,
-                    false,
-                )
-            });
+            .map(|reference| (&reference.resource_arn, false));
         let stateful = policy
             .stateful_rule_group_references
             .iter()
             .flatten()
-            .map(|reference| ("StatefulRuleGroupReferences", &reference.resource_arn, true));
+            .map(|reference| (&reference.resource_arn, true));
 
-        for (member, arn, wants_stateful) in stateless.chain(stateful) {
+        for (arn, wants_stateful) in stateless.chain(stateful) {
             let Some(record) = self
                 .rule_group_arn_index
                 .get(arn)
                 .and_then(|key| self.rule_groups.get(key))
             else {
-                return Some(format!(
-                    "FirewallPolicy.{member} references a rule group that does not exist, \
-                     parameter: [{arn}]"
-                ));
+                // The message is built from the request, so it takes the
+                // service's one request-derived shape: a fixed stem naming the
+                // referenced KIND and the defect, then the offending ARN in
+                // parameter brackets. The input member the reference arrived in
+                // is not part of it.
+                return Some(missing_arn_message(KIND_RULE_GROUP, arn));
             };
             // Every type other than STATELESS is a stateful rule group, which is
             // the same split the store's keys are built on.
             let is_stateful = record.rule_group_type != RULE_GROUP_STATELESS;
             if is_stateful != wants_stateful {
-                return Some(format!(
-                    "FirewallPolicy.{member} must reference a {} rule group, but [{arn}] is a \
-                     {} rule group.",
-                    if wants_stateful {
-                        "stateful"
-                    } else {
-                        RULE_GROUP_STATELESS
-                    },
-                    record.rule_group_type
+                // Same shape as the miss above: a fixed stem plus the ARN in
+                // parameter brackets, naming the kind the reference list is for
+                // rather than the list's member name.
+                return Some(parameter_message(
+                    &format!(
+                        "{} rule group ARN is not valid",
+                        if wants_stateful {
+                            "stateful"
+                        } else {
+                            "stateless"
+                        }
+                    ),
+                    arn,
                 ));
             }
         }
@@ -1493,14 +1541,15 @@ fn resolve(
 /// declares), so the mapping cannot be a single function. This macro keeps it a
 /// single piece of wording: a request naming no resource at all, or naming two
 /// different ones, is a bad request; one naming a resource that is not stored is
-/// a miss.
+/// a miss answered with the service's one constant
+/// [`RESOURCE_NOT_FOUND_MESSAGE`], which carries nothing from the request.
 ///
 /// Internal to this crate: `pub(crate) use` below keeps it off the crate's
 /// public surface while still letting `src/ops/*` reach it by path.
 macro_rules! impl_resolve_error {
     (
         $mapper:ident -> $error:ty, $modeled:ident,
-        resource = $resource:literal, plural = $plural:literal,
+        plural = $plural:literal,
         name_member = $name_member:literal, arn_member = $arn_member:literal
     ) => {
         /// Map a name/ARN resolution failure onto this operation's modelled errors.
@@ -1509,7 +1558,7 @@ macro_rules! impl_resolve_error {
                 $crate::state::ResolveError::NotFound => $modeled::ResourceNotFoundException(
                     $crate::ops::types::ResourceNotFoundException {
                         message: ::std::option::Option::Some(
-                            concat!("The ", $resource, " does not exist.").to_string(),
+                            $crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
                         ),
                     },
                 ),

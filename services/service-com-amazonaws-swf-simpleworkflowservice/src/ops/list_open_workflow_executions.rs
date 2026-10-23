@@ -234,7 +234,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the executions"; `reverseOrder` returns them ascending instead. Sorting is by
         // the full order key, so the position of two runs started in the same instant
         // is still defined — the store holds them in a map with no order of its own.
-        matching.sort_by_key(|execution| crate::state::execution_order_key(execution));
+        // Every run this listing reports is OPEN, so the only instant it can order on
+        // is the start instant: a run that has closed is reported by the
+        // closed-execution listing, which chooses between the two.
+        let basis = crate::state::ExecutionTimeBasis::StartTime;
+        matching.sort_by_key(|execution| crate::state::execution_order_key(execution, basis));
         if !input.reverse_order {
             matching.reverse();
         }
@@ -255,11 +259,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the two calls shifts nothing the token addresses.
         let start = match crate::state::non_empty(&input.next_page_token) {
             Some(token) => {
-                let resume_after =
-                    crate::state::decode_execution_page_token(&token, input.reverse_order)
-                        .map_err(crate::scaffolded::Scaffolded::validation)?;
+                let resume_after = crate::state::decode_execution_page_token(
+                    &token,
+                    input.reverse_order,
+                    basis,
+                )
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
                 matching.partition_point(|execution| {
-                    let key = crate::state::execution_order_key(execution);
+                    let key = crate::state::execution_order_key(execution, basis);
                     if input.reverse_order {
                         key <= resume_after
                     } else {
@@ -280,7 +287,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_page_token: page.last().filter(|_| end < total).map(|last| {
                 crate::state::encode_execution_page_token(
                     input.reverse_order,
-                    &crate::state::execution_order_key(last),
+                    basis,
+                    &crate::state::execution_order_key(last, basis),
                 )
             }),
         })

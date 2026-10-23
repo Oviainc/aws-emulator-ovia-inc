@@ -14,6 +14,11 @@
 //! violations get restated and in what envelope. The envelope itself, the member paths and
 //! every other requirement are the framework's, so nothing about them can drift per crate.
 //!
+//! A service whose recordings show the other of the two renderings that home offers
+//! ([`crate::validation::unanchored_grouping_alternation`], which keeps a top-level
+//! alternation grouped) delegates to [`aws_validation_refusal_with`] and passes it: the
+//! rendering is the only thing a service chooses here.
+//!
 //! The rendering rule is framework-level — it belongs in
 //! `vendor/smithy-schema-server/src/constraints.rs`'s `Violation::requirement`, which a fix
 //! may not change from here; once it learns this, delete this module and every
@@ -48,6 +53,22 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// a boundary refusal there as `MalformedQueryString`, so forcing the JSON code would
 /// change what a client branches on.
 pub fn aws_validation_refusal(refusal: &Refusal) -> Option<Refused> {
+    aws_validation_refusal_with(refusal, unanchored)
+}
+
+/// [`aws_validation_refusal`], with the `@pattern` rendering CHOSEN by the caller.
+///
+/// Everything a service does not choose — which refusals are restated, which violations are
+/// touched, the code, the envelope, the member paths and every other requirement — is this
+/// one body and the framework's, so the two renderings cannot drift into two envelopes.
+/// `quote_pattern` is one of [`crate::validation`]'s two (`unanchored`, or
+/// `unanchored_grouping_alternation` for a service whose recordings show a top-level
+/// alternation grouped); the CHECK always used the model's pattern as written, so this only
+/// changes how the expression is quoted back.
+pub fn aws_validation_refusal_with(
+    refusal: &Refusal,
+    quote_pattern: impl Fn(&str) -> String,
+) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
     };
@@ -56,7 +77,7 @@ pub fn aws_validation_refusal(refusal: &Refusal) -> Option<Refused> {
         .map(|violation| match &violation.kind {
             ViolationKind::Pattern(pattern) => Violation {
                 path: violation.path.clone(),
-                kind: ViolationKind::Pattern(unanchored(pattern)),
+                kind: ViolationKind::Pattern(quote_pattern(pattern)),
                 value: violation.value.clone(),
             },
             _ => violation.clone(),
@@ -70,7 +91,8 @@ pub fn aws_validation_refusal(refusal: &Refusal) -> Option<Refused> {
 
 #[cfg(test)]
 mod tests {
-    use super::aws_validation_refusal;
+    use super::{aws_validation_refusal, aws_validation_refusal_with};
+    use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema_server::{Violation, ViolationKind};
     use smithy_server_runtime::Refusal;
 
@@ -174,6 +196,68 @@ mod tests {
         );
     }
 
+    /// RULE: the chosen rendering is the ONLY thing that differs between the two entry
+    /// points — same code, same envelope, same clause around a differently quoted
+    /// expression — and a caller that passes the grouping rendering gets it.
+    #[test]
+    fn the_chosen_pattern_rendering_is_the_only_difference_between_the_two_entry_points() {
+        // (case, the model's pattern, what the default states, what the grouping rendering
+        // states). The expressions are `crate::validation`'s own table rows: a wrapping
+        // pair, and a pair the branches of a top-level alternation share.
+        let rows: [(&str, &str, &str, &str); 3] = [
+            (
+                "a wrapping pair, where the two renderings agree",
+                r"^[0-9]{12}$",
+                r"[0-9]{12}",
+                r"[0-9]{12}",
+            ),
+            (
+                "a top-level alternation of two groups",
+                r"^(arn:[^:]+:x)|([a-f0-9]{8})$",
+                r"(arn:[^:]+:x)|([a-f0-9]{8})",
+                r"((arn:[^:]+:x)|([a-f0-9]{8}))",
+            ),
+            (
+                "a bare top-level alternation",
+                r"^a|b$",
+                r"a|b",
+                r"(a|b)",
+            ),
+        ];
+        for (case, pattern, plain, grouped) in rows {
+            let refusal = Refusal::Invalid(vec![violation(
+                "name",
+                ViolationKind::Pattern(pattern.to_owned()),
+                "x",
+            )]);
+            for (rendering, expected, stated) in [
+                ("the default", plain, aws_validation_refusal(&refusal)),
+                (
+                    "the grouping rendering",
+                    grouped,
+                    aws_validation_refusal_with(&refusal, unanchored_grouping_alternation),
+                ),
+            ] {
+                let stated = stated.expect("a constraint refusal is stated");
+                assert_eq!(
+                    stated.code, "ValidationException",
+                    "case {case:?} under {rendering}: expected the JSON protocols' refusal \
+                     code, got {:?}",
+                    stated.code
+                );
+                let one = format!(
+                    "1 validation error detected: Value 'x' at 'name' failed to satisfy \
+                     constraint: Member must satisfy regular expression pattern: {expected}"
+                );
+                assert_eq!(
+                    stated.message, one,
+                    "case {case:?} under {rendering}: expected {one:?}, got {:?}",
+                    stated.message
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_refusal_that_is_not_a_constraint_keeps_the_frameworks_wording() {
         assert!(
@@ -183,6 +267,11 @@ mod tests {
         assert!(
             aws_validation_refusal(&Refusal::Invalid(Vec::new())).is_none(),
             "expected no violations to state nothing"
+        );
+        assert!(
+            aws_validation_refusal_with(&Refusal::Unauthenticated, unanchored_grouping_alternation)
+                .is_none(),
+            "expected the chosen rendering not to change which refusals are stated"
         );
     }
 }

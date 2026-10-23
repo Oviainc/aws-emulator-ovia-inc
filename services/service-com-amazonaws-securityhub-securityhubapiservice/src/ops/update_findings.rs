@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFindings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFindings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Writes the `Note` of every finding stored in [`crate::state`] for the caller's
+//! account and Region that the request's `Filters` select, so a later `GetFindings`
+//! reports it. The filter predicate is the one `GetFindings` applies to the same
+//! `AwsSecurityFindingFilters` — this operation addresses findings by a filter, not
+//! by identifier — so a filter member nothing evaluates answers 501 naming that
+//! member, and an illegal filter is refused with the modelled
+//! `InvalidInputException` before any finding is read.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFindings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## `RecordState` is not a field a caller writes
+//!
+//! `RecordState` is accepted (and the model's `ACTIVE | ARCHIVED` membership is
+//! enforced at the boundary) but changes no stored finding: a finding's record state
+//! is owned by the finding provider, which sets it through `BatchImportFindings`, and
+//! by Security Hub CSPM itself. The model is explicit about which finding members a
+//! customer may write — neither `BatchUpdateFindingsRequest` nor an automation rule's
+//! `AutomationRulesFindingFieldsUpdate` (the two supported update surfaces, and the
+//! ones this deprecated operation was replaced by) models a `RecordState` member at
+//! all; both carry only the investigation surface (`Note`, `Workflow`,
+//! `VerificationState`, `Severity`, `Confidence`, `Criticality`, `Types`,
+//! `UserDefinedFields`, `RelatedFindings`). A request naming `RecordState` therefore
+//! succeeds with the modelled empty response and leaves every matched finding's
+//! record state as it was.
+//!
+//! Unlike `BatchUpdateFindings`, a write made here appends NO finding-history event:
+//! "Security Hub CSPM doesn't record updates made with UpdateFindings in the finding
+//! history" (this operation's own documentation, below), and
+//! `FindingHistoryUpdateSourceType` models no value for it.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +172,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFindings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFindingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFindings"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateFindingsError::Modeled(UpdateFindingsErrorModeled::InternalException(
+                InternalException {
+                    message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+        let invalid_input = |message: String| {
+            UpdateFindingsError::Modeled(UpdateFindingsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                    code: Some("InvalidInputException".to_string()),
+                },
+            ))
+        };
+
+        let (account_id, region) = crate::state::hub_key(ctx);
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&(account_id.clone(), region.clone())) {
+            return Err(UpdateFindingsErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(crate::state::not_subscribed_message(&account_id, &region)),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // `Filters` is the only way this operation addresses findings, so a member
+        // nothing evaluates is reported rather than ignored: silently dropping one
+        // would update findings a predicate nothing applied had excluded.
+        let filters = &input.filters;
+        if let Some(member) = crate::ops::get_findings::unsupported_filter_member(filters) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "UpdateFindings filter {member}"
+            )));
+        }
+        // Whether the request is valid cannot depend on what is stored, so an illegal
+        // filter is refused identically on a full and on an empty hub.
+        if let Err(message) = crate::ops::get_findings::validate_filters(filters) {
+            return Err(invalid_input(message));
+        }
+
+        // `Note` is the only finding member a caller writes through this operation:
+        // `input.record_state` is deliberately never read, because a finding's record
+        // state is owned by the finding provider and by Security Hub CSPM itself (see
+        // this module's header — neither `BatchUpdateFindings` nor an automation
+        // rule's finding-fields update models a `RecordState` member). A request that
+        // carries no `Note` therefore selects nothing: it is still validated above,
+        // and the store is left exactly as it was.
+        let Some(note) = input.note.as_ref() else {
+            return Ok(UpdateFindingsOutput {});
+        };
+        // The note is copied onto every finding the filter selected, so the
+        // documented bound on its text is checked once, before any of them is
+        // written: a note too long for one finding is too long for all of them.
+        if let Some(message) = crate::state::note_update_violation(note) {
+            return Err(invalid_input(message));
+        }
+
+        let now_nanos = crate::state::now_nanos();
+        // One instant for the whole call: `Note$UpdatedAt` records when the note was
+        // updated, so every note this call writes carries the same timestamp.
+        let note_updated_at = crate::state::now_iso8601();
+
+        // The findings this call writes, selected before anything is written, so the
+        // predicate every one of them was chosen by is the store as the call found it.
+        let mut to_update: Vec<crate::state::FindingKey> = Vec::new();
+        for (key, stored) in &store.findings {
+            if key.account_id != account_id || key.region != region {
+                continue;
+            }
+            match crate::ops::get_findings::finding_matches(&stored.finding, filters, now_nanos) {
+                Ok(true) => to_update.push(key.clone()),
+                Ok(false) => continue,
+                Err(message) => return Err(invalid_input(message)),
+            }
+        }
+
+        // One write sequence per finding this call writes, minted before the mutable
+        // borrows begin (`next_write_seq` and `get_mut` both borrow the store): every
+        // key came from this same map under the same lock, so each one is written and
+        // no sequence is spent on a write that does not happen.
+        let seqs: Vec<u64> = to_update.iter().map(|_| store.next_write_seq()).collect();
+        for (key, seq) in to_update.iter().zip(seqs) {
+            let Some(stored) = store.findings.get_mut(key) else {
+                continue;
+            };
+            // `NoteUpdate` carries only `Text` and `UpdatedBy`; the service stamps
+            // `UpdatedAt` itself.
+            stored.finding.note = Some(Note {
+                text: note.text.clone(),
+                updated_by: note.updated_by.clone(),
+                updated_at: note_updated_at.clone(),
+            });
+            stored.updated_seq = seq;
+        }
+
+        Ok(UpdateFindingsOutput {})
     }
 }

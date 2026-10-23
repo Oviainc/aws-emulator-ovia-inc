@@ -260,14 +260,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // Where a configuration lives decides whether AppConfig needs a role to read
+        // it: the model's own `RetrievalRoleArn` documentation says "A retrieval role
+        // ARN is not required for configurations stored in CodePipeline or the AppConfig
+        // hosted configuration store. It is required for all other sources that store
+        // your configuration." The member is optional in the model, so the schema walk
+        // cannot refuse this; it is a server-side cross-field rule, and leaving it
+        // unenforced persists a profile AppConfig would never have created.
+        if crate::state::location_uri_requires_retrieval_role(&input.location_uri)
+            && input.retrieval_role_arn.is_none()
+        {
+            return Err(CreateConfigurationProfileErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::retrieval_role_required_message(
+                        &input.location_uri,
+                    )),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
+
         // A profile only exists under an application, so the parent is resolved before
         // an id is minted for the child.
         let Some(application) = store.applications.get(&input.application_id) else {
             return Err(CreateConfigurationProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No application with id {} exists.",
-                        input.application_id
+                    message: Some(crate::state::application_not_found(
+                        &input.application_id,
                     )),
                     resource_name: Some(input.application_id),
                 },

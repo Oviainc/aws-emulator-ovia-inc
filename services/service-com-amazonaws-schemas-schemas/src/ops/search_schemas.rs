@@ -236,7 +236,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into_iter()
                     .map(|schema| SearchSchemaSummary {
                         registry_name: Some(input.registry_name.clone()),
-                        schema_arn: Some(registry.schema_arn_in(&region, schema)),
+                        // A summary carries only the members the schema HAS — see
+                        // `Registry::schema_arn_in`.
+                        schema_arn: registry.schema_arn_in(&region, schema),
                         schema_name: Some(schema.name.clone()),
                         // "An array of schema version summaries": one entry per
                         // version this service holds for the schema, in version
@@ -386,7 +388,13 @@ mod tests {
             "the published registry must hold schemas to search over"
         );
         for (schema_name, schema) in &registry.schemas {
-            let declared = declared_event_keywords(schema);
+            // A document records the event on every component that is ABOUT the event
+            // (its envelope and the component the envelope's `detail` references), and
+            // the keywords are read from every version, so what a schema is indexed
+            // under is the SET of values declared: the event's source and its detail
+            // type, twice.
+            let declared: ::std::collections::BTreeSet<String> =
+                declared_event_keywords(schema).into_iter().collect();
             assert_eq!(
                 declared.len(),
                 2,

@@ -155,6 +155,24 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
 ///   (`'101 items'`, `'0'`) is a figure internal to the validating walk rather
 ///   than anything the caller sent. No renderer in the framework states a
 ///   clause without a value, so this one is built here.
+///
+/// A COLLECTION member past its cap is the same clause: the member and the
+/// bound, with nothing echoed. Some recorded AWS refusals of a capped
+/// collection — the transactional `TransactItems` lists — instead echo the
+/// rejected list as AWS's OWN internal object rendering
+/// (`[TransactGetItem(get=Get(key={pk=AttributeValue(s=k0, n=null, …,
+/// iNT=null, dECIMALSET=null, …)}, …, workloadProfileName=null)), …]`), over
+/// members this service's model does not declare:
+/// `smithy_query(query="shape", shape="com.amazonaws.dynamodb#AttributeValue")`
+/// gives `S N B SS NS BS M L NULL BOOL` and no `iNT`/`dECIMALSET`, and `Get`
+/// and `Put` carry no `workloadProfileName`. No rule reachable from the model
+/// or the docs renders that text, two recorded refusals of the SAME violation
+/// class (a `BatchGetItem` key list past the same 100 cap) state the
+/// no-value, wire-path form this function builds, and the framework hands this
+/// seam a count rather than the collection — so the clause states what is
+/// derivable: the member and the bound it broke.
+/// `tests/all/collection_cap_constraint_reports.rs` pins that over the capped
+/// collections of the batched and transactional operations.
 fn violation_clause(violation: &Violation) -> Option<String> {
     match &violation.kind {
         ViolationKind::MissingRequiredMember | ViolationKind::EnumValue(_) => Some(

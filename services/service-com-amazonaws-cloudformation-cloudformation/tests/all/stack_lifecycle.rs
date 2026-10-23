@@ -6,9 +6,11 @@
 //! — through the router, so what it asserts is what a client
 //! sees: `CreateStack` persists a stack, and `DescribeStacks`, `ListStacks`,
 //! `GetTemplate`, `UpdateStack`, `DeleteStack` and `DescribeStackEvents` read and mutate
-//! THAT stack rather than echoing the request back. That router carries Amazon S3 beside
-//! this service on one engine, because a stack that declares an `AWS::S3::Bucket`
-//! provisions it by calling S3 in process (see `router_with_engine`).
+//! THAT stack rather than echoing the request back. That router carries the services that
+//! own the resource types a stack really creates beside this one on one engine — Amazon S3
+//! for an `AWS::S3::Bucket`, Amazon SNS for the `AWS::SNS::Topic` most of these templates
+//! declare — because a stack provisions them by calling those services in process (see
+//! `router_with_engine`).
 //!
 //! The wire harness here (`call`, `member`, the XML readers, `router`) is this crate's
 //! one such harness: `stack_outputs.rs` drives its cases through these same helpers.
@@ -39,9 +41,12 @@ pub(crate) fn router() -> MultiServiceRouter {
 /// The services that OWN the resource types `state::provisioning` creates are mounted
 /// beside CloudFormation on the SAME engine, exactly as `core/router/src/lib.rs` mounts
 /// them: a stack's create calls those services, so a suite that deploys a template
-/// declaring one of those types must have them there. (Amazon Data Firehose is
-/// deliberately NOT one of them — `unprovisioned_resources.rs` is the suite that pins
-/// what a stack does when an owning service cannot be reached.)
+/// declaring one of those types must have them there — Amazon SNS among them, since the
+/// `AWS::SNS::Topic` most cases here declare is really created in SNS by the stack. (Amazon
+/// Data Firehose is deliberately NOT one of them — `unprovisioned_resources.rs` is the
+/// suite that pins what a stack does when an owning service cannot be reached.) No case
+/// here calls SNS itself; what a stack and SNS must agree about is
+/// `core/router/tests/all/cloudformation_provisions_sns_topics.rs`.
 pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -56,6 +61,11 @@ pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryE
     );
     router.register_service(
         service_com_amazonaws_codepipeline_codepipeline_20150709::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_sns_amazonsimplenotificationservice::EmulatedService::new(
             Arc::clone(&engine),
         ),
     );

@@ -35,14 +35,16 @@ pub const CONNECTION_STATUS_ON_CREATE: &str = "PENDING";
 /// something updates it.
 pub const HOST_STATUS_ON_CREATE: &str = "PENDING";
 
-/// The largest page `ListConnections` renders, whatever the caller asked for.
+/// The largest page a paginated report of this service renders, whatever the caller
+/// asked for.
 ///
 /// This is the published maximum of the modeled `MaxResults` member (`range 0..100`,
-/// from `smithy_query(query="operation", operation="ListConnections")`), applied
-/// server-side: a caller that asks for more, or that omits `MaxResults` entirely (the
-/// member is modeled `default: 0`), still gets at most this many connections in one
-/// response and a `NextToken` for the rest. Without the clamp a one-line request would
-/// render the whole store in a single response.
+/// from `smithy_query(query="operation", operation="ListConnections")` and
+/// `operation="ListSyncConfigurations"`, which agree), applied server-side: a caller
+/// that asks for more, or that omits `MaxResults` entirely (the member is modeled
+/// `default: 0`), still gets at most this many items in one response and a `NextToken`
+/// for the rest. Without the clamp a one-line request would render the whole store in a
+/// single response.
 pub const MAX_PAGE_SIZE: usize = 100;
 
 /// The largest number of connections this emulator stores for the account.
@@ -521,14 +523,48 @@ pub fn resource_id(resource_kind: &str, account_id: &str, region: &str, sequence
     )
 }
 
-/// Encode a `ListConnections` page token naming the last connection a page returned.
+/// Encode a page token naming the store position the page just rendered ended at: the
+/// last connection's `ConnectionArn` for `ListConnections`, the last configuration's
+/// `ResourceName` for `ListSyncConfigurations`.
 ///
-/// The token is the hex of that `ConnectionArn`: opaque to a caller, and a position
-/// in the `connections` key order, so resuming skips exactly the keys at or before it
-/// however the map changed in between. The modeled `NextToken` is 1..1024 characters
-/// matching `^.*$`; an ARN is at most 256 characters, so its hex is at most 512.
-pub fn encode_page_token(last_returned_arn: &str) -> String {
-    hex::encode(last_returned_arn.as_bytes())
+/// The token is the hex of that key: opaque to a caller, and a POSITION in the store's
+/// own key order rather than an offset into a snapshot, so resuming skips exactly the
+/// keys at or before it however the map changed in between. The modeled next-token
+/// members are 1..1024 (`NextToken`) and 1..2048 (`SharpNextToken`) characters matching
+/// `^.*$`; an ARN is at most 256 characters and a `ResourceName` at most 100, so the hex
+/// of either fits.
+pub fn encode_page_token(last_returned_key: &str) -> String {
+    hex::encode(last_returned_key.as_bytes())
+}
+
+/// Split an ordered, already-filtered selection into the page one response renders and
+/// the token naming its end, given the `MaxResults` the caller asked for and the member
+/// each item's store position is read from.
+///
+/// The ONE page bound and token rule every paginated report of this service applies, so
+/// two list operations cannot drift in how they clamp a page or decide to stop:
+/// `MaxResults` is modelled `range 0..100, default: 0`, so a caller that omits it
+/// arrives with zero; neither zero nor an over-large value is read as "render the whole
+/// store" — [`MAX_PAGE_SIZE`] is the service's own page size either way, and the
+/// remainder is reported through the token. A token comes back only when items are
+/// really left: the contract is that the caller stops when none does.
+pub fn page_of<Item>(
+    items: &[Item],
+    max_results: i32,
+    position: impl Fn(&Item) -> &str,
+) -> (&[Item], Option<String>) {
+    let page_size = if max_results > 0 {
+        (max_results as usize).min(MAX_PAGE_SIZE)
+    } else {
+        MAX_PAGE_SIZE
+    }
+    .min(items.len());
+    let (page, remaining) = items.split_at(page_size);
+    let next_token = match (remaining.is_empty(), page.last()) {
+        (false, Some(last)) => Some(encode_page_token(position(last))),
+        _ => None,
+    };
+    (page, next_token)
 }
 
 /// Decode a token [`encode_page_token`] produced, or `None` when it is not one.
@@ -539,6 +575,37 @@ pub fn encode_page_token(last_returned_arn: &str) -> String {
 pub fn decode_page_token(token: &str) -> Option<String> {
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
     is_connection_arn(&decoded).then_some(decoded)
+}
+
+/// Decode a page token [`encode_page_token`] produced for a report positioned by
+/// `ResourceName` (`ListSyncConfigurations`), or `None` when it is not one.
+///
+/// A token only names a position if it decodes to a value the API could have stored as
+/// a `ResourceName`, so anything else — a hand-written string, or a hex blob that
+/// decodes to text no resource name could be — is rejected rather than silently read
+/// as a position.
+pub fn decode_resource_name_page_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    is_resource_name(&decoded).then_some(decoded)
+}
+
+/// The published maximum length of the modeled `ResourceName` (`length 1..100`, from
+/// `smithy_query(query="shape", shape="ResourceName")`).
+const MAX_RESOURCE_NAME_LEN: usize = 100;
+
+/// Whether `candidate` satisfies the modeled `ResourceName` constraints: length
+/// 1..100 and pattern `^[0-9A-Za-z]+[0-9A-Za-z_\-]*$`, from
+/// `smithy_query(query="shape", shape="ResourceName")` — the same constraints the
+/// request walk applies to a `ResourceName` member, so this reader can never refuse a
+/// token this service issued itself. The admitted alphabet is ASCII only, so the byte
+/// length is the character length.
+fn is_resource_name(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && candidate.len() <= MAX_RESOURCE_NAME_LEN
+        && candidate.starts_with(|first: char| first.is_ascii_alphanumeric())
+        && candidate
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-')
 }
 
 /// The partitions the modeled `ConnectionArn` pattern `^arn:aws(-[\w]+)*:…` admits,

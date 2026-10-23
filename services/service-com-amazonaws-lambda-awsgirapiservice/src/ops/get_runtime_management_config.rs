@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRuntimeManagementConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRuntimeManagementConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRuntimeManagementConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the runtime management configuration the function record in [`crate::state`]
+//! holds for the version the request addresses — the documented `Auto` default (see
+//! [`crate::state::DEFAULT_UPDATE_RUNTIME_ON`]) until a `PutRuntimeManagementConfig`
+//! call has stored another one for that version.
+//!
+//! `RuntimeVersionArn` is reported only where one is stored, which is only in `Manual`
+//! mode: "The ARN of the runtime the function is configured to use. If the runtime
+//! update mode is manual, the ARN is returned, otherwise null is returned."
+//!
+//! The operation is `@readonly`: it resolves the `FunctionName` and `Qualifier` to one
+//! stored record through [`crate::state::resolve_function`] and answers out of what is
+//! stored. The only thing that resolution writes is the `Pending` -> `Active` move the
+//! CLOCK already made due, which would have been owed at the same instant even if
+//! nobody had called.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +171,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRuntimeManagementConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRuntimeManagementConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRuntimeManagementConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRuntimeManagementConfigErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        // "Specify a version of the function [...] If no value is specified, the
+        // configuration for the $LATEST version is returned", which is what resolution
+        // defaults to.
+        let (record, version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                GetRuntimeManagementConfigErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                GetRuntimeManagementConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+
+        let stored = record.runtime_management_config(&version);
+        Ok(GetRuntimeManagementConfigOutput {
+            update_runtime_on: Some(stored.update_runtime_on),
+            function_arn: Some(record.versioned_arn(&version)),
+            runtime_version_arn: stored.runtime_version_arn,
+        })
     }
 }

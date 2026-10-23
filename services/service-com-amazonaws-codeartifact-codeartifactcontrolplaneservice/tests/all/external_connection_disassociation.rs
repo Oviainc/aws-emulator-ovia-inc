@@ -58,10 +58,12 @@ const SUPPORTED_CONNECTIONS: &[(&str, &str)] = &[
     ("public:crates-io", "cargo"),
 ];
 
-/// The only value `ExternalConnectionStatus` models
-/// (`smithy_query(query="shape",shape="ExternalConnectionStatus")` → `["Available"]`), so
-/// it is the status every association reports.
-const AVAILABLE: &str = "Available";
+/// The one external-connection status, as the WIRE spells it: the live responses of
+/// `AssociateExternalConnection` and `DescribeRepository` return `AVAILABLE`, where the
+/// on-disk model's `ExternalConnectionStatus`
+/// (`smithy_query(query="shape",shape="ExternalConnectionStatus")` → `["Available"]`) is
+/// stale for this member. It is the status every association reports.
+const AVAILABLE: &str = "AVAILABLE";
 
 /// Percent-encode the one character a connection name may carry that a query string reads
 /// specially. `ExternalConnectionName`'s pattern allows `:`, `.`, `-` and alphanumerics.

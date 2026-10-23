@@ -212,11 +212,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `branchName` identifies a branch within its app, so a second create under
         // the same name is refused rather than silently replacing the first branch.
+        // The refusal's message is built from the request's own members through the
+        // one formatter every duplicate-name refusal in this crate shares, because
+        // callers substring-match it to tell this conflict from the other conditions
+        // Amplify also reports as a bare `BadRequestException`.
         if app.branches.contains_key(&input.branch_name) {
             return Err(CreateBranchErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "Branch {} already exists on app {}",
-                    input.branch_name, input.app_id
+                message: Some(crate::state::already_exists_message(
+                    crate::state::BRANCH_ENTITY,
+                    &input.branch_name,
+                    &input.app_id,
                 )),
             })
             .into());
@@ -288,8 +293,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             compute_role_arn: input.compute_role_arn,
         };
 
-        app.branches
-            .insert(branch.branch_name.clone(), branch.clone());
+        app.branches.insert(
+            branch.branch_name.clone(),
+            crate::state::AmplifyBranch::new(branch.clone()),
+        );
 
         Ok(CreateBranchOutput {
             branch: BranchProjection::written(branch),

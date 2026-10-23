@@ -25,6 +25,14 @@ tracing = { workspace = true }
 # per-process seed, rendered as hex.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Reads the rule group names out of a caller-supplied rules file (a YAML document), so
+# the documented bound on the combined length of a namespace name and a rule group name
+# is measured against the file's real contents. Same pinned version the apigateway,
+# cloudformation and greengrassv2 crates read caller-supplied YAML with; yaml-rust2 is a
+# pure-Rust YAML 1.2 implementation. The tests parse the default scraper configuration
+# this service serves with it too, so the blob is asserted to be a YAML document with the
+# structure a Prometheus scraper reads rather than compared byte for byte.
+yaml-rust2 = { version = "0.10", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -32,11 +40,6 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
-# Parses the default scraper configuration this service serves, so the test asserts the
-# blob really is a YAML document with the structure a Prometheus scraper reads, rather
-# than comparing bytes or re-deriving a reader. Same pinned version the cloudformation
-# and greengrassv2 crates use; yaml-rust2 is a pure-Rust YAML 1.2 implementation.
-yaml-rust2 = { version = "0.10", default-features = false }
 
 [lints]
 workspace = true

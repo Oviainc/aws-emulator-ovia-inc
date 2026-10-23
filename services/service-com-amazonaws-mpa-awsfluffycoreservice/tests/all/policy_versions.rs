@@ -38,7 +38,7 @@ const MAX_RESULTS_MIN: i64 = 1;
 const MAX_RESULTS_MAX: i64 = 20;
 
 /// `PolicyName` is `length(max: 64)`.
-const MAX_POLICY_NAME: usize = 64;
+pub(crate) const MAX_POLICY_NAME: usize = 64;
 
 /// `QualifiedPolicyArn` is `length(max: 1224)`.
 const MAX_POLICY_ARN: usize = 1224;
@@ -46,11 +46,11 @@ const MAX_POLICY_ARN: usize = 1224;
 /// Largest difference, in seconds, between a reported timestamp and the instant the store
 /// holds: the wire renders `IsoTimestamp` as a `date-time` string, so a reported instant
 /// is the stored one to well inside a millisecond.
-const INSTANT_TOLERANCE: f64 = 0.001;
+pub(crate) const INSTANT_TOLERANCE: f64 = 0.001;
 
 /// A fixed instant the recorded tables date their versions from, so no assertion below
 /// depends on when the test ran.
-fn base_instant() -> SystemTime {
+pub(crate) fn base_instant() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
 }
 
@@ -79,7 +79,7 @@ struct VersionCase {
 /// Alternate the two `PolicyStatus` tokens the model declares, so no row below tests a
 /// single value of it. An older version of a policy is the one AWS deprecates, so the
 /// deprecated ones here are the lower ids.
-fn status_for(version_id: i32, newest: i32) -> state::PolicyStatus {
+pub(crate) fn status_for(version_id: i32, newest: i32) -> state::PolicyStatus {
     if version_id < newest {
         state::PolicyStatus::Deprecated
     } else {
@@ -194,7 +194,7 @@ fn record_policy(harness: &Harness, case: &VersionCase) -> String {
 }
 
 /// The catalog record the store holds for `arn`.
-fn stored_policy(harness: &Harness, arn: &str) -> state::CatalogPolicy {
+pub(crate) fn stored_policy(harness: &Harness, arn: &str) -> state::CatalogPolicy {
     let store = state::service_state(&*harness.engine).expect("the service store");
     let guard = store.lock();
     guard.policy(arn).expect("a stored policy").clone()
@@ -299,7 +299,7 @@ fn assert_entry(
 }
 
 /// One timestamp member against the instant the store holds.
-fn assert_instant(case: &str, listed: &Value, member: &str, expected: SystemTime) {
+pub(crate) fn assert_instant(case: &str, listed: &Value, member: &str, expected: SystemTime) {
     let expected_secs = expected
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("an instant after the epoch")
@@ -314,7 +314,7 @@ fn assert_instant(case: &str, listed: &Value, member: &str, expected: SystemTime
 /// Whether `arn` satisfies `QualifiedPolicyArn`'s modelled pattern
 /// `^arn:.{1,63}:mpa:::aws:policy/[a-zA-Z0-9_\.-]{1,1023}/[a-zA-Z0-9_\.-]{1,1023}/(?:[\d]+|\$DEFAULT)$`
 /// and its `length(max: 1224)`.
-fn is_qualified_policy_arn(arn: &str) -> bool {
+pub(crate) fn is_qualified_policy_arn(arn: &str) -> bool {
     if arn.len() > MAX_POLICY_ARN {
         return false;
     }

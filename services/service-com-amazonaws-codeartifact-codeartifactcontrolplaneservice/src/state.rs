@@ -48,11 +48,19 @@ pub const DOMAIN_STATUS_ACTIVE: &str = "Active";
 /// the domain is in AFTER the call, not the record as it was before.
 pub const DOMAIN_STATUS_DELETED: &str = "Deleted";
 
-/// The only status an external connection this emulator holds can be in.
-/// `ExternalConnectionStatus` models exactly one value, `Available`, and the
-/// `RepositoryExternalConnectionInfo.status` doc says so ("There is one valid value,
-/// `Available`"), so an associated connection is reported available from the first read.
-pub const EXTERNAL_CONNECTION_STATUS_AVAILABLE: &str = "Available";
+/// The only status an external connection this emulator holds can be in: there is one
+/// external-connection status, and an associated connection carries it from the first
+/// read (CodeArtifact associates a public registry synchronously, so there is no
+/// transient state to move through).
+///
+/// Spelled as the WIRE spells it. The on-disk model is stale for this member — Smithy
+/// `ExternalConnectionStatus` lists `Available`
+/// (`smithy_query(query="shape",shape="ExternalConnectionStatus")`) and the member doc
+/// repeats it, but the live responses of `AssociateExternalConnection` and
+/// `DescribeRepository` return `AVAILABLE`, and `status` is an enum a client COMPARES
+/// against what it sees from AWS, so the observed wire token is the contract here and the
+/// model entry is not.
+pub const EXTERNAL_CONNECTION_STATUS_AVAILABLE: &str = "AVAILABLE";
 
 /// The public registries CodeArtifact can connect a repository to, each paired with the
 /// `PackageFormat` its packages carry.
@@ -193,6 +201,14 @@ pub const MAX_STORED_ASSET_BYTES: i64 = 256 * 1024 * 1024;
 /// The only `PackageFormat` `PublishPackageVersion` accepts: "Only generic packages can
 /// be published using this API" (the operation's own documentation).
 pub const PACKAGE_FORMAT_GENERIC: &str = "generic";
+
+/// The `PackageFormat`s whose namespace is a SCOPE, so the scope is part of how a package
+/// of that format is written: "The namespace of an npm or Swift package version is its
+/// scope" (`PackageVersionDescription$namespace`,
+/// `smithy_query(query="doc",shape="PackageVersionDescription",member="namespace")`).
+/// Used by [`package_display_name`]; every other format writes its namespace as a
+/// separate coordinate (a Maven `groupId`, a generic `namespace`) or has none at all.
+pub const SCOPED_PACKAGE_FORMATS: &[&str] = &["npm", "swift"];
 
 /// `PackageVersionStatus` of a version whose assets are all uploaded.
 pub const PACKAGE_VERSION_STATUS_PUBLISHED: &str = "Published";
@@ -1137,6 +1153,36 @@ pub fn package_key(format: &str, namespace: Option<&str>, package: &str) -> Stri
     format!("{format}/{}/{package}", namespace.unwrap_or_default())
 }
 
+/// `displayName`: the stored package's name written the way its FORMAT writes it.
+///
+/// The rule and its one documented variation come from the member itself: "The name of
+/// the package that is displayed. The `displayName` varies depending on the package
+/// version's format. For example, if an npm package is named `ui`, is in the namespace
+/// `vue`, and has the format `npm`, then the `displayName` is `@vue/ui`"
+/// (`smithy_query(query="doc",shape="PackageVersionDescription",member="displayName")`).
+///
+/// So the display name folds the namespace into the name exactly for the formats whose
+/// namespace is a SCOPE ([`SCOPED_PACKAGE_FORMATS`]) — written `@<scope>/<name>`, the one
+/// spelling the doc gives. Every other format writes its namespace as a separate
+/// coordinate (a Maven `groupId`, a generic `namespace`) or carries none, so its display
+/// name is the package name.
+///
+/// DERIVED from the coordinate the version is stored under and therefore always
+/// available: nothing here is read out of package metadata, which is also why the
+/// metadata-sourced members beside it (`summary`, `homePage`, `sourceCodeRepository`)
+/// stay absent. A leading `@` already on the scope is not doubled, so a caller that
+/// published `@vue` as the namespace and one that published `vue` get the same rendering.
+pub fn package_display_name(format: &str, namespace: Option<&str>, package: &str) -> String {
+    match namespace {
+        Some(scope)
+            if !scope.is_empty() && SCOPED_PACKAGE_FORMATS.contains(&format) =>
+        {
+            format!("@{}/{package}", scope.strip_prefix('@').unwrap_or(scope))
+        }
+        _ => package.to_string(),
+    }
+}
+
 /// A stored package inside a repository.
 ///
 /// A package is identified by the triple (`format`, `namespace`, `name`) — the same triple
@@ -1251,22 +1297,37 @@ impl PackageVersion {
 
     /// The modelled `PackageVersionDescription` for this record, inside `package`.
     ///
-    /// `displayName`, `summary`, `homePage`, `sourceCodeRepository` and `licenses` are
-    /// read by CodeArtifact out of a package's own metadata file (a `pom.xml`, a
-    /// `package.json`): a generic package has none, so they have no source here and are
-    /// omitted rather than invented.
+    /// `displayName` is DERIVED from the coordinate the version is stored under, by its
+    /// format's own display rule ([`package_display_name`]), so every described version
+    /// reports one.
+    ///
+    /// `licenses` is reported as the list it is, and the list is EMPTY: CodeArtifact reads
+    /// license data out of a package's own metadata file (a `pom.xml`, a `package.json`),
+    /// and the versions this service holds are published through `PublishPackageVersion`,
+    /// which takes generic assets carrying no such metadata. An absent list is not an
+    /// empty one — a client that iterates `licenses` must see "no licenses", not "no
+    /// information" — so the member is present whenever the version is described.
+    ///
+    /// `summary`, `homePage` and `sourceCodeRepository` are the other metadata-sourced
+    /// members, and they stay absent: they are single values with no source here, and
+    /// absent is exactly "this package version has no such value", which inventing a
+    /// string would not be.
     pub fn description(&self, package: &Package) -> PackageVersionDescription {
         PackageVersionDescription {
             format: Some(package.format.clone()),
             namespace: package.namespace.clone(),
             package_name: Some(package.name.clone()),
-            display_name: None,
+            display_name: Some(package_display_name(
+                &package.format,
+                package.namespace.as_deref(),
+                &package.name,
+            )),
             version: Some(self.version.clone()),
             summary: None,
             home_page: None,
             source_code_repository: None,
             published_time: Some(self.published_time.into()),
-            licenses: None,
+            licenses: Some(Vec::new()),
             revision: Some(self.revision()),
             status: Some(self.status.clone()),
             origin: Some(PackageVersionOrigin {

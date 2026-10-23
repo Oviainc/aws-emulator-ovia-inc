@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEBSVolumeRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEBSVolumeRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEBSVolumeRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the Amazon EBS volume recommendations Compute Optimizer holds for
+//! an account — for every observed volume the request selects, the recommendation
+//! [`crate::state::ObservedVolume::to_recommendation`] derives from that volume's stored
+//! configuration and metric samples under the look-back period in force, one page at a
+//! time. REPORTING only: Compute Optimizer has no API that creates a recommendation, so
+//! this call writes nothing.
+//!
+//! A request narrows the answer three ways, each applied before the page is cut:
+//! `accountIds` (one account id, as the model documents — naming any account other than
+//! the one this emulator presents is refused, see [`foreign_account`]), `volumeArns`
+//! (the volumes asked about; one this service holds no recommendation for is absent from
+//! the answer rather than reported in `errors`) and `filters` (the `Finding`
+//! classification — the one name the model's `EBSFilterName` enum admits).
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +181,298 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEBSVolumeRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEBSVolumeRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEBSVolumeRecommendations"))
+        let region = crate::state::request_region(ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetEBSVolumeRecommendationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The Compute Optimizer recommendation store is unavailable."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every malformed request is refused before the store is read, so
+        // InvalidParameterValueException takes precedence over the opt-in gate below, as
+        // it does in this service's other readers; so is every request that asks about an
+        // account this service cannot answer for (see [`foreign_account`]).
+        let account_id = requested_account_id(input.account_ids.as_deref())?;
+        let requested_volumes =
+            requested_volume_ids(input.volume_arns.as_deref(), &account_id, &region)?;
+        let filters = volume_filters(input.filters.as_deref())?;
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_resource_page_token(token) {
+                Some(volume_arn) => Some(volume_arn),
+                None => {
+                    return Err(invalid_parameter(
+                        "The value supplied for parameter nextToken is not valid.".to_string(),
+                    ))
+                }
+            },
+        };
+        // `maxResults` is modelled 0..1000 (the boundary refuses anything outside that).
+        // Whatever it asks for, the page is capped at `MAX_PAGE_SIZE` so no number a
+        // request carries can size the response or the allocation that builds it; and a
+        // request naming no size (or naming the range's lower bound `0`, which the
+        // service documents no meaning for) gets `DEFAULT_PAGE_SIZE` plus a `nextToken`
+        // to walk the rest, as `GetRecommendationPreferences` does.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .filter(|requested| *requested > 0)
+            .unwrap_or(crate::state::DEFAULT_PAGE_SIZE)
+            .min(crate::state::MAX_PAGE_SIZE);
+
+        let guard = state.lock();
+        if !guard.enrollment.is_opted_in() {
+            return Err(
+                GetEBSVolumeRecommendationsErrorModeled::OptInRequiredException(
+                    OptInRequiredException {
+                        message: Some(
+                            "The account is not opted in to Compute Optimizer.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The look-back period in force for this account's EBS volumes decides which
+        // samples each recommendation analyses, so it is resolved once per request.
+        let look_back_period = guard
+            .effective_look_back_period(crate::state::RESOURCE_TYPE_EBS_VOLUME, &account_id);
+
+        // When these recommendations were last generated: the analysis the account's
+        // enrollment started, which came due one analysis span after the enrollment record
+        // was written. Derived from the store, so every read reports the same instant —
+        // the same rule `GetAutoScalingGroupRecommendations` reports its refresh with.
+        let last_refresh_timestamp = guard.enrollment.last_updated_timestamp.map(|written| {
+            ::aws_smithy_types::DateTime::from_secs_f64(
+                written.as_secs_f64() + crate::state::ANALYSIS_DELAY.as_secs_f64(),
+            )
+        });
+
+        // The volumes this request asks about: the account's whole observed inventory in
+        // this Region — which a caller sees only once the analysis its enrollment started
+        // is due ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::visible_volumes`]) —
+        // or exactly the ones the named ARNs pick out of it. A well-formed volume ARN of
+        // the requested account that this service holds no recommendation for is simply
+        // ABSENT from the answer: the recorded behaviour of the real service is that such
+        // an ARN is not reported in `errors`, which carries the volumes an analysis
+        // rejected ("an error is returned if you request recommendations for an
+        // unsupported volume", `GetEBSVolumeRecommendationsResponse$errors`) and not the
+        // ones it has never seen. This emulator observes the inventory in `crate::state`
+        // and classifies no volume as unsupported, so it reports no error.
+        let selected: Vec<&crate::state::ObservedVolume> = guard
+            .visible_volumes()
+            .filter(|volume| volume.account_id == account_id)
+            .filter(|volume| {
+                requested_volumes
+                    .as_ref()
+                    .is_none_or(|wanted| wanted.contains(&volume.volume_id))
+            })
+            .collect();
+
+        // The recommendation is computed first and filtered second: `Finding` filters on
+        // the finding this service derived, not on anything the request supplied — and
+        // the finding depends on the look-back period, so it cannot be known earlier.
+        let matching: Vec<VolumeRecommendation> = selected
+            .into_iter()
+            .map(|volume| {
+                volume.to_recommendation(&region, &look_back_period, last_refresh_timestamp)
+            })
+            .filter(|recommendation| {
+                recommendation
+                    .volume_arn
+                    .as_deref()
+                    .is_some_and(|arn| resume_at.as_deref().is_none_or(|start| arn >= start))
+            })
+            .filter(|recommendation| filters.iter().all(|filter| filter.matches(recommendation)))
+            .collect();
+
+        // One page, plus the volume the next page starts at when recommendations remain.
+        let next_token = matching.get(page_size).and_then(|recommendation| {
+            recommendation
+                .volume_arn
+                .as_deref()
+                .map(crate::state::encode_resource_page_token)
+        });
+        let volume_recommendations = matching.into_iter().take(page_size).collect();
+
+        Ok(GetEBSVolumeRecommendationsOutput {
+            next_token,
+            volume_recommendations: Some(volume_recommendations),
+            // No volume of this inventory is unsupported, so no request is answered with
+            // a per-volume error (see the selection above).
+            errors: Some(Vec::new()),
+        })
     }
+}
+
+/// What this operation answers when a `volumeArns` entry is not an Amazon EBS volume
+/// ARN: a constant refusal naming the parameter's subject, as the real service words it
+/// — it states the member that is wrong, not the value the request carried.
+const INVALID_VOLUME_ARN_MESSAGE: &str = "Invalid volume ARN.";
+
+/// A 400 `InvalidParameterValueException` — "The value supplied for the input parameter
+/// is out of range or not valid" — carrying why this request's value is not.
+fn invalid_parameter(message: String) -> GetEBSVolumeRecommendationsError {
+    GetEBSVolumeRecommendationsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// What this operation answers when a request asks about an account other than the one
+/// this service answers for: the real service's constant refusal, which names neither the
+/// member nor the account — it states the permission that is missing and how an
+/// organization account gets it.
+const CROSS_ACCOUNT_MESSAGE: &str = "Invalid permission to access another account. If this \
+     is an organization account, request the management account to enable service access.";
+
+/// A 400 `InvalidParameterValueException` for a request that asks about an account other
+/// than the one this service answers for.
+///
+/// `accountIds` is how a MANAGEMENT account names a member account of its organization:
+/// "If your account is the management account of an organization, use this parameter to
+/// specify the member account for which you want to return volume recommendations." This
+/// emulator presents one standalone account (`::engine::emulator_account_id`) and records
+/// no organization, so no other account is a member account it can be asked about — in
+/// `accountIds`, or through a `volumeArns` entry that names one.
+fn foreign_account() -> GetEBSVolumeRecommendationsError {
+    invalid_parameter(CROSS_ACCOUNT_MESSAGE.to_string())
+}
+
+/// The account whose recommendations this request asks for: the one id `accountIds`
+/// carries, or the caller's own account when it carries none.
+///
+/// "Only one account ID can be specified per request"
+/// (`GetEBSVolumeRecommendations$accountIds`), and an `AccountId` is a 12-digit Amazon
+/// Web Services account id (`Scope$value`), so anything else is refused rather than
+/// silently answered for the caller. An id that is well-formed but names another account
+/// is refused by [`foreign_account`].
+fn requested_account_id(
+    account_ids: Option<&[String]>,
+) -> Result<String, GetEBSVolumeRecommendationsError> {
+    let account_ids = account_ids.unwrap_or_default();
+    if account_ids.len() > 1 {
+        return Err(invalid_parameter(format!(
+            "The value supplied for parameter accountIds is not valid: only one account ID can \
+             be specified per request, not {}.",
+            account_ids.len(),
+        )));
+    }
+    match account_ids.first() {
+        None => Ok(::engine::emulator_account_id().to_string()),
+        Some(account_id) => {
+            if !crate::state::is_account_id(account_id) {
+                return Err(invalid_parameter(format!(
+                    "The value supplied for parameter accountIds is not valid: {account_id} is \
+                     not a 12-digit Amazon Web Services account ID."
+                )));
+            }
+            if account_id != ::engine::emulator_account_id() {
+                return Err(foreign_account());
+            }
+            Ok(account_id.clone())
+        }
+    }
+}
+
+/// The volumes this request asks about, by volume id, or `None` when it names none and so
+/// asks about the account's whole inventory in this Region.
+///
+/// Every ARN has to be an Amazon EBS volume ARN — `volumeArns` is "the Amazon Resource
+/// Name (ARN) of the volumes for which to return recommendations" — so anything else is
+/// refused with [`INVALID_VOLUME_ARN_MESSAGE`], and one that names another account's
+/// volume with [`foreign_account`]. An ARN of ANOTHER Region names a volume this regional
+/// endpoint does not observe, so it selects nothing, exactly as an unknown volume of this
+/// Region does.
+fn requested_volume_ids(
+    volume_arns: Option<&[String]>,
+    account_id: &str,
+    region: &str,
+) -> Result<Option<Vec<String>>, GetEBSVolumeRecommendationsError> {
+    let Some(volume_arns) = volume_arns else {
+        return Ok(None);
+    };
+    let mut volume_ids = Vec::new();
+    for arn in volume_arns {
+        let Some(volume) = crate::state::parse_volume_arn(arn) else {
+            return Err(invalid_parameter(INVALID_VOLUME_ARN_MESSAGE.to_string()));
+        };
+        if volume.account_id != account_id {
+            return Err(foreign_account());
+        }
+        if volume.region == region {
+            volume_ids.push(volume.volume_id.to_string());
+        }
+    }
+    Ok(Some(volume_ids))
+}
+
+/// One filter from the request, resolved to the test it applies to a recommendation.
+///
+/// `Finding` is the ONE filter name this operation has: `EBSFilterName` is a closed enum
+/// whose only value is `Finding` (`smithy_query query="shape" shape="EBSFilterName"`), so
+/// the request boundary refuses every other name — including the `tag:key` and `tag-key`
+/// names `EBSFilter$name`'s prose mentions — before this handler runs. The model is what
+/// the wire enforces, so this handler implements what the model declares.
+struct FindingFilter {
+    /// The `EBSFinding` values this filter admits.
+    findings: Vec<String>,
+}
+
+impl FindingFilter {
+    /// Whether a recommendation satisfies this filter: a filter is satisfied by ANY of
+    /// its values, and a request's filters all have to be.
+    fn matches(&self, recommendation: &VolumeRecommendation) -> bool {
+        recommendation
+            .finding
+            .as_deref()
+            .is_some_and(|finding| self.findings.iter().any(|wanted| wanted == finding))
+    }
+}
+
+/// This request's filters, refusing any `Finding` value that is not an `EBSFinding`
+/// ("The valid values are `Optimized`, or `NotOptimized`", `EBSFilter$values`). Refused
+/// up front, so a request cannot be answered by a filter that silently matched nothing.
+fn volume_filters(
+    filters: Option<&[EBSFilter]>,
+) -> Result<Vec<FindingFilter>, GetEBSVolumeRecommendationsError> {
+    let mut resolved = Vec::new();
+    for filter in filters.unwrap_or_default() {
+        let findings = filter.values.clone().unwrap_or_default();
+        let name = filter
+            .name
+            .as_deref()
+            .unwrap_or(crate::state::EBS_FILTER_NAME_FINDING);
+        if name != crate::state::EBS_FILTER_NAME_FINDING {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter filters is not valid: {name} is not a filter \
+                 name Amazon EBS volume recommendations can be filtered by."
+            )));
+        }
+        for finding in &findings {
+            if finding != crate::state::FINDING_OPTIMIZED
+                && finding != crate::state::FINDING_NOT_OPTIMIZED
+            {
+                return Err(invalid_parameter(format!(
+                    "The value supplied for parameter filters is not valid: {finding} is not a \
+                     valid value of the {name} filter. Valid values are {} and {}.",
+                    crate::state::FINDING_OPTIMIZED,
+                    crate::state::FINDING_NOT_OPTIMIZED,
+                )));
+            }
+        }
+        resolved.push(FindingFilter { findings });
+    }
+    Ok(resolved)
 }

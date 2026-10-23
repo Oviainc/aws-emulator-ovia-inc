@@ -209,14 +209,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         })?;
-        let branch = app.branches.get_mut(&input.branch_name).ok_or_else(|| {
-            UpdateBranchErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message(
-                    crate::state::BRANCH_ENTITY,
-                    &input.branch_name,
-                )),
-            })
-        })?;
+        let branch = app
+            .branches
+            .get_mut(&input.branch_name)
+            .map(|stored| &mut stored.branch)
+            .ok_or_else(|| {
+                UpdateBranchErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::not_found_message(
+                        crate::state::BRANCH_ENTITY,
+                        &input.branch_name,
+                    )),
+                })
+            })?;
 
         // Every member the request CARRIES replaces the stored one; a member it omits
         // is left as it was, so promoting a branch's `stage` does not reset the rest

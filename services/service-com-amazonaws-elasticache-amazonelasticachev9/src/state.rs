@@ -206,6 +206,96 @@ pub const DEFAULT_SNAPSHOT_RETENTION_LIMIT: i32 = 0;
 /// ("Example: sun:23:00-mon:01:30").
 pub const DEFAULT_MAINTENANCE_WINDOW: &str = "sun:23:00-mon:01:30";
 
+/// The day abbreviations a maintenance window may name, in week order.
+///
+/// `PreferredMaintenanceWindow` states them: "Valid values for `ddd` are: sun,
+/// mon, tue, wed, thu, fri, sat". The position in this list is the day's offset
+/// from the start of the week, which is what makes the span of a window that
+/// crosses midnight computable ([`maintenance_window_refusal`]).
+pub const MAINTENANCE_WINDOW_DAYS: [&str; 7] =
+    ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+/// The documented minimum span of a maintenance window, in minutes:
+/// `PreferredMaintenanceWindow` states "The minimum maintenance window is a 60
+/// minute period."
+pub const MAINTENANCE_WINDOW_MIN_MINUTES: i64 = 60;
+
+/// Minutes in a day, and in a week: the arithmetic a `ddd:hh24:mi` point is
+/// placed on.
+const MINUTES_PER_DAY: i64 = 24 * 60;
+/// See [`MINUTES_PER_DAY`].
+const MINUTES_PER_WEEK: i64 = 7 * MINUTES_PER_DAY;
+
+/// How ElastiCache words a `PreferredMaintenanceWindow` it cannot read.
+///
+/// The format is the one the member documents — "a range in the format
+/// ddd:hh24:mi-ddd:hh24:mi (24H Clock UTC)" — and this is the wording AWS was
+/// recorded answering with. The HTTP status (400) and the awsQuery code
+/// (`InvalidParameterValue`) are the contract.
+pub const INVALID_MAINTENANCE_WINDOW_MESSAGE: &str =
+    "Invalid maintenance window format. Should be specified as a range \
+     ddd:hh24:mi-ddd:hh24:mi (24H Clock UTC). Example: Sun:23:15-Mon:03:15";
+
+/// Minutes from the start of the week that the `ddd:hh24:mi` point `value`
+/// names, or `None` when it is not one.
+///
+/// The day is matched case-insensitively against [`MAINTENANCE_WINDOW_DAYS`] and
+/// the clock fields are exactly two digits each on a 24-hour clock, so neither
+/// `notaday:99:99` nor `24:00` is a point.
+fn week_minute(value: &str) -> Option<i64> {
+    let mut fields = value.split(':');
+    let day = fields.next()?;
+    let hour = fields.next()?;
+    let minute = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    let day = MAINTENANCE_WINDOW_DAYS
+        .iter()
+        .position(|candidate| candidate.eq_ignore_ascii_case(day))?;
+    let clock_field = |field: &str, max: i64| -> Option<i64> {
+        if field.len() != 2 || !field.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        field.parse::<i64>().ok().filter(|value| *value <= max)
+    };
+    let hour = clock_field(hour, 23)?;
+    let minute = clock_field(minute, 59)?;
+    Some(i64::try_from(day).unwrap_or(0) * MINUTES_PER_DAY + hour * 60 + minute)
+}
+
+/// Why `value` cannot be a `PreferredMaintenanceWindow`, or `None` when it can.
+///
+/// The rule is the member's own: a range `ddd:hh24:mi-ddd:hh24:mi` on the 24-hour
+/// UTC clock whose span is at least [`MAINTENANCE_WINDOW_MIN_MINUTES`]. A window
+/// whose end lies before its start wraps to the next week, which is how
+/// `sun:23:00-mon:01:30` is a 150-minute window; a window whose two ends are the
+/// same point spans nothing and is refused.
+///
+/// Every operation that accepts a maintenance window goes through this one
+/// helper, so a value refused by one is refused by all of them, and the refusal
+/// runs before any state is written.
+pub fn maintenance_window_refusal(value: &str) -> Option<String> {
+    let invalid = || Some(INVALID_MAINTENANCE_WINDOW_MESSAGE.to_string());
+    let Some((start, end)) = value.split_once('-') else {
+        return invalid();
+    };
+    let (Some(start), Some(end)) = (week_minute(start), week_minute(end)) else {
+        return invalid();
+    };
+    let span = match end.cmp(&start) {
+        ::std::cmp::Ordering::Greater => end - start,
+        ::std::cmp::Ordering::Equal => 0,
+        ::std::cmp::Ordering::Less => end + MINUTES_PER_WEEK - start,
+    };
+    if span < MAINTENANCE_WINDOW_MIN_MINUTES {
+        return Some(format!(
+            "The maintenance window must be at least {MAINTENANCE_WINDOW_MIN_MINUTES} minutes."
+        ));
+    }
+    None
+}
+
 /// How long a cluster stays in the status the call that started the work
 /// returned (`creating` after a create, `modifying` after an immediate modify,
 /// `rebooting cluster nodes` after a reboot) before the clock owes it
@@ -1849,6 +1939,17 @@ pub fn identifier_refusal(
          letter; must contain only ASCII letters, digits, and hyphens; and must not end with a \
          hyphen or contain two consecutive hyphens."
     ))
+}
+
+/// How ElastiCache words a cache cluster this account does not hold:
+/// `CacheCluster not found: <id>`.
+///
+/// One helper, so every surface that reports a missing cache cluster — the
+/// modelled `CacheClusterNotFoundFault` of a describe, modify, delete, reboot or
+/// snapshot call, and the `ErrorMessage` a batch update action reports for a
+/// resource it could not resolve — words it the one way the service does.
+pub fn cache_cluster_not_found_message(cache_cluster_id: &str) -> String {
+    format!("CacheCluster not found: {cache_cluster_id}")
 }
 
 /// The ARN of a cache cluster: `arn:aws:elasticache:<region>:<account>:cluster:<id>`.
@@ -6942,7 +7043,7 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                     Some(cluster) => Ok((key, cluster.engine.clone())),
                     None => Err((
                         CACHE_CLUSTER_NOT_FOUND_ERROR_TYPE,
-                        format!("Cache cluster {id} not found."),
+                        cache_cluster_not_found_message(id),
                     )),
                 }
             }

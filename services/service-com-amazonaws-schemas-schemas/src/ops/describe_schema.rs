@@ -192,7 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // description — the one the last `UpdateSchema` that sent one stored.
             description: schema.description.clone(),
             last_modified: Some(schema.last_modified.into()),
-            schema_arn: Some(registry.schema_arn_in(&region, schema)),
+            // A schema of a service-owned registry is not a customer resource and
+            // carries no ARN; this response always carries the member, so it reports
+            // the empty value for one.
+            schema_arn: Some(registry.reported_schema_arn_in(&region, schema)),
             schema_name: Some(schema.name.clone()),
             schema_version: Some(version.version.to_string()),
             tags: crate::state::tags_to_output(&schema.tags),

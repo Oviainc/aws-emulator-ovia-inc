@@ -50,6 +50,16 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/AIOpsAssistantRole";
 /// The region a case signs for when it only needs one.
 const REGION: &str = "us-west-2";
 
+/// The error code the RESOURCE operations report an unresolvable identifier with:
+/// this service's own modelled `ResourceNotFoundException`
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`: `@httpError 404`).
+const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The error code the TAGGING operations report an unresolvable `resourceArn` with:
+/// the tagging frontend's own `NotFoundException` — see
+/// `state::TAGGING_RESOURCE_NOT_FOUND` for the rule and its source.
+const TAGGING_NOT_FOUND: &str = "NotFoundException";
+
 /// Regions the per-region rows span: the recorded one, two other commercial regions
 /// and one whose name is longer and carries more fields.
 const REGIONS: &[&str] = &["us-west-2", "eu-central-1", "ap-southeast-4", "us-gov-west-1"];
@@ -658,36 +668,73 @@ async fn only_the_arn_resolves_a_group() {
     ];
 
     // Every operation that resolves a group through an identifier, as
-    // (name, method, uri template, body).
-    let operations: Vec<(&str, &str, &str, Option<Value>)> = vec![
-        ("GetInvestigationGroup", "GET", "/investigationGroups/{}", None),
+    // (name, method, uri template, body, expected error code). The resource
+    // operations report this service's modelled `ResourceNotFoundException`; the
+    // three tagging operations are served by the tagging frontend, whose not-found
+    // answer carries its own `NotFoundException`
+    // (`state::TAGGING_RESOURCE_NOT_FOUND`).
+    let operations: Vec<(&str, &str, &str, Option<Value>, &str)> = vec![
+        (
+            "GetInvestigationGroup",
+            "GET",
+            "/investigationGroups/{}",
+            None,
+            RESOURCE_NOT_FOUND,
+        ),
         (
             "UpdateInvestigationGroup",
             "PATCH",
             "/investigationGroups/{}",
             Some(json!({ "isCloudTrailEventHistoryEnabled": true })),
+            RESOURCE_NOT_FOUND,
         ),
-        ("DeleteInvestigationGroup", "DELETE", "/investigationGroups/{}", None),
-        ("GetInvestigationGroupPolicy", "GET", "/investigationGroups/{}/policy", None),
+        (
+            "DeleteInvestigationGroup",
+            "DELETE",
+            "/investigationGroups/{}",
+            None,
+            RESOURCE_NOT_FOUND,
+        ),
+        (
+            "GetInvestigationGroupPolicy",
+            "GET",
+            "/investigationGroups/{}/policy",
+            None,
+            RESOURCE_NOT_FOUND,
+        ),
         (
             "PutInvestigationGroupPolicy",
             "POST",
             "/investigationGroups/{}/policy",
             Some(json!({ "policy": r#"{"Version":"2012-10-17"}"# })),
+            RESOURCE_NOT_FOUND,
         ),
-        ("DeleteInvestigationGroupPolicy", "DELETE", "/investigationGroups/{}/policy", None),
-        ("ListTagsForResource", "GET", "/tags/{}", None),
+        (
+            "DeleteInvestigationGroupPolicy",
+            "DELETE",
+            "/investigationGroups/{}/policy",
+            None,
+            RESOURCE_NOT_FOUND,
+        ),
+        ("ListTagsForResource", "GET", "/tags/{}", None, TAGGING_NOT_FOUND),
         (
             "TagResource",
             "POST",
             "/tags/{}",
             Some(json!({ "tags": { "Team": "ops" } })),
+            TAGGING_NOT_FOUND,
         ),
-        ("UntagResource", "DELETE", "/tags/{}?tagKeys=Team", None),
+        (
+            "UntagResource",
+            "DELETE",
+            "/tags/{}?tagKeys=Team",
+            None,
+            TAGGING_NOT_FOUND,
+        ),
     ];
 
     for (form, identifier) in &unresolvable {
-        for (operation, method, template, body) in &operations {
+        for (operation, method, template, body, expected_code) in &operations {
             let case = format!("{operation} addressed by {form}");
             let uri = template.replace("{}", &label(identifier));
             let (status, answer) = call(&router, method, &uri, body.as_ref()).await;
@@ -697,8 +744,8 @@ async fn only_the_arn_resolves_a_group() {
             );
             assert_eq!(
                 error_code(&answer),
-                "ResourceNotFoundException",
-                "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
+                *expected_code,
+                "case {case:?}: expected {expected_code}, got {answer:?}"
             );
             assert!(
                 !message(&answer).contains(identifier),

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/auto_scaling_group_recommendations.rs"]
 mod auto_scaling_group_recommendations;
+#[path = "all/ebs_volume_recommendations.rs"]
+mod ebs_volume_recommendations;
 #[path = "all/enrollment_and_preferences.rs"]
 mod enrollment_and_preferences;
 #[path = "all/harness.rs"]

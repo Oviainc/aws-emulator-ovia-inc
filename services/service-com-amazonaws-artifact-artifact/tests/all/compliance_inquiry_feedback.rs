@@ -9,12 +9,16 @@
 //! * a submission is RECORDED on the targeted inquiry and answered with the instant it was
 //!   recorded, and that record is what the document `ExportComplianceInquiry` renders
 //!   reports back — whatever rating, reason codes, comment or revision the request carried;
-//! * a `Put` REPLACES the feedback the inquiry already held for that query, so the record
-//!   is the caller's current rating rather than an append-only log, while feedback on
-//!   another query of the same inquiry is a record of its own;
-//! * `clientToken` is the operation's `@idempotencyToken`: a repeat of one request records
-//!   nothing further and answers the `submittedAt` the first call answered, while the same
-//!   token on a different request is refused with the modelled `ConflictException`;
+//! * one RESPONSE VERSION — the `queryIdentifier` and `responseRevisionId` a request names
+//!   together — accepts exactly ONE submitted feedback: a second submission against a
+//!   version that already carries feedback is refused with the modelled
+//!   `ConflictException`, whatever `clientToken` it carries (a fresh one, none, or the
+//!   first request's), while a submission against another version of the same query,
+//!   another query, or another inquiry is a record of its own;
+//! * `clientToken` is the operation's `@idempotencyToken` layered ON TOP of that rule: a
+//!   repeat of one request records nothing further and answers the `submittedAt` the first
+//!   call answered, while the same token on a different request — one targeting a version
+//!   nothing has rated yet — is refused with the modelled `ConflictException`;
 //! * `queryIdentifier` must name a query of THAT inquiry, so one it does not own is
 //!   refused with the modelled `ValidationException` naming the member;
 //! * an inquiry id the store does not hold is refused the way every other inquiry
@@ -49,6 +53,13 @@ const RATINGS: [&str; 2] = ["THUMBS_UP", "THUMBS_DOWN"];
 /// `FeedbackReasonCode`'s values. Source:
 /// `smithy_query(query="shape",shape="FeedbackReasonCode")`.
 const REASON_CODES: [&str; 3] = ["OTHER", "PARTIAL_RESPONSE", "IRRELEVANT_RESPONSE"];
+
+/// The message the service states for a submission against a response version that already
+/// carries feedback, as the recorded AWS refusal carries it. The requirement under test is
+/// the CONDITION it names — one feedback per response version — together with the status
+/// and the error code; the text is pinned because the service states this one fixed
+/// sentence for the condition rather than building it from the request.
+const ALREADY_SUBMITTED: &str = "Feedback already submitted for this response version.";
 
 /// A SigV4 credential scope for `REGION` naming this service — what routes the request.
 fn signed() -> String {
@@ -522,14 +533,29 @@ async fn the_same_client_token_on_a_different_submission_is_refused_with_a_confl
         .commenting("Good answer.")
         .on_revision(1)
         .with_token(TOKEN);
-    // One row per member a second request can differ in — each the only difference.
+    // One row per member a second request can differ in — each the only difference —
+    // every one of them targeting a response version NOTHING has rated yet, so what is
+    // under test is the idempotency rule alone rather than the per-version rule the test
+    // below covers: these requests would be recorded if they carried a token of their own.
     let conflicting: Vec<(&str, Submission)> = vec![
-        ("another rating", first.clone().rated_as(RATINGS[1])),
-        ("another comment", first.clone().commenting("Bad answer.")),
-        ("another reason code set", first.clone().because(&REASON_CODES)),
-        ("another revision id", first.clone().on_revision(2)),
+        (
+            "another rating, on another revision",
+            first.clone().rated_as(RATINGS[1]).on_revision(2),
+        ),
+        (
+            "another comment, on another revision",
+            first.clone().commenting("Bad answer.").on_revision(3),
+        ),
+        (
+            "another reason code set, on another revision",
+            first.clone().because(&REASON_CODES).on_revision(4),
+        ),
+        ("another revision id", first.clone().on_revision(5)),
         ("no query identifier", first.clone().on_no_query()),
-        ("no comment", first.clone().without_comment()),
+        (
+            "no comment, on another revision",
+            first.clone().without_comment().on_revision(6),
+        ),
     ];
 
     for (label, second) in conflicting {
@@ -569,6 +595,16 @@ async fn the_same_client_token_on_a_different_submission_is_refused_with_a_confl
             json!("ComplianceInquiry"),
             "case {label:?}: the conflict names the resource type, got {:?}",
             refused.body["resourceType"]
+        );
+        // A client must be able to tell "my token collided" (retry with a new token) from
+        // "this response version has been rated" (terminal), so the two refusals do not
+        // state the same thing.
+        assert_ne!(
+            refused.body["message"],
+            json!(ALREADY_SUBMITTED),
+            "case {label:?}: a token collision must not be reported as a version that \
+             already carries feedback, got {:?}",
+            refused.body["message"]
         );
 
         // The refusal left the first submission exactly as it was.
@@ -721,60 +757,278 @@ async fn an_inquiry_the_account_does_not_hold_is_refused_by_the_front_door() {
 }
 
 #[tokio::test]
-async fn a_put_replaces_the_feedback_held_for_that_query_and_leaves_the_others() {
-    let router = emulator();
-    let inquiry_id = held_inquiry(&router, &text_body("Residency", "Where is data stored?")).await;
+async fn one_response_version_accepts_exactly_one_feedback() {
+    // Each row is a pair: a first submission, which must be recorded, and a second one
+    // against the SAME response version — the (queryIdentifier, responseRevisionId) pair —
+    // which must be refused. The rows differ along the version's form (on a query or on the
+    // inquiry's response as a whole, a revision named or not, a bound of Integer) and along
+    // what the second request carries: a FRESH clientToken, no token at all, or the first
+    // request's token on different content. None of them gets past the refusal, because it
+    // is keyed on the version's state rather than on a token.
+    let rows: Vec<(&str, Submission, Submission)> = vec![
+        (
+            "a fresh token, on the same query and revision",
+            Submission::rated(RATINGS[0])
+                .on_query(1)
+                .on_revision(0)
+                .with_token("token-first"),
+            Submission::rated(RATINGS[1])
+                .on_query(1)
+                .on_revision(0)
+                .with_token("token-second"),
+        ),
+        (
+            "neither request carrying a token",
+            Submission::rated(RATINGS[0]).on_query(1).on_revision(2),
+            Submission::rated(RATINGS[1])
+                .on_query(1)
+                .on_revision(2)
+                .because(&[REASON_CODES[0]])
+                .commenting("Reconsidered."),
+        ),
+        (
+            "the first request's token on different content",
+            Submission::rated(RATINGS[0])
+                .on_query(1)
+                .on_revision(7)
+                .with_token("token-shared"),
+            Submission::rated(RATINGS[1])
+                .on_query(1)
+                .on_revision(7)
+                .with_token("token-shared"),
+        ),
+        (
+            "no revision named by either request",
+            Submission::rated(RATINGS[1])
+                .on_query(1)
+                .because(&[REASON_CODES[2]]),
+            Submission::rated(RATINGS[0]).on_query(1).with_token("token-no-revision"),
+        ),
+        (
+            "the inquiry's response as a whole, rated twice",
+            Submission::rated(RATINGS[0]).with_token("token-whole-first"),
+            Submission::rated(RATINGS[1])
+                .commenting("Still wrong.")
+                .with_token("token-whole-second"),
+        ),
+        (
+            "the largest revision an Integer carries",
+            Submission::rated(RATINGS[0])
+                .on_query(1)
+                .on_revision(i32::MAX)
+                .because(&REASON_CODES),
+            Submission::rated(RATINGS[1])
+                .on_query(1)
+                .on_revision(i32::MAX)
+                .with_token("token-max-revision"),
+        ),
+        (
+            "the smallest revision an Integer carries",
+            Submission::rated(RATINGS[1]).on_query(1).on_revision(i32::MIN),
+            Submission::rated(RATINGS[1])
+                .on_query(1)
+                .on_revision(i32::MIN)
+                .with_token("token-min-revision"),
+        ),
+    ];
 
-    // Feedback on the inquiry as a whole, and on its one query: two records, because the
-    // query the feedback is on is what keys it.
-    let whole = Submission::rated(RATINGS[0]).with_token("token-whole");
-    let on_query = Submission::rated(RATINGS[0])
-        .on_query(1)
-        .because(&[REASON_CODES[1]])
-        .with_token("token-query-first");
-    let whole_answer = put_feedback(&router, &whole.body(&inquiry_id)).await;
-    let first_answer = put_feedback(&router, &on_query.body(&inquiry_id)).await;
-    for (label, answer) in [("inquiry-wide", &whole_answer), ("on query 1", &first_answer)] {
+    for (label, first, second) in rows {
+        let router = emulator();
+        let inquiry_id =
+            held_inquiry(&router, &text_body("Residency", "Where is data stored?")).await;
+
+        let recorded = put_feedback(&router, &first.body(&inquiry_id)).await;
         assert_eq!(
-            answer.status, 200,
-            "case {label:?}: the submission must be recorded, got {} with {:?}",
-            answer.status, answer.body
+            recorded.status, 200,
+            "case {label:?}: the first submission must be recorded, got {} with {:?}",
+            recorded.status, recorded.body
+        );
+        let submitted_at = recorded.submitted_at().to_string();
+
+        let refused = put_feedback(&router, &second.body(&inquiry_id)).await;
+        assert_eq!(
+            refused.status, 409,
+            "case {label:?}: a second feedback on one response version is refused, got {} \
+             with {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            "ConflictException",
+            "case {label:?}: expected the modelled ConflictException, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.body["message"],
+            json!(ALREADY_SUBMITTED),
+            "case {label:?}: the refusal states the response version's state, got {:?}",
+            refused.body["message"]
+        );
+        // The modelled `ConflictException` declares both @required.
+        assert_eq!(
+            refused.body["resourceId"],
+            json!(inquiry_id),
+            "case {label:?}: the conflict names the inquiry the record lives on, got {:?}",
+            refused.body["resourceId"]
+        );
+        assert_eq!(
+            refused.body["resourceType"],
+            json!("ComplianceInquiry"),
+            "case {label:?}: the conflict names the resource type, got {:?}",
+            refused.body["resourceType"]
+        );
+
+        // The refused submission recorded NOTHING: the version still carries the first
+        // feedback, unreplaced.
+        let feedback = exported_feedback(&router, &inquiry_id).await;
+        assert_eq!(
+            feedback,
+            vec![first.expected_entry(&submitted_at)],
+            "case {label:?}: the refused submission must record nothing, got {feedback:?}"
         );
     }
-    let feedback = exported_feedback(&router, &inquiry_id).await;
+}
+
+#[tokio::test]
+async fn feedback_on_another_response_version_is_a_record_of_its_own() {
+    // Each row is a pair of submissions on ONE inquiry that target DIFFERENT response
+    // versions, so both are recorded. The rows differ along which coordinate of the version
+    // the two requests differ in — the query, the revision, or a revision named against
+    // none — and along the values and bounds those coordinates take.
+    let rows: Vec<(&str, Submission, Submission)> = vec![
+        (
+            "two revisions of the same query",
+            Submission::rated(RATINGS[0]).on_query(1).on_revision(0),
+            Submission::rated(RATINGS[1]).on_query(1).on_revision(1),
+        ),
+        (
+            "the same query, with and without a revision",
+            Submission::rated(RATINGS[0]).on_query(1),
+            Submission::rated(RATINGS[1]).on_query(1).on_revision(0),
+        ),
+        (
+            "the inquiry's response as a whole and one of its queries",
+            Submission::rated(RATINGS[0]),
+            Submission::rated(RATINGS[0]).on_query(1),
+        ),
+        (
+            "two revisions of the inquiry's response as a whole",
+            Submission::rated(RATINGS[1]).on_revision(1),
+            Submission::rated(RATINGS[1]).on_revision(2),
+        ),
+        (
+            "the largest revision an Integer carries and the one below it",
+            Submission::rated(RATINGS[0])
+                .on_query(1)
+                .on_revision(i32::MAX - 1),
+            Submission::rated(RATINGS[1])
+                .on_query(1)
+                .on_revision(i32::MAX)
+                .because(&[REASON_CODES[1]]),
+        ),
+        (
+            "a negative revision and the next one up — Integer declares no range",
+            Submission::rated(RATINGS[1]).on_query(1).on_revision(-1),
+            Submission::rated(RATINGS[1])
+                .on_query(1)
+                .on_revision(0)
+                .commenting("Better on the new version."),
+        ),
+    ];
+
+    for (label, first, second) in rows {
+        let router = emulator();
+        let inquiry_id =
+            held_inquiry(&router, &text_body("Residency", "Where is data stored?")).await;
+
+        let first_answer = put_feedback(&router, &first.body(&inquiry_id)).await;
+        let second_answer = put_feedback(&router, &second.body(&inquiry_id)).await;
+        for (which, answer) in [("the first", &first_answer), ("the second", &second_answer)] {
+            assert_eq!(
+                answer.status, 200,
+                "case {label:?}: {which} submission targets a version of its own and must \
+                 be recorded, got {} with {:?}",
+                answer.status, answer.body
+            );
+        }
+
+        // Both records are held, in the store's key order: the version each was submitted
+        // against, inquiry-wide entries first and then by ascending query and revision.
+        let mut expected = vec![
+            (
+                (first.query_identifier, first.response_revision_id),
+                first.expected_entry(first_answer.submitted_at()),
+            ),
+            (
+                (second.query_identifier, second.response_revision_id),
+                second.expected_entry(second_answer.submitted_at()),
+            ),
+        ];
+        expected.sort_by_key(|(target, _)| *target);
+        let expected: Vec<Value> = expected.into_iter().map(|(_, entry)| entry).collect();
+        let feedback = exported_feedback(&router, &inquiry_id).await;
+        assert_eq!(
+            feedback, expected,
+            "case {label:?}: two response versions carry two records, got {feedback:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn another_inquirys_untouched_version_accepts_the_same_feedback() {
+    // The rule is scoped to the INQUIRY the version belongs to: rating one inquiry's
+    // version does not refuse the same rating on another inquiry's untouched one, and the
+    // rated version stays refused.
+    let router = emulator();
+    let one = held_inquiry(&router, &text_body("One", "First question?")).await;
+    let other = held_inquiry(&router, &text_body("Two", "Second question?")).await;
+    let submission = Submission::rated(RATINGS[1]).on_query(1).on_revision(0);
+
+    let recorded = put_feedback(
+        &router,
+        &submission.clone().with_token("token-one").body(&one),
+    )
+    .await;
     assert_eq!(
-        feedback,
-        vec![
-            whole.expected_entry(whole_answer.submitted_at()),
-            on_query.expected_entry(first_answer.submitted_at()),
-        ],
-        "feedback on the inquiry and on one of its queries are two records, got \
-         {feedback:?}"
+        recorded.status, 200,
+        "the first inquiry's version must accept the feedback, got {} with {:?}",
+        recorded.status, recorded.body
     );
 
-    // A second `Put` on query 1, under a token of its own, REPLACES the record that query
-    // held — and leaves the inquiry-wide one alone.
-    let replacing = Submission::rated(RATINGS[1])
-        .on_query(1)
-        .because(&[REASON_CODES[0], REASON_CODES[2]])
-        .commenting("Reconsidered.")
-        .on_revision(4)
-        .with_token("token-query-second");
-    let second_answer = put_feedback(&router, &replacing.body(&inquiry_id)).await;
+    let crossed = put_feedback(
+        &router,
+        &submission.clone().with_token("token-two").body(&other),
+    )
+    .await;
     assert_eq!(
-        second_answer.status, 200,
-        "the replacing submission must be recorded, got {} with {:?}",
-        second_answer.status, second_answer.body
+        crossed.status, 200,
+        "another inquiry's untouched version must accept the same feedback, got {} with \
+         {:?}",
+        crossed.status, crossed.body
     );
-    let feedback = exported_feedback(&router, &inquiry_id).await;
+
+    let repeated = put_feedback(
+        &router,
+        &submission.clone().with_token("token-three").body(&one),
+    )
+    .await;
     assert_eq!(
-        feedback,
-        vec![
-            whole.expected_entry(whole_answer.submitted_at()),
-            replacing.expected_entry(second_answer.submitted_at()),
-        ],
-        "a Put replaces the feedback that query held, got {feedback:?}"
+        repeated.status, 409,
+        "the already rated version stays refused, got {} with {:?}",
+        repeated.status, repeated.body
     );
+
+    for (label, inquiry_id, submitted_at) in [
+        ("the first inquiry", &one, recorded.submitted_at()),
+        ("the other inquiry", &other, crossed.submitted_at()),
+    ] {
+        let feedback = exported_feedback(&router, inquiry_id).await;
+        assert_eq!(
+            feedback,
+            vec![submission.expected_entry(submitted_at)],
+            "case {label:?}: each inquiry holds its own one record, got {feedback:?}"
+        );
+    }
 }
 
 #[tokio::test]

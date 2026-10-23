@@ -19,6 +19,8 @@ mod guardrail_timestamp_wire_form;
 mod guardrail_wire_shape;
 #[path = "all/guardrails.rs"]
 mod guardrails;
+#[path = "all/model_invocation_logging.rs"]
+mod model_invocation_logging;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/state_roundtrip.rs"]

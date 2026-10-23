@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/alarm_history.rs"]
 mod alarm_history;
+#[path = "all/alarm_history_data.rs"]
+mod alarm_history_data;
 #[path = "all/ec2_alarm_actions.rs"]
 mod ec2_alarm_actions;
 #[path = "all/harness.rs"]

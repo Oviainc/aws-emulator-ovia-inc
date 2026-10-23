@@ -151,6 +151,11 @@
 //! RDS, Amazon DocumentDB and Amazon Neptune are three Smithy models of. The data is pure
 //! — no modelled shape appears in it — so each of those crates keeps its own generated
 //! shapes and state while the catalog and the rules over it live here once.
+//!
+//! [`query_error_envelope`] is the third: the `<RequestId>` element an `awsQuery`
+//! `<ErrorResponse>` carries beside its `<Error>`, which no model declares and the
+//! framework's error renderers do not write, for every service of that protocol whose
+//! errors must carry the request id an SDK reports.
 
 pub mod rds_cluster_parameters;
 
@@ -168,6 +173,7 @@ pub mod iot_commands;
 pub mod iot_job_executions;
 pub mod lex;
 pub mod network;
+pub mod query_error_envelope;
 pub mod rfc3339;
 pub mod rpc_target;
 pub mod shared_path;

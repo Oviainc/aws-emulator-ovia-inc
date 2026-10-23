@@ -6148,10 +6148,13 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "percent-encoding",
+ "quick-xml",
  "serde_json",
  "service-com-amazonaws-codepipeline-codepipeline-20150709",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-s3-amazons3",
+ "service-com-amazonaws-sns-amazonsimplenotificationservice",
  "service-common",
  "sha2 0.10.9",
  "tokio",
@@ -8011,6 +8014,7 @@ dependencies = [
  "http",
  "serde_json",
  "service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -8034,6 +8038,8 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -14708,6 +14714,7 @@ dependencies = [
  "http",
  "serde_json",
  "sha2 0.10.9",
+ "uuid",
 ]
 
 [[package]]

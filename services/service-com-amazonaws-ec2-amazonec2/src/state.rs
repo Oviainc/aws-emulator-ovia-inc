@@ -152,12 +152,18 @@
 //!
 //! [`ComAmazonawsEc2Amazonec2State::byoip_cidrs`] holds the address ranges the account has
 //! brought to AWS as [`ByoipCidrRecord`]s: the modelled [`ByoipCidr`] every operation that
-//! reports one answers with, plus the release the clock owes a range a
-//! `DeprovisionByoipCidr` has started ([`ByoipCidrRecord::released_at`], on the same monotonic
-//! clock and the same [`TRANSITION_DELAY`] as a `pending` VPC's `available` move). Keyed by
+//! reports one answers with, plus the two moves the clock can owe one — the state move a
+//! `ProvisionByoipCidr` or an `AdvertiseByoipCidr` left non-terminal
+//! ([`ByoipCidrRecord::pending`], the [`PendingStateMove`] every other record of this store
+//! carries) and the release a `DeprovisionByoipCidr` has started
+//! ([`ByoipCidrRecord::released_at`], beside it because WHAT a release ends as is decided at
+//! its due instant rather than when it starts). Both run on the same monotonic clock and the
+//! same [`TRANSITION_DELAY`] span as a `pending` VPC's `available` move, and are applied by
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]. Keyed by
 //! the range itself in its canonical form ([`canonical_byoip_cidr`]), because the range IS
 //! the name the API takes — every BYOIP operation is addressed by `Cidr`, not by a minted id
-//! — which also gives the describe path one stable order. That key comes from a REQUEST, so
+//! — which also gives the describe path one stable order, the order `DescribeByoipCidrs`
+//! reports and pages over. That key comes from a REQUEST, so
 //! the store is bounded like every other one here: a new range has to fit inside the record
 //! ceiling ([`ComAmazonawsEc2Amazonec2State::has_byoip_cidr_capacity`]) and the byte budget,
 //! and [`byoip_cidr_payload_bytes`] is the one definition of what a range is charged, given
@@ -401,6 +407,27 @@
 //! `TransitGatewayOptions$AssociationDefaultRouteTableId` and
 //! `$PropagationDefaultRouteTableId` report name that record.
 //!
+//! ## Transit gateway policy tables and their associations
+//!
+//! [`ComAmazonawsEc2Amazonec2State::transit_gateway_policy_tables`] holds the account's
+//! policy tables as [`TransitGatewayPolicyTableRecord`]s, keyed by
+//! `TransitGatewayPolicyTableId` in a [`BTreeMap`]: the modelled [`TransitGatewayPolicyTable`]
+//! every operation that reports one answers with, plus the thing that shape carries no
+//! member for — the attachments associated with the table, keyed by
+//! `TransitGatewayAttachmentId`, each as the modelled
+//! [`TransitGatewayPolicyTableAssociation`] its own report answers with beside the
+//! [`PendingStateMove`] the clock owes it. An association is per (table, attachment), so
+//! that is what the key is, and the order it gives is the order
+//! `GetTransitGatewayPolicyTableAssociations` reports and pages over.
+//!
+//! `AssociateTransitGatewayPolicyTable` answers an association in the non-terminal
+//! `associating` state, so the clock owes it `associated` one [`TRANSITION_DELAY`] later,
+//! on the same monotonic clock as every other move this store owes, and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it. An attachment
+//! is associated with at most ONE policy table
+//! ([`ComAmazonawsEc2Amazonec2State::policy_table_of_attachment`]), so a second association
+//! of the same attachment is refused rather than stored beside the first.
+//!
 //! Which attachment propagates its routes into which of those route tables is a resource of
 //! its own too — "Enables the specified attachment to propagate routes to the specified
 //! propagation route table" (`EnableTransitGatewayRouteTablePropagation`) — so
@@ -484,6 +511,21 @@
 //! of progress an active task reports is derived per read, being a fact of elapsed time
 //! that no store could hold.
 //!
+//! ## Spot Instance requests
+//!
+//! [`ComAmazonawsEc2Amazonec2State::spot_instance_requests`] holds the Spot Instance
+//! requests `RequestSpotInstances` mints as [`SpotInstanceRequestRecord`]s: the modelled
+//! [`SpotInstanceRequest`] `DescribeSpotInstanceRequests` reports, plus the fulfillment the
+//! clock owes an `open` request and the instant its own `ValidUntil` expires it. Keyed by
+//! `SpotInstanceRequestId` in a [`BTreeMap`], like every other store here, so a pagination
+//! token can name the id the next page starts at. A request AWS hands back is `open`, so
+//! both moves are owed by the clock and applied once by
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_spot_instance_requests`] — and the
+//! fulfillment LAUNCHES an instance into
+//! [`ComAmazonawsEc2Amazonec2State::instances`], which is why an instance carries the
+//! [`InstanceRecord::spot_instance_request_id`] of the request that launched it rather than
+//! Spot Instances being kept in a store of their own.
+//!
 //! ## Placement groups
 //!
 //! [`ComAmazonawsEc2Amazonec2State::placement_groups`] holds the account's placement
@@ -523,7 +565,9 @@ use crate::ops::types::{
     TagSpecification,
     TransitGateway, TransitGatewayClientVpnAttachment,
     TransitGatewayMulticastDomainAssociation, TransitGatewayOptions,
-    TransitGatewayPeeringAttachment, TransitGatewayPropagation, TransitGatewayRequestOptions,
+    TransitGatewayPeeringAttachment, TransitGatewayPolicyTable,
+    TransitGatewayPolicyTableAssociation, TransitGatewayPropagation,
+    TransitGatewayRequestOptions,
     TransitGatewayRouteTable, TransitGatewayRouteTableAnnouncement,
     TransitGatewayRouteTablePropagation,
     TransitGatewayVpcAttachment,
@@ -722,6 +766,7 @@ pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "instance-type",
     "instance.group-id",
     "instance.group-name",
+    "instance-lifecycle",
     "key-name",
     "launch-index",
     "monitoring-state",
@@ -729,6 +774,7 @@ pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "private-dns-name",
     "private-ip-address",
     "reservation-id",
+    "spot-instance-request-id",
     "subnet-id",
     "tag-key",
 ];
@@ -862,6 +908,11 @@ pub struct InstanceRecord {
     pub disable_api_termination: bool,
     pub tags: BTreeMap<String, String>,
     pub client_token: Option<String>,
+    /// The Spot Instance request this instance was launched to fulfill, for an instance
+    /// that was: "if the request is a Spot Instance request, the ID of the request"
+    /// (`Instance$SpotInstanceRequestId`). `None` for an on-demand launch, which is what
+    /// makes the instance's reported `InstanceLifecycle` absent too.
+    pub spot_instance_request_id: Option<String>,
 }
 
 /// One stored reservation: the unit of state one `RunInstances` call creates.
@@ -1446,6 +1497,17 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `TransitGatewayRouteTableAnnouncementId`.
     pub transit_gateway_route_table_announcements:
         BTreeMap<String, TransitGatewayRouteTableAnnouncementRecord>,
+    /// Every transit gateway policy table the account holds, by
+    /// `TransitGatewayPolicyTableId`, each with the attachments associated with it — see
+    /// [`TransitGatewayPolicyTableRecord`] and the module docs. Ordered by id, the stable
+    /// order every reader of it reports in.
+    ///
+    /// `CreateTransitGatewayPolicyTable` is the operation that adds one and
+    /// `DeleteTransitGatewayPolicyTable` the one that removes it; both are still scaffolds,
+    /// so a fresh account holds none — which is why `AssociateTransitGatewayPolicyTable`
+    /// answers `InvalidTransitGatewayPolicyTableId.NotFound` for every id until one of them
+    /// is written, exactly as the real service does for a table that does not exist.
+    pub transit_gateway_policy_tables: BTreeMap<String, TransitGatewayPolicyTableRecord>,
     /// Every IPAM pool the account holds, by `IpamPoolId`, as the modelled [`IpamPool`]
     /// shape itself.
     pub ipam_pools: BTreeMap<String, IpamPool>,
@@ -1473,6 +1535,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// The state of the account's *block public access for snapshots* setting — see the
     /// module docs.
     ///
+    /// Every Spot Instance request the account holds, by `SpotInstanceRequestId` — see the
+    /// module docs. Ordered by id, which is the order `DescribeSpotInstanceRequests`
+    /// reports and pages over.
+    pub spot_instance_requests: BTreeMap<String, SpotInstanceRequestRecord>,
+    /// A `RequestSpotInstances` `ClientToken` and the request ids that call minted, so a
+    /// repeat of the same request answers with those requests instead of asking for more
+    /// capacity. One token names EVERY request of the one call, because one call mints
+    /// `InstanceCount` of them — the same arrangement as
+    /// [`Self::dedicated_host_client_tokens`].
+    pub spot_instance_request_client_tokens: HashMap<String, Vec<String>>,
     /// A `&'static str` so only a member of the modelled `SnapshotBlockPublicAccessState`
     /// catalog can ever be stored here: the word comes from this module's own constants,
     /// never from a request. Read it through
@@ -1546,10 +1618,13 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_attachments: BTreeMap::new(),
             transit_gateway_multicast_domains: BTreeMap::new(),
             transit_gateway_route_table_announcements: BTreeMap::new(),
+            transit_gateway_policy_tables: BTreeMap::new(),
             ipam_pools: BTreeMap::new(),
             vpc_block_public_access_exclusions: BTreeMap::new(),
             import_image_tasks: BTreeMap::new(),
             import_image_task_client_tokens: HashMap::new(),
+            spot_instance_requests: BTreeMap::new(),
+            spot_instance_request_client_tokens: HashMap::new(),
             placement_groups: BTreeMap::new(),
             // "Public sharing is not blocked" is where an account that has never called
             // `EnableSnapshotBlockPublicAccess` sits.
@@ -2602,7 +2677,9 @@ impl ComAmazonawsEc2Amazonec2State {
             if held.is_empty() {
                 // The release succeeded: the range is not one of the account's any more, so
                 // the bytes its record held go back to the budget — exactly what
-                // [`Self::insert_byoip_cidr`] charged for it.
+                // [`Self::insert_byoip_cidr`] charged for it. The move the clock may still
+                // have owed the range goes with the record that carried it
+                // ([`ByoipCidrRecord::pending`]), so nothing can resurrect a released range.
                 if let Some(record) = self.byoip_cidrs.remove(&cidr) {
                     self.release_stored_bytes(byoip_cidr_payload_bytes(&record));
                 }
@@ -2748,6 +2825,23 @@ impl ComAmazonawsEc2Amazonec2State {
                 record.pending = None;
             }
         }
+        // One attachment's association with a policy table, which
+        // `AssociateTransitGatewayPolicyTable` leaves in the transient `associating` state
+        // with `associated` owed: the same contract as the multicast domain associations
+        // above.
+        for table in self.transit_gateway_policy_tables.values_mut() {
+            for association in table.associations.values_mut() {
+                if let Some(state) = association
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.due_by(now))
+                    .map(str::to_string)
+                {
+                    association.view.state = Some(state);
+                    association.pending = None;
+                }
+            }
+        }
         for record in self.byoip_cidrs.values_mut() {
             if let Some(state) = record
                 .pending
@@ -2755,6 +2849,15 @@ impl ComAmazonawsEc2Amazonec2State {
                 .and_then(|pending| pending.due_by(now))
                 .map(str::to_string)
             {
+                // A range leaving `pending-provision` is one whose provision has just
+                // completed — "the address range is not ready to use until its status
+                // changes from pending-provision to provisioned" (`ProvisionByoipCidr`) —
+                // and "Upon success, contains the ID of the address pool"
+                // (`ByoipCidr$StatusMessage`) is what there is to report from that instant
+                // on, where until it there was no success to report.
+                if record.byoip_cidr.state.as_deref() == Some(BYOIP_CIDR_STATE_PENDING_PROVISION) {
+                    record.byoip_cidr.status_message = record.byoip_cidr.pool_id.clone();
+                }
                 record.byoip_cidr.state = Some(state);
                 record.pending = None;
             }
@@ -2808,6 +2911,7 @@ impl ComAmazonawsEc2Amazonec2State {
         // documents, so they are read off the wall clock rather than `now`.
         self.expire_due_address_transfers(SystemTime::now());
         self.complete_due_import_image_tasks(now);
+        self.materialize_due_spot_instance_requests(now);
     }
 
     /// The modelled `Instance` for one stored instance.
@@ -2862,6 +2966,14 @@ impl ComAmazonawsEc2Amazonec2State {
             ),
             client_token: instance.client_token.clone(),
             tags: Some(tag_list(&instance.tags)),
+            // "spot - the instance is a Spot Instance" (`Instance$InstanceLifecycle`) is
+            // reported only for an instance a Spot Instance request launched; an
+            // on-demand instance has no lifecycle word and no request id.
+            instance_lifecycle: instance
+                .spot_instance_request_id
+                .as_ref()
+                .map(|_| INSTANCE_LIFECYCLE_SPOT.to_string()),
+            spot_instance_request_id: instance.spot_instance_request_id.clone(),
             ..Default::default()
         }
     }
@@ -2936,6 +3048,17 @@ impl ComAmazonawsEc2Amazonec2State {
                     .filter_map(|(_, group_name)| group_name.clone())
                     .collect(),
             ),
+            // "instance-lifecycle - Indicates whether this is a Spot Instance" and
+            // "spot-instance-request-id - The ID of the Spot Instance request"
+            // (`DescribeInstancesRequest$Filters`): an on-demand instance holds no value
+            // for either, so a filter naming one selects only Spot Instances.
+            "instance-lifecycle" => single(
+                instance
+                    .spot_instance_request_id
+                    .as_ref()
+                    .map(|_| INSTANCE_LIFECYCLE_SPOT.to_string()),
+            ),
+            "spot-instance-request-id" => single(instance.spot_instance_request_id.clone()),
             "key-name" => single(instance.key_name.clone()),
             "launch-index" => single(Some(instance.ami_launch_index.to_string())),
             "monitoring-state" => single(Some(instance.monitoring_state.clone())),
@@ -3012,10 +3135,18 @@ pub fn filter_name_supported(name: &str) -> bool {
 /// The caller-chosen bytes one stored instance holds.
 ///
 /// Only the members whose length the REQUEST chose count: an id, a state or a
-/// timestamp this emulator mints is a fixed size.
+/// timestamp this emulator mints is a fixed size. EVERY such member counts, though —
+/// the image id, the instance type, the subnet, the key pair name and the zone are
+/// cloned onto every instance a launch mints just as its user data is, so leaving them
+/// out would let one request retain bytes the store's ceiling never saw.
 pub fn instance_payload_bytes(record: &InstanceRecord) -> usize {
     record.user_data.as_ref().map_or(0, String::len)
         + record.client_token.as_ref().map_or(0, String::len)
+        + record.image_id.as_ref().map_or(0, String::len)
+        + record.instance_type.len()
+        + record.subnet_id.as_ref().map_or(0, String::len)
+        + record.key_name.as_ref().map_or(0, String::len)
+        + record.placement_az.len()
         + tag_bytes(&record.tags)
         + record
             .security_groups
@@ -6356,11 +6487,17 @@ pub fn image_is_deprecated(image: &Image, now: SystemTime) -> bool {
 
 /// Refuse a request that named an AMI id the account can see no image for, the way EC2
 /// does: HTTP 400 `InvalidAMIID.NotFound`.
+///
+/// The message is EC2's own: it names the ids it could not resolve as a BRACKETED list,
+/// because the refusal is made over the ids the request supplied — "The image id
+/// '[ami-12345678]' does not exist" is what the real service answers, recorded by the
+/// corpus unit `ec2.op-contract-request-spot-instances`. A refusal here names the one id at
+/// fault.
 pub fn invalid_ami_id_not_found<E>(image_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_AMI_ID_NOT_FOUND,
         400,
-        format!("The image id '{image_id}' does not exist"),
+        format!("The image id '[{image_id}]' does not exist"),
     )
 }
 
@@ -7734,8 +7871,62 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 // ---------------------------------------------------------------------------
-// BYOIP address ranges
+// BYOIP address ranges: the modelled states, the address family, and what a
+// provision is held to. The published prefix bounds, the non-public address
+// catalogs and the provision path itself continue under the `part 2` banner
+// further down.
 // ---------------------------------------------------------------------------
+
+/// "pending-provision: You've submitted a request to provision an address range and it's
+/// pending" (`ByoipCidr$State`) — the state a range is in until the clock has given it
+/// [`TRANSITION_DELAY`], because "provisioning an address range is an asynchronous
+/// operation, so the call returns immediately, but the address range is not ready to use
+/// until its status changes from pending-provision to provisioned"
+/// (`ProvisionByoipCidr`).
+pub const BYOIP_CIDR_STATE_PENDING_PROVISION: &str = "pending-provision";
+
+/// The address family of a CIDR block: which of the two address spaces it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressFamily {
+    /// IPv4, read by the crate's own `canonical_ipv4_cidr` and the published-bound
+    /// readers on top of it ([`canonical_vpc_ipv4_cidr`] and friends).
+    Ipv4,
+    /// IPv6, read by [`canonical_ipv6_cidr`].
+    Ipv6,
+}
+
+impl AddressFamily {
+    /// The `ResourceType` of the address pool "provisioning an IPv4 or IPv6 address range
+    /// … creates a corresponding address pool" (`ProvisionByoipCidr`) for a range of this
+    /// family: the `ResourceType` enum's `ipv4pool-ec2` and `ipv6pool-ec2` members. It is
+    /// both the type a `PoolTagSpecifications` entry may name and the prefix of the pool's
+    /// own id, which is how EC2 spells a public pool id (`ipv4pool-ec2-…`).
+    pub fn pool_resource_type(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "ipv4pool-ec2",
+            Self::Ipv6 => "ipv6pool-ec2",
+        }
+    }
+
+    /// The family of `cidr`: an IPv6 block is the one that carries a `:`, no IPv4
+    /// presentation form having one.
+    pub fn of_cidr(cidr: &str) -> Self {
+        if cidr.contains(':') {
+            Self::Ipv6
+        } else {
+            Self::Ipv4
+        }
+    }
+
+    /// How the model spells this family in an `AddressFamily` member
+    /// ([`ADDRESS_FAMILY_IPV4`] / [`ADDRESS_FAMILY_IPV6`]).
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Ipv4 => ADDRESS_FAMILY_IPV4,
+            Self::Ipv6 => ADDRESS_FAMILY_IPV6,
+        }
+    }
+}
 
 /// `ByoipCidrState` of a range AWS has finished provisioning and will advertise on
 /// request.
@@ -7804,13 +7995,15 @@ pub struct ByoipCidrRecord {
     /// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`], from the addresses
     /// the account holds out of the range then.
     pub released_at: Option<Instant>,
-    /// The state move an ADVERTISEMENT owes the range, for a range `AdvertiseByoipCidr` left
-    /// in `pending-advertising`; `None` for a range nothing is advertising.
+    /// The state move the clock owes the range for the work a request has STARTED on it: a
+    /// range `ProvisionByoipCidr` left in `pending-provision`, or one `AdvertiseByoipCidr`
+    /// left in `pending-advertising`; `None` for a range nothing is owed.
     ///
     /// Beside [`Self::released_at`] rather than folded into it because the two owe different
     /// things: a release's outcome is decided at its due instant from the addresses the
-    /// account holds then, while an advertisement's is known when it is asked for, so it is
-    /// carried as the [`PendingStateMove`] every other record of this store uses.
+    /// account holds then, while a provision's and an advertisement's are known when they
+    /// are asked for, so they are carried as the [`PendingStateMove`] every other record of
+    /// this store uses.
     pub pending: Option<PendingStateMove>,
 }
 
@@ -7940,6 +8133,11 @@ impl ComAmazonawsEc2Amazonec2State {
         record.byoip_cidr.state = Some(BYOIP_CIDR_STATE_PENDING_DEPROVISION.to_string());
         record.byoip_cidr.status_message = None;
         record.released_at = Some(Instant::now() + TRANSITION_DELAY);
+        // The release supersedes whatever state move was owed the range: a range being
+        // released is not going to land in the state an earlier provision or advertisement
+        // was moving it to, so that move is dropped rather than left to overwrite the
+        // release's own outcome.
+        record.pending = None;
         Some(record.byoip_cidr.clone())
     }
 
@@ -8540,6 +8738,357 @@ impl<T> ClockTransition<T> {
             due_at: Instant::now() + TRANSITION_DELAY,
             at: SystemTime::now() + TRANSITION_DELAY,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BYOIP address ranges (`ByoipCidr`), part 2: what a provision is held to, and
+// the stored record. Continues the `part 1` banner above.
+// ---------------------------------------------------------------------------
+
+/// The most specific IPv4 prefix a BYOIP range may have: "The most specific IPv4 prefix
+/// that you can specify is /24" (`ProvisionByoipCidrRequest$Cidr`).
+pub const MOST_SPECIFIC_BYOIP_IPV4_PREFIX: u8 = 24;
+
+/// The most specific IPv6 prefix a publicly advertisable BYOIP range may have: "The most
+/// specific IPv6 address range that you can bring is /48 for CIDRs that are publicly
+/// advertisable" (`ProvisionByoipCidrRequest$Cidr`).
+pub const MOST_SPECIFIC_BYOIP_IPV6_PREFIX: u8 = 48;
+
+/// The most specific IPv6 prefix a range that is NOT publicly advertisable may have: "…
+/// and /56 for CIDRs that are not publicly advertisable"
+/// (`ProvisionByoipCidrRequest$Cidr`).
+pub const MOST_SPECIFIC_BYOIP_IPV6_PREFIX_NOT_PUBLICLY_ADVERTISABLE: u8 = 56;
+
+/// "(IPv6 only) Indicate whether the address range will be publicly advertised to the
+/// internet. Default: true" (`ProvisionByoipCidrRequest$PubliclyAdvertisable`).
+pub const DEFAULT_PUBLICLY_ADVERTISABLE: bool = true;
+
+/// The Local Zone network border groups a BYOIPv4 range may be provisioned to: "You can
+/// provision BYOIP address ranges to and advertise them in the following Local Zone
+/// network border groups: us-east-1-dfw-2 us-west-2-lax-1 us-west-2-phx-2"
+/// (`ProvisionByoipCidrRequest$NetworkBorderGroup`).
+pub const LOCAL_ZONE_NETWORK_BORDER_GROUPS: [&str; 3] =
+    ["us-east-1-dfw-2", "us-west-2-lax-1", "us-west-2-phx-2"];
+
+/// May a range of `family` be provisioned to the network border group `group` from
+/// `region`?
+///
+/// The Region a request was signed for is always a network border group of its own — it is
+/// the group a request that names none gets — and beside it a BYOIPv4 range may name one of
+/// the Region's own Local Zone groups ([`LOCAL_ZONE_NETWORK_BORDER_GROUPS`], each of which
+/// starts with its parent Region's name). "You cannot provision or advertise BYOIPv6
+/// address ranges in Local Zones at this time"
+/// (`ProvisionByoipCidrRequest$NetworkBorderGroup`), so for IPv6 only the Region itself
+/// holds.
+pub fn byoip_network_border_group_allowed(
+    group: &str,
+    region: &str,
+    family: AddressFamily,
+) -> bool {
+    group == region
+        || (family == AddressFamily::Ipv4
+            && group.starts_with(region)
+            && LOCAL_ZONE_NETWORK_BORDER_GROUPS.contains(&group))
+}
+
+/// The error code a provision past the store's record ceiling carries, in EC2's own
+/// `<Resource>LimitExceeded` naming — the same convention as [`VPC_LIMIT_EXCEEDED`],
+/// [`SUBNET_LIMIT_EXCEEDED`] and [`VOLUME_LIMIT_EXCEEDED`], each of which is the code the
+/// real service answers that resource's quota with.
+pub const BYOIP_CIDR_LIMIT_EXCEEDED: &str = "ByoipCidrLimitExceeded";
+
+/// Refuse a provision that would take the store past the BYOIP record ceiling
+/// ([`ComAmazonawsEc2Amazonec2State::has_byoip_cidr_capacity`]): HTTP 400
+/// [`BYOIP_CIDR_LIMIT_EXCEEDED`].
+pub fn byoip_cidr_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        BYOIP_CIDR_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of BYOIP address ranges has been reached \
+             ({MAX_STORED_RECORDS_PER_STORE})"
+        ),
+    )
+}
+
+/// Why a requested BYOIP address range cannot be provisioned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByoipCidrProblem {
+    /// The value is not a CIDR block of either address family.
+    Malformed,
+    /// The block parses, but its prefix is more specific than the most specific one the
+    /// family (and, for IPv6, the advertisability) admits — the carried bound.
+    PrefixLength(u8),
+    /// The block parses, but it is not public address space, so it cannot be an address
+    /// range brought to AWS: `ProvisionByoipCidrRequest$Cidr` is "The public IPv4 or IPv6
+    /// address range".
+    NotPublic,
+}
+
+/// One readable BYOIP address range: the block in canonical form, and its family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ByoipCidrBlock {
+    /// The block with its host bits cleared, the form this crate stores every CIDR in.
+    pub cidr: String,
+    /// Which address space it names, which decides the pool's resource type and the
+    /// prefix bound it was held to.
+    pub family: AddressFamily,
+}
+
+/// A requested BYOIP address range, read the one way this crate reads a CIDR block and
+/// held to what `ProvisionByoipCidrRequest$Cidr` publishes for one: a PUBLIC IPv4 or IPv6
+/// range, no more specific than /24 for IPv4, /48 for a publicly advertisable IPv6 range
+/// and /56 for one that is not.
+///
+/// The canonical form is the one the store keys its ranges by ([`canonical_byoip_cidr`]);
+/// what this adds is the published bounds a PROVISION is held to, which a range already in
+/// the store is not re-checked against.
+pub fn provisionable_byoip_cidr(
+    value: &str,
+    publicly_advertisable: bool,
+) -> Result<ByoipCidrBlock, ByoipCidrProblem> {
+    let family = AddressFamily::of_cidr(value);
+    let canonical = canonical_byoip_cidr(value).map_err(|_| ByoipCidrProblem::Malformed)?;
+    let (prefix_length, most_specific) = match family {
+        AddressFamily::Ipv4 => {
+            let (_, prefix_length) =
+                split_ipv4_cidr(&canonical).ok_or(ByoipCidrProblem::Malformed)?;
+            (prefix_length, MOST_SPECIFIC_BYOIP_IPV4_PREFIX)
+        }
+        AddressFamily::Ipv6 => {
+            let (_, prefix_length) =
+                split_ipv6_cidr(&canonical).ok_or(ByoipCidrProblem::Malformed)?;
+            let most_specific = if publicly_advertisable {
+                MOST_SPECIFIC_BYOIP_IPV6_PREFIX
+            } else {
+                MOST_SPECIFIC_BYOIP_IPV6_PREFIX_NOT_PUBLICLY_ADVERTISABLE
+            };
+            (prefix_length, most_specific)
+        }
+    };
+    if prefix_length > most_specific {
+        return Err(ByoipCidrProblem::PrefixLength(most_specific));
+    }
+    if !cidr_block_is_public(&canonical) {
+        return Err(ByoipCidrProblem::NotPublic);
+    }
+    Ok(ByoipCidrBlock {
+        cidr: canonical,
+        family,
+    })
+}
+
+/// Every IPv4 block the IANA IPv4 Special-Purpose Address Registry (RFC 6890) marks as
+/// NOT globally reachable: this host, private use, shared address space, loopback,
+/// link local, protocol assignments, the three documentation blocks, the AS112 and AMT
+/// assignments, benchmarking, 6to4 relay anycast, multicast and reserved space.
+///
+/// An address range brought to AWS is "The public IPv4 or IPv6 address range"
+/// (`ProvisionByoipCidrRequest$Cidr`) — a range the account holds a registry allocation and
+/// an RPKI ROA for — so a block that meets any of these cannot be one.
+const NON_PUBLIC_IPV4_BLOCKS: [&str; 18] = [
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.31.196.0/24",
+    "192.52.193.0/24",
+    "192.88.99.0/24",
+    "192.168.0.0/16",
+    "192.175.48.0/24",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+];
+
+/// Every IPv6 block the IANA IPv6 Special-Purpose Address Registry marks as not globally
+/// reachable while sitting INSIDE global unicast space: Teredo, benchmarking, ORCHIDv2 and
+/// the two documentation blocks, plus 6to4. Everything outside global unicast is excluded
+/// by [`GLOBAL_UNICAST_IPV6_BLOCK`] instead.
+const NON_PUBLIC_IPV6_BLOCKS: [&str; 6] = [
+    "2001::/32",
+    "2001:2::/48",
+    "2001:20::/28",
+    "2001:db8::/32",
+    "2002::/16",
+    "3fff::/20",
+];
+
+/// The one global unicast IPv6 block: IANA's IPv6 Global Unicast Address Assignments give
+/// `2000::/3` as the only space handed to the registries, so a BYOIPv6 range has to be
+/// inside it.
+const GLOBAL_UNICAST_IPV6_BLOCK: &str = "2000::/3";
+
+/// Is every address of `block` public address space — space a registry allocates, as
+/// opposed to the special-purpose blocks no one can bring to AWS?
+///
+/// A block that is only PARTLY public is not: a caller cannot hold an allocation for a
+/// range that reaches into reserved space, which is why this asks about overlap rather
+/// than about the block's base address.
+pub fn cidr_block_is_public(block: &str) -> bool {
+    match AddressFamily::of_cidr(block) {
+        AddressFamily::Ipv4 => NON_PUBLIC_IPV4_BLOCKS
+            .iter()
+            .all(|reserved| !ipv4_cidr_blocks_overlap(block, reserved)),
+        AddressFamily::Ipv6 => {
+            ipv6_cidr_block_contains(GLOBAL_UNICAST_IPV6_BLOCK, block)
+                && NON_PUBLIC_IPV6_BLOCKS
+                    .iter()
+                    .all(|reserved| !ipv6_cidr_blocks_overlap(block, reserved))
+        }
+    }
+}
+
+/// `block` as its base address and prefix length, for a block already in canonical form —
+/// the IPv6 counterpart of [`split_ipv4_cidr`].
+fn split_ipv6_cidr(block: &str) -> Option<(u128, u8)> {
+    let (address, prefix_length) = block.split_once('/')?;
+    let base = u128::from(address.parse::<Ipv6Addr>().ok()?);
+    let prefix_length: u8 = prefix_length.parse().ok()?;
+    (prefix_length <= 128).then_some((base, prefix_length))
+}
+
+/// The first and last address of `block`, or `None` when it is not an IPv6 CIDR block.
+fn ipv6_cidr_bounds(block: &str) -> Option<(u128, u128)> {
+    let (base, prefix_length) = split_ipv6_cidr(block)?;
+    let size = 1u128
+        .checked_shl(u32::from(128 - prefix_length))
+        .unwrap_or_default();
+    // A /0 spans the whole space, whose size does not fit a u128; its last address is the
+    // largest one there is.
+    let last = match size {
+        0 => u128::MAX,
+        size => base.checked_add(size - 1)?,
+    };
+    Some((base, last))
+}
+
+/// Do `left` and `right` share any IPv6 address? The IPv6 counterpart of
+/// [`ipv4_cidr_blocks_overlap`], on the same terms: a block this emulator cannot read
+/// overlaps nothing.
+pub fn ipv6_cidr_blocks_overlap(left: &str, right: &str) -> bool {
+    match (ipv6_cidr_bounds(left), ipv6_cidr_bounds(right)) {
+        (Some((left_first, left_last)), Some((right_first, right_last))) => {
+            left_first <= right_last && right_first <= left_last
+        }
+        _ => false,
+    }
+}
+
+/// Is every address of `inner` an address of `outer`? The IPv6 counterpart of
+/// [`ipv4_cidr_block_contains`].
+pub fn ipv6_cidr_block_contains(outer: &str, inner: &str) -> bool {
+    match (ipv6_cidr_bounds(outer), ipv6_cidr_bounds(inner)) {
+        (Some((outer_first, outer_last)), Some((inner_first, inner_last))) => {
+            outer_first <= inner_first && inner_last <= outer_last
+        }
+        _ => false,
+    }
+}
+
+/// Do `left` and `right` share an address, whatever family they are?
+///
+/// Two blocks of DIFFERENT families share nothing — an IPv4 address is not an IPv6 one —
+/// so the question is only ever asked within one family, and this is the one reader that
+/// picks which. It is what "The address range cannot overlap with another address range
+/// that you've brought to this or another Region" (`ProvisionByoipCidrRequest$Cidr`) asks.
+pub fn cidr_blocks_overlap(left: &str, right: &str) -> bool {
+    match (AddressFamily::of_cidr(left), AddressFamily::of_cidr(right)) {
+        (AddressFamily::Ipv4, AddressFamily::Ipv4) => ipv4_cidr_blocks_overlap(left, right),
+        (AddressFamily::Ipv6, AddressFamily::Ipv6) => ipv6_cidr_blocks_overlap(left, right),
+        _ => false,
+    }
+}
+
+/// What a provision stores: everything about one BYOIP range that comes from the request,
+/// read and validated by `ProvisionByoipCidr` before the store is touched.
+#[derive(Debug, Clone)]
+pub struct ByoipCidrSpec {
+    /// The range, canonical, as [`provisionable_byoip_cidr`] read it.
+    pub block: ByoipCidrBlock,
+    /// "A description for the address range and the address pool"
+    /// (`ProvisionByoipCidrRequest$Description`).
+    pub description: Option<String>,
+    /// The network border group the range is advertised from: the one the request named,
+    /// or the Region it was signed for.
+    pub network_border_group: String,
+    /// Whether the range "will be publicly advertised to the internet"
+    /// (`ProvisionByoipCidrRequest$PubliclyAdvertisable`).
+    pub publicly_advertisable: bool,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The BYOIP range the store holds that shares an address with `cidr`, if any.
+    ///
+    /// "The address range cannot overlap with another address range that you've brought to
+    /// this or another Region" (`ProvisionByoipCidrRequest$Cidr`) — asked over the whole
+    /// store, so a range that merely CONTAINS or sits inside a provisioned one is caught
+    /// as well as an exact repeat.
+    pub fn byoip_cidr_overlapping(&self, cidr: &str) -> Option<&str> {
+        self.byoip_cidrs
+            .keys()
+            .find(|held| cidr_blocks_overlap(cidr, held))
+            .map(String::as_str)
+    }
+
+    /// Store `spec` as a newly provisioned BYOIP range and answer it as the provision
+    /// reports it — `pending-provision`, the state the clock owes `provisioned`
+    /// [`TRANSITION_DELAY`] from now ([`ByoipCidrRecord::pending`]).
+    ///
+    /// The pool the range gets ("creates a corresponding address pool",
+    /// `ProvisionByoipCidr`) is minted here from the store's own id counter, so no caller
+    /// can choose a pool id. The record goes in through [`Self::insert_byoip_cidr`], the one
+    /// write path, which charges the bytes it holds and REFUSES a record that does not fit
+    /// the store's ceilings — so `None`, with nothing stored, rather than a range reported
+    /// to a caller that the store does not hold.
+    pub fn provision_byoip_cidr(&mut self, spec: ByoipCidrSpec) -> Option<ByoipCidr> {
+        let pool_id = self.next_id(spec.block.family.pool_resource_type());
+        let becomes = match (spec.block.family, spec.publicly_advertisable) {
+            (AddressFamily::Ipv6, false) => BYOIP_CIDR_STATE_PROVISIONED_NOT_PUBLICLY_ADVERTISABLE,
+            _ => BYOIP_CIDR_STATE_PROVISIONED,
+        };
+        let record = ByoipCidrRecord {
+            byoip_cidr: ByoipCidr {
+                cidr: Some(spec.block.cidr.clone()),
+                description: spec.description,
+                // "The BYOIP CIDR associations with ASNs" (`ByoipCidr$AsnAssociations`):
+                // none until `AssociateIpamByoasn` makes one.
+                asn_associations: Some(Vec::new()),
+                // "Upon success, contains the ID of the address pool"
+                // (`ByoipCidr$StatusMessage`) — the provision has not succeeded yet, so
+                // there is nothing to report until the clock says it has.
+                status_message: None,
+                state: Some(BYOIP_CIDR_STATE_PENDING_PROVISION.to_string()),
+                network_border_group: Some(spec.network_border_group),
+                // `ByoipCidr$AdvertisementType` is how the range IS advertised, and this
+                // one is not advertised yet — `AdvertiseByoipCidr` is what starts that.
+                advertisement_type: None,
+                pool_id: Some(pool_id),
+                // "The ID of the IPAM pool associated with the CIDR"
+                // (`ByoipCidr$IpamPoolId`): a range provisioned through this operation is
+                // not in an IPAM pool; `MoveByoipCidrToIpam` is what puts one there.
+                ipam_pool_id: None,
+            },
+            released_at: None,
+            // What the clock now owes this range, recorded rather than slept for: "the
+            // address range is not ready to use until its status changes from
+            // pending-provision to provisioned" (`ProvisionByoipCidr`), one
+            // [`TRANSITION_DELAY`] from now, off the same monotonic clock as every other
+            // move this store owes. WHAT it becomes is decided by the REQUEST — an IPv6
+            // range the caller asked not to have advertised lands in
+            // `provisioned-not-publicly-advertisable` — so it is recorded here rather than
+            // guessed at the due instant.
+            pending: Some(PendingStateMove::starting_now(becomes)),
+        };
+        let reported = record.byoip_cidr.clone();
+        self.insert_byoip_cidr(record).then_some(reported)
     }
 }
 
@@ -10777,6 +11326,245 @@ pub const ANNOUNCEMENT_STATE_DELETING: &str = "deleting";
 pub const ANNOUNCEMENT_STATE_DELETED: &str = "deleted";
 
 // =============================================================================
+// Transit gateway policy tables, and the attachments associated with them
+// =============================================================================
+
+/// The id prefix a transit gateway policy table is minted with.
+pub const TRANSIT_GATEWAY_POLICY_TABLE_ID_PREFIX: &str = "tgw-ptb";
+
+/// A policy table association being carried out: the `TransitGatewayAssociationState`
+/// enum's `associating` member
+/// (`smithy_query(query="shape",shape="TransitGatewayAssociationState")`, whose members are
+/// `associating`, `associated`, `disassociating`, `disassociated`).
+pub const TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATING: &str = "associating";
+
+/// An association in force: that enum's `associated` member.
+pub const TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATED: &str = "associated";
+
+/// A policy table in service: the `TransitGatewayPolicyTableState` enum's `available`
+/// member (that enum being `pending`, `available`, `deleting`, `deleted`).
+pub const TRANSIT_GATEWAY_POLICY_TABLE_STATE_AVAILABLE: &str = "available";
+
+/// One attachment's association with a transit gateway policy table: the modelled
+/// [`TransitGatewayPolicyTableAssociation`] every operation that reports one answers with,
+/// plus the move the clock owes it.
+///
+/// The modelled shape itself rather than a parallel record, for the reason every other
+/// store here holds one: a member a writer sets round-trips through
+/// `GetTransitGatewayPolicyTableAssociations` without a field-by-field copy that can
+/// silently drop one.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayPolicyTableAssociationRecord {
+    /// The association as the model shapes it, carrying the state reached so far.
+    pub view: TransitGatewayPolicyTableAssociation,
+    /// The move to `associated` an association owes while it is still `associating`;
+    /// `None` for one that owes none.
+    pub pending: Option<PendingStateMove>,
+}
+
+/// One transit gateway policy table and the attachments associated with it.
+///
+/// The associations are keyed by `TransitGatewayAttachmentId`, because an association IS
+/// per (table, attachment): one attachment cannot be associated with one table twice, and
+/// the key order is the stable order a report of them pages over.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayPolicyTableRecord {
+    /// The policy table itself, as the modelled shape its own operations report.
+    pub view: TransitGatewayPolicyTable,
+    /// The attachments associated with this table, by `TransitGatewayAttachmentId`.
+    pub associations: BTreeMap<String, TransitGatewayPolicyTableAssociationRecord>,
+}
+
+/// `InvalidTransitGatewayPolicyTableId.NotFound` (HTTP 400): the request named a transit
+/// gateway policy table id this account holds no policy table for.
+pub const INVALID_TRANSIT_GATEWAY_POLICY_TABLE_ID_NOT_FOUND: &str =
+    "InvalidTransitGatewayPolicyTableId.NotFound";
+
+/// `InvalidTransitGatewayPolicyTableId.Malformed` (HTTP 400): the request named something
+/// that is not a transit gateway policy table id at all.
+pub const INVALID_TRANSIT_GATEWAY_POLICY_TABLE_ID_MALFORMED: &str =
+    "InvalidTransitGatewayPolicyTableId.Malformed";
+
+/// Refuse a request that named a transit gateway policy table id no policy table of the
+/// account has: HTTP 400 `InvalidTransitGatewayPolicyTableId.NotFound`, worded the way
+/// [`invalid_transit_gateway_id_not_found`] words the transit gateway's own.
+pub fn invalid_transit_gateway_policy_table_id_not_found<E>(
+    transit_gateway_policy_table_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_TRANSIT_GATEWAY_POLICY_TABLE_ID_NOT_FOUND,
+        400,
+        format!(
+            "Transit Gateway Policy Table {transit_gateway_policy_table_id} was deleted or does \
+             not exist."
+        ),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The transit gateway policy table `transit_gateway_policy_table_id` names, refusing a
+    /// malformed id first and an unknown one second — the order
+    /// [`require_well_formed_id`] documents, so "not an id of this kind" is never reported
+    /// as "no such policy table".
+    ///
+    /// The ONE place a `TransitGatewayPolicyTableId` is resolved, so every operation that
+    /// takes one refuses the same id the same way.
+    pub fn require_transit_gateway_policy_table<E>(
+        &self,
+        transit_gateway_policy_table_id: &str,
+    ) -> Result<&TransitGatewayPolicyTableRecord, Scaffolded<E>> {
+        require_well_formed_id(
+            TRANSIT_GATEWAY_POLICY_TABLE_ID_PREFIX,
+            transit_gateway_policy_table_id,
+            INVALID_TRANSIT_GATEWAY_POLICY_TABLE_ID_MALFORMED,
+        )?;
+        self.transit_gateway_policy_tables
+            .get(transit_gateway_policy_table_id)
+            .ok_or_else(|| {
+                invalid_transit_gateway_policy_table_id_not_found(transit_gateway_policy_table_id)
+            })
+    }
+
+    /// The policy table `transit_gateway_attachment_id` is already associated with, if any.
+    ///
+    /// An attachment is associated with at most one policy table, so this answers at most
+    /// one id; it is a scan of the tables the account holds, which is bounded by
+    /// [`MAX_STORED_RECORDS_PER_STORE`] like every other store here.
+    pub fn policy_table_of_attachment(&self, transit_gateway_attachment_id: &str) -> Option<&str> {
+        self.transit_gateway_policy_tables
+            .iter()
+            .find(|(_, table)| {
+                table
+                    .associations
+                    .contains_key(transit_gateway_attachment_id)
+            })
+            .map(|(policy_table_id, _)| policy_table_id.as_str())
+    }
+
+    /// Store a transit gateway policy table and answer the `TransitGatewayPolicyTableId` it
+    /// was given — or `None` when the store is full.
+    ///
+    /// The id is minted here rather than taken from `view`, exactly as
+    /// [`Self::insert_transit_gateway_attachment`] mints an attachment id, and the
+    /// caller-chosen bytes the table holds (its tags) are charged here on top of the fixed
+    /// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, so no path can store one
+    /// uncharged. A table is stored with no associations: every association is made by a
+    /// request.
+    pub fn insert_transit_gateway_policy_table(
+        &mut self,
+        mut view: TransitGatewayPolicyTable,
+    ) -> Option<String> {
+        if self.transit_gateway_policy_tables.len() >= MAX_STORED_RECORDS_PER_STORE {
+            return None;
+        }
+        let policy_table_id = self.next_id(TRANSIT_GATEWAY_POLICY_TABLE_ID_PREFIX);
+        view.transit_gateway_policy_table_id = Some(policy_table_id.clone());
+        self.add_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES + tag_list_bytes(view.tags.as_deref().unwrap_or_default()),
+        );
+        self.transit_gateway_policy_tables.insert(
+            policy_table_id.clone(),
+            TransitGatewayPolicyTableRecord {
+                view,
+                associations: BTreeMap::new(),
+            },
+        );
+        Some(policy_table_id)
+    }
+}
+
+/// Associate the transit gateway attachment `transit_gateway_attachment_id` with the
+/// transit gateway policy table `transit_gateway_policy_table_id`, and answer the
+/// association as it now stands.
+///
+/// The rule `AssociateTransitGatewayPolicyTable` follows, in one place so a later
+/// disassociation and report cannot disagree with it: both resources must exist, an
+/// attachment already associated with a policy table cannot be associated with another, and
+/// a new association starts in the TRANSIENT `associating` state with the clock owing it
+/// `associated` — the span is never zero, so a caller acting straight after this call still
+/// sees `associating`.
+///
+/// The association's `ResourceId` and `ResourceType` are read off the stored attachment
+/// ("The resource ID of the transit gateway attachment" /  "The resource type for the
+/// transit gateway policy table association",
+/// `TransitGatewayPolicyTableAssociation$ResourceId` / `$ResourceType`), never off the
+/// request, which names neither. The CALLER refuses a malformed id of either kind first, so
+/// nothing here depends on the request's form.
+pub fn associate_transit_gateway_policy_table<E>(
+    store: &mut ComAmazonawsEc2Amazonec2State,
+    transit_gateway_policy_table_id: &str,
+    transit_gateway_attachment_id: &str,
+) -> Result<TransitGatewayPolicyTableAssociation, Scaffolded<E>> {
+    // The clock first: an association whose move has fallen due is already `associated`, so
+    // what this call is asked against is the state the store is ACTUALLY in.
+    store.materialize_due_transitions();
+
+    // The policy table the request names, before the attachment: the operation's members
+    // name the table first, and a request naming two unknown resources is told about the
+    // first one.
+    store.require_transit_gateway_policy_table(transit_gateway_policy_table_id)?;
+
+    // "The ID of the transit gateway attachment to associate with the policy table"
+    // (`AssociateTransitGatewayPolicyTableRequest$TransitGatewayAttachmentId`): an id
+    // naming no attachment of the account is refused with the attachment's own NotFound
+    // code rather than silently associating nothing.
+    let attachment = store
+        .transit_gateway_attachments
+        .get(transit_gateway_attachment_id)
+        .ok_or_else(|| {
+            id_not_found(
+                INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
+                "transit gateway attachment ID",
+                transit_gateway_attachment_id,
+            )
+        })?;
+    let resource_id = attachment.view.resource_id().map(str::to_string);
+    let resource_type = attachment.view.resource_type().to_string();
+
+    // One attachment, at most one policy table — so a second association is refused with
+    // EC2's own `Resource.AlreadyAssociated` and NOTHING is written, whether the table it
+    // already belongs to is this one or another.
+    if let Some(holder) = store.policy_table_of_attachment(transit_gateway_attachment_id) {
+        return Err(resource_already_associated(format!(
+            "The transit gateway attachment '{transit_gateway_attachment_id}' is already \
+             associated with the transit gateway policy table '{holder}'"
+        )));
+    }
+
+    let view = TransitGatewayPolicyTableAssociation {
+        transit_gateway_policy_table_id: Some(transit_gateway_policy_table_id.to_string()),
+        transit_gateway_attachment_id: Some(transit_gateway_attachment_id.to_string()),
+        resource_id,
+        resource_type: Some(resource_type),
+        state: Some(TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATING.to_string()),
+    };
+    // An association retains no caller-chosen text at all — every string on it is either a
+    // word this module chose or an id read back out of another store, and an attachment is
+    // associated at most once, so the table cannot hold more associations than the
+    // attachment store holds attachments ([`MAX_STORED_RECORDS_PER_STORE`]). No byte charge
+    // is made for one, for the reason a Windows fast launch configuration makes none.
+    let table = store
+        .transit_gateway_policy_tables
+        .get_mut(transit_gateway_policy_table_id)
+        .ok_or_else(|| {
+            internal_error(format!(
+                "the transit gateway policy table '{transit_gateway_policy_table_id}' resolved a \
+                 moment ago is not in the store any more"
+            ))
+        })?;
+    table.associations.insert(
+        transit_gateway_attachment_id.to_string(),
+        TransitGatewayPolicyTableAssociationRecord {
+            view: view.clone(),
+            pending: Some(PendingStateMove::starting_now(
+                TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATED,
+            )),
+        },
+    );
+    Ok(view)
+}
+
+// =============================================================================
 // IPAM pools, and the one BYOIP state the release path has no word for
 // =============================================================================
 
@@ -10803,13 +11591,14 @@ pub const ADDRESS_FAMILY_IPV4: &str = "ipv4";
 /// The `AddressFamily` of an IPv6 pool or range.
 pub const ADDRESS_FAMILY_IPV6: &str = "ipv6";
 
-/// The address family a canonical BYOIP range belongs to, as `AddressFamily` spells it.
+/// The address family a canonical BYOIP range belongs to, as `AddressFamily` spells it on
+/// the wire.
+///
+/// One definition of "which family is this range": the decision is
+/// [`AddressFamily::of_cidr`]'s and this only names the result the way the model does
+/// ([`AddressFamily::wire_name`]), so the two cannot drift.
 pub fn byoip_cidr_address_family(cidr: &str) -> &'static str {
-    if cidr.contains(':') {
-        ADDRESS_FAMILY_IPV6
-    } else {
-        ADDRESS_FAMILY_IPV4
-    }
+    AddressFamily::of_cidr(cidr).wire_name()
 }
 
 // =============================================================================
@@ -11853,6 +12642,652 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn set_snapshot_block_public_access_state(&mut self, state: &'static str) -> &'static str {
         self.snapshot_block_public_access = state;
         self.snapshot_block_public_access
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spot Instance requests
+// ---------------------------------------------------------------------------
+//
+// A Spot Instance request is a STANDING ORDER for capacity, not a resource that is
+// finished when the call returns: "the request becomes active at this date and time and
+// remains active until all instances launch, the request expires, or the request is
+// canceled" (`RequestSpotInstancesRequest$ValidFrom`). So a stored request carries the
+// modelled `SpotInstanceRequest` the describes report plus the two moves the CLOCK owes
+// it — the fulfillment that launches its instance, and the expiry its own `ValidUntil`
+// makes due — each applied once by
+// [`ComAmazonawsEc2Amazonec2State::materialize_due_spot_instance_requests`], which
+// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] calls.
+//
+// Fulfilling a request LAUNCHES AN INSTANCE into this store's own instance lifecycle —
+// "the instance ID, if an instance has been launched to fulfill the Spot Instance
+// request" (`SpotInstanceRequest$InstanceId`) — so a Spot Instance is one instance of
+// this account like any other, reported by `DescribeInstances` with the
+// `spot` lifecycle and the id of the request that launched it.
+
+// The modelled shapes this slice reads, named HERE rather than in the module's shared
+// `use crate::ops::types::{..}` list at the top, the way the VM import slice does it.
+use crate::ops::types::{SpotInstanceRequest, SpotInstanceStatus};
+
+/// "`open` - The request is waiting to be fulfilled" — the `SpotInstanceState` enum's
+/// `open` member, which is where every request a `RequestSpotInstances` mints starts.
+pub const SPOT_REQUEST_STATE_OPEN: &str = "open";
+
+/// "`active` - The request is fulfilled and has an associated Spot Instance" — the
+/// `SpotInstanceState` enum's `active` member.
+pub const SPOT_REQUEST_STATE_ACTIVE: &str = "active";
+
+/// "`closed` - The request is unfulfillable" — the `SpotInstanceState` enum's `closed`
+/// member, which an expired request lands in.
+pub const SPOT_REQUEST_STATE_CLOSED: &str = "closed";
+
+/// "`cancelled` - The request was canceled" — the `SpotInstanceState` enum's `cancelled`
+/// member.
+pub const SPOT_REQUEST_STATE_CANCELLED: &str = "cancelled";
+
+/// The status code of a request that has been submitted and not yet evaluated, the first
+/// of the Spot request status codes `SpotInstanceStatus$Code` points at.
+pub const SPOT_STATUS_PENDING_EVALUATION: &str = "pending-evaluation";
+
+/// The status code of a request whose instance has been launched.
+pub const SPOT_STATUS_FULFILLED: &str = "fulfilled";
+
+/// The status code of a request whose own validity window ended before it was fulfilled.
+pub const SPOT_STATUS_SCHEDULE_EXPIRED: &str = "schedule-expired";
+
+/// The status code of a request that could not be fulfilled for want of capacity.
+pub const SPOT_STATUS_CAPACITY_NOT_AVAILABLE: &str = "capacity-not-available";
+
+/// The description [`SPOT_STATUS_PENDING_EVALUATION`] carries: "The description for the
+/// status code" (`SpotInstanceStatus$Message`). An EXAMPLE wording of the code, which is
+/// what clients branch on.
+pub const SPOT_STATUS_MESSAGE_PENDING_EVALUATION: &str =
+    "Your Spot request has been submitted for review, and is pending evaluation.";
+
+/// The description [`SPOT_STATUS_FULFILLED`] carries.
+pub const SPOT_STATUS_MESSAGE_FULFILLED: &str = "Your Spot request is fulfilled.";
+
+/// The description [`SPOT_STATUS_SCHEDULE_EXPIRED`] carries.
+pub const SPOT_STATUS_MESSAGE_SCHEDULE_EXPIRED: &str =
+    "Your Spot request has expired because the end of its validity period was reached.";
+
+/// The description [`SPOT_STATUS_CAPACITY_NOT_AVAILABLE`] carries.
+pub const SPOT_STATUS_MESSAGE_CAPACITY_NOT_AVAILABLE: &str =
+    "There is no Spot capacity available that matches your request.";
+
+/// The id prefix of a Spot Instance request, the form
+/// `SpotInstanceRequest$SpotInstanceRequestId` carries.
+pub const SPOT_INSTANCE_REQUEST_ID_PREFIX: &str = "sir";
+
+/// [`SPOT_INSTANCE_REQUEST_ID_PREFIX`] and the hyphen that separates it from the id's hex
+/// suffix, as one static, so recognising an id allocates nothing on the request path.
+pub const SPOT_INSTANCE_REQUEST_ID_PREFIX_WITH_HYPHEN: &str = "sir-";
+
+/// "`one-time`" — the `SpotInstanceType` enum's `one-time` member, and the type
+/// `RequestSpotInstancesRequest$Type` documents as its default ("Default: one-time").
+pub const SPOT_INSTANCE_TYPE_ONE_TIME: &str = "one-time";
+
+/// "`persistent`" — the `SpotInstanceType` enum's other member.
+pub const SPOT_INSTANCE_TYPE_PERSISTENT: &str = "persistent";
+
+/// The whole `SpotInstanceType` catalog, which the `type` filter selects over.
+pub const SPOT_INSTANCE_TYPES: [&str; 2] = [
+    SPOT_INSTANCE_TYPE_ONE_TIME,
+    SPOT_INSTANCE_TYPE_PERSISTENT,
+];
+
+/// "The behavior when a Spot Instance is interrupted. The default is terminate"
+/// (`RequestSpotInstancesRequest$InstanceInterruptionBehavior`): the
+/// `InstanceInterruptionBehavior` enum's `terminate` member.
+pub const INSTANCE_INTERRUPTION_BEHAVIOR_TERMINATE: &str = "terminate";
+
+/// The resource type a `RequestSpotInstances` `TagSpecification` may name: "The value for
+/// ResourceType must be spot-instances-request, otherwise the Spot Instance request fails"
+/// (`RequestSpotInstancesRequest$TagSpecifications`).
+pub const SPOT_REQUEST_TAGGABLE_RESOURCE: &str = "spot-instances-request";
+
+/// How long a Spot Instance request stays valid when the request names no `ValidUntil`.
+///
+/// DOCUMENTED, not chosen: "By default, the request is valid for 7 days from the date the
+/// request was created" (`RequestSpotInstancesRequest$ValidUntil`).
+pub const DEFAULT_SPOT_REQUEST_VALIDITY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How many Spot Instances one `RequestSpotInstances` call may ask for.
+///
+/// CHOSEN for the same reason as [`MAX_INSTANCES_PER_RUN`], and equal to it: "the maximum
+/// number of Spot Instances to launch" (`RequestSpotInstancesRequest$InstanceCount`)
+/// arrives as a plain integer with no modelled `@range`, and one request mints a stored
+/// record — and later an instance — per unit of it.
+pub const MAX_SPOT_INSTANCES_PER_REQUEST: i32 = MAX_INSTANCES_PER_RUN;
+
+/// How many Spot Instance requests this emulator stores before `RequestSpotInstances` is
+/// refused.
+///
+/// CHOSEN, like [`MAX_STORED_IMPORT_IMAGE_TASKS`] and for the same reason: nothing here
+/// reclaims a closed request, so the store needs a ceiling that is not the process's
+/// memory. The caller-chosen BYTES of each request are charged against
+/// [`MAX_STORED_BYTES`] separately ([`spot_instance_request_payload_bytes`]).
+pub const MAX_STORED_SPOT_INSTANCE_REQUESTS: usize = 4_096;
+
+/// "`spot` - the instance is a Spot Instance" — the `InstanceLifecycleType` enum's `spot`
+/// member, which is what an instance launched to fulfill a Spot Instance request reports
+/// as its `InstanceLifecycle`.
+pub const INSTANCE_LIFECYCLE_SPOT: &str = "spot";
+
+/// The `MonitoringState` enum's `enabled` member, which an instance launched with detailed
+/// monitoring reports.
+pub const MONITORING_STATE_ENABLED: &str = "enabled";
+
+/// The `MonitoringState` enum's `disabled` member, which an instance launched without
+/// detailed monitoring reports ("Default: Disabled",
+/// `RequestSpotLaunchSpecification$Monitoring`).
+pub const MONITORING_STATE_DISABLED: &str = "disabled";
+
+/// The product description of a Spot request for a Linux AMI: "`product-description` - The
+/// product description associated with the instance (`Linux/UNIX` | `Windows`)"
+/// (`DescribeSpotInstanceRequestsRequest$Filters`), and a member of the modelled
+/// `RIProductDescription` catalog.
+pub const PRODUCT_DESCRIPTION_LINUX_UNIX: &str = "Linux/UNIX";
+
+/// The product description of a Spot request for a Windows AMI, from the same sentence.
+pub const PRODUCT_DESCRIPTION_WINDOWS: &str = IMAGE_PLATFORM_WINDOWS;
+
+/// EC2's code for a Spot Instance request id no request of the account has.
+pub const INVALID_SPOT_INSTANCE_REQUEST_ID_NOT_FOUND: &str =
+    "InvalidSpotInstanceRequestID.NotFound";
+
+/// EC2's code for something that is not a Spot Instance request id at all.
+pub const INVALID_SPOT_INSTANCE_REQUEST_ID_MALFORMED: &str =
+    "InvalidSpotInstanceRequestID.Malformed";
+
+/// The furthest ahead this emulator carries an instant computed from a caller-supplied
+/// date: a century.
+///
+/// `Instant + Duration` and `SystemTime + Duration` PANIC when the sum is not
+/// representable, and a `ValidFrom` / `ValidUntil` is an unbounded timestamp off a single
+/// request, so every due instant computed from one is capped here and added with CHECKED
+/// arithmetic ([`due_instant`], [`due_system_time`]). A request valid for longer than this
+/// process will ever run is indistinguishable from one valid for a century, so the cap
+/// changes nothing a caller can observe — and no request can reach the overflow.
+pub const MAX_CLOCK_HORIZON: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+/// `Instant::now()` plus `delay`, capped at [`MAX_CLOCK_HORIZON`] and added with checked
+/// arithmetic: a delay this platform's monotonic clock cannot represent is halved until it
+/// can, so a caller-supplied date can never panic a handler.
+pub fn due_instant(delay: Duration) -> Instant {
+    let now = Instant::now();
+    let mut wanted = delay.min(MAX_CLOCK_HORIZON);
+    loop {
+        match now.checked_add(wanted) {
+            Some(due_at) => return due_at,
+            None if wanted.is_zero() => return now,
+            None => wanted /= 2,
+        }
+    }
+}
+
+/// The wall-clock counterpart of [`due_instant`]: `base` plus `delay`, capped and checked
+/// the same way, for the instant a move is reported to have fallen due.
+pub fn due_system_time(base: SystemTime, delay: Duration) -> SystemTime {
+    let mut wanted = delay.min(MAX_CLOCK_HORIZON);
+    loop {
+        match base.checked_add(wanted) {
+            Some(at) => return at,
+            None if wanted.is_zero() => return base,
+            None => wanted /= 2,
+        }
+    }
+}
+
+/// A move the clock owes one Spot Instance request, with the instants it falls due on.
+///
+/// The same shape, and the same reasons for both fields, as [`FastLaunchTransition`]:
+/// `due_at` is monotonic because it is only ever compared against the clock, and `at` is
+/// the wall-clock instant the move fell due, which the request reports as its status
+/// `UpdateTime` once the move has been applied.
+#[derive(Debug, Clone)]
+pub struct SpotTransition {
+    /// The instant from which the move is due.
+    pub due_at: Instant,
+    /// The wall-clock instant the move falls due.
+    pub at: SystemTime,
+}
+
+impl SpotTransition {
+    /// A move due `delay` from now, on both clocks.
+    ///
+    /// `delay` can come from a caller's `ValidFrom`, so both instants are computed by the
+    /// capped, checked helpers rather than by the panicking `+`.
+    pub fn due_in(delay: Duration) -> Self {
+        Self {
+            due_at: due_instant(delay),
+            at: due_system_time(SystemTime::now(), delay),
+        }
+    }
+}
+
+/// One stored Spot Instance request: the modelled [`SpotInstanceRequest`] every operation
+/// that reports one answers with, plus the facts that shape carries no member for.
+///
+/// The stored view is the truth about the request — `RequestSpotInstances` answers it and
+/// `DescribeSpotInstanceRequests` reports it, so the two cannot describe one request
+/// differently — and every clock-owed move is written onto it ONCE
+/// ([`ComAmazonawsEc2Amazonec2State::materialize_due_spot_instance_requests`]), because a
+/// fulfillment MINTS an instance that has to be the same in every later read.
+#[derive(Debug, Clone)]
+pub struct SpotInstanceRequestRecord {
+    /// The request as the model shapes it, carrying the state reached so far.
+    pub view: SpotInstanceRequest,
+    /// The fulfillment the clock owes this request while it is `open`, or `None` once it
+    /// has been fulfilled, has expired or could not be fulfilled at all.
+    pub fulfillment: Option<SpotTransition>,
+    /// The instant this request stops being valid, on the monotonic clock: the
+    /// `ValidUntil` the view reports, which is compared against the clock here and never
+    /// reported from here, so a wall-clock adjustment cannot un-expire a request.
+    pub valid_until_at: Instant,
+    /// The Region the request was made in, which the instance a fulfillment launches
+    /// needs for its private DNS name. Not a member of any modelled Spot shape.
+    pub region: String,
+}
+
+/// The caller-chosen bytes one stored Spot Instance request holds: the launch
+/// specification's user data, the ids and names the launch named, the zone it placed the
+/// instance in, its tags, the launch and Availability Zone groups, the maximum price and
+/// the `ClientToken` the token map keeps for it. Everything else on the record — the id,
+/// the state, the status code, the type and the interruption behaviour — is derived here or
+/// drawn from a closed catalog, so it is fixed-size.
+///
+/// The ONE definition of that charge: `RequestSpotInstances` asks it before the write and
+/// charges exactly it, per request it mints. It also COVERS the caller-chosen bytes of the
+/// instance a fulfillment later launches ([`instance_payload_bytes`]), which is what bounds
+/// that launch's own charge: the instance carries no caller-chosen member its request does
+/// not — and the one member it can hold that the request did not name, the zone the service
+/// picks when the request named none, is a name out of the Region's own zone set rather
+/// than anything a caller sized.
+pub fn spot_instance_request_payload_bytes(
+    view: &SpotInstanceRequest,
+    client_token: Option<&str>,
+) -> usize {
+    let launch = view.launch_specification.as_ref();
+    // The zone the instance is placed in: named by the request when it names one, and
+    // retained on the instance a fulfillment launches, so it is charged here too.
+    let placement_bytes = launch
+        .and_then(|launch| launch.placement.as_ref())
+        .and_then(|placement| placement.availability_zone.as_ref())
+        .map_or(0, String::len);
+    let group_bytes: usize = launch.map_or(0, |launch| {
+        launch
+            .security_groups
+            .iter()
+            .flatten()
+            .map(|group| {
+                group.group_id.as_ref().map_or(0, String::len)
+                    + group.group_name.as_ref().map_or(0, String::len)
+            })
+            .sum()
+    });
+    launch
+        .and_then(|launch| launch.user_data.as_ref())
+        .map_or(0, String::len)
+        .saturating_add(
+            launch
+                .and_then(|launch| launch.image_id.as_ref())
+                .map_or(0, String::len),
+        )
+        .saturating_add(
+            launch
+                .and_then(|launch| launch.key_name.as_ref())
+                .map_or(0, String::len),
+        )
+        .saturating_add(
+            launch
+                .and_then(|launch| launch.subnet_id.as_ref())
+                .map_or(0, String::len),
+        )
+        .saturating_add(
+            launch
+                .and_then(|launch| launch.instance_type.as_ref())
+                .map_or(0, String::len),
+        )
+        .saturating_add(group_bytes)
+        .saturating_add(placement_bytes)
+        .saturating_add(tag_list_bytes(view.tags.as_deref().unwrap_or_default()))
+        .saturating_add(view.launch_group.as_ref().map_or(0, String::len))
+        .saturating_add(view.availability_zone_group.as_ref().map_or(0, String::len))
+        .saturating_add(view.spot_price.as_ref().map_or(0, String::len))
+        .saturating_add(client_token.map_or(0, str::len))
+}
+
+/// Whether `id` is a well-formed Spot Instance request id.
+///
+/// `sir-` followed by 8 or 17 lowercase hexadecimal digits — the short and the long id
+/// form every EC2 resource id takes, read the same way
+/// [`import_image_task_id_is_well_formed`] reads an import task's.
+pub fn spot_instance_request_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix(SPOT_INSTANCE_REQUEST_ID_PREFIX_WITH_HYPHEN) else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Refuse something that is not a Spot Instance request id at all: HTTP 400
+/// [`INVALID_SPOT_INSTANCE_REQUEST_ID_MALFORMED`]. There is nothing to look up for it, so
+/// it is refused before any lookup, the way this service answers every malformed resource
+/// id.
+pub fn require_well_formed_spot_instance_request_id<E>(
+    request_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if spot_instance_request_id_is_well_formed(request_id) {
+        return Ok(());
+    }
+    Err(crate::scaffolded::Scaffolded::service_error(
+        INVALID_SPOT_INSTANCE_REQUEST_ID_MALFORMED,
+        400,
+        format!("Invalid id: '{request_id}'"),
+    ))
+}
+
+/// Refuse a request that named a Spot Instance request id no request of the account has:
+/// HTTP 400 [`INVALID_SPOT_INSTANCE_REQUEST_ID_NOT_FOUND`].
+pub fn invalid_spot_instance_request_id_not_found<E>(
+    request_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_SPOT_INSTANCE_REQUEST_ID_NOT_FOUND,
+        400,
+        format!("The spot instance request ID '{request_id}' does not exist"),
+    )
+}
+
+/// A modelled timestamp as a wall-clock instant: the inverse of
+/// [`system_time_to_date_time`], for a `ValidFrom` / `ValidUntil` the caller named and the
+/// service has to compare against the clock.
+pub fn date_time_to_system_time(at: ::aws_smithy_types::DateTime) -> SystemTime {
+    let offset = Duration::new(at.secs().unsigned_abs(), at.subsec_nanos());
+    if at.secs() >= 0 {
+        UNIX_EPOCH.checked_add(offset).unwrap_or(UNIX_EPOCH)
+    } else {
+        UNIX_EPOCH.checked_sub(offset).unwrap_or(UNIX_EPOCH)
+    }
+}
+
+/// How far `at` is in the future, or [`Duration::ZERO`] when it is not in the future.
+pub fn duration_until(at: SystemTime) -> Duration {
+    at.duration_since(SystemTime::now()).unwrap_or_default()
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another Spot Instance request fits inside the store's ceiling
+    /// ([`MAX_STORED_SPOT_INSTANCE_REQUESTS`]).
+    ///
+    /// The same contract as [`Self::has_import_image_task_capacity`]: a create asks first,
+    /// for every request the call would mint, and refuses instead of growing the store
+    /// past its ceiling.
+    pub fn has_spot_instance_request_capacity(&self, wanted: usize) -> bool {
+        self.spot_instance_requests
+            .len()
+            .saturating_add(wanted)
+            <= MAX_STORED_SPOT_INSTANCE_REQUESTS
+    }
+
+    /// Store one Spot Instance request under a freshly minted id, and answer that id.
+    ///
+    /// The one writer of a Spot Instance request: the id comes from the store's own mint,
+    /// the view's own `SpotInstanceRequestId` is set from it, and the record's bytes are
+    /// charged against [`MAX_STORED_BYTES`] by the one definition of that charge, so no
+    /// caller can store a request the byte budget has not been told about.
+    pub fn insert_spot_instance_request(
+        &mut self,
+        mut view: SpotInstanceRequest,
+        fulfillment: Option<SpotTransition>,
+        valid_until_at: Instant,
+        region: &str,
+        client_token: Option<&str>,
+    ) -> String {
+        let request_id = self.next_id(SPOT_INSTANCE_REQUEST_ID_PREFIX);
+        view.spot_instance_request_id = Some(request_id.clone());
+        self.add_stored_bytes(spot_instance_request_payload_bytes(&view, client_token));
+        self.spot_instance_requests.insert(
+            request_id.clone(),
+            SpotInstanceRequestRecord {
+                view,
+                fulfillment,
+                valid_until_at,
+                region: region.to_string(),
+            },
+        );
+        request_id
+    }
+
+    /// Apply every move the clock owed a Spot Instance request by `now`.
+    ///
+    /// Reached only through [`Self::materialize_due_transitions`], so a reporting operation
+    /// observes these moves without having caused them: each was owed at this instant
+    /// whether or not anybody called. Two moves, in this order, because a request whose
+    /// validity ended before its fulfillment fell due was never fulfillable:
+    ///
+    /// 1. EXPIRY — "for a one-time request, the request remains active until all instances
+    ///    launch, the request is canceled, or the `validUntil` date and time is reached"
+    ///    (`SpotInstanceRequest$ValidUntil`): an `open` request whose window has closed is
+    ///    [`SPOT_REQUEST_STATE_CLOSED`] with the status code
+    ///    [`SPOT_STATUS_SCHEDULE_EXPIRED`].
+    /// 2. FULFILLMENT — "the instance ID, if an instance has been launched to fulfill the
+    ///    Spot Instance request" (`SpotInstanceRequest$InstanceId`): the request becomes
+    ///    [`SPOT_REQUEST_STATE_ACTIVE`] with the status code [`SPOT_STATUS_FULFILLED`] and
+    ///    an instance of this account's own instance store. It is a WRITE rather than a
+    ///    derive for the same reason an import's completion is: it mints an instance every
+    ///    later read has to agree on.
+    pub fn materialize_due_spot_instance_requests(&mut self, now: Instant) {
+        let expired: Vec<String> = self
+            .spot_instance_requests
+            .iter()
+            .filter(|(_, record)| {
+                record.view.state.as_deref() == Some(SPOT_REQUEST_STATE_OPEN)
+                    && now >= record.valid_until_at
+            })
+            .map(|(request_id, _)| request_id.clone())
+            .collect();
+        for request_id in expired {
+            let Some(record) = self.spot_instance_requests.get_mut(&request_id) else {
+                continue;
+            };
+            record.view.state = Some(SPOT_REQUEST_STATE_CLOSED.to_string());
+            // The window closed when `ValidUntil` was reached, not when somebody next
+            // asked, so that is the instant the status update reports.
+            record.view.status = Some(SpotInstanceStatus {
+                code: Some(SPOT_STATUS_SCHEDULE_EXPIRED.to_string()),
+                message: Some(SPOT_STATUS_MESSAGE_SCHEDULE_EXPIRED.to_string()),
+                update_time: record.view.valid_until,
+            });
+            // Nothing is owed on a request that can no longer be fulfilled.
+            record.fulfillment = None;
+        }
+
+        let due: Vec<String> = self
+            .spot_instance_requests
+            .iter()
+            .filter(|(_, record)| {
+                record.view.state.as_deref() == Some(SPOT_REQUEST_STATE_OPEN)
+                    && record
+                        .fulfillment
+                        .as_ref()
+                        .is_some_and(|fulfillment| now >= fulfillment.due_at)
+            })
+            .map(|(request_id, _)| request_id.clone())
+            .collect();
+        for request_id in due {
+            self.fulfill_spot_instance_request(&request_id);
+        }
+    }
+
+    /// Launch the instance one due Spot Instance request asked for, and move the request to
+    /// `active` / `fulfilled`.
+    ///
+    /// Every launch parameter comes off the request's own stored launch specification, so
+    /// the instance is the one the request described; the request keeps its tags (they tag
+    /// "the Spot Instance request on creation",
+    /// `RequestSpotInstancesRequest$TagSpecifications`, not the instance).
+    ///
+    /// A request this store has no room to launch for — no instance slot, or no private
+    /// address left — stays `open` carrying [`SPOT_STATUS_CAPACITY_NOT_AVAILABLE`], which
+    /// is what the real service reports for a request it cannot place, and owes nothing
+    /// further.
+    ///
+    /// The instance's own byte charge is made by [`Self::insert_instance`] and is NOT asked
+    /// for again here, because `RequestSpotInstances` already asked for it: every
+    /// caller-chosen string the instance holds is one
+    /// [`spot_instance_request_payload_bytes`] charged for the request that launched it, so
+    /// the store's byte ceiling was cleared before this move was ever owed.
+    fn fulfill_spot_instance_request(&mut self, request_id: &str) {
+        let Some(record) = self.spot_instance_requests.get(request_id) else {
+            return;
+        };
+        let launch = record.view.launch_specification.clone().unwrap_or_default();
+        let region = record.region.clone();
+        let at = record
+            .fulfillment
+            .as_ref()
+            .map_or_else(SystemTime::now, |fulfillment| fulfillment.at);
+        let availability_zone = launch
+            .placement
+            .as_ref()
+            .and_then(|placement| placement.availability_zone.clone())
+            .or_else(|| {
+                availability_zones_in_region(&region)
+                    .first()
+                    .map(|zone| zone.zone_name.clone())
+            })
+            .unwrap_or_else(|| region.clone());
+
+        if self.instances.len() >= MAX_STORED_INSTANCES {
+            self.leave_spot_instance_request_unplaced(request_id, at);
+            return;
+        }
+        let Some(private_ip) = self.allocate_private_ip() else {
+            self.leave_spot_instance_request_unplaced(request_id, at);
+            return;
+        };
+
+        // A Spot Instance is its own reservation: one instance launched by one request.
+        let reservation_id = self.mint_reservation_id();
+        self.insert_reservation(ReservationRecord {
+            reservation_id: reservation_id.clone(),
+            owner_id: ::engine::emulator_account_id().to_string(),
+            requester_id: None,
+            instance_ids: Vec::new(),
+        });
+        let instance_id = self.mint_instance_id();
+        let instance_type = launch
+            .instance_type
+            .clone()
+            .unwrap_or_else(|| DEFAULT_INSTANCE_TYPE.to_string());
+        self.insert_instance(InstanceRecord {
+            instance_id: instance_id.clone(),
+            reservation_id,
+            image_id: launch.image_id.clone(),
+            instance_type: instance_type.clone(),
+            key_name: launch.key_name.clone(),
+            subnet_id: launch.subnet_id.clone(),
+            security_groups: launch
+                .security_groups
+                .iter()
+                .flatten()
+                .map(|group| (group.group_id.clone(), group.group_name.clone()))
+                .collect(),
+            private_dns_name: private_dns_name(&private_ip, &region),
+            private_ip,
+            // A public address comes from a default-VPC subnet or an Elastic IP, neither of
+            // which this slice models — the same answer `RunInstances` gives.
+            public_ip: None,
+            // An instance AWS has just launched is `pending`; the clock owes it `running`,
+            // on the same span as every other transition of this crate.
+            state: InstanceStateName::Pending,
+            pending_transition: Some(PendingTransition::starting_now(InstanceStateName::Running)),
+            state_transition_reason: None,
+            state_reason: None,
+            // The instance was launched when the fulfillment fell due, not when somebody
+            // next asked about it.
+            launch_time: at,
+            ami_launch_index: 0,
+            user_data: launch.user_data.clone(),
+            placement_az: availability_zone.clone(),
+            monitoring_state: if launch
+                .monitoring
+                .as_ref()
+                .is_some_and(|monitoring| monitoring.enabled)
+            {
+                MONITORING_STATE_ENABLED.to_string()
+            } else {
+                MONITORING_STATE_DISABLED.to_string()
+            },
+            architecture: architecture_for(&instance_type),
+            ebs_optimized: launch.ebs_optimized.unwrap_or(false),
+            // Hibernation is `InstanceInterruptionBehavior`'s business for a Spot
+            // Instance, and the launch specification carries no hibernation member.
+            hibernation_configured: false,
+            disable_api_termination: false,
+            // The request's tags tag the REQUEST; nothing tags the instance.
+            tags: BTreeMap::new(),
+            client_token: None,
+            spot_instance_request_id: Some(request_id.to_string()),
+        });
+
+        if let Some(record) = self.spot_instance_requests.get_mut(request_id) {
+            record.view.state = Some(SPOT_REQUEST_STATE_ACTIVE.to_string());
+            record.view.status = Some(SpotInstanceStatus {
+                code: Some(SPOT_STATUS_FULFILLED.to_string()),
+                message: Some(SPOT_STATUS_MESSAGE_FULFILLED.to_string()),
+                update_time: Some(system_time_to_date_time(at)),
+            });
+            record.view.instance_id = Some(instance_id);
+            // "The Availability Zone in which the request is launched" — known only now
+            // that it has been launched. Its zone ID is deliberately NOT set beside it:
+            // "either launchedAvailabilityZone or launchedAvailabilityZoneId can be
+            // specified, but not both" (`SpotInstanceRequest$LaunchedAvailabilityZone`).
+            record.view.launched_availability_zone = Some(availability_zone);
+            record.fulfillment = None;
+        }
+    }
+
+    /// Leave one due Spot Instance request `open` carrying
+    /// [`SPOT_STATUS_CAPACITY_NOT_AVAILABLE`]: there was no capacity in this store to
+    /// place its instance in.
+    fn leave_spot_instance_request_unplaced(&mut self, request_id: &str, at: SystemTime) {
+        if let Some(record) = self.spot_instance_requests.get_mut(request_id) {
+            record.view.status = Some(SpotInstanceStatus {
+                code: Some(SPOT_STATUS_CAPACITY_NOT_AVAILABLE.to_string()),
+                message: Some(SPOT_STATUS_MESSAGE_CAPACITY_NOT_AVAILABLE.to_string()),
+                update_time: Some(system_time_to_date_time(at)),
+            });
+            record.fulfillment = None;
+        }
+    }
+
+    /// The product description a Spot request for `image_id` carries: which operating
+    /// system the Spot Instance runs, read off the AMI the launch names when this account
+    /// can see it.
+    ///
+    /// An AMI this store does not hold leaves the description at the Linux one, which is
+    /// what the overwhelming majority of AMIs are and what EC2 reports for an AMI with no
+    /// `Platform` of its own ("the value is `windows` for Windows AMIs; otherwise blank",
+    /// `Image$Platform`).
+    pub fn spot_product_description(&self, image_id: Option<&str>) -> &'static str {
+        let windows = image_id
+            .and_then(|image_id| self.images.get(image_id))
+            .is_some_and(|image| {
+                image
+                    .platform
+                    .as_deref()
+                    .is_some_and(|platform| platform.eq_ignore_ascii_case(IMAGE_PLATFORM_WINDOWS))
+            });
+        if windows {
+            PRODUCT_DESCRIPTION_WINDOWS
+        } else {
+            PRODUCT_DESCRIPTION_LINUX_UNIX
+        }
     }
 }
 
@@ -13195,3 +14630,4 @@ pub fn allowed_images_settings_full<E>(region: &str, full: AllowedImagesSettings
         )),
     }
 }
+

@@ -49,6 +49,8 @@ mod experiment_lifecycle;
 mod feature_group_lifecycle;
 #[path = "all/hub_contents_listing.rs"]
 mod hub_contents_listing;
+#[path = "all/hyperparameter_tuning_job.rs"]
+mod hyperparameter_tuning_job;
 #[path = "all/hyperpod_cluster_audit_record.rs"]
 mod hyperpod_cluster_audit_record;
 #[path = "all/hyperpod_cluster_listing.rs"]

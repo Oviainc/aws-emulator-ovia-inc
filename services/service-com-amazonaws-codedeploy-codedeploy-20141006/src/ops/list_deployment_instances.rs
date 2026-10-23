@@ -1,15 +1,42 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDeploymentInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDeploymentInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the instance ids of the instances a deployment deployed to, in
+//! resolution order, narrowed by the `instanceStatusFilter` and
+//! `instanceTypeFilter` the request names, one page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDeploymentInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the deprecated, instance-shaped view of the SAME records
+//! `ListDeploymentTargets` lists (the model: "The newer
+//! BatchGetDeploymentTargets should be used instead because it works with all
+//! compute types"), so it reads the one snapshot a deployment holds
+//! ([`crate::state::deployment_targets`]) and the one status mapping its
+//! progress implies ([`crate::state::target_status`]) — `InstanceStatus` and
+//! `TargetStatus` carry the same members, and the former's own deprecation note
+//! says so ("InstanceStatus is deprecated, use TargetStatus instead"). A
+//! deployment the clock has not started yet has no instance state to report,
+//! which is its `DeploymentNotStartedException`.
+//!
+//! Instances are what only the EC2/on-premises and Lambda compute platforms
+//! have, so a deployment on any other platform is refused with
+//! `InvalidComputePlatformException`; see
+//! [`crate::state::platform_reports_instances`]. An `instanceTypeFilter`
+//! selects instances by the ENVIRONMENT they belong to, which only a blue/green
+//! deployment has two of, so against an in-place deployment it is refused with
+//! `InvalidDeploymentInstanceTypeException`; see
+//! [`crate::state::INSTANCE_TYPE_ON_IN_PLACE_DEPLOYMENT`].
+//!
+//! NOTE: an instance this emulator resolves but cannot NAME is not listed — a
+//! Lambda deployment's target is the function its revision's AppSpec names, and
+//! CodeDeploy's state holds no revision content to read it from (the same gap
+//! [`crate::state::deployment_targets`] documents for EC2 inventory).
+//!
+//! A value outside `InstanceStatus` or `InstanceType` is refused at the
+//! BOUNDARY, before this handler runs, with the error this service's refusal
+//! table gives each member (`InvalidInstanceStatusException` and
+//! `InvalidInstanceTypeException` — see `crate::service`), so nothing here
+//! re-checks enum membership.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +212,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDeploymentInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDeploymentInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDeploymentInstances"))
+        let _ = ctx;
+        let deployment_id = input.deployment_id;
+        // The id's FORMAT is gated before the deployment is looked up, so "that
+        // is not an id" and "no deployment has that id" stay two different
+        // answers, as they are everywhere else in this service.
+        if deployment_id.trim().is_empty() {
+            return Err(
+                ListDeploymentInstancesErrorModeled::DeploymentIdRequiredException(
+                    DeploymentIdRequiredException {
+                        message: Some(crate::state::DEPLOYMENT_ID_MISSING.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        if !crate::state::deployment_id_is_well_formed(&deployment_id) {
+            return Err(
+                ListDeploymentInstancesErrorModeled::InvalidDeploymentIdException(
+                    InvalidDeploymentIdException {
+                        message: Some(crate::state::malformed_deployment_id_message(
+                            &deployment_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let token = input.next_token;
+        let wanted_statuses = input.instance_status_filter;
+        let wanted_labels = input.instance_type_filter;
+
+        // The instances come from the deployment's own record — the snapshot its
+        // deployment group resolved when it was created — and their status from
+        // how far that deployment has got, which `with_state` has already
+        // brought up to the instants the clock owed it.
+        let outcome = crate::state::with_state(&*self.engine, |state| {
+            let Some(deployment) = state.deployments.get(&deployment_id) else {
+                return Err(
+                    ListDeploymentInstancesErrorModeled::DeploymentDoesNotExistException(
+                        DeploymentDoesNotExistException {
+                            message: Some(crate::state::deployment_not_found(&deployment_id)),
+                        },
+                    ),
+                );
+            };
+            // Whether this operation applies to the deployment AT ALL is
+            // answered before how far the deployment has got: a deployment on a
+            // compute platform that has no instances has none to report whatever
+            // its progress, so its answer cannot depend on when it is asked.
+            if !crate::state::platform_reports_instances(&deployment.compute_platform) {
+                return Err(
+                    ListDeploymentInstancesErrorModeled::InvalidComputePlatformException(
+                        InvalidComputePlatformException {
+                            message: Some(crate::state::instances_not_reported_for_platform(
+                                &deployment.compute_platform,
+                            )),
+                        },
+                    ),
+                );
+            }
+            // A deployment that has not started has deployed to nothing, so it
+            // has no instance state to report: that is this operation's
+            // `DeploymentNotStartedException`, not an empty page.
+            if !deployment.is_started() {
+                return Err(
+                    ListDeploymentInstancesErrorModeled::DeploymentNotStartedException(
+                        DeploymentNotStartedException {
+                            message: Some(crate::state::deployment_not_started(&deployment_id)),
+                        },
+                    ),
+                );
+            }
+            // Selecting instances by the environment they belong to only means
+            // anything for a deployment that HAS two environments: that is what
+            // `InvalidDeploymentInstanceTypeException` refuses for an in-place
+            // deployment (see `state::INSTANCE_TYPE_ON_IN_PLACE_DEPLOYMENT`),
+            // rather than the empty page that would suggest the deployment has
+            // no instance of that environment. The member being PRESENT is what
+            // asks the question, so one listing no value is refused too.
+            if wanted_labels.is_some() && !deployment.is_blue_green() {
+                return Err(
+                    ListDeploymentInstancesErrorModeled::InvalidDeploymentInstanceTypeException(
+                        InvalidDeploymentInstanceTypeException {
+                            message: Some(
+                                crate::state::INSTANCE_TYPE_ON_IN_PLACE_DEPLOYMENT.to_string(),
+                            ),
+                        },
+                    ),
+                );
+            }
+            let status = crate::state::target_status(deployment);
+            let matching: Vec<String> = deployment
+                .targets
+                .iter()
+                // A filter the request carries keeps an instance only if the
+                // property it selects on holds one of the values it lists, so a
+                // filter listing none names no instance; a filter the request
+                // omits narrows nothing. An instance with no label belongs to
+                // neither environment, so it satisfies no environment filter.
+                .filter(|target| {
+                    wanted_statuses
+                        .as_ref()
+                        .is_none_or(|wanted| wanted.iter().any(|value| value == status))
+                        && wanted_labels.as_ref().is_none_or(|wanted| {
+                            target
+                                .instance_label
+                                .as_deref()
+                                .is_some_and(|label| wanted.iter().any(|value| value == label))
+                        })
+                })
+                // An instance this emulator resolved but cannot NAME is not one
+                // a client can list; see `DeploymentTargetSnapshot::target_id`.
+                .filter_map(|target| target.target_id.clone())
+                .collect();
+
+            crate::state::paginate(&matching, token.as_deref()).ok_or_else(|| {
+                ListDeploymentInstancesErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: Some(
+                            "The next token was specified in an invalid format".to_string(),
+                        ),
+                    },
+                )
+            })
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let (instances_list, next_token) = outcome?;
+        Ok(ListDeploymentInstancesOutput {
+            instances_list: Some(instances_list),
+            next_token,
+        })
     }
 }

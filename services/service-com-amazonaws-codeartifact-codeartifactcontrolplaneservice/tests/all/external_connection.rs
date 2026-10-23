@@ -10,7 +10,7 @@
 //!
 //! 1. Associating a supported public registry stores it on the repository as its ONE
 //!    external connection, with the `packageFormat` of that registry and status
-//!    `Available`, and answers with the repository record as it now stands — which a
+//!    `AVAILABLE`, and answers with the repository record as it now stands — which a
 //!    later `DescribeRepository` reports byte-identically.
 //! 2. A repository holds at most one external connection: a second, different one is
 //!    refused on its input as `ValidationException` (400) stating the limit, and
@@ -52,8 +52,11 @@ const SUPPORTED_CONNECTIONS: &[(&str, &str)] = &[
     ("public:crates-io", "cargo"),
 ];
 
-/// The only value `ExternalConnectionStatus` models.
-const AVAILABLE: &str = "Available";
+/// The one external-connection status, as the WIRE spells it: the live responses of
+/// `AssociateExternalConnection` and `DescribeRepository` return `AVAILABLE`, where the
+/// on-disk model's `ExternalConnectionStatus` lists `Available` and is stale for this
+/// member.
+const AVAILABLE: &str = "AVAILABLE";
 
 /// One HTTP answer's `repository` member.
 impl Answer {
@@ -127,7 +130,7 @@ fn connections(repository: &Value) -> Vec<Value> {
 }
 
 /// Rule 1: every supported registry can be associated, is stored with that registry's
-/// package format and the `Available` status, and is reported by a later read.
+/// package format and the `AVAILABLE` status, and is reported by a later read.
 #[tokio::test]
 async fn each_supported_connection_is_stored_with_its_package_format() {
     let router = emulator();

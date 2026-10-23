@@ -457,6 +457,36 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             .filter(|scan| scan.region == region)
     }
 
+    /// Every malware scan `region`'s endpoint serves, in scan-id order — a total
+    /// order, so a page token stays meaningful before any sort is applied.
+    ///
+    /// The listing counterpart of [`Self::malware_scan_in`], and regional for the
+    /// same reason: a scan started through another Region's endpoint is not served
+    /// here.
+    pub fn malware_scans_in(&self, region: &str) -> Vec<&MalwareScan> {
+        let mut scans: Vec<&MalwareScan> = self
+            .malware_scans
+            .values()
+            .filter(|scan| scan.region == region)
+            .collect();
+        scans.sort_by(|a, b| a.id.cmp(&b.id));
+        scans
+    }
+
+    /// Materialise the status change the CLOCK already owes EVERY scan this store
+    /// holds, through [`MalwareScan::settle`].
+    ///
+    /// The per-scan counterpart is what `GetMalwareScan` applies to the one scan it
+    /// reports; a listing reports a set, so it owes the same move to each of them.
+    /// Each was owed at that scan's own `terminal_due_millis` whether or not
+    /// anybody called, which is why a reporting operation may apply it.
+    pub fn settle_malware_scans(&mut self) {
+        let now = now_millis();
+        for scan in self.malware_scans.values_mut() {
+            scan.settle(now);
+        }
+    }
+
     /// The scan `region`'s endpoint started under `token`, if a start recorded one.
     ///
     /// The token is a pure REPLAY key: it resolves to the scan the first start
@@ -893,7 +923,8 @@ pub const DETECTOR_ID_LEN: usize = 32;
 ///
 /// Form only: a well-formed id need not exist. Case is not significant, so an id
 /// a caller upper-cased is still well formed — and is then refused as not owned,
-/// which is the ownership failure and not a parameter one.
+/// which is the ownership failure and not a parameter one. One reader for every
+/// member of that form, so the form cannot drift between them.
 pub fn is_minted_id(id: &str) -> bool {
     id.len() == DETECTOR_ID_LEN && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -907,6 +938,16 @@ pub fn is_detector_id(id: &str) -> bool {
 pub fn invalid_parameter_message(member: &str) -> String {
     format!("The request is rejected because the parameter {member} has an invalid value.")
 }
+
+/// The message GuardDuty refuses an unusable input value with where it does NOT
+/// name the member at fault: its generic parameter-validation wording.
+///
+/// Which of the two a member gets is the service's own choice, not ours: the
+/// corpus records this wording for `GetMalwareScan`'s `scanId` and the
+/// member-naming [`invalid_parameter_message`] for `detectorId`, so each member
+/// keeps the message the service answers for it.
+pub const INVALID_INPUT_VALUE_MESSAGE: &str =
+    "The request is rejected because an invalid or out-of-range value is specified as an input parameter.";
 
 /// The message for a member the request left out that the service cannot act
 /// without.
@@ -2803,14 +2844,14 @@ pub const RESOURCE_ARN_MEMBER: &str = "resourceArn";
 
 /// The message a read of a scan this account and Region does not hold answers with.
 ///
-/// Built through the shared [`not_owned_message`], like
-/// [`malware_protection_plan_not_found_message`] and for the same reason: "never
-/// existed" and "belongs to someone else" are one refusal, so one account cannot
-/// probe another's scan ids, and every operation rejects the same input the same
-/// way.
-pub fn malware_scan_not_found_message() -> String {
-    not_owned_message(SCAN_ID_MEMBER)
-}
+/// The service's own constant wording for a resource it cannot find, which names
+/// neither the member nor the value: "never existed" and "belongs to someone else"
+/// are one refusal, so one account cannot probe another's scan ids. The literal is
+/// the one the corpus records GuardDuty answering; the model's prose for the shape
+/// ("The requested resource can't be found",
+/// `smithy_query(shape="ResourceNotFoundException")`) describes the error, it is not
+/// the wire message — do not "correct" the value to it.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found.";
 
 /// The message a start is refused with when the Region's endpoint holds no
 /// detector.
@@ -3398,21 +3439,45 @@ pub fn sort_findings(
     }
 
     findings.sort_by(|a, b| {
-        let key = |f: &FindingRecord| match finding_attribute(f, attribute) {
-            Some(Attribute::Number(n)) => (n, String::new()),
-            Some(Attribute::Text(t)) => (0.0, t),
-            None => (0.0, String::new()),
-        };
-        let (an, at) = key(a);
-        let (bn, bt) = key(b);
-        let primary = an
-            .partial_cmp(&bn)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| at.cmp(&bt));
-        let primary = if descending { primary.reverse() } else { primary };
-        primary.then_with(|| a.id.cmp(&b.id))
+        compare_by_attribute(
+            *a,
+            *b,
+            descending,
+            |finding| finding_attribute(finding, attribute),
+            |finding| finding.id.clone(),
+        )
     });
     Ok(())
+}
+
+/// Compare two records by one resolved attribute, in `descending` order or not,
+/// with `tiebreak` making the order total.
+///
+/// Both [`sort_findings`] and [`sort_malware_scans`] order a borrowed record set
+/// by an attribute that is either a number or a text, so the comparison lives here
+/// once: the two differ only in the attribute resolver and the tiebreaker, and
+/// cannot drift apart. An attribute the resolver cannot produce sorts as the
+/// neutral key rather than dropping the record.
+fn compare_by_attribute<T, K: Ord>(
+    left: &T,
+    right: &T,
+    descending: bool,
+    attribute: impl Fn(&T) -> Option<Attribute>,
+    tiebreak: impl Fn(&T) -> K,
+) -> std::cmp::Ordering {
+    let key = |record: &T| match attribute(record) {
+        Some(Attribute::Number(n)) => (n, String::new()),
+        Some(Attribute::Text(t)) => (0.0, t),
+        None => (0.0, String::new()),
+    };
+    let (left_number, left_text) = key(left);
+    let (right_number, right_text) = key(right);
+    let primary = left_number
+        .partial_cmp(&right_number)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| left_text.cmp(&right_text));
+    let primary = if descending { primary.reverse() } else { primary };
+    primary.then_with(|| tiebreak(left).cmp(&tiebreak(right)))
 }
 
 /// Take one page out of an ordered key list.
@@ -3666,6 +3731,251 @@ pub fn apply_data_sources(
     {
         detector.set_feature(FEATURE_EBS_MALWARE_PROTECTION, status(enable), now);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Listing malware scans
+//
+// `ListMalwareScans` reports the account's SET of the scans [`MalwareScan`]
+// records, narrowed by a `ListMalwareScansFilterCriteria` and ordered by a
+// `SortCriteria`, so the criterion lookup, the filter and the sort live here —
+// once — beside the record they read, and the operation builds only its own
+// modelled output.
+// ---------------------------------------------------------------------------
+
+/// Every `ListMalwareScansCriterionKey` member a filter may name: the crate's
+/// MODEL-DERIVED list, so a key the model gains cannot be missed here.
+pub const MALWARE_SCAN_CRITERION_KEYS: &[&str] =
+    crate::ops::types::shared_types::LIST_MALWARE_SCANS_CRITERION_KEY_VALUES;
+
+/// The criterion key whose value is an INSTANT, and so the only one an ordering
+/// condition can compare: `FilterCondition.GreaterThan` / `LessThan` are `long`
+/// bounds (`smithy_query(shape="FilterCondition")`), which every other key's
+/// value — an ARN, an id, an enum member — has no numeric form for.
+pub const MALWARE_SCAN_TEMPORAL_KEY: &str = "SCAN_START_TIME";
+
+/// Resolve one scan value by its `ListMalwareScansCriterionKey`, or `None` when
+/// the key is not a member of that enum, or the scan has no value for it.
+pub fn malware_scan_criterion_value(scan: &MalwareScan, key: &str) -> Option<Attribute> {
+    let value = match key {
+        "RESOURCE_ARN" => Attribute::Text(scan.resource_arn.clone()),
+        "SCAN_ID" => Attribute::Text(scan.id.clone()),
+        // Every scan this emulator holds was started by this account through this
+        // emulator, so the account a filter compares is the emulator's own.
+        "ACCOUNT_ID" => Attribute::Text(::engine::emulator_account_id().to_string()),
+        "GUARDDUTY_FINDING_ID" => {
+            // `TriggerDetails.GuardDutyFindingId` names the finding that triggered
+            // a GuardDuty-INITIATED scan. Every scan here was asked for through
+            // `StartMalwareScan` ([`MALWARE_SCAN_TYPE_ON_DEMAND`]), so none has a
+            // triggering finding, and an absent member has no value to compare: no
+            // condition on this key matches such a scan, not even one naming the
+            // empty string.
+            return None;
+        }
+        "RESOURCE_TYPE" => Attribute::Text(scan.resource_type.clone()),
+        MALWARE_SCAN_TEMPORAL_KEY => Attribute::Number(scan.started_at_millis as f64),
+        "SCAN_STATUS" => Attribute::Text(scan.status.clone()),
+        "SCAN_TYPE" => Attribute::Text(scan.scan_type.clone()),
+        _ => return None,
+    };
+    Some(value)
+}
+
+/// Does `scan` satisfy one `FilterCondition` on `key`?
+///
+/// `EqualsValue` compares the value's text. An instant has two textual forms a
+/// client could reasonably send — its ISO-8601 rendering and its epoch
+/// milliseconds — and either matches, because the model fixes neither.
+///
+/// A condition that populates nothing constrains nothing, on EVERY key: it selects
+/// every scan, including one whose value for that key is absent. Only a condition
+/// that does constrain can exclude a scan the key has no value for.
+fn malware_scan_condition_matches(
+    scan: &MalwareScan,
+    key: &str,
+    condition: &crate::ops::types::FilterCondition,
+) -> bool {
+    let constrains = condition.equals_value.is_some()
+        || condition.greater_than.is_some()
+        || condition.less_than.is_some();
+    if !constrains {
+        return true;
+    }
+    let Some(value) = malware_scan_criterion_value(scan, key) else {
+        return false;
+    };
+    if let Some(expected) = condition.equals_value.as_deref() {
+        let matched = match value.as_number() {
+            Some(millis) => {
+                iso8601(millis as i64) == expected || value.as_text() == expected
+            }
+            None => value.as_text() == expected,
+        };
+        if !matched {
+            return false;
+        }
+    }
+    for (bound, greater) in [(condition.greater_than, true), (condition.less_than, false)] {
+        let Some(bound) = bound else { continue };
+        let Some(number) = value.as_number() else {
+            return false;
+        };
+        let holds = if greater {
+            number > bound as f64
+        } else {
+            number < bound as f64
+        };
+        if !holds {
+            return false;
+        }
+    }
+    true
+}
+
+/// Does `scan` satisfy `criteria`? An absent or empty criteria structure matches
+/// every scan.
+///
+/// The model caps the criterion list at one entry (len 0..1,
+/// `smithy_query(shape="ListMalwareScansFilterCriteria")`), so the boundary
+/// refuses a longer one before a handler runs; an entry with no key or no
+/// condition constrains nothing.
+pub fn malware_scan_matches(
+    scan: &MalwareScan,
+    criteria: Option<&crate::ops::types::ListMalwareScansFilterCriteria>,
+) -> bool {
+    let Some(criterion) = criteria.and_then(|c| c.list_malware_scans_filter_criterion.as_ref())
+    else {
+        return true;
+    };
+    for entry in criterion {
+        let Some(key) = entry.list_malware_scans_criterion_key.as_deref() else {
+            continue;
+        };
+        let Some(condition) = entry.filter_condition.as_ref() else {
+            continue;
+        };
+        if !malware_scan_condition_matches(scan, key, condition) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Refuse a `ListMalwareScansFilterCriteria` this service cannot evaluate, with
+/// the message the refusal carries.
+///
+/// Checked BEFORE any scan is looked at, so whether a criterion is refused does
+/// not depend on how many scans happen to be stored: an account with none must
+/// answer an unevaluable criterion exactly as a populated one does. Two rules: the
+/// key must be a `ListMalwareScansCriterionKey` member, and an ordering bound
+/// applies only to the one key whose value is an instant.
+pub fn validate_malware_scan_criteria(
+    criteria: Option<&crate::ops::types::ListMalwareScansFilterCriteria>,
+) -> Result<(), String> {
+    let Some(criterion) = criteria.and_then(|c| c.list_malware_scans_filter_criterion.as_ref())
+    else {
+        return Ok(());
+    };
+    for entry in criterion {
+        let Some(key) = entry.list_malware_scans_criterion_key.as_deref() else {
+            continue;
+        };
+        if !MALWARE_SCAN_CRITERION_KEYS.contains(&key) {
+            return Err(format!(
+                "filterCriteria: '{key}' is not a malware scan criterion key. Supported keys are {}.",
+                MALWARE_SCAN_CRITERION_KEYS.join(", ")
+            ));
+        }
+        let orders = entry
+            .filter_condition
+            .as_ref()
+            .is_some_and(|c| c.greater_than.is_some() || c.less_than.is_some());
+        if orders && key != MALWARE_SCAN_TEMPORAL_KEY {
+            return Err(format!(
+                "filterCriteria: greaterThan and lessThan compare instants, so they apply only to {MALWARE_SCAN_TEMPORAL_KEY}, not to '{key}'."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The scan attributes this service can sort on, as the `MalwareScan` shape's own
+/// `jsonName`s name them (`smithy_query(shape="MalwareScan")`) — the members a
+/// `ListMalwareScans` response carries are the ones a client can ask it to order
+/// by.
+pub const MALWARE_SCAN_ATTRIBUTES: [&str; 8] = [
+    "resourceArn",
+    "resourceType",
+    "scanCompletedAt",
+    "scanId",
+    "scanResultStatus",
+    "scanStartedAt",
+    "scanStatus",
+    "scanType",
+];
+
+/// The attribute a `ListMalwareScans` sort orders by when the request names none:
+/// when the scan started, which with [`DESCENDING_BY_DEFAULT`] puts the newest
+/// scan first.
+pub const MALWARE_SCAN_DEFAULT_SORT_ATTRIBUTE: &str = "scanStartedAt";
+
+/// A sort with no explicit `OrderBy` on the default attribute runs newest-first,
+/// like [`sort_findings`].
+const DESCENDING_BY_DEFAULT: bool = true;
+
+/// Resolve one scan attribute by its `MalwareScan` member name, or `None` when
+/// this service does not model that name.
+pub fn malware_scan_attribute(scan: &MalwareScan, path: &str) -> Option<Attribute> {
+    let value = match path {
+        "resourceArn" => Attribute::Text(scan.resource_arn.clone()),
+        "resourceType" => Attribute::Text(scan.resource_type.clone()),
+        "scanCompletedAt" => Attribute::Number(scan.completed_at_millis.unwrap_or(0) as f64),
+        "scanId" => Attribute::Text(scan.id.clone()),
+        // Absent until a scan produces a result, and ordering by an absent value
+        // is ordering by the empty string.
+        "scanResultStatus" => Attribute::Text(String::new()),
+        "scanStartedAt" => Attribute::Number(scan.started_at_millis as f64),
+        "scanStatus" => Attribute::Text(scan.status.clone()),
+        "scanType" => Attribute::Text(scan.scan_type.clone()),
+        _ => return None,
+    };
+    Some(value)
+}
+
+/// Order `scans` for `ListMalwareScans`.
+///
+/// With no `SortCriteria` the newest scan comes first, with the scan id breaking
+/// ties so the order is total and a page token stays meaningful.
+/// `Err(attribute)` means this service does not model that sort attribute.
+pub fn sort_malware_scans(
+    scans: &mut [&MalwareScan],
+    sort: Option<&crate::ops::types::SortCriteria>,
+) -> Result<(), String> {
+    let attribute = sort
+        .and_then(|s| s.attribute_name.as_deref())
+        .filter(|a| !a.is_empty());
+    let descending = match sort.and_then(|s| s.order_by.as_deref()) {
+        Some("ASC") => false,
+        Some("DESC") => true,
+        // No explicit order: newest-first for the default attribute, ascending for
+        // an attribute the caller named.
+        _ => attribute.is_none() && DESCENDING_BY_DEFAULT,
+    };
+    let attribute = attribute.unwrap_or(MALWARE_SCAN_DEFAULT_SORT_ATTRIBUTE);
+    if !MALWARE_SCAN_ATTRIBUTES.contains(&attribute) {
+        return Err(attribute.to_string());
+    }
+
+    scans.sort_by(|a, b| {
+        compare_by_attribute(
+            *a,
+            *b,
+            descending,
+            |scan| malware_scan_attribute(scan, attribute),
+            |scan| scan.id.clone(),
+        )
+    });
+    Ok(())
 }
 
 /// Refuse a `ScanResourceCriteria` this service cannot accept, with the message the

@@ -287,6 +287,11 @@ impl ComAmazonawsAiopsAiopsState {
 // the identifier that named it. Recorded 4xx responses from this service are built
 // that way across every operation, and both messages are the whole machine-readable
 // detail a client gets, so a caller's own bytes must not be copied into them.
+//
+// The TAGGING operations are served by the tagging frontend and have their own two
+// wordings, single-homed below for the same reason: [`tag_capacity_rejection`] (400
+// `BadRequestException`) and [`TAGGING_RESOURCE_NOT_FOUND`] (404
+// `NotFoundException`). Neither carries anything the request sent either.
 // ---------------------------------------------------------------------------
 
 /// The modelled name of this service's primary resource
@@ -566,6 +571,25 @@ pub fn tag_capacity_rejection(resulting_tags: usize) -> Option<String> {
     (resulting_tags > MAX_TAGS)
         .then(|| format!("The resultant tag set must not have more than {MAX_TAGS} user tags."))
 }
+
+/// What the TAGGING operations answer when `resourceArn` names no resource.
+///
+/// The same split as [`tag_capacity_rejection`], one status up: a tagging call is
+/// served by the tagging frontend rather than by this service's own resource surface,
+/// and the frontend reports an absent resource as HTTP 404 with the error code
+/// `NotFoundException` — the code recorded for `ListTagsForResource`, `TagResource`
+/// and `UntagResource` against an investigation group that was never created, where
+/// the resource operations are recorded answering this service's own modelled
+/// `ResourceNotFoundException` ([`investigation_group_not_found`]). That shape is not
+/// in this service's model, so the answer goes out through
+/// [`crate::scaffolded::Scaffolded::not_found`].
+///
+/// The frontend addresses every taggable resource type through one `resourceArn`, so
+/// its wording names no resource type; like every other 4xx this service words, it
+/// carries nothing the request sent. Only the status and the error code are
+/// requirements — no rule published by the model or the recording produces this
+/// sentence — so this is the frontend's recorded generic text, single-homed here.
+pub const TAGGING_RESOURCE_NOT_FOUND: &str = "Resource was not found";
 
 /// The `EncryptionConfigurationType` value naming the Amazon Web Services owned key,
 /// taken from the modelled value set

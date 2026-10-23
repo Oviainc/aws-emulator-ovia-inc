@@ -308,16 +308,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // later Describe / Modify / Delete resolves is the lowercased one.
         let cache_cluster_id = input.cache_cluster_id.to_ascii_lowercase();
         // `CacheClusterId` carries no modelled `@pattern`, so the documented
-        // name rule is enforced here rather than at the boundary.
-        if !crate::state::is_valid_cluster_id(&cache_cluster_id) {
+        // name rule is enforced here rather than at the boundary — worded by the
+        // one helper every identifier refusal of this service goes through
+        // (`crate::state::identifier_refusal`), so a create and a lookup state
+        // the same rule and name the same parameter.
+        if let Some(message) = crate::state::identifier_refusal(
+            "Cache Cluster ID",
+            "CacheClusterIdentifier",
+            &cache_cluster_id,
+            crate::state::CLUSTER_ID_MAX_LEN,
+        ) {
             return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
-                    message: Some(format!(
-                        "Invalid value {} for CacheClusterId: a name must contain from 1 to 50 \
-                         alphanumeric characters or hyphens, must begin with a letter, and must \
-                         not end with a hyphen or contain two consecutive hyphens.",
-                        input.cache_cluster_id
-                    )),
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // `PreferredMaintenanceWindow` is a documented range, refused here
+        // before anything is stored; see
+        // `crate::state::maintenance_window_refusal`.
+        if let Some(message) = input
+            .preferred_maintenance_window
+            .as_deref()
+            .and_then(crate::state::maintenance_window_refusal)
+        {
+            return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
                 },
             )
             .into());

@@ -23,6 +23,8 @@ mod associate_address;
 mod availability_zones;
 #[path = "all/byoip_cidr_lifecycle.rs"]
 mod byoip_cidr_lifecycle;
+#[path = "all/byoip_cidrs.rs"]
+mod byoip_cidrs;
 #[path = "all/capacity_block_offerings.rs"]
 mod capacity_block_offerings;
 #[path = "all/capacity_blocks.rs"]
@@ -102,6 +104,8 @@ mod security_group_filter_limits;
 mod security_groups;
 #[path = "all/snapshot_block_public_access.rs"]
 mod snapshot_block_public_access;
+#[path = "all/spot_instance_requests.rs"]
+mod spot_instance_requests;
 #[path = "all/spot_placement_scores.rs"]
 mod spot_placement_scores;
 #[path = "all/stale_security_groups.rs"]
@@ -112,6 +116,8 @@ mod state_roundtrip;
 mod transit_gateway_acceptance;
 #[path = "all/transit_gateway_lifecycle.rs"]
 mod transit_gateway_lifecycle;
+#[path = "all/transit_gateway_policy_table_associations.rs"]
+mod transit_gateway_policy_table_associations;
 #[path = "all/transit_gateway_route_table_propagation.rs"]
 mod transit_gateway_route_table_propagation;
 // The Verified Access trust provider slice: create, then read it back.

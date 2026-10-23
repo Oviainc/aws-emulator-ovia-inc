@@ -25,6 +25,8 @@ mod image_tag_mutability;
 mod layer_availability;
 #[path = "all/layer_part_upload.rs"]
 mod layer_part_upload;
+#[path = "all/layer_upload_commit.rs"]
+mod layer_upload_commit;
 #[path = "all/layer_upload_sessions.rs"]
 mod layer_upload_sessions;
 #[path = "all/lifecycle_policy.rs"]

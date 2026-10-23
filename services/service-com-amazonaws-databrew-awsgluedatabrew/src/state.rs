@@ -53,6 +53,9 @@ pub const MAX_DATASETS: usize = 1_000;
 /// The most jobs this emulator retains, for the reason [`MAX_DATASETS`] gives.
 pub const MAX_JOBS: usize = 1_000;
 
+/// The most schedules this emulator retains, for the reason [`MAX_DATASETS`] gives.
+pub const MAX_SCHEDULES: usize = 1_000;
+
 /// The most runs this emulator retains for one job. `StartJobRun` inserts a record
 /// on every call and a run has no name of its own to collide on, so retention is
 /// bounded by EVICTING the oldest run of the job rather than by refusing the start:
@@ -160,6 +163,18 @@ pub struct JobRecord {
     pub audit: Audit,
 }
 
+/// A stored DataBrew schedule: the cron expression it runs on and the jobs it runs.
+/// The ARN and the [`Audit`] are server-derived, never client-supplied.
+#[derive(Debug, Clone)]
+pub struct ScheduleRecord {
+    pub name: String,
+    pub cron_expression: String,
+    pub job_names: Vec<String>,
+    pub tags: BTreeMap<String, String>,
+    pub resource_arn: String,
+    pub audit: Audit,
+}
+
 /// A stored run of a job: what `StartJobRun` minted plus the job's shape copied at
 /// start time, so the run still reports what it ran with after the job changes.
 #[derive(Debug, Clone)]
@@ -187,6 +202,8 @@ pub struct ComAmazonawsDatabrewAwsgluedatabrewState {
     pub datasets: BTreeMap<String, DatasetRecord>,
     /// Recipe and profile jobs by `Name`.
     pub jobs: BTreeMap<String, JobRecord>,
+    /// Schedules by `Name`.
+    pub schedules: BTreeMap<String, ScheduleRecord>,
     /// Job runs by `(JobName, RunId)`, so one job's runs are a contiguous range.
     pub job_runs: BTreeMap<(String, String), JobRunRecord>,
     /// Monotonic source of the `RunId` values stored in `job_runs`.
@@ -496,6 +513,229 @@ pub fn validate_resource_name(member: &str, value: &str) -> Result<(), String> {
         )),
         None => Ok(()),
     }
+}
+
+/// One field of a DataBrew cron expression: the values and wildcards it accepts.
+///
+/// The six fields, their ranges and their wildcards are the ones the Glue DataBrew
+/// Developer Guide's "Cron expressions" page documents — the page the model's
+/// `CreateScheduleRequest$CronExpression` doc links to
+/// (<https://docs.aws.amazon.com/databrew/latest/dg/jobs.cron.html>):
+/// `cron(minutes hours day-of-month month day-of-week year)`, with minutes 0-59,
+/// hours 0-23, day-of-month 1-31, month 1-12 or JAN-DEC, day-of-week 1-7 or
+/// SUN-SAT, and year 1970-2199.
+struct CronField {
+    /// The lowest numeric value the field accepts.
+    min: u32,
+    /// The highest numeric value the field accepts.
+    max: u32,
+    /// The aliases the field accepts, the one for [`CronField::min`] first.
+    names: &'static [&'static str],
+    /// Whether `?` ("no specific value") is a value of this field.
+    question: bool,
+    /// Whether `L` ("last") is a value of this field.
+    last: bool,
+    /// Whether `W` ("nearest weekday") is a value of this field.
+    weekday: bool,
+    /// Whether `#` ("nth day of the month") is a value of this field.
+    nth: bool,
+}
+
+/// The month aliases the guide lists for the month field, January first.
+const MONTH_NAMES: &[&str] = &[
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+];
+
+/// The day aliases the guide lists for the day-of-week field. Sunday is the field's
+/// lowest value (1), which is where AWS cron differs from standard cron's 0.
+const DAY_OF_WEEK_NAMES: &[&str] = &["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+
+/// The six fields of a DataBrew cron expression, in the order they are written.
+const CRON_FIELDS: [CronField; 6] = [
+    // minutes
+    CronField {
+        min: 0,
+        max: 59,
+        names: &[],
+        question: false,
+        last: false,
+        weekday: false,
+        nth: false,
+    },
+    // hours
+    CronField {
+        min: 0,
+        max: 23,
+        names: &[],
+        question: false,
+        last: false,
+        weekday: false,
+        nth: false,
+    },
+    // day-of-month
+    CronField {
+        min: 1,
+        max: 31,
+        names: &[],
+        question: true,
+        last: true,
+        weekday: true,
+        nth: false,
+    },
+    // month
+    CronField {
+        min: 1,
+        max: 12,
+        names: MONTH_NAMES,
+        question: false,
+        last: false,
+        weekday: false,
+        nth: false,
+    },
+    // day-of-week
+    CronField {
+        min: 1,
+        max: 7,
+        names: DAY_OF_WEEK_NAMES,
+        question: true,
+        last: true,
+        weekday: false,
+        nth: true,
+    },
+    // year
+    CronField {
+        min: 1970,
+        max: 2199,
+        names: &[],
+        question: false,
+        last: false,
+        weekday: false,
+        nth: false,
+    },
+];
+
+/// The message DataBrew answers a `ValidationException` with when a schedule's
+/// `CronExpression` is not a cron expression it can read.
+///
+/// One constant sentence for the whole class: the service names no part of the
+/// request in it and reports the expected FORM rather than which field is wrong, so
+/// it is the message for every way an expression can fail that form.
+pub const INVALID_CRON_EXPRESSION_MESSAGE: &str =
+    "Invalid schedule cron expression. Expected format: Cron(CRON_EXPRESSION)";
+
+/// Whether `CronExpression` is a cron expression DataBrew accepts.
+///
+/// A schedule runs its jobs on the dates and times its cron expression names, so the
+/// expression must be one: `cron(` + the six documented fields + `)`, each field a
+/// comma-separated list of values, ranges, steps and the wildcards that field accepts,
+/// with `?` in exactly one of day-of-month and day-of-week. The modelled `len 1..512`
+/// bound is already enforced before a handler runs; the FORM is not, so anything else
+/// — a bare field list with no `cron(..)` around it, a rate expression, free text, a
+/// value outside a field's published range — is not one, and the operation refuses it
+/// with [`INVALID_CRON_EXPRESSION_MESSAGE`].
+pub fn cron_expression_is_valid(value: &str) -> bool {
+    let Some(body) = value
+        .strip_prefix("cron(")
+        .and_then(|body| body.strip_suffix(')'))
+    else {
+        return false;
+    };
+
+    let fields: Vec<&str> = body.split_whitespace().collect();
+    if fields.len() != CRON_FIELDS.len() {
+        return false;
+    }
+
+    if !fields
+        .iter()
+        .zip(CRON_FIELDS.iter())
+        .all(|(field, spec)| cron_field_is_valid(spec, field))
+    {
+        return false;
+    }
+
+    // The guide's limit: "You can't specify the Day-of-month and Day-of-week fields in
+    // the same cron expression. If you specify a value (or a *) in one of the fields,
+    // you must use a ? (question mark) in the other." So exactly one of the two is `?`.
+    let day_of_month_unspecified = fields[2] == "?";
+    let day_of_week_unspecified = fields[4] == "?";
+    day_of_month_unspecified != day_of_week_unspecified
+}
+
+/// Whether one field of a cron expression is one `spec` accepts: the single value `?`
+/// where the field has it, else a comma-separated list of terms.
+fn cron_field_is_valid(spec: &CronField, field: &str) -> bool {
+    if field == "?" {
+        return spec.question;
+    }
+    field
+        .split(',')
+        .all(|term| cron_term_is_valid(spec, term))
+}
+
+/// Whether one comma-separated term of a field is one `spec` accepts: `*`, a value, a
+/// `low-high` range, any of those with a `/step` increment, or one of the field's
+/// wildcards (`L`, `LW`, `<day>W`, `<day>L`, `<day>#<nth>`).
+fn cron_term_is_valid(spec: &CronField, term: &str) -> bool {
+    let (base, step) = match term.split_once('/') {
+        Some((base, step)) => (base, Some(step)),
+        None => (term, None),
+    };
+    // A step is the increment between values, so it is a positive integer.
+    if let Some(step) = step {
+        if cron_number(step).is_none_or(|step| step < 1) {
+            return false;
+        }
+    }
+    if base == "*" {
+        return true;
+    }
+    if let Some((low, high)) = base.split_once('-') {
+        return match (cron_value(spec, low), cron_value(spec, high)) {
+            (Some(low), Some(high)) => low <= high,
+            _ => false,
+        };
+    }
+    // `L` is the last day of the month or week and `LW` the last weekday of the month.
+    if spec.last && (base == "L" || (spec.weekday && base == "LW")) {
+        return true;
+    }
+    if spec.weekday {
+        if let Some(day) = base.strip_suffix('W') {
+            return cron_value(spec, day).is_some();
+        }
+    }
+    if spec.last {
+        if let Some(day) = base.strip_suffix('L') {
+            return cron_value(spec, day).is_some();
+        }
+    }
+    if spec.nth {
+        if let Some((day, nth)) = base.split_once('#') {
+            // `#` takes the 1st to 5th such day of the month.
+            return cron_value(spec, day).is_some()
+                && cron_number(nth).is_some_and(|nth| (1..=5).contains(&nth));
+        }
+    }
+    cron_value(spec, base).is_some()
+}
+
+/// One value of `spec`'s field: a number in its range, or one of its aliases.
+fn cron_value(spec: &CronField, token: &str) -> Option<u32> {
+    let alias = token.to_ascii_uppercase();
+    if let Some(index) = spec.names.iter().position(|name| *name == alias) {
+        return Some(spec.min + index as u32);
+    }
+    cron_number(token).filter(|value| (spec.min..=spec.max).contains(value))
+}
+
+/// A cron token as a plain decimal number: digits only, so a sign or a stray
+/// character is not a cron value.
+fn cron_number(token: &str) -> Option<u32> {
+    if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    token.parse().ok()
 }
 
 /// One page of a listing, and the token that resumes after it.

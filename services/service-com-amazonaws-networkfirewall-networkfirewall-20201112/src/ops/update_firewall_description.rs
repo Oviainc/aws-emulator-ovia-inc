@@ -196,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = state.firewalls.get_mut(&key) else {
             return Err(UpdateFirewallDescriptionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Firewall {key} does not exist.")),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -215,11 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if token != &record.update_token {
                 return Err(UpdateFirewallDescriptionErrorModeled::InvalidTokenException(
                     InvalidTokenException {
-                        message: Some(
-                            "The UpdateToken you provided is no longer current for this firewall. \
-                             Retrieve the current token and retry."
-                                .to_string(),
-                        ),
+                        message: Some(crate::state::INVALID_TOKEN_MESSAGE.to_string()),
                     },
                 )
                 .into());
@@ -240,6 +236,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 crate::state::impl_resolve_error!(
     update_lookup_error -> UpdateFirewallDescriptionError, UpdateFirewallDescriptionErrorModeled,
-    resource = "firewall", plural = "firewalls",
+    plural = "firewalls",
     name_member = "FirewallName", arn_member = "FirewallArn"
 );

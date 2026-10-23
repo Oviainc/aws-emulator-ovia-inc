@@ -19,6 +19,8 @@ mod async_invocation;
 mod capacity_provider_bounds;
 #[path = "all/capacity_providers.rs"]
 mod capacity_providers;
+#[path = "all/event_source_mappings.rs"]
+mod event_source_mappings;
 #[path = "all/function_aliases.rs"]
 mod function_aliases;
 #[path = "all/function_code_update.rs"]
@@ -37,6 +39,8 @@ mod layer_versions;
 mod resource_policy;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/runtime_management_config.rs"]
+mod runtime_management_config;
 #[path = "all/signing_name_routing.rs"]
 mod signing_name_routing;
 #[path = "all/state_roundtrip.rs"]

@@ -3,8 +3,8 @@
 //! @op CompleteSnapshot
 //!
 //! Implemented: checks the number of blocks actually written against
-//! `ChangedBlocksCount`, seals the stored snapshot and answers with the status read back
-//! from that record.
+//! `ChangedBlocksCount`, records the asynchronous seal the 202 acknowledges and answers
+//! with the status read back from the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -94,7 +94,11 @@ use super::types::*;
 
 use std::time::SystemTime;
 
-use crate::state::SnapshotStatus;
+use crate::state::{
+    is_well_formed_snapshot_id, malformed_snapshot_id_message, snapshot_not_found_message,
+    unsupported_checksum_algorithm_message, SnapshotStatus, CHECKSUM_ALGORITHM_SHA256,
+    SNAPSHOT_COMPLETION_DELAY,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -173,36 +177,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
         let now = SystemTime::now();
         let mut store = state.lock();
-        store.expire_due_snapshots(now);
+        store.apply_due_transitions(now);
+
+        // `ChecksumAlgorithm` is checked HERE rather than at the boundary (the member
+        // carries `skip_validation` on `CompleteSnapshotInput`): the service answers an
+        // algorithm it does not support with its own modelled `ValidationException`,
+        // which carries the `Reason` a client branches on and a message naming the
+        // rejected algorithm and the supported set. The boundary's refusal would carry
+        // neither.
+        if let Some(algorithm) = input.checksum_algorithm.as_deref() {
+            if algorithm != CHECKSUM_ALGORITHM_SHA256 {
+                return Err(validation(
+                    "INVALID_PARAMETER_VALUE",
+                    unsupported_checksum_algorithm_message(algorithm),
+                ));
+            }
+        }
 
         let Some(snapshot) = store.snapshots.get_mut(&input.snapshot_id) else {
-            return Err(not_found(format!(
-                "snapshot {} does not exist",
-                input.snapshot_id
-            )));
+            // A value that is not even shaped like a snapshot id is a malformed
+            // parameter, not a snapshot the service does not hold.
+            if !is_well_formed_snapshot_id(&input.snapshot_id) {
+                return Err(validation(
+                    "INVALID_SNAPSHOT_ID",
+                    malformed_snapshot_id_message("snapshotId", &input.snapshot_id),
+                ));
+            }
+            return Err(not_found(snapshot_not_found_message(&input.snapshot_id)));
         };
 
         // DECLINED, deliberately: the optional aggregate `Checksum` /
-        // `ChecksumAlgorithm` / `ChecksumAggregationMethod` headers are NOT verified
-        // here. Their values are constrained by the model (`SHA256`, `LINEAR`) and the
-        // boundary validator already refuses anything else, but the rule that turns the
-        // per-block checksums into the aggregate is not in the model and the published
-        // prose does not pin the byte-level composition (whether the per-block
-        // checksums are concatenated as their Base64 text or as their raw digests).
+        // `ChecksumAggregationMethod` headers are NOT verified here. Their values are
+        // constrained by the model (`LINEAR`) and the boundary validator already refuses
+        // anything else, but the rule that turns the per-block checksums into the
+        // aggregate is not in the model and the published prose does not pin the
+        // byte-level composition (whether the per-block checksums are concatenated as
+        // their Base64 text or as their raw digests).
         // Refusing on a guessed composition would reject requests a real client builds
         // correctly, which is worse than not checking; so the snapshot is sealed on the
         // evidence this service does have — the blocks it actually stored, checksum-
         // verified one by one as `PutSnapshotBlock` persisted them, and counted against
         // `ChangedBlocksCount` below.
-        let _ = (
-            &input.checksum,
-            &input.checksum_algorithm,
-            &input.checksum_aggregation_method,
-        );
+        let _ = (&input.checksum, &input.checksum_aggregation_method);
 
         // "Seals and completes the snapshot after all of the required blocks of data
-        // have been written to it": the caller's count must agree with what was written.
-        let written = i32::try_from(snapshot.blocks.len()).unwrap_or(i32::MAX);
+        // have been written to it": the caller's count must agree with what was written
+        // to THIS snapshot. Blocks a `ParentSnapshotId` was inherited from were not
+        // written to it, so they are not counted (see `BlockEntry::written`).
+        let written = i32::try_from(snapshot.written_block_count()).unwrap_or(i32::MAX);
         if written != input.changed_blocks_count {
             return Err(validation(
                 "INVALID_PARAMETER_VALUE",
@@ -214,8 +236,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         match snapshot.status {
-            // "Completing the snapshot changes the status to completed."
-            SnapshotStatus::Pending => snapshot.status = SnapshotStatus::Completed,
+            // The seal is ASYNCHRONOUS: this operation is modelled `@http(code: 202)` —
+            // Accepted — so it records when the seal falls due and leaves the status
+            // `pending`; "Completing the snapshot changes the status to completed" is
+            // what a caller observes afterwards, through a later read of the snapshot.
+            // Repeating the request while the seal is in flight re-reports the same
+            // acknowledgement and does not move the due instant.
+            SnapshotStatus::Pending => {
+                if snapshot.completion_due.is_none() {
+                    snapshot.completion_due = Some(now + SNAPSHOT_COMPLETION_DELAY);
+                }
+            }
             // Already sealed: nothing left to change, so the stored status is the answer.
             SnapshotStatus::Completed => {}
             // A snapshot whose `Timeout` cancelled it can no longer be sealed.
@@ -230,10 +261,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The sealed snapshot no longer has a `Timeout` outstanding, so the store's
-        // expiry schedule is recomputed: `next_expiry_due` keeps naming a snapshot that
-        // really is still pending.
-        store.refresh_expiry_schedule();
+        // The snapshot now owes a seal rather than a `Timeout`, so the store's schedule
+        // is recomputed: `next_transition_due` keeps naming the earliest change the clock
+        // really does owe.
+        store.refresh_transition_schedule();
 
         // Read the status back off the stored record rather than returning a literal.
         let stored = store.snapshots.get(&input.snapshot_id).ok_or_else(|| {

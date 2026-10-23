@@ -18,13 +18,13 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// `ManagedThingArn` pattern (`^arn:aws:iotmanagedintegrations:…`) requires.
 pub const SERVICE_ARN_NAMESPACE: &str = "iotmanagedintegrations";
 
-/// The `Role`, `AuthMaterialType`, `HubNetworkMode`, `EncryptionType` and
+/// The `Role`, `AuthMaterialType`, `HubNetworkMode`, `EncryptionType`, `LogLevel` and
 /// `ConfigurationState` value lists the handlers validate against and report, re-exported
 /// from the MODEL-GENERATED constants in `crate::ops::types` so there is no second copy
 /// to drift from the model.
 pub use crate::ops::types::{
     AUTH_MATERIAL_TYPE_VALUES, CONFIGURATION_STATE_VALUES, ENCRYPTION_TYPE_VALUES,
-    HUB_NETWORK_MODE_VALUES, ROLE_VALUES,
+    HUB_NETWORK_MODE_VALUES, LOG_LEVEL_VALUES, ROLE_VALUES,
 };
 
 /// The `ProvisioningStatus` a freshly created managed thing carries: it is not yet
@@ -228,6 +228,55 @@ impl DefaultEncryptionConfiguration {
     }
 }
 
+/// One stored event log configuration: the logging level this account has in force for ONE
+/// log target. `CreateEventLogConfiguration` inserts it and `GetEventLogConfiguration`
+/// projects it onto its output shape.
+#[derive(Debug, Clone)]
+pub struct EventLogConfiguration {
+    /// The generated `LogConfigurationId` this record is keyed by.
+    pub id: String,
+    /// The region the creating request was signed for. Every resource of this service is
+    /// regional (see [`ManagedThing::region`]): only that region's endpoint resolves this
+    /// configuration.
+    pub region: String,
+    /// `SmartHomeResourceType`: a resource type, or `*` for the whole account.
+    pub resource_type: String,
+    /// `SmartHomeResourceId`, absent when the configuration addresses every resource of
+    /// [`Self::resource_type`] rather than one of them.
+    pub resource_id: Option<String>,
+    /// `LogLevel` enum value, one of [`LOG_LEVEL_VALUES`].
+    pub event_log_level: String,
+    /// Monotonic insertion sequence, which is also what makes [`Self::id`] unique. A later
+    /// `ListEventLogConfigurations` pages by it, as `ListManagedThings` does.
+    pub sequence: u64,
+}
+
+impl EventLogConfiguration {
+    /// The log TARGET this configuration addresses: the resource type it names, and the
+    /// resource within that type when it names one. The target is what an event log
+    /// configuration configures, so two records with the same target would be two
+    /// configurations of one thing — which is what makes a second create for a target a
+    /// conflict rather than another record.
+    pub fn target(&self) -> (&str, Option<&str>) {
+        (self.resource_type.as_str(), self.resource_id.as_deref())
+    }
+}
+
+/// The `ResourceType` this service reports an event log configuration under — the Smithy
+/// resource name, which is what `ResourceNotFoundException`'s `ResourceType` member
+/// carries, as [`MANAGED_THING_RESOURCE_TYPE`] does for a managed thing.
+pub const EVENT_LOG_CONFIGURATION_RESOURCE_TYPE: &str = "EventLogConfiguration";
+
+/// The event-log-configuration resource as a READ's reason names it — the resource's name
+/// in words ([`resource_not_found_message`]), as [`MANAGED_THING_RESOURCE_NAME`] is for a
+/// managed thing.
+pub const EVENT_LOG_CONFIGURATION_RESOURCE_NAME: &str = "Event Log Configuration";
+
+/// The most event log configurations one store holds. A create past it is refused rather
+/// than grown into, so a caller cannot make this emulator's memory grow without end. A
+/// bound CHOSEN for the emulator, like [`MAX_MANAGED_THINGS`], not a published AWS quota.
+pub const MAX_EVENT_LOG_CONFIGURATIONS: usize = 1_000;
+
 /// Per-service state for com-amazonaws-iotmanagedintegrations-iotmanagedintegrations. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
@@ -261,6 +310,10 @@ pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// endpoint reports its own. A region no put has configured holds no entry and reports
     /// [`DefaultEncryptionConfiguration::default`].
     pub default_encryption: HashMap<String, DefaultEncryptionConfiguration>,
+    /// The authoritative event-log-configuration store, keyed by the generated
+    /// `LogConfigurationId`. At most one record per log target per region — see
+    /// [`Self::event_log_configuration_for_target`].
+    pub event_log_configurations: HashMap<String, EventLogConfiguration>,
 }
 
 /// One region's hub configuration: the hub token timer expiry an account set there, and
@@ -456,6 +509,35 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
         self.default_encryption
             .insert(region.to_string(), configuration);
         true
+    }
+
+    /// The record `region`'s endpoint holds under `id`, if any. A configuration created in
+    /// another region is not visible here.
+    pub fn event_log_configuration_in(
+        &self,
+        region: &str,
+        id: &str,
+    ) -> Option<&EventLogConfiguration> {
+        self.event_log_configurations
+            .get(id)
+            .filter(|configuration| configuration.region == region)
+    }
+
+    /// The configuration `region` already holds for the log target `resource_type` and
+    /// `resource_id` name, if any.
+    ///
+    /// A target has at most ONE configuration — a logging level is a single setting of the
+    /// thing it configures — so this is what a create consults before minting a record.
+    pub fn event_log_configuration_for_target(
+        &self,
+        region: &str,
+        resource_type: &str,
+        resource_id: Option<&str>,
+    ) -> Option<&EventLogConfiguration> {
+        self.event_log_configurations.values().find(|configuration| {
+            configuration.region == region
+                && configuration.target() == (resource_type, resource_id)
+        })
     }
 
     /// Take the next insertion sequence number.
@@ -914,7 +996,20 @@ pub fn managed_thing_not_found_on_mutation(identifier: &str) -> ResourceNotFound
             MANAGED_THING_RESOURCE_TYPE,
             identifier,
         )),
-        ..managed_thing_not_found(identifier)
+        ..resource_not_found(MANAGED_THING_RESOURCE_TYPE, identifier)
+    }
+}
+
+/// The modelled `ResourceNotFoundException` a READ answers for an event log configuration
+/// the store does not hold under the `Id` the request named: the read path's reason
+/// ([`resource_not_found_message`]) plus the `ResourceId` and `ResourceType` members, worded
+/// through the same two helpers every other resource of this service uses.
+pub fn event_log_configuration_not_found_on_read(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(resource_not_found_message(
+            EVENT_LOG_CONFIGURATION_RESOURCE_NAME,
+        )),
+        ..resource_not_found(EVENT_LOG_CONFIGURATION_RESOURCE_TYPE, id)
     }
 }
 
@@ -923,19 +1018,19 @@ pub fn managed_thing_not_found_on_mutation(identifier: &str) -> ResourceNotFound
 pub fn managed_thing_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(resource_not_found_message(MANAGED_THING_RESOURCE_NAME)),
-        ..managed_thing_not_found(identifier)
+        ..resource_not_found(MANAGED_THING_RESOURCE_TYPE, identifier)
     }
 }
 
-/// The `ResourceId` and `ResourceType` half of a managed thing's 404, which both paths
-/// report the same way: the identifier the request carried, and the resource's type. The
-/// reason is the caller's to fill, so this is not public — reach it through
-/// [`managed_thing_not_found_on_read`] or [`managed_thing_not_found_on_mutation`].
-fn managed_thing_not_found(identifier: &str) -> ResourceNotFoundException {
+/// The `ResourceId` and `ResourceType` half of any resource's 404, which every path reports
+/// the same way: the identifier the request carried, and the resource's type. The reason is
+/// the caller's to fill, so this is not public — reach it through one of the
+/// `*_not_found_on_read` / `*_not_found_on_mutation` helpers above.
+fn resource_not_found(resource_type: &str, identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: None,
         resource_id: Some(identifier.to_string()),
-        resource_type: Some(MANAGED_THING_RESOURCE_TYPE.to_string()),
+        resource_type: Some(resource_type.to_string()),
     }
 }
 

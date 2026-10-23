@@ -1375,9 +1375,9 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
     /// * an ARN that is not a MemoryDB resource ARN at all —
     ///   [`TagTargetRejection::InvalidArn`], the 400 `InvalidARNFault`;
     /// * a well-formed one naming no resource in this store —
-    ///   [`TagTargetRejection::NotFound`] carrying the kind whose 404 the operation
-    ///   models. A resource's ARN is STORED rather than rebuilt per call, so an ARN
-    ///   naming an existing resource in another region or account resolves to nothing
+    ///   [`TagTargetRejection::NotFound`] carrying the kind whose not-found fault the
+    ///   operation models. A resource's ARN is STORED rather than rebuilt per call, so an
+    ///   ARN naming an existing resource in another region or account resolves to nothing
     ///   too.
     pub fn tag_target(&self, resource_arn: &str) -> Result<String, TagTargetRejection> {
         let Some((kind, name)) = parse_resource_arn(resource_arn) else {
@@ -2486,7 +2486,8 @@ pub fn parse_resource_arn(resource_arn: &str) -> Option<(ResourceKind, &str)> {
 pub enum TagTargetRejection {
     /// The ARN is not a MemoryDB resource ARN at all: the 400 `InvalidARNFault`.
     InvalidArn(String),
-    /// The ARN is well formed but names no resource in this store: that kind's 404.
+    /// The ARN is well formed but names no resource in this store: that kind's
+    /// not-found fault.
     NotFound(ResourceKind, String),
 }
 

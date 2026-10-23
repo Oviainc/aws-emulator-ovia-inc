@@ -293,13 +293,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // A rule group is identified by its name AND its type, so a name is only taken
-        // within the half of the service the type names.
+        // within the half of the service the type names. The refusal carries the
+        // service's constant already-exists message: it names neither the type nor the
+        // name the request asked for.
         let key = crate::state::rule_group_resource_path(&input.r#type, &input.rule_group_name);
         if state.rule_groups.contains_key(&key) {
-            return Err(invalid_request(&format!(
-                "A {} rule group named {} already exists.",
-                input.r#type, input.rule_group_name
-            )));
+            return Err(invalid_request(
+                crate::state::RESOURCE_ALREADY_EXISTS_MESSAGE,
+            ));
         }
         // Bound what one caller can make this emulator retain: nothing else caps the
         // number of stored rule groups, so a request past the ceiling is refused with

@@ -68,6 +68,18 @@ pub const STATE_MACHINE_RESOURCE: &str = "stateMachine";
 /// The resource type an execution ARN carries.
 pub const EXECUTION_RESOURCE: &str = "execution";
 
+/// The resource type a SYNCHRONOUS Express execution ARN carries.
+///
+/// `StartSyncExecution` starts "a Synchronous Express state machine execution" and
+/// answers the execution's own ARN, which names the `express` resource rather than
+/// the `execution` one and carries a trailing id field:
+/// `arn:<partition>:states:<region>:<account>:express:<stateMachineName>:<executionName>:<executionId>`.
+/// That id is what tells two runs that reused one name apart — which Express
+/// workflows allow, since `StartExecution`'s `name` documents that "for EXPRESS
+/// workflows, execution names can be reused immediately" — so a synchronous start is
+/// never refused for a name another run already used.
+pub const EXPRESS_EXECUTION_RESOURCE: &str = "express";
+
 /// The resource type an activity ARN carries.
 ///
 /// A Step Functions tagging call takes "the ARN for the Step Functions state
@@ -877,6 +889,16 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// 8-4-4-4-12 in lowercase hex. The counter is what makes two mints in the same
     /// nanosecond differ.
     pub fn fresh_execution_name(&mut self) -> String {
+        self.fresh_uuid()
+    }
+
+    /// A fresh id for the trailing field of one Express execution ARN (see
+    /// [`EXPRESS_EXECUTION_RESOURCE`]).
+    ///
+    /// Minted from the same generator as an execution name, so two synchronous runs
+    /// that reused one name still differ — the id is what makes the ARN unique, and
+    /// the counter is what makes two mints in the same nanosecond differ.
+    pub fn fresh_execution_id(&mut self) -> String {
         self.fresh_uuid()
     }
 
@@ -1778,6 +1800,25 @@ pub fn execution_arn(region: &str, state_machine_name: &str, execution_name: &st
     )
 }
 
+/// The ARN of one SYNCHRONOUS Express execution of a state machine.
+///
+/// See [`EXPRESS_EXECUTION_RESOURCE`] for the form and for what the trailing
+/// `execution_id` field is for.
+pub fn express_execution_arn(
+    region: &str,
+    state_machine_name: &str,
+    execution_name: &str,
+    execution_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!(
+            "{EXPRESS_EXECUTION_RESOURCE}:{state_machine_name}:{execution_name}:{execution_id}"
+        ),
+    )
+}
+
 /// The region field of `arn`, or the emulator's default region when `arn` carries
 /// none.
 ///
@@ -1944,6 +1985,42 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         })
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The HTTP header an X-Ray trace header is passed in.
+///
+/// From `traceHeader`'s own documentation: "For X-Ray traces, all Amazon Web Services
+/// services use the X-Amzn-Trace-Id header from the HTTP request."
+pub const TRACE_HEADER_HEADER: &str = "x-amzn-trace-id";
+
+/// The most characters a reported `traceHeader` may carry: the modelled `TraceHeader`
+/// shape's own bound (len 0..256, pattern `^\p{ASCII}*$`).
+pub const MAX_TRACE_HEADER_CHARS: usize = 256;
+
+/// The trace header an execution carries, given the one its request body supplied.
+///
+/// From `traceHeader`'s own documentation, on `StartExecution` and
+/// `StartSyncExecution` alike: "Using the header is the preferred mechanism to
+/// identify a trace. StartExecution and StartSyncExecution API operations can also
+/// use traceHeader from the body of the request payload. If both sources are
+/// provided, Step Functions will use the header value (preferred) over the value in
+/// the request body."
+///
+/// A request header is caller text of any length and any bytes, while the modelled
+/// `TraceHeader` the member is reported through is 0..256 ASCII characters — so a
+/// header outside what that shape models is not reported through it and the body
+/// value stands.
+pub fn effective_trace_header(
+    parts: &::http::request::Parts,
+    from_body: Option<String>,
+) -> Option<String> {
+    parts
+        .headers
+        .get(TRACE_HEADER_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.is_ascii() && value.chars().count() <= MAX_TRACE_HEADER_CHARS)
+        .map(str::to_string)
+        .or(from_body)
 }
 
 // ---------------------------------------------------------------------------
@@ -2528,6 +2605,36 @@ pub fn plan_run(
     opening: &str,
     previous_event_id: i64,
 ) -> (Vec<HistoryEvent>, PendingOutcome) {
+    plan_run_settling_after(
+        definition,
+        input,
+        start,
+        context,
+        opening,
+        previous_event_id,
+        EXECUTION_SETTLE_DELAY,
+    )
+}
+
+/// As [`plan_run`], with the delay after which the outcome settles stated by the
+/// caller rather than taken as [`EXECUTION_SETTLE_DELAY`].
+///
+/// An ASYNCHRONOUS start (`StartExecution`, `RedriveExecution`) answers while the
+/// execution is still `RUNNING`, so the terminal outcome it computed is owed to the
+/// clock and settles one [`EXECUTION_SETTLE_DELAY`] later. A SYNCHRONOUS start
+/// (`StartSyncExecution`) answers the terminal outcome in the call itself — "the
+/// status code in the API response doesn't reflect function errors", so the response
+/// already carries `status`, `stopDate` and the output — so it owes the clock
+/// nothing and passes `Duration::ZERO`.
+pub fn plan_run_settling_after(
+    definition: &str,
+    input: &str,
+    start: SystemTime,
+    context: &asl::Context,
+    opening: &str,
+    previous_event_id: i64,
+    settle: Duration,
+) -> (Vec<HistoryEvent>, PendingOutcome) {
     let run = asl::run(definition, input, start, context);
     let started = HistoryEvent {
         id: previous_event_id + 1,
@@ -2540,7 +2647,7 @@ pub fn plan_run(
     // definition, so every instant is computed with checked arithmetic: an
     // offset no instant can represent is held at the furthest instant this clock
     // carries, rather than reached through the panicking `Add`.
-    let due_at = after(start, EXECUTION_SETTLE_DELAY.saturating_add(run.elapsed));
+    let due_at = after(start, settle.saturating_add(run.elapsed));
     let events: Vec<HistoryEvent> = run
         .steps
         .into_iter()
@@ -2570,6 +2677,53 @@ pub fn plan_run(
             events,
         },
     )
+}
+
+// ---------------------------------------------------------------------------
+// What a synchronous execution is billed
+// ---------------------------------------------------------------------------
+
+/// The increment `billedDurationInMilliseconds` is reported in.
+///
+/// An AWS-published billing increment, from Step Functions' pricing for Express
+/// Workflows: a workflow's duration "is rounded up to the nearest 100 ms". It is
+/// therefore also the SMALLEST billed duration: a run that ended inside the first
+/// increment is billed one.
+pub const BILLED_DURATION_INCREMENT_MILLIS: i64 = 100;
+
+/// The increment `billedMemoryUsedInMB` is reported in.
+///
+/// The same source: Express Workflow memory consumption is billed in 64 MB
+/// increments, the smallest of which is what a workflow whose data fits inside it
+/// costs.
+pub const BILLED_MEMORY_INCREMENT_MB: i64 = 64;
+
+/// What `StartSyncExecution` reports as the run's billed duration: the span from the
+/// execution's start to its stop, rounded UP to the next
+/// [`BILLED_DURATION_INCREMENT_MILLIS`], and never less than one increment.
+pub fn billed_duration_millis(start: SystemTime, stop: SystemTime) -> i64 {
+    let ran = stop.duration_since(start).unwrap_or_default();
+    let millis = i64::try_from(ran.as_millis()).unwrap_or(i64::MAX);
+    round_up_to(millis, BILLED_DURATION_INCREMENT_MILLIS)
+}
+
+/// What `StartSyncExecution` reports as the run's billed memory: the bytes the run
+/// actually retained (its input, the outcome it computed and its history), rounded UP
+/// to the next [`BILLED_MEMORY_INCREMENT_MB`], and never less than one increment.
+///
+/// A run interpreted in this process retains at most the modelled payload maxima, so
+/// it normally fits inside the first increment and is billed exactly one — the same
+/// floor the published increments give a small workflow.
+pub fn billed_memory_mb(retained_bytes: usize) -> i64 {
+    let megabytes = i64::try_from(retained_bytes.div_ceil(1024 * 1024)).unwrap_or(i64::MAX);
+    round_up_to(megabytes, BILLED_MEMORY_INCREMENT_MB)
+}
+
+/// `value` rounded up to the next multiple of `increment`, with one increment as the
+/// floor, saturating rather than overflowing.
+fn round_up_to(value: i64, increment: i64) -> i64 {
+    let increments = value.max(1).saturating_add(increment - 1) / increment;
+    increments.saturating_mul(increment)
 }
 
 pub mod asl;

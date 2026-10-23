@@ -85,6 +85,12 @@ pub struct RestApiEntry {
     /// records `CreateDocumentationPart` and `ImportDocumentationParts` write and
     /// `GetDocumentationPart` / `GetDocumentationParts` report.
     pub documentation_parts: BTreeMap<String, DocumentationPartEntry>,
+    /// Every `DocumentationVersion` of this API, keyed by its version identifier — the
+    /// identifier `CreateDocumentationVersion` mints the snapshot under and
+    /// `GetDocumentationVersion` takes in its `documentationVersion` path label. A
+    /// version identifier is the record's KEY, which is what makes a second snapshot
+    /// under one identifier a conflict.
+    pub documentation_versions: BTreeMap<String, DocumentationVersionEntry>,
     /// Every `Authorizer` of this API, keyed by authorizer id — the identifier a
     /// `Method`'s `authorizerId` names and `GetAuthorizer` takes in its path label.
     pub authorizers: BTreeMap<String, AuthorizerEntry>,
@@ -242,6 +248,30 @@ pub struct DocumentationPartEntry {
     pub sequence: u64,
 }
 
+/// One stored `DocumentationVersion`: "a snapshot of the documentation of an API"
+/// (`DocumentationVersion` in this service's model), under the version identifier the
+/// create minted it as.
+///
+/// The snapshot is the API's documentation parts as they stood at that instant, kept on
+/// the record rather than recomputed from the API's current parts: later calls go on
+/// creating, updating and deleting parts, and a snapshot that followed them would not be
+/// a snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct DocumentationVersionEntry {
+    /// The version identifier, which is also this record's key in
+    /// [`RestApiEntry::documentation_versions`].
+    pub version: String,
+    pub description: Option<String>,
+    pub created_date: Option<::aws_smithy_types::DateTime>,
+    /// The documentation parts this snapshot froze, in the creation order they had then;
+    /// what `GetExport` serves for this version once it is implemented.
+    pub documentation_parts: Vec<DocumentationPartEntry>,
+    /// This version's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
+    /// listing reports creation order rather than version-identifier order.
+    pub sequence: u64,
+}
+
 /// One stored `Method` on a resource.
 #[derive(Debug, Clone, Default)]
 pub struct MethodEntry {
@@ -260,6 +290,11 @@ pub struct MethodEntry {
     pub method_responses: BTreeMap<String, GetMethodResponseOutput>,
     /// Written by `PutIntegration` and reported by `GetIntegration` and a `Method`
     /// body's `methodIntegration`; absent until an integration is put on the method.
+    ///
+    /// Its `integrationResponses` map is where `PutIntegrationResponse` writes and
+    /// `GetIntegrationResponse` reads, keyed by the response's `statusCode`: an
+    /// integration response hangs off the INTEGRATION, so the one record lives on the
+    /// integration that owns it rather than in a second map beside it.
     pub integration: Option<GetIntegrationOutput>,
 }
 
@@ -515,6 +550,12 @@ pub const MAX_RESOURCES_PER_API: usize = 300;
 
 /// API Gateway's default quota "Documentation parts: 2000 per API".
 pub const MAX_DOCUMENTATION_PARTS_PER_API: usize = 2_000;
+
+/// Emulator resource guard, NOT an AWS quota: the most documentation versions this
+/// emulator keeps for one API. API Gateway publishes a documentation-PARTS quota (see
+/// [`MAX_DOCUMENTATION_PARTS_PER_API`]) but none for the snapshots taken of them, so this
+/// bound is the emulator's own, the same order as the deployment guard beside it.
+pub const MAX_DOCUMENTATION_VERSIONS_PER_API: usize = 300;
 
 /// API Gateway's default quota "Stages per API: 10".
 pub const MAX_STAGES_PER_API: usize = 10;
@@ -1401,8 +1442,10 @@ pub const NO_SUCH_METHOD: &str = "Invalid Method identifier specified";
 /// The `NotFoundException` message for a method that carries no integration.
 pub const NO_SUCH_INTEGRATION: &str = "Invalid Integration identifier specified";
 
-/// The `NotFoundException` message for a `statusCode` that names no method response of
-/// the method.
+/// The `NotFoundException` message for a `statusCode` that names no response of the
+/// method at that code — the method response `GetMethodResponse` resolves, or the
+/// integration response `GetIntegrationResponse` resolves on the method's integration.
+/// Both are keyed by the same `StatusCode`, so both say the same thing about it.
 pub const NO_SUCH_METHOD_RESPONSE: &str = "Invalid Response status code specified";
 
 /// The `NotFoundException` message for a `stageName` that names no stage of the API.
@@ -1439,6 +1482,10 @@ pub fn invalid_tagged_resource_arn(resource_arn: &str) -> String {
 /// The `NotFoundException` message for a `documentationPartId` that names no stored
 /// documentation part of the API.
 pub const NO_SUCH_DOCUMENTATION_PART: &str = "Invalid Documentation part identifier specified";
+
+/// The `NotFoundException` message for a documentation version identifier that names no
+/// snapshot of the API, in the shape of the sibling identifier messages above.
+pub const NO_SUCH_DOCUMENTATION_VERSION: &str = "Invalid Documentation version specified";
 
 /// The `NotFoundException` message for an `authorizerId` that names no stored authorizer
 /// of the API.

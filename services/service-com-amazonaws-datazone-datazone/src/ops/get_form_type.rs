@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        use crate::state::{date_time, now_ms};
+        use crate::state::{date_time, now_ms, ResourceKind};
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetFormTypeErrorModeled::InternalServerException(InternalServerException {
@@ -194,21 +194,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_clock(now_ms());
 
+        // Every miss below is reported with the KIND's own recorded not-found text
+        // (`crate::state::ResourceKind::not_found_message`), never with the identifier
+        // the caller supplied: a form type this domain does not hold at the addressed
+        // revision is a form type that does not exist, however it was addressed.
         let form_type = store
             .live_domain(&input.domain_identifier)
             .ok_or_else(|| {
                 GetFormTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("Domain {} was not found", input.domain_identifier),
+                    message: ResourceKind::Domain.not_found_message(),
                 })
             })?
             .form_types
             .get(&input.form_type_identifier)
             .ok_or_else(|| {
                 GetFormTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!(
-                        "Metadata form type {} was not found",
-                        input.form_type_identifier
-                    ),
+                    message: ResourceKind::FormType.not_found_message(),
                 })
             })?;
         // A request naming a `revision` addresses exactly that revision; one naming
@@ -216,18 +217,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let revision = match input.revision.as_deref() {
             Some(wanted) => form_type.revision(wanted).ok_or_else(|| {
                 GetFormTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!(
-                        "Metadata form type {} has no revision {wanted}",
-                        input.form_type_identifier
-                    ),
+                    message: ResourceKind::FormType.not_found_message(),
                 })
             })?,
             None => form_type.latest_revision().ok_or_else(|| {
                 GetFormTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!(
-                        "Metadata form type {} has no revisions",
-                        input.form_type_identifier
-                    ),
+                    message: ResourceKind::FormType.not_found_message(),
                 })
             })?,
         };

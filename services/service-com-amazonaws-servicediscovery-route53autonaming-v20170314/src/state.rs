@@ -310,6 +310,42 @@ pub fn described(description: Option<String>) -> Option<String> {
     description.filter(|text| !text.is_empty())
 }
 
+/// What a DNS-namespace update asked for, as an idempotency `request` key.
+///
+/// `UpdaterRequestId` "allows failed Update…Namespace requests to be retried without
+/// the risk of running the operation twice", so the remembered request must identify
+/// the whole change: the resolved namespace and every property the call asked to
+/// change. The two options are rendered with their `Debug` form so an absent member
+/// (which leaves the stored value alone) is never the same key as a member carrying the
+/// empty string or a zero TTL.
+pub fn dns_namespace_change_request(
+    namespace_id: &str,
+    description: Option<&str>,
+    soa_ttl: Option<i64>,
+) -> String {
+    format!("{namespace_id}:{description:?}:{soa_ttl:?}")
+}
+
+/// The message a namespace update is refused with when the stored namespace is of
+/// another `NamespaceType` than the one that update applies to.
+///
+/// Each `Update*Namespace` operation is documented against ONE namespace kind, and its
+/// change shape carries only the properties that kind has (an HTTP namespace has no
+/// SOA, a DNS namespace no `HttpName`), so asking the wrong kind of update of a
+/// namespace that does exist is a bad request rather than a missing namespace. The
+/// wording names the namespace, the type it actually has and the operation that refused
+/// it, so one text serves every namespace update.
+pub fn wrong_namespace_type_message(
+    namespace_id: &str,
+    stored_type: &str,
+    operation: &str,
+) -> String {
+    format!(
+        "The namespace {namespace_id} is a {stored_type} namespace, so it can't be updated \
+         with {operation}."
+    )
+}
+
 /// The message a namespace create is refused with when the `Name` is already owned by
 /// a create that has already completed.
 ///
@@ -514,6 +550,8 @@ pub enum IdempotencyScope {
     CreateService,
     RegisterInstance,
     UpdateHttpNamespace,
+    UpdatePrivateDnsNamespace,
+    UpdatePublicDnsNamespace,
 }
 impl IdempotencyScope {
     fn as_str(self) -> &'static str {
@@ -524,6 +562,8 @@ impl IdempotencyScope {
             Self::CreateService => "CreateService",
             Self::RegisterInstance => "RegisterInstance",
             Self::UpdateHttpNamespace => "UpdateHttpNamespace",
+            Self::UpdatePrivateDnsNamespace => "UpdatePrivateDnsNamespace",
+            Self::UpdatePublicDnsNamespace => "UpdatePublicDnsNamespace",
         }
     }
 }
@@ -720,6 +760,46 @@ impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
             .values()
             .find(|namespace| namespace.arn == reference)
             .map(|namespace| namespace.id.clone())
+    }
+
+    /// The `NamespaceType` of the stored namespace `namespace_id`, or the empty string
+    /// when no namespace is stored under that id.
+    pub fn namespace_type(&self, namespace_id: &str) -> String {
+        self.namespaces
+            .get(namespace_id)
+            .map(|namespace| namespace.namespace_type.clone())
+            .unwrap_or_default()
+    }
+
+    /// Apply to the stored namespace `namespace_id` the change a DNS-namespace update
+    /// asks for.
+    ///
+    /// Both members of a DNS namespace change are OPTIONAL
+    /// (`Private`/`PublicDnsNamespaceChange` declare `Description` and `Properties`
+    /// without `@required`), so a member the change omits is left exactly as it was and
+    /// a call that carries one property updates only that one. A `Description` the
+    /// change does carry replaces the stored one — the empty string storing none, as
+    /// [`described`] decides for every resource description — and a
+    /// `Properties.DnsProperties.SOA.TTL` it carries, the updated TTL for purposes of
+    /// negative caching, replaces the stored TTL, which is what a later `GetNamespace`
+    /// reports under `Properties.DnsProperties.SOA`.
+    ///
+    /// Writing through the one stored record is what makes the namespace updates and
+    /// every namespace read agree; nothing is cached beside it.
+    pub fn apply_dns_namespace_change(
+        &mut self,
+        namespace_id: &str,
+        description: Option<String>,
+        soa_ttl: Option<i64>,
+    ) {
+        if let Some(namespace) = self.namespaces.get_mut(namespace_id) {
+            if let Some(description) = description {
+                namespace.description = described(Some(description));
+            }
+            if let Some(ttl) = soa_ttl {
+                namespace.soa_ttl = Some(ttl);
+            }
+        }
     }
 
     /// Resolve a service reference (its id or its ARN) to a stored service id.

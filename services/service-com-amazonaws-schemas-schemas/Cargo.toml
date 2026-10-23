@@ -30,6 +30,9 @@ serde-transcode = "1.1"
 tracing = { workspace = true }
 # Opaque, query-string-safe encoding for the `NextToken` the listing operations mint.
 hex = { workspace = true }
+# A stable digest of a published schema's name, so the AWS-managed catalogue's
+# per-schema metadata is the schema's own and the same in every process.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

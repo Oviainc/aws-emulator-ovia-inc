@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartConfigRulesEvaluation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartConfigRulesEvaluation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartConfigRulesEvaluation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starting an on-demand evaluation invokes, for every rule the request names, the
+//! same evaluation pass Config runs by itself when a rule is written: the pass is
+//! recorded as in flight against the rule and completes on its own a span later,
+//! which is what `DescribeConfigRuleEvaluationStatus` reports. It re-records no
+//! configuration state, so nothing else in the store moves.
 //!
 //! ## Shape of an operation
 //!
@@ -133,6 +130,45 @@ impl From<StartConfigRulesEvaluationErrorModeled> for StartConfigRulesEvaluation
     }
 }
 
+/// How this operation words `LimitExceededException` for a request whose named rule
+/// still has an on-demand evaluation pass running.
+///
+/// The message is BUILT FROM THE REQUEST — it quotes the rule the caller named — and
+/// states the precondition the model documents for this operation: "An existing
+/// StartConfigRulesEvaluation call for the specified rules must complete before you
+/// can call the API again" (`StartConfigRulesEvaluation`; `LimitExceededException`:
+/// "For StartConfigRulesEvaluation API, this exception is thrown if an evaluation is
+/// in progress").
+fn evaluation_in_progress_message(name: &str) -> String {
+    format!(
+        "An evaluation is in progress for the ConfigRule '{name}'. An existing \
+         StartConfigRulesEvaluation call for the specified rules must complete before \
+         you can call the API again."
+    )
+}
+
+/// The fewest names `ConfigRuleNames` may carry
+/// (`smithy_query(query="operation",operation="StartConfigRulesEvaluation")`:
+/// `ReevaluateConfigRuleNames`, length 1..25).
+const CONFIG_RULE_NAMES_MIN: usize = 1;
+/// The most names `ConfigRuleNames` may carry; see [`CONFIG_RULE_NAMES_MIN`].
+const CONFIG_RULE_NAMES_MAX: usize = 25;
+
+/// How this operation words `InvalidParameterValueException` for a request that named
+/// no rule at all.
+///
+/// This operation "[r]uns an on-demand evaluation for the SPECIFIED Config rules", and
+/// the model bounds `ConfigRuleNames` at 1..25 — a list that is present states at
+/// least one name — so a request that omits the member states no rule to evaluate and
+/// is a bad parameter value, not an evaluation of everything. The message names the
+/// member to supply and the bound it carries.
+fn no_rule_names_message() -> String {
+    format!(
+        "ConfigRuleNames is required: specify between {CONFIG_RULE_NAMES_MIN} and \
+         {CONFIG_RULE_NAMES_MAX} Config rule names to run an evaluation for."
+    )
+}
+
 /// The `StartConfigRulesEvaluation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -169,18 +205,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartConfigRulesEvaluation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartConfigRulesEvaluationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartConfigRulesEvaluation"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // `ConfigRuleNames` is what names the rules to evaluate; the modelled 1..25
+        // bound already refuses a present-but-empty list, so only an omitted member
+        // reaches here with nothing in it.
+        let names = input.config_rule_names.unwrap_or_default();
+        if names.len() < CONFIG_RULE_NAMES_MIN {
+            return Err(
+                StartConfigRulesEvaluationErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(no_rule_names_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Materialise every pass the clock has already made due before deciding
+        // anything, so "an evaluation is in progress" is about a pass that is
+        // genuinely still running rather than one nobody has read back yet.
+        for rule in store.config_rules.values_mut() {
+            rule.evaluation.settle(now);
+        }
+
+        // A name that names no rule is a failure for the request as a whole: nothing
+        // is evaluated, so no named rule's pass starts. The refusal is worded for a
+        // LIST-shaped lookup, which is how this operation names its rules.
+        if names
+            .iter()
+            .any(|name| !store.config_rules.contains_key(name))
+        {
+            return Err(
+                StartConfigRulesEvaluationErrorModeled::NoSuchConfigRuleException(
+                    NoSuchConfigRuleException {
+                        message: Some(crate::state::NO_SUCH_CONFIG_RULES.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "An existing StartConfigRulesEvaluation call for the specified rules must
+        // complete before you can call the API again" — so a rule whose ON-DEMAND
+        // pass is still running refuses this one, and again nothing is evaluated. The
+        // pass Config runs by itself when a rule is written is not such a call, so it
+        // never stands in the way of the first on-demand evaluation of a new rule.
+        let running = names.iter().find(|name| {
+            store
+                .config_rules
+                .get(name.as_str())
+                .is_some_and(|rule| rule.evaluation.on_demand_in_progress(now))
+        });
+        if let Some(name) = running {
+            return Err(
+                StartConfigRulesEvaluationErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(evaluation_in_progress_message(name)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Start the pass for every named rule. It re-runs against the configuration
+        // state already recorded and does not re-record it, so nothing but each
+        // rule's invocation-and-evaluation history moves: that history is what
+        // `DescribeConfigRuleEvaluationStatus` reports, and the pass completes on its
+        // own a span later without any further call.
+        for name in &names {
+            if let Some(rule) = store.config_rules.get_mut(name) {
+                rule.evaluation.invoke_on_demand(now);
+            }
+        }
+
+        Ok(StartConfigRulesEvaluationOutput {})
     }
 }

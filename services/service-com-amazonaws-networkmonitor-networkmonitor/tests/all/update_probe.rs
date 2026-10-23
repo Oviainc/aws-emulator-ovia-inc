@@ -16,9 +16,11 @@
 //!   `destination` must be an IP literal, `destinationPort` is required when the
 //!   `protocol` is `TCP` and must be at least `1` — and a refused update leaves
 //!   the stored probe exactly as it was;
-//! * `state` is the state the caller asks for, over the whole modelled
-//!   `ProbeState` catalog, and a probe put back into the transient `PENDING` is
-//!   owed the `ACTIVE` transition afresh;
+//! * `state` is the activate/deactivate toggle: only the states a CALLER may
+//!   ask for are accepted, and a state the SERVICE assigns over a probe's
+//!   lifecycle is refused with `ValidationException` and written nowhere;
+//! * the TCP-requires-`destinationPort` rule is refused with the one sentence
+//!   every path that applies it emits;
 //! * `modifiedAt` moves only when a stored value actually changed (the operation
 //!   is `@idempotent`), and `createdAt` never moves;
 //! * a `monitorName` or `probeId` nothing is stored under is 404
@@ -34,9 +36,26 @@ use super::monitor_and_probe::{
 
 /// Every value the model's `ProbeState` enum admits
 /// (`smithy_query(query="shape",shape="ProbeState")` ->
-/// `PENDING | ACTIVE | INACTIVE | ERROR | DELETING | DELETED`), which is the
-/// catalog `UpdateProbeInput$state` accepts.
-const PROBE_STATES: &[&str] = &["PENDING", "ACTIVE", "INACTIVE", "ERROR", "DELETING", "DELETED"];
+/// `PENDING | ACTIVE | INACTIVE | ERROR | DELETING | DELETED`), each marked
+/// with whether a CALLER may put a probe into it through
+/// `UpdateProbeInput$state` — the documented activate/deactivate toggle — or
+/// whether the SERVICE assigns it over a probe's lifecycle (it provisions
+/// through `PENDING`, records its own failure as `ERROR`, tears a probe down
+/// through `DELETING` / `DELETED`).
+const PROBE_STATES: &[(&str, bool)] = &[
+    ("PENDING", false),
+    ("ACTIVE", true),
+    ("INACTIVE", true),
+    ("ERROR", false),
+    ("DELETING", false),
+    ("DELETED", false),
+];
+
+/// The sentence AWS emits for the cross-member rule the model states on both
+/// the create and the update path (`ProbeInput$destinationPort` "is required
+/// only if the `protocol` is `TCP`"; `UpdateProbeInput$protocol` "If the
+/// protocol is `TCP`, then `port` is also required").
+const TCP_PORT_REQUIRED_MESSAGE: &str = "Destination port must be provided for TCP protocol.";
 
 /// The members a probe record reports that an update can change, plus the two
 /// derived ones every read must keep consistent with them.
@@ -307,15 +326,22 @@ async fn an_update_replaces_only_the_members_it_names() {
     }
 }
 
-/// `state` is the state the caller asked for, over the whole modelled
-/// `ProbeState` catalog — and a probe put back into the transient `PENDING` is
-/// owed the `ACTIVE` transition afresh, so the caller observes `PENDING` first
-/// and `ACTIVE` once the due instant has passed.
+/// `state` is the documented activate/deactivate toggle, so an update stores
+/// only a state a CALLER may ask for: a request naming one of the lifecycle
+/// values the SERVICE assigns itself is refused with the modelled
+/// `ValidationException` (400) naming the rejected status, leaves the stored
+/// probe exactly as it was, and does not stop a settable update on that same
+/// probe from being accepted afterwards.
+///
+/// The table is the WHOLE modelled `ProbeState` catalog (`PROBE_STATES`), one
+/// row per value, so it spans both halves of the rule rather than the one
+/// recorded value: the two settable states are accepted and persist, the four
+/// service-assigned ones are each refused.
 #[tokio::test]
-async fn an_update_stores_every_state_the_model_admits() {
+async fn only_the_states_a_caller_can_set_are_accepted() {
     let router = router();
-    for (index, requested) in PROBE_STATES.iter().enumerate() {
-        let case = format!("state {requested}");
+    for (index, (requested, settable)) in PROBE_STATES.iter().enumerate() {
+        let case = format!("state {requested} (settable by a caller: {settable})");
         let (monitor, probe_id, _) = probe_fixture(
             &router,
             &format!("state-case-{index}"),
@@ -330,38 +356,219 @@ async fn an_update_stores_every_state_the_model_admits() {
             "ACTIVE",
             "case {case:?}: setup expected a settled ACTIVE probe, got {settled:?}"
         );
+        let settled_modified_at = timestamp(&settled, "modifiedAt");
 
-        let (status, updated) =
+        let (status, answered) =
             update_probe(&router, &monitor, &probe_id, &format!(r#"{{"state":"{requested}"}}"#))
                 .await;
+
+        if *settable {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a settable state expects HTTP 200, got {status} {answered:?}"
+            );
+            assert_eq!(
+                string_at(&answered, "state"),
+                *requested,
+                "case {case:?}: expected state {requested}, got {answered:?}"
+            );
+            let (_, got) = get_probe(&router, &monitor, &probe_id).await;
+            assert_eq!(
+                string_at(&got, "state"),
+                *requested,
+                "case {case:?}: GetProbe must report the stored state {requested}, got {got:?}"
+            );
+            // A state the caller set owes the clock nothing, so it is still
+            // there past the activation span.
+            std::thread::sleep(PAST_ACTIVATION);
+            let (_, later) = get_probe(&router, &monitor, &probe_id).await;
+            assert_eq!(
+                string_at(&later, "state"),
+                *requested,
+                "case {case:?}: past the activation span expected {requested}, got {later:?}"
+            );
+            continue;
+        }
+
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected HTTP 200, got {status} {updated:?}"
+            status, 400,
+            "case {case:?}: a service-assigned state expects HTTP 400, got {status} {answered:?}"
         );
         assert_eq!(
-            string_at(&updated, "state"),
-            *requested,
-            "case {case:?}: expected state {requested}, got {updated:?}"
+            error_code(&answered),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {answered:?}"
         );
-        let (_, got) = get_probe(&router, &monitor, &probe_id).await;
         assert_eq!(
-            string_at(&got, "state"),
-            *requested,
-            "case {case:?}: GetProbe must report the stored state {requested}, got {got:?}"
+            string_at(&answered, "message"),
+            format!("{requested} is not a valid probe status."),
+            "case {case:?}: expected the refusal to name the rejected status, got {answered:?}"
         );
 
-        // `PENDING` is the one transient state in the catalog: the clock owes
-        // such a probe `ACTIVE`. Every other state is terminal until the next
-        // call, so it is still there after the same wait.
-        std::thread::sleep(PAST_ACTIVATION);
-        let (_, later) = get_probe(&router, &monitor, &probe_id).await;
-        let expected_later = if *requested == "PENDING" { "ACTIVE" } else { requested };
+        // The refused update wrote nothing: the probe is as it was.
+        let (status, after) = get_probe(&router, &monitor, &probe_id).await;
         assert_eq!(
-            string_at(&later, "state"),
-            expected_later,
-            "case {case:?}: past the activation span expected {expected_later}, got {later:?}"
+            status, 200,
+            "case {case:?}: the probe must still be there, got {status} {after:?}"
+        );
+        assert_eq!(
+            string_at(&after, "state"),
+            "ACTIVE",
+            "case {case:?}: a refused state update leaves the stored state alone, got {after:?}"
+        );
+        assert!(
+            (timestamp(&after, "modifiedAt") - settled_modified_at).abs() < f64::EPSILON,
+            "case {case:?}: a refused update modified nothing, so modifiedAt must stay at \
+             {settled_modified_at}, got {after:?}"
+        );
+
+        // Positive control: the refusal is about the value, not the probe — a
+        // settable state is still accepted on it and converges.
+        let (status, accepted) =
+            update_probe(&router, &monitor, &probe_id, r#"{"state":"INACTIVE"}"#).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a settable state after the refusal expects HTTP 200, \
+             got {status} {accepted:?}"
+        );
+        let (_, converged) = get_probe(&router, &monitor, &probe_id).await;
+        assert_eq!(
+            string_at(&converged, "state"),
+            "INACTIVE",
+            "case {case:?}: GetProbe must converge to the settable state, got {converged:?}"
         );
     }
+}
+
+/// The TCP-requires-`destinationPort` rule is one rule, so every path that
+/// applies it refuses with the one sentence AWS emits for it
+/// (`TCP_PORT_REQUIRED_MESSAGE`) — and a request that supplies the port is
+/// accepted on each of those paths.
+///
+/// The table spans the class: the rule holds wherever a probe record is
+/// written, so it carries the two create paths (`CreateMonitor`'s inline
+/// `probes` list and `CreateProbe`) beside the `UpdateProbe` path the recorded
+/// case names, and the update row reaches it by naming `protocol` alone over a
+/// stored probe that holds no port.
+#[tokio::test]
+async fn tcp_without_a_destination_port_is_refused_with_one_shared_message() {
+    let router = router();
+    let icmp = r#"{"sourceArn":"SOURCE","destination":"10.0.9.1","protocol":"ICMP","packetSize":56}"#;
+
+    // CreateMonitor, with the probe in the request's inline `probes` list.
+    let probes = |port: &str| {
+        format!(
+            r#"{{"monitorName":"tcp-message-monitor{suffix}","probes":[{{"sourceArn":"{source}",
+                "destination":"10.0.9.2","protocol":"TCP"{port},"packetSize":56}}]}}"#,
+            suffix = if port.is_empty() { "-refused" } else { "-ok" },
+            source = source_arn(),
+            port = port,
+        )
+    };
+    let (status, refused) = create_monitor(&router, &probes("")).await;
+    assert_eq!(
+        status, 400,
+        "case \"CreateMonitor with a TCP probe and no port\": expected HTTP 400, \
+         got {status} {refused:?}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ValidationException",
+        "case \"CreateMonitor with a TCP probe and no port\": expected ValidationException, \
+         got {refused:?}"
+    );
+    assert_eq!(
+        string_at(&refused, "message"),
+        TCP_PORT_REQUIRED_MESSAGE,
+        "case \"CreateMonitor with a TCP probe and no port\": expected the shared sentence, \
+         got {refused:?}"
+    );
+    let (status, created) = create_monitor(&router, &probes(r#","destinationPort":443"#)).await;
+    assert_eq!(
+        status, 200,
+        "case \"CreateMonitor with a TCP probe and a port\": expected HTTP 200, \
+         got {status} {created:?}"
+    );
+
+    // CreateProbe, on a monitor that already exists.
+    let (monitor, probe_id, _) = probe_fixture(&router, "tcp-message-probe", icmp).await;
+    let tcp_probe = |port: &str| {
+        format!(
+            r#"{{"probe":{{"sourceArn":"{source}","destination":"10.0.9.3","protocol":"TCP"{port},
+                "packetSize":56}}}}"#,
+            source = source_arn(),
+            port = port,
+        )
+    };
+    let (status, refused) = create_probe(&router, &monitor, &tcp_probe("")).await;
+    assert_eq!(
+        status, 400,
+        "case \"CreateProbe TCP with no port\": expected HTTP 400, got {status} {refused:?}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ValidationException",
+        "case \"CreateProbe TCP with no port\": expected ValidationException, got {refused:?}"
+    );
+    assert_eq!(
+        string_at(&refused, "message"),
+        TCP_PORT_REQUIRED_MESSAGE,
+        "case \"CreateProbe TCP with no port\": expected the shared sentence, got {refused:?}"
+    );
+    let (status, created) =
+        create_probe(&router, &monitor, &tcp_probe(r#","destinationPort":443"#)).await;
+    assert_eq!(
+        status, 200,
+        "case \"CreateProbe TCP with a port\": expected HTTP 200, got {status} {created:?}"
+    );
+
+    // UpdateProbe, switching the stored ICMP probe (which holds no port) to TCP.
+    let (status, refused) = update_probe(&router, &monitor, &probe_id, r#"{"protocol":"TCP"}"#).await;
+    assert_eq!(
+        status, 400,
+        "case \"UpdateProbe to TCP with no port\": expected HTTP 400, got {status} {refused:?}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ValidationException",
+        "case \"UpdateProbe to TCP with no port\": expected ValidationException, got {refused:?}"
+    );
+    assert_eq!(
+        string_at(&refused, "message"),
+        TCP_PORT_REQUIRED_MESSAGE,
+        "case \"UpdateProbe to TCP with no port\": expected the shared sentence, got {refused:?}"
+    );
+    // The refused update left the probe's ICMP configuration untouched.
+    let (_, after) = get_probe(&router, &monitor, &probe_id).await;
+    assert_eq!(
+        string_at(&after, "protocol"),
+        "ICMP",
+        "case \"UpdateProbe to TCP with no port\": the stored protocol must stay ICMP, \
+         got {after:?}"
+    );
+    assert_eq!(
+        member_of(&after, "destinationPort"),
+        Value::Null,
+        "case \"UpdateProbe to TCP with no port\": the probe must still hold no port, \
+         got {after:?}"
+    );
+    // Positive control: protocol and port together are accepted.
+    let (status, updated) = update_probe(
+        &router,
+        &monitor,
+        &probe_id,
+        r#"{"protocol":"TCP","destinationPort":8080}"#,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"UpdateProbe to TCP with a port\": expected HTTP 200, got {status} {updated:?}"
+    );
+    assert_eq!(
+        member_of(&updated, "destinationPort"),
+        json!(8080),
+        "case \"UpdateProbe to TCP with a port\": expected the port stored, got {updated:?}"
+    );
 }
 
 /// A probe deactivated and reactivated through `UpdateProbe` reports each state

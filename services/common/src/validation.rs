@@ -90,7 +90,10 @@
 //!   and, for a clause stated at a collection member, the collection itself
 //!   ([`submitted_lists`]);
 //! * a `@pattern` printed as the expression a value has to satisfy, without the `^`/`$`
-//!   anchors a model writes to demand a whole-string match ([`unanchored`]) — LANDED here,
+//!   anchors a model writes to demand a whole-string match ([`unanchored`], and
+//!   [`unanchored_grouping_alternation`] for the services whose recordings show the pair
+//!   dropped from a top-level alternation, where the alternation is kept grouped so the
+//!   expression still matches what it matched anchored) — LANDED here,
 //!   while ~26 service crates still carry their own inlined copy
 //!   (`grep -rln 'fn unanchored' services/*/src`), each pinned by that service's own
 //!   recordings and tests; deleting those copies in favour of this one is the migration's
@@ -459,6 +462,70 @@ pub fn unanchored(regex: &str) -> String {
         Some(inner) if !ends_with_escape(inner) => inner.to_string(),
         _ => regex.to_string(),
     }
+}
+
+/// [`unanchored`], with a top-level ALTERNATION left GROUPED so the expression quoted still
+/// matches exactly what the model's anchored text matched.
+///
+/// Dropping the pair from `^a|b$` turns "starts with `a`, or ends with `b`" into "contains
+/// `a`, or contains `b`"; wrapping what is left in one group — `(a|b)` — restores it, since
+/// that expression matches, anywhere in a value, exactly what the anchored one matched at
+/// the ends. A service whose recordings show the quoted expression grouped states it this
+/// way; one whose recordings show it bare (lambdacore's `NetworkConnectorName`, quoted in
+/// [`unanchored`]) states the plain rendering. Which of the two a service uses is part of
+/// its validation-message dialect (the module docs above), so the choice stays with the
+/// service and both rules live here.
+///
+/// The DROP is [`unanchored`]'s, called rather than restated, so the two cannot disagree on
+/// it: this adds exactly the group, and only when the pair was dropped AND what is left
+/// alternates at the top level. An alternation already inside a group (`^(a|b)$`) is not
+/// wrapped again, and neither is an expression that keeps its pair.
+#[must_use]
+pub fn unanchored_grouping_alternation(regex: &str) -> String {
+    let stated = unanchored(regex);
+    if stated == regex || !alternates_at_top_level(&stated) {
+        return stated;
+    }
+    format!("({stated})")
+}
+
+/// Whether `text` alternates at its TOP level — a `|` that is not inside a group and not
+/// inside a character class, where it is the literal character. Escapes are honoured
+/// throughout, so an escaped `|`, `[`, `]`, `(` or `)` is a literal too.
+///
+/// A `]` in the FIRST position of a class is the literal bracket rather than the class's
+/// end (`[]|]` is the two-character class `]|`, not an empty class followed by `|]`), and a
+/// leading `^` does not count as a position, so `[^]|]` is read the same way. Tracking the
+/// position inside the class is what keeps a `|` in such a class from being read as an
+/// alternation.
+fn alternates_at_top_level(text: &str) -> bool {
+    let mut escaped = false;
+    // `Some(n)`: inside a class, with `n` characters seen in it (a leading `^` excluded).
+    let mut in_class: Option<usize> = None;
+    let mut depth = 0_usize;
+    for character in text.chars() {
+        if escaped {
+            escaped = false;
+            // An escaped character still occupies a position in the class it is in.
+            in_class = in_class.map(|seen| seen + 1);
+            continue;
+        }
+        match (character, in_class) {
+            ('\\', _) => escaped = true,
+            // The negation marker, which is not a position of its own.
+            ('^', Some(0)) => {}
+            // A `]` where the class has no members yet is the literal bracket.
+            (']', Some(0)) => in_class = Some(1),
+            (']', Some(_)) => in_class = None,
+            (_, Some(seen)) => in_class = Some(seen + 1),
+            ('[', None) => in_class = Some(0),
+            ('(', None) => depth += 1,
+            (')', None) => depth = depth.saturating_sub(1),
+            ('|', None) if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Whether `text` ends in an escape — an odd number of trailing backslashes, so the
@@ -926,8 +993,9 @@ impl ShapeSerializer for SubmittedValues {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_elision_of, list_of_element, unanchored, Submitted, SubmittedValues,
-        MAX_RECORDED_BYTES, MAX_RECORDED_LEAVES, MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
+        is_elision_of, list_of_element, unanchored, unanchored_grouping_alternation, Submitted,
+        SubmittedValues, MAX_RECORDED_BYTES, MAX_RECORDED_LEAVES, MAX_RESTORED_ECHO,
+        MAX_RESTORED_TOTAL,
     };
     use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 
@@ -1253,6 +1321,118 @@ mod tests {
             assert!(MAX_RECORDED_LEAVES > 0 && MAX_RECORDED_BYTES > 0);
         };
         let () = COHERENT;
+    }
+
+    /// RULE: the two renderings drop the SAME pair ([`super::unanchored`]'s positional
+    /// rule, which the test above pins) and differ in exactly one thing —
+    /// [`super::unanchored_grouping_alternation`] leaves a top-level ALTERNATION grouped,
+    /// so the expression it quotes still matches what the model's anchored text matched,
+    /// while [`super::unanchored`] quotes it bare. Nothing else is grouped: an alternation
+    /// already inside a group is not wrapped again, and an expression whose pair was not
+    /// dropped is stated verbatim by both.
+    ///
+    /// The rows are the model patterns this rule meets in the tree plus the regex
+    /// constructs that can hide an anchor or an alternation — an escape, a character class,
+    /// a group — and the half-anchored forms neither rendering may touch.
+    #[test]
+    fn only_the_grouping_rendering_wraps_a_top_level_alternation() {
+        // (case, the model's pattern, what `unanchored` states, what
+        // `unanchored_grouping_alternation` states)
+        let rows: [(&str, &str, &str, &str); 15] = [
+            ("a plain whole-value pattern", "^[0-9]{12}$", "[0-9]{12}", "[0-9]{12}"),
+            (
+                "an alternation already inside a group",
+                "^(a|b)$",
+                "(a|b)",
+                "(a|b)",
+            ),
+            // The shape of this service family's `SessionIdentifier`: an ARN branch or a
+            // bare uuid branch, sharing one outer pair.
+            (
+                "a top-level alternation of two groups",
+                "^(arn:[^:]+:x)|([a-f0-9]{8})$",
+                "(arn:[^:]+:x)|([a-f0-9]{8})",
+                "((arn:[^:]+:x)|([a-f0-9]{8}))",
+            ),
+            (
+                "a bare top-level alternation",
+                "^a|b$",
+                "a|b",
+                "(a|b)",
+            ),
+            // Branches that carry an anchor of their own while SHARING the outer pair: the
+            // pair is dropped positionally (see the test above), and the group this
+            // rendering adds around what is left changes nothing about what it matches.
+            (
+                "branches anchored individually, sharing the outer pair",
+                "^a$|^b$",
+                "a$|^b",
+                "(a$|^b)",
+            ),
+            // Branches parenthesised, so there is no outer pair to drop and nothing to
+            // group.
+            (
+                "branches anchored individually inside their own groups",
+                "(^a$)|(^b$)",
+                "(^a$)|(^b$)",
+                "(^a$)|(^b$)",
+            ),
+            ("anchored at the start only", "^abc", "^abc", "^abc"),
+            ("anchored at the end only", "abc$", "abc$", "abc$"),
+            ("no anchors at all", "[0-9]+", "[0-9]+", "[0-9]+"),
+            (
+                "a trailing escaped dollar, which is a literal",
+                r"^cost\$$",
+                r"cost\$",
+                r"cost\$",
+            ),
+            (
+                "an expression that IS a literal dollar",
+                r"^\$$",
+                r"\$",
+                r"\$",
+            ),
+            (
+                "a pipe inside a character class, which is a literal",
+                "^[a|b]{2}$",
+                "[a|b]{2}",
+                "[a|b]{2}",
+            ),
+            (
+                "a caret inside a negated class, which is not an anchor",
+                "^[^:]+$",
+                "[^:]+",
+                "[^:]+",
+            ),
+            // A `]` in the first position of a class is the literal bracket, so the `|`
+            // after it is still inside the class and alternates nothing.
+            (
+                "a literal bracket opening a class, with a pipe inside it",
+                "^[]|]a$",
+                "[]|]a",
+                "[]|]a",
+            ),
+            (
+                "an escaped bracket inside a class, with a pipe inside it",
+                r"^[\]|]a$",
+                r"[\]|]a",
+                r"[\]|]a",
+            ),
+        ];
+
+        for (case, pattern, plain, grouped) in rows {
+            let actual = unanchored(pattern);
+            assert_eq!(
+                actual, plain,
+                "case {case:?}: expected unanchored {plain:?}, got {actual:?}"
+            );
+            let actual = unanchored_grouping_alternation(pattern);
+            assert_eq!(
+                actual, grouped,
+                "case {case:?}: expected unanchored_grouping_alternation {grouped:?}, \
+                 got {actual:?}"
+            );
+        }
     }
 }
 
