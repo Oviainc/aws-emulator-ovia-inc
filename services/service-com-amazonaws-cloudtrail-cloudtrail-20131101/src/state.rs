@@ -248,6 +248,19 @@ pub fn sns_topic_arn(region: &str, topic: &str) -> String {
     }
 }
 
+/// The refusal text for a well-formed identifier that names no trail, shared by
+/// every operation that answers `TrailNotFoundException`.
+///
+/// It names the identifier EXACTLY as the caller wrote it — a bare name or a trail
+/// ARN — and the account the lookup ran in, because a trail name is scoped to one
+/// account and Region, so "no trail of this name here" is the whole refusal.
+pub fn unknown_trail_message(identifier: &str) -> String {
+    format!(
+        "Unknown trail: {identifier} for the user: {}",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// Check a bare trail name against the rules the model documents for
 /// `CreateTrailRequest$Name`:
 ///
@@ -256,37 +269,52 @@ pub fn sns_topic_arn(region: &str, topic: &str) -> String {
 /// * between [`TRAIL_NAME_MIN_LEN`] and [`TRAIL_NAME_MAX_LEN`] characters,
 /// * no two adjacent periods, underscores or dashes,
 /// * not in IP-address format.
+///
+/// A refusal names the ONE rule the name broke — and, where that rule is a length
+/// bound, the bound and the name's own length — rather than restating every rule, so
+/// the caller can fix the name from the refusal alone. The rules are checked in the
+/// order they are listed above, so a name that breaks several is refused for the
+/// first.
 pub fn validate_trail_name(name: &str) -> Result<(), IdentifierRejection> {
-    let reject = || {
-        Err(IdentifierRejection::InvalidName(format!(
-            "Trail name '{name}' is not valid: a trail name must contain only ASCII \
-             letters, numbers, periods (.), underscores (_) or dashes (-), start and end \
-             with a letter or number, be between {TRAIL_NAME_MIN_LEN} and \
-             {TRAIL_NAME_MAX_LEN} characters, have no adjacent periods, underscores or \
-             dashes, and not be in IP address format"
-        )))
-    };
+    let reject = |message: String| Err(IdentifierRejection::InvalidName(message));
 
     let length = name.chars().count();
-    if !(TRAIL_NAME_MIN_LEN..=TRAIL_NAME_MAX_LEN).contains(&length) {
-        return reject();
+    if length < TRAIL_NAME_MIN_LEN {
+        return reject(format!(
+            "Trail name too short. Minimum allowed length: {TRAIL_NAME_MIN_LEN} characters. \
+             Specified name length: {length} characters."
+        ));
+    }
+    if length > TRAIL_NAME_MAX_LEN {
+        return reject(format!(
+            "Trail name too long. Maximum allowed length: {TRAIL_NAME_MAX_LEN} characters. \
+             Specified name length: {length} characters."
+        ));
     }
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || TRAIL_NAME_PUNCTUATION.contains(&c))
     {
-        return reject();
+        return reject(
+            "Trail name or ARN can only contain ASCII letters (a-z, A-Z), numbers (0-9), \
+             periods (.), underscores (_), or dashes (-)."
+                .to_string(),
+        );
     }
-    let edges_are_alphanumeric = name
+    // The two edges are separate rules, so a refusal names the edge that broke.
+    if name
         .chars()
         .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric())
-        && name
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_ascii_alphanumeric());
-    if !edges_are_alphanumeric {
-        return reject();
+        .is_some_and(|c| !c.is_ascii_alphanumeric())
+    {
+        return reject("Trail name must start with a letter or number.".to_string());
+    }
+    if name
+        .chars()
+        .next_back()
+        .is_some_and(|c| !c.is_ascii_alphanumeric())
+    {
+        return reject("Trail name must end with a letter or number.".to_string());
     }
     let punctuation = |c: &char| TRAIL_NAME_PUNCTUATION.contains(c);
     if name
@@ -294,13 +322,17 @@ pub fn validate_trail_name(name: &str) -> Result<(), IdentifierRejection> {
         .zip(name.chars().skip(1))
         .any(|(a, b)| punctuation(&a) && punctuation(&b))
     {
-        return reject();
+        return reject(
+            "Trail name or ARN cannot have adjacent periods (.), hyphens (-), or \
+             underscores (_)."
+                .to_string(),
+        );
     }
     // "Not be in IP address format (for example, 192.168.5.4)" — a dotted quad is
     // exactly what `Ipv4Addr`'s parser accepts, and a name cannot hold the colons an
     // IPv6 literal needs.
     if name.parse::<Ipv4Addr>().is_ok() {
-        return reject();
+        return reject("Trail names must not be formatted as an IP address.".to_string());
     }
     Ok(())
 }

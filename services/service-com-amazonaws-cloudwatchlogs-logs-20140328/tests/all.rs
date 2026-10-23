@@ -35,3 +35,5 @@ mod retention_policy;
 mod state_roundtrip;
 #[path = "all/subscription_filters.rs"]
 mod subscription_filters;
+#[path = "all/validation_message_rendering.rs"]
+mod validation_message_rendering;
