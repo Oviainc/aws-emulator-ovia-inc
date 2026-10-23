@@ -15,6 +15,8 @@
 mod ad_assessment;
 #[path = "all/directory_lifecycle.rs"]
 mod directory_lifecycle;
+#[path = "all/directory_limits.rs"]
+mod directory_limits;
 #[path = "all/directory_networking_and_settings.rs"]
 mod directory_networking_and_settings;
 #[path = "all/event_topics.rs"]
