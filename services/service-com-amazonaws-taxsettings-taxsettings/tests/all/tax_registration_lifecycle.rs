@@ -216,10 +216,15 @@ fn round_trip_cases() -> Vec<Case> {
                 "legalName": "Example Services Sdn Bhd",
                 "sector": "Business",
                 "legalAddress": { "postalCode": "50450", "countryCode": "MY" },
+                // Malaysia's documented rule for a business reseller with
+                // service codes: businessRegistrationNumber,
+                // taxInformationNumber and distinct serviceTaxCodes
+                // (`crate::state::COUNTRY_RULES`).
                 "additionalTaxInformation": {
                     "malaysiaAdditionalInfo": {
                         "serviceTaxCodes": ["IT Services"],
                         "businessRegistrationNumber": "202001001234",
+                        "taxInformationNumber": "C1234567890",
                     },
                 },
                 "verificationDetails": {
@@ -718,6 +723,9 @@ async fn reads_are_repeatable_and_a_rewrite_replaces_the_record() {
         "legalName": "Acme SARL",
         "sector": "Business",
         "legalAddress": { "postalCode": "75001", "countryCode": "FR" },
+        // France's documented rule: the sirenNumber must be specified
+        // (`crate::state::COUNTRY_RULES`).
+        "additionalTaxInformation": { "franceAdditionalInfo": { "sirenNumber": "123456789" } },
     });
 
     let put = call(

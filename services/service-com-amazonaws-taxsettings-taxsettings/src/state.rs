@@ -15,9 +15,9 @@ use ::aws_smithy_types::base64;
 
 use crate::ops::types::{
     AdditionalInfoRequest, AdditionalInfoResponse, Address, ConflictException,
-    InternalServerException, Jurisdiction, ResourceNotFoundException, TaxDocumentMetadata,
-    TaxRegistration, TaxRegistrationEntry, TaxRegistrationWithJurisdiction, ValidationException,
-    ValidationExceptionField,
+    IndonesiaAdditionalInfo, InternalServerException, Jurisdiction, ResourceNotFoundException,
+    TaxDocumentMetadata, TaxRegistration, TaxRegistrationEntry, TaxRegistrationWithJurisdiction,
+    ValidationException, ValidationExceptionField,
 };
 
 /// The `TaxRegistrationStatus` values, from the model's enum
@@ -103,8 +103,9 @@ pub const MANAGEMENT_ACCOUNT_ONLY: &str =
 /// `NonIndiaCustomerCanNotSetPAN`, so the type is India-only.
 ///
 /// Country rules that make a member REQUIRED (Saudi Arabia's `addressLine3`,
-/// Turkey's `districtOrCounty`, Kenya's `personType`, …) are a different class
-/// and are not enforced here; see this module's siblings in `src/ops/`.
+/// Turkey's `districtOrCounty`, Kenya's `personType`, …) are a different class:
+/// they are the per-country business rules [`COUNTRY_RULES`] carries and
+/// [`check_country_requirements`] applies.
 pub const TYPES_WITH_DERIVED_LEGAL_ADDRESS: &[(&str, &str)] = &[("PAN", "India")];
 
 /// `ValidationException.errorCode` values, from the model's
@@ -539,6 +540,601 @@ pub fn check_address(member_path: &str, address: &Address) -> Result<(), Validat
         if let Some(value) = value {
             check_not_blank(&format!("{member_path}.{name}"), value)?;
         }
+    }
+    Ok(())
+}
+
+/// What AWS answers when the `additionalTaxInformation` object a request carries
+/// does not satisfy the country's rule.
+///
+/// Observed for the Kenya rule (an entry whose `kenyaAdditionalInfo` carries no
+/// `personType`) and used for every rule about that object: one message per
+/// class of refusal, with the offending parameter in `fieldList`, rather than a
+/// per-member sentence no recording pins.
+pub const ADDITIONAL_INFO_INVALID: &str = "Your request has an AdditionalInfo object that isn't \
+                                           valid or is missing information. Check your request \
+                                           and try again.";
+
+/// The `Sector` values the model documents as valid for a country whose rule
+/// reads "The sector valid values are `Business` and `Individual`" (Malaysia,
+/// Nepal, Ukraine) — a subset of the `Sector` enum (`Business | Individual |
+/// Government`).
+pub const SECTORS_BUSINESS_OR_INDIVIDUAL: &[&str] = &["Business", "Individual"];
+
+/// The `PersonType` values the model documents as valid for Georgia ("The valid
+/// `personType` values are `Physical Person` and `Business`") — a subset of the
+/// `PersonType` enum (`Legal Person | Physical Person | Business`).
+pub const GEORGIA_PERSON_TYPES: &[&str] = &["Physical Person", "Business"];
+
+/// The `TaxRegistrationType` values the model documents as valid for Malaysia
+/// ("`RegistrationType` valid values are `NRIC` for individual, and TIN and
+/// sales and service tax (SST) for Business").
+pub const MALAYSIA_REGISTRATION_TYPES: &[&str] = &["NRIC", "TIN", "SST"];
+
+/// The Malaysian registration types the model documents as the business ones,
+/// for which "you must specify a `businessRegistrationNumber` in
+/// `MalaysiaAdditionalInfo`".
+pub const MALAYSIA_BUSINESS_REGISTRATION_TYPES: &[&str] = &["TIN", "SST"];
+
+/// The Malaysian registration type of a business reseller, for which "you must
+/// specify a `businessRegistrationNumber` and `taxInformationNumber` in
+/// `MalaysiaAdditionalInfo`".
+pub const MALAYSIA_RESELLER_REGISTRATION_TYPE: &str = "SST";
+
+/// The `IndonesiaTaxRegistrationNumberType` values whose
+/// `ppnExceptionDesignationCode` set is the wider one: "If the
+/// `taxRegistrationNumberType` is set to NPWP or NITKU, valid values for
+/// `ppnExceptionDesignationCode` are either 01, 02, 03, 07, or 08."
+pub const INDONESIA_WIDE_PPN_TYPES: &[&str] = &["NPWP", "NITKU"];
+
+/// See [`INDONESIA_WIDE_PPN_TYPES`].
+pub const INDONESIA_PPN_CODES_WIDE: &[&str] = &["01", "02", "03", "07", "08"];
+
+/// "For other `taxRegistrationNumberType` values, `ppnExceptionDesignationCode`
+/// must be either 01, 07, or 08."
+pub const INDONESIA_PPN_CODES_NARROW: &[&str] = &["01", "07", "08"];
+
+/// "If `ppnExceptionDesignationCode` is 07 or 08, you must specify the
+/// `decisionNumber`."
+pub const INDONESIA_PPN_CODES_NEEDING_DECISION_NUMBER: &[&str] = &["07", "08"];
+
+/// The Kenyan `personType` for which "you must specify the tax registration
+/// certificate document in the `taxRegistrationDocuments` field".
+pub const KENYA_PERSON_TYPE_NEEDING_DOCUMENT: &str = "Physical Person";
+
+/// The Spanish `registrationType` for which "you must specify the tax
+/// registration certificate document in the `taxRegistrationDocuments` field".
+pub const SPAIN_REGISTRATION_TYPE_NEEDING_DOCUMENT: &str = "Local";
+
+/// The Turkish `sector` for which the model documents "If your `sector` is
+/// `Individual`, don't enter this value" of `taxOffice` and `kepEmailId`, and
+/// for which `taxOffice` is therefore not required either.
+pub const TURKEY_SECTOR_WITHOUT_TAX_OFFICE: &str = "Individual";
+
+/// One per-country business rule `PutTaxRegistration` documents for
+/// `taxRegistrationEntry`.
+///
+/// The operation's model documentation states, country by country, which members
+/// of the entry a request for that country must specify and which values those
+/// members may take ("Kenya: You must specify the `personType` in the
+/// `kenyaAdditionalInfo` field of the `additionalTaxInformation` object"). Each
+/// row below is one of those sentences, so the rule set is read off the model
+/// rather than written per request shape, and one evaluator
+/// ([`check_country_requirements`]) applies all of them.
+#[derive(Debug, Clone, Copy)]
+pub struct CountryRule {
+    /// The `Address$countryCode` whose rule this is. Compared case-insensitively,
+    /// because the member's pattern (`^[a-zA-Z]+$`) admits either case.
+    pub country_code: &'static str,
+    /// The member the rule is about, as the wire spells it. Its last segment is
+    /// the parameter the refusal names — see [`parameter_name`].
+    pub member_path: &'static str,
+    /// The `ValidationExceptionErrorCode` the refusal carries:
+    /// [`ERROR_CODE_MISSING_INPUT`] for a member the country requires and the
+    /// entry omits, [`ERROR_CODE_FIELD_VALIDATION_FAILED`] for one the entry
+    /// carries with a value (or at all) the country does not admit.
+    pub error_code: &'static str,
+    /// The refusal's message.
+    pub message: &'static str,
+    /// Whether this rule has anything to say about `entry` — some rules are
+    /// documented as conditional on another member of the same entry.
+    pub applies: fn(&TaxRegistrationEntry) -> bool,
+    /// Whether `entry` satisfies the rule.
+    pub satisfied: fn(&TaxRegistrationEntry) -> bool,
+}
+
+/// A rule that applies to every entry for its country.
+fn always(_entry: &TaxRegistrationEntry) -> bool {
+    true
+}
+
+/// The `additionalTaxInformation` object of `entry`, if it carries one.
+fn additional_info(entry: &TaxRegistrationEntry) -> Option<&AdditionalInfoRequest> {
+    entry.additional_tax_information.as_ref()
+}
+
+/// Whether `entry` carries at least one tax registration certificate document in
+/// `verificationDetails.taxRegistrationDocuments`.
+fn has_registration_document(entry: &TaxRegistrationEntry) -> bool {
+    entry
+        .verification_details
+        .as_ref()
+        .and_then(|details| details.tax_registration_documents.as_ref())
+        .is_some_and(|documents| !documents.is_empty())
+}
+
+/// `taxRegistrationEntry.sector`, if the entry carries one.
+fn sector(entry: &TaxRegistrationEntry) -> Option<&str> {
+    entry.sector.as_deref()
+}
+
+/// Whether the entry's `sector` is one of `SECTORS_BUSINESS_OR_INDIVIDUAL`, for
+/// a country that admits only those two. An entry carrying no sector is left to
+/// the rule that requires one, where the country has one.
+fn sector_is_business_or_individual(entry: &TaxRegistrationEntry) -> bool {
+    sector(entry).is_none_or(|value| SECTORS_BUSINESS_OR_INDIVIDUAL.contains(&value))
+}
+
+/// `additionalTaxInformation.kenyaAdditionalInfo.personType`, if the entry
+/// carries the Kenyan block. `personType` is `@required` on
+/// `KenyaAdditionalInfo`, so the boundary validator has already refused a block
+/// without one: carrying the block is carrying the member.
+fn kenya_person_type(entry: &TaxRegistrationEntry) -> Option<&str> {
+    additional_info(entry)
+        .and_then(|info| info.kenya_additional_info.as_ref())
+        .map(|kenya| kenya.person_type.as_str())
+}
+
+/// `additionalTaxInformation.spainAdditionalInfo.registrationType`, if the entry
+/// carries the Spanish block (`registrationType` is `@required` on it).
+fn spain_registration_type(entry: &TaxRegistrationEntry) -> Option<&str> {
+    additional_info(entry)
+        .and_then(|info| info.spain_additional_info.as_ref())
+        .map(|spain| spain.registration_type.as_str())
+}
+
+/// The entry's `indonesiaAdditionalInfo` block, if it carries one.
+fn indonesia_info(entry: &TaxRegistrationEntry) -> Option<&IndonesiaAdditionalInfo> {
+    additional_info(entry).and_then(|info| info.indonesia_additional_info.as_ref())
+}
+
+/// `indonesiaAdditionalInfo.ppnExceptionDesignationCode`, if the entry carries
+/// one.
+fn indonesia_ppn_code(entry: &TaxRegistrationEntry) -> Option<&str> {
+    indonesia_info(entry).and_then(|indonesia| indonesia.ppn_exception_designation_code.as_deref())
+}
+
+/// Whether the `ppnExceptionDesignationCode` the entry carries is one the
+/// documented set for its `taxRegistrationNumberType` admits.
+fn indonesia_ppn_code_is_admitted(entry: &TaxRegistrationEntry) -> bool {
+    let Some(indonesia) = indonesia_info(entry) else {
+        return true;
+    };
+    let Some(code) = indonesia.ppn_exception_designation_code.as_deref() else {
+        return true;
+    };
+    let admitted = match indonesia.tax_registration_number_type.as_deref() {
+        Some(number_type) if INDONESIA_WIDE_PPN_TYPES.contains(&number_type) => {
+            INDONESIA_PPN_CODES_WIDE
+        }
+        _ => INDONESIA_PPN_CODES_NARROW,
+    };
+    admitted.contains(&code)
+}
+
+/// The entry's `turkeyAdditionalInfo` member `select`ed, or `None` when the entry
+/// carries no Turkish block.
+fn turkey_member(
+    entry: &TaxRegistrationEntry,
+    select: fn(&crate::ops::types::TurkeyAdditionalInfo) -> Option<&String>,
+) -> Option<String> {
+    additional_info(entry)
+        .and_then(|info| info.turkey_additional_info.as_ref())
+        .and_then(|turkey| select(turkey).cloned())
+}
+
+/// Whether the entry's `sector` is the Turkish one that does not take a
+/// `taxOffice` or a `kepEmailId`.
+fn turkey_sector_is_individual(entry: &TaxRegistrationEntry) -> bool {
+    sector(entry).is_some_and(|value| value == TURKEY_SECTOR_WITHOUT_TAX_OFFICE)
+}
+
+/// Every per-country business rule `PutTaxRegistration`'s model documentation
+/// states for `taxRegistrationEntry`, in the order that documentation lists the
+/// countries
+/// (`smithy_query(query="doc",shape="com.amazonaws.taxsettings#PutTaxRegistration")`).
+///
+/// Three documented rules are deliberately NOT rows here, because the fact they
+/// turn on is not in the request and this service models no API that supplies
+/// one: Brazil's and Mexico's "complete the registration process in the console
+/// first" / "address and legal name are populated from your tax registration
+/// number" carve-outs (see `ops/put_tax_registration.rs`, which refuses an entry
+/// omitting either member for every country), and Turkey's "if your `sector` is
+/// `Business` and you're subject to KDV tax, you must specify your industry",
+/// whose KDV liability no member of the entry states.
+pub const COUNTRY_RULES: &[CountryRule] = &[
+    // Bangladesh: "You must specify the tax registration certificate document in
+    // the taxRegistrationDocuments field of the VerificationDetails object."
+    CountryRule {
+        country_code: "BD",
+        member_path: "taxRegistrationEntry.verificationDetails.taxRegistrationDocuments",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: "A tax registration in Bangladesh must specify the tax registration certificate \
+                  document in verificationDetails.taxRegistrationDocuments.",
+        applies: always,
+        satisfied: has_registration_document,
+    },
+    // Georgia: "The valid personType values are Physical Person and Business."
+    CountryRule {
+        country_code: "GE",
+        member_path: "additionalTaxInformation.georgiaAdditionalInfo.personType",
+        error_code: ERROR_CODE_FIELD_VALIDATION_FAILED,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: |entry: &TaxRegistrationEntry| {
+            additional_info(entry).is_some_and(|info| info.georgia_additional_info.is_some())
+        },
+        satisfied: |entry: &TaxRegistrationEntry| {
+            additional_info(entry)
+                .and_then(|info| info.georgia_additional_info.as_ref())
+                .is_none_or(|georgia| {
+                    GEORGIA_PERSON_TYPES.contains(&georgia.person_type.as_str())
+                })
+        },
+    },
+    // Indonesia: "You must specify the taxRegistrationNumberType in the
+    // indonesiaAdditionalInfo field of the additionalTaxInformation object."
+    CountryRule {
+        country_code: "ID",
+        member_path: "additionalTaxInformation.indonesiaAdditionalInfo.taxRegistrationNumberType",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: always,
+        satisfied: |entry: &TaxRegistrationEntry| {
+            indonesia_info(entry)
+                .is_some_and(|indonesia| indonesia.tax_registration_number_type.is_some())
+        },
+    },
+    // Indonesia: "If you specify decisionNumber, you must specify the
+    // ppnExceptionDesignationCode in the indonesiaAdditionalInfo field of the
+    // additionalTaxInformation object."
+    CountryRule {
+        country_code: "ID",
+        member_path: "additionalTaxInformation.indonesiaAdditionalInfo.ppnExceptionDesignationCode",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: |entry: &TaxRegistrationEntry| {
+            indonesia_info(entry).is_some_and(|indonesia| indonesia.decision_number.is_some())
+        },
+        satisfied: |entry: &TaxRegistrationEntry| indonesia_ppn_code(entry).is_some(),
+    },
+    // Indonesia: the ppnExceptionDesignationCode value set, which depends on the
+    // taxRegistrationNumberType — see `indonesia_ppn_code_is_admitted`.
+    CountryRule {
+        country_code: "ID",
+        member_path: "additionalTaxInformation.indonesiaAdditionalInfo.ppnExceptionDesignationCode",
+        error_code: ERROR_CODE_FIELD_VALIDATION_FAILED,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: |entry: &TaxRegistrationEntry| indonesia_ppn_code(entry).is_some(),
+        satisfied: indonesia_ppn_code_is_admitted,
+    },
+    // Indonesia: "If ppnExceptionDesignationCode is 07 or 08, you must specify
+    // the decisionNumber in the indonesiaAdditionalInfo field of the
+    // additionalTaxInformation object."
+    CountryRule {
+        country_code: "ID",
+        member_path: "additionalTaxInformation.indonesiaAdditionalInfo.decisionNumber",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: |entry: &TaxRegistrationEntry| {
+            indonesia_ppn_code(entry)
+                .is_some_and(|code| INDONESIA_PPN_CODES_NEEDING_DECISION_NUMBER.contains(&code))
+        },
+        satisfied: |entry: &TaxRegistrationEntry| {
+            indonesia_info(entry).is_some_and(|indonesia| indonesia.decision_number.is_some())
+        },
+    },
+    // Kenya: "You must specify the personType in the kenyaAdditionalInfo field of
+    // the additionalTaxInformation object."
+    CountryRule {
+        country_code: "KE",
+        member_path: "additionalTaxInformation.kenyaAdditionalInfo.personType",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: always,
+        satisfied: |entry: &TaxRegistrationEntry| kenya_person_type(entry).is_some(),
+    },
+    // Kenya: "If the personType is Physical Person, you must specify the tax
+    // registration certificate document in the taxRegistrationDocuments field of
+    // the VerificationDetails object."
+    CountryRule {
+        country_code: "KE",
+        member_path: "taxRegistrationEntry.verificationDetails.taxRegistrationDocuments",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: "A tax registration in Kenya for a Physical Person must specify the tax \
+                  registration certificate document in \
+                  verificationDetails.taxRegistrationDocuments.",
+        applies: |entry: &TaxRegistrationEntry| {
+            kenya_person_type(entry).is_some_and(|person| person == KENYA_PERSON_TYPE_NEEDING_DOCUMENT)
+        },
+        satisfied: has_registration_document,
+    },
+    // Malaysia: "The sector valid values are Business and Individual."
+    CountryRule {
+        country_code: "MY",
+        member_path: "taxRegistrationEntry.sector",
+        error_code: ERROR_CODE_FIELD_VALIDATION_FAILED,
+        message: "The valid sector values for a tax registration in Malaysia are Business and \
+                  Individual.",
+        applies: always,
+        satisfied: sector_is_business_or_individual,
+    },
+    // Malaysia: "RegistrationType valid values are NRIC for individual, and TIN
+    // and sales and service tax (SST) for Business."
+    CountryRule {
+        country_code: "MY",
+        member_path: "taxRegistrationEntry.registrationType",
+        error_code: ERROR_CODE_FIELD_VALIDATION_FAILED,
+        message: "The valid registrationType values for a tax registration in Malaysia are NRIC, \
+                  TIN and SST.",
+        applies: always,
+        satisfied: |entry: &TaxRegistrationEntry| {
+            MALAYSIA_REGISTRATION_TYPES.contains(&entry.registration_type.as_str())
+        },
+    },
+    // Malaysia: "For business, you must specify a businessRegistrationNumber in
+    // MalaysiaAdditionalInfo with a TIN type and tax identification number."
+    CountryRule {
+        country_code: "MY",
+        member_path: "additionalTaxInformation.malaysiaAdditionalInfo.businessRegistrationNumber",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: |entry: &TaxRegistrationEntry| {
+            MALAYSIA_BUSINESS_REGISTRATION_TYPES.contains(&entry.registration_type.as_str())
+        },
+        satisfied: |entry: &TaxRegistrationEntry| {
+            additional_info(entry)
+                .and_then(|info| info.malaysia_additional_info.as_ref())
+                .is_some_and(|malaysia| malaysia.business_registration_number.is_some())
+        },
+    },
+    // Malaysia: "For business resellers, you must specify a
+    // businessRegistrationNumber and taxInformationNumber in
+    // MalaysiaAdditionalInfo with a sales and service tax (SST) type and a valid
+    // SST number."
+    CountryRule {
+        country_code: "MY",
+        member_path: "additionalTaxInformation.malaysiaAdditionalInfo.taxInformationNumber",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: |entry: &TaxRegistrationEntry| {
+            entry.registration_type == MALAYSIA_RESELLER_REGISTRATION_TYPE
+        },
+        satisfied: |entry: &TaxRegistrationEntry| {
+            additional_info(entry)
+                .and_then(|info| info.malaysia_additional_info.as_ref())
+                .is_some_and(|malaysia| malaysia.tax_information_number.is_some())
+        },
+    },
+    // Mexico: "You must provide a Constancia de Situación fiscal (CSF) document
+    // in the verificationDetails field."
+    CountryRule {
+        country_code: "MX",
+        member_path: "taxRegistrationEntry.verificationDetails.taxRegistrationDocuments",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: "A tax registration in Mexico must provide a Constancia de Situacion Fiscal \
+                  (CSF) document in verificationDetails.taxRegistrationDocuments.",
+        applies: always,
+        satisfied: has_registration_document,
+    },
+    // Nepal: "The sector valid values are Business and Individual."
+    CountryRule {
+        country_code: "NP",
+        member_path: "taxRegistrationEntry.sector",
+        error_code: ERROR_CODE_FIELD_VALIDATION_FAILED,
+        message: "The valid sector values for a tax registration in Nepal are Business and \
+                  Individual.",
+        applies: always,
+        satisfied: sector_is_business_or_individual,
+    },
+    // Saudi Arabia: "For address, you must specify addressLine3."
+    CountryRule {
+        country_code: "SA",
+        member_path: "taxRegistrationEntry.legalAddress.addressLine3",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: "A tax registration in Saudi Arabia must specify legalAddress.addressLine3.",
+        applies: always,
+        satisfied: |entry: &TaxRegistrationEntry| {
+            entry
+                .legal_address
+                .as_ref()
+                .is_some_and(|address| address.address_line3.is_some())
+        },
+    },
+    // South Korea: "You must specify the certifiedEmailId and legalName in the
+    // TaxRegistrationEntry object." (`legalName` is required for every country
+    // here — see `ops/put_tax_registration.rs`.)
+    CountryRule {
+        country_code: "KR",
+        member_path: "taxRegistrationEntry.certifiedEmailId",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: "A tax registration in South Korea must specify certifiedEmailId.",
+        applies: always,
+        satisfied: |entry: &TaxRegistrationEntry| entry.certified_email_id.is_some(),
+    },
+    // South Korea: "You must specify the businessRepresentativeName,
+    // itemOfBusiness, and lineOfBusiness in the southKoreaAdditionalInfo field of
+    // the additionalTaxInformation object." All three are `@required` on
+    // `SouthKoreaAdditionalInfo`, so the boundary validator refuses a block
+    // missing any one: what is left to check is that the block is there.
+    CountryRule {
+        country_code: "KR",
+        member_path: "additionalTaxInformation.southKoreaAdditionalInfo",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: always,
+        satisfied: |entry: &TaxRegistrationEntry| {
+            additional_info(entry).is_some_and(|info| info.south_korea_additional_info.is_some())
+        },
+    },
+    // South Korea: "You must specify the tax registration certificate document in
+    // the taxRegistrationDocuments field of the VerificationDetails object."
+    CountryRule {
+        country_code: "KR",
+        member_path: "taxRegistrationEntry.verificationDetails.taxRegistrationDocuments",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: "A tax registration in South Korea must specify the tax registration certificate \
+                  document in verificationDetails.taxRegistrationDocuments.",
+        applies: always,
+        satisfied: has_registration_document,
+    },
+    // Spain: "You must specify the registrationType in the spainAdditionalInfo
+    // field of the additionalTaxInformation object."
+    CountryRule {
+        country_code: "ES",
+        member_path: "additionalTaxInformation.spainAdditionalInfo.registrationType",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: always,
+        satisfied: |entry: &TaxRegistrationEntry| spain_registration_type(entry).is_some(),
+    },
+    // Spain: "If the registrationType is Local, you must specify the tax
+    // registration certificate document in the taxRegistrationDocuments field of
+    // the VerificationDetails object."
+    CountryRule {
+        country_code: "ES",
+        member_path: "taxRegistrationEntry.verificationDetails.taxRegistrationDocuments",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: "A Local tax registration in Spain must specify the tax registration certificate \
+                  document in verificationDetails.taxRegistrationDocuments.",
+        applies: |entry: &TaxRegistrationEntry| {
+            spain_registration_type(entry)
+                .is_some_and(|value| value == SPAIN_REGISTRATION_TYPE_NEEDING_DOCUMENT)
+        },
+        satisfied: has_registration_document,
+    },
+    // Turkey: "You must specify the sector in the taxRegistrationEntry object."
+    CountryRule {
+        country_code: "TR",
+        member_path: "taxRegistrationEntry.sector",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: "A tax registration in Turkey must specify sector.",
+        applies: always,
+        satisfied: |entry: &TaxRegistrationEntry| sector(entry).is_some(),
+    },
+    // Turkey: "For address, you must specify districtOrCounty."
+    CountryRule {
+        country_code: "TR",
+        member_path: "taxRegistrationEntry.legalAddress.districtOrCounty",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: "A tax registration in Turkey must specify legalAddress.districtOrCounty.",
+        applies: always,
+        satisfied: |entry: &TaxRegistrationEntry| {
+            entry
+                .legal_address
+                .as_ref()
+                .is_some_and(|address| address.district_or_county.is_some())
+        },
+    },
+    // Turkey: "Specify the taxOffice. If your sector is Individual, don't enter
+    // this value." — required for the other sectors, refused for Individual.
+    CountryRule {
+        country_code: "TR",
+        member_path: "additionalTaxInformation.turkeyAdditionalInfo.taxOffice",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: |entry: &TaxRegistrationEntry| {
+            sector(entry).is_some() && !turkey_sector_is_individual(entry)
+        },
+        satisfied: |entry: &TaxRegistrationEntry| {
+            turkey_member(entry, |turkey| turkey.tax_office.as_ref()).is_some()
+        },
+    },
+    CountryRule {
+        country_code: "TR",
+        member_path: "additionalTaxInformation.turkeyAdditionalInfo.taxOffice",
+        error_code: ERROR_CODE_FIELD_VALIDATION_FAILED,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: turkey_sector_is_individual,
+        satisfied: |entry: &TaxRegistrationEntry| {
+            turkey_member(entry, |turkey| turkey.tax_office.as_ref()).is_none()
+        },
+    },
+    // Turkey: "(Optional) Specify the kepEmailId. If your sector is Individual,
+    // don't enter this value."
+    CountryRule {
+        country_code: "TR",
+        member_path: "additionalTaxInformation.turkeyAdditionalInfo.kepEmailId",
+        error_code: ERROR_CODE_FIELD_VALIDATION_FAILED,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: turkey_sector_is_individual,
+        satisfied: |entry: &TaxRegistrationEntry| {
+            turkey_member(entry, |turkey| turkey.kep_email_id.as_ref()).is_none()
+        },
+    },
+    // Ukraine: "The sector valid values are Business and Individual."
+    CountryRule {
+        country_code: "UA",
+        member_path: "taxRegistrationEntry.sector",
+        error_code: ERROR_CODE_FIELD_VALIDATION_FAILED,
+        message: "The valid sector values for a tax registration in Ukraine are Business and \
+                  Individual.",
+        applies: always,
+        satisfied: sector_is_business_or_individual,
+    },
+    // France: "You must specify the sirenNumber in the franceAdditionalInfo field
+    // of the additionalTaxInformation object." (`sirenNumber` is `@required` on
+    // `FranceAdditionalInfo`, so carrying the block is carrying the member.)
+    CountryRule {
+        country_code: "FR",
+        member_path: "additionalTaxInformation.franceAdditionalInfo.sirenNumber",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: always,
+        satisfied: |entry: &TaxRegistrationEntry| {
+            additional_info(entry).is_some_and(|info| info.france_additional_info.is_some())
+        },
+    },
+    // Monaco: "You must specify the businessNumber in the monacoAdditionalInfo
+    // field of the additionalTaxInformation object." (`businessNumber` is
+    // `@required` on `MonacoAdditionalInfo`.)
+    CountryRule {
+        country_code: "MC",
+        member_path: "additionalTaxInformation.monacoAdditionalInfo.businessNumber",
+        error_code: ERROR_CODE_MISSING_INPUT,
+        message: ADDITIONAL_INFO_INVALID,
+        applies: always,
+        satisfied: |entry: &TaxRegistrationEntry| {
+            additional_info(entry).is_some_and(|info| info.monaco_additional_info.is_some())
+        },
+    },
+];
+
+/// Refuse an entry that does not satisfy the per-country business rules
+/// `PutTaxRegistration` documents for the country of its legal address.
+///
+/// The country is `legalAddress.countryCode`; an entry with no legal address has
+/// no country to apply a rule for, and is refused by the caller for omitting a
+/// member every shape that reports a registration requires. The first unmet rule
+/// in [`COUNTRY_RULES`] is the refusal, so the rule set is shared by every writer
+/// of a `TaxRegistrationEntry` rather than re-stated per operation.
+pub fn check_country_requirements(
+    entry: &TaxRegistrationEntry,
+) -> Result<(), ValidationException> {
+    let Some(country_code) = entry
+        .legal_address
+        .as_ref()
+        .map(|address| address.country_code.as_str())
+    else {
+        return Ok(());
+    };
+    for rule in COUNTRY_RULES {
+        if !rule.country_code.eq_ignore_ascii_case(country_code) {
+            continue;
+        }
+        if !(rule.applies)(entry) || (rule.satisfied)(entry) {
+            continue;
+        }
+        return Err(validation(rule.error_code, rule.member_path, rule.message));
     }
     Ok(())
 }

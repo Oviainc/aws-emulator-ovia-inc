@@ -259,6 +259,12 @@ async fn a_submitted_trn_is_pending_until_its_validation_is_due_then_settles() {
                 "registrationType": "TIN",
                 "legalName": "Ejemplo SA",
                 "legalAddress": { "postalCode": "28001", "countryCode": "ES" },
+                // Spain's documented rules: the registrationType must be
+                // specified, and a `Local` one needs the certificate document
+                // (`crate::state::COUNTRY_RULES`).
+                "additionalTaxInformation": {
+                    "spainAdditionalInfo": { "registrationType": "Local" },
+                },
                 "verificationDetails": {
                     "taxRegistrationDocuments": [
                         { "file": { "fileName": "certificate.pdf", "fileContent": "aGVsbG8=" } },

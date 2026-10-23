@@ -42,6 +42,18 @@
 //!   [`crate::state::MAX_STORED_REGISTRATIONS`] is refused with the modelled
 //!   `ConflictException`; see that constant for why the store is bounded.
 //!
+//! Beyond those, this handler applies the per-country business rules the
+//! operation's own model documentation states for `taxRegistrationEntry` — "Kenya
+//! You must specify the `personType` in the `kenyaAdditionalInfo` field of the
+//! `additionalTaxInformation` object", and the equivalent sentence for every
+//! other country the documentation names. They live in
+//! [`crate::state::COUNTRY_RULES`], one row per documented sentence, and are
+//! applied by [`crate::state::check_country_requirements`] BEFORE the state
+//! write, so an entry AWS refuses is refused here with the modelled
+//! `ValidationException` and nothing is persisted. They are in `state.rs` rather
+//! than in this file so every writer of a `TaxRegistrationEntry`
+//! (`BatchPutTaxRegistration`, when it is implemented) applies the same set.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -266,6 +278,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_not_blank("taxRegistrationEntry.legalName", legal_name)
             .map_err(PutTaxRegistrationErrorModeled::ValidationException)?;
         crate::state::check_address("taxRegistrationEntry.legalAddress", legal_address)
+            .map_err(PutTaxRegistrationErrorModeled::ValidationException)?;
+
+        // The per-country business rules the model documents for this operation
+        // (`crate::state::COUNTRY_RULES`), keyed off the entry's
+        // `legalAddress.countryCode`: an entry the country's rules refuse is
+        // refused here, BEFORE the write, so nothing is persisted.
+        crate::state::check_country_requirements(entry)
             .map_err(PutTaxRegistrationErrorModeled::ValidationException)?;
 
         // A write replaces the account's record and bumps its revision, which the
