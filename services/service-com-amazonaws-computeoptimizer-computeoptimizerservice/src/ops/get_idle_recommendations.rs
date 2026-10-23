@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIdleRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIdleRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIdleRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns idle resource recommendations. Compute Optimizer generates recommendations for
+//! idle resources that meet a specific set of requirements. For more information, see
+//! Resource requirements in the Compute Optimizer User Guide
+//!
+//! A REPORTING operation: it selects, orders and pages over the idle resource
+//! recommendations this service holds ([`crate::state::IdleRecommendationStore`]) and
+//! writes nothing. Compute Optimizer's own analysis of an observed workload is what
+//! produces an idle recommendation, so no request to this API creates one and this handler
+//! never invents one: a resource the store holds no recommendation for is reported in the
+//! response's `errors` list, which is what the model says that list is ("Returns of list of
+//! resources that doesn't have idle recommendations").
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +177,218 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIdleRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIdleRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIdleRecommendations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetIdleRecommendationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The Compute Optimizer recommendation store is unavailable.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A malformed request is refused BEFORE the store is read, so
+        // InvalidParameterValueException takes precedence over the opt-in gate below, as it
+        // does in the other read operations of this service.
+        let account_ids = input.account_ids.unwrap_or_default();
+        // `accountIds`: "You can only specify one account ID per request."
+        if account_ids.len() > 1 {
+            return Err(invalid_parameter(
+                "The value supplied for parameter accountIds is not valid: you can only specify \
+                 one account ID per request."
+                    .to_string(),
+            ));
+        }
+        if let Some(value) = account_ids
+            .iter()
+            .find(|value| !crate::state::is_account_id(value))
+        {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter accountIds is not valid: {value} is not a \
+                 12-digit Amazon Web Services account ID."
+            )));
+        }
+
+        // `resourceArns`: "The ARN that identifies the idle resource" — so each value is an
+        // ARN. Which resource an ARN names is NOT checked here: a well-formed ARN the
+        // service holds no recommendation for is reported in `errors` below, not refused.
+        let resource_arns = input.resource_arns.unwrap_or_default();
+        if let Some(value) = resource_arns
+            .iter()
+            .find(|value| crate::state::parse_arn(value).is_none())
+        {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter resourceArns is not valid: {value} is not an \
+                 Amazon Resource Name (ARN)."
+            )));
+        }
+
+        // The filter vocabulary is the model's own; a name or value outside it is refused
+        // rather than silently matching nothing. The modelled `@enum` on
+        // `IdleRecommendationFilter$name` already refuses an unmodelled name at the request
+        // boundary, so this covers the VALUES a filter carries and a filter with no name.
+        let filters = input.filters.unwrap_or_default();
+        if let Some(reason) = crate::state::idle_filter_rejection(&filters) {
+            return Err(invalid_parameter(reason));
+        }
+
+        // The page token carries this operation's name and the selection it was taken with,
+        // so resuming a walk with a different selection, or with a token another operation
+        // issued, is refused rather than answered with a page of a different result set.
+        let selection_fingerprint = crate::state::fingerprint(&(
+            Self::NAME,
+            &resource_arns,
+            &account_ids,
+            &filters,
+            &input.order_by,
+        ));
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let cursor = crate::state::decode_idle_page_token(token).filter(|cursor| {
+                    cursor.selection_fingerprint == selection_fingerprint
+                });
+                let Some(cursor) = cursor else {
+                    return Err(invalid_parameter(
+                        "The value supplied for parameter nextToken is not valid: it must be a \
+                         token returned by a previous GetIdleRecommendations call for the same \
+                         resourceArns, accountIds, filters and orderBy."
+                            .to_string(),
+                    ));
+                };
+                cursor.offset
+            }
+        };
+
+        // `maxResults` is modelled 0..100 (the request boundary refuses anything outside
+        // that). Whatever it asks for, the page is capped at `IDLE_MAX_PAGE_SIZE` so no
+        // number a request carries can size the response or the allocation that builds it;
+        // a request naming no size — or the range's lower bound `0`, which the service
+        // documents no meaning for — gets that same bound, the largest page the model
+        // allows, plus a `nextToken` to walk the rest.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .filter(|requested| *requested > 0)
+            .unwrap_or(crate::state::IDLE_MAX_PAGE_SIZE)
+            .min(crate::state::IDLE_MAX_PAGE_SIZE);
+
+        let guard = state.lock();
+        if !guard.enrollment.is_opted_in() {
+            return Err(GetIdleRecommendationsErrorModeled::OptInRequiredException(
+                OptInRequiredException {
+                    message: Some("The account is not opted in to Compute Optimizer.".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The recommendations the request selects: those of the named resources, of the
+        // named account, that satisfy every filter. A member the request omits selects
+        // nothing away.
+        let mut selected: Vec<IdleRecommendation> = guard
+            .idle_recommendations
+            .iter_in_order()
+            .filter(|recommendation| {
+                resource_arns.is_empty()
+                    || recommendation
+                        .resource_arn
+                        .as_ref()
+                        .is_some_and(|arn| resource_arns.contains(arn))
+            })
+            .filter(|recommendation| {
+                account_ids.is_empty()
+                    || recommendation
+                        .account_id
+                        .as_ref()
+                        .is_some_and(|account_id| account_ids.contains(account_id))
+            })
+            .filter(|recommendation| {
+                crate::state::idle_recommendation_matches_filters(recommendation, &filters)
+            })
+            .cloned()
+            .collect();
+
+        // "The order to sort the idle resource recommendations": the dimension names the
+        // savings figure to sort on and `order` the direction. With no dimension there is
+        // nothing to sort on, so the recommendations keep the order the analysis recorded
+        // them in. The model documents no default direction, so this emulator sorts
+        // ascending unless `Desc` asks otherwise.
+        if let Some(dimension) = input
+            .order_by
+            .as_ref()
+            .and_then(|order_by| order_by.dimension.as_deref())
+        {
+            let descending = crate::state::idle_sorts_descending(
+                input
+                    .order_by
+                    .as_ref()
+                    .and_then(|order_by| order_by.order.as_deref()),
+            );
+            selected.sort_by(|left, right| {
+                let ordering = crate::state::idle_savings_value(left, dimension)
+                    .total_cmp(&crate::state::idle_savings_value(right, dimension));
+                if descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            });
+        }
+
+        // "Returns of list of resources that doesn't have idle recommendations": every ARN
+        // the request named that the service holds no recommendation for, whatever the
+        // filters select. Reported with each page, because it describes the request rather
+        // than the page.
+        let errors: Vec<IdleRecommendationError> = resource_arns
+            .iter()
+            .filter(|arn| guard.idle_recommendations.get(arn).is_none())
+            .map(|arn| IdleRecommendationError {
+                identifier: Some(arn.clone()),
+                code: Some(crate::state::IDLE_NO_RECOMMENDATION_CODE.to_string()),
+                message: Some(
+                    "Compute Optimizer has no idle resource recommendation for the resource this \
+                     identifier names."
+                        .to_string(),
+                ),
+                resource_type: crate::state::idle_resource_type_of_arn(arn)
+                    .map(ToString::to_string),
+            })
+            .collect();
+
+        // One page of the selected sequence. A next token is handed out only when the
+        // sequence continues past this page, and it resumes exactly where this page stopped.
+        let page: Vec<IdleRecommendation> = selected
+            .into_iter()
+            .skip(offset)
+            .take(page_size.saturating_add(1))
+            .collect();
+        let has_more = page.len() > page_size;
+        let page: Vec<IdleRecommendation> = page.into_iter().take(page_size).collect();
+        let next_token = has_more.then(|| {
+            crate::state::encode_idle_page_token(&crate::state::IdlePageCursor {
+                offset: offset.saturating_add(page.len()),
+                selection_fingerprint,
+            })
+        });
+
+        Ok(GetIdleRecommendationsOutput {
+            next_token,
+            idle_recommendations: Some(page),
+            errors: Some(errors),
+        })
     }
+}
+
+/// The 400 `InvalidParameterValueException` this operation refuses a bad request with:
+/// "The value supplied for the input parameter is out of range or not valid."
+fn invalid_parameter(message: String) -> GetIdleRecommendationsError {
+    GetIdleRecommendationsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

@@ -8,7 +8,8 @@
 //! operation of this service creates one — so `DescribeApplicationProvider` REPORTS the
 //! built-in provider its ARN names, echoing the ARN asked for with that provider's
 //! `FederationProtocol` and display data, and refuses every other ARN the pattern admits
-//! with the modelled `ResourceNotFoundException` (404). It writes nothing.
+//! with the modelled `ResourceNotFoundException`, at the HTTP 400 this awsJson1_1 service
+//! answers every refusal of a request with. It writes nothing.
 //!
 //! The table is the service's own catalogue
 //! ([`state::BUILT_IN_APPLICATION_PROVIDERS`], read from the crate so the test tracks it
@@ -129,7 +130,7 @@ async fn the_cited_and_an_uncited_entry_both_describe() {
     }
 }
 
-/// RULE — any other ARN the pattern admits names no provider: 404
+/// RULE — any other ARN the pattern admits names no provider:
 /// `ResourceNotFoundException`, never a 200 and never a 501.
 #[tokio::test]
 async fn an_arn_outside_the_catalogue_is_not_found() {
@@ -156,8 +157,8 @@ async fn an_arn_outside_the_catalogue_is_not_found() {
             )
             .await;
             assert_eq!(
-                status, 404,
-                "case {arn}: an unknown provider expected 404, got {status} {body}"
+                status, 400,
+                "case {arn}: an unknown provider expected 400, got {status} {body}"
             );
             assert_eq!(
                 error_code(&body),

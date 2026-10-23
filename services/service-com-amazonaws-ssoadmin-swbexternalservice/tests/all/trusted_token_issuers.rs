@@ -12,12 +12,12 @@
 //!    — for every value of those members the model admits;
 //! 2. `ClientToken` is the operation's `@idempotencyToken`: the same token with the same
 //!    parameters answers with the ARN the first call minted and creates nothing, the
-//!    same token with any different parameter is refused `ConflictException` (409), and
+//!    same token with any different parameter is refused `ConflictException`, and
 //!    a request carrying no token is never a retry of another;
 //! 3. an `InstanceArn` this account holds no instance for is refused
 //!    `AccessDeniedException` (403) — the only not-found channel the operation's model
 //!    declares — and a `TrustedTokenIssuerArn` no create minted is refused
-//!    `ResourceNotFoundException` (404) by the describe, never answered with a 200;
+//!    `ResourceNotFoundException` by the describe, never answered with a 200;
 //! 4. a describe is a REPORT: repeating it answers identically and changes nothing a
 //!    later caller sees.
 //!
@@ -304,7 +304,7 @@ async fn every_created_issuer_reads_back_exactly_what_was_stored() {
 }
 
 /// Rule 2: a replayed `ClientToken` with the same parameters answers with the first
-/// call's ARN, and the same token with a different parameter is a 409 conflict.
+/// call's ARN, and the same token with a different parameter is a conflict.
 #[tokio::test]
 async fn a_replayed_client_token_mints_no_second_issuer_and_a_changed_parameter_conflicts() {
     let router = router();
@@ -382,8 +382,8 @@ async fn a_replayed_client_token_mints_no_second_issuer_and_a_changed_parameter_
         for (member, mutated) in mutations {
             let (status, body) = create(&router, &instance_arn, &mutated).await;
             assert_eq!(
-                status, 409,
-                "case {case:?} changed {member}: the reused token must be refused 409, \
+                status, 400,
+                "case {case:?} changed {member}: the reused token must be refused 400, \
                  got {status} {body}"
             );
             assert_eq!(
@@ -514,7 +514,7 @@ async fn creating_under_an_instance_this_account_does_not_hold_is_refused() {
     }
 }
 
-/// Rule 3: a `TrustedTokenIssuerArn` no create minted is a 404, never a 200.
+/// Rule 3: a `TrustedTokenIssuerArn` no create minted is a not-found, never a 200.
 #[tokio::test]
 async fn describing_an_arn_no_create_minted_answers_not_found() {
     let router = router();
@@ -524,7 +524,7 @@ async fn describing_an_arn_no_create_minted_answers_not_found() {
         .next()
         .unwrap_or_default()
         .to_string();
-    // One issuer exists, so the 404 is about the ARN asked for and not about an empty
+    // One issuer exists, so the not-found is about the ARN asked for and not about an empty
     // store.
     let (status, body) = create(
         &router,
@@ -588,8 +588,8 @@ async fn describing_an_arn_no_create_minted_answers_not_found() {
         );
         let (status, body) = describe(&router, &arn).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: an unminted ARN must be refused 404, got {status} {body}"
+            status, 400,
+            "case {case:?}: an unminted ARN must be refused 400, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
