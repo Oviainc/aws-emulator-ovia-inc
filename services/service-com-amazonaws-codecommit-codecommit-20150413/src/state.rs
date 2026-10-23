@@ -906,21 +906,27 @@ pub fn normalize_comment_id(raw: &str) -> Result<&str, CommentIdProblem> {
     Ok(trimmed)
 }
 
-/// The message `CommentDeletedException` carries: a FIXED sentence naming the
-/// action that was refused, carrying no value from the request.
+/// The message `CommentDeletedException` carries: a FIXED sentence carrying no
+/// value from the request.
 ///
 /// CodeCommit answers a call against a comment whose content has been deleted with
-/// "You cannot <action> this comment. The specified comment has already been marked
-/// as deleted. Verify that you specified a valid comment ID, and then try again." —
-/// the recorded answer to a repeated `DeleteCommentContent` is that sentence with
-/// `delete` as the action. `refused_action` is the verb phrase for the operation
-/// doing the refusing, so the four operations that reject a deleted comment cannot
-/// disagree about the rest of the sentence.
-pub fn comment_deleted_message(refused_action: &str) -> String {
-    format!(
-        "You cannot {refused_action} this comment. The specified comment has already been marked \
-         as deleted. Verify that you specified a valid comment ID, and then try again."
-    )
+/// "The specified comment has already been marked as deleted. Verify that you
+/// specified a valid comment ID, and then try again." — the recorded answer to a
+/// `GetComment` of such a comment is that sentence alone, so the sentence is what
+/// the exception says and the four operations that reject a deleted comment cannot
+/// disagree about it.
+///
+/// `refused_action` is the verb phrase of an operation the service is RECORDED
+/// leading that sentence with ("You cannot delete this comment." for a repeated
+/// `DeleteCommentContent`); an operation with no such recording passes `None`
+/// rather than synthesising a lead clause of its own.
+pub fn comment_deleted_message(refused_action: Option<&str>) -> String {
+    let already_deleted = "The specified comment has already been marked as deleted. Verify that \
+                           you specified a valid comment ID, and then try again.";
+    match refused_action {
+        Some(action) => format!("You cannot {action} this comment. {already_deleted}"),
+        None => already_deleted.to_string(),
+    }
 }
 
 /// A comment's opaque `commentId`: the same kind of version-8 UUID, over the
