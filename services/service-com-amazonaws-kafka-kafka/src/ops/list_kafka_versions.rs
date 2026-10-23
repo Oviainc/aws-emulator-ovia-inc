@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListKafkaVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListKafkaVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Pages the service's Apache Kafka version catalog
+//! ([`crate::state::KAFKA_VERSION_CATALOG`]), reporting each entry's version
+//! string and its `ACTIVE`/`DEPRECATED` support status.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListKafkaVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The catalog is service-wide published metadata rather than caller state: the
+//! same versions are offered to every account in every region, so this operation
+//! creates and mutates nothing. `MaxResults` bounds the page and `NextToken` is an
+//! opaque encoding of the last version returned, resolved back to its position in
+//! the catalog — so each page is a contiguous run of one fixed, duplicate-free
+//! order and the pages of any walk partition the catalog exactly.
+//!
+//! Authentication and authorization are NOT this handler's business: the emulator
+//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +151,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListKafkaVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListKafkaVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListKafkaVersions"))
+        // The catalog is the same for every caller in every region, so neither the
+        // engine nor the request's signing scope selects what this call reports.
+        let _ = (ctx, &self.engine);
+
+        // A token names the version the previous page stopped at; the next page
+        // starts at the catalog position after it. A token that is not one of
+        // ours, or that names a version this catalog does not hold, is a bad
+        // request rather than an empty page.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let position = crate::state::decode_kafka_version_page_token(token)
+                    .as_deref()
+                    .and_then(crate::state::kafka_version_index);
+                match position {
+                    Some(index) => Some(index),
+                    None => {
+                        return Err(ListKafkaVersionsErrorModeled::BadRequestException(
+                            BadRequestException {
+                                invalid_parameter: Some("NextToken".to_string()),
+                                message: Some("The pagination token is not valid.".to_string()),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        // Absent `MaxResults` pages at the largest size the model allows; a value
+        // outside the modelled 1..100 range is REFUSED rather than clamped, so a
+        // page size this handler cannot honour is answered the way the real
+        // service answers it. The boundary validator already refuses such a value
+        // from the wire, so this is the same rule stated where the page is sized.
+        let page_size = match input.max_results {
+            None => crate::state::MAX_RESULTS_LIMIT as usize,
+            Some(requested) => match usize::try_from(requested) {
+                Ok(size) if (1..=crate::state::MAX_RESULTS_LIMIT as usize).contains(&size) => size,
+                _ => {
+                    return Err(ListKafkaVersionsErrorModeled::BadRequestException(
+                        BadRequestException {
+                            invalid_parameter: Some("MaxResults".to_string()),
+                            message: Some(format!(
+                                "MaxResults must be between 1 and {}, not {requested}.",
+                                crate::state::MAX_RESULTS_LIMIT
+                            )),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let page = crate::state::kafka_version_page(resume_after, page_size);
+        Ok(ListKafkaVersionsOutput {
+            kafka_versions: Some(
+                page.entries
+                    .iter()
+                    .map(|entry| KafkaVersion {
+                        version: Some(entry.version.to_string()),
+                        status: Some(entry.status.to_string()),
+                    })
+                    .collect(),
+            ),
+            next_token: page.next_token,
+        })
     }
 }

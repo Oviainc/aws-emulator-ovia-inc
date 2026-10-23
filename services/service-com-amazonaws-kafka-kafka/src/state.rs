@@ -440,6 +440,82 @@ fn kafka_version_key(version: &str) -> (Vec<u32>, String) {
     (numbers, qualifier)
 }
 
+/// Where `version` sits in [`KAFKA_VERSION_CATALOG`], or `None` when MSK knows
+/// no such version. This is the lookup a `ListKafkaVersions` pagination token
+/// resolves through, so a token can only ever name a position in the catalog
+/// itself.
+pub fn kafka_version_index(version: &str) -> Option<usize> {
+    KAFKA_VERSION_CATALOG
+        .iter()
+        .position(|entry| entry.version == version)
+}
+
+/// Marker that prefixes a version page token's plaintext, so a token minted for
+/// some other list cannot be mistaken for one of these.
+const KAFKA_VERSION_PAGE_TOKEN_PREFIX: &str = "kafka:kafka-versions:";
+
+/// Encode the catalog version a page stopped at as a token, through the same
+/// [`encode_page_token`] every listing here mints its tokens with. The version
+/// inside is only resolved against the public catalog, so a forged resume point
+/// can only skip or repeat entries every caller may already list.
+pub fn encode_kafka_version_page_token(last_version: &str) -> String {
+    encode_page_token(KAFKA_VERSION_PAGE_TOKEN_PREFIX, last_version)
+}
+
+/// The version a token resumes after, or `None` when the token is not one the
+/// version listing minted — which that listing refuses as a bad request rather
+/// than serving as a first page.
+pub fn decode_kafka_version_page_token(token: &str) -> Option<String> {
+    decode_page_token(KAFKA_VERSION_PAGE_TOKEN_PREFIX, token)
+}
+
+/// One page of the version catalog: the entries it reports, and the token that
+/// resumes after them — absent on the last page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KafkaVersionPage {
+    pub entries: &'static [KafkaVersionEntry],
+    pub next_token: Option<String>,
+}
+
+/// Choose one page of [`KAFKA_VERSION_CATALOG`]: the `page_size` entries that
+/// follow `resume_after` (a catalog position, as
+/// [`decode_kafka_version_page_token`] plus [`kafka_version_index`] resolve one),
+/// or the first `page_size` entries when a request names no token.
+///
+/// `page_size` is clamped into the `MaxResults` range the model declares, so no
+/// caller of this module can size the page from an unchecked value. Every page is
+/// a contiguous run of the catalog in its published order, so the pages of any
+/// walk partition the catalog exactly once.
+///
+/// A `resume_after` naming the LAST catalogued version yields an empty final page
+/// with no token: the listing never mints a token for the last entry (the page
+/// that reports it closes the list), so only a forged resume point reaches that
+/// case, and an empty page is the truthful answer to "what follows the end".
+pub fn kafka_version_page(resume_after: Option<usize>, page_size: usize) -> KafkaVersionPage {
+    let page_size = page_size.clamp(1, MAX_RESULTS_LIMIT as usize);
+    let start = resume_after
+        .map_or(0, |index| index.saturating_add(1))
+        .min(KAFKA_VERSION_CATALOG.len());
+    let end = start
+        .saturating_add(page_size)
+        .min(KAFKA_VERSION_CATALOG.len());
+    let entries = &KAFKA_VERSION_CATALOG[start..end];
+    // The token names the entry this page stopped at — the same value the resume
+    // lookup resolves — and is absent once the page reaches the end of the
+    // catalog, which is what tells a paginating client to stop.
+    let next_token = if end < KAFKA_VERSION_CATALOG.len() {
+        entries
+            .last()
+            .map(|entry| encode_kafka_version_page_token(entry.version))
+    } else {
+        None
+    };
+    KafkaVersionPage {
+        entries,
+        next_token,
+    }
+}
+
 /// The message Amazon MSK answers a request naming a resource it does not hold.
 ///
 /// A CONSTANT of the service, not built from the request: every operation that
@@ -458,9 +534,9 @@ pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{201
 /// carries `SERVERLESS` yet.
 pub const CLUSTER_TYPE_PROVISIONED: &str = "PROVISIONED";
 
-/// The largest page a cluster listing may report, from the `range` on the
-/// `MaxResults` shape (1..100) that `ListClusters` and `ListClustersV2` both bind.
-/// Also the page size used when a request names none.
+/// The largest page a listing may report, from the `range` on the `MaxResults`
+/// shape (1..100) that `ListClusters`, `ListClustersV2` and `ListKafkaVersions`
+/// all bind. Also the page size used when a request names none.
 pub const MAX_RESULTS_LIMIT: i32 = 100;
 
 /// Marker that prefixes a cluster page token's plaintext, so a token minted for
@@ -2187,18 +2263,34 @@ where
 /// against the keys of the caller's own registry, so a forged resume point can
 /// only skip or repeat entries the caller may already list.
 pub fn encode_cluster_page_token(last_arn: &str) -> String {
-    ::aws_smithy_types::base64::encode(format!("{CLUSTER_PAGE_TOKEN_PREFIX}{last_arn}"))
+    encode_page_token(CLUSTER_PAGE_TOKEN_PREFIX, last_arn)
 }
 
 /// The ARN a token resumes after, or `None` when the token is not one a cluster
 /// listing minted — which every listing refuses as a bad request rather than
 /// serving as a first page.
 pub fn decode_cluster_page_token(token: &str) -> Option<String> {
+    decode_page_token(CLUSTER_PAGE_TOKEN_PREFIX, token)
+}
+
+/// Mint a page token for `value`, marked with `prefix` so a token minted for one
+/// listing cannot be mistaken for another's.
+///
+/// The ONE place a page token is encoded, whatever listing mints it, so a change
+/// to the encoding cannot leave two listings disagreeing. Base64 of a marked
+/// plaintext: a token is ENCODED, not authenticated — see
+/// [`encode_cluster_page_token`] for why that is harmless for these listings.
+fn encode_page_token(prefix: &str, value: &str) -> String {
+    ::aws_smithy_types::base64::encode(format!("{prefix}{value}"))
+}
+
+/// The value a token carries, or `None` when it is not a token minted with
+/// `prefix` — the inverse of [`encode_page_token`], and the one place a page
+/// token is decoded.
+fn decode_page_token(prefix: &str, token: &str) -> Option<String> {
     let decoded = ::aws_smithy_types::base64::decode(token).ok()?;
     let decoded = String::from_utf8(decoded).ok()?;
-    decoded
-        .strip_prefix(CLUSTER_PAGE_TOKEN_PREFIX)
-        .map(ToString::to_string)
+    decoded.strip_prefix(prefix).map(ToString::to_string)
 }
 
 /// The alias of one `KafkaCluster` entry: an Amazon MSK cluster is aliased by its
