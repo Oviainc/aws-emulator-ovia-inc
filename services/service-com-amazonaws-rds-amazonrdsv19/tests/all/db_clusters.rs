@@ -1439,7 +1439,8 @@ async fn the_storage_type_a_cluster_reports_is_the_one_its_member_documents() {
 }
 
 #[tokio::test]
-async fn a_replica_cluster_names_its_source_and_the_source_lists_it() {    let router = emulator();
+async fn a_replica_cluster_names_its_source_and_the_source_lists_it() {
+    let router = emulator();
 
     expect_ok(
         "the source cluster",

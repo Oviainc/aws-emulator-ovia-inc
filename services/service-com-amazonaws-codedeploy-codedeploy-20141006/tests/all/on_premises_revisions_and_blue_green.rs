@@ -378,8 +378,10 @@ async fn reading_an_unregistered_on_premises_instance_is_refused() {
 }
 
 /// RULE: deregistering an instance RETIRES its record with a `deregisterTime`
-/// instead of dropping it, deregistering a name twice or deregistering one that
-/// was never registered is a success, and the name can be registered again.
+/// instead of dropping it — so the batch read still reports it while the
+/// single-instance read refuses it as not registered — deregistering a name
+/// twice or deregistering one that was never registered is a success, and the
+/// name can be registered again.
 #[tokio::test]
 async fn deregistering_an_on_premises_instance_retires_its_record() {
     let emulator = Emulator::new();
@@ -408,10 +410,28 @@ async fn deregistering_an_on_premises_instance_retires_its_record() {
         );
     }
 
-    let read = emulator
-        .ok("GetOnPremisesInstance", json!({"instanceName": "retired"}))
+    // The registration is gone, so the single-instance reader refuses the name.
+    let code = emulator
+        .refused(
+            "a deregistered instance",
+            "GetOnPremisesInstance",
+            json!({"instanceName": "retired"}),
+        )
         .await;
-    let info = &read["instanceInfo"];
+    assert_eq!(
+        code, "InstanceNotRegisteredException",
+        "case a deregistered instance: expected InstanceNotRegisteredException, got {code}"
+    );
+
+    // The retired RECORD is still there: the batch read reports it, with the
+    // instant it was retired at.
+    let read = emulator
+        .ok(
+            "BatchGetOnPremisesInstances",
+            json!({"instanceNames": ["retired"]}),
+        )
+        .await;
+    let info = &read["instanceInfos"][0];
     let deregister_time = info["deregisterTime"].as_f64().unwrap_or_default();
     assert!(
         deregister_time > 0.0,
@@ -424,7 +444,10 @@ async fn deregistering_an_on_premises_instance_retires_its_record() {
 
     // Deregistering twice does not move the instant it was retired at.
     let again = emulator
-        .ok("GetOnPremisesInstance", json!({"instanceName": "retired"}))
+        .ok(
+            "BatchGetOnPremisesInstances",
+            json!({"instanceNames": ["retired"]}),
+        )
         .await;
     assert_eq!(
         again, read,
