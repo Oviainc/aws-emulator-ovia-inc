@@ -324,7 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             changed = true;
         }
         if let Some(deobfuscation) = input.deobfuscation_configuration {
-            record.deobfuscation_configuration = Some(deobfuscation);
+            record.deobfuscation_configuration = deobfuscation;
             changed = true;
         }
         // `LastModified` is "the date and time of the most recent changes to this app
@@ -332,7 +332,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // when this call actually changed something: a request that carries no updatable
         // member leaves the monitor, timestamp included, exactly as it was.
         if changed {
-            record.last_modified = modified;
+            record.last_modified = Some(modified);
         }
 
         // `UpdateAppMonitorResponse` models no members: a later `GetAppMonitor` is what
