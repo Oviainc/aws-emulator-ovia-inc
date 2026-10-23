@@ -6,8 +6,14 @@
 //! `StartDomainExport` mints one export record, `GetExport` reports it by ARN and
 //! `ListExports` enumerates the records. Every one of those three answers from the
 //! single store below, so a write by one call is what the next call reads.
+//!
+//! The store also holds the **domain registry** a `domainName` is resolved against.
+//! No operation of this service creates a SimpleDB domain (that is the SimpleDB
+//! 2009-04-15 `CreateDomain`), so the registry holds what the operator declared
+//! through [`EXISTING_DOMAINS_ENV`] plus the domain of every stored export, and a name
+//! it does not hold is the modelled `NoSuchDomainException`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::ExportSummary;
@@ -18,6 +24,42 @@ pub const ARN_SERVICE: &str = "sdb";
 
 /// Region used when a request carries no SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The domains the operator running this emulator declares this account already has,
+/// which the export operations resolve a `domainName` against: comma-separated
+/// `DomainName` values, read once when this service's store is created
+/// (`SIMPLEDB_EXISTING_DOMAINS="orders,customers"`).
+///
+/// A SimpleDB domain is created by the SimpleDB 2009-04-15 `CreateDomain` and removed
+/// by its `DeleteDomain`; this service's whole bound surface is the three export
+/// operations — `GetExport`, `ListExports` and `StartDomainExport` — so NOTHING on
+/// this wire creates a domain. An account nobody declared a domain for therefore has
+/// none, which is exactly what `StartDomainExport` and a `ListExports` domain filter
+/// answer [`NO_SUCH_DOMAIN_MESSAGE`] for. Nothing is invented: unset means no domains
+/// at all.
+pub const EXISTING_DOMAINS_ENV: &str = "SIMPLEDB_EXISTING_DOMAINS";
+
+/// The `message` every `NoSuchDomainException` this service raises carries.
+///
+/// It is the sentence the shape's own documentation states — source:
+/// `smithy_query(query="shape",shape="NoSuchDomainException")` → doc "The specified
+/// domain does not exist." — so the wording is the model's rather than this
+/// emulator's, and it echoes no caller-supplied value back.
+pub const NO_SUCH_DOMAIN_MESSAGE: &str = "The specified domain does not exist.";
+
+/// The domain names `setting` declares: comma-separated, surrounding space trimmed.
+///
+/// An entry this service could not export anyway — an empty one, or one
+/// [`domain_name_rejection`] refuses — is SKIPPED rather than guessed at, so a typo
+/// declares no domain instead of declaring an unintended one.
+pub fn parse_existing_domains(setting: &str) -> Vec<String> {
+    setting
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && domain_name_rejection(DEFAULT_REGION, name).is_none())
+        .map(str::to_string)
+        .collect()
+}
 
 /// The `ExportStatus` an export is created in: "export request received".
 pub const STATUS_PENDING: &str = "PENDING";
@@ -195,21 +237,80 @@ impl StoredExport {
 
 /// Per-service state for com-amazonaws-simpledbv2-simpledbv2. A handler reaches it through [`service_state`].
 ///
-/// The two indexes are kept private so they cannot drift apart: `exports` is the
+/// The indexes are kept private so they cannot drift apart: `exports` is the
 /// authoritative record store, `export_order` is the insertion order `ListExports`
-/// pages through, and `client_tokens` is the idempotency index `StartDomainExport`
-/// looks a repeat up in.
-#[derive(Debug, Default)]
+/// pages through, `client_tokens` is the idempotency index `StartDomainExport` looks a
+/// repeat up in, and `domains` is the registry a `domainName` is resolved against.
+#[derive(Debug)]
 pub struct ComAmazonawsSimpledbv2Simpledbv2State {
     exports: HashMap<String, StoredExport>,
     export_order: Vec<String>,
     client_tokens: HashMap<String, String>,
+    /// The SimpleDB domains this account holds, in name order.
+    ///
+    /// BOUNDED: the only writers are [`Self::create_domain`] — not reachable from the
+    /// wire, see [`EXISTING_DOMAINS_ENV`] — and [`Self::insert_export`], which is
+    /// itself bounded at [`MAX_EXPORTS`] records, so no caller can grow this set
+    /// without end.
+    domains: BTreeSet<String>,
     /// Strictly increasing, and mixed into every minted id, so two ids minted in the
     /// same nanosecond still differ.
     id_counter: u64,
 }
 
+/// A fresh store: no exports, and no domains beyond the ones [`EXISTING_DOMAINS_ENV`]
+/// declares (none, unless it is set).
+///
+/// `engine::InMemoryEngine::state` builds a service's state with `Default` the first
+/// time a handler reaches it, so this is the ONE construction every store goes
+/// through, and it is where the operator's declared domains are read: no modelled
+/// operation of this service creates a domain, so a domain that is to exist at all has
+/// to reach the store from outside the wire.
+impl Default for ComAmazonawsSimpledbv2Simpledbv2State {
+    fn default() -> Self {
+        let mut state = Self {
+            exports: HashMap::new(),
+            export_order: Vec::new(),
+            client_tokens: HashMap::new(),
+            domains: BTreeSet::new(),
+            id_counter: 0,
+        };
+        for domain in ::std::env::var(EXISTING_DOMAINS_ENV)
+            .map(|setting| parse_existing_domains(&setting))
+            .unwrap_or_default()
+        {
+            state.create_domain(&domain);
+        }
+        state
+    }
+}
+
 impl ComAmazonawsSimpledbv2Simpledbv2State {
+    /// Record that this account holds a domain named `domain_name`.
+    ///
+    /// The ONLY way a domain enters the registry other than as the domain of a stored
+    /// export, and NOT reachable from the wire: this service models no operation that
+    /// creates one, so this is reached from [`EXISTING_DOMAINS_ENV`] when the store is
+    /// created, and from a test standing up an account that does have domains.
+    /// Declaring a name the registry already holds changes nothing.
+    pub fn create_domain(&mut self, domain_name: &str) {
+        self.domains.insert(domain_name.to_string());
+    }
+
+    /// Whether this account holds a domain named `domain_name`.
+    ///
+    /// This is the precondition `StartDomainExport` and a `ListExports` `domainName`
+    /// filter resolve before they mint or enumerate anything, and whose failure is the
+    /// modelled `NoSuchDomainException`.
+    pub fn has_domain(&self, domain_name: &str) -> bool {
+        self.domains.contains(domain_name)
+    }
+
+    /// Every domain this account holds, in name order.
+    pub fn domains(&self) -> impl Iterator<Item = &str> + '_ {
+        self.domains.iter().map(String::as_str)
+    }
+
     /// A fresh identifier, rendered the way RFC 4122 renders a version-4 UUID
     /// (`8-4-4-4-12` lower-case hex, [`UUID_LEN`] characters) — the form the service's
     /// own smoke test shows an export id taking.
@@ -302,10 +403,16 @@ impl ComAmazonawsSimpledbv2Simpledbv2State {
     /// caller can drop it; a handler maps a `false` onto its own modelled quota error.
     /// A token whose window has lapsed is re-pointed at the new export, which is what
     /// "treated as a new request" means for the index.
+    ///
+    /// The export's domain is recorded in the registry at the same time: an export can
+    /// only be started for a domain that exists, so a stored record is itself evidence
+    /// of its domain, and that is what keeps `ListExports` from refusing a filter on a
+    /// domain it reports summaries for.
     pub fn insert_export(&mut self, export: StoredExport) -> bool {
         if self.export_order.len() >= MAX_EXPORTS {
             return false;
         }
+        self.create_domain(&export.domain_name);
         self.client_tokens
             .insert(export.client_token.clone(), export.export_arn.clone());
         self.export_order.push(export.export_arn.clone());

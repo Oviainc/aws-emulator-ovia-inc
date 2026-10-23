@@ -3,7 +3,8 @@
 //! @op StartDomainExport
 //! Implements the start of the domain-export lifecycle: it MINTS one export record,
 //! persists it, and answers from that record. `GetExport` and `ListExports` read the
-//! same store.
+//! same store. A `domainName` the account's domain registry does not hold is refused
+//! with the modelled `NoSuchDomainException` before anything is minted.
 //!
 //! ## Shape of an operation
 //!
@@ -240,18 +241,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `NoSuchDomainException` is modelled but unreachable here, and deliberately
-        // so: this service's whole bound surface is the three export operations, none
-        // of which creates, lists or deletes a SimpleDB domain, so the emulator holds
-        // no domain registry that could contradict the caller. Every `domainName` the
-        // rule above admits therefore names a domain that exists, and `ListExports`
-        // answers an empty list — not this error — for a domain that simply has no
-        // exports.
-
         let mut store = state.lock();
         // Status moves this call is about to report alongside are owed on the clock,
         // not on the call, so settle before reading anything back.
         store.settle_all(now);
+
+        // `domainName` names the domain to export, so it is RESOLVED against the
+        // account's domain registry before an id is minted or anything is stored — the
+        // request's own parameter values are checked first (above), then the resource
+        // it names. The registry holds the domains the operator declared and the domain
+        // of every stored export (see `crate::state::EXISTING_DOMAINS_ENV`): no
+        // operation of this service creates a SimpleDB domain, so an account nobody
+        // declared one for holds none and every start is refused here, exactly as the
+        // real service refuses a start naming a domain the account does not hold.
+        if !store.has_domain(&input.domain_name) {
+            audit(ctx, "refused-no-such-domain", None);
+            return Err(StartDomainExportErrorModeled::NoSuchDomainException(
+                NoSuchDomainException {
+                    message: crate::state::NO_SUCH_DOMAIN_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
 
         // `clientToken` carries `@idempotencyToken`, so an SDK fills it in; a request
         // that reaches here without one still needs the token the output requires, so
