@@ -3,7 +3,8 @@
 //! @op DeleteSite
 //! Deletes an existing site of a global network and reports the removed record as
 //! `DELETING`; an unknown global network or site, or a site that belongs to a different
-//! global network, is a 404. This is the ONLY file to touch for this operation.
+//! global network, is a 404, and a site that still holds links is a 409. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -168,6 +169,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     context: None,
                 },
             )
+            .into());
+        }
+
+        // "Deletes an existing site. The site cannot be associated with any device or
+        // link." (`smithy_query query="doc" shape="DeleteSite"`) — so a site that still
+        // holds links is a conflict, never a delete that orphans them.
+        let links = store.link_ids_of_site(&input.site_id);
+        if !links.is_empty() {
+            return Err(DeleteSiteErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "site {} is still associated with {} link(s)",
+                    input.site_id,
+                    links.len()
+                ),
+                resource_id: input.site_id.clone(),
+                resource_type: crate::state::SITE_KIND.to_string(),
+            })
             .into());
         }
 
