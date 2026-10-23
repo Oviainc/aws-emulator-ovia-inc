@@ -159,15 +159,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Every statement is validated BEFORE anything is written, so a refused put
-        // leaves the stored policy exactly as it was.
-        let statements = crate::state::validate_policy_statements(&input.statements)
-            .map_err(|message| {
-                PutApplicationPolicyErrorModeled::BadRequestException(crate::state::bad_request(
-                    message,
-                ))
-            })?;
-
         let mut store = state.lock();
         let Some(application) = store.applications.get_mut(&input.application_id) else {
             return Err(PutApplicationPolicyErrorModeled::NotFoundException(
@@ -179,6 +170,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Every statement is validated BEFORE anything is written, so a refused put
+        // leaves the stored policy exactly as it was. The owner's account comes from the
+        // application's own `ApplicationId`, because a resource policy grants access to
+        // OTHER principals: the owner cannot be a principal of its own policy.
+        let owner_account = crate::state::arn_account_id(&application.application_id)
+            .unwrap_or_default()
+            .to_string();
+        let statements =
+            crate::state::validate_policy_statements(&input.statements, &owner_account)
+                .map_err(bad_request)?;
+
         // REPLACE, not merge: the policy is the set of statements this call carries, so a
         // statement the previous policy had and this one does not is gone.
         application.policy_statements = statements;
@@ -186,4 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             statements: Some(application.policy()),
         })
     }
+}
+
+/// The 400 this operation answers for a policy statement outside the contract the
+/// `ApplicationPolicyStatement` members document but the model does not express as a
+/// constraint trait.
+fn bad_request(message: String) -> PutApplicationPolicyError {
+    PutApplicationPolicyErrorModeled::BadRequestException(crate::state::bad_request(message)).into()
 }

@@ -17,11 +17,18 @@
 //!    policy, one application's policy is not another's, and a deleted application's
 //!    policy is gone with it;
 //! 5. a statement outside the documented contract (an action that is not an application
-//!    permission, a principal that is neither an account id nor `*`, an organization id
-//!    that is not one, a repeated `statementId`) is refused with the modelled
-//!    `BadRequestException` and the stored policy is exactly as it was;
+//!    permission, a principal that is neither an account id nor `*`, a principal that is
+//!    the application's own owner, an organization id that is not one, a repeated
+//!    `statementId`) is refused with the modelled `BadRequestException` and the stored
+//!    policy is exactly as it was;
 //! 6. a policy read or written on an application the catalogue does not hold is the
 //!    modelled `NotFoundException`.
+//!
+//! Every refusal of rule 5 carries one shape and one `errorCode`, so its MESSAGE is the
+//! only thing that tells the conditions apart, which makes the wording part of the
+//! contract: a value outside its member's vocabulary is reported as
+//! `<Member> <value> is invalid`, and the application's own owner as a principal as
+//! `You cannot set principal to resource owner`.
 //!
 //! Every case drives the real wire path — the router resolves this service from the
 //! request's SigV4 credential scope, restJson1 routes on method + URI and deserializes
@@ -514,21 +521,40 @@ async fn a_refused_policy_leaves_the_stored_policy_as_it_was() {
             })
         })
         .collect();
+    // The third element is what the refusal's MESSAGE must carry. Every refusal here is
+    // one shape (`BadRequestException`) under one `errorCode`, so the message is the only
+    // thing that tells the conditions apart, which makes its wording part of the
+    // contract: a value outside its member's vocabulary is reported as
+    // `<Member> <value> is invalid` (asserted whole), and a structural refusal names the
+    // member it is about.
     let cases: Vec<(&str, Value, &str)> = vec![
         (
             "an action that is not an application permission",
             json!([{ "actions": ["DeleteApplication"], "principals": ["123456789012"] }]),
-            "Actions",
+            "Action DeleteApplication is invalid",
         ),
         (
             "an action of another service",
             json!([{ "actions": ["s3:GetObject"], "principals": ["123456789012"] }]),
-            "Actions",
+            "Action s3:GetObject is invalid",
         ),
         (
             "a permission misspelled in case",
             json!([{ "actions": ["deploy"], "principals": ["123456789012"] }]),
-            "Actions",
+            "Action deploy is invalid",
+        ),
+        (
+            "an action this service has no operation for",
+            json!([{ "actions": ["Undeploy"], "principals": ["123456789012"] }]),
+            "Action Undeploy is invalid",
+        ),
+        (
+            "one ungrantable action beside grantable ones",
+            json!([{
+                "actions": ["Deploy", "GetApplication", "CreateApplication"],
+                "principals": ["123456789012"]
+            }]),
+            "Action CreateApplication is invalid",
         ),
         (
             "no actions at all",
@@ -543,12 +569,12 @@ async fn a_refused_policy_leaves_the_stored_policy_as_it_was() {
         (
             "a principal that is not an account id",
             json!([{ "actions": ["Deploy"], "principals": ["not-an-account"] }]),
-            "Principals",
+            "Principal not-an-account is invalid",
         ),
         (
             "an account id of the wrong length",
             json!([{ "actions": ["Deploy"], "principals": ["12345"] }]),
-            "Principals",
+            "Principal 12345 is invalid",
         ),
         (
             "a principal with one bad entry among good ones",
@@ -556,7 +582,15 @@ async fn a_refused_policy_leaves_the_stored_policy_as_it_was() {
                 "actions": ["Deploy"],
                 "principals": ["123456789012", "1234567890123"]
             }]),
-            "Principals",
+            "Principal 1234567890123 is invalid",
+        ),
+        (
+            "a principal written as an IAM ARN",
+            json!([{
+                "actions": ["Deploy"],
+                "principals": ["arn:aws:iam::123456789012:root"]
+            }]),
+            "Principal arn:aws:iam::123456789012:root is invalid",
         ),
         (
             "an organization id that is not one",
@@ -565,7 +599,7 @@ async fn a_refused_policy_leaves_the_stored_policy_as_it_was() {
                 "principals": ["*"],
                 "principalOrgIDs": ["org-12345"]
             }]),
-            "PrincipalOrgIDs",
+            "PrincipalOrgID org-12345 is invalid",
         ),
         (
             "an organization id too short for the condition key",
@@ -574,7 +608,7 @@ async fn a_refused_policy_leaves_the_stored_policy_as_it_was() {
                 "principals": ["*"],
                 "principalOrgIDs": ["o-abc"]
             }]),
-            "PrincipalOrgIDs",
+            "PrincipalOrgID o-abc is invalid",
         ),
         (
             "two statements under one statementId",
@@ -630,7 +664,7 @@ async fn a_refused_policy_leaves_the_stored_policy_as_it_was() {
         let message = refused.at("message").as_str().unwrap_or_default().to_string();
         assert!(
             message.contains(member),
-            "case {case:?}: the refusal must name the member {member}, got {message:?}"
+            "case {case:?}: the refusal must say {member:?}, got {message:?}"
         );
 
         let after = get_policy(&repo, &application_id).await;
@@ -664,6 +698,130 @@ async fn a_refused_policy_leaves_the_stored_policy_as_it_was() {
         "the accepted policy replaced the stored one, got {}",
         accepted.body
     );
+}
+
+/// RULE 5's other half: the account that OWNS the application cannot be a principal of
+/// that application's own policy — a resource policy grants access to OTHER accounts, and
+/// the owner's own access does not come from it. Refused with the service's own wording,
+/// which is what separates this condition from the other `BadRequestException`s.
+///
+/// The rows differ along where the owner appears: alone, beside another account, in a
+/// later statement of the policy, and with organization ids beside it; in each case the
+/// stored policy is untouched.
+#[tokio::test]
+async fn the_applications_own_owner_cannot_be_a_principal() {
+    let repo = Repo::new();
+    let application_id = created(&repo, "policy-owner-principal").await;
+    // The owner is the account field of the application's own ARN.
+    let owner = application_id
+        .split(':')
+        .nth(4)
+        .expect("an ApplicationId is an ARN with an account field")
+        .to_string();
+    assert!(
+        !owner.is_empty(),
+        "the owner account must be readable from {application_id:?}"
+    );
+
+    let kept = json!([{
+        "actions": ["Deploy"],
+        "principals": ["123456789012"],
+        "statementId": "granted-to-another-account"
+    }]);
+    let accepted = put_policy(&repo, &application_id, kept).await;
+    assert_eq!(
+        accepted.status, 200,
+        "the policy to be kept: expected 200, got {} with {}",
+        accepted.status, accepted.body
+    );
+    let stored = statements_of(&accepted);
+
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "the owner as the only principal",
+            json!([{ "actions": ["Deploy"], "principals": [&owner] }]),
+        ),
+        (
+            "the owner beside another account",
+            json!([{
+                "actions": ["GetApplication"],
+                "principals": ["123456789012", &owner]
+            }]),
+        ),
+        (
+            "the owner in a later statement of the policy",
+            json!([
+                { "actions": ["Deploy"], "principals": ["123456789012"] },
+                {
+                    "actions": ["SearchApplications"],
+                    "principals": [&owner],
+                    "statementId": "the-owner"
+                }
+            ]),
+        ),
+        (
+            "the owner with organization ids beside it",
+            json!([{
+                "actions": ["Deploy"],
+                "principals": [&owner],
+                "principalOrgIDs": ["o-abcde12345"]
+            }]),
+        ),
+    ];
+
+    for (case, requested) in &cases {
+        let refused = put_policy(&repo, &application_id, requested.clone()).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected 400, got {} with {}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.at("__type").as_str().unwrap_or_default(),
+            "BadRequestException",
+            "case {case:?}: expected the modelled shape BadRequestException, got {}",
+            refused.body
+        );
+        assert_eq!(
+            refused.at("errorCode").as_str().unwrap_or_default(),
+            "InvalidRequestException",
+            "case {case:?}: errorCode must name the condition, got {}",
+            refused.body
+        );
+        assert_eq!(
+            refused.at("message").as_str().unwrap_or_default(),
+            "You cannot set principal to resource owner",
+            "case {case:?}: the message is what separates this condition from the other \
+             BadRequestExceptions, got {}",
+            refused.body
+        );
+
+        let after = get_policy(&repo, &application_id).await;
+        assert_eq!(
+            statements_of(&after),
+            stored,
+            "case {case:?}: a refused put must leave the stored policy as it was, got {}",
+            after.body
+        );
+    }
+
+    // The public principal is NOT the owner, and every other account is still grantable.
+    for (case, principals) in [
+        ("the public principal", json!(["*"])),
+        ("another account", json!(["210987654321"])),
+    ] {
+        let accepted = put_policy(
+            &repo,
+            &application_id,
+            json!([{ "actions": ["Deploy"], "principals": principals }]),
+        )
+        .await;
+        assert_eq!(
+            accepted.status, 200,
+            "case {case:?}: expected 200, got {} with {}",
+            accepted.status, accepted.body
+        );
+    }
 }
 
 /// RULE 6: a policy of an application the catalogue does not hold is a 404 naming the id
@@ -717,3 +875,4 @@ async fn a_policy_of_an_absent_application_is_not_found() {
         }
     }
 }
+

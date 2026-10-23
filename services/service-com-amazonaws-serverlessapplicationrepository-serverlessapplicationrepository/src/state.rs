@@ -672,7 +672,9 @@ pub const MAX_STATEMENT_ID_LENGTH: usize = 128;
 /// * an action must be an application permission ([`APPLICATION_PERMISSIONS`]);
 /// * a principal is "an array of AWS account IDs, or * to make the application public"
 ///   (`smithy_query(query="doc", shape="ApplicationPolicyStatement", member="Principals")`),
-///   so it is a 12-digit account id or `*`;
+///   so it is a 12-digit account id or `*`, and never the account that OWNS the
+///   application: a resource policy grants access to OTHER principals, and the owner's
+///   own access does not come from it;
 /// * a `PrincipalOrgIDs` entry "corresponds to AWS IAM aws:PrincipalOrgID" (the same
 ///   query on that member), whose value is an organization id, `o-` and 10 to 32
 ///   lowercase alphanumerics;
@@ -681,8 +683,15 @@ pub const MAX_STATEMENT_ID_LENGTH: usize = 128;
 ///
 /// Nothing is written until every statement passes, so a refused put leaves the stored
 /// policy untouched.
+///
+/// Every one of these refusals is carried by one modelled shape, `BadRequestException`,
+/// under one `errorCode`, so the MESSAGE is the only thing that tells the conditions
+/// apart — which makes its wording part of the contract. A value outside its member's
+/// vocabulary is reported as `<Member> <value> is invalid`, and a principal that is the
+/// application's own owner as [`PRINCIPAL_IS_OWNER_MESSAGE`].
 pub fn validate_policy_statements(
     statements: &[ApplicationPolicyStatement],
+    owner_account: &str,
 ) -> Result<Vec<PolicyStatement>, String> {
     if statements.len() > MAX_POLICY_STATEMENTS {
         return Err(format!(
@@ -697,19 +706,17 @@ pub fn validate_policy_statements(
         for action in &statement.actions {
             let permission = action.strip_prefix(ACTION_PREFIX).unwrap_or(action);
             if !APPLICATION_PERMISSIONS.contains(&permission) {
-                return Err(format!(
-                    "Actions must each be one of the application permissions [{}], got {action}",
-                    APPLICATION_PERMISSIONS.join(", ")
-                ));
+                return Err(format!("Action {action} is invalid"));
             }
         }
 
         bounded_entries("Principals", statement.principals.len())?;
         for principal in &statement.principals {
             if !is_principal(principal) {
-                return Err(format!(
-                    "Principals must each be a 12-digit AWS account ID or *, got {principal}"
-                ));
+                return Err(format!("Principal {principal} is invalid"));
+            }
+            if principal == owner_account {
+                return Err(PRINCIPAL_IS_OWNER_MESSAGE.to_string());
             }
         }
 
@@ -718,10 +725,7 @@ pub fn validate_policy_statements(
             bounded_entries("PrincipalOrgIDs", principal_org_ids.len())?;
             for organization_id in &principal_org_ids {
                 if !is_organization_id(organization_id) {
-                    return Err(format!(
-                        "PrincipalOrgIDs must each be an AWS organization ID matching \
-                         ^o-[a-z0-9]{{10,32}}$, got {organization_id}"
-                    ));
+                    return Err(format!("PrincipalOrgID {organization_id} is invalid"));
                 }
             }
         }
@@ -749,6 +753,21 @@ pub fn validate_policy_statements(
     }
 
     Ok(stored)
+}
+
+/// The wording a statement granting to the application's own owner is refused with.
+///
+/// A resource policy grants access to OTHER principals; the account that owns the
+/// application already has that access and cannot be a principal of its own
+/// application's policy. This is the service's own wording for the condition, and it is
+/// the only thing that separates it from the other refusals of this operation, which all
+/// share `BadRequestException` and one `errorCode`.
+pub const PRINCIPAL_IS_OWNER_MESSAGE: &str = "You cannot set principal to resource owner";
+
+/// The account that owns the resource an ARN names: an ARN's fifth colon-separated field
+/// (`arn:<partition>:<service>:<region>:<account>:<resource>`).
+pub fn arn_account_id(arn: &str) -> Option<&str> {
+    arn.split(':').nth(4)
 }
 
 /// A list member of a policy statement carries at least one entry and at most

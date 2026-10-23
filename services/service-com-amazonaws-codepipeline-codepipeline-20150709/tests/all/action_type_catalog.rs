@@ -652,3 +652,4 @@ async fn the_accounts_registration_store_is_bounded() {
         "the listing must report only the registrations it was asked for, got {listed}"
     );
 }
+
