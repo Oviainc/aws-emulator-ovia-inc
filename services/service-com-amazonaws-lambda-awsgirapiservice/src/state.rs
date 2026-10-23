@@ -138,6 +138,17 @@ pub const MAX_PAGE_SIZE: usize = 50;
 /// total code storage of an account and answers the same modelled error there.
 pub const MAX_FUNCTIONS: usize = 1_000;
 
+/// The most published versions this emulator keeps for one function.
+///
+/// An EMULATOR-CHOSEN ceiling for the same reason as [`MAX_FUNCTIONS`], and bounding
+/// the same way: every `PublishVersion` keeps a whole configuration snapshot in memory,
+/// including for a package whose bytes this emulator holds none of (so one that counts
+/// zero against the account's code-storage quota), and past this point the slice answers
+/// the modelled `CodeStorageExceededException` rather than growing without bound. AWS
+/// bounds a function's versions by that code-storage quota instead, and answers the same
+/// modelled error.
+pub const MAX_FUNCTION_VERSIONS: usize = 500;
+
 /// `AccountLimit$TotalCodeSize` — "The amount of storage space that you can use for all
 /// deployment packages and layer archives", in bytes.
 ///

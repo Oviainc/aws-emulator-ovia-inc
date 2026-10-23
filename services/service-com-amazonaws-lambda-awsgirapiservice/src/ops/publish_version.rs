@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PublishVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PublishVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PublishVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Freezes the function's current (`$LATEST`) code and configuration as a new numbered
+//! version in [`crate::state`] and answers with the snapshot it stored. The version
+//! numbering, the snapshot itself and the "nothing changed, nothing published" rule all
+//! come out of the record [`crate::ops::create_function`] persisted — nothing here is
+//! computed from anything but stored state.
 //!
 //! ## Shape of an operation
 //!
@@ -284,18 +281,280 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PublishVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PublishVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `PublishTo` is modelled with a single sentence ("Specifies where to publish
+        // the function version or configuration") and its only value,
+        // `LATEST_PUBLISHED`, names a destination this operation's own `Version` output
+        // member cannot even express (`^(\$LATEST|[0-9]+)$`). Nothing in the model says
+        // what publishing there does, so this emulator answers the scaffold's 501 for
+        // that member rather than inventing behaviour for it; every request that does
+        // not name it is served below.
+        if let Some(publish_to) = input.publish_to.as_deref() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "PublishVersion with PublishTo={publish_to}"
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PublishVersionErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+
+        let reference = crate::state::parse_function_reference(&input.function_name)
+            .ok_or_else(|| {
+                invalid_parameter(format!(
+                    "1 validation error detected: Value '{}' at 'functionName' failed to \
+                     satisfy constraint: Member must satisfy one of the documented name \
+                     formats (name, name:qualifier, partial ARN or function ARN)",
+                    input.function_name
+                ))
+            })?;
+
+        // "Creates a version from the current code and configuration of a function":
+        // the source of a new version is always the unpublished version, so a name
+        // qualified with anything else names no publishable configuration.
+        if let Some(qualifier) = reference
+            .qualifier
+            .as_deref()
+            .filter(|qualifier| *qualifier != crate::state::VERSION_LATEST)
+        {
+            return Err(invalid_parameter(format!(
+                "PublishVersion publishes the unpublished {latest} configuration, and the \
+                 qualifier '{qualifier}' in 'functionName' names a published version or an \
+                 alias",
+                latest = crate::state::VERSION_LATEST
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The storage this account already uses, measured BEFORE this call adds a
+        // snapshot to it (`AccountUsage$TotalCodeSize` counts every published version).
+        let used_code_size = store.account_usage().total_code_size;
+        let code_size_limit = store.account_limit().total_code_size;
+
+        let Some(record) = store.functions.get_mut(&reference.name) else {
+            return Err(PublishVersionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(format!(
+                        "Function not found: {}",
+                        crate::state::function_arn(&region, &reference.name)
+                    )),
+                },
+            )
+            .into());
+        };
+        record.materialize(now);
+
+        // "Only update the function if the revision ID matches the ID that's specified."
+        // A mismatch is the one failure `PreconditionFailedException` is modelled for:
+        // "The RevisionId provided does not match the latest RevisionId for the Lambda
+        // function or alias."
+        if let Some(expected) = input
+            .revision_id
+            .as_deref()
+            .filter(|expected| *expected != record.config.revision_id)
+        {
+            return Err(PublishVersionErrorModeled::PreconditionFailedException(
+                PreconditionFailedException {
+                    r#type: None,
+                    message: Some(format!(
+                        "The RevisionId provided ({expected}) does not match the latest \
+                         RevisionId for the Lambda function. Call the GetFunction API to \
+                         retrieve the latest RevisionId for your resource."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Only publish a version if the hash value matches the value that's
+        // specified." The digest is the one computed from the stored deployment package,
+        // so a function whose package this emulator holds no bytes for can match no
+        // hash at all.
+        if let Some(expected) = input.code_sha256.as_deref() {
+            match record.config.code_sha256.as_deref() {
+                Some(stored) if stored == expected => {}
+                Some(stored) => {
+                    return Err(invalid_parameter(format!(
+                        "CodeSha256 '{expected}' does not match the SHA256 of the function's \
+                         deployment package, which is '{stored}'"
+                    )))
+                }
+                None => {
+                    return Err(invalid_parameter(format!(
+                        "CodeSha256 '{expected}' cannot be matched: no deployment package \
+                         bytes are stored for this function, so it has no SHA256 to compare"
+                    )))
+                }
+            }
+        }
+
+        // "A description for the version to override the description in the function
+        // configuration": the override belongs to the snapshot, and the unpublished
+        // configuration keeps its own description.
+        let description = input
+            .description
+            .clone()
+            .or_else(|| record.config.description.clone());
+
+        // "Lambda doesn't publish a version if the function's configuration and code
+        // haven't changed since the LAST version." A new revision id is minted on every
+        // change to a function's code or configuration, so the last version froze the
+        // configuration this call would freeze exactly when it carries the same revision
+        // and the same (possibly overridden) description — and then this call has nothing
+        // to add. The comparison is against the newest version only, as that sentence
+        // says: a configuration an OLDER version froze has changed since the last one, so
+        // publishing it again is a change and gets its own number. The ceiling below is
+        // what bounds the store, not this rule.
+        let already_published = record
+            .versions
+            .values()
+            .next_back()
+            .filter(|published| {
+                published.config.revision_id == record.config.revision_id
+                    && published.config.description == description
+            })
+            .map(|published| (published.version.to_string(), published.config.clone()));
+        if let Some((label, config)) = already_published {
+            return Ok(function_configuration(record.configuration(&label, &config)));
+        }
+
+        // Each published version keeps its own copy of the deployment package, and AWS
+        // counts every one of them against the account's code storage quota, answering
+        // `CodeStorageExceededException` ("Your Amazon Web Services account has exceeded
+        // its maximum total code size") once the sum would pass it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PublishVersion"))
+        // That quota is accounted in package bytes, and this emulator holds the whole
+        // snapshot — configuration included — in memory for a package it may hold no
+        // bytes for at all, so the per-function ceiling below bounds the store on its own
+        // terms as well, exactly as `crate::state::MAX_FUNCTIONS` bounds the function map.
+        if used_code_size.saturating_add(record.config.code_size) > code_size_limit {
+            return Err(PublishVersionErrorModeled::CodeStorageExceededException(
+                CodeStorageExceededException {
+                    r#type: None,
+                    message: Some(format!(
+                        "Code storage limit exceeded: publishing this version would take the \
+                         account past its total code size limit of {code_size_limit} bytes."
+                    )),
+                },
+            )
+            .into());
+        }
+        if record.versions.len() >= crate::state::MAX_FUNCTION_VERSIONS {
+            return Err(PublishVersionErrorModeled::CodeStorageExceededException(
+                CodeStorageExceededException {
+                    r#type: None,
+                    message: Some(format!(
+                        "Code storage limit exceeded: this function already holds the maximum \
+                         of {} published versions.",
+                        crate::state::MAX_FUNCTION_VERSIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Versions are numbered from 1 upwards and a number is never reused, so the next
+        // one follows the highest ever published rather than the count held.
+        let Some(version_number) = record.latest_version.checked_add(1) else {
+            return Err(PublishVersionErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some(
+                    "No further version number can be assigned to this function".to_string(),
+                ),
+            })
+            .into());
+        };
+        let mut config = record.config.clone();
+        config.description = description;
+        record.versions.insert(
+            version_number,
+            crate::state::FunctionVersionRecord {
+                version: version_number,
+                config,
+                created: crate::state::iso8601(now),
+            },
+        );
+        record.latest_version = version_number;
+
+        // Answered by reading the snapshot back out of the record, so GetFunction on the
+        // new version reports exactly what this call persisted.
+        let label = version_number.to_string();
+        let Some(config) = record.config_of(&label).cloned() else {
+            return Err(PublishVersionErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("The published version could not be read back".to_string()),
+            })
+            .into());
+        };
+        Ok(function_configuration(record.configuration(&label, &config)))
+    }
+}
+
+/// The modelled 400 this operation answers a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> PublishVersionError {
+    PublishVersionErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The one `FunctionConfiguration` the model declares, in this operation's own
+/// generated shape of it.
+///
+/// [`crate::state::FunctionRecord::configuration`] builds the shared
+/// `FunctionConfiguration` (generated as `CreateFunctionOutput`) that every operation
+/// reporting a function answers with; this operation's output is generated as its own
+/// struct over the same shape, so the members are carried across one for one rather
+/// than rebuilt from state a second time.
+fn function_configuration(configuration: CreateFunctionOutput) -> PublishVersionOutput {
+    PublishVersionOutput {
+        function_name: configuration.function_name,
+        function_arn: configuration.function_arn,
+        runtime: configuration.runtime,
+        role: configuration.role,
+        handler: configuration.handler,
+        code_size: configuration.code_size,
+        description: configuration.description,
+        timeout: configuration.timeout,
+        memory_size: configuration.memory_size,
+        last_modified: configuration.last_modified,
+        code_sha256: configuration.code_sha256,
+        version: configuration.version,
+        vpc_config: configuration.vpc_config,
+        dead_letter_config: configuration.dead_letter_config,
+        environment: configuration.environment,
+        kms_key_arn: configuration.kms_key_arn,
+        tracing_config: configuration.tracing_config,
+        master_arn: configuration.master_arn,
+        revision_id: configuration.revision_id,
+        layers: configuration.layers,
+        state: configuration.state,
+        state_reason: configuration.state_reason,
+        state_reason_code: configuration.state_reason_code,
+        last_update_status: configuration.last_update_status,
+        last_update_status_reason: configuration.last_update_status_reason,
+        last_update_status_reason_code: configuration.last_update_status_reason_code,
+        file_system_configs: configuration.file_system_configs,
+        signing_profile_version_arn: configuration.signing_profile_version_arn,
+        signing_job_arn: configuration.signing_job_arn,
+        package_type: configuration.package_type,
+        image_config_response: configuration.image_config_response,
+        architectures: configuration.architectures,
+        ephemeral_storage: configuration.ephemeral_storage,
+        snap_start: configuration.snap_start,
+        runtime_version_config: configuration.runtime_version_config,
+        logging_config: configuration.logging_config,
+        tenancy_config: configuration.tenancy_config,
+        capacity_provider_config: configuration.capacity_provider_config,
+        config_sha256: configuration.config_sha256,
+        durable_config: configuration.durable_config,
     }
 }
