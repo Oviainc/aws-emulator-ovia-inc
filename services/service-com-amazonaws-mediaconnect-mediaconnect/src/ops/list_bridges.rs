@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBridges
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBridges`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBridges::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of the bridges [`crate::state`] holds, in a stable order, optionally
+//! filtered to the ones associated with one ARN: every summary is the stored bridge's own
+//! record projected into `ListedBridge`.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +90,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page ListBridges returns: the maximum of the modelled `MaxResults` range
+/// (1..1000).
+const MAX_PAGE_SIZE: i32 = 1000;
+
+/// The page size ListBridges uses when the request names none: "If MaxResults is not
+/// included in the request, the service defaults to pagination with a maximum of 10
+/// results per page"
+/// (`smithy_query(query="doc",shape="ListBridgesRequest",member="MaxResults")`).
+const DEFAULT_PAGE_SIZE: i32 = 10;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -167,18 +172,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBridges` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBridgesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBridges"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListBridgesErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect bridge store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The ONLY write this reporting operation makes: a bridge state change the clock
+        // already made due (see `crate::state::TRANSITION_SPAN`) was owed at that instant
+        // whether or not anybody called, so the listed state is the current one.
+        store.settle_due_transitions(::std::time::SystemTime::now());
+
+        // `NextToken` is the ARN this listing resumes at, so a token the service never
+        // minted is a semantic error, not a key to page from — the same rule ListGateways
+        // applies to its own token. The bridge it names may have been deleted in between;
+        // paging survives that, which is why the check is on the token's FORM and not on
+        // the store.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_mintable_bridge_arn(token) {
+                return Err(ListBridgesErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: crate::state::validation_failed_message(&format!(
+                            "Invalid NextToken {token:?}. A pagination token must be one this \
+                             service issued."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Defence in depth: the modelled `MaxResults` range (1..1000) is already
+        // enforced at the boundary, so an out-of-range value is refused with a 400 before
+        // this handler runs and the clamp below never fires on a real request.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(DEFAULT_PAGE_SIZE)
+                .clamp(1, MAX_PAGE_SIZE),
+        )
+        .unwrap_or(1);
+
+        // "Filter the list results to display only the bridges associated with the
+        // selected ARN": the ARN a bridge is associated with is its placement
+        // (`ListedBridge$PlacementArn`: "the ARN of the gateway associated with the
+        // bridge"), so the filter keeps the bridges placed on that gateway and no other.
+        let filter_arn = input.filter_arn.as_deref();
+
+        // The token is the ARN of the first bridge of the NEXT page, so paging resumes at
+        // that key even if bridges were created or deleted in between. With no token the
+        // walk starts before every minted ARN, which is what the empty key is.
+        let resume_at = input.next_token.clone().unwrap_or_default();
+        let mut bridges: Vec<ListedBridge> = Vec::new();
+        let mut next_token: Option<String> = None;
+        for (bridge_arn, bridge) in store.bridges.range(resume_at..) {
+            if filter_arn.is_some_and(|arn| bridge.placement_arn != arn) {
+                continue;
+            }
+            if bridges.len() == page_size {
+                next_token = Some(bridge_arn.clone());
+                break;
+            }
+            bridges.push(bridge.to_listed_bridge());
+        }
+
+        Ok(ListBridgesOutput {
+            bridges: Some(bridges),
+            next_token,
+        })
     }
 }

@@ -28,7 +28,7 @@ use crate::flow_lifecycle::{Emulator, REGION};
 /// it, so it satisfies the pattern the model puts on
 /// `AddBridgeFlowSourceRequest$FlowArn` (`^arn:.+:mediaconnect.+:flow:.+$`) the way a
 /// real CreateFlow answer would.
-fn minted_flow_arn(suffix: u64, name: &str) -> String {
+pub(crate) fn minted_flow_arn(suffix: u64, name: &str) -> String {
     engine::emulator_arn(
         mc::SERVICE_NAMESPACE,
         REGION,
@@ -38,7 +38,7 @@ fn minted_flow_arn(suffix: u64, name: &str) -> String {
 
 /// A gateway ARN of the form this service mints — what a bridge's `PlacementArn` names
 /// (`ListedBridge$PlacementArn`: "the ARN of the gateway associated with the bridge").
-fn minted_gateway_arn(suffix: u64, name: &str) -> String {
+pub(crate) fn minted_gateway_arn(suffix: u64, name: &str) -> String {
     engine::emulator_arn(
         mc::SERVICE_NAMESPACE,
         REGION,
@@ -81,11 +81,11 @@ fn assert_minted_bridge_arn(case: &str, arn: &str, name: &str) {
     );
 }
 
-async fn create_bridge(emulator: &Emulator, body: Value) -> (u16, Option<String>, Value) {
+pub(crate) async fn create_bridge(emulator: &Emulator, body: Value) -> (u16, Option<String>, Value) {
     emulator.send("POST", "/v1/bridges", Some(body)).await
 }
 
-async fn describe_bridge(emulator: &Emulator, arn: &str) -> (u16, Option<String>, Value) {
+pub(crate) async fn describe_bridge(emulator: &Emulator, arn: &str) -> (u16, Option<String>, Value) {
     emulator
         .send("GET", &format!("/v1/bridges/{arn}"), None)
         .await

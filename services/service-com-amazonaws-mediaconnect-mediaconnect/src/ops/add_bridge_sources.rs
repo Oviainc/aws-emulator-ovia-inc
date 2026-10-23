@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddBridgeSources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddBridgeSources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddBridgeSources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Appends sources to a bridge the store holds and answers with the sources it appended,
+//! read back out of [`crate::state`]: the sources DescribeBridge reports afterwards are
+//! the bridge's own ones plus these.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +78,36 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> AddBridgeSourcesError {
+    AddBridgeSourcesErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
+/// in the request does not exist in the system" — the bridge `identifier` addressed, in
+/// this service's not-found envelope ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> AddBridgeSourcesError {
+    AddBridgeSourcesErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
+
+/// The server-side refusal this operation answers when the store cannot be reached or a
+/// bridge it just read cannot be read back (HTTP 500).
+fn internal_error(message: &str) -> AddBridgeSourcesError {
+    AddBridgeSourcesErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: message.to_string(),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -158,18 +183,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddBridgeSources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddBridgeSourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddBridgeSources"))
+        // Nothing in this operation's answer depends on request metadata: the bridge is
+        // addressed by an `@httpLabel` the deserializer already put on `input`, and the
+        // response is read back out of the stored bridge.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error("the mediaconnect bridge store is unavailable"));
+        };
+
+        // "The sources that you want to add to this bridge": a request that adds no source
+        // has nothing to do, which is a semantic error rather than a no-op — the same rule
+        // AddFlowSources applies to its own required list.
+        if input.sources.is_empty() {
+            return Err(bad_request(
+                "An add bridge sources request must include at least one source.",
+            ));
+        }
+
+        let mut store = state.lock();
+        // The bridge state change the clock already owes is materialised before the bridge
+        // is read, exactly as the reporting operations do it (see
+        // `crate::state::TRANSITION_SPAN`).
+        store.settle_due_transitions(::std::time::SystemTime::now());
+
+        // This operation adds sources to "an existing bridge", addressed by the bridge's
+        // own ARN.
+        let Some(bridge) = store.bridges.get(&input.bridge_arn) else {
+            return Err(not_found(&input.bridge_arn));
+        };
+
+        // The bound is on the STORED bridge, so it counts the sources already stored plus
+        // the ones this request would add (see `crate::state::MAX_BRIDGE_SOURCES`).
+        let held = bridge.sources.len();
+        if held + input.sources.len() > crate::state::MAX_BRIDGE_SOURCES {
+            return Err(bad_request(format!(
+                "A bridge can hold at most {} sources; bridge {} already has {held} and \
+                 this request adds {}.",
+                crate::state::MAX_BRIDGE_SOURCES,
+                input.bridge_arn,
+                input.sources.len()
+            )));
+        }
+
+        // Each entry configures ONE kind of source, and a source is addressed by its name:
+        // `AddBridgeNetworkSourceRequest$Name` / `AddBridgeFlowSourceRequest$Name` "is used
+        // to reference the source and must be unique among sources in this bridge" — so a
+        // name is checked against the names the bridge ALREADY holds as well as the ones
+        // resolved for earlier entries of this same request.
+        let mut taken = bridge.source_names();
+        let mut added: Vec<BridgeSource> = Vec::with_capacity(input.sources.len());
+        for request in &input.sources {
+            let Some(source) = crate::state::materialise_bridge_source(request) else {
+                return Err(bad_request(
+                    "Each entry of Sources must name exactly one of FlowSource and \
+                     NetworkSource.",
+                ));
+            };
+            let name = crate::state::bridge_source_name(&source);
+            if !crate::state::is_valid_bridge_member_name(name) {
+                return Err(bad_request(format!(
+                    "Invalid bridge source name {name:?}. A source name must not be empty \
+                     and must not contain '/'."
+                )));
+            }
+            if !taken.insert(name.to_string()) {
+                return Err(bad_request(format!(
+                    "A source name must be unique among the sources of one bridge; {name:?} \
+                     is already in use."
+                )));
+            }
+            added.push(source);
+        }
+
+        // Nothing above wrote anything, so a refused request leaves the bridge exactly as
+        // it was. From here the whole batch is stored.
+        let Some(bridge) = store.bridges.get_mut(&input.bridge_arn) else {
+            return Err(internal_error(
+                "the bridge could not be read back while adding its sources",
+            ));
+        };
+        let first_added = bridge.sources.len();
+        bridge.sources.extend(added);
+
+        // "The sources that you added to this bridge" — read back out of the STORED bridge
+        // rather than echoed from the request, and only the sources this call appended.
+        // Adding a source moves nothing else about the bridge: its state is left as it was,
+        // because no clock owes a change for an added source.
+        let sources: Vec<BridgeSource> = bridge.sources[first_added..].to_vec();
+        Ok(AddBridgeSourcesOutput {
+            bridge_arn: Some(bridge.bridge_arn.clone()),
+            sources: Some(sources),
+        })
     }
 }
