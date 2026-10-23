@@ -47,6 +47,8 @@ mod malware_scan_settings;
 mod member_accounts;
 #[path = "all/member_association.rs"]
 mod member_association;
+#[path = "all/member_creation.rs"]
+mod member_creation;
 #[path = "all/modeled_constraint_refusals.rs"]
 mod modeled_constraint_refusals;
 #[path = "all/publishing_destination_lifecycle.rs"]
