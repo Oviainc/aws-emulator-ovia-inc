@@ -365,15 +365,40 @@ pub const PIPELINE_EXECUTION_ENDS_AFTER: Duration = Duration::from_millis(400);
 /// A pipeline's steps are training, processing, transform, Lambda and callback work run
 /// outside SageMaker's control plane, and this emulator has no runtime that performs any
 /// of it. So an accepted execution is never reported `Succeeded`: nothing ran its steps,
-/// and a success status, a step list or an output artifact for work nothing performed
+/// and a success status, a job ARN, a step output or a runtime for work nothing performed
 /// would be fabricated. The execution instead ends in the modelled failure state with
-/// this reason, which says exactly that. Within the modelled
-/// `PipelineExecutionFailureReason` length (0..1300).
+/// this reason, which says exactly that, and the steps the run was to perform report the
+/// same failure state and the same reason — see [`step_status_of_execution`] and
+/// [`pipeline_definition_step_declarations`], which is what
+/// `ListPipelineExecutionSteps` reports them from. Within the modelled
+/// `PipelineExecutionFailureReason` length (0..1300), and within the shorter
+/// `FailureReason` (0..1024) a step execution reports it under.
 pub const PIPELINE_EXECUTION_NOT_RUN: &str =
     "The pipeline execution was accepted but no step of it ran: this emulator has no \
      runtime that performs a pipeline step's work (training, processing, transform, \
      Lambda or callback), so the execution ended Failed rather than reporting work that \
      did not happen.";
+
+/// The `StepStatus` the steps of an execution in `execution_status` report, or `None`
+/// while that execution has reached no step at all.
+///
+/// A step execution belongs to the run that performs it, so its status follows the run's:
+/// `PipelineExecutionStatus` and `StepStatus` share every member
+/// (`smithy_query(query="shape",shape="StepStatus")` answers `Starting`, `Executing`,
+/// `Stopping`, `Stopped`, `Failed`, `Succeeded`) but `CompletedWithFailures`, which names
+/// no step's own outcome. An execution still [`PIPELINE_EXECUTION_STATUS_EXECUTING`] has
+/// reached no step yet — the clock has not settled it, so nothing about any step of it is
+/// known — and a status with no `StepStatus` member of its own reports no step rather
+/// than one in a status the model does not name.
+pub fn step_status_of_execution(execution_status: &str) -> Option<&'static str> {
+    if execution_status == PIPELINE_EXECUTION_STATUS_EXECUTING {
+        return None;
+    }
+    crate::ops::types::STEP_STATUS_VALUES
+        .iter()
+        .copied()
+        .find(|member| *member == execution_status)
+}
 
 /// See [`MODEL_QUOTA`]. Bounds the pipeline-execution store, so a caller starting
 /// executions cannot grow it without end; `StartPipelineExecution` refuses past it with
@@ -2760,6 +2785,33 @@ pub fn pipeline_execution_arn(pipeline_arn: &str, execution_id: &str) -> String 
 /// then whatever it resolved before the violation; a definition that reached the store
 /// was accepted by that validator, so this walk reports none.
 pub fn pipeline_definition_step_names(definition: &str) -> Vec<String> {
+    pipeline_definition_step_declarations(definition)
+        .into_iter()
+        .map(|step| step.name)
+        .collect()
+}
+
+/// One step a pipeline definition declares, in the members a step EXECUTION of it
+/// reports: the name it is addressed by, plus the display name and description the
+/// definition optionally gives it.
+///
+/// `PipelineExecutionStep` carries exactly these three as `StepName`,
+/// `StepDisplayName` and `StepDescription`
+/// (`smithy_query(query="shape",shape="PipelineExecutionStep")`), and a definition's step
+/// object carries them under `Name`, `DisplayName` and `Description` — the keys the
+/// SageMaker Python SDK's `Step` serialises its own `name`, `display_name` and
+/// `description` to. A step that declares neither optional key reports neither member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineStepDeclaration {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Every step a pipeline definition declares, in declaration order, as the control plane
+/// knows it — the same walk (and so the same order and the same one step-name namespace)
+/// [`pipeline_definition_step_names`] reports the names of.
+pub fn pipeline_definition_step_declarations(definition: &str) -> Vec<PipelineStepDeclaration> {
     let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(definition) else {
         return Vec::new();
     };
@@ -2771,7 +2823,11 @@ pub fn pipeline_definition_step_names(definition: &str) -> Vec<String> {
     declared
         .steps
         .iter()
-        .map(|step| step.name.to_string())
+        .map(|step| PipelineStepDeclaration {
+            name: step.name.to_string(),
+            display_name: step.display_name.map(str::to_string),
+            description: step.description.map(str::to_string),
+        })
         .collect()
 }
 
@@ -2799,11 +2855,14 @@ pub fn pipeline_definition_parameter_names(definition: &str) -> Vec<String> {
 }
 
 /// One step of a pipeline definition, reduced to what the dependency graph is built
-/// from: the name it declares and the step names it depends on, borrowed from the parsed
-/// document so a large definition is not copied to walk it.
+/// from and what a step execution of it reports: the name it declares, the step names it
+/// depends on, and the display name and description it optionally carries — all borrowed
+/// from the parsed document so a large definition is not copied to walk it.
 struct PipelineStep<'a> {
     name: &'a str,
     depends_on: Vec<&'a str>,
+    display_name: Option<&'a str>,
+    description: Option<&'a str>,
 }
 
 /// Every step one definition declares, in declaration order, plus the index that makes
@@ -2893,7 +2952,16 @@ fn collect_pipeline_steps<'a>(
             }
         }
         out.by_name.insert(name, out.steps.len());
-        out.steps.push(PipelineStep { name, depends_on });
+        out.steps.push(PipelineStep {
+            name,
+            depends_on,
+            display_name: member
+                .get("DisplayName")
+                .and_then(::serde_json::Value::as_str),
+            description: member
+                .get("Description")
+                .and_then(::serde_json::Value::as_str),
+        });
 
         // Only a condition step holds steps of its own, and only under the two branch
         // keys the schema gives it: any other step's `Arguments` are its own payload,

@@ -77,6 +77,8 @@ mod list_code_repositories;
 mod list_endpoints;
 #[path = "all/list_model_packages.rs"]
 mod list_model_packages;
+#[path = "all/list_pipeline_execution_steps.rs"]
+mod list_pipeline_execution_steps;
 #[path = "all/list_training_jobs.rs"]
 mod list_training_jobs;
 #[path = "all/mlflow_app_lifecycle.rs"]
