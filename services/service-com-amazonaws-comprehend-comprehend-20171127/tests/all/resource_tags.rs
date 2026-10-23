@@ -21,6 +21,13 @@
 //! modelled bound, a tag with no value at all, keys already held versus new ones, how
 //! many), and along the keys a removal names. The recorded unit's single nonexistent
 //! resource ARN is ONE row of the not-found table.
+//!
+//! Because the map is keyed by the tag key, the order the tags were associated in is
+//! not part of it: a set reached by any order of requests is reported as the same
+//! key-ordered list, and reporting it leaves it alone. The rows of
+//! [`the_reported_map_is_one_key_order_whatever_order_the_tags_were_associated_in`]
+//! differ along exactly that — the order, the number of requests, and the number of
+//! tags.
 
 use std::collections::BTreeMap;
 
@@ -514,6 +521,117 @@ async fn a_removal_naming_more_tag_keys_than_a_resource_can_hold_is_refused() {
                 "case {case:?}: expected {expected} tags left, got {remaining:?}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn the_reported_map_is_one_key_order_whatever_order_the_tags_were_associated_in() {
+    // Rows: the SAME three-key tag set reached by different association orders and by
+    // different numbers of `TagResource` calls, a set whose keys sort the other way
+    // round from the order they were given in, a single tag, and no tags at all. The
+    // tag set is a key-value MAP, so every row that reaches the same map must be
+    // reported identically — in key order — and a read must report it again unchanged.
+    let rows: &[(&str, &[Value])] = &[
+        ("no tags at all", &[]),
+        (
+            "one tag",
+            &[json!([{ "Key": "team", "Value": "research" }])],
+        ),
+        (
+            "three tags in one request, keys ascending",
+            &[json!([
+                { "Key": "a-env", "Value": "staging" },
+                { "Key": "m-owner", "Value": "nlp" },
+                { "Key": "z-team", "Value": "research" },
+            ])],
+        ),
+        (
+            "the same three tags in one request, keys descending",
+            &[json!([
+                { "Key": "z-team", "Value": "research" },
+                { "Key": "m-owner", "Value": "nlp" },
+                { "Key": "a-env", "Value": "staging" },
+            ])],
+        ),
+        (
+            "the same three tags over three requests, in a third order",
+            &[
+                json!([{ "Key": "m-owner", "Value": "nlp" }]),
+                json!([{ "Key": "z-team", "Value": "research" }]),
+                json!([{ "Key": "a-env", "Value": "staging" }]),
+            ],
+        ),
+        (
+            "a key associated twice, the later value winning",
+            &[
+                json!([{ "Key": "z-team", "Value": "superseded" }]),
+                json!([
+                    { "Key": "a-env", "Value": "staging" },
+                    { "Key": "z-team", "Value": "research" },
+                ]),
+                json!([{ "Key": "m-owner", "Value": "nlp" }]),
+            ],
+        ),
+        (
+            // `key0..key11`: given in numeric order, these sort "key0", "key1",
+            // "key10", "key11", "key2", … so a reported key order cannot be the
+            // insertion order.
+            "twelve tags whose key order differs from the order they were given in",
+            &[tag_list("key", 12)],
+        ),
+    ];
+
+    for (case, batches) in rows {
+        let comprehend = Comprehend::new();
+        // A resource whose creation carried no `Tags`, so the reported map is exactly
+        // what these requests associated.
+        let (arn, created) = create(&comprehend, &RESOURCE_KINDS[1], "order").await;
+        assert!(
+            created.is_empty(),
+            "case {case:?}: this row's resource must start with no tags, got {created:?}"
+        );
+
+        let mut expected: TagMap = Vec::new();
+        for batch in *batches {
+            comprehend
+                .ok("TagResource", &json!({ "ResourceArn": &arn, "Tags": batch }))
+                .await;
+            expected = merged(&expected, batch);
+        }
+
+        let reported = list_tags(&comprehend, &arn, case).await;
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected the key-ordered map {expected:?}, got {reported:?}"
+        );
+        let keys: Vec<&String> = reported.iter().map(|(key, _)| key).collect();
+        assert!(
+            keys.windows(2).all(|pair| pair[0] < pair[1]),
+            "case {case:?}: the reported tags must be a set in strictly ascending key \
+             order, got {keys:?}"
+        );
+
+        // The read reports, it does not change: reading again reports the same map,
+        // and a later removal still finds every key the first read reported.
+        let again = list_tags(&comprehend, &arn, case).await;
+        assert_eq!(
+            again, reported,
+            "case {case:?}: a repeated ListTagsForResource must report {reported:?}, \
+             got {again:?}"
+        );
+        let all_keys: Vec<String> = reported.iter().map(|(key, _)| key.clone()).collect();
+        comprehend
+            .ok(
+                "UntagResource",
+                &json!({ "ResourceArn": &arn, "TagKeys": &all_keys }),
+            )
+            .await;
+        let emptied = list_tags(&comprehend, &arn, case).await;
+        assert!(
+            emptied.is_empty(),
+            "case {case:?}: removing every key the read reported must leave no tags, \
+             got {emptied:?}"
+        );
     }
 }
 
