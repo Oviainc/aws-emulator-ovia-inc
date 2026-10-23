@@ -51,6 +51,8 @@ mod email_validation_dispatch;
 mod refusal_codes_and_search_projection;
 #[path = "all/resend_validation_email.rs"]
 mod resend_validation_email;
+#[path = "all/resource_tag_input_constraints.rs"]
+mod resource_tag_input_constraints;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

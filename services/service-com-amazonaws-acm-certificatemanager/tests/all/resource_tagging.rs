@@ -50,7 +50,7 @@ const TAG_VALUE_MAX: usize = 256;
 
 /// One tagging case: what it exercises, the `Tags` the request names, and the pairs the
 /// resource must carry afterwards.
-type TagCase = (&'static str, Value, Vec<(String, String)>);
+pub(crate) type TagCase = (&'static str, Value, Vec<(String, String)>);
 
 /// One refusal case: what it exercises and the ARN the request names.
 type ArnCase = (&'static str, String);
@@ -64,7 +64,7 @@ type TagStep = (&'static str, &'static str, Value, Vec<(String, String)>);
 ///
 /// The ACME endpoint is the non-certificate resource this service persists, so it is
 /// the resource the generic tagging operations address here.
-async fn create_endpoint(router: &MultiServiceRouter, case: &str) -> String {
+pub(crate) async fn create_endpoint(router: &MultiServiceRouter, case: &str) -> String {
     let (status, response) = call(
         router,
         "CreateAcmeEndpoint",
@@ -87,7 +87,7 @@ async fn create_endpoint(router: &MultiServiceRouter, case: &str) -> String {
 
 /// A `TagList` on the wire as `(key, value)` pairs, in the order the response listed
 /// them.
-fn tag_pairs(tags: &Value) -> Vec<(String, String)> {
+pub(crate) fn tag_pairs(tags: &Value) -> Vec<(String, String)> {
     tags.as_array()
         .map(|tags| {
             tags.iter()
@@ -105,7 +105,7 @@ fn tag_pairs(tags: &Value) -> Vec<(String, String)> {
 /// The resource's stored tags, read back through `ListTagsForResource`, in the order it
 /// reported them. An untagged resource reports no `Tags` member, which is the empty
 /// vector here.
-async fn stored_tags(
+pub(crate) async fn stored_tags(
     router: &MultiServiceRouter,
     case: &str,
     arn: &str,
@@ -120,7 +120,7 @@ async fn stored_tags(
 }
 
 /// `TagResource`, asserted to succeed.
-async fn tag_resource(router: &MultiServiceRouter, case: &str, arn: &str, tags: &Value) {
+pub(crate) async fn tag_resource(router: &MultiServiceRouter, case: &str, arn: &str, tags: &Value) {
     let (status, response) = call(
         router,
         "TagResource",
@@ -135,7 +135,7 @@ async fn tag_resource(router: &MultiServiceRouter, case: &str, arn: &str, tags: 
 
 /// `(key, value)` pairs from literals, sorted by key — the order the stored map is
 /// reported in.
-fn expect(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn expect(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     let mut expected: Vec<(String, String)> = pairs
         .iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
