@@ -131,6 +131,12 @@ pub const CHANGE_ACTION_UNPUBLISH: &str = "UNPUBLISH";
 pub const ENTITY_TYPE_ASSET: &str = "ASSET";
 pub const ENTITY_TYPE_DATA_PRODUCT: &str = "DATA_PRODUCT";
 
+/// The only `DataZoneEntityType` member (model enum
+/// `com.amazonaws.datazone#DataZoneEntityType`: DOMAIN_UNIT) — the kind of entity
+/// `AddEntityOwner`, `ListEntityOwners` and `RemoveEntityOwner` work on, so an owner is
+/// kept on a stored domain unit.
+pub const DATA_ZONE_ENTITY_TYPE_DOMAIN_UNIT: &str = "DOMAIN_UNIT";
+
 /// The `listingRevision` that names a listing's newest revision: the `@default` the
 /// model puts on `GetListingInput::listingRevision` (smithy_query operation="GetListing").
 pub const LISTING_REVISION_LATEST: &str = "latest";
@@ -460,6 +466,62 @@ pub enum DomainUnitOwner {
     Group(String),
 }
 
+impl DomainUnitOwner {
+    /// The principal this owner names, and the tag that tells a user from a group —
+    /// the two members both owner unions declare (smithy_query
+    /// shape="OwnerProperties,DomainUnitOwnerProperties").
+    pub fn parts(&self) -> (&str, &'static str) {
+        match self {
+            Self::User(user_id) => (user_id.as_str(), "user"),
+            Self::Group(group_id) => (group_id.as_str(), "group"),
+        }
+    }
+}
+
+/// The key one owner is identified and ordered by.
+///
+/// Injective in `(identifier, kind)` for the reason [`membership_key`] is: the kind tag
+/// is always last and the two tags are distinct, so no two different principals key to
+/// the same string. It is what makes an entity's owners a SET — `AddEntityOwner`
+/// compares owners by it — and gives `ListEntityOwners` one stable total order to
+/// paginate over, independent of the order the owners were added in.
+pub fn owner_key(owner: &DomainUnitOwner) -> String {
+    let (identifier, tag) = owner.parts();
+    format!("{identifier}{PRINCIPAL_KEY_SEPARATOR}{tag}")
+}
+
+/// The owner a request's `OwnerProperties` union names, in stored form (smithy_query
+/// shape="OwnerProperties": `user` carries `userIdentifier`, `group` carries
+/// `groupIdentifier`). Shared by `AddEntityOwner` and `RemoveEntityOwner`, so the two
+/// cannot read the same request differently.
+pub fn owner_from_properties(owner: &crate::ops::types::OwnerProperties) -> DomainUnitOwner {
+    use crate::ops::types::OwnerProperties;
+    match owner {
+        OwnerProperties::User(user) => DomainUnitOwner::User(user.user_identifier.clone()),
+        OwnerProperties::Group(group) => DomainUnitOwner::Group(group.group_identifier.clone()),
+    }
+}
+
+/// A stored owner as the modelled `OwnerPropertiesOutput` union (smithy_query
+/// shape="OwnerPropertiesOutput": `user` carries `userId`, `group` carries `groupId`),
+/// the form `ListEntityOwners` reports. The companion of [`owner_properties`], which
+/// renders the same stored owner in the union `GetDomainUnit` reports.
+pub fn entity_owner_output(owner: &DomainUnitOwner) -> crate::ops::types::OwnerPropertiesOutput {
+    use crate::ops::types::{
+        OwnerGroupPropertiesOutput, OwnerPropertiesOutput, OwnerUserPropertiesOutput,
+    };
+    match owner {
+        DomainUnitOwner::User(user_id) => OwnerPropertiesOutput::User(OwnerUserPropertiesOutput {
+            user_id: Some(user_id.clone()),
+        }),
+        DomainUnitOwner::Group(group_id) => {
+            OwnerPropertiesOutput::Group(OwnerGroupPropertiesOutput {
+                group_id: Some(group_id.clone()),
+            })
+        }
+    }
+}
+
 /// One stored metadata form type: a name, the project that owns it, and every
 /// revision created under that name.
 ///
@@ -619,19 +681,21 @@ pub struct Membership {
     pub designation: String,
 }
 
-/// The separator between a member's identifier and its kind inside a membership key.
+/// The separator between a principal's identifier and its kind inside a key this state
+/// builds for it — a membership key ([`membership_key`]) or an owner key
+/// ([`owner_key`]).
 ///
 /// A control character, so the key orders by the identifier FIRST — the only name this
-/// emulator holds for a member, and so the order `sortBy=NAME` asks for — while still
-/// telling a user apart from a group that happens to share its identifier.
-const MEMBERSHIP_KEY_SEPARATOR: char = '\u{1}';
+/// emulator holds for a principal, and so the order `sortBy=NAME` asks for — while
+/// still telling a user apart from a group that happens to share its identifier.
+const PRINCIPAL_KEY_SEPARATOR: char = '\u{1}';
 
 /// The key one membership is stored under.
 ///
 /// Injective in `(identifier, kind)`: the kind tag is always last and the two tags are
 /// distinct, so no two different members can key to the same string.
 pub fn membership_key(kind: MemberKind, identifier: &str) -> String {
-    format!("{identifier}{MEMBERSHIP_KEY_SEPARATOR}{}", kind.tag())
+    format!("{identifier}{PRINCIPAL_KEY_SEPARATOR}{}", kind.tag())
 }
 
 /// The principal a `Member` union value names.
@@ -966,6 +1030,11 @@ pub const MAX_FORM_TYPE_REVISIONS: usize = 100;
 /// It also bounds the depth of the hierarchy, since every unit but the root hangs
 /// under a parent that is itself stored.
 pub const MAX_DOMAIN_UNITS_PER_DOMAIN: usize = 100;
+
+/// The most owners this emulator keeps on one entity, for the same reason and with the
+/// same refusal (`AddEntityOwner` models `ServiceQuotaExceededException` too): adding
+/// owners is caller-driven growth of a stored entity.
+pub const MAX_OWNERS_PER_ENTITY: usize = 100;
 
 /// The most assets this emulator stores in one domain, for the same reason and with the
 /// same refusal (`CreateAsset` models `ServiceQuotaExceededException` too).
@@ -1353,6 +1422,41 @@ impl ComAmazonawsDatazoneDatazoneState {
     /// The domain unit `unit_id` stored in domain `domain_id`, when both exist.
     pub fn domain_unit(&self, domain_id: &str, unit_id: &str) -> Option<&DomainUnit> {
         self.domains.get(domain_id)?.domain_units.get(unit_id)
+    }
+
+    /// The entity an entity-owner call names, when it is stored.
+    ///
+    /// `DataZoneEntityType` has exactly one member, `DOMAIN_UNIT` (smithy_query
+    /// shape="DataZoneEntityType"), so the entity owners are kept on is the domain unit
+    /// `entity_id` of domain `domain_id`. `None` when `entity_type` is not that member
+    /// or either resource is not stored, so `AddEntityOwner`, `ListEntityOwners` and
+    /// `RemoveEntityOwner` all resolve the pair by one rule.
+    pub fn owned_entity(
+        &self,
+        domain_id: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Option<&DomainUnit> {
+        if entity_type != DATA_ZONE_ENTITY_TYPE_DOMAIN_UNIT {
+            return None;
+        }
+        self.domain_unit(domain_id, entity_id)
+    }
+
+    /// [`Self::owned_entity`], for a call that writes the entity's owners.
+    pub fn owned_entity_mut(
+        &mut self,
+        domain_id: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Option<&mut DomainUnit> {
+        if entity_type != DATA_ZONE_ENTITY_TYPE_DOMAIN_UNIT {
+            return None;
+        }
+        self.domains
+            .get_mut(domain_id)?
+            .domain_units
+            .get_mut(entity_id)
     }
 
     /// The live domain that already carries `name`, if the account has one.

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveEntityOwner
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveEntityOwner`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveEntityOwner::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes one owner off a stored entity of one domain, writing `crate::state`: the
+//! entity's owners are a SET keyed by `crate::state::owner_key`, so this call leaves
+//! the entity with every owner but the one it names, as `ListEntityOwners` and
+//! `GetDomainUnit` then report.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +147,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveEntityOwner` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveEntityOwnerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveEntityOwner"))
+        use crate::state::{
+            caller_principal, now_ms, owner_from_properties, owner_key, ResourceKind,
+        };
+
+        // `entityType` targets an enum SHAPE, whose member set the request walk does
+        // not check, so the members the model declares are checked here rather than
+        // taken: a type this service has no entity of is bad input, and this operation
+        // models `ValidationException` for exactly that.
+        if !DATA_ZONE_ENTITY_TYPE_VALUES.contains(&input.entity_type.as_str()) {
+            return Err(RemoveEntityOwnerErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "entityType must be one of {}",
+                    DATA_ZONE_ENTITY_TYPE_VALUES.join(", ")
+                ),
+            })
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RemoveEntityOwnerErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // This operation models `ResourceNotFoundException`, so a domain or an entity
+        // that is not stored is reported as not found rather than as bad input. It
+        // models no `ConflictException`, so a stored domain in any status is served:
+        // the units of a domain being deleted are still readable until the clock
+        // removes it.
+        if !store.domains.contains_key(&input.domain_identifier) {
+            return Err(RemoveEntityOwnerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: ResourceKind::Domain.not_found_message(),
+                },
+            )
+            .into());
+        }
+
+        let unwanted_key = owner_key(&owner_from_properties(&input.owner));
+        let removed_by = caller_principal(ctx);
+        let entity = store
+            .owned_entity_mut(
+                &input.domain_identifier,
+                &input.entity_type,
+                &input.entity_identifier,
+            )
+            .ok_or_else(|| {
+                RemoveEntityOwnerErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: ResourceKind::DomainUnit.not_found_message(),
+                    },
+                )
+            })?;
+
+        // The model marks this operation `@idempotent` and gives its `clientToken` the
+        // `@idempotencyToken` trait (smithy_query operation="RemoveEntityOwner"), so an
+        // entity's owners are a SET: the call leaves the entity without the owner it
+        // names, and a repeat — of this request or of one naming an owner the entity
+        // never had — succeeds while changing nothing.
+        let before = entity.owners.len();
+        entity
+            .owners
+            .retain(|owner| owner_key(owner) != unwanted_key);
+        if entity.owners.len() != before {
+            // Removing an owner changes the entity, which is what `lastUpdatedAt`
+            // reports: "The timestamp at which the domain unit was last updated"
+            // (smithy_query query="doc", shape="GetDomainUnitOutput",
+            // member="lastUpdatedAt"). A call that removed nothing leaves it alone.
+            entity.last_updated_by = Some(removed_by);
+            entity.last_updated_at_ms = Some(now);
+        }
+
+        Ok(RemoveEntityOwnerOutput {})
     }
 }

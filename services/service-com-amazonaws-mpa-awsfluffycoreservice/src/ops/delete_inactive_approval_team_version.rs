@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInactiveApprovalTeamVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteInactiveApprovalTeamVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteInactiveApprovalTeamVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the approval-team VERSION the request's `(Arn, VersionId)` pair names, when
+//! that version is one this service may delete directly: a version that has never been
+//! activated (the team is `PENDING` with `PENDING_ACTIVATION` — the team DRAFT the
+//! operation's own documentation names) or one that is no longer active (`INACTIVE`).
+//! An `ACTIVE` team, and a team already inside a pending deletion window (`DELETING`),
+//! are refused with the modelled `ConflictException` (409): an active team is deleted
+//! through `StartActiveApprovalTeamDeletion`, which is the operation that opens that
+//! window.
+//!
+//! A pair that names NOTHING this store holds — an ARN under which no team is stored, or
+//! a `VersionId` other than the stored team's current one — is a success that changes
+//! nothing: the operation is `@idempotent`, so asking for a version that is already gone
+//! leaves the caller in the state it asked for. That is also what the recorded unit
+//! `mpa.delete-inactive-approval-team-version-nonexistent-is-noop` observes of the real
+//! service. The account boundary is decided FIRST, so an ARN outside the caller's own
+//! account is refused with `AccessDeniedException` (403) and never reported as "already
+//! absent" (see [`crate::state::authorize_resource_arn`]).
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +160,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteInactiveApprovalTeamVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteInactiveApprovalTeamVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteInactiveApprovalTeamVersion"))
+        let _ = ctx;
+        // The account boundary is evaluated BEFORE the resource is resolved: a
+        // destructive call on an ARN outside the caller's account is refused with the
+        // modelled `AccessDeniedException` (403) rather than reported as "already
+        // absent".
+        crate::state::authorize_resource_arn(Self::NAME, &input.arn)
+            .map_err(DeleteInactiveApprovalTeamVersionErrorModeled::AccessDeniedException)?;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteInactiveApprovalTeamVersionError::Modeled(
+                DeleteInactiveApprovalTeamVersionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the approval-team store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+
+        let mut state = store.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialize_due(now);
+
+        // What the decision needs, read out of the store before anything is removed. A
+        // pair naming no stored version — an ARN under which no team is stored, or a
+        // `VersionId` that is not the stored team's current one — leaves the caller in
+        // the state it asked for, so the idempotent delete answers success and writes
+        // nothing.
+        let Some(status) = state
+            .team(&input.arn)
+            .filter(|team| team.version_id == input.version_id)
+            .map(|team| team.status)
+        else {
+            return Ok(DeleteInactiveApprovalTeamVersionOutput {});
+        };
+
+        match status {
+            // A version that has never been activated (the team draft) or one that is no
+            // longer active is this operation's to delete.
+            crate::state::TeamStatus::Pending | crate::state::TeamStatus::Inactive => {}
+            // An active team — and a team already inside the pending deletion window
+            // that `StartActiveApprovalTeamDeletion` opened — is not deleted here.
+            other => {
+                return Err(
+                    DeleteInactiveApprovalTeamVersionErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "Approval team '{}' version '{}' is {} and not {} or {}, so it \
+                                 cannot be deleted by {}; an active team's deletion is started \
+                                 with StartActiveApprovalTeamDeletion.",
+                                input.arn,
+                                input.version_id,
+                                other.as_wire(),
+                                crate::state::TeamStatus::Inactive.as_wire(),
+                                crate::state::TeamStatus::Pending.as_wire(),
+                                Self::NAME,
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The store holds one version per team, so removing the named version removes
+        // the team and everything that indexes it (its name, its idempotency tokens).
+        state.remove_team(&input.arn);
+
+        Ok(DeleteInactiveApprovalTeamVersionOutput {})
     }
 }

@@ -5,8 +5,11 @@
 //! version on first use, and answers with the stored record's revision, status and
 //! `AssetSummary`. `unfinished` keeps the version open for further assets; omitting it
 //! closes the version at `Published`, after which the version is immutable — a further
-//! publish into it is a `ConflictException` (409). A declared `assetSHA256` that does not
-//! match the bytes received, or a `format` other than `generic`, is a
+//! publish into it is a `ConflictException` (409) naming the version's whole coordinate.
+//! A declared `assetSHA256` that does not
+//! match the bytes received, a `format` other than `generic`, or a generic publish that
+//! names no `namespace` (the namespace is a component of a generic version's identity), is
+//! a
 //! `ValidationException` (400) that stores nothing; an unknown domain or repository is a
 //! `ResourceNotFoundException` (404); a package whose origin configuration blocks
 //! publishing is an `AccessDeniedException` (403).
@@ -220,6 +223,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A generic package version's identity is `<namespace>/<package>/<version>`: the
+        // namespace is a COMPONENT of the coordinate, not a label, so a publish that
+        // names none addresses no version this service could ever resolve again. The
+        // model leaves `namespace` optional because other formats derive it (a Maven
+        // groupId, an npm scope) — for `generic` the caller supplies it, so a request
+        // without one is refused here, naming the member and the condition that requires
+        // it, before anything is stored.
+        if input
+            .namespace
+            .as_deref()
+            .is_none_or(|namespace| namespace.is_empty())
+        {
+            return Err(PublishPackageVersionErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "'namespace' is required when 'format' is '{}'.",
+                        crate::state::PACKAGE_FORMAT_GENERIC
+                    ),
+                    reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
+                },
+            )
+            .into());
+        }
+
         // The emulator holds asset bytes in process, so an asset past its own ceiling is
         // refused the way an over-quota publish is — and refused BEFORE it is hashed, so
         // the one pass over the bytes below is bounded by this ceiling.
@@ -235,6 +262,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "asset",
             ));
         }
+
+        // The identity a refusal names a PACKAGE VERSION by: its whole coordinate inside
+        // the repository, not the bare version string, so two conflicts on different
+        // packages are distinguishable (`resourceId` is documented as the ID of the
+        // resource, and a client keys retry/skip logic off it).
+        let version_identity = crate::state::package_version_resource_id(
+            input.namespace.as_deref(),
+            &input.package,
+            &input.package_version,
+        );
 
         // Hash the request's bytes ONCE, here, outside the store's lock: the asset record
         // keeps its digests, so neither this response nor any later read hashes stored
@@ -365,7 +402,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             input.package_version,
                             crate::state::MAX_PACKAGE_VERSIONS_PER_PACKAGE
                         ),
-                        &input.package_version,
+                        &version_identity,
                         "package-version",
                     ));
                 }
@@ -438,7 +475,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "Package version {} {} is {} and cannot be published to.",
                         input.package, input.package_version, existing.status
                     ),
-                    &input.package_version,
+                    &version_identity,
                     "package-version",
                 ));
             }
@@ -478,9 +515,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The `ValidationExceptionReason` a refused member carries: the request reached the
-/// service and one of its fields failed a rule the model cannot express.
-const VALIDATION_REASON_FIELD_FAILED: &str = "FIELD_VALIDATION_FAILED";
+/// The `ValidationExceptionReason` a refused member carries, as this service spells it
+/// for every handler-level refusal ([`crate::state::VALIDATION_REASON_FIELD_FAILED`]).
+const VALIDATION_REASON_FIELD_FAILED: &str = crate::state::VALIDATION_REASON_FIELD_FAILED;
 
 /// A `ResourceNotFoundException` (404) naming the resource that was addressed.
 fn not_found(message: String, resource_id: &str, resource_type: &str) -> PublishPackageVersionError {

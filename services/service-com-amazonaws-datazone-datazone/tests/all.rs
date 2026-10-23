@@ -23,6 +23,8 @@ mod domain_project_lifecycle;
 mod domain_unit_hierarchy;
 #[path = "all/domain_units_for_parent.rs"]
 mod domain_units_for_parent;
+#[path = "all/entity_owners.rs"]
+mod entity_owners;
 #[path = "all/form_type_revisions.rs"]
 mod form_type_revisions;
 #[path = "all/glossary_lifecycle.rs"]
