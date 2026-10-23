@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetComplianceDetailsByConfigRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetComplianceDetailsByConfigRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetComplianceDetailsByConfigRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the evaluation results recorded against ONE Config rule: exactly the
+//! results the rule holds in state, in the store's stable (resource type, resource id,
+//! evaluation mode) order, narrowed to the `ComplianceTypes` the request filters by and
+//! cut into pages of the requested `Limit` — where 0 asks for the operation's default
+//! of 10. It writes nothing: a rule nothing has evaluated reports an empty page, a rule
+//! this account does not hold is refused with `NoSuchConfigRuleException`, and a
+//! `NextToken` this operation did not issue with `InvalidNextTokenException`.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +156,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetComplianceDetailsByConfigRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetComplianceDetailsByConfigRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetComplianceDetailsByConfigRule"))
+        // `ctx` carries request metadata only; this report is computed from state.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // `INSUFFICIENT_DATA` is a ComplianceType a result can carry but no filter may
+        // name, so a filter naming it — or any value outside the published list — is a
+        // bad parameter rather than an empty page.
+        let wanted = input.compliance_types.unwrap_or_default();
+        if let Some(rejected) = wanted.iter().find(|compliance_type| {
+            !crate::state::FILTERABLE_COMPLIANCE_TYPES.contains(&compliance_type.as_str())
+        }) {
+            return Err(
+                GetComplianceDetailsByConfigRuleErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::unfilterable_compliance_type_message(
+                            "ComplianceTypes",
+                            rejected,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_evaluation_result_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        GetComplianceDetailsByConfigRuleErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified NextToken is not valid; use the NextToken a \
+                                     previous GetComplianceDetailsByConfigRule response returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        let store = state.lock();
+
+        // A rule this account does not hold is a failure, not an empty page.
+        let rule = store
+            .config_rules
+            .get(&input.config_rule_name)
+            .ok_or_else(|| {
+                GetComplianceDetailsByConfigRuleError::from(
+                    GetComplianceDetailsByConfigRuleErrorModeled::NoSuchConfigRuleException(
+                        NoSuchConfigRuleException {
+                            message: Some(crate::state::no_such_config_rule_message(
+                                &input.config_rule_name,
+                            )),
+                        },
+                    ),
+                )
+            })?;
+
+        // A `Limit` of 0 asks for the operation's default page size; the modelled
+        // maximum of 100 is refused before this handler runs.
+        let page_size = usize::try_from(input.limit)
+            .ok()
+            .filter(|limit| *limit > 0)
+            .unwrap_or(crate::state::GET_COMPLIANCE_DETAILS_PAGE_SIZE);
+
+        // Page over the rule's own result ordering, so a token holds the KEY the next
+        // page resumes at and survives results recorded or dropped between pages.
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for (key, result) in &rule.evaluation_results {
+            if resume_at.as_ref().is_some_and(|resume_at| key < resume_at) {
+                continue;
+            }
+            if !wanted.is_empty()
+                && !wanted
+                    .iter()
+                    .any(|compliance_type| compliance_type == &result.compliance_type)
+            {
+                continue;
+            }
+            if page.len() == page_size {
+                next_token = Some(crate::state::encode_evaluation_result_token(key));
+                break;
+            }
+            page.push(result.to_shape(&rule.name));
+        }
+
+        Ok(GetComplianceDetailsByConfigRuleOutput {
+            evaluation_results: Some(page),
+            next_token,
+        })
     }
 }
+

@@ -347,7 +347,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                     created_at: now,
                     tags: crate::state::tag_set(input.tags.as_deref().unwrap_or_default()),
-                    resource_compliance: ::std::collections::BTreeMap::new(),
+                    evaluation_results: ::std::collections::BTreeMap::new(),
                     // Config evaluates a rule as soon as it is created, with no call
                     // from the caller; the pass completes a span later.
                     evaluation: crate::state::RuleEvaluationEntry::invoked_at(now),

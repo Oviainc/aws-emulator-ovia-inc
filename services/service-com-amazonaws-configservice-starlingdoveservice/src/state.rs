@@ -123,6 +123,27 @@ pub const COMPLIANCE_TYPE_COMPLIANT: &str = "COMPLIANT";
 pub const COMPLIANCE_TYPE_NON_COMPLIANT: &str = "NON_COMPLIANT";
 /// See [`COMPLIANCE_TYPE_COMPLIANT`].
 pub const COMPLIANCE_TYPE_INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
+/// See [`COMPLIANCE_TYPE_COMPLIANT`].
+pub const COMPLIANCE_TYPE_NOT_APPLICABLE: &str = "NOT_APPLICABLE";
+
+/// Every `ComplianceType` an evaluation-results filter may name: the published
+/// `ComplianceType` values (`com.amazonaws.configservice#ComplianceType`) MINUS
+/// `INSUFFICIENT_DATA`, which the filter members exclude
+/// (`GetComplianceDetailsByConfigRuleRequest$ComplianceTypes`: "INSUFFICIENT_DATA is a
+/// valid ComplianceType that is returned when an Config rule cannot be evaluated.
+/// However, INSUFFICIENT_DATA cannot be used as a ComplianceType for filtering
+/// results").
+pub const FILTERABLE_COMPLIANCE_TYPES: [&str; 3] = [
+    COMPLIANCE_TYPE_COMPLIANT,
+    COMPLIANCE_TYPE_NON_COMPLIANT,
+    COMPLIANCE_TYPE_NOT_APPLICABLE,
+];
+
+/// How many evaluation results one page carries when the request asks for no size of
+/// its own (`GetComplianceDetailsByConfigRuleRequest$Limit`: "The maximum number of
+/// evaluation results returned on each page. The default is 10. ... If you specify 0,
+/// Config uses the default").
+pub const GET_COMPLIANCE_DETAILS_PAGE_SIZE: usize = 10;
 
 /// The cap a `ComplianceSummary` counts Config rules up to
 /// (`ComplianceSummary$CompliantResourceCount`: "The number of Config rules or Amazon
@@ -736,6 +757,108 @@ impl DeliveryChannelEntry {
     }
 }
 
+/// What identifies one evaluation result WITHIN a rule: the resource type, the
+/// resource id and the evaluation mode of its `EvaluationResultQualifier`
+/// (`EvaluationResultQualifier` carries `ConfigRuleName`, `ResourceType`, `ResourceId`
+/// and `EvaluationMode`; the rule name is the map this key indexes). A rule holds ONE
+/// result per key — the last one recorded for that resource in that mode.
+///
+/// Ordering this triple is what gives [`ConfigRuleEntry::evaluation_results`] a stable
+/// total order, so a page of evaluation details can resume at a key.
+pub type EvaluationResultKey = (String, String, String);
+
+/// One evaluation result recorded against a Config rule.
+#[derive(Debug, Clone)]
+pub struct EvaluationResultEntry {
+    /// The type of the evaluated resource (`EvaluationResultQualifier$ResourceType`).
+    pub resource_type: String,
+    /// The id of the evaluated resource (`EvaluationResultQualifier$ResourceId`).
+    pub resource_id: String,
+    /// The mode the rule was evaluated in
+    /// (`EvaluationResultQualifier$EvaluationMode`, `DETECTIVE` or `PROACTIVE`).
+    pub evaluation_mode: String,
+    /// Whether the resource complies (`EvaluationResult$ComplianceType`).
+    pub compliance_type: String,
+    /// The supplementary information the evaluation carried
+    /// (`EvaluationResult$Annotation`), absent when it carried none.
+    pub annotation: Option<String>,
+    /// The time of the event that triggered the evaluation
+    /// (`EvaluationResultIdentifier$OrderingTimestamp`).
+    pub ordering_timestamp: SystemTime,
+    /// The time the result was recorded (`EvaluationResult$ResultRecordedTime`).
+    pub result_recorded_time: SystemTime,
+    /// The time the rule that produced the result was invoked
+    /// (`EvaluationResult$ConfigRuleInvokedTime`).
+    pub config_rule_invoked_time: SystemTime,
+    /// The resource evaluation this result came from
+    /// (`EvaluationResultIdentifier$ResourceEvaluationId`), set only for a result a
+    /// `StartResourceEvaluation` run produced.
+    pub resource_evaluation_id: Option<String>,
+}
+
+impl EvaluationResultEntry {
+    /// The result of evaluating the resource `resource_type`/`resource_id` in
+    /// `evaluation_mode` at `at`, carrying no annotation and belonging to no resource
+    /// evaluation run.
+    ///
+    /// One evaluation is triggered, invoked and recorded at the same instant here, so
+    /// `at` is all three timestamps; a caller that needs them apart sets the fields.
+    pub fn new(
+        resource_type: &str,
+        resource_id: &str,
+        evaluation_mode: &str,
+        compliance_type: &str,
+        at: SystemTime,
+    ) -> Self {
+        Self {
+            resource_type: resource_type.to_string(),
+            resource_id: resource_id.to_string(),
+            evaluation_mode: evaluation_mode.to_string(),
+            compliance_type: compliance_type.to_string(),
+            annotation: None,
+            ordering_timestamp: at,
+            result_recorded_time: at,
+            config_rule_invoked_time: at,
+            resource_evaluation_id: None,
+        }
+    }
+
+    /// The key this result is stored under, which is its identity within a rule.
+    pub fn key(&self) -> EvaluationResultKey {
+        (
+            self.resource_type.clone(),
+            self.resource_id.clone(),
+            self.evaluation_mode.clone(),
+        )
+    }
+
+    /// The modelled `EvaluationResult` for the rule named `config_rule_name`, read
+    /// back out of state.
+    ///
+    /// `ResultToken` stays unset: the token associates an evaluation with the
+    /// `PutEvaluations` call that delivered it, and the read path does not hand one
+    /// back.
+    pub fn to_shape(&self, config_rule_name: &str) -> crate::ops::types::EvaluationResult {
+        crate::ops::types::EvaluationResult {
+            evaluation_result_identifier: Some(crate::ops::types::EvaluationResultIdentifier {
+                evaluation_result_qualifier: Some(crate::ops::types::EvaluationResultQualifier {
+                    config_rule_name: Some(config_rule_name.to_string()),
+                    resource_type: Some(self.resource_type.clone()),
+                    resource_id: Some(self.resource_id.clone()),
+                    evaluation_mode: Some(self.evaluation_mode.clone()),
+                }),
+                ordering_timestamp: Some(timestamp(self.ordering_timestamp)),
+                resource_evaluation_id: self.resource_evaluation_id.clone(),
+            }),
+            compliance_type: Some(self.compliance_type.clone()),
+            result_recorded_time: Some(timestamp(self.result_recorded_time)),
+            config_rule_invoked_time: Some(timestamp(self.config_rule_invoked_time)),
+            annotation: self.annotation.clone(),
+            result_token: None,
+        }
+    }
+}
+
 /// The invocation-and-evaluation history of one Config rule, as
 /// `DescribeConfigRuleEvaluationStatus` reports it.
 ///
@@ -831,16 +954,18 @@ pub struct ConfigRuleEntry {
     /// by `TagResource` and `UntagResource` (`PutConfigRule`: "Use TagResource and
     /// UntagResource to update tags after creation").
     pub tags: TagSet,
-    /// The `ComplianceType` of the last evaluation result recorded for each resource
-    /// this rule evaluated, keyed by `<ComplianceResourceType>/<ComplianceResourceId>`.
+    /// The last evaluation result recorded for each resource this rule evaluated,
+    /// keyed by [`EvaluationResultKey`] so the map is the single record of both what
+    /// `GetComplianceDetailsByConfigRule` reports and what the rule's own compliance
+    /// rolls up from ([`Self::compliance`]).
     ///
-    /// A rule's own compliance is the roll-up of these ([`Self::compliance`]). No
-    /// operation of this emulator can record one yet: `PutEvaluations` identifies the
-    /// rule only through a `ResultToken` minted by the Lambda invocation that produced
-    /// the evaluation, which this emulator does not run, so it stays scaffolded. A rule
-    /// therefore carries no results and rolls up to `INSUFFICIENT_DATA` until an
-    /// evaluation writer lands.
-    pub resource_compliance: BTreeMap<String, String>,
+    /// No operation of this emulator can record one yet: `PutEvaluations` identifies
+    /// the rule only through a `ResultToken` minted by the Lambda invocation that
+    /// produced the evaluation, which this emulator does not run, so it stays
+    /// scaffolded. A rule therefore carries no results — an empty page of evaluation
+    /// details, and a roll-up of `INSUFFICIENT_DATA` — until an evaluation writer
+    /// lands.
+    pub evaluation_results: BTreeMap<EvaluationResultKey, EvaluationResultEntry>,
     /// When Config invoked this rule and when those invocations finished evaluating
     /// the resources in scope, as `DescribeConfigRuleEvaluationStatus` reports it.
     pub evaluation: RuleEvaluationEntry,
@@ -930,9 +1055,9 @@ impl ConfigRuleEntry {
     /// result places it either way (which includes a rule nothing has evaluated).
     pub fn compliance(&self) -> &'static str {
         let has = |compliance_type: &str| {
-            self.resource_compliance
+            self.evaluation_results
                 .values()
-                .any(|recorded| recorded == compliance_type)
+                .any(|recorded| recorded.compliance_type == compliance_type)
         };
         if has(COMPLIANCE_TYPE_NON_COMPLIANT) {
             COMPLIANCE_TYPE_NON_COMPLIANT
@@ -954,9 +1079,9 @@ impl ConfigRuleEntry {
     /// resources.
     pub fn compliance_shape(&self) -> Compliance {
         let contributors = self
-            .resource_compliance
+            .evaluation_results
             .values()
-            .filter(|recorded| recorded.as_str() == COMPLIANCE_TYPE_NON_COMPLIANT)
+            .filter(|recorded| recorded.compliance_type == COMPLIANCE_TYPE_NON_COMPLIANT)
             .count();
         Compliance {
             compliance_type: Some(self.compliance().to_string()),
@@ -1306,7 +1431,7 @@ pub type ResourceEvaluationPageKey = (::std::cmp::Reverse<i128>, String);
 /// The evaluation's OUTCOME is not part of this record: deciding whether the resource
 /// details comply means running every proactive Config rule against them, which this
 /// emulator has no rule engine for — the same reason
-/// [`ConfigRuleEntry::resource_compliance`] stays empty and
+/// [`ConfigRuleEntry::evaluation_results`] stays empty and
 /// `GetResourceEvaluationSummary` is still scaffolded. What is persisted is what the
 /// control plane owns and what the list path reports: the id Config minted, the mode
 /// the evaluation runs in, when its execution started, the deployment context it
@@ -2217,6 +2342,54 @@ pub fn decode_pending_aggregation_request_token(token: &str) -> Option<(String, 
     well_formed.then(|| (account.to_string(), region.to_string()))
 }
 
+/// Encode the [`EvaluationResultKey`] a `GetComplianceDetailsByConfigRule` page should
+/// resume at as an opaque `NextToken`.
+///
+/// The three fields are LENGTH-PREFIXED rather than joined on a separator:
+/// `ResourceType` (`StringWithCharLimit256`) and `ResourceId` (`BaseResourceId`) are
+/// unconstrained strings, so no character can be claimed as one without a resource id
+/// that contains it splitting the key wrongly.
+pub fn encode_evaluation_result_token(key: &EvaluationResultKey) -> String {
+    let mut encoded = String::new();
+    for field in [&key.0, &key.1, &key.2] {
+        encoded.push_str(&format!("{}:{field}", field.len()));
+    }
+    encode_page_token(&encoded)
+}
+
+/// The [`EvaluationResultKey`] a `NextToken` resumes at, or `None` when the token is
+/// malformed — i.e. not something [`encode_evaluation_result_token`] produced, so its
+/// three length-prefixed fields do not account for exactly its decoded bytes.
+pub fn decode_evaluation_result_token(token: &str) -> Option<EvaluationResultKey> {
+    let decoded = decode_page_token(token)?;
+    let mut rest = decoded.as_str();
+    let mut fields: Vec<String> = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let (length, tail) = rest.split_once(':')?;
+        let length: usize = length.parse().ok()?;
+        fields.push(tail.get(..length)?.to_string());
+        rest = tail.get(length..)?;
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    let mut fields = fields.into_iter();
+    Some((fields.next()?, fields.next()?, fields.next()?))
+}
+
+/// How Config words `InvalidParameterValueException` for a results filter that named a
+/// `ComplianceType` no filter may name.
+///
+/// The message is BUILT FROM THE REQUEST — it quotes the value the caller sent, names
+/// the member and lists the values that member accepts
+/// ([`FILTERABLE_COMPLIANCE_TYPES`]).
+pub fn unfilterable_compliance_type_message(member: &str, value: &str) -> String {
+    format!(
+        "'{value}' is not a valid value for {member}; the valid values are {}.",
+        FILTERABLE_COMPLIANCE_TYPES.join(", ")
+    )
+}
+
 /// How Config words `NoSuchConfigRuleException` for a request that named ONE rule
 /// this account does not hold, through a single-name member (`ConfigRuleName`).
 ///
@@ -2401,14 +2574,18 @@ mod tests {
             rule_evaluation_visibility: Some(RULE_EVALUATION_VISIBILITY_EXTERNAL.to_string()),
             created_at: SystemTime::UNIX_EPOCH,
             tags: TagSet::new(),
-            resource_compliance: compliance_types
+            evaluation_results: compliance_types
                 .iter()
                 .enumerate()
                 .map(|(index, compliance)| {
-                    (
-                        format!("AWS::EC2::Volume/vol-{index}"),
-                        (*compliance).to_string(),
-                    )
+                    let entry = EvaluationResultEntry::new(
+                        "AWS::EC2::Volume",
+                        &format!("vol-{index}"),
+                        EVALUATION_MODE_DETECTIVE,
+                        compliance,
+                        SystemTime::UNIX_EPOCH,
+                    );
+                    (entry.key(), entry)
                 })
                 .collect(),
             evaluation: RuleEvaluationEntry::default(),
@@ -2521,6 +2698,87 @@ mod tests {
             assert!(
                 summary.compliance_summary_timestamp.is_some(),
                 "case {case:?}: expected a ComplianceSummaryTimestamp"
+            );
+        }
+    }
+
+    #[test]
+    fn an_evaluation_result_page_token_round_trips_every_key_it_is_given() {
+        // Rows differ along what the key's fields hold: ordinary values, the characters
+        // a separator-joined token would split on, empty and multi-byte fields, and a
+        // resource id at the `BaseResourceId` length maximum of 768.
+        let cases: [(&str, EvaluationResultKey); 6] = [
+            (
+                "an ordinary key",
+                (
+                    "AWS::EC2::Volume".to_string(),
+                    "vol-0123456789abcdef0".to_string(),
+                    EVALUATION_MODE_DETECTIVE.to_string(),
+                ),
+            ),
+            (
+                "a resource id carrying the separators a joined token would use",
+                (
+                    "AWS::S3::Bucket".to_string(),
+                    "bucket#with:odd/characters|inside".to_string(),
+                    EVALUATION_MODE_DETECTIVE.to_string(),
+                ),
+            ),
+            (
+                "a resource id that is itself a length prefix",
+                (
+                    "AWS::S3::Bucket".to_string(),
+                    "3:abc".to_string(),
+                    "PROACTIVE".to_string(),
+                ),
+            ),
+            (
+                "empty fields",
+                (String::new(), String::new(), String::new()),
+            ),
+            (
+                "multi-byte characters",
+                (
+                    "AWS::S3::Bucket".to_string(),
+                    "caf\u{e9}-b\u{fc}cket-\u{1f512}".to_string(),
+                    "PROACTIVE".to_string(),
+                ),
+            ),
+            (
+                "a resource id at the published BaseResourceId maximum of 768",
+                (
+                    "AWS::EC2::Instance".to_string(),
+                    "i".repeat(768),
+                    EVALUATION_MODE_DETECTIVE.to_string(),
+                ),
+            ),
+        ];
+
+        for (case, key) in cases {
+            let token = encode_evaluation_result_token(&key);
+            let decoded = decode_evaluation_result_token(&token);
+            assert_eq!(
+                decoded.as_ref(),
+                Some(&key),
+                "case {case:?}: expected the token {token:?} to decode back to {key:?}, \
+                 got {decoded:?}"
+            );
+        }
+
+        // A token this emulator did not issue decodes to nothing, whatever it is.
+        for token in [
+            "",
+            "not-base64-at-all!!",
+            &::aws_smithy_types::base64::encode("AWS::EC2::Volume/vol-0"),
+            &::aws_smithy_types::base64::encode("3:abc"),
+            &::aws_smithy_types::base64::encode("3:abc3:def3:ghi-trailing"),
+            &::aws_smithy_types::base64::encode("99:abc0:0:"),
+        ] {
+            let decoded = decode_evaluation_result_token(token);
+            assert!(
+                decoded.is_none(),
+                "case {token:?}: a token this operation did not issue is malformed, got \
+                 {decoded:?}"
             );
         }
     }
