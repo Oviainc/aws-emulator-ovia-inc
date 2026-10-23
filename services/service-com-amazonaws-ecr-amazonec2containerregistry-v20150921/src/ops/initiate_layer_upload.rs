@@ -285,6 +285,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 repository_name: input.repository_name,
                 part_size,
                 started_at: ::std::time::SystemTime::now(),
+                // A freshly opened upload has received nothing: `UploadLayerPart` is
+                // what streams the layer's bytes into it.
+                received_bytes: Vec::new(),
             },
         );
 

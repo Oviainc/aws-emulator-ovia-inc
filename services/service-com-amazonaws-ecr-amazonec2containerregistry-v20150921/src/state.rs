@@ -392,13 +392,25 @@ pub const MAX_LAYER_UPLOADS: usize = 1_000;
 /// that cap.
 pub const REPORTED_LAYER_PART_SIZE: i64 = 10 * 1024 * 1024;
 
+/// See [`MAX_REPOSITORIES`]: the ceiling on how many bytes ONE in-flight upload
+/// accumulates. `UploadLayerPart` is the only thing that grows it — by up to 20971520
+/// bytes per call, the model's cap on `layerPartBlob` — and the bytes stay in memory
+/// until the upload is completed or the process ends, so the registry needs a ceiling
+/// on the layer a client can stream into it. Past it the part is refused with the
+/// `LimitExceededException` `UploadLayerPart` models ("the operation did not succeed
+/// because it would have exceeded a service limit for your account") and no byte of it
+/// is kept. AWS publishes no fixed maximum layer size, so the number is this
+/// emulator's own bound, set well above any layer an ordinary push sends.
+pub const MAX_LAYER_UPLOAD_BYTES: usize = 128 * 1024 * 1024;
+
 /// One in-flight layer upload: what `InitiateLayerUpload` opened, addressed by the
 /// upload id it handed the client.
 ///
-/// `UploadLayerPart` and `CompleteLayerUpload` are the operations that consume one
-/// (both still 501 stubs with issues of their own), so what is kept here is what
-/// opening the upload decided: which repository it is for, the part size the client
-/// was told to send, and when it was opened.
+/// `UploadLayerPart` streams the layer into it one part at a time and
+/// `CompleteLayerUpload` (still a 501 stub with an issue of its own) is what closes it,
+/// so what is kept here is what opening the upload decided — which repository it is
+/// for, the part size the client was told to send, when it was opened — plus the layer
+/// bytes received so far.
 #[derive(Debug, Clone)]
 pub struct LayerUpload {
     /// The repository the upload was opened against. An upload id is only valid for
@@ -407,9 +419,77 @@ pub struct LayerUpload {
     /// The `partSize` reported to the client when the upload was opened.
     pub part_size: i64,
     /// When `InitiateLayerUpload` opened it. Nothing reads it yet: the first operation
-    /// that does — `UploadLayerPart` or `CompleteLayerUpload`, each a 501 stub with its
-    /// own issue — is the one to decide whether an upload also expires with age.
+    /// that does — `CompleteLayerUpload`, still a 501 stub with its own issue — is the
+    /// one to decide whether an upload also expires with age.
     pub started_at: SystemTime,
+    /// The layer bytes accepted so far, in the order they arrived. Each part starts
+    /// where the previous one ended, so this is the prefix of the layer the registry
+    /// holds and its length is both the byte count received and the offset the next
+    /// part must start at — see [`LayerUpload::receive_part`].
+    pub received_bytes: Vec<u8>,
+}
+
+/// Why a layer part is not accepted into an upload. The caller-facing error each one
+/// answers with belongs to the operation (`UploadLayerPart`'s
+/// `InvalidLayerPartException` and `LimitExceededException`); what is decided here is
+/// whether the part may join the upload at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerPartRejection {
+    /// `partFirstByte` and `partLastByte` do not describe the blob sent with them: the
+    /// range spans a different number of bytes, or spans none at all.
+    PartSizeMismatch,
+    /// The part does not begin where the upload's received bytes end, so accepting it
+    /// would leave a gap in the layer or overwrite bytes already received.
+    NonConsecutivePart,
+    /// Accepting the part would take the upload past [`MAX_LAYER_UPLOAD_BYTES`].
+    UploadTooLarge,
+}
+
+impl LayerUpload {
+    /// The offset the next part must start at: the number of bytes already accepted, so
+    /// the first part of an upload starts at byte 0.
+    pub fn next_part_first_byte(&self) -> i64 {
+        i64::try_from(self.received_bytes.len()).unwrap_or(i64::MAX)
+    }
+
+    /// The last byte of the layer this upload has accepted, or `None` while it has
+    /// accepted nothing — there is no last byte before the first part arrives.
+    pub fn last_byte_received(&self) -> Option<i64> {
+        self.next_part_first_byte()
+            .checked_sub(1)
+            .filter(|last| *last >= 0)
+    }
+
+    /// Append one layer part to this upload, answering the last byte the upload has now
+    /// received.
+    ///
+    /// A part is accepted only when its declared `[partFirstByte, partLastByte]` range
+    /// spans exactly as many bytes as the blob carries AND starts where the upload's
+    /// received bytes end; a rejected part changes nothing, so the upload stays exactly
+    /// as the last accepted part left it.
+    pub fn receive_part(
+        &mut self,
+        part_first_byte: i64,
+        part_last_byte: i64,
+        blob: &[u8],
+    ) -> Result<i64, LayerPartRejection> {
+        let declared_len = part_last_byte
+            .checked_sub(part_first_byte)
+            .and_then(|span| span.checked_add(1))
+            .filter(|len| *len > 0);
+        let carried_len = i64::try_from(blob.len()).unwrap_or(i64::MAX);
+        if declared_len != Some(carried_len) {
+            return Err(LayerPartRejection::PartSizeMismatch);
+        }
+        if part_first_byte != self.next_part_first_byte() {
+            return Err(LayerPartRejection::NonConsecutivePart);
+        }
+        if self.received_bytes.len().saturating_add(blob.len()) > MAX_LAYER_UPLOAD_BYTES {
+            return Err(LayerPartRejection::UploadTooLarge);
+        }
+        self.received_bytes.extend_from_slice(blob);
+        Ok(self.last_byte_received().unwrap_or(part_last_byte))
+    }
 }
 
 /// Why an `imageIds` entry resolves to no stored image.
@@ -1434,6 +1514,21 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
             .ok_or_else(|| Fault::RepositoryNotFound(repository_not_found_message(name)))
     }
 
+    /// The in-flight upload `upload_id` addresses, for mutation, or `None` when this
+    /// registry holds no such upload OR holds one that was opened against another
+    /// repository: an upload id is only valid for the repository it was issued for,
+    /// which is exactly what `UploadNotFoundException` reports ("the upload could not
+    /// be found, or the specified upload ID is not valid for this repository").
+    pub fn upload_mut(
+        &mut self,
+        repository_name: &str,
+        upload_id: &str,
+    ) -> Option<&mut LayerUpload> {
+        self.uploads
+            .get_mut(upload_id)
+            .filter(|upload| upload.repository_name == repository_name)
+    }
+
     /// The rule registered for `prefix`, whichever way its trailing slash is written, or
     /// `None` when the registry holds no rule for it.
     pub fn pull_through_cache_rule(&self, prefix: &str) -> Option<&PullThroughCacheRule> {
@@ -1598,6 +1693,18 @@ pub fn normalize_prefix(prefix: &str) -> String {
 pub fn repository_not_found_message(name: &str) -> String {
     format!(
         "The repository with name '{name}' does not exist in the registry with id '{}'",
+        registry_id()
+    )
+}
+
+/// The wording ECR uses for an upload id this registry cannot resolve against the
+/// repository the request named — the state `UploadNotFoundException` documents: "the
+/// upload could not be found, or the specified upload ID is not valid for this
+/// repository". One wording for every operation that addresses an upload.
+pub fn upload_not_found_message(upload_id: &str, repository_name: &str) -> String {
+    format!(
+        "Upload not found with ID: '{upload_id}' for repository '{repository_name}' in \
+         the registry with id '{}'",
         registry_id()
     )
 }
