@@ -25,6 +25,8 @@ mod event_configuration;
 mod event_data_store_reads;
 #[path = "all/event_selectors.rs"]
 mod event_selectors;
+#[path = "all/import_list.rs"]
+mod import_list;
 #[path = "all/import_reads.rs"]
 mod import_reads;
 #[path = "all/import_stop.rs"]

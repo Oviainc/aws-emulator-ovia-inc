@@ -29,8 +29,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AdvancedEventSelector, AggregationConfiguration, ContextKeySelector, EventSelector,
-    ImportSource, ImportStatistics, PartitionKey, RefreshSchedule, RequestWidget, Tag, Trail,
-    TrailInfo, Widget,
+    ImportSource, ImportStatistics, ImportsListItem, PartitionKey, RefreshSchedule, RequestWidget,
+    Tag, Trail, TrailInfo, Widget,
 };
 
 /// The Region a request is served in when it carries no SigV4 credential scope to
@@ -583,6 +583,18 @@ impl ImportRecord {
     /// Whether this import is still running, so a stop has something to stop.
     pub fn is_running(&self) -> bool {
         RUNNING_IMPORT_STATUSES.contains(&self.status.as_str())
+    }
+
+    /// Project onto the modelled `ImportsListItem` shape, as `ListImports` reports
+    /// it: the five members that shape carries, each from the stored record.
+    pub fn to_imports_list_item(&self) -> ImportsListItem {
+        ImportsListItem {
+            import_id: Some(self.import_id.clone()),
+            import_status: Some(self.status.clone()),
+            destinations: Some(self.destinations.clone()),
+            created_timestamp: Some(::aws_smithy_types::DateTime::from(self.created_timestamp)),
+            updated_timestamp: Some(::aws_smithy_types::DateTime::from(self.updated_timestamp)),
+        }
     }
 
     /// Stop this import.
