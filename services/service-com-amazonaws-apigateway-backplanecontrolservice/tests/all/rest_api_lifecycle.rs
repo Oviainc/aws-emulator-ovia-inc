@@ -28,7 +28,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// One emulator with this service mounted on a fresh shared engine.
 pub(crate) struct Gateway {
-    router: MultiServiceRouter,
+    /// `pub(crate)` so a sibling suite can dispatch a request this harness does not
+    /// build — the `execute_api_data_plane` suite drives UNSIGNED requests to a stage
+    /// invoke URL, which carry neither this harness's credential scope nor its host.
+    pub(crate) router: MultiServiceRouter,
 }
 
 /// One answered request: the HTTP status, the `x-amzn-errortype` error code when the

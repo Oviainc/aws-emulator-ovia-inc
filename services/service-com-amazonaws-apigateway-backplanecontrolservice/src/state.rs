@@ -37,12 +37,75 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// Every created `ApiKey`, keyed by its API key id — the identifier `GetApiKey`
     /// and `DeleteApiKey` take in their `apiKey` path label, NOT the key's value.
     pub api_keys: BTreeMap<String, ApiKeyEntry>,
+    /// The account-level settings `UpdateAccount` writes and `GetAccount` reports.
+    /// There is exactly one per account, so it is a field rather than a map.
+    pub account: AccountEntry,
     /// Drives [`ComAmazonawsApigatewayBackplanecontrolserviceState::mint_id`]; see there for how an id is derived from it.
     pub id_seed: u64,
     /// Drives [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`]: the creation rank stamped on each
     /// record so a listing can report creation order rather than id order.
     pub sequence_counter: u64,
 }
+
+/// The account's own `Account` settings: what `GetAccount` reports and `UpdateAccount`
+/// patches.
+///
+/// The two values a caller never sets — the request limits API Gateway applies to the
+/// account and the version of the API keys it issues — are the service's own and are
+/// seeded from [`DEFAULT_ACCOUNT_THROTTLE`] / [`API_KEY_VERSION`]; `cloudwatch_role_arn`
+/// is absent until a caller sets one, which is what distinguishes an account with no
+/// CloudWatch role from one whose role is configured.
+#[derive(Debug, Clone)]
+pub struct AccountEntry {
+    /// The ARN of the IAM role API Gateway uses to write logs to CloudWatch Logs;
+    /// `None` on an account that has never had one set.
+    pub cloudwatch_role_arn: Option<String>,
+    /// The account-wide request limits, in `(burstLimit, rateLimit)` order; see
+    /// [`DEFAULT_ACCOUNT_THROTTLE`].
+    pub throttle_burst_limit: i32,
+    /// See [`DEFAULT_ACCOUNT_THROTTLE`].
+    pub throttle_rate_limit: f64,
+    /// The features enabled for the account, reported in the `features` list.
+    pub features: Vec<String>,
+    /// The version of the API keys the account issues; see [`API_KEY_VERSION`].
+    pub api_key_version: String,
+}
+
+impl Default for AccountEntry {
+    fn default() -> Self {
+        Self {
+            cloudwatch_role_arn: None,
+            throttle_burst_limit: DEFAULT_ACCOUNT_THROTTLE.0,
+            throttle_rate_limit: DEFAULT_ACCOUNT_THROTTLE.1,
+            features: vec![USAGE_PLANS_FEATURE.to_string()],
+            api_key_version: API_KEY_VERSION.to_string(),
+        }
+    }
+}
+
+/// The account-wide request limits API Gateway applies, as `(burstLimit, rateLimit)`.
+///
+/// From API Gateway's published default quota for an account in one Region: "10,000
+/// requests per second (RPS) with an additional burst capacity provided by the token
+/// bucket algorithm, using a maximum bucket capacity of 5,000 requests" — the pair
+/// `GetAccount` reports as `throttleSettings`.
+pub const DEFAULT_ACCOUNT_THROTTLE: (i32, f64) = (5_000, 10_000.0);
+
+/// The `features` entry an account with usage plans enabled carries, from
+/// `Account$features`'s own documentation: "When usage plans are enabled, the features
+/// list will include an entry of `UsagePlans`". It is an account-level flag of the
+/// Region's API Gateway, not a claim about which operations of this emulator are
+/// implemented, and AWS reports it for every account.
+pub const USAGE_PLANS_FEATURE: &str = "UsagePlans";
+
+/// The `apiKeyVersion` of an account: the current version of the API keys API Gateway
+/// issues, which every account reports.
+pub const API_KEY_VERSION: &str = "4";
+
+/// The `patchOperations` path `UpdateAccount` applies: the account's CloudWatch role.
+/// It is the only member of `Account` a caller sets — the others are the service's own
+/// (see [`AccountEntry`]) — so it is the only path this operation supports.
+pub const ACCOUNT_CLOUDWATCH_ROLE_PATH: &str = "cloudwatchRoleArn";
 
 /// One stored `RestApi`, with the resource tree that hangs off it.
 #[derive(Debug, Clone, Default)]
@@ -243,6 +306,17 @@ pub struct DeploymentEntry {
     /// The `apiSummary` this deployment reports: resource path -> HTTP verb -> the
     /// method as it stood when the deployment was created.
     pub api_summary: BTreeMap<String, BTreeMap<String, MethodSnapshot>>,
+    /// The API's resource tree as it stood when this deployment was created, keyed by
+    /// resource id exactly as [`RestApiEntry::resources`] is.
+    ///
+    /// A deployment is a SNAPSHOT: "a Deployment resource is a snapshot of your REST API
+    /// configuration", and a stage serves the deployment it points at, so this — and not
+    /// the live tree — is what the execute-api data plane
+    /// ([`crate::service::execute_api`]) matches a request against. An integration put on
+    /// a method after this deployment was created is therefore not served until the API
+    /// is redeployed, which is what AWS does. `apiSummary` cannot stand in for it: the
+    /// modelled `MethodSnapshot` carries only `authorizationType` and `apiKeyRequired`.
+    pub resources: BTreeMap<String, ResourceEntry>,
     /// This deployment's creation rank, from
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`].
     pub sequence: u64,

@@ -17,15 +17,18 @@
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
 //! - `can_handle` — which requests this service claims. The default matches the
-//!   request's resolved route key against this service's signing name. Edit it
-//!   for anything the model does not express: a signing name shared by several
-//!   services, or routing that keys on the access-key id.
+//!   request's resolved route key against this service's signing name. EDITED HERE: it
+//!   claims the control plane as the framework's own rule does, and beside it a request
+//!   addressed to a DEPLOYED STAGE's invoke URL — the `execute-api` data plane, which no
+//!   route key names (see [`execute_api`]).
 //! - `override_operation` — which operation serves a request. EDITED HERE: the key and
 //!   the handler stay the generated table's, but each operation is served through
 //!   [`StatedPerOperation`], which states a refused request the way this service states
 //!   it and, ahead of that, answers a query value that cannot be converted to its
 //!   member's modelled type through [`query_coercion`] — a deserialization failure, not
-//!   a constraint violation.
+//!   a constraint violation. A request addressed to a stage invoke URL is served by
+//!   [`execute_api::ExecuteApiSurface`] instead, which the model's routing key cannot
+//!   name.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.

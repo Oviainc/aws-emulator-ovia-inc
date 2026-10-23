@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies `patchOperations` to the account's own [`crate::state::AccountEntry`] and
+//! reports the stored record — the same `Account` body `GetAccount` then reads back.
+//! The one member a caller sets is the CloudWatch role
+//! ([`crate::state::ACCOUNT_CLOUDWATCH_ROLE_PATH`]); the account's request limits, its
+//! features and its API key version are the service's own, so a patch naming them is
+//! refused rather than applied.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +82,61 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{patch_optional_string, Patch, PatchFailure};
+
+/// The `patchOperations` paths this operation supports, for the refusal that lists them.
+const SUPPORTED_PATHS: &[&str] = &["/cloudwatchRoleArn"];
+
+/// The ARN vendor an account's CloudWatch role ARN names, and the resource type under
+/// it: the member is "the ARN of an Amazon CloudWatch role for the current Account", and
+/// API Gateway assumes that IAM ROLE to write logs, so a value that is not an IAM role
+/// ARN is one it could never assume.
+const IAM_VENDOR: &str = "iam";
+
+/// See [`IAM_VENDOR`].
+const ROLE_RESOURCE_TYPE: &str = "role";
+
+/// Refuse a `cloudwatchRoleArn` that is not an IAM role ARN.
+///
+/// Only the ARN's SHAPE is judged, which is what this emulator can know without IAM:
+/// whether the role exists and whether API Gateway may assume it is a separate check
+/// that belongs to whatever resolves the role against IAM.
+fn role_arn_violation(role_arn: &str) -> Option<String> {
+    let names_a_role = ::service_common::arn::parse_of(role_arn, IAM_VENDOR)
+        .is_some_and(|arn| arn.resource_type() == ROLE_RESOURCE_TYPE);
+    (!names_a_role).then(|| {
+        format!(
+            "Invalid role ARN specified: /{} takes an IAM role ARN of the form \
+             arn:{{partition}}:iam::{{account}}:role/{{name}}",
+            crate::state::ACCOUNT_CLOUDWATCH_ROLE_PATH
+        )
+    })
+}
+
+/// Apply one patch to a COPY of the stored account record.
+///
+/// Only the CloudWatch role is a caller's to set: `throttleSettings`, `features` and
+/// `apiKeyVersion` are values API Gateway itself reports for the account, so a patch
+/// naming one of them is refused with the same "Invalid patch path" wording every other
+/// unsupported path on this surface earns.
+fn apply_patch(account: &mut crate::state::AccountEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    match patch.member() {
+        crate::state::ACCOUNT_CLOUDWATCH_ROLE_PATH => {
+            if let Some(role_arn) = patch.value.as_deref() {
+                if let Some(violation) = role_arn_violation(role_arn) {
+                    return Err(PatchFailure::BadRequest(violation));
+                }
+            }
+            patch_optional_string(
+                &mut account.cloudwatch_role_arn,
+                patch,
+                crate::state::MAX_STRING_CHARS,
+            )
+        }
+        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,18 +210,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccount"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the record at all.
+        let patches = crate::state::parse_patches(input.patch_operations.as_ref())
+            .map_err(patch_failure)?;
+
+        let mut store = state.lock();
+        // Patched on a COPY: a list whose later op is refused leaves the stored account
+        // untouched, rather than keeping the ops before it.
+        let mut updated = store.account.clone();
+        for patch in &patches {
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+        store.account = updated;
+
+        // Reported through the one `Account` body this crate builds, so the update
+        // reports the record exactly as `GetAccount` will read it back.
+        let body = super::get_account::account_body(&store.account);
+        // Everything below is owned, so the store lock is released before the access
+        // record is emitted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — the role ARN a caller set names an IAM role and is not a
+        // secret, but it is the caller's own value, so only WHETHER one is now set is
+        // recorded.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            patch_operations = patches.len(),
+            cloudwatch_role_set = body.cloudwatch_role_arn.is_some(),
+            outcome = "updated",
+            "account settings updated",
+        );
+        Ok(UpdateAccountOutput {
+            cloudwatch_role_arn: body.cloudwatch_role_arn,
+            throttle_settings: body.throttle_settings,
+            features: body.features,
+            api_key_version: body.api_key_version,
+        })
     }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateAccountError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateAccountErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateAccountErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateAccountErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }
