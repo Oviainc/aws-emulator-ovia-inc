@@ -565,7 +565,8 @@ use crate::ops::types::{
     CreateVolumeOutput, DescribeFastLaunchImagesSuccessItem, DisableFastLaunchOutput,
     VolumeModification,
     EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
-    ImageCriterion, Instance, InstanceApplicationStatus, IpamPool,
+    ImageCriterion, Instance, InstanceApplicationStatus, IpamInternetRegistryAssociation,
+    IpamPool, IpamRoutingPolicyRegistration, IpamRoutingPolicyRegistrationDelta,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, Monitoring, NetworkInsightsAccessScope,
     NetworkInsightsAccessScopeAnalysis, OperatorResponse, PeeringAttachmentStatus, Placement,
@@ -1526,6 +1527,23 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Every IPAM pool the account holds, by `IpamPoolId`, as the modelled [`IpamPool`]
     /// shape itself.
     pub ipam_pools: BTreeMap<String, IpamPool>,
+    /// Every IPAM internet registry association the account holds, by
+    /// `IpamInternetRegistryAssociationId`, each with the routing policy registrations
+    /// (ROAs) made under it — see [`IpamInternetRegistryAssociationRecord`]. Ordered by id,
+    /// the stable order every reader of them reports in.
+    pub ipam_internet_registry_associations:
+        BTreeMap<String, IpamInternetRegistryAssociationRecord>,
+    /// Every routing policy registration delta the account's registrations have produced,
+    /// by `DeltaId` — see [`IpamRoutingPolicyRegistrationDeltaRecord`]. A delta is the
+    /// record of ONE change to one registration, so it outlives the call that made it and
+    /// is kept beside the registrations rather than on them.
+    pub ipam_routing_policy_registration_deltas:
+        BTreeMap<String, IpamRoutingPolicyRegistrationDeltaRecord>,
+    /// A `ClientToken` of a routing policy registration write and the `DeltaId` that call
+    /// minted, so a repeat of the same request answers with that delta and changes nothing:
+    /// "If this token matches a previous request, the operation ignores the request, but
+    /// does not return an error" (`DeleteIpamRoutingPolicyRegistrationRequest$ClientToken`).
+    pub ipam_routing_policy_registration_delta_client_tokens: HashMap<String, String>,
     /// Every VPC Block Public Access exclusion the account holds, by `ExclusionId` — see
     /// the module docs. Ordered by id, which is the order
     /// `DescribeVpcBlockPublicAccessExclusions` reports and pages over.
@@ -1643,6 +1661,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_route_table_announcements: BTreeMap::new(),
             transit_gateway_policy_tables: BTreeMap::new(),
             ipam_pools: BTreeMap::new(),
+            ipam_internet_registry_associations: BTreeMap::new(),
+            ipam_routing_policy_registration_deltas: BTreeMap::new(),
+            ipam_routing_policy_registration_delta_client_tokens: HashMap::new(),
             vpc_block_public_access_exclusions: BTreeMap::new(),
             import_image_tasks: BTreeMap::new(),
             import_image_task_client_tokens: HashMap::new(),
@@ -2866,6 +2887,40 @@ impl ComAmazonawsEc2Amazonec2State {
                     association.view.state = Some(state);
                     association.pending = None;
                 }
+            }
+        }
+        // One routing policy registration a delete (or another write) left transient, and
+        // the delta that write minted: the registration reaches the terminal state the
+        // write recorded for it and the delta reaches `published`, both at the instant they
+        // were owed whether or not anybody called — the same contract as the policy table
+        // associations above.
+        for association in self.ipam_internet_registry_associations.values_mut() {
+            for registration in association.registrations.values_mut() {
+                if let Some(state) = registration
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.due_by(now))
+                    .map(str::to_string)
+                {
+                    registration.view.state = Some(state);
+                    registration.pending = None;
+                }
+            }
+        }
+        for record in self.ipam_routing_policy_registration_deltas.values_mut() {
+            if let Some(state) = record
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string)
+            {
+                // "A message describing the current state"
+                // (`IpamRoutingPolicyRegistrationDelta$StateMessage`) is about the state the
+                // delta is in, so it moves with it rather than keeping the pending wording.
+                record.view.state_message =
+                    Some(IPAM_ROUTING_POLICY_REGISTRATION_DELTA_PUBLISHED_MESSAGE.to_string());
+                record.view.state = Some(state);
+                record.pending = None;
             }
         }
         for record in self.byoip_cidrs.values_mut() {
@@ -15224,6 +15279,486 @@ pub fn allowed_images_settings_full<E>(region: &str, full: AllowedImagesSettings
             "The image criteria carry {requested} bytes, which this emulator has no room for: \
              it stores at most {MAX_STORED_BYTES} bytes of caller-supplied data"
         )),
+    }
+}
+
+// =============================================================================
+// IPAM internet registry associations, and the routing policy registrations
+// (Route Origin Authorizations) made under them
+// =============================================================================
+
+/// The id prefix this service mints an IPAM internet registry association with.
+///
+/// NOT `ipam-ira`, and the recorded wire corpus is why. AWS answers
+/// `ipam-ira-0000000000000000f` — a seventeen-hexadecimal-digit suffix, the long EC2 resource
+/// id form — with `InvalidIpamInternetRegistryAssociationId.Malformed` ("The
+/// ipam-internet-registry-association ID '…' is malformed"), while the SAME suffix under the
+/// prefixes AWS does issue is resolved and only then reported missing:
+/// `ipam-pool-0000000000000000f` ("The ipam-pool ID '…' does not exist"),
+/// `ipam-scope-0000000000000000f`, `ipam-0000000000000000f` and `tgw-rtb-0000000000000000f`
+/// each come back as a NotFound. The suffix is therefore well formed and it is the PREFIX
+/// that EC2 does not know: `ipam-ira` is not a resource-id prefix of this API, which is what
+/// makes an id carrying it malformed rather than missing.
+///
+/// Which prefix AWS does issue for this resource is published nowhere the model carries
+/// (`smithy_query(query="shape",shape="IpamInternetRegistryAssociationId")` is a plain
+/// `String` with no `@pattern`), so this one is CHOSEN, spelled in the style of the IPAM
+/// resource discovery association's own prefix: `ir` for the internet registry the
+/// association is with, `-assoc` for the association itself.
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] appends the seventeen lowercase hexadecimal
+/// digits every long EC2 id carries, so every id this store mints is one
+/// [`ipam_internet_registry_association_id_is_well_formed`] accepts.
+pub const IPAM_INTERNET_REGISTRY_ASSOCIATION_ID_PREFIX: &str = "ipam-ir-assoc";
+
+/// The `ResourceType` an internet registry association's own ARN names, which is also how
+/// EC2's refusals spell this resource kind.
+pub const RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION: &str =
+    "ipam-internet-registry-association";
+
+/// The id prefix a routing policy registration delta is minted with.
+///
+/// "The unique identifier of the delta" (`IpamRoutingPolicyRegistrationDelta$DeltaId`) carries
+/// no documented form — no `@pattern` and no example in the model — so the form is CHOSEN:
+/// an EC2 resource id of the long form under a prefix naming the resource, like every other
+/// id this store mints.
+pub const IPAM_ROUTING_POLICY_REGISTRATION_DELTA_ID_PREFIX: &str = "ipam-rpr-delta";
+
+/// A routing policy registration in service: the `IpamRoutingPolicyRegistrationState`
+/// catalog's `create-complete` member (the generated catalog is
+/// `crate::ops::types::IPAM_ROUTING_POLICY_REGISTRATION_STATE_VALUES`).
+pub const IPAM_ROUTING_POLICY_REGISTRATION_STATE_CREATE_COMPLETE: &str = "create-complete";
+
+/// A registration whose deletion has been asked for and is not finished: that catalog's
+/// `delete-in-progress` member, the TRANSIENT state a delete answers with.
+pub const IPAM_ROUTING_POLICY_REGISTRATION_STATE_DELETE_IN_PROGRESS: &str = "delete-in-progress";
+
+/// A registration whose deletion is finished: that catalog's `delete-complete` member, which
+/// the clock owes every registration a delete has started on.
+pub const IPAM_ROUTING_POLICY_REGISTRATION_STATE_DELETE_COMPLETE: &str = "delete-complete";
+
+/// A delta that has not been published yet: the `IpamRoutingPolicyRegistrationDeltaState`
+/// catalog's `pending` member ("Valid values: `pending` | `published` | `failed`",
+/// `IpamRoutingPolicyRegistrationDelta$State`).
+pub const IPAM_ROUTING_POLICY_REGISTRATION_DELTA_STATE_PENDING: &str = "pending";
+
+/// A delta that has been published: that catalog's `published` member, which the clock owes
+/// every delta this store mints.
+pub const IPAM_ROUTING_POLICY_REGISTRATION_DELTA_STATE_PUBLISHED: &str = "published";
+
+/// The `StateMessage` a delta carries while it is
+/// [`IPAM_ROUTING_POLICY_REGISTRATION_DELTA_STATE_PENDING`] — "a message describing the
+/// current state" (`IpamRoutingPolicyRegistrationDelta$StateMessage`), in this crate's own
+/// words rather than a recording's.
+pub const IPAM_ROUTING_POLICY_REGISTRATION_DELTA_PENDING_MESSAGE: &str =
+    "The routing policy registration delta has not been published yet.";
+
+/// The `StateMessage` a delta carries once it is
+/// [`IPAM_ROUTING_POLICY_REGISTRATION_DELTA_STATE_PUBLISHED`].
+pub const IPAM_ROUTING_POLICY_REGISTRATION_DELTA_PUBLISHED_MESSAGE: &str =
+    "The routing policy registration delta has been published.";
+
+/// `InvalidIpamInternetRegistryAssociationId.Malformed` (HTTP 400): the request named
+/// something that is not an IPAM internet registry association id at all, so there is
+/// nothing to look up. The code AWS answers, as the recorded wire corpus behind
+/// `issues/…-ec2-deleteipamroutingpolicyregistration-stub.md` shows.
+pub const INVALID_IPAM_INTERNET_REGISTRY_ASSOCIATION_ID_MALFORMED: &str =
+    "InvalidIpamInternetRegistryAssociationId.Malformed";
+
+/// `InvalidIpamInternetRegistryAssociationId.NotFound` (HTTP 400): the request named a
+/// well-formed IPAM internet registry association id this account holds no association for.
+///
+/// The `.NotFound` counterpart of the `.Malformed` code above, which is how every EC2
+/// resource spells the second of those two questions (`InvalidIpamPoolId.NotFound`,
+/// `InvalidVpcEndpointId.NotFound`, …).
+pub const INVALID_IPAM_INTERNET_REGISTRY_ASSOCIATION_ID_NOT_FOUND: &str =
+    "InvalidIpamInternetRegistryAssociationId.NotFound";
+
+/// Whether `id` is a well-formed IPAM internet registry association id — one this service
+/// could have ISSUED.
+///
+/// `<prefix>-<8 or 17 lowercase hex digits>`, read by the one generic id reader
+/// ([`prefixed_id_is_well_formed`]) under this resource's own prefix
+/// ([`IPAM_INTERNET_REGISTRY_ASSOCIATION_ID_PREFIX`], whose doc carries the recorded
+/// evidence for it). Anything else is `.Malformed` BEFORE any lookup, so a caller can tell
+/// "not an id of this kind" from "no such association".
+pub fn ipam_internet_registry_association_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(IPAM_INTERNET_REGISTRY_ASSOCIATION_ID_PREFIX, id)
+}
+
+/// Refuse something that is not an IPAM internet registry association id at all: HTTP 400
+/// `InvalidIpamInternetRegistryAssociationId.Malformed`, worded the way AWS words a
+/// malformed id of this resource and built from the request's own value.
+pub fn invalid_ipam_internet_registry_association_id_malformed<E>(id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_IPAM_INTERNET_REGISTRY_ASSOCIATION_ID_MALFORMED,
+        400,
+        format!("The {RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION} ID '{id}' is malformed"),
+    )
+}
+
+/// Refuse a well-formed IPAM internet registry association id this account holds no
+/// association for: HTTP 400 `InvalidIpamInternetRegistryAssociationId.NotFound`, worded by
+/// the one writer of that refusal ([`id_not_found`]).
+pub fn invalid_ipam_internet_registry_association_id_not_found<E>(id: &str) -> Scaffolded<E> {
+    id_not_found(
+        INVALID_IPAM_INTERNET_REGISTRY_ASSOCIATION_ID_NOT_FOUND,
+        &format!("{RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION} ID"),
+        id,
+    )
+}
+
+/// Refuse an `IpamInternetRegistryAssociationId` this service cannot resolve: a malformed
+/// one before an unknown one, the order [`require_well_formed_id`] documents.
+///
+/// The ONE place an association id is resolved, so every operation that takes one refuses
+/// the same id the same way; the contract [`require_known_instance`] writes out for
+/// instances.
+pub fn require_known_ipam_internet_registry_association<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    id: &str,
+) -> Result<(), Scaffolded<E>> {
+    if !ipam_internet_registry_association_id_is_well_formed(id) {
+        return Err(invalid_ipam_internet_registry_association_id_malformed(id));
+    }
+    if !store.ipam_internet_registry_associations.contains_key(id) {
+        return Err(invalid_ipam_internet_registry_association_id_not_found(id));
+    }
+    Ok(())
+}
+
+/// Refuse a request that named a CIDR prefix the association holds no routing policy
+/// registration for: HTTP 400 `InvalidCidr.NotFound`, which is EC2's code for an address
+/// range a request named that there is nothing stored under
+/// ([`invalid_cidr_not_found`] words the BYOIP path's own).
+///
+/// A registration is addressed by `IpamInternetRegistryAssociationId` + `Cidr` and carries
+/// no id of its own, so the refusal names both: the caller can tell which of several
+/// prefixes, under which association, was not found from this text alone.
+pub fn ipam_routing_policy_registration_not_found<E>(
+    association_id: &str,
+    cidr: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CIDR_NOT_FOUND,
+        400,
+        format!(
+            "The {RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION} '{association_id}' has no \
+             routing policy registration for the CIDR ({cidr})."
+        ),
+    )
+}
+
+/// One routing policy registration: the modelled [`IpamRoutingPolicyRegistration`] every
+/// operation that reports one answers with, plus the move the clock owes it.
+///
+/// The modelled shape itself rather than a parallel record, for the reason every other store
+/// here holds one: a member a writer sets round-trips through
+/// `GetIpamRoutingPolicyRegistrations` without a field-by-field copy that can silently drop
+/// one.
+#[derive(Debug, Clone)]
+pub struct IpamRoutingPolicyRegistrationRecord {
+    /// The registration as the model shapes it, carrying the state reached so far.
+    pub view: IpamRoutingPolicyRegistration,
+    /// The terminal state the clock owes this registration while it is still transient
+    /// (`delete-in-progress` -> `delete-complete`); `None` for one that owes none.
+    pub pending: Option<PendingStateMove>,
+}
+
+impl IpamRoutingPolicyRegistrationRecord {
+    /// A registration sitting in `state` with the ASNs and prefix it authorizes, and nothing
+    /// owed to it by the clock.
+    pub fn in_state(view: IpamRoutingPolicyRegistration, state: &str) -> Self {
+        Self {
+            view: IpamRoutingPolicyRegistration {
+                state: Some(state.to_string()),
+                ..view
+            },
+            pending: None,
+        }
+    }
+
+    /// The registration's current `IpamRoutingPolicyRegistrationState`.
+    pub fn state(&self) -> &str {
+        self.view.state.as_deref().unwrap_or_default()
+    }
+
+    /// Whether a deletion of this registration has already been asked for: it is either
+    /// still `delete-in-progress` or already `delete-complete`, and in neither state is
+    /// there an authorization left to withdraw.
+    pub fn is_deleting(&self) -> bool {
+        self.state() == IPAM_ROUTING_POLICY_REGISTRATION_STATE_DELETE_IN_PROGRESS
+            || self.state() == IPAM_ROUTING_POLICY_REGISTRATION_STATE_DELETE_COMPLETE
+    }
+}
+
+/// One IPAM internet registry association and the routing policy registrations made under
+/// it.
+///
+/// The registrations are keyed by the CIDR prefix they authorize, in the canonical form
+/// [`canonical_byoip_cidr`] reads, because a registration IS per (association, prefix): the
+/// operations that act on one name it by `IpamInternetRegistryAssociationId` + `Cidr` and
+/// carry no id of their own for it. The key order is the stable order a report of them pages
+/// over.
+#[derive(Debug, Clone)]
+pub struct IpamInternetRegistryAssociationRecord {
+    /// The association itself, as the modelled shape its own operations report.
+    pub view: IpamInternetRegistryAssociation,
+    /// The routing policy registrations under this association, by canonical CIDR prefix.
+    pub registrations: BTreeMap<String, IpamRoutingPolicyRegistrationRecord>,
+}
+
+/// One routing policy registration delta: the modelled
+/// [`IpamRoutingPolicyRegistrationDelta`] the write that minted it answered with, plus which
+/// registration it changed and the publication the clock owes it.
+///
+/// "Contains information about a routing policy registration change"
+/// (`IpamRoutingPolicyRegistrationDelta`): a delta is the record of ONE change, so it is kept
+/// after the call that made it rather than being rebuilt by whoever asks next, and the
+/// registration it belongs to is named on it so a report of the deltas of one registration
+/// needs no scan of the registrations.
+#[derive(Debug, Clone)]
+pub struct IpamRoutingPolicyRegistrationDeltaRecord {
+    /// The delta as the model shapes it, carrying the state reached so far.
+    pub view: IpamRoutingPolicyRegistrationDelta,
+    /// The association the changed registration belongs to.
+    pub ipam_internet_registry_association_id: String,
+    /// The canonical CIDR prefix of the changed registration.
+    pub cidr: String,
+    /// The move to `published` a delta owes while it is still `pending`; `None` once it has
+    /// been applied.
+    pub pending: Option<PendingStateMove>,
+}
+
+/// What a routing policy registration delta is minted from.
+///
+/// A struct rather than four positional arguments so no caller can swap the association id
+/// and the prefix, which are both strings.
+#[derive(Debug, Clone)]
+pub struct IpamRoutingPolicyRegistrationDeltaSpec {
+    /// The association whose registration changed.
+    pub ipam_internet_registry_association_id: String,
+    /// The canonical CIDR prefix of the registration that changed.
+    pub cidr: String,
+    /// "The JSON specification describing the changes applied in this delta"
+    /// (`IpamRoutingPolicyRegistrationDelta$DeltaJson`), built by the operation that made
+    /// the change from the registration it changed.
+    pub delta_json: String,
+}
+
+/// The bytes one stored routing policy registration holds: the prefix it authorizes, the
+/// ASNs authorized to originate it, its description and the id of its latest delta, on top
+/// of the fixed [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs.
+///
+/// The ONE definition of that charge, the way [`byoip_cidr_payload_bytes`] is for an address
+/// range: a writer charges exactly it.
+pub fn ipam_routing_policy_registration_payload_bytes(
+    view: &IpamRoutingPolicyRegistration,
+) -> usize {
+    let asn_bytes = view
+        .asns
+        .iter()
+        .flatten()
+        .map(String::len)
+        .fold(0usize, usize::saturating_add);
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(view.cidr.as_deref().map_or(0, str::len))
+        .saturating_add(view.description.as_deref().map_or(0, str::len))
+        .saturating_add(view.latest_delta_id.as_deref().map_or(0, str::len))
+        .saturating_add(asn_bytes)
+}
+
+/// The bytes one stored delta holds: its JSON specification and its state message, on top of
+/// the same fixed overhead.
+pub fn ipam_routing_policy_registration_delta_payload_bytes(
+    view: &IpamRoutingPolicyRegistrationDelta,
+) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(view.delta_json.as_deref().map_or(0, str::len))
+        .saturating_add(view.state_message.as_deref().map_or(0, str::len))
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another IPAM internet registry association fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`].
+    pub fn has_ipam_internet_registry_association_capacity(&self) -> bool {
+        self.ipam_internet_registry_associations.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Whether another routing policy registration delta fits inside that same ceiling.
+    pub fn has_ipam_routing_policy_registration_delta_capacity(&self) -> bool {
+        self.ipam_routing_policy_registration_deltas.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store an IPAM internet registry association and answer the
+    /// `IpamInternetRegistryAssociationId` it was given — or `None` when the store is at
+    /// [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was stored.
+    ///
+    /// The id and the ARN are minted here rather than taken from `view`, exactly as
+    /// [`Self::insert_ipam_pool`] mints a pool's, so no path can store an association
+    /// under an id this service could not have issued. An association is stored with no
+    /// registrations: every registration is made by a request.
+    pub fn insert_ipam_internet_registry_association(
+        &mut self,
+        mut view: IpamInternetRegistryAssociation,
+    ) -> Option<String> {
+        if !self.has_ipam_internet_registry_association_capacity() {
+            return None;
+        }
+        let association_id = self.next_id(IPAM_INTERNET_REGISTRY_ASSOCIATION_ID_PREFIX);
+        let region = view
+            .ipam_region
+            .clone()
+            .unwrap_or_else(|| DEFAULT_REGION.to_string());
+        view.ipam_internet_registry_association_id = Some(association_id.clone());
+        // "The Amazon Resource Name (ARN) of the internet registry association"
+        // (`IpamInternetRegistryAssociation$IpamInternetRegistryAssociationArn`): an EC2 ARN
+        // in the IPAM's own Region, under this resource's type.
+        view.ipam_internet_registry_association_arn = Some(::engine::emulator_arn(
+            "ec2",
+            &region,
+            &format!("{RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION}/{association_id}"),
+        ));
+        // "The ID of the Amazon Web Services account that owns the internet registry
+        // association" (`IpamInternetRegistryAssociation$OwnerId`): this emulator serves one
+        // account, so the association is owned by it rather than by anything a request says.
+        view.owner_id = Some(::engine::emulator_account_id().to_string());
+        self.add_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES
+                + tag_list_bytes(view.tags.as_deref().unwrap_or_default())
+                + view.description.as_deref().unwrap_or_default().len()
+                + view.organization_handle.as_deref().unwrap_or_default().len(),
+        );
+        self.ipam_internet_registry_associations.insert(
+            association_id.clone(),
+            IpamInternetRegistryAssociationRecord {
+                view,
+                registrations: BTreeMap::new(),
+            },
+        );
+        Some(association_id)
+    }
+
+    /// Store `record` as the routing policy registration of `association_id` for the `Cidr`
+    /// its view carries, replacing whatever registration that prefix named before, and
+    /// answer the canonical prefix it was filed under.
+    ///
+    /// The key is the prefix in the canonical form the store documents
+    /// ([`canonical_byoip_cidr`]), taken here rather than trusted from the caller, so a
+    /// writer that stores `192.0.2.5/24` cannot create a registration no lookup can name —
+    /// the same contract as [`Self::insert_byoip_cidr`].
+    ///
+    /// `None`, with NOTHING written, when the view carries no prefix to file it under, when
+    /// `association_id` names no association, or when a NEW registration would cross one of
+    /// the store's ceilings.
+    pub fn insert_ipam_routing_policy_registration(
+        &mut self,
+        association_id: &str,
+        mut record: IpamRoutingPolicyRegistrationRecord,
+    ) -> Option<String> {
+        let cidr = record
+            .view
+            .cidr
+            .as_deref()
+            .and_then(|cidr| canonical_byoip_cidr(cidr).ok())?;
+        record.view.cidr = Some(cidr.clone());
+        let charge = ipam_routing_policy_registration_payload_bytes(&record.view);
+        let association = self.ipam_internet_registry_associations.get(association_id)?;
+        // A prefix the association does not already hold a registration for is a NEW record,
+        // so it is the one that has to fit inside both ceilings; replacing one stores no
+        // further record and gives back what the record it replaces was charged.
+        let refund = association
+            .registrations
+            .get(&cidr)
+            .map(|held| ipam_routing_policy_registration_payload_bytes(&held.view));
+        if refund.is_none()
+            && (association.registrations.len() >= MAX_STORED_RECORDS_PER_STORE
+                || self.would_exceed_stored_bytes(charge))
+        {
+            return None;
+        }
+        if let Some(refund) = refund {
+            self.release_stored_bytes(refund);
+        }
+        self.add_stored_bytes(charge);
+        self.ipam_internet_registry_associations
+            .get_mut(association_id)?
+            .registrations
+            .insert(cidr.clone(), record);
+        Some(cidr)
+    }
+
+    /// The routing policy registration `association_id` holds for `cidr`, if any.
+    ///
+    /// `cidr` is canonicalised here, so a caller that names the same prefix two ways
+    /// ("192.0.2.0/24" and "192.0.2.5/24") reaches the one registration.
+    pub fn ipam_routing_policy_registration(
+        &self,
+        association_id: &str,
+        cidr: &str,
+    ) -> Option<&IpamRoutingPolicyRegistrationRecord> {
+        let cidr = canonical_byoip_cidr(cidr).ok()?;
+        self.ipam_internet_registry_associations
+            .get(association_id)?
+            .registrations
+            .get(&cidr)
+    }
+
+    /// Mint the delta that records one change to a routing policy registration, and answer
+    /// it as the caller is told about it — or `None` when the store is at
+    /// [`MAX_STORED_RECORDS_PER_STORE`] deltas, or the bytes this one would hold would cross
+    /// [`MAX_STORED_BYTES`], and NOTHING was stored.
+    ///
+    /// A delta AWS hands back is not published yet — the state catalog's own `pending`,
+    /// before `published` — so it is stored `pending` with the clock owing it `published`
+    /// one [`TRANSITION_DELAY`] later, through [`Self::materialize_due_transitions`]: the
+    /// span is never zero, so a caller reading the delta straight after the call that minted
+    /// it still sees `pending`.
+    pub fn insert_ipam_routing_policy_registration_delta(
+        &mut self,
+        spec: IpamRoutingPolicyRegistrationDeltaSpec,
+    ) -> Option<IpamRoutingPolicyRegistrationDelta> {
+        let view = IpamRoutingPolicyRegistrationDelta {
+            delta_id: None,
+            delta_json: Some(spec.delta_json),
+            state: Some(IPAM_ROUTING_POLICY_REGISTRATION_DELTA_STATE_PENDING.to_string()),
+            state_message: Some(
+                IPAM_ROUTING_POLICY_REGISTRATION_DELTA_PENDING_MESSAGE.to_string(),
+            ),
+        };
+        let charge = ipam_routing_policy_registration_delta_payload_bytes(&view);
+        if !self.has_ipam_routing_policy_registration_delta_capacity()
+            || self.would_exceed_stored_bytes(charge)
+        {
+            return None;
+        }
+        let delta_id = self.next_id(IPAM_ROUTING_POLICY_REGISTRATION_DELTA_ID_PREFIX);
+        let view = IpamRoutingPolicyRegistrationDelta {
+            delta_id: Some(delta_id.clone()),
+            ..view
+        };
+        self.add_stored_bytes(charge);
+        let stored = view.clone();
+        self.ipam_routing_policy_registration_deltas.insert(
+            delta_id,
+            IpamRoutingPolicyRegistrationDeltaRecord {
+                view,
+                ipam_internet_registry_association_id: spec.ipam_internet_registry_association_id,
+                cidr: spec.cidr,
+                pending: Some(PendingStateMove::starting_now(
+                    IPAM_ROUTING_POLICY_REGISTRATION_DELTA_STATE_PUBLISHED,
+                )),
+            },
+        );
+        Some(stored)
+    }
+
+    /// The delta `delta_id` names, as it now stands.
+    pub fn ipam_routing_policy_registration_delta(
+        &self,
+        delta_id: &str,
+    ) -> Option<&IpamRoutingPolicyRegistrationDeltaRecord> {
+        self.ipam_routing_policy_registration_deltas.get(delta_id)
     }
 }
 
