@@ -1919,6 +1919,9 @@ fn non_empty<T: Clone>(items: &[T]) -> Option<Vec<T>> {
 /// second copy that could disagree with it. `targets` is the one
 /// [`target_revision_keys`] map the caller built for this request, so projecting
 /// a page of revisions walks the index ONCE however many revisions it carries.
+/// It is reported as the list the revision HAS, empty included: every revision
+/// of every application has such a set of groups, so a client can index the
+/// member rather than handling absent and empty separately.
 pub fn generic_revision_info(
     application: &Application,
     targets: &HashMap<String, String>,
@@ -1927,7 +1930,7 @@ pub fn generic_revision_info(
     let revision = application.revisions.get(key);
     crate::ops::types::GenericRevisionInfo {
         description: revision.and_then(|revision| revision.description.clone()),
-        deployment_groups: non_empty(&deployment_groups_targeting(application, targets, key)),
+        deployment_groups: Some(deployment_groups_targeting(application, targets, key)),
         first_used_time: revision
             .and_then(|revision| revision.first_used_time_ms)
             .map(timestamp),
