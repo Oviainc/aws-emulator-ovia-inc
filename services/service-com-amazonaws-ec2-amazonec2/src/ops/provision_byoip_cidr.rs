@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ProvisionByoipCidr
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ProvisionByoipCidr`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ProvisionByoipCidr::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Brings one public address range to this account: validates the range against what
+//! `ProvisionByoipCidrRequest$Cidr` publishes for one — public space, no more specific
+//! than the family's most specific prefix, overlapping no range already brought — mints
+//! the address pool the provision creates, and stores the range in [`crate::state`] in
+//! `pending-provision`, the state the CLOCK owes `provisioned`. A mutating operation;
+//! `DescribeByoipCidrs` is what reports the result.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +160,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ProvisionByoipCidr` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ProvisionByoipCidrErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ProvisionByoipCidr"))
+        use crate::state;
+
+        // "The public IPv4 or IPv6 address range, in CIDR notation"
+        // (`ProvisionByoipCidrRequest$Cidr`) is what this action is about, so a request
+        // that carries no value for it has nothing to provision.
+        let requested = input.cidr.trim();
+        if requested.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter cidr",
+            ));
+        }
+
+        // "(IPv6 only) Indicate whether the address range will be publicly advertised to
+        // the internet. Default: true"
+        // (`ProvisionByoipCidrRequest$PubliclyAdvertisable`). It decides both the most
+        // specific IPv6 prefix the range may have and which provisioned state the clock
+        // owes it; for an IPv4 range the member says nothing — every IPv4 range AWS takes
+        // is advertisable — so it is read here and left aside by the store.
+        let publicly_advertisable = input
+            .publicly_advertisable
+            .unwrap_or(state::DEFAULT_PUBLICLY_ADVERTISABLE);
+
+        // The range itself, read the one way this crate reads a CIDR block and held to the
+        // bounds that member publishes: "The most specific IPv4 prefix that you can specify
+        // is /24. The most specific IPv6 address range that you can bring is /48 for CIDRs
+        // that are publicly advertisable and /56 for CIDRs that are not publicly
+        // advertisable."
+        let block = match state::provisionable_byoip_cidr(requested, publicly_advertisable) {
+            Ok(block) => block,
+            Err(state::ByoipCidrProblem::Malformed) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({requested}) for parameter cidr is invalid. \
+                     This is not a valid CIDR block."
+                )))
+            }
+            Err(state::ByoipCidrProblem::PrefixLength(most_specific)) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({requested}) for parameter cidr is invalid. \
+                     The most specific prefix that can be provisioned is /{most_specific}."
+                )))
+            }
+            Err(state::ByoipCidrProblem::NotPublic) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({requested}) for parameter cidr is invalid. \
+                     Only a public address range can be provisioned."
+                )))
+            }
+        };
+
+        let region = state::request_region(ctx.parts());
+        // "If you have Local Zones enabled, you can choose a network border group for
+        // Local Zones when you provision and advertise a BYOIPv4 CIDR"
+        // (`ProvisionByoipCidrRequest$NetworkBorderGroup`) — and only one of the Local Zone
+        // groups that member lists, in the Region the request was signed for. A request
+        // that names none advertises from that Region, which is its own network border
+        // group.
+        let network_border_group = match input.network_border_group.as_deref() {
+            None => region.clone(),
+            Some(group)
+                if state::byoip_network_border_group_allowed(group, &region, block.family) =>
+            {
+                group.to_string()
+            }
+            Some(group) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({group}) for parameter networkBorderGroup is invalid. \
+                     The address range can only be provisioned to {region} or to one of \
+                     its Local Zone network border groups, and a BYOIPv6 address range \
+                     cannot be provisioned to a Local Zone."
+                )))
+            }
+        };
+
+        // "The tags to apply to the address pool"
+        // (`ProvisionByoipCidrRequest$PoolTagSpecifications`): the only resource this
+        // action tags is the pool it creates, whose `ResourceType` is the one of the
+        // range's own family. The tag payload's own bounds are the ones every create holds
+        // its tags to, applied by the one shared reader — so a specification naming
+        // another resource type, or a tag outside those bounds, is refused HERE. The tags
+        // themselves are not stored: the address pool is not a resource this store holds
+        // (every public-pool operation is a scaffold answering 501), so there would be
+        // nothing to hang them on and nothing that could report them back. The operation
+        // that lands a public-pool read has to store them WITH the pool rather than let
+        // this drop them.
+        let _pool_tags: Vec<Tag> = state::tags_from_specifications(
+            input.pool_tag_specifications.as_deref(),
+            block.family.pool_resource_type(),
+            Self::NAME,
+        )?;
+
+        // Everything about the range that comes from the request, assembled before the
+        // store is touched so nothing is written for a request that is still refused below.
+        let spec = state::ByoipCidrSpec {
+            block,
+            description: input.description.clone(),
+            network_border_group,
+            publicly_advertisable,
+        };
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+
+        // The record-count ceiling, asked before anything is minted. The BYTE budget is the
+        // store's own to enforce: `provision_byoip_cidr` charges the record it builds
+        // through the single insert path, which refuses one whose bytes would cross
+        // [`state::MAX_STORED_BYTES`], so this handler reads that refusal below rather than
+        // computing the charge a second time here.
+        if !store.has_byoip_cidr_capacity() {
+            return Err(state::byoip_cidr_limit_exceeded());
+        }
+
+        // "The address range cannot overlap with another address range that you've brought
+        // to this or another Region" (`ProvisionByoipCidrRequest$Cidr`) — asked against the
+        // whole store, so a repeat of a range already brought is refused as well as one
+        // that merely reaches into it.
+        if let Some(held) = store.byoip_cidr_overlapping(&spec.block.cidr) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({requested}) for parameter cidr is invalid. \
+                 The address range overlaps with address range {held}, \
+                 which has already been provisioned."
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation"
+        // (`ProvisionByoipCidrRequest$DryRun`). Nothing has been written yet, and nothing
+        // is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // `CidrAuthorizationContext` is "a signed document that proves that you are
+        // authorized to bring the specified IP address range to Amazon using BYOIP" —
+        // proof AWS checks against the range's RPKI ROA, which no emulator can reach.
+        // Every caller of this emulator is permitted, so the document is neither required
+        // nor verified, and nothing from it is stored or reported. `MultiRegion` the model
+        // documents as "Reserved.", so it carries nothing to act on either.
+        // The store refuses a record whose caller-chosen bytes would cross the emulator's
+        // one byte budget, and a range it did not store is not a range to report.
+        let Some(byoip_cidr) = store.provision_byoip_cidr(spec) else {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store this address range",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        };
+        Ok(ProvisionByoipCidrOutput {
+            byoip_cidr: Some(byoip_cidr),
+        })
     }
 }

@@ -8,14 +8,17 @@
 //! can skip a layer that was uploaded before.
 //!
 //! One answer per requested digest, in request order, split between the two output
-//! members the model gives: a layer this repository holds is `AVAILABLE` with the size
-//! the completed upload carried, a well-formed digest it does not hold is a
-//! `MissingLayerDigest` failure, and a digest that is not of the `<algorithm>:<hex>` form
-//! the model's `LayerDigest` declares is an `InvalidLayerDigest` failure — this
-//! operation's own `layerDigests` are `BatchedOperationLayerDigest`, which carries no
-//! pattern, so such a digest reaches the handler instead of being refused at the
-//! boundary. `Layer$mediaType` is reported for no layer: a layer upload carries no media
-//! type, so nothing stored states one.
+//! members the model gives: a digest of the `<algorithm>:<hex>` form the model's
+//! `LayerDigest` declares addresses a layer, so it is answered with a `Layer` —
+//! `AVAILABLE` with the size the completed upload carried when this repository holds it,
+//! and `UNAVAILABLE` when it does not, which is what a push client reads to decide it
+//! must upload the blob. A `LayerFailure` is reserved for a request entry that addresses
+//! no layer at all: this operation's own `layerDigests` are
+//! `BatchedOperationLayerDigest`, which carries no pattern, so an entry outside
+//! `LayerDigest`'s form reaches the handler instead of being refused at the boundary and
+//! is reported as `InvalidLayerDigest`, or as `MissingLayerDigest` when it carries no
+//! digest at all. `Layer$mediaType` is reported for no layer: a layer upload carries no
+//! media type, so nothing stored states one.
 //!
 //! A report, so nothing is written: the layer set is projected as it stands.
 //!
@@ -227,12 +230,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut failures: Vec<LayerFailure> = Vec::new();
         for requested in &input.layer_digests {
             if !crate::state::is_layer_digest_form(requested) {
+                // An entry outside `LayerDigest`'s form addresses no layer, so it can
+                // only be answered as a failure: one carrying nothing at all is a
+                // missing digest, one carrying something that is not a content digest an
+                // invalid one.
+                let (failure_code, failure_reason) = if requested.is_empty() {
+                    (MISSING_LAYER_DIGEST, "This entry carries no layer digest")
+                } else {
+                    (
+                        INVALID_LAYER_DIGEST,
+                        "The layer digest is not of the form '<algorithm>:<hex>'",
+                    )
+                };
                 failures.push(LayerFailure {
                     layer_digest: Some(requested.clone()),
-                    failure_code: Some(INVALID_LAYER_DIGEST.to_string()),
-                    failure_reason: Some(
-                        "The layer digest is not of the form '<algorithm>:<hex>'".to_string(),
-                    ),
+                    failure_code: Some(failure_code.to_string()),
+                    failure_reason: Some(failure_reason.to_string()),
                 });
                 continue;
             }
@@ -252,12 +265,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // none for a layer: the member is absent rather than invented.
                     media_type: None,
                 }),
-                None => failures.push(LayerFailure {
+                None => layers.push(Layer {
                     layer_digest: Some(requested.clone()),
-                    failure_code: Some(MISSING_LAYER_DIGEST.to_string()),
-                    failure_reason: Some(
-                        "The layer digest is not present in the repository".to_string(),
-                    ),
+                    layer_availability: Some(LAYER_UNAVAILABLE.to_string()),
+                    // The repository knows no size for a layer it does not hold, and no
+                    // media type for any layer.
+                    layer_size: None,
+                    media_type: None,
                 }),
             }
         }
@@ -274,13 +288,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The `LayerAvailability` value a layer this repository holds reports
 /// (`LAYER_AVAILABILITY_VALUES` in `ops/types/shared_types.rs`: `AVAILABLE` /
-/// `UNAVAILABLE`). `UNAVAILABLE` describes a layer the registry knows of but cannot
-/// serve, which nothing in this model produces: a layer is recorded only by the upload
-/// that completed it, and one that was never completed is a failure rather than a layer.
+/// `UNAVAILABLE`).
 const LAYER_AVAILABLE: &str = "AVAILABLE";
 
-/// The `LayerFailureCode` for a well-formed digest this repository does not hold
-/// (`LAYER_FAILURE_CODE_VALUES`: `InvalidLayerDigest` / `MissingLayerDigest`).
+/// The `LayerAvailability` value reported for a layer this repository does not hold: the
+/// digest addresses a layer, and that layer is simply not here — which is what a push
+/// client asks about before uploading a blob.
+const LAYER_UNAVAILABLE: &str = "UNAVAILABLE";
+
+/// The `LayerFailureCode` for a request entry carrying no digest at all, so it addresses
+/// no layer to report on (`LAYER_FAILURE_CODE_VALUES`: `InvalidLayerDigest` /
+/// `MissingLayerDigest`).
 const MISSING_LAYER_DIGEST: &str = "MissingLayerDigest";
 
 /// The `LayerFailureCode` for a digest that is not of the form the model's `LayerDigest`

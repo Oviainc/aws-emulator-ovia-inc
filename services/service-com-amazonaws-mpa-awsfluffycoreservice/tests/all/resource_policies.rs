@@ -182,7 +182,7 @@ fn attachment(case: &PolicyCase) -> String {
 
 /// A create body the modelled constraints accept, carrying `policies` as its
 /// `Policies` references. `Policies` is `length(1..10)`.
-fn create_body(name: &str, policies: &[String]) -> Value {
+pub(crate) fn create_body(name: &str, policies: &[String]) -> Value {
     json!({
         "Name": name,
         "Description": "resource policies",
@@ -202,7 +202,7 @@ fn create_body(name: &str, policies: &[String]) -> Value {
 }
 
 /// One `GetResourcePolicy` call, over the wire.
-async fn get_resource_policy(
+pub(crate) async fn get_resource_policy(
     harness: &Harness,
     resource_arn: &str,
     policy_name: &str,

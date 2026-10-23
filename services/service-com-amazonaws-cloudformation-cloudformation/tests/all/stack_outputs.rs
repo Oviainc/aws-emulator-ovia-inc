@@ -436,8 +436,9 @@ fn output_cases() -> Vec<OutputCase> {
             // `AWS::SQS::Queue`, whose documented `Ref` is the queue url — is asserted
             // where the queue is really created, in
             // `core/router/tests/all/cloudformation_provisions_sqs_queues.rs`: this
-            // emulator PROVISIONS that type, so with CloudFormation alone mounted such a
-            // stack fails rather than publishing a url nothing answers to.
+            // emulator PROVISIONS that type, and Amazon SQS is not one of the services
+            // this crate's harness mounts, so such a stack fails here rather than
+            // publishing a url nothing answers to.
             case: "a bucket and a table: Ref is the name, Arn is the attribute",
             stack_name: "storage",
             template: r#"{"Resources":{"B":{"Type":"AWS::S3::Bucket",

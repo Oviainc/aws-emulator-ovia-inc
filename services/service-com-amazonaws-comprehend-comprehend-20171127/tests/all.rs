@@ -27,6 +27,8 @@ mod batch_syntax;
 mod classifier_training;
 #[path = "all/comprehend_client.rs"]
 mod comprehend_client;
+#[path = "all/detect_pii_entities.rs"]
+mod detect_pii_entities;
 #[path = "all/document_classifiers.rs"]
 mod document_classifiers;
 #[path = "all/dominant_language_jobs.rs"]
@@ -43,6 +45,8 @@ mod scratch_dump;
 mod key_phrases_jobs;
 #[path = "all/pii_detection.rs"]
 mod pii_detection;
+#[path = "all/pii_entities.rs"]
+mod pii_entities;
 #[path = "all/pii_entities_jobs.rs"]
 mod pii_entities_jobs;
 #[path = "all/realtime_text_quotas.rs"]

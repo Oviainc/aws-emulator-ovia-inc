@@ -44,8 +44,10 @@
 //!
 //! Each catalog entry carries its VERSIONS ([`CatalogPolicy::versions`]), one of which is
 //! the entry's default; `ListPolicyVersions` reports them for the policy its `PolicyArn`
-//! names. A version is as immutable as the policy that owns it — nothing in this model
-//! mints or retires one — so no reader of the catalog writes to it.
+//! names and `GetPolicyVersion` reports the one its `PolicyVersionArn` names, resolved
+//! through [`ComAmazonawsMpaAwsfluffycoreserviceState::policy_version`]. A version is as
+//! immutable as the policy that owns it — nothing in this model mints or retires one — so
+//! no reader of the catalog writes to it.
 //!
 //! # Authorization
 //!
@@ -916,21 +918,18 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
         resource_arn: &str,
         attached_arn: &str,
     ) -> Option<ResourcePolicy> {
-        let reference = parse_policy_version_arn(attached_arn)?;
-        let policy = self.policy(&reference.policy_arn)?;
-        let version_id = match reference.version {
-            PolicyVersionSelector::Default => policy.default_version,
-            PolicyVersionSelector::Id(version_id) => version_id,
-        };
-        policy.version(version_id)?;
+        // The one resolver for a qualified policy ARN, so an attachment and
+        // `GetPolicyVersion` name the same version — and the same document — for the
+        // same ARN.
+        let (policy, version) = self.policy_version(attached_arn)?;
         Some(ResourcePolicy {
             resource_arn: resource_arn.to_string(),
             policy_arn: policy.arn.clone(),
-            policy_version_arn: policy.version_arn(version_id),
-            policy_version_id: version_id,
+            policy_version_arn: policy.version_arn(version.version_id),
+            policy_version_id: version.version_id,
             policy_name: policy.name.clone(),
             policy_type: policy.policy_type,
-            document: policy_version_document(policy, version_id),
+            document: policy_version_document(policy, version.version_id),
         })
     }
 
@@ -938,6 +937,25 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     #[must_use]
     pub fn policy(&self, arn: &str) -> Option<&CatalogPolicy> {
         self.policies.get(arn)
+    }
+
+    /// The catalog policy and the one of its versions that a `QualifiedPolicyArn` names,
+    /// or `None` when `arn` is outside that grammar or the catalog holds no such version.
+    ///
+    /// The grammar is [`parse_policy_version_arn`]'s, so every reader of a qualified
+    /// policy ARN — the resource-policy reads and `GetPolicyVersion` alike — resolves one
+    /// through this one function and accepts exactly the ARNs the model's pattern fixes.
+    /// `$DEFAULT` is resolved against the policy's RECORDED default, so such an ARN names
+    /// whichever version is the default when it is read.
+    #[must_use]
+    pub fn policy_version(&self, arn: &str) -> Option<(&CatalogPolicy, &CatalogPolicyVersion)> {
+        let reference = parse_policy_version_arn(arn)?;
+        let policy = self.policy(&reference.policy_arn)?;
+        let version_id = match reference.version {
+            PolicyVersionSelector::Default => policy.default_version,
+            PolicyVersionSelector::Id(version_id) => version_id,
+        };
+        policy.version(version_id).map(|version| (policy, version))
     }
 
     /// Record a policy in the catalog, replacing any entry under the same ARN.

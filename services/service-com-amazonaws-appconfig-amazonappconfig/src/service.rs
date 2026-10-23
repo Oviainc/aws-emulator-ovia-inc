@@ -128,17 +128,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // AppConfig's model declares NO `ValidationException` anywhere: a request that
+        // violates a declared constraint is refused with the modelled
+        // `BadRequestException` (HTTP 400), which every operation in this service
+        // lists, so that is the code a client switches on. The framework's default
+        // names `ValidationException` — a class this service does not model, which an
+        // SDK cannot classify — so the code is replaced here, once for the whole
+        // service, rather than in each handler: the refusal happens BEFORE any handler
+        // runs.
+        //
+        // The message is the framework's own `N validation error detected: Value <v> at
+        // '<member>' failed to satisfy constraint: …` envelope, which is already the
+        // text AWS states for a constraint violation and is built from the request's
+        // own member path and value. The echoed value is elided by the framework's
+        // bound on how much of a caller-supplied value a response repeats.
+        //
+        // `Unauthenticated` keeps the framework's wording: authentication is the
+        // emulator's, not AppConfig's, and this service models no error for it.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: aws_smithy_schema_server::envelope(violations)
+                    .unwrap_or_else(|| "invalid request".to_string()),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

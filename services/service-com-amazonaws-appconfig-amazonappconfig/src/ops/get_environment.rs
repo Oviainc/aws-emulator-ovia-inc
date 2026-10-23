@@ -162,9 +162,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(application) = store.applications.get_mut(&input.application_id) else {
             return Err(GetEnvironmentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No application with id {} exists.",
-                        input.application_id
+                    message: Some(crate::state::application_not_found(
+                        &input.application_id,
                     )),
                     resource_name: Some(input.application_id),
                 },
@@ -174,9 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(environment) = application.environments.get_mut(&input.environment_id) else {
             return Err(GetEnvironmentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No environment with id {} exists in application {}.",
-                        input.environment_id, input.application_id
+                    message: Some(crate::state::environment_not_found(
+                        &input.application_id,
+                        &input.environment_id,
                     )),
                     resource_name: Some(input.environment_id),
                 },

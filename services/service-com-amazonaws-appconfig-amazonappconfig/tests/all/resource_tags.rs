@@ -514,10 +514,10 @@ enum Expected {
 /// `TagKey` is `length 1..128` and `TagValue` is `length 0..256` — the same numbers the
 /// `Tags` member documents ("The tag key can be up to 128 characters and must not start
 /// with `aws:`. The tag value can be up to 256 characters."). A map VALUE's constraints
-/// are part of the schema walk, so a value past its bound is refused with
-/// `ValidationException` before any handler runs; a map KEY's are not, so the key rules
-/// and the reserved prefix (which the model carries no trait for) are the service's own
-/// `BadRequestException`.
+/// are part of the schema walk, so a value past its bound is refused before any handler
+/// runs; a map KEY's are not, so the key rules and the reserved prefix (which the model
+/// carries no trait for) are refused by the handler. Either way the code is the modelled
+/// `BadRequestException` — this service's model declares no `ValidationException` at all.
 ///
 /// Each bound is tested AT the published value and one character past it, so the row that
 /// is accepted and the row that is refused differ by that one character alone.
@@ -547,7 +547,7 @@ fn tag_pair_rows() -> Vec<(String, String, String, Expected)> {
             format!("a {}-character value, one past the maximum", value_bound + 1),
             "value-past-the-bound".to_string(),
             filler(value_bound + 1, 4),
-            Expected::Refused("ValidationException"),
+            Expected::Refused("BadRequestException"),
         ),
         (
             "an empty key, which names no tag".to_string(),
