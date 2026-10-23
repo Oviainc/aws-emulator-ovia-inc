@@ -5,10 +5,11 @@
 //! its external connection, and answers with the stored repository's
 //! `RepositoryDescription`. A repository holds at most ONE external connection (the
 //! operation's own documentation: "One external connection is allowed per repository"),
-//! so a second one is a `ServiceQuotaExceededException` (402) and re-associating the one
-//! already held is a `ConflictException` (409); an unknown domain or repository is a
-//! `ResourceNotFoundException` (404) and a connection name that is not a registry
-//! CodeArtifact supports is a `ValidationException` (400).
+//! so a second one is a `ValidationException` (400) stating that limit and re-associating
+//! the one already held is a `ConflictException` (409); an unknown domain or repository is
+//! a `ResourceNotFoundException` (404), and so is a well-formed connection name that is
+//! not a registry CodeArtifact supports — that registry does not exist, rather than the
+//! request being malformed.
 //!
 //! ## Shape of an operation
 //!
@@ -174,19 +175,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // only checked its length and pattern: whether it NAMES a registry CodeArtifact
         // can connect to is this handler's check, and its package format comes from the
         // same catalog rather than from the request.
+        //
+        // A well-formed name that is not in the catalog names a connection that does not
+        // exist, which is a 404 and not a 400: the value satisfies every constraint
+        // `ExternalConnectionName` declares (len 2..100, pattern
+        // `^[A-Za-z0-9][A-Za-z0-9._\-:]{1,99}$`), so there is nothing about the REQUEST to
+        // refuse — the registry it asks for is simply not one this service offers.
+        // `resourceType` is left unset: `ResourceType` models only `asset`, `domain`,
+        // `package`, `package-version` and `repository`, so there is no enum value for an
+        // external connection to report.
         let Some(package_format) =
             crate::state::external_connection_package_format(&input.external_connection)
         else {
-            return Err(AssociateExternalConnectionErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "Invalid external connection '{}'.",
-                        input.external_connection
-                    ),
-                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-                },
-            )
-            .into());
+            return Err(
+                AssociateExternalConnectionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "The external connection '{}' does not exist",
+                            input.external_connection
+                        ),
+                        resource_id: Some(input.external_connection.clone()),
+                        resource_type: None,
+                    },
+                )
+                .into(),
+            );
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -258,27 +271,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // One external connection per repository: a request for a SECOND one would take
-        // the repository past that limit, which is what this operation's
-        // `ServiceQuotaExceededException` is for.
+        // One external connection per repository. The request is refused on its INPUT —
+        // this `externalConnection` cannot be associated with this repository at all,
+        // whatever the account's quotas are — so it is the modelled `ValidationException`
+        // (400) and not the `ServiceQuotaExceededException` (402) the model also declares
+        // here: a client (and an SDK retry policy) treats a quota error as a transient,
+        // raise-the-limit condition and retries it forever, where a validation error is
+        // the permanent input error this is.
         if repository.external_connections.len()
             >= crate::state::MAX_EXTERNAL_CONNECTIONS_PER_REPOSITORY
         {
-            return Err(
-                AssociateExternalConnectionErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: format!(
-                            "Cannot associate external connection '{}' with repository '{}': only {} external connection is allowed per repository.",
-                            input.external_connection,
-                            input.repository,
-                            crate::state::MAX_EXTERNAL_CONNECTIONS_PER_REPOSITORY
-                        ),
-                        resource_id: Some(input.external_connection.clone()),
-                        resource_type: Some("repository".to_string()),
-                    },
-                )
-                .into(),
-            );
+            return Err(AssociateExternalConnectionErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "ExternalConnections for repositories are currently limited to {}",
+                        crate::state::MAX_EXTERNAL_CONNECTIONS_PER_REPOSITORY
+                    ),
+                    reason: Some(crate::state::VALIDATION_REASON_FIELD_FAILED.to_string()),
+                },
+            )
+            .into());
         }
 
         repository
