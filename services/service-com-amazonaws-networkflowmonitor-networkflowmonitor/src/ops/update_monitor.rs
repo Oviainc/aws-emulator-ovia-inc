@@ -184,9 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // This operation addresses an existing monitor by name (`PATCH
-        // /monitors/{monitorName}`) and mints nothing, so it needs no Region from
-        // the request: every ARN it reports was minted by the create.
-        let _ = ctx;
+        // /monitors/{monitorName}`) and mints nothing: every ARN it REPORTS was
+        // minted by the create. The request's Region is still needed for the one
+        // ARN no record holds — the one in the refusal for a monitor that is not
+        // there (`state::monitor_not_found`).
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateMonitorErrorModeled::InternalServerException(
                 crate::state::state_unavailable(),
@@ -215,7 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // creates a monitor, so a name the store does not hold is the modelled 404.
         let Some(monitor) = state.monitors.get_mut(&input.monitor_name) else {
             return Err(UpdateMonitorErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::MONITOR_RESOURCE, &input.monitor_name),
+                crate::state::monitor_not_found(
+                    &crate::state::request_region(ctx.parts()),
+                    &input.monitor_name,
+                ),
             )
             .into());
         };

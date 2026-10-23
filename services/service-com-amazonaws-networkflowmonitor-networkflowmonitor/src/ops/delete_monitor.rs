@@ -139,7 +139,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteMonitorErrorModeled::InternalServerException(
                 crate::state::state_unavailable(),
@@ -150,9 +149,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(::std::time::SystemTime::now());
 
+        // The same missing-monitor refusal the readers answer with
+        // (`state::monitor_not_found`), so a delete-then-verify flow reads one
+        // wording whichever call found the monitor gone.
         let Some(monitor) = state.monitors.remove(&input.monitor_name) else {
             return Err(DeleteMonitorErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::MONITOR_RESOURCE, &input.monitor_name),
+                crate::state::monitor_not_found(
+                    &crate::state::request_region(ctx.parts()),
+                    &input.monitor_name,
+                ),
             )
             .into());
         };
