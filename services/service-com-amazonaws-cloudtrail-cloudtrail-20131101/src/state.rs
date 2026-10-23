@@ -675,6 +675,11 @@ pub fn iso8601(at: SystemTime) -> Option<String> {
 /// `@range` on `com.amazonaws.cloudtrail#RetentionPeriod` (7..3653).
 pub const RETENTION_PERIOD_MIN_DAYS: i32 = 7;
 
+/// From the model doc for `CreateEventDataStoreRequest$AdvancedEventSelectors`:
+/// "You can configure up to five advanced event selectors for each event data
+/// store." Exceeding it is the modelled `InvalidEventSelectorsException`.
+pub const ADVANCED_EVENT_SELECTOR_LIMIT: usize = 5;
+
 /// The default and maximum retention period of `billing_mode`, in days.
 ///
 /// From the model doc for `CreateEventDataStoreRequest$BillingMode`:
@@ -715,6 +720,23 @@ pub const EVENT_DATA_STORE_DELETION_WAIT: Duration = Duration::from_secs(7 * 24 
 /// by varying the Region it signs for. It sits far above any workflow an emulator
 /// serves.
 pub const EVENT_DATA_STORE_QUOTA: usize = 1_000;
+
+/// The fully specified KMS key ARN a `KmsKeyId` names.
+///
+/// The request takes "an alias name prefixed by alias/, a fully specified ARN to an
+/// alias, a fully specified ARN to a key, or a globally unique identifier" — the forms
+/// differ only in how they SPELL one key, so two spellings of the same key name the
+/// same key. Completing a bare value into the ARN it names is what lets a caller that
+/// re-states a store's key in another accepted form be told it changed nothing.
+pub fn kms_key_arn(region: &str, key: &str) -> String {
+    if key.starts_with("arn:") {
+        key.to_string()
+    } else if key.starts_with("alias/") {
+        ::engine::emulator_arn("kms", region, key)
+    } else {
+        ::engine::emulator_arn("kms", region, &format!("key/{key}"))
+    }
+}
 
 /// The `ImportStatus` values the model's enum declares
 /// (`smithy_query(query="shape",shape="ImportStatus")`): `INITIALIZING | IN_PROGRESS |
@@ -925,11 +947,13 @@ impl EventDataStoreState {
 pub const INGESTION_CONTROLLABLE_EVENT_CATEGORIES: &[&str] =
     &["Management", "Data", "NetworkActivity", "ConfigurationItem"];
 
-/// How long an event data store reads `STARTING_INGESTION` / `STOPPING_INGESTION`
-/// before the clock settles it into `ENABLED` / `STOPPED_INGESTION`.
+/// How long an event data store reads a non-terminal status — `CREATED` after
+/// `CreateEventDataStore`, `STARTING_INGESTION` / `STOPPING_INGESTION` after the
+/// Start/Stop ingestion pair — before the clock settles it into the status it is
+/// heading for (`ENABLED` / `STOPPED_INGESTION`).
 ///
-/// The model's `EventDataStoreStatus` enum carries both in-flight values, so the
-/// Start/Stop ingestion pair IS asynchronous. CloudTrail publishes no duration
+/// The model's `EventDataStoreStatus` enum carries every one of those in-flight
+/// values, so both transitions ARE asynchronous. CloudTrail publishes no duration
 /// for either, so this span is the emulator's own: short enough not to stall a
 /// workflow, non-zero so a caller that reads the store straight after the call
 /// still sees the transient status — and so the state errors that transient
@@ -1424,18 +1448,25 @@ pub fn event_data_store_arn(region: &str, id: &str) -> String {
 /// store ARN or the bare id suffix of one.
 ///
 /// A value carrying a `:` is read as an ARN — so a malformed ARN is refused as one
-/// rather than taken for an id — and anything else as a bare id.
+/// rather than taken for an id — and anything else as a bare id. Either way the id
+/// has to BE one this service could have minted ([`is_event_data_store_id`]) when it
+/// is written WITHOUT an ARN: the recorded answer to `UpdateEventDataStore` naming
+/// `not-an-arn` is `EventDataStoreARNInvalidException` over the ARN that value
+/// completes to, not a report that the store is absent. An ARN's resource suffix is
+/// the store the ARN names, so for that form whether a store of that id exists is
+/// the next question and not a question about the ARN's form.
 pub fn parse_event_data_store_identifier(
     value: &str,
 ) -> Result<EventDataStoreIdentifier, EventDataStoreRejection> {
+    let reject = || Err(EventDataStoreRejection::InvalidArn(value.to_string()));
     if !value.contains(':') {
         // The id suffix form, with or without the `eventdatastore/` resource
         // prefix the full ARN carries.
         let id = value
             .strip_prefix(EVENT_DATA_STORE_RESOURCE_PREFIX)
             .unwrap_or(value);
-        if id.is_empty() {
-            return Err(EventDataStoreRejection::InvalidArn(value.to_string()));
+        if !is_event_data_store_id(id) {
+            return reject();
         }
         return Ok(EventDataStoreIdentifier {
             id: id.to_string(),
@@ -1443,7 +1474,6 @@ pub fn parse_event_data_store_identifier(
         });
     }
 
-    let reject = || Err(EventDataStoreRejection::InvalidArn(value.to_string()));
     let Some((region, _account, resource)) = cloudtrail_arn_fields(value) else {
         return reject();
     };
@@ -1463,6 +1493,21 @@ pub fn parse_event_data_store_identifier(
         }),
         _ => reject(),
     }
+}
+
+/// Whether `value` is an id this service could have minted for an event data
+/// store: the UUID that is the resource suffix of its ARN
+/// (`eventdatastore/1a0abbc2-dfa0-46e6-885a-5ce09f2ee3ee`).
+///
+/// Only the lower-case hyphenated form counts. `Uuid::try_parse` also accepts the
+/// simple, braced and URN forms and upper-case hex, and none of those is an id
+/// `CreateEventDataStore` ever handed out: the modelled `UUID` shape every store
+/// id member targets is `len 36..36`, `pattern ^[a-f0-9\-]+$`
+/// (`smithy_query(query="shape", shape="UUID")`).
+pub fn is_event_data_store_id(value: &str) -> bool {
+    value.len() == 36
+        && !value.contains(|c: char| c.is_ascii_uppercase())
+        && ::uuid::Uuid::try_parse(value).is_ok()
 }
 
 /// The text an unreadable event data store identifier is refused with, worded the
@@ -1811,15 +1856,6 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
             .any(|record| record.region == region && record.owner() == account_id)
     }
 
-    /// Whether this Region already holds a store of this name. An event data store
-    /// name is unique per Region, which is what
-    /// `EventDataStoreAlreadyExistsException` reports.
-    pub fn event_data_store_named(&self, name: &str, region: &str) -> bool {
-        self.event_data_stores
-            .values()
-            .any(|record| record.name == name && record.region == region)
-    }
-
     /// Resolve a caller-supplied event data store identifier (an ARN or the bare
     /// id suffix of one) to a stored event data store.
     ///
@@ -1853,8 +1889,11 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
     }
 
     /// [`Self::addressed_event_data_store`] for a caller that CHANGES the store —
-    /// or that materialises a transition the clock already owed it (see
-    /// [`EventDataStoreRecord::settle_federation`]).
+    /// or that materialises a transition the clock already owed it: its status move
+    /// (see [`EventDataStoreRecord::settle`], which covers the create's step and
+    /// the ingestion step alike) and its federation transition (see
+    /// [`EventDataStoreRecord::settle_federation`]), each of which was due at the
+    /// stored instant whether or not anybody called.
     ///
     /// The addressing rule is the same one: a store is reachable only from the
     /// Region it lives in, whether it is named by a bare id or by an ARN.
@@ -1862,11 +1901,16 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
         &mut self,
         identifier: &EventDataStoreIdentifier,
         request_region: &str,
+        now: SystemTime,
     ) -> Option<&mut EventDataStoreRecord> {
         let addressed = identifier.addressed_region(request_region).to_string();
-        self.event_data_stores
+        let record = self
+            .event_data_stores
             .get_mut(&identifier.id)
-            .filter(|record| record.region == addressed)
+            .filter(|record| record.region == addressed)?;
+        record.settle(now);
+        record.settle_federation(now);
+        Some(record)
     }
 
     /// The query `query_id` names, as a call made in `request_region` and naming
@@ -2254,6 +2298,24 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
         let record = self.dashboards.get_mut(&key)?;
         record.settle(now);
         Some(record)
+    }
+
+    /// Whether a store in `region` other than `except` already carries `name`.
+    ///
+    /// An event data store name is unique per Region, which is what
+    /// `EventDataStoreAlreadyExistsException` reports; `except` is the id of the
+    /// store being renamed, which never conflicts with itself.
+    pub fn event_data_store_name_taken(
+        &self,
+        name: &str,
+        region: &str,
+        except: Option<&str>,
+    ) -> bool {
+        self.event_data_stores.values().any(|record| {
+            record.name == name
+                && record.region == region
+                && except.is_none_or(|id| record.id != id)
+        })
     }
 }
 

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEventDataStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEventDataStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEventDataStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates one CloudTrail Lake event data store in the shared registry
+//! (`crate::state`).
 //!
 //! ## Shape of an operation
 //!
@@ -322,18 +315,317 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEventDataStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEventDataStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEventDataStore"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // "Other parameters are optional, but at least one optional parameter must
+        // be specified, or CloudTrail throws an error."
+        let changes_nothing = input.name.is_none()
+            && input.advanced_event_selectors.is_none()
+            && input.multi_region_enabled.is_none()
+            && input.organization_enabled.is_none()
+            && input.retention_period.is_none()
+            && input.termination_protection_enabled.is_none()
+            && input.kms_key_id.is_none()
+            && input.billing_mode.is_none();
+        if changes_nothing {
+            return Err(UpdateEventDataStoreErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "At least one optional parameter must be specified besides \
+                         EventDataStore: Name, AdvancedEventSelectors, MultiRegionEnabled, \
+                         OrganizationEnabled, RetentionPeriod, TerminationProtectionEnabled, \
+                         KmsKeyId or BillingMode"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The selectors a store may carry: "You can configure up to five advanced
+        // event selectors for each event data store", the same bound
+        // `CreateEventDataStore` holds a new store to, and the per-selector rules are
+        // `PutEventSelectors`', this crate's one reading of an advanced event
+        // selector, so every writer of a selector list refuses alike.
+        if let Some(selectors) = input
+            .advanced_event_selectors
+            .as_ref()
+            .filter(|s| s.len() > crate::state::ADVANCED_SELECTORS_PER_EVENT_DATA_STORE_LIMIT)
+        {
+            return Err(
+                UpdateEventDataStoreErrorModeled::InvalidEventSelectorsException(
+                    InvalidEventSelectorsException {
+                        message: Some(format!(
+                            "AdvancedEventSelectors carries {} selectors; configure up to {} \
+                             advanced event selectors for each event data store",
+                            selectors.len(),
+                            crate::state::ADVANCED_SELECTORS_PER_EVENT_DATA_STORE_LIMIT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(reason) = input
+            .advanced_event_selectors
+            .as_deref()
+            .and_then(|selectors| {
+                crate::ops::put_event_selectors::validate_advanced_event_selectors(selectors).err()
+            })
+        {
+            return Err(
+                UpdateEventDataStoreErrorModeled::InvalidEventSelectorsException(
+                    InvalidEventSelectorsException {
+                        message: Some(reason),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateEventDataStoreErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "UpdateEventDataStore needs the CloudTrail event data store registry, \
+                         which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        // Every change the CLOCK already owed the registry is materialised first — a
+        // provisioning span that has elapsed, a settled ingestion change, a store
+        // whose seven-day deletion wait is over — so this call reads and writes the
+        // store a caller would have seen even if nobody had called.
+        store.settle_event_data_stores(now);
+
+        // Resolve BEFORE any change: `EventDataStore` is either a store ARN or the
+        // id suffix of one, a value readable as neither is refused as an ARN, and a
+        // readable one naming no store in the Region it addresses is not found. The
+        // identifier is read here rather than through
+        // `ComAmazonawsCloudtrailCloudtrail20131101State::event_data_store` so the
+        // refusal below can name the ARN it addressed.
+        let identifier = crate::state::parse_event_data_store_identifier(&input.event_data_store)
+            .map_err(|rejection| {
+            UpdateEventDataStoreErrorModeled::EventDataStoreARNInvalidException(
+                EventDataStoreARNInvalidException {
+                    message: Some(rejection.message(&region)),
+                },
+            )
+        })?;
+        let not_found = || {
+            crate::scaffolded::Scaffolded::modeled_with_status(
+                UpdateEventDataStoreErrorModeled::EventDataStoreNotFoundException(
+                    EventDataStoreNotFoundException {
+                        message: Some(crate::state::event_data_store_not_found_message(
+                            &identifier.arn(&region),
+                        )),
+                    },
+                ),
+                NOT_FOUND_STATUS,
+            )
+        };
+        let Some(record) = store.addressed_event_data_store_mut(&identifier, &region, now) else {
+            return Err(not_found());
+        };
+        // Every check below reads the store as it is now; nothing is written until
+        // all of them pass, so a refused update leaves the store untouched.
+        let store_id = record.id.clone();
+        let store_region = record.region.clone();
+        let store_status = record.status;
+        let current_billing_mode = record.billing_mode;
+        let current_kms_key_id = record.kms_key_id.clone();
+
+        // A store awaiting deletion holds no configuration left to change, which is
+        // what the modelled `InactiveEventDataStoreException` ("The event data store
+        // is inactive") reports — the same refusal `put_event_configuration` and
+        // `disable_federation` answer for that state through this registry.
+        if !store_status.is_queryable() {
+            return Err(
+                UpdateEventDataStoreErrorModeled::InactiveEventDataStoreException(
+                    InactiveEventDataStoreException {
+                        message: Some(format!(
+                            "The event data store {} is {} and cannot be updated.",
+                            identifier.arn(&region),
+                            store_status.as_wire()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You can't change the billing mode from EXTENDABLE_RETENTION_PRICING to
+        // FIXED_RETENTION_PRICING."
+        let extendable = crate::state::EventDataStoreBillingMode::ExtendableRetentionPricing;
+        let fixed = crate::state::EventDataStoreBillingMode::FixedRetentionPricing;
+        let billing_mode = match input.billing_mode.as_deref() {
+            None => current_billing_mode,
+            Some(value) => {
+                let Some(mode) = crate::state::EventDataStoreBillingMode::from_wire(value) else {
+                    return Err(UpdateEventDataStoreErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(format!(
+                                "BillingMode '{value}' is not valid: the billing mode must be \
+                                 {} or {}",
+                                extendable.as_wire(),
+                                fixed.as_wire()
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                mode
+            }
+        };
+        if current_billing_mode == extendable && billing_mode == fixed {
+            return Err(UpdateEventDataStoreErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "BillingMode cannot be changed from {} to {}; stop ingestion on this \
+                         event data store and create a new one that uses {}",
+                        extendable.as_wire(),
+                        fixed.as_wire(),
+                        fixed.as_wire()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The retention period a store may carry is the band its billing mode
+        // documents, which the request may be changing in the same call. The band is
+        // narrower than the model's own `@range` (7..3653) the boundary validator has
+        // already applied, so it is read here the way `CreateEventDataStore` reads it.
+        let (_, max_retention) = crate::state::retention_bounds(billing_mode);
+        if let Some(retention_period) = input
+            .retention_period
+            .filter(|days| !(crate::state::RETENTION_PERIOD_MIN_DAYS..=max_retention).contains(days))
+        {
+            return Err(UpdateEventDataStoreErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "RetentionPeriod {retention_period} is not valid for BillingMode {}: \
+                         the retention period must be between {} and {max_retention} days",
+                        billing_mode.as_wire(),
+                        crate::state::RETENTION_PERIOD_MIN_DAYS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "After you associate an event data store with a KMS key, the KMS key
+        // cannot be removed or changed." The accepted forms differ only in how they
+        // SPELL one key, so the two are compared as the ARN each names
+        // ([`crate::state::kms_key_arn`]) while the store keeps the value as the
+        // request wrote it — which is what `CreateEventDataStore` stores too.
+        let kms_key_id = match (current_kms_key_id, input.kms_key_id.as_deref()) {
+            (Some(current), Some(requested)) => {
+                if crate::state::kms_key_arn(&store_region, requested)
+                    != crate::state::kms_key_arn(&store_region, &current)
+                {
+                    return Err(UpdateEventDataStoreErrorModeled::InvalidKmsKeyIdException(
+                        InvalidKmsKeyIdException {
+                            message: Some(format!(
+                                "This event data store is already associated with the KMS key \
+                                 {current}; after an event data store is associated with a KMS \
+                                 key, the KMS key cannot be removed or changed"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                Some(current)
+            }
+            (None, Some(requested)) => Some(requested.to_string()),
+            (current, None) => current,
+        };
+
+        // A store name is unique per Region, so a rename onto a name another store
+        // in this Region already carries is a conflict.
+        if let Some(name) = input.name.as_deref() {
+            if store.event_data_store_name_taken(name, &store_region, Some(&store_id)) {
+                return Err(
+                    UpdateEventDataStoreErrorModeled::EventDataStoreAlreadyExistsException(
+                        EventDataStoreAlreadyExistsException {
+                            message: Some(format!(
+                                "An event data store called {name} already exists in \
+                                 {store_region}"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Every check passed: apply only the members the request carried, and move
+        // UpdatedTimestamp, which "is always either the same or newer than the time
+        // shown in CreatedTimestamp". The record is resolved a second time only
+        // because the name-uniqueness query above reads the whole registry, which
+        // ends the mutable borrow taken for the checks; the store was resolved under
+        // this same lock, so the `not_found` arm cannot be reached in practice.
+        let Some(record) = store.event_data_stores.get_mut(&store_id) else {
+            return Err(not_found());
+        };
+        if let Some(name) = input.name {
+            record.name = name;
+        }
+        if let Some(selectors) = input.advanced_event_selectors {
+            record.advanced_event_selectors = selectors;
+        }
+        if let Some(multi_region_enabled) = input.multi_region_enabled {
+            record.multi_region_enabled = multi_region_enabled;
+        }
+        if let Some(organization_enabled) = input.organization_enabled {
+            record.organization_enabled = organization_enabled;
+        }
+        if let Some(retention_period) = input.retention_period {
+            record.retention_period = Some(retention_period);
+        }
+        if let Some(termination_protection_enabled) = input.termination_protection_enabled {
+            record.termination_protection_enabled = termination_protection_enabled;
+        }
+        record.kms_key_id = kms_key_id;
+        record.billing_mode = billing_mode;
+        record.updated_at = Some(now);
+
+        // Report the stored record, so the response and every later read of this
+        // store are the same values.
+        Ok(UpdateEventDataStoreOutput {
+            event_data_store_arn: Some(record.arn()),
+            name: Some(record.name.clone()),
+            status: Some(record.status.as_wire().to_string()),
+            advanced_event_selectors: (!record.advanced_event_selectors.is_empty())
+                .then(|| record.advanced_event_selectors.clone()),
+            multi_region_enabled: Some(record.multi_region_enabled),
+            organization_enabled: Some(record.organization_enabled),
+            retention_period: record.retention_period,
+            termination_protection_enabled: Some(record.termination_protection_enabled),
+            created_timestamp: record.created_at.map(::aws_smithy_types::DateTime::from),
+            updated_timestamp: record
+                .updated_at
+                .or(record.created_at)
+                .map(::aws_smithy_types::DateTime::from),
+            kms_key_id: record.kms_key_id.clone(),
+            billing_mode: Some(record.billing_mode.as_wire().to_string()),
+            federation_status: Some(record.federation_status.as_wire().to_string()),
+            federation_role_arn: record.federation_role_arn.clone(),
+        })
     }
 }
+
+/// The HTTP status this service answers a not-found refusal with.
+///
+/// The model annotates `EventDataStoreNotFoundException` `@httpError(404)`, but
+/// CloudTrail answers 400 for it on the wire: the recorded response to this very
+/// operation naming a store that does not exist is `HTTP 400` with `__type`
+/// `EventDataStoreNotFoundException` and a `Message` naming the store's ARN. The
+/// error CODE is the model's; only the status is stated here, through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`] — the same way
+/// `get_event_data_store` states it.
+const NOT_FOUND_STATUS: u16 = 400;

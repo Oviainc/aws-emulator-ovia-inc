@@ -6,11 +6,13 @@
 //! the id suffix of that ARN. Every member of the answer comes from the stored
 //! record.
 //!
-//! The one thing it writes is a federation transition the clock already owed the
-//! store (`ENABLING` into `ENABLED`, `DISABLING` into `DISABLED`): that was due at
-//! the store's settle instant whether or not anybody read it, so materialising it
-//! here changes nothing a later caller would otherwise have seen — the same way
-//! `get_dashboard` materialises `CREATING` into `CREATED`.
+//! The things it writes are transitions the clock already owed the store: the
+//! status move `CreateEventDataStore` starts (`CREATED` into `ENABLED` or
+//! `STOPPED_INGESTION`) and a federation transition (`ENABLING` into `ENABLED`,
+//! `DISABLING` into `DISABLED`). Each was due at the store's settle instant
+//! whether or not anybody read it, so materialising them here changes nothing a
+//! later caller would otherwise have seen — the same way `get_dashboard`
+//! materialises `CREATING` into `CREATED`.
 //!
 //! ## Shape of an operation
 //!
@@ -227,7 +229,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
-        let Some(record) = store.addressed_event_data_store_mut(&identifier, &region) else {
+        // Resolved mutably only to materialise the transitions the clock had
+        // already made due; nothing else about the store changes here.
+        let Some(record) = store.addressed_event_data_store_mut(&identifier, &region, now) else {
             return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                 GetEventDataStoreErrorModeled::EventDataStoreNotFoundException(
                     EventDataStoreNotFoundException {

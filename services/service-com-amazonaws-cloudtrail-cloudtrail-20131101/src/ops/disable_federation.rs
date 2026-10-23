@@ -237,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
         let addressed_arn = identifier.arn(&region);
 
-        let Some(record) = store.addressed_event_data_store_mut(&identifier, &region) else {
+        let Some(record) = store.addressed_event_data_store_mut(&identifier, &region, now) else {
             return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                 DisableFederationErrorModeled::EventDataStoreNotFoundException(
                     EventDataStoreNotFoundException {

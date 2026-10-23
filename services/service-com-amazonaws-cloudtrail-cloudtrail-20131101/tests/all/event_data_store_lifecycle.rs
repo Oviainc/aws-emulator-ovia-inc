@@ -932,14 +932,6 @@ async fn an_identifier_naming_no_store_is_not_found() {
             format!("arn:aws:cloudtrail:ap-south-1:{account}:eventdatastore/{present_id}"),
             format!("arn:aws:cloudtrail:ap-south-1:{account}:eventdatastore/{present_id}"),
         ),
-        (
-            "an id suffix that is not a UUID",
-            "no-such-event-data-store".to_string(),
-            format!(
-                "arn:aws:cloudtrail:{HOME_REGION}:{account}:eventdatastore/\
-                 no-such-event-data-store"
-            ),
-        ),
     ];
 
     for (case, identifier, addressed) in rows {
@@ -960,12 +952,19 @@ async fn an_identifier_naming_no_store_is_not_found() {
 }
 
 /// A value WRITTEN as an ARN that is not a CloudTrail event data store ARN is refused
-/// as a bad ARN, not reported as a missing store.
+/// as a bad ARN, not reported as a missing store — and so is a bare value that is no
+/// id this service mints, which the recorded `UpdateEventDataStore` answer to
+/// `not-an-arn` refuses as `EventDataStoreARNInvalidException` over the ARN it
+/// completes to.
 #[tokio::test]
 async fn a_value_written_as_an_arn_must_be_an_event_data_store_arn() {
     let emulator = Emulator::new();
     let account = engine::emulator_account_id();
     let rows = [
+        (
+            "a bare value that is no id this service mints",
+            "no-such-event-data-store".to_string(),
+        ),
         (
             "another resource type",
             format!("arn:aws:cloudtrail:{HOME_REGION}:{account}:trail/demo"),
