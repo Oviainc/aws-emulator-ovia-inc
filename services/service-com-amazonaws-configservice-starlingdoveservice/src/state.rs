@@ -1772,10 +1772,20 @@ pub struct ResourceEvaluationEntry {
 
 impl ResourceEvaluationEntry {
     /// The modelled `ResourceEvaluation`, read back out of state.
+    ///
+    /// A LISTED evaluation carries its identity and the instant its execution started.
+    /// `ResourceEvaluation$EvaluationMode` is modelled but NOT populated here: the
+    /// recorded `ListResourceEvaluations` entries carry only `ResourceEvaluationId` and
+    /// `EvaluationStartTimestamp`, with the mode living in the request's
+    /// `ResourceEvaluationFilters` vocabulary rather than in the listed item. The mode
+    /// the execution runs in is persisted all the same
+    /// ([`ResourceEvaluationEntry::evaluation_mode`]) — the list path filters on it,
+    /// and `GetResourceEvaluationSummary` reports it, where the model and the
+    /// recordings agree it is populated.
     pub fn to_shape(&self) -> ResourceEvaluation {
         ResourceEvaluation {
             resource_evaluation_id: Some(self.id.clone()),
-            evaluation_mode: Some(self.evaluation_mode.clone()),
+            evaluation_mode: None,
             evaluation_start_timestamp: Some(timestamp(self.started_at)),
         }
     }

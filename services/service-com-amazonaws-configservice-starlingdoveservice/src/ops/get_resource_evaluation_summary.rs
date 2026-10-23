@@ -9,7 +9,7 @@
 //! A READ ONLY: every member is derived from the evaluation persisted in
 //! [`crate::state`], from the Config rules that account holds, and from the clock.
 //! Nothing here writes, and nothing synthesises a verdict for rule logic this
-//! emulator did not run — see [`evaluation_outcome`].
+//! emulator did not run — see [`crate::state::execution_outcome`].
 //!
 //! ## Shape of an operation
 //!

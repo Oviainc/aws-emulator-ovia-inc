@@ -66,3 +66,5 @@ mod compliance_details_by_config_rule;
 mod proactive_resource_evaluation;
 #[path = "all/aggregate_resource_config.rs"]
 mod aggregate_resource_config;
+#[path = "all/resource_evaluation_surface.rs"]
+mod resource_evaluation_surface;

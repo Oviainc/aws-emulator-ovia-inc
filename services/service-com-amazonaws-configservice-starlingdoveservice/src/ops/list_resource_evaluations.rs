@@ -177,6 +177,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whose start is after its end bounds nothing and is not a valid range. Equal
         // bounds are a valid (degenerate) window: the inclusive bounds then select the
         // executions at exactly that instant.
+        //
+        // The refusal carries its CODE alone: this is the envelope the operation's
+        // recorded refusals have, so no `message` member is populated — the error class
+        // ("The specified time range is not valid. The earlier time is not
+        // chronologically before the later time.") carries the information.
         let window = filters.time_window.clone().unwrap_or_default();
         let started_after = window.start_time.map(crate::state::epoch_nanos);
         let started_before = window.end_time.map(crate::state::epoch_nanos);
@@ -184,14 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if after > before {
                 return Err(
                     ListResourceEvaluationsErrorModeled::InvalidTimeRangeException(
-                        InvalidTimeRangeException {
-                            message: Some(
-                                "The specified time range is not valid. \
-                                 Filters.TimeWindow.StartTime must not be after \
-                                 Filters.TimeWindow.EndTime."
-                                    .to_string(),
-                            ),
-                        },
+                        InvalidTimeRangeException { message: None },
                     )
                     .into(),
                 );

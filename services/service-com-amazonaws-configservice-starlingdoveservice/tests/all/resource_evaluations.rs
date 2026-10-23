@@ -13,7 +13,7 @@
 //!    `StartResourceEvaluationRequest$EvaluationMode` and
 //!    `ResourceEvaluationFilters$EvaluationMode`;
 //! 2. a started evaluation is reported back by the list path with the id the service
-//!    minted, the mode it runs in and the instant its execution started, most recent
+//!    minted and the instant its execution started — and nothing else — most recent
 //!    first, whatever resource details, context or timeout it was started with;
 //! 3. the list path selects by every `ResourceEvaluationFilters` member and pages at the
 //!    requested `Limit`, with an inverted time window and a token this operation never
@@ -316,10 +316,20 @@ async fn a_started_evaluation_is_reported_back_most_recent_first() {
             .iter()
             .find(|evaluation| evaluation["ResourceEvaluationId"].as_str() == Some(id))
             .unwrap_or_else(|| panic!("case {case:?}: {id:?} must be listed, got {evaluations:?}"));
+        // A listed entry carries exactly the identity and the start instant: the
+        // mode belongs to the request's Filters vocabulary, not to the listed item.
+        let mut members: Vec<&str> = evaluation
+            .as_object()
+            .unwrap_or_else(|| panic!("case {case:?}: an entry is an object, got {evaluation}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        members.sort_unstable();
         assert_eq!(
-            evaluation["EvaluationMode"].as_str(),
-            Some(PROACTIVE),
-            "case {case:?}: expected EvaluationMode {PROACTIVE}, got {evaluation}"
+            members,
+            ["EvaluationStartTimestamp", "ResourceEvaluationId"],
+            "case {case:?}: expected exactly ResourceEvaluationId and \
+             EvaluationStartTimestamp on a listed entry, got {members:?}"
         );
         let started_at = evaluation["EvaluationStartTimestamp"]
             .as_f64()
