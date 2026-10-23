@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBucket
-//! Inserts one bucket record into this service's store and answers the record it
-//! stored, together with the operation-log entry the create wrote.
+//! Claims the bucket's object store in this emulator's Amazon S3 store, inserts one
+//! bucket record into this service's store, and answers the record it stored together
+//! with the operation-log entry the create wrote.
+//!
+//! A Lightsail bucket IS an S3-compatible object store, so standing that store up is
+//! part of creating the bucket: the `url` this call answers is the address the S3 data
+//! plane serves the bucket on, and the access keys `CreateBucketAccessKey` mints are
+//! what a client signs its object requests to that address with. A name already taken
+//! in that one object namespace is refused, and a record that cannot be stored gives
+//! the claim back.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -201,7 +209,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_ms();
         let location = crate::state::StoredLocation::regional(&region);
 
-        crate::state::with_state(&*self.engine, |store| {
+        // A bucket IS an S3-compatible object store ("Access keys grant full
+        // programmatic access to the specified bucket and its objects"), so the
+        // bucket's object data plane is stood up HERE, as part of creating it:
+        // without it the record this call answers would promise a `url` and an
+        // access key that reach nothing. It is claimed BEFORE this service's store
+        // is locked, so no other component's lock is taken while that guard is
+        // held, and the claim is released again below if the record is refused —
+        // the same shape `CreateBucketAccessKey` withdraws a credential in.
+        //
+        // The name is the bucket's ADDRESS in the one object namespace an S3
+        // endpoint serves, so a name already taken there is refused: the create
+        // cannot hand out an address that would reach somebody else's bucket.
+        let claimed = crate::state::claim_bucket_object_store(
+            &*self.engine,
+            &input.bucket_name,
+            &region,
+            object_versioning == crate::state::OBJECT_VERSIONING_ENABLED,
+        )
+        .ok_or_else(unavailable)?;
+        match claimed {
+            crate::state::BucketCreation::Created => {}
+            // A bucket name is unique in object storage, so a taken one is in use —
+            // stated to the caller in those terms; what makes it so is the doc comment's
+            // and this module's business, not the client's.
+            crate::state::BucketCreation::NameTaken => {
+                return Err(invalid(format!(
+                    "bucketName '{}' is already in use by a bucket; a bucket name must be \
+                     unique",
+                    input.bucket_name
+                )));
+            }
+            // The object store's own account quota, which a bucket provisioned for
+            // another service's resource is not measured against, so this arm is the
+            // outcome's remaining case rather than a limit a Lightsail bucket meets:
+            // what bounds the buckets this service creates is its own `MAX_BUCKETS`,
+            // checked below.
+            crate::state::BucketCreation::QuotaReached => {
+                return Err(invalid(
+                    "creating another bucket would exceed the number of buckets object \
+                     storage can hold for this account"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let created = crate::state::with_state(&*self.engine, |store| {
+            // A taken name was already refused by the object-store claim above, which is
+            // the check a duplicate create actually meets (the name is taken in one
+            // namespace, whichever Region asks for it). This is the invariant behind it:
+            // a record this store already holds is never overwritten by a create, so if
+            // the two ever disagreed the bucket that exists wins and the create is
+            // refused rather than replacing it.
             if store.bucket(&region, &input.bucket_name).is_some() {
                 return Err(invalid(format!(
                     "bucketName '{}' already names a bucket of this account in {region}",
@@ -273,8 +332,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 bucket: Some(view),
                 operations: Some(vec![operation.view()]),
             })
-        })
-        .ok_or_else(unavailable)?
+        });
+
+        match created {
+            Some(Ok(output)) => Ok(output),
+            // The record was refused after the object store was claimed, so the
+            // claim is given back: an object store no bucket record names is
+            // reachable by nobody and would hold the name against a later create.
+            Some(Err(refusal)) => {
+                release_claim(&*self.engine, &input.bucket_name, "the request was refused");
+                Err(refusal)
+            }
+            None => {
+                release_claim(
+                    &*self.engine,
+                    &input.bucket_name,
+                    "the bucket store is unavailable",
+                );
+                Err(unavailable())
+            }
+        }
+    }
+}
+
+/// Give back the object store this call claimed for `bucket_name`, because the
+/// bucket record it was claimed for was not stored.
+///
+/// A failed release would leave an object store no bucket names, so it is reported
+/// rather than dropped silently — the same shape `CreateBucketAccessKey` withdraws
+/// an unattributed credential in.
+fn release_claim<Eng: Send + Sync + 'static>(engine: &Eng, bucket_name: &str, why: &'static str) {
+    if crate::state::release_bucket_object_store(engine, bucket_name) != Some(true) {
+        ::tracing::warn!(
+            operation = "CreateBucket",
+            bucket_name = %bucket_name,
+            why,
+            "the object store claimed for a bucket that was not created could not be \
+             released"
+        );
     }
 }
 

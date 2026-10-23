@@ -5,17 +5,21 @@
 //! The rule under test, from the operation's own documentation ("The list of S3 buckets
 //! in your account", `S3BucketInfo$Name` "The name of the S3 bucket",
 //! `S3BucketInfo$CreationDate` "The creation date of the S3 bucket"): the answer names
-//! EVERY bucket Amazon S3 holds for the account and nothing else, each with its name and
+//! EVERY bucket Amazon S3 holds FOR THE ACCOUNT and nothing else, each with its name and
 //! the instant S3 recorded it, in bucket-name order — whatever the bucket's name, Region
-//! or creation order, and however many there are. `NextToken` is "Reserved for future
-//! use" on both the request and the response, so it selects nothing and is never
-//! reported.
+//! or creation order, and however many there are. A bucket another emulated service
+//! provisioned as the object store of one of its own resources is not a bucket of the
+//! account, so it is not named. `NextToken` is "Reserved for future use" on both the
+//! request and the response, so it selects nothing and is never reported.
 //!
-//! Every bucket here is created over S3's REAL wire (`PUT /<bucket>` — `CreateBucket`)
-//! against the same shared engine both services are mounted on, exactly as a client
-//! creates one; nothing in this suite writes to a store directly. That is also what the
-//! operation being a REPORTING one means here: a second `ListS3Buckets` with no
-//! intervening S3 call answers the identical document.
+//! Every bucket of the account here is created over S3's REAL wire (`PUT /<bucket>` —
+//! `CreateBucket`) against the same shared engine both services are mounted on, exactly
+//! as a client creates one. The one exception is the case about a bucket another emulated
+//! service provisioned as the object store of its own resource: no S3 API creates such a
+//! bucket, so that case reaches the S3 store's `provision_bucket` seam — the one the
+//! owning service's control plane calls — directly. That is also what the operation being
+//! a REPORTING one means here: a second `ListS3Buckets` with no intervening S3 call
+//! answers the identical document.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -45,14 +49,21 @@ fn authorization(service: &str) -> String {
 /// AmplifyBackend and S3 mounted on ONE shared engine, the way the router mounts every
 /// service: the bucket store S3 writes is the store AmplifyBackend reports.
 fn router() -> MultiServiceRouter {
+    router_on_shared_engine().0
+}
+
+/// The same pair of services, handing back the shared engine as well — what the one case
+/// about a bucket ANOTHER service provisioned needs, since no S3 API creates such a
+/// bucket.
+fn router_on_shared_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
     router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
-        engine,
+        Arc::clone(&engine),
     ));
-    router
+    (router, engine)
 }
 
 /// `PUT /<bucket>` — S3's `CreateBucket`, with the location constraint (when any) in its
@@ -342,4 +353,96 @@ async fn a_bucket_created_after_a_list_is_reported_by_the_next_one() {
         entry_for(&before, first),
         entry_for(&after, first)
     );
+}
+
+/// A bucket ANOTHER emulated service provisioned as the object store of one of its own
+/// resources is not a bucket of this account, so it is not reported — while every bucket
+/// created over S3's own API still is.
+///
+/// No S3 API creates such a bucket (the owning service's control plane does, through the
+/// S3 store's `provision_bucket` seam), so this one case reaches that seam directly; the
+/// account's own buckets are still created over the wire.
+#[tokio::test]
+async fn a_bucket_another_service_provisioned_is_not_a_bucket_of_this_account() {
+    let (router, engine) = router_on_shared_engine();
+
+    // (case, the bucket name, the service that provisioned it — `None` for one created
+    // over S3's own API, so it belongs to the account)
+    let rows: &[(&str, &str, Option<&str>)] = &[
+        ("created over the S3 API", "amplify-app-storage", None),
+        (
+            "provisioned by another service",
+            "lightsail-object-store",
+            Some("lightsail"),
+        ),
+        ("another bucket of the account", "amplify-logs", None),
+        (
+            "provisioned by a second service",
+            "another-managed-store",
+            Some("someotherservice"),
+        ),
+    ];
+
+    for (case, bucket, provisioned_by) in rows {
+        match provisioned_by {
+            None => assert_eq!(
+                create_bucket(&router, bucket, None).await,
+                200,
+                "case {case:?}: creating bucket {bucket:?} must succeed"
+            ),
+            Some(service) => {
+                let state = service_com_amazonaws_s3_amazons3::state::service_state(&*engine)
+                    .expect("the S3 store is reachable from the shared engine");
+                let outcome = state.lock().provision_bucket(bucket, "us-east-1", service);
+                assert_eq!(
+                    outcome,
+                    service_com_amazonaws_s3_amazons3::state::BucketCreation::Created,
+                    "case {case:?}: provisioning bucket {bucket:?} must record it"
+                );
+            }
+        }
+    }
+
+    let (status, body) = list_s3_buckets(&router, None).await;
+    assert_eq!(
+        status, 200,
+        "ListS3Buckets must answer 200, got HTTP {status} with {body:?}"
+    );
+    let reported: Vec<&str> = body
+        .get("buckets")
+        .and_then(Value::as_array)
+        .map(|buckets| {
+            buckets
+                .iter()
+                .filter_map(|bucket| bucket.get("name").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut expected: Vec<&str> = rows
+        .iter()
+        .filter(|(_, _, provisioned_by)| provisioned_by.is_none())
+        .map(|(_, bucket, _)| *bucket)
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(
+        reported, expected,
+        "expected only the account's own buckets {expected:?}, got {reported:?}"
+    );
+
+    // The provisioned buckets ARE in the store — the filter is what leaves them out of
+    // this account's listing, not their absence.
+    let state = service_com_amazonaws_s3_amazons3::state::service_state(&*engine)
+        .expect("the S3 store is reachable from the shared engine");
+    let store = state.lock();
+    for (case, bucket, provisioned_by) in rows {
+        let held = store
+            .bucket(bucket)
+            .unwrap_or_else(|| panic!("case {case:?}: the store must hold bucket {bucket:?}"));
+        assert_eq!(
+            held.provisioned_by(),
+            *provisioned_by,
+            "case {case:?}: expected the provisioner {provisioned_by:?}, got {:?}",
+            held.provisioned_by()
+        );
+    }
 }

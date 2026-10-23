@@ -9,10 +9,12 @@
 //! recordsets in), the **container service** (a compute resource containers are
 //! deployed to), the **bucket** (an object-storage resource of the Lightsail
 //! object storage service) together with the **access keys** it grants
-//! programmatic access through, the **managed relational database** (a MySQL or
-//! PostgreSQL database the service runs for the account), the **load balancer**
-//! (a regional resource that spreads HTTP traffic across the instances attached
-//! to it), the append-only
+//! programmatic access through — whose OBJECTS live in the one object store this
+//! emulator holds, Amazon S3's own, which this module provisions a bucket in
+//! ([`claim_bucket_object_store`]) rather than keeping a second object map here —
+//! the **managed relational database** (a MySQL or PostgreSQL database the service
+//! runs for the account), the **load balancer** (a regional resource that spreads
+//! HTTP traffic across the instances attached to it), the append-only
 //! **operation log** every mutating call
 //! writes, and the service's static **Region catalog** — the Regions and
 //! Availability Zones `GetRegions` lists and every other operation validates a
@@ -33,6 +35,12 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
+
+// A bucket's OBJECT data plane is not a map of this module's own: a Lightsail bucket
+// is an S3-compatible object store, and the service that serves the S3 object
+// protocol in this emulator is Amazon S3, so a bucket is provisioned in that one
+// store (see `claim_bucket_object_store`) and this is the outcome it reports.
+pub use ::service_com_amazonaws_s3_amazons3::state::BucketCreation;
 
 use crate::ops::types::{
     AccessKey, AccessKeyLastUsed, AccessRules, AccountLevelBpaSync, AddOn, AddOnRequest, Alarm,
@@ -329,6 +337,10 @@ pub const OPERATION_TYPE_DELETE_INSTANCE: &str = "DeleteInstance";
 pub const OPERATION_TYPE_CREATE_DOMAIN: &str = "CreateDomain";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_BUCKET: &str = "CreateBucket";
+
+/// The `Operation$operationType` a `DeleteBucket` call logs, from the modelled
+/// `OperationType` enum.
+pub const OPERATION_TYPE_DELETE_BUCKET: &str = "DeleteBucket";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK: &str = "CreateDisk";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -1063,39 +1075,132 @@ pub const MAX_BUCKETS: usize = 100;
 /// response carries a `nextPageToken` when more buckets remain.
 pub const BUCKET_PAGE_SIZE: usize = 10;
 
-/// The path space every bucket's address is published under, beneath the
-/// endpoint the emulator is reached on.
+/// The URL of the bucket `name`, as announced to a caller that reached this
+/// emulator at `endpoint` (its `Host`/`:authority`).
 ///
-/// AWS publishes a Lightsail bucket's address as a DNS name under the Amazon S3
-/// zone that backs it (`<bucket>.s3.<region>.amazonaws.com`). That HOSTNAME is
-/// environment-specific — no caller may assume it — while the PROMISE the field
-/// makes is not: `Bucket$url` is "The URL of the bucket", so it has to be an
-/// address the caller can actually reach. This emulator owns no DNS zone, so the
-/// only address it can be reached on is the endpoint the request arrived at, and
-/// the two labels AWS puts in the hostname (region and bucket name) are carried
-/// in the path instead — never a literal AWS hostname, which would send the next
-/// client out of the emulator entirely (see [`request_endpoint`]). The prefix
-/// names this service and this resource type, so it cannot collide with another
-/// service's modelled URI space.
+/// `Bucket$url` is "The URL of the bucket", so it has to be an address the caller
+/// can actually reach — and what a caller reaches a Lightsail bucket WITH is an
+/// S3 client signed with one of the bucket's access keys ("Access keys grant full
+/// programmatic access to the specified bucket and its objects"). AWS publishes
+/// that address as a DNS name in the Amazon S3 zone that backs the bucket; this
+/// emulator owns no DNS zone, and a literal AWS hostname would send the next
+/// client out of the emulator entirely (see [`request_endpoint`]), so the address
+/// is the PATH-STYLE S3 address of the bucket under the endpoint this request
+/// arrived at — `https://<endpoint>/<bucket>` — which is exactly where this
+/// emulator's Amazon S3 data plane answers for the bucket this service
+/// provisioned there (see [`claim_bucket_object_store`]).
 ///
-/// Nothing claims or answers this path space yet: a bucket's object data plane
-/// (put, get, list) is not implemented here, and it is `can_handle`'s business to
-/// claim the path once it is, as `CONTAINER_SERVICE_PUBLIC_PATH_PREFIX` already
-/// does for that resource. Until then the address says WHERE this emulator would
-/// serve the bucket — within this emulator rather than out at AWS — and a client
-/// following it gets the router's unknown-route answer.
-pub const BUCKET_PUBLIC_PATH_PREFIX: &str = "/lightsail-bucket";
-
-/// The URL of the bucket `name` in `region`, as announced to a caller that
-/// reached this emulator at `endpoint` (its `Host`/`:authority`).
+/// No Region in the address: a bucket's name alone addresses it in the one object
+/// namespace an S3 endpoint serves, which is also why that name has to be free in
+/// it before a bucket can be created under it.
 ///
 /// `https`, because the emulator serves one TLS listener
 /// (`emulator_server::serve_emulator_until_shutdown`) and no plaintext one, so
-/// that is the scheme its own endpoint answers on. See
-/// [`BUCKET_PUBLIC_PATH_PREFIX`] for why the address is a path under the
-/// request's own endpoint rather than an AWS hostname.
-pub fn bucket_url(endpoint: &str, region: &str, name: &str) -> String {
-    format!("https://{endpoint}{BUCKET_PUBLIC_PATH_PREFIX}/{region}/{name}")
+/// that is the scheme its own endpoint answers on.
+pub fn bucket_url(endpoint: &str, name: &str) -> String {
+    format!("https://{endpoint}/{name}")
+}
+
+/// What this service records in the Amazon S3 store as the provisioner of a
+/// bucket's object store, so a reader of the account's OWN S3 buckets can leave
+/// it out (AWS holds a Lightsail bucket in a service-managed account, not in the
+/// caller's).
+pub const BUCKET_OBJECT_STORE_PROVISIONER: &str = ARN_SERVICE;
+
+/// Claim the object store of a bucket named `name` in `region`: stand the bucket
+/// up in this emulator's ONE object store, Amazon S3's own, so the bucket's
+/// objects can be written and read with the access keys this service mints for
+/// it. `versioned` is whether the bucket was created with object versioning
+/// enabled, which is a property of how that store keeps the bucket's objects.
+///
+/// A Lightsail bucket IS an S3-compatible object store, and the thing that serves
+/// the S3 object protocol in this emulator is the Amazon S3 service. So a bucket
+/// this service creates is provisioned there rather than copied into a second
+/// object map of this service's own: `PutObject`, `GetObject`, `ListObjectsV2`
+/// and `DeleteObject` against the bucket are then served from the one store, and
+/// what this service reports about the bucket's contents is read from the same
+/// place.
+///
+/// Answers what the claim did ([`BucketCreation::NameTaken`] when the one bucket
+/// namespace already holds that name, so the caller refuses the create rather
+/// than taking over a bucket that is not its own), or `None` when that store
+/// cannot be reached at all.
+///
+/// LOCK ORDER: this takes the S3 store's lock and holds no other while it does,
+/// and it hands back an owned value rather than a guard — so it must be called
+/// with NO guard of this service's store held. Keeping the cross-service access
+/// one-directional and guard-free is what makes a lock cycle between the two
+/// stores unreachable (the S3 service never reaches into this one).
+pub fn claim_bucket_object_store<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    name: &str,
+    region: &str,
+    versioned: bool,
+) -> Option<BucketCreation> {
+    let state = ::service_com_amazonaws_s3_amazons3::state::service_state(engine)?;
+    let mut store = state.lock();
+    let claimed = store.provision_bucket(name, region, BUCKET_OBJECT_STORE_PROVISIONER);
+    // `Bucket$objectVersioning` is `Enabled` when the create asked for versioning of the
+    // bucket's objects, and that is what the OBJECT store has to do about it: "All
+    // objects added to the bucket receive a unique version ID". A bucket created without
+    // it keeps no versions, which is the state a fresh bucket is in there.
+    //
+    // The bucket is there: this guard is still held from the claim that just recorded it.
+    // A store that nevertheless does not hold it would make the control plane report
+    // versioning its data plane does not do, so say so rather than passing it over.
+    if versioned && claimed == BucketCreation::Created {
+        match store.bucket_mut(name) {
+            Some(bucket) => bucket.set_versioning(
+                ::service_com_amazonaws_s3_amazons3::state::VERSIONING_ENABLED_STATUS,
+                None,
+            ),
+            None => ::tracing::warn!(
+                bucket_name = %name,
+                "the object store did not hold the bucket it had just recorded, so object \
+                 versioning was not enabled on it"
+            ),
+        }
+    }
+    Some(claimed)
+}
+
+/// Release the object store of the bucket named `name`, with every object it
+/// still held: what a delete of the bucket does, because "when you delete your
+/// bucket, the bucket name is released and can be reused for a new bucket"
+/// (`DeleteBucket`).
+///
+/// `true` when the object store held such a bucket, `false` when it did not, and
+/// `None` when that store cannot be reached at all. The same LOCK ORDER as
+/// [`claim_bucket_object_store`].
+pub fn release_bucket_object_store<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    name: &str,
+) -> Option<bool> {
+    let state = ::service_com_amazonaws_s3_amazons3::state::service_state(engine)?;
+    let mut store = state.lock();
+    Some(store.remove_bucket(name))
+}
+
+/// How many object keys the bucket named `name` holds in its object store — the
+/// keys with a current object plus the keys only noncurrent versions are left of,
+/// since a stored version is an object the bucket still holds.
+///
+/// A pure READ of the object store, for the one thing this service's control
+/// plane has to know about a bucket's contents: whether the bucket is empty, which
+/// is what decides a `DeleteBucket` without `forceDelete`. A name the object store
+/// holds no bucket for holds no objects, and answers `0`: there is nothing there to
+/// block a delete.
+///
+/// `None` when the object store cannot be reached at all. The same LOCK ORDER as
+/// [`claim_bucket_object_store`].
+pub fn bucket_object_count<Eng: Send + Sync + 'static>(engine: &Eng, name: &str) -> Option<usize> {
+    let state = ::service_com_amazonaws_s3_amazons3::state::service_state(engine)?;
+    let store = state.lock();
+    Some(
+        store
+            .bucket(name)
+            .map_or(0, |bucket| bucket.version_keys().len()),
+    )
 }
 
 /// The ARN of the bucket `id` in `region`. A bucket is regional, so its ARN
@@ -1162,11 +1267,11 @@ impl StoredBucketAccessKey {
     /// access key value of an access key", and nothing here holds one to return.
     ///
     /// `lastUsed` reports the never-used form the member documents (`N/A` region
-    /// and service name, null `lastUsedDate`): this emulator records no use of a
-    /// credential — a bucket's object data plane is not served here, so no request
-    /// against this bucket can have been signed with the key — and claiming a use
-    /// instant for work nothing did would be worse than saying it has not been
-    /// used.
+    /// and service name, null `lastUsedDate`): a request signed with this key is
+    /// served by the emulator's Amazon S3 data plane, which keeps no record of
+    /// WHICH credential signed it — nothing in this emulator records the use of a
+    /// credential — so there is no use instant to report, and claiming one for
+    /// work nothing recorded would be worse than saying the key has not been used.
     pub fn view(&self) -> AccessKey {
         AccessKey {
             access_key_id: Some(self.access_key_id.clone()),
@@ -1245,9 +1350,9 @@ impl StoredBucket {
     ///
     /// `url` is the one member that depends on the request: it is the address the
     /// caller is told to reach this bucket on, so it has to be the endpoint THIS
-    /// request arrived at (see [`BUCKET_PUBLIC_PATH_PREFIX`]). A request that
-    /// names no host at all names no endpoint to announce, so `url` is omitted
-    /// rather than filled with an address nothing serves.
+    /// request arrived at (see [`bucket_url`]). A request that names no host at
+    /// all names no endpoint to announce, so `url` is omitted rather than filled
+    /// with an address nothing serves.
     ///
     /// `include_connected_resources` and `include_cors` are the `GetBuckets`
     /// flags of the same names: `resourcesReceivingAccess` is reported only when
@@ -1269,8 +1374,7 @@ impl StoredBucket {
             resource_type: Some(RESOURCE_TYPE_BUCKET.to_string()),
             tags: Some(self.tags.clone()),
             bundle_id: Some(self.bundle_id.clone()),
-            url: endpoint
-                .map(|endpoint| bucket_url(endpoint, &self.location.region_name, &self.name)),
+            url: endpoint.map(|endpoint| bucket_url(endpoint, &self.name)),
             object_versioning: Some(self.object_versioning.clone()),
             able_to_update_bundle: Some(self.able_to_update_bundle),
             access_rules: Some(self.access_rules.clone()),
@@ -5409,6 +5513,17 @@ impl ComAmazonawsLightsailLightsail20161128State {
             (bucket.location.region_name.clone(), bucket.name.clone()),
             bucket,
         );
+    }
+
+    /// Remove the bucket `name` names in `region`, answering it. `None` when
+    /// nothing matched.
+    ///
+    /// Only the control-plane RECORD: the bucket's objects live in this emulator's
+    /// one object store, which [`release_bucket_object_store`] is what releases
+    /// (it takes that store's lock, so it is called with no guard of this store
+    /// held).
+    pub fn remove_bucket(&mut self, region: &str, name: &str) -> Option<StoredBucket> {
+        self.buckets.remove(&(region.to_string(), name.to_string()))
     }
 
     /// The load balancer `name` names in `region`, for a reporting operation.

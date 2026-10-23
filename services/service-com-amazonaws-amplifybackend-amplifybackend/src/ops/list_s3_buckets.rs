@@ -5,10 +5,12 @@
 //! ## What this operation answers
 //!
 //! "The list of S3 buckets in your account" — so the buckets reported are the ones
-//! Amazon S3 holds, read from the S3 service's own store through the one shared engine
-//! ([`s3_buckets`] below). This service keeps no bucket registry of its own: a bucket
-//! created or deleted over the S3 API is reported, or stops being reported, with no
-//! propagation step.
+//! Amazon S3 holds for the account, read from the S3 service's own store through the one
+//! shared engine ([`s3_buckets`] below). This service keeps no bucket registry of its
+//! own: a bucket created or deleted over the S3 API is reported, or stops being reported,
+//! with no propagation step. A bucket another emulated service provisioned as the object
+//! store of one of ITS resources (a Lightsail bucket) is not a bucket of this account, so
+//! it is not reported — that is what the S3 store's `account_buckets` seam leaves out.
 //!
 //! Each bucket is reported with its `Name` and its `CreationDate` — the instant S3
 //! recorded it, rendered the way this service renders every timestamp member
@@ -94,7 +96,9 @@ use ::std::time::SystemTime;
 /// a bucket rather than inventing one.
 ///
 /// `ListS3Buckets` reports "The list of S3 buckets in your account", so the buckets it
-/// reports are the ones Amazon S3 holds — not a registry of this service's own. They are
+/// reports are the ones Amazon S3 holds for the account — not a registry of this service's
+/// own, and not a bucket another emulated service provisioned as the object store of one of
+/// its own resources (S3's `account_buckets` seam is what leaves that one out). They are
 /// read from the S3 service's OWN store through the one shared engine, so a bucket
 /// created or removed over the S3 API is reported here with no propagation step and
 /// without this service keeping a second copy of the map.
@@ -116,7 +120,7 @@ fn s3_buckets<Eng: Send + Sync + 'static>(
     let store = state.lock();
     Some(
         store
-            .buckets()
+            .account_buckets()
             .map(|(name, bucket)| (name.to_string(), bucket.created_at()))
             .collect(),
     )

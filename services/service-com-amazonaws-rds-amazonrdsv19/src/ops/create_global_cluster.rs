@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request was signed for does not scope what it creates. It is still read, so
         // a malformed credential scope is refused here as it is everywhere else in this
         // service.
-        let _region =
+        let region =
             crate::state::request_region(ctx).map_err(CreateGlobalClusterError::validation)?;
         // "This parameter is stored as a lowercase string", so the identifier is folded
         // before it is stored, echoed or looked up — which is also what makes
@@ -323,7 +323,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // becomes the global database's first member: its primary.
         let mut inherited = None;
         if let Some(source) = &input.source_db_cluster_identifier {
-            let Some(cluster) = store.resolve_db_cluster(&_region, source) else {
+            let Some(cluster) = store.resolve_db_cluster(&region, source) else {
                 return Err(CreateGlobalClusterErrorModeled::DBClusterNotFoundFault(
                     DBClusterNotFoundFault {
                         message: Some(format!(
@@ -333,7 +333,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
+            // A DB cluster belongs to AT MOST ONE global database: adopting one that is
+            // already a member would leave the global database it is already in reporting a
+            // member that no longer points back at it, and that one cannot be deleted while
+            // its member list is not empty. The cluster is not in a state this operation can
+            // act on, which is the modelled `InvalidDBClusterStateFault`.
+            if let Some(joined) = &cluster.global_cluster_identifier {
+                return Err(CreateGlobalClusterErrorModeled::InvalidDBClusterStateFault(
+                    InvalidDBClusterStateFault {
+                        message: Some(format!(
+                            "DB cluster {} is already a member of global cluster {joined}",
+                            cluster.identifier
+                        )),
+                    },
+                )
+                .into());
+            }
             inherited = Some(SourceCluster {
+                identifier: cluster.identifier.clone(),
                 arn: cluster.arn(),
                 engine: cluster.engine.clone(),
                 engine_version: cluster.engine_version.clone(),
@@ -381,7 +398,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A global database created EMPTY provisions no DB cluster of its own — "You
             // can create a global database that is initially empty, and then create the
             // primary and secondary DB clusters in the global database" — so it is usable
-            // the moment it exists and owes no transition to a later status.
+            // the moment it exists and owes no transition to a later status. One created
+            // around an existing cluster adopts a cluster that is already provisioned, so
+            // it owes none either.
             status: crate::state::GLOBAL_CLUSTER_STATUS_AVAILABLE.to_string(),
             engine: match &inherited {
                 Some(source) => Some(source.engine.clone()),
@@ -418,7 +437,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
         };
         let global_cluster = record.to_wire();
-        store.global_clusters.insert(identifier, record);
+        store.global_clusters.insert(identifier.clone(), record);
+        // The adopted cluster now BELONGS to this global database, which is what
+        // `DBCluster$GlobalClusterIdentifier` reports for it: the reference is written on
+        // both records under the one lock, so a later describe of either cannot disagree
+        // with the other.
+        if let Some(source) = &inherited {
+            store
+                .db_clusters
+                .get_mut(&(region.clone(), source.identifier.clone()))
+                .expect("the source cluster resolved under this same lock")
+                .global_cluster_identifier = Some(identifier);
+        }
 
         Ok(CreateGlobalClusterOutput {
             global_cluster: Some(global_cluster),
@@ -427,8 +457,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The settings a global database takes from the source DB cluster it was created from,
-/// and that cluster's ARN — its first member.
+/// the identifier the store keys that cluster by, and its ARN — its first member.
 struct SourceCluster {
+    identifier: String,
     arn: String,
     engine: String,
     engine_version: Option<String>,

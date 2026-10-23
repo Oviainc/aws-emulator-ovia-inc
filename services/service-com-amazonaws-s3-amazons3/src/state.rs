@@ -43,7 +43,11 @@ const EU_LOCATION_CONSTRAINT: &str = "EU";
 /// is bounded `range {min 1, max 10000}`
 /// (`smithy_query(query="operation",operation="ListBuckets")`), i.e. one page may name
 /// every bucket an account is allowed to hold. A create past it is refused rather than
-/// recorded, so the store this emulator keeps is bounded whatever a caller does.
+/// recorded, so the buckets of the account this emulator keeps are bounded whatever a
+/// caller does. It counts the ACCOUNT's buckets: a bucket another emulated service
+/// provisioned as the object store of one of its own resources
+/// ([`Bucket::provisioned_by`]) is bounded by that service's own limit on the resource it
+/// belongs to.
 pub const MAX_BUCKETS_PER_ACCOUNT: usize = 10_000;
 
 /// What [`ComAmazonawsS3Amazons3State::create_bucket`] did, so the caller answers each
@@ -926,6 +930,23 @@ pub struct Bucket {
     /// because that is the order S3 lists objects in ("returns some or all of the objects
     /// in a bucket … in lexicographical order").
     objects: BTreeMap<String, Object>,
+    /// The emulated service that provisioned this bucket on the account's behalf, or
+    /// `None` for a bucket a client created over S3's own API
+    /// ([`ComAmazonawsS3Amazons3State::create_bucket`]).
+    ///
+    /// Another AWS service whose own resource IS an S3-compatible object store (a
+    /// Lightsail bucket is the one in this workspace: "Access keys grant full
+    /// programmatic access to the specified bucket and its objects") stands that store up
+    /// here, through [`ComAmazonawsS3Amazons3State::provision_bucket`], so the objects its
+    /// resource holds are the objects THIS service's data plane serves — one object store
+    /// in this emulator, not two. Such a bucket is nevertheless not a bucket of the
+    /// caller's own S3 account (AWS keeps it in a service-managed account), so a reader
+    /// that reports the account's buckets leaves it out:
+    /// [`ComAmazonawsS3Amazons3State::account_buckets`].
+    ///
+    /// Private, like `tags`, and written only where the bucket comes into being: a stored
+    /// bucket never changes hands.
+    provisioned_by: Option<String>,
     /// The NONCURRENT versions of each key, newest first.
     ///
     /// A version lands here only when it stops being the current one on a bucket whose
@@ -948,6 +969,12 @@ impl Bucket {
     /// never holds — a reader reports no creation date rather than inventing one.
     pub fn created_at(&self) -> Option<SystemTime> {
         self.created_at
+    }
+
+    /// The emulated service that provisioned the bucket as the object store of one of ITS
+    /// resources, or `None` for a bucket created over S3's own API. See the field.
+    pub fn provisioned_by(&self) -> Option<&str> {
+        self.provisioned_by.as_deref()
     }
 
     /// The bucket's tag set, empty when none is associated with it.
@@ -1556,6 +1583,21 @@ impl ComAmazonawsS3Amazons3State {
             .map(|(name, bucket)| (name.as_str(), bucket))
     }
 
+    /// Every bucket of the CALLER'S OWN S3 account, as `(name, bucket)` in bucket-name
+    /// order.
+    ///
+    /// The read seam for any operation that reports "the buckets in your account" — S3's
+    /// own `ListBuckets` and the peer services that report the account's buckets. It is
+    /// [`Self::buckets`] LESS the buckets another emulated service provisioned as the
+    /// object store of one of its own resources ([`Bucket::provisioned_by`]): those are
+    /// served by this service's object data plane, because that is what they are for, but
+    /// they are not buckets of the caller's S3 account — AWS holds a Lightsail bucket in a
+    /// service-managed account, so it is not in the account's own `ListBuckets` either.
+    pub fn account_buckets(&self) -> impl Iterator<Item = (&str, &Bucket)> + '_ {
+        self.buckets()
+            .filter(|(_, bucket)| bucket.provisioned_by.is_none())
+    }
+
     /// The bucket named `name`, or `None` when this emulator holds no such bucket.
     pub fn bucket(&self, name: &str) -> Option<&Bucket> {
         self.buckets.get(name)
@@ -1760,16 +1802,61 @@ impl ComAmazonawsS3Amazons3State {
     /// leaves the existing bucket alone, and a create past
     /// [`MAX_BUCKETS_PER_ACCOUNT`] is refused, which is what bounds this map.
     pub fn create_bucket(&mut self, name: &str, region: &str) -> BucketCreation {
+        self.record_bucket(name, region, None)
+    }
+
+    /// Record a bucket named `name` in `region` that `provisioned_by` — another emulated
+    /// service — stands up as the object store of one of ITS resources, reporting what
+    /// happened.
+    ///
+    /// This is the one way a service other than S3 gives a resource of its own an
+    /// S3-compatible object data plane: every object operation here serves the bucket
+    /// (that is the point of provisioning it), while [`Self::account_buckets`] leaves it
+    /// out. See [`Bucket::provisioned_by`].
+    ///
+    /// The same guarantees as [`Self::create_bucket`], which it shares its body with: a
+    /// name this store already holds is [`BucketCreation::NameTaken`] and writes NOTHING,
+    /// so a provisioning service learns the name is taken instead of taking over the
+    /// bucket that holds it — one bucket namespace, whoever provisioned the bucket in it.
+    /// What it does NOT share is the account's bucket quota: see
+    /// [`MAX_BUCKETS_PER_ACCOUNT`].
+    pub fn provision_bucket(
+        &mut self,
+        name: &str,
+        region: &str,
+        provisioned_by: &str,
+    ) -> BucketCreation {
+        self.record_bucket(name, region, Some(provisioned_by))
+    }
+
+    /// Record a bucket named `name` in `region`, provisioned by `provisioned_by` (`None`
+    /// for one created over S3's own API), reporting what happened.
+    ///
+    /// Private: a create comes in through [`Self::create_bucket`] or
+    /// [`Self::provision_bucket`], which is what keeps both subject to the same taken-name
+    /// and quota checks.
+    fn record_bucket(
+        &mut self,
+        name: &str,
+        region: &str,
+        provisioned_by: Option<&str>,
+    ) -> BucketCreation {
         if self.buckets.contains_key(name) {
             return BucketCreation::NameTaken;
         }
-        if self.buckets.len() >= MAX_BUCKETS_PER_ACCOUNT {
+        // The quota is the ACCOUNT's, so it bounds the account's own buckets and is
+        // measured over them: a bucket another service provisioned is not one of them (it
+        // is not even reported among them, see [`Self::account_buckets`]) and is bounded
+        // by that service's own limit on the resource it belongs to, so it neither
+        // consumes this quota nor is refused by it.
+        if provisioned_by.is_none() && self.account_buckets().count() >= MAX_BUCKETS_PER_ACCOUNT {
             return BucketCreation::QuotaReached;
         }
         self.buckets.insert(
             name.to_string(),
             Bucket {
                 region: region.to_string(),
+                provisioned_by: provisioned_by.map(str::to_string),
                 // The creation instant is read here, where the bucket comes into being,
                 // so `CreationDate` is the moment the store accepted it.
                 created_at: Some(SystemTime::now()),

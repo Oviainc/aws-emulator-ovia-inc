@@ -109,6 +109,18 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// What this operation answers a `network` it does not serve with.
+///
+/// Request-independent, like every other message this service sends
+/// (`crate::state::INVALID_PARAMETER_VALUES_MESSAGE`): the member a rule was violated on
+/// is `ValidationExceptionField$name`, and the value that violated it is the caller's
+/// own, so neither is interpolated into the sentence.
+const UNSUPPORTED_NETWORK_MESSAGE: &str = "Please use a blockchain network supported by this API.";
+
+/// What this operation answers an `addressIdentifierFilter` that does not name an address
+/// of the Bitcoin chain with; see [`UNSUPPORTED_NETWORK_MESSAGE`].
+const INVALID_BITCOIN_ADDRESS_MESSAGE: &str = "Please provide a valid bitcoin address.";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -183,26 +195,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
+        // One `fieldList` entry per field whose value this operation refuses, all of
+        // them accumulated before anything is answered: `ValidationException$fieldList`
+        // is "the container for the `fieldList` of the exception", the machine-readable
+        // half a client repairs its request from, so a request that breaks several rules
+        // at once learns about all of them in one response instead of one round trip per
+        // rule.
+        let mut fields = Vec::new();
+
         // This operation is Bitcoin-only: "Lists all the transaction events for an
         // address on the blockchain. This operation is only supported on the Bitcoin
         // networks", and `network` documents "Valid Values: BITCOIN_MAINNET |
         // BITCOIN_TESTNET". The member targets a plain `String` rather than the
         // `QueryNetwork` enum, so the boundary validator admits any value and the
-        // operation's own value set has to be checked here — BEFORE anything else, so a
-        // request naming a network this operation does not serve is refused rather than
-        // answered from (or about) a ledger it would never read.
+        // operation's own value set has to be checked here.
         if !crate::state::is_bitcoin(&input.network) {
-            return Err(ListFilteredTransactionEventsErrorModeled::ValidationException(
-                crate::state::field_validation_exception(
-                    "network",
-                    format!(
-                        "network must be one of [{}], not {}",
-                        crate::state::BITCOIN_NETWORKS.join(", "),
-                        input.network
-                    ),
-                ),
-            )
-            .into());
+            fields.push(crate::state::validation_field(
+                "network",
+                UNSUPPORTED_NETWORK_MESSAGE,
+            ));
         }
 
         // `AddressIdentifierFilter$transactionEventToAddress` is
@@ -212,18 +223,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .address_identifier_filter
             .transaction_event_to_address
             .as_slice();
-        let [address] = addresses else {
-            return Err(ListFilteredTransactionEventsErrorModeled::ValidationException(
-                crate::state::field_validation_exception(
+        // The arity rule is the MODEL's `@length`, which the boundary validator reports
+        // at the list member itself, so its entry is named by that member's dotted path;
+        // the value rule below is this operation's own and names the filter, the member a
+        // caller would repair.
+        let filtered = match addresses {
+            [address] => Some(address),
+            _ => {
+                fields.push(crate::state::validation_field(
                     "addressIdentifierFilter.transactionEventToAddress",
-                    format!(
-                        "exactly one recipient address must be specified, got {}",
-                        addresses.len()
-                    ),
-                ),
-            )
-            .into());
+                    "The request must include exactly one recipient address.",
+                ));
+                None
+            }
         };
+        // And that address has to be an address of the chain this operation serves.
+        // `ChainAddress`'s `^[-A-Za-z0-9]{13,74}$` is one pattern for every chain this
+        // service indexes, so it admits addresses of the others; what makes a string a
+        // Bitcoin address is the encodings Bitcoin itself defines
+        // (`crate::state::address`).
+        if filtered.is_some_and(|address| !crate::state::address::is_bitcoin_address(address)) {
+            fields.push(crate::state::validation_field(
+                "addressIdentifierFilter",
+                INVALID_BITCOIN_ADDRESS_MESSAGE,
+            ));
+        }
 
         // The window the listing covers, measured on the event's own
         // `blockchainInstant` — which is the instant of the transaction that emitted it.
@@ -239,17 +263,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .and_then(|filter| filter.to.as_ref()),
         );
+        // A window that ends before it starts selects nothing a caller could have meant,
+        // so it is refused rather than answered with an empty page.
         if let (Some(earliest), Some(latest)) = (from, to) {
             if earliest > latest {
-                return Err(ListFilteredTransactionEventsErrorModeled::ValidationException(
-                    crate::state::field_validation_exception(
-                        "timeFilter.from",
-                        "timeFilter.from must not be later than timeFilter.to",
-                    ),
-                )
-                .into());
+                fields.push(crate::state::validation_field(
+                    "timeFilter.from",
+                    "The 'time' field in timeFilter.from must be less than or equal to \
+                     the 'time' field in timeFilter.to.",
+                ));
             }
         }
+
+        // Nothing is read until every rule has had its say.
+        if !fields.is_empty() {
+            return Err(ListFilteredTransactionEventsErrorModeled::ValidationException(
+                crate::state::validation_exception(fields),
+            )
+            .into());
+        }
+        // `filtered` is `Some` whenever no field was refused: the only way it is `None`
+        // is the arity rule above, which pushed an entry.
+        let Some(address) = filtered else {
+            return Err(ListFilteredTransactionEventsErrorModeled::ValidationException(
+                crate::state::field_validation_exception(
+                    "addressIdentifierFilter.transactionEventToAddress",
+                    "The request must include exactly one recipient address.",
+                ),
+            )
+            .into());
+        };
+        // The address as the LEDGER spells it, so the recipient filter selects the same
+        // events whichever spelling of one account the caller filtered by — the same
+        // form `NetworkLedger::for_address` resolves the transaction set by.
+        let wanted_recipient = crate::state::derived::normalize_address(address);
 
         // `ListFilteredTransactionEventsSortBy` declares exactly one value,
         // `blockchainInstant`, which is the order the ledger is already keyed in, and
@@ -306,7 +353,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .zip(transaction.events())
                 .enumerate()
             {
-                if stored.to.as_deref() != Some(address.as_str())
+                // Both sides are in the ledger's own spelling: the stored events were
+                // brought into it by `NetworkLedger::insert_transaction`, so the match is
+                // an exact comparison and no per-event respelling is needed.
+                if stored.to.as_deref() != Some(wanted_recipient.as_str())
                     || wanted_vout_spent.is_some_and(|wanted| stored.vout_spent != Some(wanted))
                 {
                     continue;

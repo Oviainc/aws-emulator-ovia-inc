@@ -259,10 +259,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut buckets: Vec<Bucket> = Vec::new();
         let mut next_continuation_token: Option<String> = None;
 
-        // `state::buckets()` walks the store's `BTreeMap`, so this is already in
+        // `state::account_buckets()` walks the store's `BTreeMap`, so this is already in
         // ascending bucket-name order and a page's resume point is simply the next name
-        // in it.
-        for (name, bucket) in store.buckets() {
+        // in it. It reports the buckets of THIS account: a bucket another emulated
+        // service provisioned as the object store of one of its own resources (a
+        // Lightsail bucket) is served by this service's object operations but is held in
+        // a service-managed account, not the caller's, so `ListBuckets` does not name it.
+        for (name, bucket) in store.account_buckets() {
             // "Limits the response to bucket names that begin with the specified bucket
             // name prefix" (`ListBucketsRequest$Prefix`).
             if !name.starts_with(&prefix) {

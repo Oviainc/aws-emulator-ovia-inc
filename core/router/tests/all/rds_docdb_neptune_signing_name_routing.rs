@@ -166,7 +166,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_body_contains: &["<DBClusters></DBClusters>"],
                 },
                 Call {
-                    case: "neptune DescribeDBClusters",
+                    case: "neptune DescribeDBClusters reports its own empty store",
                     addressed: Addressed::Signed("neptune"),
                     action: "DescribeDBClusters",
                     params: &[],

@@ -7,7 +7,7 @@
 //! The invariant under test is the one a batch read exists for: every item of the
 //! request is answered INDEPENDENTLY, exactly as the single-item `GetTokenBalance`
 //! answers that same item — a balance the ledger holds lands in `tokenBalances`, an item
-//! the single read refuses lands in `errors` with that refusal's code, message and
+//! the single read refuses lands in `errors` with that refusal's status, message and
 //! modelled `ErrorType`, and no item's failure costs the caller the others' balances.
 //!
 //! Each test is therefore a TABLE whose rows are generated from the ledger the service
@@ -70,8 +70,12 @@ enum Expected {
         balance: String,
         last_updated_time: Value,
     },
-    /// A refusal: the wire error code and the message it carried.
-    Failure { code: String, message: String },
+    /// A refusal: its HTTP status, the wire error code and the message it carried.
+    Failure {
+        status: u16,
+        code: String,
+        message: String,
+    },
 }
 
 /// The modelled `ErrorType` a batch item reports for the exception the single-item read
@@ -105,6 +109,7 @@ async fn single_read(emulator: &Emulator, row: &Row) -> Expected {
             last_updated_time: body["lastUpdatedTime"].clone(),
         },
         400 | 404 => Expected::Failure {
+            status,
             code: error_code(&body),
             message: body["message"]
                 .as_str()
@@ -282,7 +287,11 @@ fn assert_batch_matches(case: &str, rows: &[Row], expected: &[Expected], reply: 
                     ),
                 }
             }
-            Expected::Failure { code, message } => {
+            Expected::Failure {
+                status,
+                code,
+                message,
+            } => {
                 let got = errors.get(error_index).unwrap_or_else(|| {
                     panic!(
                         "case {case}: row {} must be the error at index {error_index}, got \
@@ -291,10 +300,15 @@ fn assert_batch_matches(case: &str, rows: &[Row], expected: &[Expected], reply: 
                     )
                 });
                 error_index += 1;
+                // `BatchGetTokenBalanceErrorItem` models `errorCode` BESIDE `errorType`,
+                // which already carries the exception's identity, so `errorCode` is the
+                // HTTP status class of the per-item failure — the status the same
+                // refusal answers the single-item read with.
                 assert_eq!(
                     got["errorCode"].as_str(),
-                    Some(code.as_str()),
-                    "case {case}: row {} must carry the single read's code {code}, got {got:?}",
+                    Some(status.to_string().as_str()),
+                    "case {case}: row {} must carry the single read's status {status}, got \
+                     {got:?}",
                     row.label
                 );
                 assert_eq!(
@@ -320,12 +334,26 @@ fn assert_batch_matches(case: &str, rows: &[Row], expected: &[Expected], reply: 
                     "case {case}: row {} must name the owner it failed on, got {got:?}",
                     row.label
                 );
-                assert_eq!(
-                    instant_secs(&got["atBlockchainInstant"]),
-                    instant_secs(&row.item["atBlockchainInstant"]),
-                    "case {case}: row {} must echo the instant it was asked for, got {got:?}",
-                    row.label
-                );
+                // `BatchGetTokenBalanceErrorItem$atBlockchainInstant` identifies WHICH
+                // item failed, so it is the instant the item named — or, when it named
+                // none, the instant the batch was read at (a per-call clock reading, so
+                // only its presence is asserted then).
+                let asked = instant_secs(&row.item["atBlockchainInstant"]);
+                let reported = instant_secs(&got["atBlockchainInstant"]);
+                match asked {
+                    Some(asked) => assert_eq!(
+                        reported,
+                        Some(asked),
+                        "case {case}: row {} must echo the instant it was asked for \
+                         ({asked}), got {got:?}",
+                        row.label
+                    ),
+                    None => assert!(
+                        reported.is_some(),
+                        "case {case}: row {} must report an atBlockchainInstant, got {got:?}",
+                        row.label
+                    ),
+                }
             }
         }
     }
