@@ -166,6 +166,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // The document's length and character set are modelled constraints the
+        // centralized walk has already applied; that it is a POLICY document — JSON,
+        // as the member documents — is this operation's own check, so a document that
+        // does not parse is refused here and nothing is attached.
+        if let Some(why) = crate::state::policy_document_rejection(&input.policy) {
+            return Err(
+                PutInvestigationGroupPolicyErrorModeled::ValidationException(ValidationException {
+                    message: Some(why),
+                })
+                .into(),
+            );
+        }
+
         let principal = crate::state::caller_principal(ctx.parts());
         let modified_at = crate::state::now_epoch_seconds();
 

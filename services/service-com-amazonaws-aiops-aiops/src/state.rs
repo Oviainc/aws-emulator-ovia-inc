@@ -4,9 +4,17 @@
 //!
 //! The service's primary resource is the **investigation group**. Every group is
 //! stored exactly once, keyed by its 16-character id — the last segment of its ARN
-//! — so each operation reads and writes the one record. `name_index` is the
-//! secondary index that lets `{identifier}` resolve by name, which the modelled
-//! `InvestigationGroupIdentifier` pattern allows alongside the id and the full ARN.
+//! — so each operation reads and writes the one record.
+//!
+//! A group is addressed by its ARN alone. The modelled `InvestigationGroupIdentifier`
+//! pattern also admits a bare label, but the service resolves no group from one:
+//! every `{identifier}` that is not this service's investigation-group ARN is a
+//! modelled 404 ([`ComAmazonawsAiopsAiopsState::resolve_group_id`]).
+//!
+//! A group belongs to the Region its ARN names, and an account holds at most
+//! [`MAX_INVESTIGATION_GROUPS_PER_REGION`] of them there — so the store is keyed by
+//! id and read per region through
+//! [`ComAmazonawsAiopsAiopsState::groups_in_region`].
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +23,7 @@ use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
     CrossAccountConfiguration, EncryptionConfiguration, ResourceNotFoundException,
+    ServiceQuotaExceededException,
 };
 
 /// Characters an investigation-group id is built from.
@@ -68,14 +77,22 @@ pub const DEFAULT_CLOUD_TRAIL_EVENT_HISTORY_ENABLED: bool = true;
 // (20..2048), `name` (1..512) and the policy document (1..32768).
 // ---------------------------------------------------------------------------
 
-/// The most investigation groups this emulator will hold.
+/// The most investigation groups one account may hold in one Region.
 ///
-/// Emulator resource guard, NOT an AWS quota. AWS documents a far tighter soft limit
-/// ("Currently, you can have one investigation group in each Region in your
-/// account"), which this slice deliberately does not enforce because
-/// `ListInvestigationGroups`' pagination needs several groups to exist; this cap is
-/// what keeps the store finite in its place. A create that would exceed it is
-/// refused with the modelled `ServiceQuotaExceededException`.
+/// An AWS quota, from `CreateInvestigationGroup`'s own documentation: "Currently, you
+/// can have one investigation group in each Region in your account." A create in a
+/// Region that already holds this many is refused with the modelled
+/// `ServiceQuotaExceededException` ([`region_quota_exceeded`]).
+pub const MAX_INVESTIGATION_GROUPS_PER_REGION: usize = 1;
+
+/// The most investigation groups this emulator will hold ACROSS every Region.
+///
+/// Emulator resource guard, NOT an AWS quota: the AWS quota is the per-region
+/// [`MAX_INVESTIGATION_GROUPS_PER_REGION`] above, but the region a request is signed
+/// for is caller-supplied text, so an unbounded number of regions could each hold
+/// their one group. This cap is what keeps the store finite in that direction; a
+/// create that would exceed it is refused with the modelled
+/// `ServiceQuotaExceededException` too ([`store_capacity_exceeded`]).
 pub const MAX_INVESTIGATION_GROUPS: usize = 500;
 
 /// The most tags one group may carry.
@@ -97,6 +114,9 @@ pub struct InvestigationGroup {
     /// The 16-character id: the ARN's last segment and this record's store key.
     pub id: String,
     pub arn: String,
+    /// The Region this group belongs to — the region field of its own ARN, which is
+    /// also what the per-region quota and `ListInvestigationGroups` are scoped by.
+    pub region: String,
     pub name: String,
     pub role_arn: String,
     pub encryption_configuration: Option<EncryptionConfiguration>,
@@ -138,9 +158,16 @@ impl InvestigationGroup {
     }
 
     /// Record that `principal` just changed this group.
+    ///
+    /// A successful mutation ALWAYS advances `lastModifiedAt`, which is what lets a
+    /// caller notice a configuration change and order two writers by it. The stamp
+    /// is whole seconds (the unit the modelled long carries), so a second write
+    /// inside the same second would otherwise report the instant the first one did:
+    /// `at` is therefore taken as a floor and the stamp still moves by its smallest
+    /// representable step when the clock has not.
     pub fn touch(&mut self, principal: &str, at: i64) {
         self.last_modified_by = principal.to_string();
-        self.last_modified_at = at;
+        self.last_modified_at = at.max(self.last_modified_at.saturating_add(1));
     }
 }
 
@@ -152,37 +179,29 @@ pub struct ComAmazonawsAiopsAiopsState {
     /// `ListInvestigationGroups` walks a stable, total order and a page token can
     /// name the next id.
     pub investigation_groups: BTreeMap<String, InvestigationGroup>,
-    /// Group name -> group id, so `{identifier}` resolves by name and a create can
-    /// detect a name already in use.
-    pub name_index: HashMap<String, String>,
     /// Mixed into each generated id so two creates in the same nanosecond differ.
     id_counter: u64,
 }
 
 impl ComAmazonawsAiopsAiopsState {
-    /// The id of the group `identifier` names, accepting either form the modelled
-    /// `InvestigationGroupIdentifier` allows: the full ARN, or the bare name (the
-    /// form `GetInvestigationGroup`'s own docs name) — and, since the bare pattern
-    /// admits it, the bare id.
+    /// The id of the group `identifier` names — resolved from its ARN and from
+    /// nothing else.
+    ///
+    /// The modelled `InvestigationGroupIdentifier` pattern admits a bare
+    /// `[\-_A-Za-z0-9]{1,512}` label beside the ARN, so a name or a bare id reaches a
+    /// handler as a well-formed identifier; the service still resolves no group from
+    /// one, and every operation reports the group as absent instead. A name is
+    /// therefore not an address: only the ARN the create handed back is.
     ///
     /// An ARN must match the stored ARN in EVERY field, so an ARN naming another
-    /// partition, region or account resolves to nothing rather than to the group
-    /// that happens to share its id segment. The name is tried before the id, so a
-    /// group named after another group's id still resolves to itself.
+    /// partition, region or account resolves to nothing rather than to the group that
+    /// happens to share its id segment.
     pub fn resolve_group_id(&self, identifier: &str) -> Option<String> {
-        if let Some(id) = group_id_from_arn(identifier) {
-            return self
-                .investigation_groups
-                .get(id)
-                .filter(|group| group.arn == identifier)
-                .map(|group| group.id.clone());
-        }
-        if let Some(id) = self.name_index.get(identifier) {
-            return Some(id.clone());
-        }
+        let id = group_id_from_arn(identifier)?;
         self.investigation_groups
-            .contains_key(identifier)
-            .then(|| identifier.to_string())
+            .get(id)
+            .filter(|group| group.arn == identifier)
+            .map(|group| group.id.clone())
     }
 
     /// The group `identifier` names, for a reporting operation.
@@ -193,29 +212,44 @@ impl ComAmazonawsAiopsAiopsState {
 
     /// The group `identifier` names, for an operation the spec says mutates it.
     ///
-    /// `name` and `id` are part of this record's identity: `name_index` is keyed on
-    /// the name and the store on the id, so neither may be reassigned through this
-    /// handle without rebuilding both. No operation needs to — the model binds no
-    /// `name` member on `UpdateInvestigationGroup` — and a future rename must go
-    /// through [`Self::remove_group`] + [`Self::insert_group`].
+    /// `id` is part of this record's identity — the store is keyed on it — so it may
+    /// not be reassigned through this handle. No operation needs to; the model binds
+    /// no `name` member on `UpdateInvestigationGroup` either, so a group keeps the
+    /// name it was created with.
     pub fn group_mut(&mut self, identifier: &str) -> Option<&mut InvestigationGroup> {
         let id = self.resolve_group_id(identifier)?;
         self.investigation_groups.get_mut(&id)
     }
 
-    /// Store a newly created group and index it by name.
+    /// Every group this account holds in `region`, in the store's stable id order.
+    ///
+    /// A group belongs to exactly one Region — the one its ARN names — so this is
+    /// what a regional reader (`ListInvestigationGroups`) reports and what the
+    /// per-region quota counts.
+    pub fn groups_in_region<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a InvestigationGroup> + 'a {
+        self.investigation_groups
+            .values()
+            .filter(move |group| group.region == region)
+    }
+
+    /// How many groups this account already holds in `region`, for the quota check.
+    pub fn group_count_in_region(&self, region: &str) -> usize {
+        self.groups_in_region(region).count()
+    }
+
+    /// Store a newly created group.
     pub fn insert_group(&mut self, group: InvestigationGroup) {
-        self.name_index.insert(group.name.clone(), group.id.clone());
         self.investigation_groups.insert(group.id.clone(), group);
     }
 
-    /// Remove the group `identifier` names, with its policy, tags and name index
-    /// entry. `None` when nothing matched.
+    /// Remove the group `identifier` names, with its policy and tags. `None` when
+    /// nothing matched.
     pub fn remove_group(&mut self, identifier: &str) -> Option<InvestigationGroup> {
         let id = self.resolve_group_id(identifier)?;
-        let group = self.investigation_groups.remove(&id)?;
-        self.name_index.remove(&group.name);
-        Some(group)
+        self.investigation_groups.remove(&id)
     }
 
     /// A 16-character alphanumeric id no stored group is using.
@@ -475,18 +509,19 @@ pub fn encryption_configuration_rejection(
 /// Why the caller-sized collections on a create or update request are unacceptable,
 /// or `None` when every one of them is within the store's bounds.
 ///
-/// The model publishes no length for the `tags` and `chatbotNotificationChannel`
-/// maps or the `tagKeyBoundaries` list, so the centralized walk cannot refuse an
-/// oversized one and this is where the bound lives. Every operation that stores any
-/// of them applies this one rule, each rendering the refusal as its own modelled
-/// `ValidationException`. Pass `None` for a member the operation does not accept.
+/// The model publishes no length for the `chatbotNotificationChannel` map or the
+/// `tagKeyBoundaries` list, so the centralized walk cannot refuse an oversized one
+/// and this is where the bound lives. Every operation that stores any of them applies
+/// this one rule, each rendering the refusal as its own modelled `ValidationException`.
+/// Pass `None` for a member the operation does not accept. The `tags` map is bounded
+/// by the service's published tag maximum instead, which is a different refusal:
+/// [`tag_capacity_rejection`].
 ///
 /// The refusal is worded through [`validation_message`] too: the member path and the
 /// bound it exceeded, in the same clause a modelled `@length` maximum would be refused
 /// with at the boundary — so a client reads one grammar for both, and the entry count
 /// the request carried is not echoed back.
 pub fn collection_bounds_rejection(
-    tags: Option<&std::collections::HashMap<String, String>>,
     tag_key_boundaries: Option<&[String]>,
     chatbot_notification_channel: Option<&std::collections::HashMap<String, Vec<String>>>,
 ) -> Option<String> {
@@ -498,37 +533,162 @@ pub fn collection_bounds_rejection(
             )
         })
     };
-    too_many("tags", tags.map_or(0, std::collections::HashMap::len), MAX_TAGS)
-        .or_else(|| {
-            too_many(
-                "tagKeyBoundaries",
-                tag_key_boundaries.map_or(0, <[String]>::len),
-                MAX_COLLECTION_ENTRIES,
-            )
-        })
-        .or_else(|| {
-            too_many(
-                "chatbotNotificationChannel",
-                chatbot_notification_channel.map_or(0, std::collections::HashMap::len),
-                MAX_COLLECTION_ENTRIES,
-            )
-        })
+    too_many(
+        "tagKeyBoundaries",
+        tag_key_boundaries.map_or(0, <[String]>::len),
+        MAX_COLLECTION_ENTRIES,
+    )
+    .or_else(|| {
+        too_many(
+            "chatbotNotificationChannel",
+            chatbot_notification_channel.map_or(0, std::collections::HashMap::len),
+            MAX_COLLECTION_ENTRIES,
+        )
+    })
 }
 
 /// Why a resource may not end up carrying `resulting_tags` tags, or `None` when that
 /// many fit.
 ///
-/// `TagResource` adds to the tags a resource ALREADY carries, so the cap applies to
-/// the merged set and not just to the map one request sent — the request's own size is
-/// what [`collection_bounds_rejection`] checks. Worded through the same builders, so
-/// the two refusals read alike.
+/// The cap applies to the tag set the resource ENDS UP with, so `TagResource` counts
+/// the merge of the request's map with the tags the resource already carries, and a
+/// create counts the map it was given. The message states that rule and carries
+/// nothing of the request.
+///
+/// This refusal is NOT the service's own `ValidationException`: a tag write is served
+/// by the tagging frontend, whose refusal is HTTP 400 with the error code
+/// `BadRequestException` — the code recorded for a 51-tag call on an investigation
+/// group, and the one a sibling service's tag map is refused with as well
+/// (`services/service-com-amazonaws-batch-awsbatchv20160810/src/service.rs`). The
+/// shape is not in this service's model, so it is answered through
+/// [`crate::scaffolded::Scaffolded::bad_request`].
 pub fn tag_capacity_rejection(resulting_tags: usize) -> Option<String> {
-    (resulting_tags > MAX_TAGS).then(|| {
+    (resulting_tags > MAX_TAGS)
+        .then(|| format!("The resultant tag set must not have more than {MAX_TAGS} user tags."))
+}
+
+/// The `EncryptionConfigurationType` value naming the Amazon Web Services owned key,
+/// taken from the modelled value set
+/// (`smithy_query(query="shape",shape="EncryptionConfigurationType")`).
+pub const AWS_OWNED_KEY_TYPE: &str = "AWS_OWNED_KEY";
+
+/// The encryption configuration a group carries when its create omitted one.
+///
+/// From `encryptionConfiguration`'s own documentation: "If you omit this parameter,
+/// CloudWatch investigations will use an Amazon Web Services key to encrypt the
+/// data." That is the [`AWS_OWNED_KEY_TYPE`] member of the modelled value set, and it
+/// carries no `kmsKeyId` because no customer managed key is involved — so the
+/// default-key state is a stored configuration like any other and every later read
+/// reports it, rather than the member going missing.
+pub fn default_encryption_configuration() -> EncryptionConfiguration {
+    EncryptionConfiguration {
+        r#type: Some(AWS_OWNED_KEY_TYPE.to_string()),
+        kms_key_id: None,
+    }
+}
+
+/// Why a `crossAccountConfigurations` list is unacceptable, or `None` when every
+/// entry names an account other than this one.
+///
+/// A cross-account configuration exists to let the investigating account reach
+/// ANOTHER account's resources, so a `sourceRoleArn` whose account id is the
+/// investigation account's own is refused: it could never do anything. The modelled
+/// constraints on the member (`@length 20..2048`, `^arn:.*$`) cannot express that, so
+/// the boundary walk admits it and this is where the rule lives — and every operation
+/// that stores the list applies it, each rendering the refusal as its own modelled
+/// `ValidationException`.
+///
+/// Worded through [`validation_message`]: the member path and the requirement, with
+/// the offending ARN withheld. The account named is the service's own, not anything
+/// the request carried.
+pub fn cross_account_configurations_rejection(
+    configurations: Option<&[CrossAccountConfiguration]>,
+) -> Option<String> {
+    let own_account = ::engine::EMULATOR_ACCOUNT_ID;
+    configurations?
+        .iter()
+        .filter_map(|configuration| configuration.source_role_arn.as_deref())
+        .any(|arn| arn_account_id(arn) == Some(own_account))
+        .then(|| {
+            validation_message(
+                "crossAccountConfigurations.sourceRoleArn",
+                &format!(
+                    "Member must name an account other than the investigation account {own_account}"
+                ),
+            )
+        })
+}
+
+/// Why a resource policy document is unacceptable, or `None` when it is one this
+/// service will attach.
+///
+/// The modelled constraints on the document bound only its length and its character
+/// set (`@length 1..32768`, `^[\u0009\u000A\u000D\u0020-\u00FF]+$`), so the boundary
+/// walk admits any printable text; the operation's own semantic check is that the
+/// document IS a policy document — the `policy` member is documented as "The policy,
+/// in JSON format", and a policy document is a JSON object. Parsed with `serde_json`,
+/// so the judgement is a real parser's and never a match on the document's text.
+///
+/// A document that fails this is not stored at all, so a later
+/// `GetInvestigationGroupPolicy` cannot hand back something unparseable.
+pub fn policy_document_rejection(policy: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(policy).ok();
+    parsed.filter(serde_json::Value::is_object).is_none().then(|| {
         validation_message(
-            "tags",
-            &requirement_text(ViolationKind::MaxLength(MAX_TAGS as i64)),
+            "policy",
+            "Member must be a resource policy document in JSON format",
         )
     })
+}
+
+/// The account id field of `arn`, or `None` when `arn` is not an ARN carrying one.
+///
+/// An ARN is `arn:partition:service:region:account:resource`, and the resource
+/// portion may itself hold `:`, so only the first five fields are split off.
+pub fn arn_account_id(arn: &str) -> Option<&str> {
+    let mut fields = arn.strip_prefix("arn:")?.splitn(5, ':');
+    let (_partition, _service, _region, account) = (
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+    );
+    (!account.is_empty()).then_some(account)
+}
+
+/// The `ServiceQuotaExceededException` every quota refusal of this service is built
+/// through: the quota that was exceeded, stated in `message`, and the resource type
+/// and service it belongs to.
+///
+/// `resourceId` and `quotaCode` stay unset: neither is a value this emulator knows,
+/// and the resource the refused create would have minted has no id.
+fn quota_exceeded(message: String) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: Some(message),
+        resource_type: Some(INVESTIGATION_GROUP_RESOURCE.to_string()),
+        service_code: Some(ARN_SERVICE.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The 402 a `CreateInvestigationGroup` is refused with when the Region it is signed
+/// for already holds this account's one investigation group.
+///
+/// The quota is published on the operation itself: "Currently, you can have one
+/// investigation group in each Region in your account."
+pub fn region_quota_exceeded() -> ServiceQuotaExceededException {
+    quota_exceeded(format!(
+        "An account can have only {MAX_INVESTIGATION_GROUPS_PER_REGION} investigation group \
+         in each Region."
+    ))
+}
+
+/// The 402 a create is refused with when the store has reached its cross-region
+/// resource guard, [`MAX_INVESTIGATION_GROUPS`].
+pub fn store_capacity_exceeded() -> ServiceQuotaExceededException {
+    quota_exceeded(format!(
+        "this account already holds the maximum of {MAX_INVESTIGATION_GROUPS} investigation groups"
+    ))
 }
 
 /// The id segment of an investigation-group ARN, or `None` when `identifier` is not

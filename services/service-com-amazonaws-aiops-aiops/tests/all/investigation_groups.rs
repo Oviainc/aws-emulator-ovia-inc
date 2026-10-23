@@ -10,17 +10,45 @@
 //! investigation-group record, so anything a create or an update stored is what a
 //! later Get, List or GetPolicy reports, and anything never stored (or since
 //! deleted) is a modelled 404.
+//!
+//! An account holds ONE investigation group per Region, so every row below that needs
+//! its own group signs for its own Region ([`region`]).
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_aiops_aiops::state::{
-    MAX_COLLECTION_ENTRIES, MAX_INVESTIGATION_GROUPS, MAX_TAGS,
+    AWS_OWNED_KEY_TYPE, MAX_COLLECTION_ENTRIES, MAX_INVESTIGATION_GROUPS, MAX_TAGS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every request below signs for; the ARNs must carry exactly this one.
+/// The region a case signs for when it only needs one; the ARNs it creates carry it.
 const REGION: &str = "us-west-2";
+
+/// Regions the rows that each need their own group sign for, in order.
+const REGIONS: &[&str] = &[
+    "us-west-2",
+    "us-east-1",
+    "us-east-2",
+    "eu-central-1",
+    "eu-west-1",
+    "eu-west-2",
+    "ap-southeast-1",
+    "ap-northeast-1",
+    "sa-east-1",
+    "ca-central-1",
+];
+
+/// The Region row `n` signs for.
+///
+/// An account holds one investigation group per Region, so a row that needs its own
+/// group needs its own Region. The names are real AWS Regions; past the list they are
+/// synthetic ones inside what a SigV4 credential scope admits (`[a-zA-Z0-9-]`).
+fn region(n: usize) -> String {
+    REGIONS
+        .get(n)
+        .map_or_else(|| format!("region-{n:04}"), |name| (*name).to_string())
+}
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN carries.
 const ACCOUNT: &str = "000000000000";
 /// Length of the ARN's id segment, from the modelled `InvestigationGroupArn`
@@ -41,17 +69,22 @@ fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// A request signed for `aiops` in [`REGION`], the signal the router routes on and
+/// A request signed for `aiops` in `region`, the signal the router routes on and
 /// the handlers read the region and the caller principal from.
-fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes::Bytes> {
+fn request(
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> http::Request<bytes::Bytes> {
     let mut builder = http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", format!("aiops.{REGION}.amazonaws.com"))
+        .header("host", format!("aiops.{region}.amazonaws.com"))
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDAIOPSTEST/20260101/{REGION}/aiops/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDAIOPSTEST/20260101/{region}/aiops/aws4_request, \
                  SignedHeaders=host, Signature=0000"
             ),
         );
@@ -66,13 +99,14 @@ fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes
 }
 
 /// Status and parsed body of one call. An empty body reads as `Value::Null`.
-async fn call(
+async fn call_in(
     router: &MultiServiceRouter,
+    region: &str,
     method: &str,
     uri: &str,
     body: Option<&Value>,
 ) -> (u16, Value) {
-    let response = router.dispatch(request(method, uri, body)).await;
+    let response = router.dispatch(request(region, method, uri, body)).await;
     let status = response.status().as_u16();
     let error_type = response
         .headers()
@@ -94,6 +128,16 @@ async fn call(
             .or_insert_with(|| Value::String(error_type));
     }
     (status, parsed)
+}
+
+/// [`call_in`] in [`REGION`].
+async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
+    call_in(router, REGION, method, uri, body).await
 }
 
 /// The modelled error shape a failed call reported.
@@ -121,13 +165,14 @@ fn label(value: &str) -> String {
         .collect()
 }
 
-async fn create(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
-    call(router, "POST", "/investigationGroups", Some(body)).await
+async fn create(router: &MultiServiceRouter, region: &str, body: &Value) -> (u16, Value) {
+    call_in(router, region, "POST", "/investigationGroups", Some(body)).await
 }
 
-async fn get(router: &MultiServiceRouter, identifier: &str) -> (u16, Value) {
-    call(
+async fn get_in(router: &MultiServiceRouter, region: &str, identifier: &str) -> (u16, Value) {
+    call_in(
         router,
+        region,
         "GET",
         &format!("/investigationGroups/{}", label(identifier)),
         None,
@@ -135,9 +180,9 @@ async fn get(router: &MultiServiceRouter, identifier: &str) -> (u16, Value) {
     .await
 }
 
-/// Create a group that must succeed, and return its ARN.
-async fn create_ok(router: &MultiServiceRouter, body: &Value) -> String {
-    let (status, created) = create(router, body).await;
+/// Create a group that must succeed in `region`, and return its ARN.
+async fn create_ok(router: &MultiServiceRouter, region: &str, body: &Value) -> String {
+    let (status, created) = create(router, region, body).await;
     assert_eq!(status, 201, "create {body}: expected 201, got {created:?}");
     created
         .get("arn")
@@ -146,10 +191,10 @@ async fn create_ok(router: &MultiServiceRouter, body: &Value) -> String {
         .to_string()
 }
 
-/// Assert `arn` satisfies the modelled `InvestigationGroupArn` pattern, and answer
-/// its 16-character id segment.
-fn assert_group_arn(case: &str, arn: &str) -> String {
-    let prefix = format!("arn:aws:aiops:{REGION}:{ACCOUNT}:investigation-group/");
+/// Assert `arn` satisfies the modelled `InvestigationGroupArn` for `region`, and
+/// answer its 16-character id segment.
+fn assert_group_arn(case: &str, region: &str, arn: &str) -> String {
+    let prefix = format!("arn:aws:aiops:{region}:{ACCOUNT}:investigation-group/");
     let id = arn
         .strip_prefix(&prefix)
         .unwrap_or_else(|| panic!("case {case:?}: expected an ARN starting {prefix}, got {arn:?}"));
@@ -174,9 +219,6 @@ struct GroupCase {
     request: Value,
     /// Every member the read-back must carry, exactly.
     expected: Value,
-    /// Whether the bare name is addressable: the modelled identifier's bare form is
-    /// `[\-_A-Za-z0-9]{1,512}`, narrower than the name's own pattern.
-    name_addressable: bool,
 }
 
 /// The table: the rule is "a Get reports what the create stored", so the rows differ
@@ -188,6 +230,8 @@ fn group_cases() -> Vec<GroupCase> {
         // Only the two required members: the documented defaults must be stored.
         // `retentionInDays`: "If you omit this parameter, the default of 90 days is
         // used." `isCloudTrailEventHistoryEnabled`: "The default is true."
+        // `encryptionConfiguration`: "If you omit this parameter, CloudWatch
+        // investigations will use an Amazon Web Services key to encrypt the data."
         GroupCase {
             name: "minimal-group",
             request: json!({ "name": "minimal-group", "roleArn": ROLE_ARN }),
@@ -196,8 +240,8 @@ fn group_cases() -> Vec<GroupCase> {
                 "roleArn": ROLE_ARN,
                 "retentionInDays": 90,
                 "isCloudTrailEventHistoryEnabled": true,
+                "encryptionConfiguration": { "type": AWS_OWNED_KEY_TYPE },
             }),
-            name_addressable: true,
         },
         // The low published bound of the modelled `retentionInDays` range (7..90),
         // the AWS-owned encryption type, and every collection at size 1-2.
@@ -208,7 +252,7 @@ fn group_cases() -> Vec<GroupCase> {
                 "roleArn": ROLE_ARN,
                 "retentionInDays": 7,
                 "isCloudTrailEventHistoryEnabled": false,
-                "encryptionConfiguration": { "type": "AWS_OWNED_KEY" },
+                "encryptionConfiguration": { "type": AWS_OWNED_KEY_TYPE },
                 "tagKeyBoundaries": ["Application", "CostCenter"],
                 "chatbotNotificationChannel": {
                     "arn:aws:sns:us-west-2:000000000000:aiops-alerts": [
@@ -216,7 +260,7 @@ fn group_cases() -> Vec<GroupCase> {
                     ]
                 },
                 "crossAccountConfigurations": [
-                    { "sourceRoleArn": "arn:aws:iam::000000000000:role/SourceOne" }
+                    { "sourceRoleArn": "arn:aws:iam::111122223333:role/SourceOne" }
                 ],
             }),
             expected: json!({
@@ -224,7 +268,7 @@ fn group_cases() -> Vec<GroupCase> {
                 "roleArn": ROLE_ARN,
                 "retentionInDays": 7,
                 "isCloudTrailEventHistoryEnabled": false,
-                "encryptionConfiguration": { "type": "AWS_OWNED_KEY" },
+                "encryptionConfiguration": { "type": AWS_OWNED_KEY_TYPE },
                 "tagKeyBoundaries": ["Application", "CostCenter"],
                 "chatbotNotificationChannel": {
                     "arn:aws:sns:us-west-2:000000000000:aiops-alerts": [
@@ -232,10 +276,9 @@ fn group_cases() -> Vec<GroupCase> {
                     ]
                 },
                 "crossAccountConfigurations": [
-                    { "sourceRoleArn": "arn:aws:iam::000000000000:role/SourceOne" }
+                    { "sourceRoleArn": "arn:aws:iam::111122223333:role/SourceOne" }
                 ],
             }),
-            name_addressable: true,
         },
         // The high published bound of the same range, the customer-managed
         // encryption type with its key, and a longer cross-account list.
@@ -250,9 +293,9 @@ fn group_cases() -> Vec<GroupCase> {
                     "kmsKeyId": "arn:aws:kms:us-west-2:000000000000:key/abcd-1234"
                 },
                 "crossAccountConfigurations": [
-                    { "sourceRoleArn": "arn:aws:iam::000000000000:role/SourceOne" },
-                    { "sourceRoleArn": "arn:aws:iam::000000000000:role/SourceTwo" },
-                    { "sourceRoleArn": "arn:aws:iam::000000000000:role/SourceThree" }
+                    { "sourceRoleArn": "arn:aws:iam::111122223333:role/SourceOne" },
+                    { "sourceRoleArn": "arn:aws:iam::111122223333:role/SourceTwo" },
+                    { "sourceRoleArn": "arn:aws:iam::444455556666:role/SourceThree" }
                 ],
             }),
             expected: json!({
@@ -265,16 +308,14 @@ fn group_cases() -> Vec<GroupCase> {
                     "kmsKeyId": "arn:aws:kms:us-west-2:000000000000:key/abcd-1234"
                 },
                 "crossAccountConfigurations": [
-                    { "sourceRoleArn": "arn:aws:iam::000000000000:role/SourceOne" },
-                    { "sourceRoleArn": "arn:aws:iam::000000000000:role/SourceTwo" },
-                    { "sourceRoleArn": "arn:aws:iam::000000000000:role/SourceThree" }
+                    { "sourceRoleArn": "arn:aws:iam::111122223333:role/SourceOne" },
+                    { "sourceRoleArn": "arn:aws:iam::111122223333:role/SourceTwo" },
+                    { "sourceRoleArn": "arn:aws:iam::444455556666:role/SourceThree" }
                 ],
             }),
-            name_addressable: true,
         },
         // A retention inside the range, and a name using the punctuation the
-        // modelled name pattern allows but the bare identifier form does not — so
-        // this row is addressable only by id or ARN.
+        // modelled name pattern allows but the bare identifier form does not.
         GroupCase {
             name: "punctuated name",
             request: json!({
@@ -288,9 +329,9 @@ fn group_cases() -> Vec<GroupCase> {
                 "roleArn": ROLE_ARN,
                 "retentionInDays": 30,
                 "isCloudTrailEventHistoryEnabled": true,
+                "encryptionConfiguration": { "type": AWS_OWNED_KEY_TYPE },
                 "tagKeyBoundaries": ["Service"],
             }),
-            name_addressable: false,
         },
     ]
 }
@@ -309,78 +350,92 @@ fn assert_members(case: &str, via: &str, expected: &Value, actual: &Value) {
     }
 }
 
+/// A created group reads back through its ARN — and through nothing else: the bare
+/// identifier forms the modelled pattern admits resolve no group.
 #[tokio::test]
-async fn a_created_group_reads_back_through_every_identifier_form() {
+async fn a_created_group_reads_back_through_its_arn() {
     let router = emulator();
     let cases = group_cases();
 
-    // Create them all first, so each read-back also proves the store keeps the rows
-    // apart rather than answering with the most recent one.
+    // Create them all first — one per Region, since an account holds one group per
+    // Region — so each read-back also proves the store keeps the rows apart rather
+    // than answering with the most recent one.
     let mut arns = Vec::new();
-    for case in &cases {
-        let arn = create_ok(&router, &case.request).await;
-        assert_group_arn(case.name, &arn);
-        arns.push(arn);
+    for (index, case) in cases.iter().enumerate() {
+        let region = region(index);
+        let arn = create_ok(&router, &region, &case.request).await;
+        assert_group_arn(case.name, &region, &arn);
+        arns.push((region, arn));
     }
 
-    for (case, arn) in cases.iter().zip(&arns) {
-        let id = assert_group_arn(case.name, arn);
+    for (case, (region, arn)) in cases.iter().zip(&arns) {
+        let id = assert_group_arn(case.name, region, arn);
 
-        let mut identifiers = vec![("arn", arn.clone()), ("id", id)];
-        if case.name_addressable {
-            identifiers.push((
-                "name",
-                case.request["name"].as_str().expect("a string name").to_string(),
-            ));
-        }
+        let (status, body) = get_in(&router, region, arn).await;
+        assert_eq!(
+            status, 200,
+            "case {:?} read via its ARN: expected 200, got {status} / {body:?}",
+            case.name
+        );
+        assert_members(case.name, "arn", &case.expected, &body);
+        assert_eq!(
+            body.get("arn").and_then(Value::as_str),
+            Some(arn.as_str()),
+            "case {:?}: expected arn {arn}, got {body:?}",
+            case.name
+        );
 
-        let mut bodies = Vec::new();
-        for (via, identifier) in &identifiers {
-            let (status, body) = get(&router, identifier).await;
-            assert_eq!(
-                status, 200,
-                "case {:?} read via {via}: expected 200, got {status} / {body:?}",
-                case.name
-            );
-            assert_members(case.name, via, &case.expected, &body);
-            assert_eq!(
-                body.get("arn").and_then(Value::as_str),
-                Some(arn.as_str()),
-                "case {:?} read via {via}: expected arn {arn}, got {body:?}",
-                case.name
-            );
-            bodies.push(body);
-        }
+        // A read never changes what the next caller sees.
+        let (_, again) = get_in(&router, region, arn).await;
+        assert_eq!(
+            again, body,
+            "case {:?}: a second read must answer the identical body",
+            case.name
+        );
 
-        // Every identifier form names the one record, so every form answers the
-        // identical body — and a read never changes it.
-        for body in &bodies {
+        // The bare forms the identifier pattern also admits name no group. A name
+        // outside that bare class (`[\-_A-Za-z0-9]{1,512}`) never even reaches the
+        // handler: the modelled pattern refuses it at the boundary.
+        let name = case.request["name"].as_str().unwrap_or_default().to_string();
+        let name_is_bare_identifier = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        for (form, identifier, want) in [
+            (
+                "its own name",
+                name,
+                if name_is_bare_identifier { 404 } else { 400 },
+            ),
+            ("its own bare id", id, 404),
+        ] {
+            let (status, answer) = get_in(&router, region, &identifier).await;
             assert_eq!(
-                body, &bodies[0],
-                "case {:?}: the identifier forms answered different bodies: {bodies:?}",
+                status, want,
+                "case {:?} read via {form}: a bare identifier resolves no group, \
+                 got {status} / {answer:?}",
                 case.name
             );
         }
 
         // The timestamps and the principal come from the create, not from the read.
-        let first = &bodies[0];
-        let created_at = first
+        let created_at = body
             .get("createdAt")
             .and_then(Value::as_i64)
-            .unwrap_or_else(|| panic!("case {:?}: no createdAt in {first:?}", case.name));
+            .unwrap_or_else(|| panic!("case {:?}: no createdAt in {body:?}", case.name));
         assert!(
             created_at > 1_600_000_000,
             "case {:?}: expected createdAt in epoch SECONDS, got {created_at}",
             case.name
         );
         assert_eq!(
-            first.get("lastModifiedAt").and_then(Value::as_i64),
+            body.get("lastModifiedAt").and_then(Value::as_i64),
             Some(created_at),
-            "case {:?}: an untouched group's lastModifiedAt must equal createdAt, got {first:?}",
+            "case {:?}: an untouched group's lastModifiedAt must equal createdAt, got {body:?}",
             case.name
         );
         for member in ["createdBy", "lastModifiedBy"] {
-            let principal = first.get(member).and_then(Value::as_str).unwrap_or("");
+            let principal = body.get(member).and_then(Value::as_str).unwrap_or("");
             assert!(
                 !principal.is_empty()
                     && principal
@@ -392,11 +447,11 @@ async fn a_created_group_reads_back_through_every_identifier_form() {
         }
     }
 
-    // A member the request never carried is reported by nobody: the minimal row has
-    // no encryption configuration, no tag key boundaries and no channel.
-    let (_, minimal) = get(&router, "minimal-group").await;
+    // A member the request never carried and the service has no default for is
+    // reported by nobody: the minimal row has no tag key boundaries and no channel.
+    let (minimal_region, minimal_arn) = &arns[0];
+    let (_, minimal) = get_in(&router, minimal_region, minimal_arn).await;
     for absent in [
-        "encryptionConfiguration",
         "tagKeyBoundaries",
         "chatbotNotificationChannel",
         "crossAccountConfigurations",
@@ -413,16 +468,21 @@ async fn an_unknown_identifier_is_a_modelled_404_not_a_hollow_200() {
     let router = emulator();
     let existing = create_ok(
         &router,
+        REGION,
         &json!({ "name": "the-one-group", "roleArn": ROLE_ARN }),
     )
     .await;
-    let existing_id = assert_group_arn("the-one-group", &existing);
+    let existing_id = assert_group_arn("the-one-group", REGION, &existing);
 
-    // Each row is a well-formed identifier that names nothing: a bare name, a bare
-    // id-shaped string, a syntactically valid ARN of a group never created, and the
-    // existing group's ARN with ONE field changed — a different partition, region or
-    // account names a different resource, so none of them may resolve to this group.
+    // Each row is a well-formed identifier that names nothing: the existing group's
+    // own name and bare id (which the service resolves nothing from), a name and an
+    // id-shaped string nothing carries, a syntactically valid ARN of a group never
+    // created, and the existing group's ARN with ONE field changed — a different
+    // partition, region or account names a different resource, so none of them may
+    // resolve to this group.
     let unknown = [
+        "the-one-group".to_string(),
+        existing_id.clone(),
         "never-created".to_string(),
         "AAAAAAAAAAAAAAAA".to_string(),
         format!("arn:aws:aiops:{REGION}:{ACCOUNT}:investigation-group/ZZZZZZZZZZZZZZZZ"),
@@ -468,44 +528,38 @@ async fn an_unknown_identifier_is_a_modelled_404_not_a_hollow_200() {
     }
 }
 
+/// `ListInvestigationGroups` is regional and an account holds one group per Region
+/// (`state::MAX_INVESTIGATION_GROUPS_PER_REGION`), so a Region's listing carries
+/// exactly the groups that Region holds, never another Region's, and never a
+/// `nextToken` — there is never a second page to name. A token this operation did not
+/// mint is still refused.
+///
+/// Rows differ along the Region, along whether it holds a group at all, and along the
+/// page size: each published bound of the modelled `maxResults` range (1..50), a size
+/// larger than the listing, and the absent-parameter default.
 #[tokio::test]
-async fn list_pages_the_store_through_the_paginated_trait() {
+async fn list_reports_exactly_the_groups_of_the_region_it_is_signed_for() {
     let router = emulator();
 
-    // Eleven groups, so a page size of 1, 2, 3, 4 and the default all behave
-    // differently: 11 is not a multiple of any of them.
-    let mut expected: Vec<(String, String)> = Vec::new();
-    for n in 0..11 {
-        let name = format!("group-{n:02}");
-        let arn = create_ok(&router, &json!({ "name": name, "roleArn": ROLE_ARN })).await;
-        expected.push((arn, name));
+    // Four Regions hold a group; a fifth deliberately holds none.
+    let mut expected: Vec<(String, (String, String))> = Vec::new();
+    for index in 0..4 {
+        let region = region(index);
+        let name = format!("group-{index:02}");
+        let arn = create_ok(&router, &region, &json!({ "name": name, "roleArn": ROLE_ARN })).await;
+        expected.push((region, (arn, name)));
     }
-    expected.sort();
+    let empty_region = region(9);
 
-    // Rows differ along the page size: each published bound of the modelled
-    // `maxResults` range (1..50), sizes that do and do not divide the store, a size
-    // larger than the store, and the absent-parameter default.
-    for page_size in [None, Some(1), Some(2), Some(3), Some(4), Some(11), Some(50)] {
-        let case = format!("maxResults={page_size:?}");
-        let mut collected: Vec<(String, String)> = Vec::new();
-        let mut token: Option<String> = None;
-        let mut pages = 0;
-
-        loop {
+    for page_size in [None, Some(1), Some(2), Some(50)] {
+        for (region, want) in &expected {
+            let case = format!("{region} with maxResults={page_size:?}");
             let mut uri = "/investigationGroups".to_string();
-            let mut query = Vec::new();
             if let Some(size) = page_size {
-                query.push(format!("maxResults={size}"));
-            }
-            if let Some(token) = &token {
-                query.push(format!("nextToken={token}"));
-            }
-            if !query.is_empty() {
-                uri.push('?');
-                uri.push_str(&query.join("&"));
+                uri.push_str(&format!("?maxResults={size}"));
             }
 
-            let (status, body) = call(&router, "GET", &uri, None).await;
+            let (status, body) = call_in(&router, region, "GET", &uri, None).await;
             assert_eq!(
                 status, 200,
                 "case {case}: expected 200 from {uri}, got {status} / {body:?}"
@@ -514,51 +568,45 @@ async fn list_pages_the_store_through_the_paginated_trait() {
                 .get("investigationGroups")
                 .and_then(Value::as_array)
                 .unwrap_or_else(|| panic!("case {case}: no investigationGroups in {body:?}"));
-            if let Some(size) = page_size {
-                assert!(
-                    items.len() <= size as usize,
-                    "case {case}: a page carried {} items, more than maxResults",
-                    items.len()
-                );
-            }
-            for item in items {
-                let arn = item
-                    .get("arn")
-                    .and_then(Value::as_str)
-                    .unwrap_or_else(|| panic!("case {case}: a list item carried no arn: {item:?}"));
-                let name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_else(|| panic!("case {case}: a list item carried no name: {item:?}"));
-                collected.push((arn.to_string(), name.to_string()));
-            }
-
-            pages += 1;
-            assert!(pages <= 32, "case {case}: pagination did not terminate");
-            token = body
-                .get("nextToken")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            if token.is_none() {
-                // The last page omits the token, which is what ends the walk.
-                break;
-            }
-        }
-
-        collected.sort();
-        assert_eq!(
-            collected, expected,
-            "case {case}: paging must visit every group exactly once"
-        );
-        if let Some(size) = page_size {
-            let want_pages = expected.len().div_ceil(size as usize);
+            let collected: Vec<(String, String)> = items
+                .iter()
+                .map(|item| {
+                    (
+                        item.get("arn")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        item.get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect();
             assert_eq!(
-                pages,
-                want_pages.max(1),
-                "case {case}: expected {want_pages} pages for {} groups",
-                expected.len()
+                collected,
+                vec![want.clone()],
+                "case {case}: a Region lists exactly its own group, got {body:?}"
+            );
+            assert!(
+                body.get("nextToken").is_none(),
+                "case {case}: one group never fills a page, so no token may be issued, \
+                 got {body:?}"
             );
         }
+
+        // A Region holding no group reports an empty listing, not another Region's.
+        let case = format!("{empty_region} with maxResults={page_size:?}");
+        let (status, body) = call_in(&router, &empty_region, "GET", "/investigationGroups", None).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected 200, got {status} / {body:?}"
+        );
+        assert_eq!(
+            body.get("investigationGroups").and_then(Value::as_array),
+            Some(&vec![]),
+            "case {case}: a Region with no group lists nothing, got {body:?}"
+        );
     }
 
     // A token this operation never issued is refused, not silently ignored.
@@ -601,24 +649,28 @@ async fn update_replaces_only_the_members_the_request_carries() {
         json!({ "encryptionConfiguration": { "type": "AWS_OWNED_KEY" } }),
         json!({
             "crossAccountConfigurations": [
-                { "sourceRoleArn": "arn:aws:iam::000000000000:role/Patched" }
+                { "sourceRoleArn": "arn:aws:iam::111122223333:role/Patched" }
             ]
         }),
-        // No member at all: a no-op patch still succeeds and still changes nothing.
+        // No member at all: a no-op patch still succeeds and still changes nothing
+        // but the modification stamp.
         json!({}),
     ];
 
     for (index, patch) in patches.iter().enumerate() {
+        let region = region(index);
         let name = format!("patched-{index}");
         let arn = create_ok(
             &router,
+            &region,
             &json!({ "name": name, "roleArn": ROLE_ARN, "retentionInDays": 14 }),
         )
         .await;
-        let (_, before) = get(&router, &arn).await;
+        let (_, before) = get_in(&router, &region, &arn).await;
 
-        let (status, answer) = call(
+        let (status, answer) = call_in(
             &router,
+            &region,
             "PATCH",
             &format!("/investigationGroups/{}", label(&arn)),
             Some(patch),
@@ -629,7 +681,7 @@ async fn update_replaces_only_the_members_the_request_carries() {
             "case {patch}: expected 200 from the update, got {status} / {answer:?}"
         );
 
-        let (status, after) = get(&router, &arn).await;
+        let (status, after) = get_in(&router, &region, &arn).await;
         assert_eq!(status, 200, "case {patch}: read-back failed with {after:?}");
 
         // Every patched member now reports the patched value.
@@ -660,13 +712,22 @@ async fn update_replaces_only_the_members_the_request_carries() {
             }
         }
 
-        // The update is recorded: `lastModifiedAt` is never earlier than the create,
-        // and never earlier than `createdAt`.
+        // The update is recorded: `lastModifiedAt` advances past what the read before
+        // it reported, and is never earlier than `createdAt`.
         let created_at = after.get("createdAt").and_then(Value::as_i64).unwrap_or(0);
         let last_modified_at = after
             .get("lastModifiedAt")
             .and_then(Value::as_i64)
             .unwrap_or(0);
+        let before_modified_at = before
+            .get("lastModifiedAt")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        assert!(
+            last_modified_at > before_modified_at,
+            "case {patch}: expected lastModifiedAt to advance past {before_modified_at}, \
+             got {last_modified_at}"
+        );
         assert!(
             last_modified_at >= created_at,
             "case {patch}: expected lastModifiedAt >= createdAt, got {last_modified_at} < {created_at}"
@@ -678,11 +739,12 @@ async fn update_replaces_only_the_members_the_request_carries() {
 async fn a_policy_round_trips_byte_for_byte() {
     let router = emulator();
 
-    // Rows differ along the document: a one-character minimum, a realistic policy,
-    // one carrying the tab/newline/carriage-return and Latin-1 bytes the modelled
+    // Rows differ along the document, inside what the operation accepts as a JSON
+    // policy document: the smallest object, a realistic policy, one carrying the
+    // tab/newline/carriage-return and Latin-1 bytes the modelled
     // `^[\u0009\u000A\u000D\u0020-\u00FF]+$` pattern admits, and a long one.
     let documents = [
-        "x".to_string(),
+        "{}".to_string(),
         json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -698,13 +760,15 @@ async fn a_policy_round_trips_byte_for_byte() {
     ];
 
     for (index, document) in documents.iter().enumerate() {
+        let region = region(index);
         let name = format!("policy-group-{index}");
-        let arn = create_ok(&router, &json!({ "name": name, "roleArn": ROLE_ARN })).await;
+        let arn = create_ok(&router, &region, &json!({ "name": name, "roleArn": ROLE_ARN })).await;
         let case = format!("{name} ({} bytes)", document.len());
 
         // Before a Put there is no policy resource, which is a 404 — not an empty 200.
-        let (status, body) = call(
+        let (status, body) = call_in(
             &router,
+            &region,
             "GET",
             &format!("/investigationGroups/{}/policy", label(&arn)),
             None,
@@ -737,9 +801,9 @@ async fn a_policy_round_trips_byte_for_byte() {
             "case {case}: the put must answer the group's own ARN, got {put:?}"
         );
 
-        // Read it back twice, and by the bare name as well as by the ARN: the bytes
-        // are the ones stored, and a read does not consume them.
-        for via in [arn.clone(), name.clone(), arn.clone()] {
+        // Read it back twice through the ARN: the bytes are the ones stored, and a
+        // read does not consume them.
+        for via in [arn.clone(), arn.clone()] {
             let (status, got) = call(
                 &router,
                 "GET",
@@ -830,17 +894,22 @@ async fn caller_sized_collections_are_bounded_before_they_reach_the_store() {
 
     // The rule: a caller-sized collection the model gives no length is accepted up to
     // this service's own bound and refused above it. Rows differ along which member
-    // carries the collection and whether its size is at the bound or one past it.
-    let cases: Vec<(String, Value, u16)> = vec![
+    // carries the collection and whether its size is at the bound or one past it — and
+    // along the error code: the `tags` map is a tag write, refused by the tagging
+    // frontend as a `BadRequestException`, while every other member is this service's
+    // own `ValidationException`. Each accepted row needs its own Region.
+    let cases: Vec<(String, Value, u16, &str)> = vec![
         (
             format!("tags at the bound ({MAX_TAGS})"),
             json!({ "name": "tags-at-bound", "roleArn": ROLE_ARN, "tags": tag_map(MAX_TAGS) }),
             201,
+            "",
         ),
         (
             format!("tags one past the bound ({})", MAX_TAGS + 1),
             json!({ "name": "tags-past-bound", "roleArn": ROLE_ARN, "tags": tag_map(MAX_TAGS + 1) }),
             400,
+            "BadRequestException",
         ),
         (
             format!("tagKeyBoundaries at the bound ({MAX_COLLECTION_ENTRIES})"),
@@ -850,6 +919,7 @@ async fn caller_sized_collections_are_bounded_before_they_reach_the_store() {
                 "tagKeyBoundaries": tag_key_boundaries(MAX_COLLECTION_ENTRIES),
             }),
             201,
+            "",
         ),
         (
             format!(
@@ -862,6 +932,7 @@ async fn caller_sized_collections_are_bounded_before_they_reach_the_store() {
                 "tagKeyBoundaries": tag_key_boundaries(MAX_COLLECTION_ENTRIES + 1),
             }),
             400,
+            "ValidationException",
         ),
         (
             format!("chatbotNotificationChannel at the bound ({MAX_COLLECTION_ENTRIES})"),
@@ -871,6 +942,7 @@ async fn caller_sized_collections_are_bounded_before_they_reach_the_store() {
                 "chatbotNotificationChannel": chatbot_channels(MAX_COLLECTION_ENTRIES),
             }),
             201,
+            "",
         ),
         (
             format!(
@@ -883,6 +955,7 @@ async fn caller_sized_collections_are_bounded_before_they_reach_the_store() {
                 "chatbotNotificationChannel": chatbot_channels(MAX_COLLECTION_ENTRIES + 1),
             }),
             400,
+            "ValidationException",
         ),
         (
             "crossAccountConfigurations one past its MODELLED 0..25 length".to_string(),
@@ -890,15 +963,16 @@ async fn caller_sized_collections_are_bounded_before_they_reach_the_store() {
                 "name": "cross-past-bound",
                 "roleArn": ROLE_ARN,
                 "crossAccountConfigurations": (0..26)
-                    .map(|n| json!({ "sourceRoleArn": format!("arn:aws:iam::{ACCOUNT}:role/R{n}") }))
+                    .map(|n| json!({ "sourceRoleArn": format!("arn:aws:iam::111122223333:role/R{n}") }))
                     .collect::<Vec<_>>(),
             }),
             400,
+            "ValidationException",
         ),
     ];
 
-    for (case, body, want_status) in cases {
-        let (status, answer) = create(&router, &body).await;
+    for (index, (case, body, want_status, want_code)) in cases.into_iter().enumerate() {
+        let (status, answer) = create(&router, &region(index), &body).await;
         assert_eq!(
             status, want_status,
             "case {case:?}: expected {want_status}, got {status} / {answer:?}"
@@ -906,15 +980,17 @@ async fn caller_sized_collections_are_bounded_before_they_reach_the_store() {
         if want_status == 400 {
             assert_eq!(
                 error_code(&answer),
-                "ValidationException",
-                "case {case:?}: expected ValidationException, got {answer:?}"
+                want_code,
+                "case {case:?}: expected {want_code}, got {answer:?}"
             );
         }
     }
 
     // The same bound applies to the replacement an update stores, not only to a create.
+    let region = region(9);
     let arn = create_ok(
         &router,
+        &region,
         &json!({ "name": "patched-bounds", "roleArn": ROLE_ARN }),
     )
     .await;
@@ -935,8 +1011,9 @@ async fn caller_sized_collections_are_bounded_before_they_reach_the_store() {
             400,
         ),
     ] {
-        let (status, answer) = call(
+        let (status, answer) = call_in(
             &router,
+            &region,
             "PATCH",
             &format!("/investigationGroups/{}", label(&arn)),
             Some(&patch),
@@ -949,7 +1026,7 @@ async fn caller_sized_collections_are_bounded_before_they_reach_the_store() {
     }
 
     // A refused update left the stored group exactly as the accepted one left it.
-    let (_, after) = get(&router, &arn).await;
+    let (_, after) = get_in(&router, &region, &arn).await;
     assert_eq!(
         after
             .get("tagKeyBoundaries")
@@ -960,15 +1037,23 @@ async fn caller_sized_collections_are_bounded_before_they_reach_the_store() {
     );
 }
 
+/// The store is finite ACROSS Regions too: each Region holds its one group, and the
+/// emulator's own cross-region guard refuses a create past
+/// [`MAX_INVESTIGATION_GROUPS`] rather than growing further. Freeing one slot lets
+/// exactly one more create through.
 #[tokio::test]
 async fn the_store_refuses_to_grow_past_its_cap() {
     let router = emulator();
 
-    // Fill the store to its cap, then one more: the create is refused with the
-    // modelled quota error rather than growing the store further.
+    // Fill the store to its cap — one group per Region, since that is the AWS quota —
+    // then one more: the create is refused with the modelled quota error rather than
+    // growing the store further.
+    let mut filled = Vec::new();
     for n in 0..MAX_INVESTIGATION_GROUPS {
+        let region = region(n + REGIONS.len());
         let (status, answer) = create(
             &router,
+            &region,
             &json!({ "name": format!("filler-{n:04}"), "roleArn": ROLE_ARN }),
         )
         .await;
@@ -976,10 +1061,22 @@ async fn the_store_refuses_to_grow_past_its_cap() {
             status, 201,
             "case fill {n}: expected 201 while under the cap, got {status} / {answer:?}"
         );
+        filled.push((
+            region,
+            answer
+                .get("arn")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ));
     }
 
+    // A Region that holds nothing yet is still refused: the cap is the store's, not
+    // the Region's.
+    let fresh_region = region(MAX_INVESTIGATION_GROUPS + REGIONS.len());
     let (status, answer) = create(
         &router,
+        &fresh_region,
         &json!({ "name": "one-too-many", "roleArn": ROLE_ARN }),
     )
     .await;
@@ -992,23 +1089,27 @@ async fn the_store_refuses_to_grow_past_its_cap() {
         "ServiceQuotaExceededException",
         "a create past the cap must be a ServiceQuotaExceededException, got {answer:?}"
     );
-    let (status, body) = get(&router, "one-too-many").await;
+    let (_, listed) = call_in(&router, &fresh_region, "GET", "/investigationGroups", None).await;
     assert_eq!(
-        status, 404,
-        "the refused create must have stored nothing, got {status} / {body:?}"
+        listed.get("investigationGroups").and_then(Value::as_array),
+        Some(&vec![]),
+        "the refused create must have stored nothing, got {listed:?}"
     );
 
     // Freeing one slot lets exactly one more create through.
-    let (status, _) = call(
+    let (victim_region, victim_arn) = &filled[0];
+    let (status, _) = call_in(
         &router,
+        victim_region,
         "DELETE",
-        "/investigationGroups/filler-0000",
+        &format!("/investigationGroups/{}", label(victim_arn)),
         None,
     )
     .await;
     assert_eq!(status, 200, "deleting a filler group must succeed");
     let (status, answer) = create(
         &router,
+        &fresh_region,
         &json!({ "name": "one-too-many", "roleArn": ROLE_ARN }),
     )
     .await;
@@ -1022,68 +1123,91 @@ async fn the_store_refuses_to_grow_past_its_cap() {
 async fn delete_removes_the_group_from_every_reader() {
     let router = emulator();
 
+    // One group per Region, each carrying a policy; rows differ along the Region the
+    // delete addresses.
     let names = ["doomed-one", "doomed-two", "survivor"];
-    let mut arns = Vec::new();
-    for name in names {
-        let arn = create_ok(&router, &json!({ "name": name, "roleArn": ROLE_ARN })).await;
-        call(
+    let mut groups = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let region = region(index);
+        let arn = create_ok(&router, &region, &json!({ "name": name, "roleArn": ROLE_ARN })).await;
+        call_in(
             &router,
+            &region,
             "POST",
             &format!("/investigationGroups/{}/policy", label(&arn)),
             Some(&json!({ "policy": format!("{{\"Sid\":\"{name}\"}}") })),
         )
         .await;
-        arns.push(arn);
+        groups.push((region, arn));
     }
 
-    // Rows differ along the identifier form the delete uses.
-    for (via, identifier) in [("arn", arns[0].clone()), ("name", names[1].to_string())] {
-        let (status, answer) = call(
+    for (region, arn) in groups.iter().take(2) {
+        let (status, answer) = call_in(
             &router,
+            region,
             "DELETE",
-            &format!("/investigationGroups/{}", label(&identifier)),
+            &format!("/investigationGroups/{}", label(arn)),
             None,
         )
         .await;
         assert_eq!(
             status, 200,
-            "case delete via {via}: expected 200, got {status} / {answer:?}"
+            "case delete in {region}: expected 200, got {status} / {answer:?}"
         );
 
-        let (status, body) = get(&router, &identifier).await;
+        let (status, body) = get_in(&router, region, arn).await;
         assert_eq!(
             status, 404,
-            "case delete via {via}: a deleted group must be gone, got {status} / {body:?}"
+            "case delete in {region}: a deleted group must be gone, got {status} / {body:?}"
         );
 
         // The policy went with it.
-        let (status, body) = call(
+        let (status, body) = call_in(
             &router,
+            region,
             "GET",
-            &format!("/investigationGroups/{}/policy", label(&identifier)),
+            &format!("/investigationGroups/{}/policy", label(arn)),
             None,
         )
         .await;
         assert_eq!(
             status, 404,
-            "case delete via {via}: the policy must go with the group, got {status} / {body:?}"
+            "case delete in {region}: the policy must go with the group, got {status} / {body:?}"
         );
 
         // And a second delete of the same identifier is a 404, not a second success.
-        let (status, body) = call(
+        let (status, body) = call_in(
             &router,
+            region,
             "DELETE",
-            &format!("/investigationGroups/{}", label(&identifier)),
+            &format!("/investigationGroups/{}", label(arn)),
             None,
         )
         .await;
         assert_eq!(
             status, 404,
-            "case delete via {via}: deleting twice must 404, got {status} / {body:?}"
+            "case delete in {region}: deleting twice must 404, got {status} / {body:?}"
+        );
+
+        // The Region's listing is empty again, and its one slot is free.
+        let (_, listed) = call_in(&router, region, "GET", "/investigationGroups", None).await;
+        assert_eq!(
+            listed.get("investigationGroups").and_then(Value::as_array),
+            Some(&vec![]),
+            "case delete in {region}: the Region must list nothing, got {listed:?}"
         );
     }
 
-    let (status, body) = call(&router, "GET", "/investigationGroups", None).await;
+    // The undeleted group is untouched, and still the only one its Region lists.
+    let (survivor_region, survivor_arn) = &groups[2];
+    let (status, body) = call_in(
+        &router,
+        survivor_region,
+        "GET",
+        "/investigationGroups",
+        None,
+    )
+    .await;
     assert_eq!(status, 200, "list after deletes failed with {body:?}");
     let listed: Vec<&str> = body["investigationGroups"]
         .as_array()
@@ -1096,57 +1220,80 @@ async fn delete_removes_the_group_from_every_reader() {
         vec!["survivor"],
         "only the undeleted group may remain, got {body:?}"
     );
+    let (status, _) = get_in(&router, survivor_region, survivor_arn).await;
+    assert_eq!(status, 200, "the survivor must still read back");
 
-    // The name a delete freed can be taken again, and gets a NEW id.
-    let reborn = create_ok(&router, &json!({ "name": names[0], "roleArn": ROLE_ARN })).await;
+    // The Region a delete emptied takes a new group, which gets a NEW id.
+    let (reborn_region, deleted_arn) = &groups[0];
+    let reborn = create_ok(
+        &router,
+        reborn_region,
+        &json!({ "name": names[0], "roleArn": ROLE_ARN }),
+    )
+    .await;
     assert_ne!(
-        reborn, arns[0],
+        &reborn, deleted_arn,
         "a recreated group must get a fresh id, got the deleted one's ARN back"
     );
 }
 
+/// A group's name is not its identity: the Region is. The same name may be used in
+/// another Region, where it names a DIFFERENT group with its own ARN, and neither
+/// group's Region lists the other.
 #[tokio::test]
-async fn a_name_already_in_use_is_a_conflict() {
+async fn the_same_name_in_another_region_is_a_different_group() {
     let router = emulator();
-    let first = create_ok(
-        &router,
-        &json!({ "name": "only-once", "roleArn": ROLE_ARN }),
-    )
-    .await;
+    let name = "shared-across-regions";
 
-    let (status, body) = create(
-        &router,
-        &json!({ "name": "only-once", "roleArn": ROLE_ARN, "retentionInDays": 30 }),
-    )
-    .await;
-    assert_eq!(
-        status, 409,
-        "a duplicate name must be refused, got {status} / {body:?}"
-    );
-    assert_eq!(
-        error_code(&body),
-        "ConflictException",
-        "a duplicate name must be a ConflictException, got {body:?}"
-    );
+    let mut created = Vec::new();
+    for index in 0..3 {
+        let region = region(index);
+        let arn = create_ok(
+            &router,
+            &region,
+            &json!({ "name": name, "roleArn": ROLE_ARN, "retentionInDays": 7 + index as i64 }),
+        )
+        .await;
+        created.push((region, arn));
+    }
 
-    // The refused create stored nothing: the original is untouched and alone.
-    let (_, listed) = call(&router, "GET", "/investigationGroups", None).await;
-    assert_eq!(
-        listed["investigationGroups"].as_array().map(Vec::len),
-        Some(1),
-        "a refused create must not store a group, got {listed:?}"
-    );
-    let (_, group) = get(&router, "only-once").await;
-    assert_eq!(
-        group.get("arn").and_then(Value::as_str),
-        Some(first.as_str()),
-        "the surviving group must be the first one, got {group:?}"
-    );
-    assert_eq!(
-        group.get("retentionInDays").and_then(Value::as_i64),
-        Some(90),
-        "the refused create must not have altered the original, got {group:?}"
-    );
+    for (index, (region, arn)) in created.iter().enumerate() {
+        // Each is its own resource, carrying what its own create stored.
+        let (status, body) = get_in(&router, region, arn).await;
+        assert_eq!(
+            status, 200,
+            "case {region}: expected 200, got {status} / {body:?}"
+        );
+        assert_eq!(
+            body.get("retentionInDays").and_then(Value::as_i64),
+            Some(7 + index as i64),
+            "case {region}: each same-named group keeps its own configuration, got {body:?}"
+        );
+
+        // And no other Region's ARN resolves in it.
+        for (other_region, other_arn) in &created {
+            if other_region == region {
+                continue;
+            }
+            assert_ne!(
+                arn, other_arn,
+                "case {region}: two Regions' groups must not share an ARN"
+            );
+        }
+
+        let (_, listed) = call_in(&router, region, "GET", "/investigationGroups", None).await;
+        let arns: Vec<&str> = listed["investigationGroups"]
+            .as_array()
+            .expect("investigationGroups")
+            .iter()
+            .filter_map(|item| item.get("arn").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            arns,
+            vec![arn.as_str()],
+            "case {region}: a Region lists only its own group, got {listed:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1155,7 +1302,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused() {
 
     // Rows: each published bound of the modelled `retentionInDays` range (7..90) and
     // one step past it, a missing required member, both patterned members, and the
-    // `EncryptionConfigurationType` value set.
+    // `EncryptionConfigurationType` value set. Each accepted row needs its own Region.
     let cases: Vec<(&str, Value, u16)> = vec![
         ("retention one below the low bound", json!({ "name": "r6", "roleArn": ROLE_ARN, "retentionInDays": 6 }), 400),
         ("retention at the low bound", json!({ "name": "r7", "roleArn": ROLE_ARN, "retentionInDays": 7 }), 201),
@@ -1179,8 +1326,8 @@ async fn a_value_outside_a_modelled_constraint_is_refused() {
         ),
     ];
 
-    for (case, body, want_status) in cases {
-        let (status, answer) = create(&router, &body).await;
+    for (index, (case, body, want_status)) in cases.into_iter().enumerate() {
+        let (status, answer) = create(&router, &region(index), &body).await;
         assert_eq!(
             status, want_status,
             "case {case:?}: expected {want_status}, got {status} / {answer:?}"

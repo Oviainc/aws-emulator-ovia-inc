@@ -12,6 +12,9 @@
 //! that has no document to remove is a modelled `ResourceNotFoundException`, naming
 //! the GROUP when no group matches `{identifier}` and the POLICY when the group
 //! exists while carrying none.
+//!
+//! An account holds ONE investigation group per Region, so every row below that needs
+//! its own group signs for its own Region ([`region`]).
 
 use std::sync::Arc;
 
@@ -19,8 +22,29 @@ use serde_json::{json, Value};
 use service_com_amazonaws_aiops_aiops::state;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every request below signs for.
+/// The region a case signs for when it only needs one.
 const REGION: &str = "us-west-2";
+
+/// Regions the rows that each need their own group sign for, in order.
+const REGIONS: &[&str] = &[
+    "us-west-2",
+    "us-east-1",
+    "eu-central-1",
+    "eu-west-2",
+    "ap-southeast-1",
+    "ap-northeast-1",
+];
+
+/// The Region row `n` signs for.
+///
+/// An account holds one investigation group per Region, so a row that needs its own
+/// group needs its own Region. The names are real AWS Regions; past the list they are
+/// synthetic ones inside what a SigV4 credential scope admits (`[a-zA-Z0-9-]`).
+fn region(n: usize) -> String {
+    REGIONS
+        .get(n)
+        .map_or_else(|| format!("region-{n:03}"), |name| (*name).to_string())
+}
 
 /// A role ARN that satisfies the modelled `RoleArn` (len 20..2048, `^arn:.*$`).
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/AIOpsAssistantRole";
@@ -36,17 +60,22 @@ fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// A request signed for `aiops` in [`REGION`], the signal the router routes on and
+/// A request signed for `aiops` in `region`, the signal the router routes on and
 /// the handlers read the region and the caller principal from.
-fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes::Bytes> {
+fn request(
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> http::Request<bytes::Bytes> {
     let mut builder = http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", format!("aiops.{REGION}.amazonaws.com"))
+        .header("host", format!("aiops.{region}.amazonaws.com"))
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDAIOPSTEST/20260101/{REGION}/aiops/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDAIOPSTEST/20260101/{region}/aiops/aws4_request, \
                  SignedHeaders=host, Signature=0000"
             ),
         );
@@ -62,13 +91,14 @@ fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes
 
 /// Status, modelled error shape (empty on a success) and parsed body of one call. An
 /// empty body reads as `Value::Null`.
-async fn call(
+async fn call_in(
     router: &MultiServiceRouter,
+    region: &str,
     method: &str,
     uri: &str,
     body: Option<&Value>,
 ) -> (u16, String, Value) {
-    let response = router.dispatch(request(method, uri, body)).await;
+    let response = router.dispatch(request(region, method, uri, body)).await;
     let status = response.status().as_u16();
     let error_type = response
         .headers()
@@ -87,6 +117,17 @@ async fn call(
     (status, error_type, parsed)
 }
 
+/// [`call_in`] in [`REGION`]: every operation below but the create resolves its group
+/// through an ARN, which names its own Region.
+async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> (u16, String, Value) {
+    call_in(router, REGION, method, uri, body).await
+}
+
 /// Percent-encode a value for use as a single `@httpLabel` path segment, which is
 /// what an SDK does: a non-greedy label may not carry a raw `/`.
 fn label(value: &str) -> String {
@@ -100,10 +141,11 @@ fn label(value: &str) -> String {
         .collect()
 }
 
-/// Create a group that must succeed, and answer its ARN.
-async fn create_ok(router: &MultiServiceRouter, name: &str) -> String {
-    let (status, code, created) = call(
+/// Create a group that must succeed in `region`, and answer its ARN.
+async fn create_ok(router: &MultiServiceRouter, region: &str, name: &str) -> String {
+    let (status, code, created) = call_in(
         router,
+        region,
         "POST",
         "/investigationGroups",
         Some(&json!({ "name": name, "roleArn": ROLE_ARN })),
@@ -167,8 +209,8 @@ fn message(body: &Value) -> String {
         .to_string()
 }
 
-/// The id segment of a group ARN — the third identifier form the modelled
-/// `InvestigationGroupIdentifier` admits beside the ARN and the name.
+/// The id segment of a group ARN — a bare form the modelled
+/// `InvestigationGroupIdentifier` admits and which the service resolves no group from.
 fn id_of(arn: &str) -> String {
     arn.rsplit('/')
         .next()
@@ -180,14 +222,14 @@ fn id_of(arn: &str) -> String {
 async fn deleting_a_policy_removes_the_stored_document_and_keeps_the_group() {
     let router = emulator();
 
-    // Rows differ along the policy document and the identifier form the delete
-    // addresses the group by. The documents span the modelled
+    // Rows differ along the policy document. The documents span the modelled
     // `InvestigationGroupPolicyDocument` (len 1..32768, pattern
-    // `^[\u0009\u000A\u000D\u0020-\u00FF]+$`): its one-character minimum, a realistic
-    // policy, one carrying the tab/newline/carriage-return and Latin-1 bytes that
-    // pattern admits, and a long one.
+    // `^[\u0009\u000A\u000D\u0020-\u00FF]+$`) inside what the operation accepts as a
+    // JSON policy document: the smallest object, a realistic policy, one carrying the
+    // tab/newline/carriage-return and Latin-1 bytes that pattern admits, and a long
+    // one. Each row needs its own group, so each signs for its own Region.
     let documents = [
-        "x".to_string(),
+        "{}".to_string(),
         json!({
             "Version": "2008-10-17",
             "Statement": [{
@@ -204,16 +246,11 @@ async fn deleting_a_policy_removes_the_stored_document_and_keeps_the_group() {
 
     for (index, document) in documents.iter().enumerate() {
         let name = format!("delete-policy-{index}");
-        let arn = create_ok(&router, &name).await;
-        let id = id_of(&arn);
-        // The three identifier forms, one per row, cycled over the documents.
-        let (form, identifier) = [
-            ("arn", arn.clone()),
-            ("name", name.clone()),
-            ("id", id.clone()),
-        ][index % 3]
-            .clone();
-        let case = format!("{name} via {form} ({} byte document)", document.len());
+        let arn = create_ok(&router, &region(index), &name).await;
+        // The ARN is the only identifier that resolves the group, so it is what every
+        // call below addresses.
+        let identifier = arn.clone();
+        let case = format!("{name} ({} byte document)", document.len());
 
         let (status, code, put) = put_policy(&router, &arn, document).await;
         assert_eq!(
@@ -253,8 +290,7 @@ async fn deleting_a_policy_removes_the_stored_document_and_keeps_the_group() {
             "case {case}: expected the policy reported absent, got {after:?}"
         );
 
-        // The GROUP survived its policy: it is still readable, and its name is still
-        // taken.
+        // The GROUP survived its policy: it is still readable.
         let (status, code, group) = call(
             &router,
             "GET",
@@ -312,11 +348,15 @@ async fn deleting_a_policy_that_is_not_there_is_the_absent_resource_it_names() {
         "the two conditions must be distinguishable, got {group_absent:?} for both"
     );
 
-    // Rows: identifier forms that resolve to no group at all — the bare name form, the
-    // bare id form, and ARNs that differ from a stored one in exactly one field.
-    let arn = create_ok(&router, "policy-bearer").await;
+    // Rows: identifiers that resolve to no group at all — the bare name and bare id
+    // forms (which the service resolves nothing from even when a group carries them),
+    // a label nothing carries, and ARNs that differ from a stored one in exactly one
+    // field.
+    let arn = create_ok(&router, REGION, "policy-bearer").await;
     let id = id_of(&arn);
     for (form, identifier) in [
+        ("the group's own name", "policy-bearer".to_string()),
+        ("the group's own bare id", id.clone()),
         ("a name no group carries", "no-such-group".to_string()),
         ("an id no group carries", "A".repeat(16)),
         (
@@ -355,12 +395,9 @@ async fn deleting_a_policy_that_is_not_there_is_the_absent_resource_it_names() {
     }
 
     // Rows: a group that exists and carries no document — never put, and already
-    // deleted — reports the POLICY absent instead, addressed in each identifier form.
-    for (form, identifier) in [
-        ("arn", arn.clone()),
-        ("name", "policy-bearer".to_string()),
-        ("id", id.clone()),
-    ] {
+    // deleted — reports the POLICY absent instead, addressed by the ARN that resolves
+    // it.
+    for (form, identifier) in [("arn", arn.clone())] {
         let case = format!("never put, via {form}");
         let (status, code, body) = delete_policy(&router, &identifier).await;
         assert_eq!(
@@ -428,22 +465,23 @@ async fn deleting_one_policy_leaves_every_other_groups_policy_alone() {
     let router = emulator();
 
     // Rows: several groups each carrying their own document, so what the delete
-    // removes is keyed to the ONE record it resolved and not to the path.
+    // removes is keyed to the ONE record it resolved and not to the path. An account
+    // holds one group per Region, so each peer lives in its own Region.
     let names = ["peer-one", "peer-two", "peer-three", "peer-four"];
     let mut groups = Vec::new();
-    for name in names {
-        let arn = create_ok(&router, name).await;
+    for (index, name) in names.iter().enumerate() {
+        let arn = create_ok(&router, &region(index), name).await;
         let document = format!("{{\"Sid\":\"{name}\"}}");
         let (status, code, put) = put_policy(&router, &arn, &document).await;
         assert_eq!(
             status, 200,
             "case {name}: expected 200 from the put, got {status} / {code} / {put:?}"
         );
-        groups.push((name, arn, document));
+        groups.push((*name, arn, document));
     }
 
-    // Delete the second group's policy, addressed by its bare name.
-    let (status, code, body) = delete_policy(&router, names[1]).await;
+    // Delete the second group's policy, addressed by its ARN.
+    let (status, code, body) = delete_policy(&router, &groups[1].1).await;
     assert_eq!(
         status, 200,
         "deleting {}'s policy: expected 200, got {status} / {code} / {body:?}",
