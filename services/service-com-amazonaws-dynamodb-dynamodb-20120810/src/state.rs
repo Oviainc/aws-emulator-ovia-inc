@@ -47,6 +47,18 @@ pub const STATUS_TRANSITION: Duration = Duration::from_millis(500);
 /// Amazon DynamoDB Developer Guide: "The maximum item size in DynamoDB is 400 KB").
 pub const MAX_ITEM_SIZE_BYTES: i64 = 400 * 1024;
 
+/// The most data ONE page of a read that pages carries, 1 MB — the documented
+/// dataset limit of a `Query` ("A single Query operation can retrieve a maximum of 1
+/// MB of data" — `Query$Limit` and "Paginating table query results") and of a `Scan`
+/// ("If the total size of scanned items exceeds the maximum dataset size limit of 1
+/// MB, the scan completes and results are returned to the user" — the `Scan` doc).
+///
+/// A page that stops here reports a `LastEvaluatedKey`, so the caller pages on and
+/// one request cannot amplify into a response the size of a table. It lives here
+/// because it is a property of this STORE rather than of either operation, so the two
+/// readers cannot drift apart.
+pub const MAX_PAGE_BYTES: i64 = 1024 * 1024;
+
 /// How a write of an item past [`MAX_ITEM_SIZE_BYTES`] is refused: AWS's FIXED
 /// sentence for that quota ("Item size has exceeded the maximum allowed size" —
 /// the Developer Guide's "Error handling" entry for `ValidationException`), with

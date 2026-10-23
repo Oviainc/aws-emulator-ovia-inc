@@ -2086,7 +2086,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::RDS::DBInstance",
     "AWS::RUM::AppMonitor",
     S3_BUCKET,
-    "AWS::SNS::Topic",
+    SNS_TOPIC,
     SQS_QUEUE,
     "AWS::SecretsManager::Secret",
     "AWS::Transfer::Server",
@@ -2124,8 +2124,12 @@ fn return_values(
     let properties = &declared.properties;
     let mut attributes = BTreeMap::new();
     match resource_type {
-        // "Ref returns the topic ARN"; Fn::GetAtt: TopicArn, TopicName.
-        "AWS::SNS::Topic" => {
+        // "Ref returns the topic ARN"; Fn::GetAtt: TopicArn, TopicName. This is the type
+        // `super::provisioning` creates in Amazon SNS itself, which then answers with the
+        // topic's own ARN — the same ARN this computes, since both are built from the one
+        // account id this emulator mints and the topic's name, which is how SNS keys a
+        // topic (`topic_arn` in its own state module).
+        SNS_TOPIC => {
             let arn = ::emulator_server::emulator_arn("sns", region, name);
             attributes.insert("TopicArn".to_string(), arn.clone());
             attributes.insert("TopicName".to_string(), name.to_string());
@@ -2726,6 +2730,10 @@ pub const S3_BUCKET: &str = "AWS::S3::Bucket";
 /// The same for an Amazon SQS queue: the SQS model carries
 /// `awsService.cloudFormationName: SQS`.
 pub const SQS_QUEUE: &str = "AWS::SQS::Queue";
+
+/// The same for an Amazon SNS topic: the SNS model carries
+/// `awsService.cloudFormationName: SNS`.
+pub const SNS_TOPIC: &str = "AWS::SNS::Topic";
 
 /// The `AWS::ECR::PublicRepository` resource type: an Amazon ECR Public repository.
 ///

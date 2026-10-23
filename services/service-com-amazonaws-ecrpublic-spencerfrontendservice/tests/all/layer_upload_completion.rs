@@ -8,10 +8,11 @@
 //! `sha256` digest the registry computes over those bytes — reported back as
 //! `layerDigest` beside the registry, repository and upload the request named — and
 //! `BatchCheckLayerAvailability` then answers every requested digest from that committed
-//! set: one this repository holds is `AVAILABLE` with the layer's byte count, a
-//! well-formed one it does not hold is a `MissingLayerDigest` failure, and one that is not
-//! of the `<algorithm>:<hex>` form the model's `LayerDigest` declares is an
-//! `InvalidLayerDigest` failure. An upload that received no part commits nothing and is
+//! set: a digest of the `<algorithm>:<hex>` form the model's `LayerDigest` declares
+//! addresses a layer, so it is answered with a layer — `AVAILABLE` with the layer's byte
+//! count when this repository holds it and `UNAVAILABLE` when it does not — while an
+//! entry outside that form addresses no layer and is an `InvalidLayerDigest` failure. An
+//! upload that received no part commits nothing and is
 //! refused with `EmptyUploadException`; so is a completion whose requested digests name a
 //! different layer (`InvalidLayerException`), one against a layer the repository already
 //! holds (`LayerAlreadyExistsException`), and one naming an upload, repository or registry
@@ -342,13 +343,14 @@ async fn completing_an_upload_commits_the_layer_its_parts_carried() {
     .await;
     assert_eq!(
         reported_layers(&report, case),
-        Vec::new(),
-        "case {case:?}: a differently cased algorithm names no held layer, got {report}"
+        vec![(other_algorithm, "UNAVAILABLE".to_string(), None)],
+        "case {case:?}: a differently cased algorithm names no held layer, so that layer is \
+         reported unavailable, got {report}"
     );
     assert_eq!(
         reported_failures(&report, case),
-        vec![(other_algorithm, "MissingLayerDigest".to_string())],
-        "case {case:?}: it is reported missing rather than available, got {report}"
+        Vec::new(),
+        "case {case:?}: the entry addresses a layer, so it is no failure, got {report}"
     );
 }
 
@@ -415,17 +417,21 @@ async fn an_upload_with_no_parts_is_refused_as_empty_and_commits_nothing() {
             "case {case:?}: expected {expected:?}, got {actual:?}"
         );
 
-        // Nothing entered the layer set: every claimed digest is still missing.
+        // Nothing entered the layer set: every claimed digest is still unavailable.
         let report = availability(&router, repository, &claimed, case).await;
         assert_eq!(
             reported_layers(&report, case),
-            Vec::new(),
+            claimed
+                .iter()
+                .map(|digest| (digest.clone(), "UNAVAILABLE".to_string(), None))
+                .collect::<Vec<_>>(),
             "case {case:?}: a refused completion commits no layer, got {report}"
         );
         assert_eq!(
             reported_failures(&report, case).len(),
-            claimed.len(),
-            "case {case:?}: every claimed digest is missing, got {report}"
+            0,
+            "case {case:?}: every claimed digest addresses a layer, so none is a failure, \
+             got {report}"
         );
 
         // The upload is still open: it is the client's parts that are missing, not the
@@ -522,7 +528,7 @@ async fn a_completion_that_names_another_layer_is_refused_as_an_invalid_layer() 
             availability(&router, &repository, std::slice::from_ref(&truth), case).await;
         assert_eq!(
             reported_layers(&report, case),
-            Vec::new(),
+            vec![(truth.clone(), "UNAVAILABLE".to_string(), None)],
             "case {case:?}: a refused completion commits no layer, got {report}"
         );
     }
@@ -706,10 +712,10 @@ async fn a_completion_is_scoped_to_the_upload_repository_and_registry_it_names()
     }
 }
 
-/// The layer report answers EVERY requested digest, in request order, splitting them
-/// between the two output members: a digest this repository holds is `AVAILABLE` with its
-/// size, a well-formed one it does not hold is `MissingLayerDigest`, and one that is not of
-/// the `<algorithm>:<hex>` form the model declares is `InvalidLayerDigest`.
+/// The layer report answers EVERY requested digest, in request order: a digest of the
+/// modelled `<algorithm>:<hex>` form is a layer — `AVAILABLE` with its size when this
+/// repository holds it and `UNAVAILABLE` when it does not — and only an entry outside
+/// that form is a failure, `InvalidLayerDigest`.
 #[tokio::test]
 async fn the_layer_report_answers_every_requested_digest_in_request_order() {
     let (router, _engine) = service_with_engine();
@@ -778,7 +784,7 @@ async fn the_layer_report_answers_every_requested_digest_in_request_order() {
         "case {case:?}: a held digest is no failure, got {report}"
     );
 
-    // A mixed batch: held, missing and malformed digests together.
+    // A mixed batch: held, unheld and malformed digests together.
     let mut requested = vec![held_small.clone(), missing.clone()];
     requested.extend(malformed.iter().map(ToString::to_string));
     requested.push(held_large.clone());
@@ -787,24 +793,23 @@ async fn the_layer_report_answers_every_requested_digest_in_request_order() {
         reported_layers(&report, case),
         vec![
             (held_small.clone(), "AVAILABLE".to_string(), Some(16)),
+            (missing.clone(), "UNAVAILABLE".to_string(), None),
             (held_large.clone(), "AVAILABLE".to_string(), Some(4096)),
         ],
-        "case {case:?}: only the held digests are layers, got {report}"
+        "case {case:?}: every digest addressing a layer is a layer entry, got {report}"
     );
-    let mut expected_failures = vec![(missing.clone(), "MissingLayerDigest".to_string())];
-    expected_failures.extend(
-        malformed
-            .iter()
-            .map(|digest| ((*digest).to_string(), "InvalidLayerDigest".to_string())),
-    );
+    let expected_failures: Vec<(String, String)> = malformed
+        .iter()
+        .map(|digest| ((*digest).to_string(), "InvalidLayerDigest".to_string()))
+        .collect();
     assert_eq!(
         reported_failures(&report, case),
         expected_failures,
-        "case {case:?}: each unheld digest reports its own failure code, got {report}"
+        "case {case:?}: only an entry addressing no layer is a failure, got {report}"
     );
 
     // The report is about one repository's layers: a second repository holding nothing
-    // reports the same digests as missing.
+    // reports the same digests as unavailable.
     let empty = "reported-empty";
     given_repository(&router, case, empty).await;
     let report = availability(
@@ -816,16 +821,16 @@ async fn the_layer_report_answers_every_requested_digest_in_request_order() {
     .await;
     assert_eq!(
         reported_layers(&report, case),
-        Vec::new(),
+        vec![
+            (held_small, "UNAVAILABLE".to_string(), None),
+            (held_large, "UNAVAILABLE".to_string(), None),
+        ],
         "case {case:?}: another repository holds no layer of its own, got {report}"
     );
     assert_eq!(
         reported_failures(&report, case),
-        vec![
-            (held_small, "MissingLayerDigest".to_string()),
-            (held_large, "MissingLayerDigest".to_string()),
-        ],
-        "case {case:?}: every digest is missing from a repository with no layers, got {report}"
+        Vec::new(),
+        "case {case:?}: every entry addresses a layer, so none is a failure, got {report}"
     );
 }
 
@@ -878,12 +883,12 @@ async fn the_layer_report_refuses_a_repository_or_registry_that_is_not_there() {
         );
     }
 
-    // Both naming legs correct: the report answers, with the digest missing.
+    // Both naming legs correct: the report answers, with the layer unavailable.
     let report =
         availability(&router, "report-scope", std::slice::from_ref(&digest), case).await;
     assert_eq!(
-        reported_failures(&report, case),
-        vec![(digest, "MissingLayerDigest".to_string())],
-        "case {case:?}: a repository with no layers reports the digest missing, got {report}"
+        reported_layers(&report, case),
+        vec![(digest, "UNAVAILABLE".to_string(), None)],
+        "case {case:?}: a repository with no layers reports the layer unavailable, got {report}"
     );
 }

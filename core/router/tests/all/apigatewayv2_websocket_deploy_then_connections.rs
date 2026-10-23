@@ -226,10 +226,14 @@ fn a_websocket_api_deploys_and_its_connections_endpoint_serves_the_registry() {
                     )
                     .await;
                     let api_id = as_str(row.case, "CreateApi", &created, "apiId");
+                    // Every row is a WEBSOCKET api, so its `ApiEndpoint` is the URI a
+                    // WebSocket client library opens: the RFC 6455 scheme `wss` on the
+                    // api's own execute-api host. The `@connections` management
+                    // endpoint below is a separate, HTTPS control surface.
                     assert_eq!(
                         created.get("apiEndpoint").and_then(Value::as_str),
                         Some(
-                            format!("https://{api_id}.execute-api.{REGION}.amazonaws.com").as_str()
+                            format!("wss://{api_id}.execute-api.{REGION}.amazonaws.com").as_str()
                         ),
                         "case {:?}: the api must report its own execute-api endpoint, got {created}",
                         row.case

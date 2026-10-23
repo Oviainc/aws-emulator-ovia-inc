@@ -89,9 +89,7 @@ fn bad_request(detail: String) -> TagResourceError {
 /// [`crate::state`] lookup and refuse an unresolvable one the same way.
 fn not_found(resource_arn: &str) -> TagResourceError {
     TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!(
-            "No AppConfig resource is addressed by {resource_arn}."
-        )),
+        message: Some(crate::state::resource_arn_not_found(resource_arn)),
         resource_name: Some(resource_arn.to_string()),
     })
     .into()

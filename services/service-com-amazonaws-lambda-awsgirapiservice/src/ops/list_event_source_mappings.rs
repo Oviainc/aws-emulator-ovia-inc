@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEventSourceMappings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEventSourceMappings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEventSourceMappings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages through the event source mappings [`crate::state`] holds, in UUID order, so a
+//! marker always continues from where the previous page ended, narrowed to one event
+//! source or one function when the request names one.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +158,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEventSourceMappings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEventSourceMappingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEventSourceMappings"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEventSourceMappingsErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The model declares `MaxItems` as `@range(min: 1, max: 10000)`, so the boundary
+        // validator has already refused anything outside it; this handler enforces the
+        // same floor itself rather than letting a page size of zero reach the pagination
+        // arithmetic below.
+        if let Some(requested) = input.max_items.filter(|requested| *requested < 1) {
+            return Err(invalid_parameter(format!(
+                "1 validation error detected: Value '{requested}' at 'maxItems' failed to \
+                 satisfy constraint: Member must have value greater than or equal to 1"
+            )));
+        }
+        // "Note that ListEventSourceMappings returns a maximum of 100 items in each
+        // response, even if you set the number higher."
+        let page_size = input
+            .max_items
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(crate::state::MAX_EVENT_SOURCE_MAPPING_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_EVENT_SOURCE_MAPPING_PAGE_SIZE);
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        store.materialize_all(now);
+
+        // "The name or ARN of the Lambda function": the filter names one function, so it
+        // resolves exactly the way every other operation on this service resolves a
+        // `FunctionName`, and a value naming no stored function is answered with the
+        // modelled not-found rather than an empty page.
+        let function_filter = match input.function_name.as_deref() {
+            Some(function_name) => {
+                let (record, version) = match crate::state::resolve_function(
+                    &mut store,
+                    function_name,
+                    None,
+                    &region,
+                    now,
+                ) {
+                    Ok(resolved) => resolved,
+                    Err(crate::state::ResolveFailure::Malformed(message)) => {
+                        return Err(invalid_parameter(message))
+                    }
+                    Err(crate::state::ResolveFailure::NotFound(message)) => {
+                        return Err(
+                            ListEventSourceMappingsErrorModeled::ResourceNotFoundException(
+                                ResourceNotFoundException {
+                                    r#type: None,
+                                    message: Some(message),
+                                },
+                            )
+                            .into(),
+                        )
+                    }
+                };
+                let name = record.config.name.clone();
+                // An unqualified reference names the function, so it matches every
+                // mapping of it; `$LATEST` is the function itself rather than one version
+                // or alias of it.
+                let qualifier =
+                    (version != crate::state::VERSION_LATEST).then(|| version.clone());
+                Some((name, qualifier))
+            }
+            None => None,
+        };
+
+        // "Specify an EventSourceArn to show only event source mappings for a single
+        // event source": the filter is the event source itself, so it matches the ARN the
+        // mapping was created against.
+        let event_source_filter = input.event_source_arn.as_deref();
+
+        let entries: Vec<&crate::state::EventSourceMappingRecord> = store
+            .event_source_mappings
+            .values()
+            .filter(|mapping| {
+                event_source_filter
+                    .is_none_or(|arn| mapping.event_source_arn.as_deref() == Some(arn))
+            })
+            .filter(|mapping| {
+                function_filter.as_ref().is_none_or(|(name, qualifier)| {
+                    mapping.is_of_function(name, qualifier.as_deref())
+                })
+            })
+            .collect();
+
+        // The store keys a mapping by its UUID, so iterating it yields the entries in one
+        // stable order. The marker is the UUID of the last entry the previous page
+        // returned, so the next page starts at the first entry ordered after it and no
+        // entry is ever reported twice.
+        let start = match input.marker.as_deref() {
+            Some(marker) => entries
+                .iter()
+                .position(|mapping| mapping.uuid.as_str() > marker)
+                .unwrap_or(entries.len()),
+            None => 0,
+        };
+        let page = match entries.get(start..) {
+            Some(remaining) => &remaining[..page_size.min(remaining.len())],
+            None => &[][..],
+        };
+        let truncated = start + page.len() < entries.len();
+
+        Ok(ListEventSourceMappingsOutput {
+            event_source_mappings: Some(
+                page.iter()
+                    .map(|mapping| mapping.listed())
+                    .collect(),
+            ),
+            // "A pagination token that's returned when the response doesn't contain all
+            // event source mappings" — so it is absent on the last page, and it is the
+            // UUID of the last entry THIS page reported, which is what the next page
+            // continues after.
+            next_marker: page
+                .last()
+                .filter(|_| truncated)
+                .map(|mapping| mapping.uuid.clone()),
+        })
     }
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> ListEventSourceMappingsError {
+    ListEventSourceMappingsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
 }

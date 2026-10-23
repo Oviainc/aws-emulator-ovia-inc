@@ -220,9 +220,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 });
             }
+            // An event source mapping is the other taggable resource this store holds —
+            // `CreateEventSourceMapping` persists "a list of tags to apply to the event
+            // source mapping" — so its tag set is reported out of its own record too.
+            crate::state::TaggableResourceRef::EventSourceMapping(uuid) => {
+                let store = state.lock();
+                let Some(record) = store.event_source_mappings.get(&uuid) else {
+                    return Err(ListTagsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            r#type: None,
+                            message: Some(format!(
+                                "The resource you requested does not exist: no event source \
+                                 mapping is held for '{}'",
+                                input.resource
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                return Ok(ListTagsOutput {
+                    tags: Some(
+                        record
+                            .tags
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect(),
+                    ),
+                });
+            }
             // A taggable Lambda resource of another type. This store holds records of
-            // functions and capacity providers only — every operation that would mint a
-            // code-signing configuration, an event source mapping or a network
+            // functions, capacity providers and event source mappings only — every
+            // operation that would mint a code-signing configuration or a network
             // connector is still a scaffold — so no resource of that type exists to
             // report tags for, which is what the modelled not-found answers. See
             // [`crate::state::parse_taggable_resource`]: whoever implements one of

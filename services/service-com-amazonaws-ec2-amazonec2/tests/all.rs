@@ -23,6 +23,8 @@ mod associate_address;
 mod availability_zones;
 #[path = "all/byoip_cidr_lifecycle.rs"]
 mod byoip_cidr_lifecycle;
+#[path = "all/byoip_cidrs.rs"]
+mod byoip_cidrs;
 #[path = "all/capacity_block_offerings.rs"]
 mod capacity_block_offerings;
 #[path = "all/capacity_blocks.rs"]

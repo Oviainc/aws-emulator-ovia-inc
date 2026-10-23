@@ -346,8 +346,8 @@ async fn update_application_refuses_a_value_past_a_modelled_bound_without_writin
             String::from_utf8_lossy(&refused.body)
         );
         assert!(
-            refused.error_code().contains("ValidationException"),
-            "case {case:?}: expected ValidationException, got {:?}",
+            refused.error_code().contains("BadRequestException"),
+            "case {case:?}: expected the modelled BadRequestException, got {:?}",
             refused.error_code()
         );
         assert_round_trip(&router, case, &id, &expected).await;
