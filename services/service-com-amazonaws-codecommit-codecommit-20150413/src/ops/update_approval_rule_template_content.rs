@@ -6,6 +6,11 @@
 //! SHA-256 signature of the content the caller believes is stored, and reports the
 //! stored template as it now is.
 //!
+//! The replacement is stored CANONICALIZED exactly as a created template's content
+//! is (see [`crate::state::canonical_json_document`]): minified, with member order
+//! and literals preserved, so an update cannot leave a template in a serialization
+//! `CreateApprovalRuleTemplate` would never have stored.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -279,9 +284,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The content replaces what was stored; every other field of the template —
-        // its id, name, description and creation date — is untouched, and the change
-        // is attributed to this caller at this instant.
+        // The content replaces what was stored, canonicalized the way a created
+        // template's content is; every other field of the template — its id, name,
+        // description and creation date — is untouched, and the change is attributed
+        // to this caller at this instant.
         template.replace_content(
             input.new_rule_content.clone(),
             crate::state::caller_identity_arn(ctx.parts()),

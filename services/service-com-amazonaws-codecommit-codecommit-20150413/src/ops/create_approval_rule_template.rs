@@ -9,6 +9,12 @@
 //! not one is refused with the modelled
 //! `InvalidApprovalRuleTemplateContentException` — no template is created.
 //!
+//! The accepted document is stored CANONICALIZED, not as the caller formatted it
+//! (see [`crate::state::canonical_json_document`]): minified, with member order and
+//! literals preserved. So this response, `GetApprovalRuleTemplate` and
+//! `ruleContentSha256` all report the same bytes for one document however its
+//! submitter indented it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -280,6 +286,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The record canonicalizes the document as it takes it: nothing downstream
+        // sees the submitted formatting.
         let template = crate::state::ApprovalRuleTemplateRecord::new(
             &input.approval_rule_template_name,
             input.approval_rule_template_content.clone(),

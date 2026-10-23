@@ -453,7 +453,13 @@ struct TemplateCase {
     label: &'static str,
     name: String,
     description: Option<String>,
+    /// The content as submitted.
     content: String,
+    /// The content the service stores and reports: the submitted document
+    /// canonicalized to minified JSON. Equal to `content` for every row written
+    /// minified already; the canonicalization itself is pinned by
+    /// `tests/all/approval_rule_template_content_canonicalization.rs`.
+    stored: String,
 }
 
 /// The table. Rows differ along what the rule generalises over: name length (the
@@ -474,17 +480,19 @@ fn template_cases() -> Vec<TemplateCase> {
         ],
     })
     .to_string();
-    let pretty = serde_json::to_string_pretty(&json!({
+    let pretty_document = json!({
         "Version": TEMPLATE_VERSION,
         "Statements": [{ "Type": STATEMENT_TYPE, "NumberOfApprovalsNeeded": 2 }],
-    }))
-    .expect("the document serializes");
+    });
+    let pretty =
+        serde_json::to_string_pretty(&pretty_document).expect("the document serializes");
     vec![
         TemplateCase {
             label: "a one-character name and the minimal document",
             name: "t".to_string(),
             description: None,
             content: minimal_content(),
+            stored: minimal_content(),
         },
         TemplateCase {
             label: "an ordinary name, a description and an approval pool",
@@ -498,24 +506,37 @@ fn template_cases() -> Vec<TemplateCase> {
                 ],
                 &["refs/heads/main"],
             ),
+            stored: template_content(
+                2,
+                &[
+                    "arn:aws:iam::111122223333:user/reviewer",
+                    "arn:aws:sts::111122223333:assumed-role/Review/*",
+                ],
+                &["refs/heads/main"],
+            ),
         },
         TemplateCase {
             label: "the longest name and an empty description",
             name: "n".repeat(100),
             description: Some(String::new()),
             content: template_content(1, &["arn:aws:iam::111122223333:user/one"], &[]),
+            stored: template_content(1, &["arn:aws:iam::111122223333:user/one"], &[]),
         },
         TemplateCase {
             label: "the longest description and several statements",
             name: "many-statements".to_string(),
             description: Some("d".repeat(1000)),
-            content: many_statements,
+            content: many_statements.clone(),
+            stored: many_statements,
         },
         TemplateCase {
             label: "the document written as pretty JSON",
             name: "pretty.document-1".to_string(),
             description: None,
             content: pretty,
+            // Stored minified: the service canonicalizes the document rather than
+            // echoing the submitted indentation.
+            stored: pretty_document.to_string(),
         },
     ]
 }
@@ -545,13 +566,13 @@ async fn a_created_approval_rule_template_is_read_back_from_state() {
         );
         assert_eq!(
             string_at(template, "/approvalRuleTemplateContent"),
-            case.content,
-            "case {label:?}: the content is stored byte for byte"
+            case.stored,
+            "case {label:?}: the content is stored in its canonical minified form"
         );
         assert_eq!(
             string_at(template, "/ruleContentSha256"),
-            content_sha256(&case.content),
-            "case {label:?}: ruleContentSha256 is the digest of the content"
+            content_sha256(&case.stored),
+            "case {label:?}: ruleContentSha256 is the digest of the stored content"
         );
         let id = string_at(template, "/approvalRuleTemplateId");
         assert!(
