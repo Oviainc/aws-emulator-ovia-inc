@@ -17,5 +17,7 @@ mod error_message_rules;
 mod investigation_group_policy_delete;
 #[path = "all/investigation_groups.rs"]
 mod investigation_groups;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

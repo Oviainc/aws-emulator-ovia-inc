@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the request's key-value pairs on the investigation group `{resourceArn}`
+//! names, adding to the tags it already carries and overwriting the value of a key it
+//! already has; `ResourceNotFoundException` when nothing matches.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +146,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Every tag key's and value's length and pattern is a modelled constraint the
+        // centralized walk has already refused anything outside of. The `Tags` map
+        // carries NO modelled length, so its bound is checked here — on the map this
+        // request sent, and then on the set the resource ends up with.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the investigation group store is unavailable".to_string()),
+            })
+        })?;
+
+        let too_large = |why: String| {
+            TagResourceError::from(TagResourceErrorModeled::ValidationException(
+                ValidationException { message: Some(why) },
+            ))
+        };
+        if let Some(why) = crate::state::collection_bounds_rejection(Some(&input.tags), None, None)
+        {
+            return Err(too_large(why));
+        }
+
+        let mut store = state.lock();
+        // `resourceArn` is the `InvestigationGroup` resource's `identifier` (this
+        // operation's modelled `@references` trait), so it resolves exactly the way
+        // every other identifier of this service does.
+        let group = store.group_mut(&input.resource_arn).ok_or_else(|| {
+            TagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::investigation_group_not_found(),
+            )
+        })?;
+
+        // Tagging is additive and per key: a key the resource already carries takes the
+        // new value, every other stored key is left alone. The resulting size is counted
+        // before anything is written, so a request past the cap stores nothing at all.
+        let added = input
+            .tags
+            .keys()
+            .filter(|key| !group.tags.contains_key(*key))
+            .count();
+        if let Some(why) = crate::state::tag_capacity_rejection(group.tags.len() + added) {
+            return Err(too_large(why));
+        }
+        for (key, value) in input.tags {
+            group.tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

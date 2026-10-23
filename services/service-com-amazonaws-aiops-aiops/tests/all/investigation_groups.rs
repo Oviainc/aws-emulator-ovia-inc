@@ -1210,28 +1210,5 @@ async fn a_value_outside_a_modelled_constraint_is_refused() {
     }
 }
 
-#[tokio::test]
-async fn the_remaining_operations_are_still_honest_501s() {
-    let router = emulator();
-    let arn = create_ok(&router, &json!({ "name": "tagged", "roleArn": ROLE_ARN })).await;
-    let resource = label(&arn);
-
-    // These three have their own gap issues; until then they must answer 501, never
-    // an empty 200 a client cannot tell from a real implementation.
-    for (method, uri, body) in [
-        ("GET", format!("/tags/{resource}"), None),
-        (
-            "POST",
-            format!("/tags/{resource}"),
-            Some(json!({ "tags": { "Team": "ops" } })),
-        ),
-        ("DELETE", format!("/tags/{resource}?tagKeys=Team"), None),
-    ] {
-        let (status, answer) = call(&router, method, &uri, body.as_ref()).await;
-        assert_eq!(
-            status, 501,
-            "case {method} {uri:?}: an unimplemented operation must answer 501, \
-             got {status} / {answer:?}"
-        );
-    }
-}
+// The three tagging operations used to be asserted here as honest 501s. They are
+// implemented now, and their end-to-end rules live in `tests/all/resource_tags.rs`.

@@ -515,6 +515,22 @@ pub fn collection_bounds_rejection(
         })
 }
 
+/// Why a resource may not end up carrying `resulting_tags` tags, or `None` when that
+/// many fit.
+///
+/// `TagResource` adds to the tags a resource ALREADY carries, so the cap applies to
+/// the merged set and not just to the map one request sent — the request's own size is
+/// what [`collection_bounds_rejection`] checks. Worded through the same builders, so
+/// the two refusals read alike.
+pub fn tag_capacity_rejection(resulting_tags: usize) -> Option<String> {
+    (resulting_tags > MAX_TAGS).then(|| {
+        validation_message(
+            "tags",
+            &requirement_text(ViolationKind::MaxLength(MAX_TAGS as i64)),
+        )
+    })
+}
+
 /// The id segment of an investigation-group ARN, or `None` when `identifier` is not
 /// an ARN of this service's investigation-group resource.
 pub fn group_id_from_arn(identifier: &str) -> Option<&str> {
