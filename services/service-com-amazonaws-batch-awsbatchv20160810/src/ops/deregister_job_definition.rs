@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterJobDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterJobDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterJobDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves ONE stored job-definition revision to `INACTIVE` in [`crate::state`] and
+//! leaves it stored: AWS documents that "Job definitions are permanently deleted
+//! after 180 days", so deregistering is a STATUS change, not a delete, and
+//! `DescribeJobDefinitions` still reports the revision — with `status` `INACTIVE`,
+//! which is what its `status` filter then selects it by. `SubmitJob` refuses a
+//! definition that is not `ACTIVE`, so a deregistered revision can no longer run.
+//!
+//! The reference resolves the way the member documents it ("The name and revision
+//! (`name:revision`) or full Amazon Resource Name (ARN) of the job definition to
+//! deregister"), and a bare name — carrying no revision — names that definition's
+//! latest revision ([`crate::state::ComAmazonawsBatchAwsbatchv20160810State::job_definition_mut`]).
+//! Because the status is SET rather than toggled, repeating the call leaves the same
+//! revision `INACTIVE` and answers 200 again. A reference no stored revision answers
+//! to is refused with the modelled `ClientException` (HTTP 400), and nothing is
+//! written.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +144,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterJobDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterJobDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterJobDefinition"))
+        use crate::state as batch;
+
+        // `ctx` carries request metadata only; this operation mints no ARN, so it
+        // reads nothing from it.
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(DeregisterJobDefinitionErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // "The name and revision (name:revision) or full Amazon Resource Name (ARN)
+        // of the job definition to deregister" (`jobDefinition`). Resolving straight
+        // to the stored record is what writes the status: there is no second lookup
+        // that could miss and answer 200 having changed nothing.
+        let Some(definition) = store.job_definition_mut(&input.job_definition) else {
+            return Err(DeregisterJobDefinitionErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "Job definition {} does not exist",
+                    input.job_definition
+                )),
+            )
+            .into());
+        };
+        // Deregistering does not delete the revision ("Job definitions are
+        // permanently deleted after 180 days"): it SETS the status, so the revision
+        // stays describable and a repeat of this call is a no-op that answers 200.
+        definition.status = Some(batch::STATUS_INACTIVE.to_string());
+        Ok(DeregisterJobDefinitionOutput {})
     }
 }
+

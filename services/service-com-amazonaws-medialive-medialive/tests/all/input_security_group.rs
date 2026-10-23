@@ -24,7 +24,10 @@ fn wait_for_the_clock() {
 
 /// `CreateInputSecurityGroup`, asserting the 201 the recorded wire response
 /// carries and returning the `SecurityGroup` it reports.
-async fn create_group(router: &MultiServiceRouter, case: &str, body: Value) -> Value {
+///
+/// Shared with the `input_security_group_listing` suite, so the two cannot
+/// disagree about how a group is created.
+pub async fn create_group(router: &MultiServiceRouter, case: &str, body: Value) -> Value {
     let (status, response) = call(router, "POST", "/prod/inputSecurityGroups", Some(body)).await;
     assert_eq!(
         status, 201,
@@ -33,15 +36,18 @@ async fn create_group(router: &MultiServiceRouter, case: &str, body: Value) -> V
     response["securityGroup"].clone()
 }
 
-async fn describe_group(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+/// `DescribeInputSecurityGroup` on one group, as a client calls it. Shared with
+/// the `input_security_group_listing` suite.
+pub async fn describe_group(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "GET", &format!("/prod/inputSecurityGroups/{id}"), None).await
 }
 
 /// `DeleteInputSecurityGroup` on one group, as a client calls it: DELETE on the
 /// group's own path (`smithy_query(query="operation",
 /// operation="DeleteInputSecurityGroup")`: DELETE
-/// /prod/inputSecurityGroups/{InputSecurityGroupId}).
-async fn delete_group(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+/// /prod/inputSecurityGroups/{InputSecurityGroupId}). Shared with the
+/// `input_security_group_listing` suite.
+pub async fn delete_group(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(
         router,
         "DELETE",

@@ -124,9 +124,9 @@ pub const STATE_ENABLED: &str = "ENABLED";
 /// deregistered.
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 
-/// `JobDefinition$status` of a deregistered revision. Named here because
-/// `DescribeJobDefinitions`' `status` filter is matched against stored status values;
-/// `DeregisterJobDefinition` (still a scaffold) is what will set it.
+/// `JobDefinition$status` of a deregistered revision. `DescribeJobDefinitions`'
+/// `status` filter is matched against stored status values, and
+/// `DeregisterJobDefinition` is what sets this one.
 pub const STATUS_INACTIVE: &str = "INACTIVE";
 
 /// `OrchestrationType` of a job definition whose work runs on Amazon ECS — the default,
@@ -616,20 +616,53 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// or without the revision, the forms `SubmitJob$jobDefinition` documents): the exact
     /// revision when one is given, else "the latest active revision".
     pub fn job_definition(&self, reference: &str) -> Option<&JobDefinition> {
-        let short = arn_resource_id(reference, "job-definition").unwrap_or(reference);
-        match short.rsplit_once(':') {
-            Some((name, revision)) => {
-                let revision: i32 = revision.parse().ok()?;
-                self.job_definitions.get(&(name.to_string(), revision))
-            }
+        let (name, revision) = parse_job_definition_reference(reference)?;
+        match revision {
+            Some(revision) => self.job_definitions.get(&(name.to_string(), revision)),
             None => self
-                .revisions_of(short)
-                .filter_map(|revision| self.job_definitions.get(&(short.to_string(), revision)))
+                .revisions_of(name)
+                .filter_map(|revision| self.job_definitions.get(&(name.to_string(), revision)))
                 .filter(|definition| {
                     definition.status.as_deref() == Some(STATUS_ACTIVE)
                 })
                 .max_by_key(|definition| definition.revision),
         }
+    }
+
+    /// The `(name, revision)` key of the STORED revision a reference names, whatever
+    /// its status.
+    ///
+    /// The forms are the ones a "name and revision (`name:revision`) or full ARN"
+    /// member documents; a reference carrying no revision names the definition's
+    /// LATEST revision, which is the highest revision stored for the name. Unlike
+    /// [`Self::job_definition`] — which resolves a reference a job is to RUN under, so
+    /// a bare name there means the latest ACTIVE revision — this resolves a reference
+    /// to a revision as a record, so an already-`INACTIVE` revision still answers to
+    /// it and `DeregisterJobDefinition` stays idempotent.
+    ///
+    /// `None` when no stored revision answers to the reference.
+    pub fn job_definition_key(&self, reference: &str) -> Option<(String, i32)> {
+        let (name, revision) = parse_job_definition_reference(reference)?;
+        match revision {
+            Some(revision) => {
+                let key = (name.to_string(), revision);
+                self.job_definitions.contains_key(&key).then_some(key)
+            }
+            None => self
+                .revisions_of(name)
+                .max()
+                .map(|revision| (name.to_string(), revision)),
+        }
+    }
+
+    /// The STORED revision a reference names, mutably: [`Self::job_definition_key`]
+    /// followed by the lookup it proved, so a caller that must WRITE the record (the
+    /// status `DeregisterJobDefinition` sets) resolves and mutates in one step
+    /// instead of resolving a key and then performing a second lookup that could
+    /// miss.
+    pub fn job_definition_mut(&mut self, reference: &str) -> Option<&mut JobDefinition> {
+        let key = self.job_definition_key(reference)?;
+        self.job_definitions.get_mut(&key)
     }
 
     /// Materialise every transition the clock already owes, and nothing else.
@@ -1026,6 +1059,22 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
 pub fn job_definition_reference_name(reference: &str) -> &str {
     let short = arn_resource_id(reference, "job-definition").unwrap_or(reference);
     short.rsplit_once(':').map_or(short, |(name, _)| name)
+}
+
+/// The two forms a job-definition reference takes, parsed once: the NAME it carries
+/// and the revision when it names one.
+///
+/// The syntax is what every `jobDefinition` member documents — a bare name, a
+/// `<name>:<revision>` short form, or a full ARN of either shape — so the
+/// resolvers above differ only in what they SELECT (the latest active revision, or
+/// the latest stored one) rather than each re-parsing the reference. `None` when a
+/// revision is present but is not a number, which no stored revision answers to.
+fn parse_job_definition_reference(reference: &str) -> Option<(&str, Option<i32>)> {
+    let short = arn_resource_id(reference, "job-definition").unwrap_or(reference);
+    match short.rsplit_once(':') {
+        Some((name, revision)) => Some((name, Some(revision.parse().ok()?))),
+        None => Some((short, None)),
+    }
 }
 
 /// A `ClientException` for `detail` — the 400 every implemented operation answers an

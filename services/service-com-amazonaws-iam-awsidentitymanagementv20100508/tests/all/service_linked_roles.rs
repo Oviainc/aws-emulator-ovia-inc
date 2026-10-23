@@ -8,9 +8,9 @@
 //! reads a request the same way.
 //!
 //! Each test is a TABLE whose rows differ along what the rule generalises over:
-//! the service principal's label count and case, whether a `CustomSuffix` is
-//! supplied, whether a `Description` is, and the length of the name the request
-//! derives.
+//! whether AWS publishes a role name for the service principal, the principal's
+//! label count and case, whether a `CustomSuffix` is supplied, whether a
+//! `Description` is, and the length of the name the request derives.
 
 use crate::user_lifecycle::{account_id, call, element, elements, error_code, router};
 
@@ -18,9 +18,10 @@ use crate::user_lifecycle::{account_id, call, element, elements, error_code, rou
 /// `Description`, and the role name the request therefore names.
 ///
 /// The expected name is written out per row rather than recomputed, so the table
-/// pins the derivation instead of restating it: the service-provided prefix
-/// `AWSServiceRoleFor` followed by the service's own label (the principal's first
-/// label, capitalised) and, when one is supplied, `_` plus the custom suffix.
+/// pins the naming instead of restating it: the name AWS publishes for that service
+/// where it publishes one, the service-provided prefix `AWSServiceRoleFor` plus the
+/// principal's first label capitalised where it does not, and `_` plus the custom
+/// suffix when one is supplied.
 struct Case {
     service_principal: &'static str,
     custom_suffix: Option<&'static str>,
@@ -28,10 +29,57 @@ struct Case {
     expected_role_name: &'static str,
 }
 
-/// Rows spanning two- and three-label principals, an already-capitalised label, a
-/// label carrying `_`, suffixes of different shapes, and both presence and absence
-/// of `Description`.
+/// Rows spanning principals whose role name AWS publishes (including names nothing
+/// like the principal's first label, and one carrying a `_` of its own) and
+/// principals it does not, two- and three-label principals, an already-capitalised
+/// label, a label carrying `_`, suffixes of different shapes, and both presence and
+/// absence of `Description`.
 const CASES: &[Case] = &[
+    // Published: AWS SSM for SAP's role, the one a client confirms with `GetRole`
+    // before `RegisterApplication`.
+    Case {
+        service_principal: "ssm-sap.amazonaws.com",
+        custom_suffix: None,
+        description: None,
+        expected_role_name: "AWSServiceRoleForAWSSSMForSAP",
+    },
+    // Published, and nothing like the principal's first label.
+    Case {
+        service_principal: "application-signals.amazonaws.com",
+        custom_suffix: None,
+        description: Some("Allows CloudWatch Application Signals to discover"),
+        expected_role_name: "AWSServiceRoleForCloudWatchApplicationSignals",
+    },
+    // Published, with a `CustomSuffix` joined to it.
+    Case {
+        service_principal: "autoscaling.amazonaws.com",
+        custom_suffix: Some("debug"),
+        description: None,
+        expected_role_name: "AWSServiceRoleForAutoScaling_debug",
+    },
+    // Published, three-label principal whose role name names the service rather
+    // than the principal's first label (`ops`).
+    Case {
+        service_principal: "ops.apigateway.amazonaws.com",
+        custom_suffix: Some("1"),
+        description: Some("A three-label principal"),
+        expected_role_name: "AWSServiceRoleForAPIGateway_1",
+    },
+    // Published, and already carrying a `_` of its own.
+    Case {
+        service_principal: "rds.application-autoscaling.amazonaws.com",
+        custom_suffix: None,
+        description: None,
+        expected_role_name: "AWSServiceRoleForApplicationAutoScaling_RDSCluster",
+    },
+    Case {
+        service_principal: "elasticbeanstalk.amazonaws.com",
+        custom_suffix: None,
+        description: Some("Allows Elastic Beanstalk to manage resources"),
+        expected_role_name: "AWSServiceRoleForElasticBeanstalk",
+    },
+    // Not published: the derived fallback, all this emulator can know for a
+    // principal no published name covers.
     Case {
         service_principal: "networkmonitor.amazonaws.com",
         custom_suffix: None,
@@ -39,34 +87,10 @@ const CASES: &[Case] = &[
         expected_role_name: "AWSServiceRoleForNetworkmonitor",
     },
     Case {
-        service_principal: "elasticbeanstalk.amazonaws.com",
-        custom_suffix: None,
-        description: Some("Allows Elastic Beanstalk to manage resources"),
-        expected_role_name: "AWSServiceRoleForElasticbeanstalk",
-    },
-    Case {
-        service_principal: "autoscaling.amazonaws.com",
-        custom_suffix: Some("debug"),
-        description: None,
-        expected_role_name: "AWSServiceRoleForAutoscaling_debug",
-    },
-    Case {
-        service_principal: "ops.apigateway.amazonaws.com",
-        custom_suffix: Some("1"),
-        description: Some("A three-label principal"),
-        expected_role_name: "AWSServiceRoleForOps_1",
-    },
-    Case {
-        service_principal: "rds.application-autoscaling.amazonaws.com",
-        custom_suffix: None,
-        description: None,
-        expected_role_name: "AWSServiceRoleForRds",
-    },
-    Case {
-        service_principal: "Spot.amazonaws.com",
+        service_principal: "Mediaconvert.amazonaws.com",
         custom_suffix: Some("Fleet_7"),
         description: None,
-        expected_role_name: "AWSServiceRoleForSpot_Fleet_7",
+        expected_role_name: "AWSServiceRoleForMediaconvert_Fleet_7",
     },
     Case {
         service_principal: "sms_voice.amazonaws.com",
@@ -74,6 +98,26 @@ const CASES: &[Case] = &[
         description: None,
         expected_role_name: "AWSServiceRoleForSms_voice",
     },
+];
+
+/// Principals whose service-linked role name AWS PUBLISHES, with that name.
+///
+/// A published name belongs to the SERVICE rather than to the spelling of its
+/// principal, so every ASCII-case spelling of the principal names the same role.
+/// Source: the same per-service "Using service-linked roles" documentation
+/// `src/ops/create_service_linked_role.rs` cites for its own table; these four rows
+/// are not the ones [`CASES`] reads, so the two tables do not pin one entry twice.
+const PUBLISHED: &[(&str, &str)] = &[
+    ("ecs.amazonaws.com", "AWSServiceRoleForECS"),
+    ("lakeformation.amazonaws.com", "AWSServiceRoleForLakeFormationDataAccess"),
+    (
+        "replication.cassandra.amazonaws.com",
+        "AWSServiceRoleForKeyspacesReplication",
+    ),
+    (
+        "dynamodb.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_DynamoDBTable",
+    ),
 ];
 
 /// The default maximum session duration a role created without one carries, as
@@ -94,7 +138,9 @@ fn create_params(case: &Case) -> Vec<(&'static str, &'static str)> {
 }
 
 /// RULE: `CreateServiceLinkedRole` mints and persists the role the request names —
-/// `AWSServiceRoleFor<Service>`, with `_<CustomSuffix>` when one is supplied,
+/// the name AWS publishes for that service principal, or `AWSServiceRoleFor<Label>`
+/// derived from the principal when AWS publishes none, with `_<CustomSuffix>` when
+/// one is supplied,
 /// filed under `/aws-service-role/<service principal>/` with the ARN built from
 /// that path and name, carrying a trust policy that lets the named service
 /// principal assume it — and a later `GetRole` returns that STORED record rather
@@ -112,7 +158,7 @@ async fn create_service_linked_role_persists_the_role_and_get_role_returns_it() 
         assert_eq!(
             element(&created, "RoleName"),
             case.expected_role_name,
-            "case {label:?}: expected the derived role name {:?}, got {:?}",
+            "case {label:?}: expected the role name {:?}, got {:?}",
             case.expected_role_name,
             element(&created, "RoleName")
         );
@@ -249,6 +295,61 @@ async fn create_service_linked_role_persists_the_role_and_get_role_returns_it() 
         }
 
         minted_ids.push(role_id);
+    }
+}
+
+/// RULE: a role name AWS publishes for a service is a property of THAT SERVICE, so
+/// every create addressing it names the same role whatever ASCII case the principal
+/// is spelled in — and the role is retrievable by that published name, which is the
+/// name a client that follows a service's documented bootstrap reads back.
+#[tokio::test]
+async fn the_published_role_name_is_the_one_aws_publishes_whatever_case_the_principal_is_spelled_in()
+{
+    for (principal, published) in PUBLISHED {
+        // Rows: the principal as published, upper-cased, and with its first
+        // character upper-cased — three spellings addressing one service. Each gets
+        // its own account, because a second create of one role name is a duplicate.
+        for spelling in [
+            (*principal).to_string(),
+            principal.to_ascii_uppercase(),
+            {
+                let mut chars = principal.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().chain(chars).collect(),
+                    None => String::new(),
+                }
+            },
+        ] {
+            let router = router();
+            let (status, created) = call(
+                &router,
+                "CreateServiceLinkedRole",
+                &[("AWSServiceName", spelling.as_str())],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {spelling:?}: expected 200, got {status}: {created}"
+            );
+            assert_eq!(
+                element(&created, "RoleName"),
+                *published,
+                "case {spelling:?}: expected the published role name {published:?}, got {:?}",
+                element(&created, "RoleName")
+            );
+
+            let (status, fetched) = call(&router, "GetRole", &[("RoleName", *published)]).await;
+            assert_eq!(
+                status, 200,
+                "case {spelling:?}: expected GetRole on {published:?} to return 200, \
+                 got {status}: {fetched}"
+            );
+            assert_eq!(
+                element(&fetched, "RoleId"),
+                element(&created, "RoleId"),
+                "case {spelling:?}: expected GetRole to return the created role, got {fetched}"
+            );
+        }
     }
 }
 

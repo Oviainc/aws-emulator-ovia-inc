@@ -23,6 +23,8 @@ mod describe_images;
 mod describe_security_groups;
 #[path = "all/describe_subnets.rs"]
 mod describe_subnets;
+#[path = "all/describe_vpc_attribute.rs"]
+mod describe_vpc_attribute;
 #[path = "all/describe_vpcs.rs"]
 mod describe_vpcs;
 // The shared ec2Query plumbing every suite drives the service through.

@@ -39,17 +39,21 @@ fn settle_wait() -> Duration {
 }
 
 /// One response, reduced to what the assertions read.
+///
+/// `pub(crate)` because the suites of this target share one harness: the
+/// validation-message suite drives the same wire through the same
+/// [`Emulator::send`].
 #[derive(Debug)]
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     /// The wire error code: restJson1 resolves an error shape from
     /// `x-amzn-errortype`, falling back to the body's `__type`.
     error_code: Option<String>,
-    body: Value,
+    pub(crate) body: Value,
 }
 
 impl Reply {
-    fn code(&self) -> &str {
+    pub(crate) fn code(&self) -> &str {
         self.error_code.as_deref().unwrap_or("")
     }
 
@@ -83,12 +87,14 @@ impl Reply {
 }
 
 /// The emulator under test: one engine, one mounted service, one router.
-struct Emulator {
+///
+/// `pub(crate)` so every suite of this test target drives ONE harness.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: std::sync::Arc<engine::InMemoryEngine> =
             std::sync::Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
@@ -96,7 +102,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn send(&self, path: &str, body: Value) -> Reply {
+    pub(crate) async fn send(&self, path: &str, body: Value) -> Reply {
         let payload = serde_json::to_vec(&body).expect("the request body serializes");
         let request = http::Request::builder()
             .method("POST")

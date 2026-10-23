@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCell
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCell`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCell::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces a stored cell's list of nested cells with the list the request carries.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +146,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCell` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCellErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCell"))
+        let _ = ctx;
+        // CC-02 growth bound: an update must not grow one record past what a create
+        // could have stored.
+        crate::state::validate_nested_cells(Some(&input.cells)).map_err(|message| {
+            UpdateCellErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        })?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateCellErrorModeled::InternalServerException(InternalServerException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let record = state.cells.get_mut(&input.cell_name).ok_or_else(|| {
+            UpdateCellErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+            })
+        })?;
+        // "completely replaces the previous list" (the `Cells` member's own docs): the
+        // submitted list is stored as given, never merged with what was there.
+        record.nested_cell_arns = input.cells;
+
+        // The answer, read off the record that was just written — one lookup, and the
+        // members are taken before the derived scopes are computed so the mutable borrow
+        // ends here rather than being worked around with a second lookup.
+        let arn = record.arn.clone();
+        let name = record.name.clone();
+        let nested_cell_arns = record.nested_cell_arns.clone();
+        let tags = record.modeled_tags();
+        // The parent scopes the replacement implies, derived from the other stored
+        // records rather than from this one.
+        let parent_readiness_scopes = state.parent_readiness_scopes(&arn);
+        Ok(UpdateCellOutput {
+            cell_arn: Some(arn),
+            cell_name: Some(name),
+            cells: Some(nested_cell_arns),
+            parent_readiness_scopes: Some(parent_readiness_scopes),
+            tags,
+        })
     }
 }

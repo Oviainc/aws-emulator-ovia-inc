@@ -38,6 +38,42 @@ pub const DEFAULT_DESCRIBE_LIMIT: i32 = 50;
 /// documented ceiling of "up to 10,000 log events" per page.
 pub const DEFAULT_EVENTS_LIMIT: i32 = 10_000;
 
+/// The number of items the name-pattern list operations return when the request omits
+/// `limit`: `ListLogGroups` ("If you omit this parameter, the default is up to 50 log
+/// groups") and `ListAggregateLogGroupSummaries` ("If you omit this parameter, the
+/// default is up to 50 aggregated summaries").
+pub const DEFAULT_LIST_LIMIT: i32 = 50;
+
+/// The shortest `logGroupNamePattern` the model admits: `LogGroupNameRegexPattern`
+/// carries `@length(min: 3, max: 129)`.
+pub const LOG_GROUP_NAME_PATTERN_MIN_LEN: usize = 3;
+
+/// The longest `logGroupNamePattern` the model admits. See
+/// [`LOG_GROUP_NAME_PATTERN_MIN_LEN`].
+pub const LOG_GROUP_NAME_PATTERN_MAX_LEN: usize = 129;
+
+/// How many `|`-separated alternatives one `logGroupNamePattern` carries, from the
+/// member's own documentation: "You can specify as many as five different regular
+/// expression patterns in this field".
+pub const MAX_LOG_GROUP_NAME_PATTERN_ALTERNATIVES: usize = 5;
+
+/// The shortest one alternative of a `logGroupNamePattern` can be, from the same
+/// sentence: "each of which must be between 3 and 24 characters".
+///
+/// The MAXIMUM half of that sentence — and of the `@pattern`'s `{3,24}` segments — is
+/// deliberately NOT a constant here: the service accepts an alternative longer than 24
+/// characters (log group names routinely exceed it), so refusing one would refuse a
+/// request the service answers. See [`check_log_group_name_pattern`].
+pub const MIN_LOG_GROUP_NAME_PATTERN_ALTERNATIVE_LEN: usize = 3;
+
+/// The prefix anchor a `logGroupNamePattern` alternative may carry: "Use ^ to match log
+/// group names by prefix."
+pub const LOG_GROUP_NAME_PATTERN_ANCHOR: char = '^';
+
+/// The separator between a `logGroupNamePattern`'s alternatives: "To match multiple
+/// patterns, separate them with a | as in the example ^/aws/lambda|discovery".
+pub const LOG_GROUP_NAME_PATTERN_SEPARATOR: char = '|';
+
 /// AWS's documented log group quota, from `CreateLogGroup`: "You can create up to
 /// 1,000,000 log groups per Region per account."
 pub const MAX_LOG_GROUPS: usize = 1_000_000;
@@ -201,6 +237,11 @@ pub struct LogGroupRecord {
     /// The resource-scoped policy attached to this group, if one has been put: AWS
     /// allows "one per LogGroup resourceARN", so at most one.
     pub resource_policy: Option<ResourcePolicyRecord>,
+    /// The data sources that ingest into this group — what `ListLogGroups`'s
+    /// `dataSources` filter selects on and what `ListAggregateLogGroupSummaries`
+    /// counts log groups by. See [`DataSourceRecord`] for why a group created through
+    /// this emulator's API carries none.
+    pub data_sources: Vec<DataSourceRecord>,
 }
 
 impl LogGroupRecord {
@@ -221,8 +262,176 @@ impl LogGroupRecord {
             streams: BTreeMap::new(),
             subscription_filters: BTreeMap::new(),
             resource_policy: None,
+            data_sources: Vec::new(),
         }
     }
+}
+
+/// One data source that ingests into a log group: the model's `DataSource` — "a data
+/// source that categorizes logs by originating service and log type" — plus the format
+/// the aggregate summaries can additionally group by (`dataSource.Format`).
+///
+/// A log group created through this emulator's API carries none, and that is a property
+/// of the API surface rather than a shortcut: the model's `LogGroup` has no data-source
+/// member, no operation associates a data source WITH a log group (the one operation that
+/// names a `DataSource`, `AssociateSourceToS3TableIntegration`, attaches it to an S3
+/// Tables integration, and is a 501 stub), and the data sources AWS reports are the ones
+/// its own vended-log ingestion created. So the aggregate grouped by data-source
+/// characteristics counts nothing here — which is a 200 with an empty list, not a
+/// refusal — and both readers go through this field, so they report whatever a later
+/// operation stores in it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DataSourceRecord {
+    /// `DataSource$name` — "The name of the data source."
+    pub name: String,
+    /// `DataSource$type` — "The type of the data source."
+    pub source_type: Option<String>,
+    /// The data source's format, which `groupBy=DATA_SOURCE_NAME_TYPE_AND_FORMAT`
+    /// groups by (`GroupingIdentifier`: "Examples are, dataSource.Name,
+    /// dataSource.Type, and dataSource.Format").
+    pub format: Option<String>,
+}
+
+/// Whether one data source satisfies a `dataSources` filter list.
+///
+/// From `ListLogGroups$dataSources`: "You can filter by data source name, type, or both.
+/// Multiple filters within the same dimension are combined with OR logic, while filters
+/// across different dimensions are combined with AND logic" — so every filter's `name`
+/// forms one dimension and every filter's `type` the other, and each is matched as the
+/// "name pattern" / "type pattern" the members document: a case-sensitive substring.
+pub fn data_source_matches_filters(
+    source: &DataSourceRecord,
+    filters: &[crate::ops::types::DataSourceFilter],
+) -> bool {
+    // `DataSourceFilter$name` is `@required`, so the name dimension is never empty.
+    let name_matches = filters
+        .iter()
+        .any(|filter| source.name.contains(&filter.name));
+    let wanted_types: Vec<&str> = filters
+        .iter()
+        .filter_map(|filter| filter.r#type.as_deref())
+        .collect();
+    let type_matches = wanted_types.is_empty()
+        || source.source_type.as_deref().is_some_and(|source_type| {
+            wanted_types
+                .iter()
+                .any(|wanted| source_type.contains(wanted))
+        });
+    name_matches && type_matches
+}
+
+/// Whether one log group satisfies a `dataSources` filter list: one of its data sources
+/// does ([`data_source_matches_filters`]).
+pub fn log_group_matches_data_source_filters(
+    group: &LogGroupRecord,
+    filters: &[crate::ops::types::DataSourceFilter],
+) -> bool {
+    group
+        .data_sources
+        .iter()
+        .any(|source| data_source_matches_filters(source, filters))
+}
+
+/// Whether one character may appear in a `logGroupNamePattern` alternative, from the
+/// `LogGroupNameRegexPattern` `@pattern`'s character class `[\.\-_\/#A-Za-z0-9]` — which
+/// is exactly the class a `LogGroupName` is built from, so an alternative can only ever
+/// be literal text.
+fn is_log_group_name_pattern_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '/' | '#')
+}
+
+/// The `LogGroupNameRegexPattern` `@pattern` as the service RENDERS it in a refusal:
+/// the modelled expression with its `^` / `$` anchors stripped. The message states the
+/// member's modelled constraint, so this is the modelled expression itself — including
+/// the per-alternative 24-character maximum the service accepts values past, which the
+/// emulator therefore does not enforce (see [`check_log_group_name_pattern`]).
+pub const LOG_GROUP_NAME_PATTERN_UNANCHORED: &str =
+    r"(\^?[\.\-_\/#A-Za-z0-9]{3,24})(\|\^?[\.\-_\/#A-Za-z0-9]{3,24}){0,4}";
+
+/// One refused member, worded on the template CloudWatch Logs words a constraint
+/// violation with: "N validation error detected: Value at '<member>' failed to satisfy
+/// constraint: <constraint>". The template is built from the request — the member that
+/// broke a constraint, and that member's modelled constraint — and carries NEITHER the
+/// submitted value nor a `@pattern`'s anchors.
+pub fn validation_message(member: &str, constraint: &str) -> String {
+    format!(
+        "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
+         {constraint}"
+    )
+}
+
+/// Judge a `logGroupNamePattern` — the member `ListLogGroups` and
+/// `ListAggregateLogGroupSummaries` share — answering the message to refuse it with.
+///
+/// The member targets `LogGroupNameRegexPattern`, whose `@pattern` decomposes the value
+/// into up to five `|`-separated alternatives of 3..24 characters. The 24-character
+/// MAXIMUM is the one part of that the service does not apply: it answers 200 for a
+/// single-alternative pattern far longer than 24 characters, which is what a pattern
+/// naming a real log group looks like. Everything else the model and the documentation
+/// state is enforced here, because the member carries `skip_validation` and the boundary
+/// walk no longer sees it:
+///
+/// * the `@length(min: 3, max: 129)` on the whole value;
+/// * "as many as five different regular expression patterns in this field";
+/// * the minimum of "each of which must be between 3 and 24 characters";
+/// * the character class, plus the optional leading `^` anchor on each alternative.
+pub fn check_log_group_name_pattern(pattern: &str) -> Result<(), String> {
+    const MEMBER: &str = "logGroupNamePattern";
+    let refuse = |constraint: String| Err(validation_message(MEMBER, &constraint));
+
+    let length = pattern.chars().count();
+    if length < LOG_GROUP_NAME_PATTERN_MIN_LEN {
+        return refuse(format!(
+            "Member must have length greater than or equal to {LOG_GROUP_NAME_PATTERN_MIN_LEN}"
+        ));
+    }
+    if length > LOG_GROUP_NAME_PATTERN_MAX_LEN {
+        return refuse(format!(
+            "Member must have length less than or equal to {LOG_GROUP_NAME_PATTERN_MAX_LEN}"
+        ));
+    }
+    let alternatives: Vec<&str> = pattern.split(LOG_GROUP_NAME_PATTERN_SEPARATOR).collect();
+    if alternatives.len() > MAX_LOG_GROUP_NAME_PATTERN_ALTERNATIVES {
+        return refuse(format!(
+            "Member must specify at most {MAX_LOG_GROUP_NAME_PATTERN_ALTERNATIVES} \
+             '{LOG_GROUP_NAME_PATTERN_SEPARATOR}'-separated patterns"
+        ));
+    }
+    for alternative in alternatives {
+        let literal = alternative
+            .strip_prefix(LOG_GROUP_NAME_PATTERN_ANCHOR)
+            .unwrap_or(alternative);
+        let shaped = literal.chars().count() >= MIN_LOG_GROUP_NAME_PATTERN_ALTERNATIVE_LEN
+            && literal.chars().all(is_log_group_name_pattern_char);
+        if !shaped {
+            return refuse(format!(
+                "Member must satisfy regular expression pattern: \
+                 {LOG_GROUP_NAME_PATTERN_UNANCHORED}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a log group name matches a `logGroupNamePattern`.
+///
+/// The member documents the whole match rule: "Use ^ to match log group names by prefix.
+/// For a substring match, specify the string to match. All matches are case sensitive To
+/// match multiple patterns, separate them with a | as in the example ^/aws/lambda|
+/// discovery". The pattern's character class admits no regular-expression metacharacter
+/// beyond that `^` and `|`, so each alternative is literal text: anchored, a prefix;
+/// otherwise, a substring. A name matches when ANY alternative matches it.
+///
+/// Caller-side the value has already been through [`check_log_group_name_pattern`].
+pub fn log_group_name_matches_pattern(name: &str, pattern: &str) -> bool {
+    pattern
+        .split(LOG_GROUP_NAME_PATTERN_SEPARATOR)
+        .any(|alternative| {
+            match alternative.strip_prefix(LOG_GROUP_NAME_PATTERN_ANCHOR) {
+                Some(prefix) => name.starts_with(prefix),
+                None => name.contains(alternative),
+            }
+        })
 }
 
 /// One subscription filter — "a real-time stream of log events ingested through

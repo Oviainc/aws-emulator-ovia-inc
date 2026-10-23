@@ -131,16 +131,148 @@ fn service_linked_role_path(service_principal: &str) -> String {
     )
 }
 
-/// The name of the service-linked role for `service_principal`, with
-/// `custom_suffix` appended when the request supplied one.
+/// The role name AWS PUBLISHES for a service principal's service-linked role.
 ///
 /// The service-provided prefix is [`SERVICE_LINKED_ROLE_NAME_PREFIX`] followed by
-/// the service's own label — the first label of its principal, capitalised. The
-/// EXACT spelling AWS gives that label is a per-service string no part of the API
-/// model carries, so it is derived from the principal the request named, which
-/// keeps the name a function of the request alone: the same principal and suffix
-/// always name the same role, and two different principals never do.
-fn service_linked_role_name(service_principal: &str, custom_suffix: Option<&str>) -> String {
+/// the service's own AWS-assigned label, and that label is NOT the first label of
+/// the principal and is not derivable from it: `ssm-sap.amazonaws.com` links
+/// `AWSServiceRoleForAWSSSMForSAP`, `ops.apigateway.amazonaws.com` links
+/// `AWSServiceRoleForAPIGateway`, `replication.cassandra.amazonaws.com` links
+/// `AWSServiceRoleForKeyspacesReplication`, and each Application Auto Scaling
+/// principal links a name suffixed with the resource type it scales. No part of the
+/// IAM model carries that label — `CreateServiceLinkedRole$CustomSuffix`'s
+/// documentation only says a suffix "is combined with the service-provided prefix to
+/// form the complete role name" — so the published names are listed here, and a
+/// principal this list does not name falls back to
+/// [`derived_service_linked_role_name`].
+///
+/// Source: the "Using service-linked roles for <service>" page of each service's own
+/// user guide, which names the role that service creates; AWS's "Amazon Web Services
+/// services that work with IAM" table links them all. Rows marked `[model]` are
+/// additionally corroborated by the documentation a Smithy model in THIS repository
+/// carries, quoted in the named handler.
+///
+/// Sorted by principal, which is also the lookup key
+/// ([`published_service_linked_role_name`]).
+const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
+    ("access-analyzer.amazonaws.com", "AWSServiceRoleForAccessAnalyzer"),
+    // [model] service-com-amazonaws-applicationsignals-applicationsignals
+    // `src/ops/start_discovery.rs`: "creating the
+    // AWSServiceRoleForCloudWatchApplicationSignals service-linked role".
+    (
+        "application-signals.amazonaws.com",
+        "AWSServiceRoleForCloudWatchApplicationSignals",
+    ),
+    // [model] service-com-amazonaws-autoscaling-autoscaling-2011-01-01
+    // `src/ops/create_auto_scaling_group.rs`: "service-linked role named
+    // AWSServiceRoleForAutoScaling".
+    ("autoscaling.amazonaws.com", "AWSServiceRoleForAutoScaling"),
+    ("backup.amazonaws.com", "AWSServiceRoleForBackup"),
+    // [model] service-com-amazonaws-batch-awsbatchv20160810
+    // `src/ops/update_compute_environment.rs`: "the AWSServiceRoleForBatch
+    // service-linked role".
+    ("batch.amazonaws.com", "AWSServiceRoleForBatch"),
+    ("cloudtrail.amazonaws.com", "AWSServiceRoleForCloudTrail"),
+    // [model] service-com-amazonaws-configservice-starlingdoveservice
+    // `src/ops/put_service_linked_configuration_recorder.rs`: "creates a
+    // service-linked role AWSServiceRoleForConfig in your account".
+    ("config.amazonaws.com", "AWSServiceRoleForConfig"),
+    // Application Auto Scaling publishes one role per scaled service, named
+    // `AWSServiceRoleForApplicationAutoScaling_<resource type>` — the suffixes this
+    // repository already lists in
+    // service-com-amazonaws-applicationautoscaling-anyscalefrontendservice
+    // `src/state.rs` (`SERVICE_LINKED_ROLE_SUFFIXES`).
+    (
+        "dynamodb.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_DynamoDBTable",
+    ),
+    ("ec2fleet.amazonaws.com", "AWSServiceRoleForEC2Fleet"),
+    // [model] service-com-amazonaws-ecs-amazonec2containerservicev20141113
+    // `src/state.rs`: `role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS`.
+    ("ecs.amazonaws.com", "AWSServiceRoleForECS"),
+    (
+        "ecs.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_ECSService",
+    ),
+    ("eks-fargate.amazonaws.com", "AWSServiceRoleForAmazonEKSForFargate"),
+    ("eks-nodegroup.amazonaws.com", "AWSServiceRoleForAmazonEKSNodegroup"),
+    ("eks.amazonaws.com", "AWSServiceRoleForAmazonEKS"),
+    ("elasticache.amazonaws.com", "AWSServiceRoleForElastiCache"),
+    ("elasticbeanstalk.amazonaws.com", "AWSServiceRoleForElasticBeanstalk"),
+    (
+        "elasticloadbalancing.amazonaws.com",
+        "AWSServiceRoleForElasticLoadBalancing",
+    ),
+    // [model] service-com-amazonaws-fms-awsfms-20180101
+    // `src/ops/put_notification_channel.rs`: "a role other than the
+    // AWSServiceRoleForFMS".
+    ("fms.amazonaws.com", "AWSServiceRoleForFMS"),
+    ("globalaccelerator.amazonaws.com", "AWSServiceRoleForGlobalAccelerator"),
+    ("guardduty.amazonaws.com", "AWSServiceRoleForAmazonGuardDuty"),
+    // [model] service-com-amazonaws-lakeformation-awslakeformation
+    // `src/ops/register_resource.rs`: "choose the
+    // AWSServiceRoleForLakeFormationDataAccess".
+    (
+        "lakeformation.amazonaws.com",
+        "AWSServiceRoleForLakeFormationDataAccess",
+    ),
+    ("lex.amazonaws.com", "AWSServiceRoleForLexBots"),
+    ("macie.amazonaws.com", "AWSServiceRoleForAmazonMacie"),
+    (
+        "opensearchservice.amazonaws.com",
+        "AWSServiceRoleForAmazonOpenSearchService",
+    ),
+    ("ops.apigateway.amazonaws.com", "AWSServiceRoleForAPIGateway"),
+    ("organizations.amazonaws.com", "AWSServiceRoleForOrganizations"),
+    ("rds.amazonaws.com", "AWSServiceRoleForRDS"),
+    (
+        "rds.application-autoscaling.amazonaws.com",
+        "AWSServiceRoleForApplicationAutoScaling_RDSCluster",
+    ),
+    // [model] service-com-amazonaws-keyspaces-keyspacesservice
+    // `src/ops/update_keyspace.rs`:
+    // `role/aws-service-role/replication.cassandra.amazonaws.com/AWSServiceRoleForKeyspacesReplication`.
+    (
+        "replication.cassandra.amazonaws.com",
+        "AWSServiceRoleForKeyspacesReplication",
+    ),
+    ("securityhub.amazonaws.com", "AWSServiceRoleForSecurityHub"),
+    // Amazon EC2 Spot and Spot Fleet: each role is assumed through the FEATURE's own
+    // principal (`spot.amazonaws.com`, `spotfleet.amazonaws.com`), which is neither
+    // the role's name nor the `ec2` endpoint prefix.
+    ("spot.amazonaws.com", "AWSServiceRoleForEC2Spot"),
+    ("spotfleet.amazonaws.com", "AWSServiceRoleForEC2SpotFleet"),
+    // AWS Systems Manager for SAP: the role AWS SSM for SAP requires in the account
+    // before it will register an application.
+    ("ssm-sap.amazonaws.com", "AWSServiceRoleForAWSSSMForSAP"),
+    ("ssm.amazonaws.com", "AWSServiceRoleForAmazonSSM"),
+    ("sso.amazonaws.com", "AWSServiceRoleForSSO"),
+    ("support.amazonaws.com", "AWSServiceRoleForSupport"),
+    ("trustedadvisor.amazonaws.com", "AWSServiceRoleForTrustedAdvisor"),
+];
+
+/// AWS's own role name for `service_principal`, when it publishes one.
+///
+/// Matched without regard to ASCII case: a service principal is a DNS-style name
+/// (`CreateServiceLinkedRole$AWSServiceName` — "a string similar to a URL but
+/// without the http:// in front"), so a differently-cased spelling addresses the
+/// same service, and IAM holds the resulting role name case-folded anyway
+/// (`crate::state::name_key`).
+fn published_service_linked_role_name(service_principal: &str) -> Option<&'static str> {
+    PUBLISHED_SERVICE_LINKED_ROLE_NAMES
+        .iter()
+        .find(|(principal, _)| principal.eq_ignore_ascii_case(service_principal))
+        .map(|(_, role_name)| *role_name)
+}
+
+/// The fallback name for a principal [`PUBLISHED_SERVICE_LINKED_ROLE_NAMES`] does
+/// not name: [`SERVICE_LINKED_ROLE_NAME_PREFIX`] followed by the principal's first
+/// label, capitalised.
+///
+/// AWS's label for such a service is not knowable here, so the name stays a function
+/// of the request alone — the same principal always names the same role, and two
+/// different principals never name one.
+fn derived_service_linked_role_name(service_principal: &str) -> String {
     let service_label = service_principal
         .split('.')
         .next()
@@ -151,6 +283,21 @@ fn service_linked_role_name(service_principal: &str, custom_suffix: Option<&str>
         role_name.extend(first.to_uppercase());
         role_name.push_str(characters.as_str());
     }
+    role_name
+}
+
+/// The name of the service-linked role for `service_principal`, with
+/// `custom_suffix` appended when the request supplied one.
+///
+/// The name is the one AWS publishes for that principal where it publishes one, and
+/// the derived fallback otherwise; a `CustomSuffix` is joined to either with
+/// [`CUSTOM_SUFFIX_SEPARATOR`], which is what that member's documentation describes
+/// ("combined with the service-provided prefix to form the complete role name").
+fn service_linked_role_name(service_principal: &str, custom_suffix: Option<&str>) -> String {
+    let mut role_name = match published_service_linked_role_name(service_principal) {
+        Some(published) => published.to_string(),
+        None => derived_service_linked_role_name(service_principal),
+    };
     if let Some(custom_suffix) = custom_suffix {
         role_name.push(CUSTOM_SUFFIX_SEPARATOR);
         role_name.push_str(custom_suffix);
