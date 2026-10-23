@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListVersionsByFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListVersionsByFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListVersionsByFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages through the versions of ONE function held in [`crate::state`]: the unpublished
+//! `$LATEST` configuration and every version `PublishVersion` froze, each reported from
+//! its own stored snapshot, in version order so a marker always continues from where the
+//! previous page ended.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +153,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListVersionsByFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListVersionsByFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListVersionsByFunction"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListVersionsByFunctionErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The model declares `MaxItems` as `@range(min: 1, max: 10000)`, so the boundary
+        // validator has already refused anything outside it; this handler enforces the
+        // same floor itself rather than letting a page size of zero reach the pagination
+        // arithmetic below.
+        if let Some(requested) = input.max_items.filter(|requested| *requested < 1) {
+            return Err(invalid_parameter(format!(
+                "1 validation error detected: Value '{requested}' at 'maxItems' failed to \
+                 satisfy constraint: Member must have value greater than or equal to 1"
+            )));
+        }
+        // "Lambda returns up to 50 versions per call", and "Note that
+        // ListVersionsByFunction returns a maximum of 50 items in each response, even if
+        // you set the number higher."
+        let page_size = input
+            .max_items
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+
+        // The marker is the version label of the last entry the previous page reported,
+        // so the next page starts at the first version ordered after it. A value that is
+        // no version label at all names no place in that order.
+        let start_after = match input.marker.as_deref() {
+            Some(marker) => Some(version_order(marker).ok_or_else(|| {
+                invalid_parameter(format!(
+                    "1 validation error detected: Value '{marker}' at 'marker' failed to \
+                     satisfy constraint: Member must be the version label of a previous \
+                     page's last entry"
+                ))
+            })?),
+            None => None,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // "The name or ARN of the Lambda function": the versions listed are the versions
+        // of the one function the name resolves to, resolved exactly the way every other
+        // operation on this service resolves a `FunctionName`.
+        let record = match crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            None,
+            &region,
+            now,
+        ) {
+            Ok((record, _version)) => record,
+            Err(crate::state::ResolveFailure::Malformed(message)) => {
+                return Err(invalid_parameter(message))
+            }
+            Err(crate::state::ResolveFailure::NotFound(message)) => {
+                return Err(ListVersionsByFunctionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // "Returns a list of versions, with the version-specific configuration of each":
+        // the unpublished `$LATEST` configuration is a version of the function too, and
+        // each published version reports the snapshot `PublishVersion` froze for it
+        // rather than the function's current configuration. Published versions are
+        // numbered upwards and the store keys them by that number, so iterating it
+        // yields them in ascending order after `$LATEST`.
+        let mut entries: Vec<(String, CreateFunctionOutput)> = Vec::new();
+        entries.push((
+            crate::state::VERSION_LATEST.to_string(),
+            record.configuration(crate::state::VERSION_LATEST, &record.config),
+        ));
+        for published in record.versions.values() {
+            let label = published.version.to_string();
+            let configuration = record.configuration(&label, &published.config);
+            entries.push((label, configuration));
+        }
+
+        let start = match start_after {
+            Some(after) => entries
+                .iter()
+                .position(|(label, _)| version_order(label).is_some_and(|order| order > after))
+                .unwrap_or(entries.len()),
+            None => 0,
+        };
+        let page = match entries.get(start..) {
+            Some(remaining) => &remaining[..page_size.min(remaining.len())],
+            None => &[][..],
+        };
+        let truncated = start + page.len() < entries.len();
+
+        Ok(ListVersionsByFunctionOutput {
+            versions: Some(
+                page.iter()
+                    .map(|(_, configuration)| configuration.clone())
+                    .collect(),
+            ),
+            // "The pagination token that's included if more results are available" — so
+            // it is absent on the last page, and it is the version label of the last
+            // entry THIS page reported, which is what the next page continues after.
+            next_marker: page
+                .last()
+                .filter(|_| truncated)
+                .map(|(label, _)| label.clone()),
+        })
     }
+}
+
+/// Where a version label sits in the order this operation reports versions in.
+///
+/// The unpublished configuration is reported first and published versions follow it in
+/// ascending numeric order, so `$LATEST` takes the one rank below version `1` (version
+/// numbers start at 1 — see [`crate::state::FunctionRecord::publish_next_version`]).
+/// `None` for a value the model's `Version` pattern (`^(\$LATEST|[0-9]+)$`) does not
+/// admit at all.
+fn version_order(label: &str) -> Option<u64> {
+    if label == crate::state::VERSION_LATEST {
+        return Some(0);
+    }
+    label.parse::<u64>().ok()
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> ListVersionsByFunctionError {
+    ListVersionsByFunctionErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
 }
