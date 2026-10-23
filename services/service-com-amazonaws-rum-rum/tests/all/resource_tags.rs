@@ -24,6 +24,8 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
+use crate::support::message;
+
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
 /// name (`rum`, per `OPERATIONS.md`'s `## Wire protocol`), which is what the router's
 /// `can_handle` routes on, and the region a created monitor's ARN is derived from.
@@ -49,7 +51,8 @@ const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 const NOT_FOUND_ERROR_CODE: &str = "NotFoundException";
 
 /// The message that refusal carries: a constant the service words the same way whatever
-/// ARN the request named (the ARN is reported in `resourceName`).
+/// ARN the request named, and the WHOLE body — RUM's `ResourceNotFoundException` puts
+/// neither `resourceName` nor `resourceType` on the wire.
 /// Source: the same recorded unit, whose check asserts the message for an unknown ARN.
 const NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
@@ -507,19 +510,28 @@ async fn untag_resource_refuses_an_arn_that_names_no_stored_resource() {
             "case {case:?}: expected the wire error code {NOT_FOUND_ERROR_CODE:?}, got {code:?}"
         );
         let document = reply.json(case);
+        // RUM's not-found body is `message` only — `resourceName`/`resourceType` are
+        // modelled but never serialized, so a client gets no second copy of the ARN it
+        // sent (see `crate::ops::types::ResourceNotFoundException`).
         assert_eq!(
-            document["resourceName"].as_str(),
-            Some(arn.as_str()),
-            "case {case:?}: the refusal must name the ARN the request carried, got {:?}",
+            document["resourceName"],
+            Value::Null,
+            "case {case:?}: expected no resourceName member, got {:?}",
             document["resourceName"]
+        );
+        assert_eq!(
+            document["resourceType"],
+            Value::Null,
+            "case {case:?}: expected no resourceType member, got {:?}",
+            document["resourceType"]
         );
         // The message is the service's own constant for this condition — the same
         // sentence for every row of this table, which varies the ARN in every component.
         assert_eq!(
-            document["Message"].as_str().or(document["message"].as_str()),
+            message(&document),
             Some(NOT_FOUND_MESSAGE),
             "case {case:?}: expected the message {NOT_FOUND_MESSAGE:?}, got {:?}",
-            document["Message"]
+            message(&document)
         );
 
         let stored = stored_tags(&router, case, "tagged").await;
@@ -569,10 +581,10 @@ async fn untag_resource_refuses_a_resource_arn_that_is_not_an_arn() {
         // different way in each one.
         let document = reply.json(case);
         assert_eq!(
-            document["Message"].as_str().or(document["message"].as_str()),
+            message(&document),
             Some(INVALID_RESOURCE_ARN_MESSAGE),
             "case {case:?}: expected the message {INVALID_RESOURCE_ARN_MESSAGE:?}, got {:?}",
-            document["Message"]
+            message(&document)
         );
     }
 

@@ -369,7 +369,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(record) = store.app_monitor_by_arn_mut(&input.resource_arn) else {
             return Err(TagResourceError::NotFound(
-                crate::state::tagged_resource_not_found(&input.resource_arn),
+                crate::state::tagged_resource_not_found(),
             ));
         };
 

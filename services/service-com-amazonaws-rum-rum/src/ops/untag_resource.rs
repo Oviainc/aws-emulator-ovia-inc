@@ -233,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (see [`UntagResourceError::NotFound`]) rather than answered as a silent success.
         let Some(record) = store.app_monitor_by_arn_mut(&input.resource_arn) else {
             return Err(UntagResourceError::NotFound(
-                crate::state::tagged_resource_not_found(&input.resource_arn),
+                crate::state::tagged_resource_not_found(),
             ));
         };
         // Each named key is dropped from the resource's tag map and every key NOT named

@@ -23,8 +23,8 @@ use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 // The ONE wire harness, shared with this crate's other suites: the signed-request
 // helpers, the raw `Reply`, and the two calls every suite sets a resource up with.
 use crate::support::{
-    call, call_in, create, emulator, get_app_monitor, is_modelled_app_monitor_id, tag_map,
-    ACCOUNT, REGION,
+    call, call_in, create, emulator, get_app_monitor, is_modelled_app_monitor_id,
+    rum_events_body, tag_map, ACCOUNT, REGION,
 };
 
 /// Every value `AppMonitorPlatform` admits.
@@ -406,34 +406,6 @@ async fn a_request_naming_no_stored_monitor_is_not_found() {
             String::from_utf8_lossy(&reply.body)
         );
     }
-}
-
-/// A `PutRumEvents` body carrying two events of different types, for the monitor whose
-/// id is `id`.
-fn rum_events_body(id: &str) -> Value {
-    json!({
-        "BatchId": "11111111-2222-4333-8444-555555555555",
-        "AppMonitorDetails": {"name": "any", "id": id, "version": "1.0.0"},
-        "UserDetails": {
-            "userId": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
-            "sessionId": "ffffffff-eeee-4ddd-8ccc-bbbbbbbbbbbb",
-        },
-        "RumEvents": [
-            {
-                "id": "12345678-1234-4234-8234-123456789012",
-                "timestamp": 1_704_067_200,
-                "type": "com.amazon.rum.page_view_event",
-                "metadata": "{\"version\":\"1.0.0\"}",
-                "details": "{\"pageId\":\"/home\"}",
-            },
-            {
-                "id": "22345678-1234-4234-8234-123456789012",
-                "timestamp": 1_704_067_260,
-                "type": "com.amazon.rum.js_error_event",
-                "details": "{\"message\":\"boom\"}",
-            },
-        ],
-    })
 }
 
 #[tokio::test]

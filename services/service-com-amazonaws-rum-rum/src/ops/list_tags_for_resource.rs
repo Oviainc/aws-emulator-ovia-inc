@@ -263,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // together, so its ARN resolves to nothing afterwards.
         let Some(record) = store.app_monitor_by_arn(&input.resource_arn) else {
             return Err(ListTagsForResourceError::NotFound(
-                crate::state::tagged_resource_not_found(&input.resource_arn),
+                crate::state::tagged_resource_not_found(),
             ));
         };
 

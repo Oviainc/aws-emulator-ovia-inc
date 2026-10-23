@@ -18,12 +18,21 @@ pub struct InternalServerException {
     pub retry_after_seconds: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.rum#ResourceNotFoundException")]
+// `ResourceNotFoundException` models `resourceName` (@required) and `resourceType`, but
+// RUM does not put either on the wire for THIS error: every recorded not-found body of
+// this service — app-monitor reads and writes, the metrics-destination calls, the
+// resource-policy calls and the ARN-addressed tagging calls alike — carries `message`
+// alone. Both members are therefore declared unsupported, which keeps them out of the
+// shape's schema and so out of the body the framework writes, rather than filling them
+// with a name and a type a client reading them would take for the service's own. The
+// sibling `ConflictException` below keeps both: RUM does report them there.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.rum#ResourceNotFoundException",
+    unsupported = ["resourceName", "resourceType"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ResourceNotFoundException {
     pub message: String,
-    pub resource_name: String,
-    pub resource_type: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.rum#ValidationException")]

@@ -21,6 +21,8 @@ mod cw_log_delivery;
 mod list_tags_for_resource;
 #[path = "all/metrics_destinations.rs"]
 mod metrics_destinations;
+#[path = "all/not_found_and_conflict_bodies.rs"]
+mod not_found_and_conflict_bodies;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/resource_tagging.rs"]

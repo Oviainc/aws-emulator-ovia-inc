@@ -78,8 +78,14 @@ pub const DEFAULT_SESSION_SAMPLE_RATE: f64 = 0.1;
 /// `DataStorage.CwLog.CwLogGroup` stable across reads and distinct per monitor.
 pub const CW_LOG_GROUP_PREFIX: &str = "/aws/vendedlogs/RUMService_";
 
-/// The `resourceType` this service's errors report for an app monitor.
-pub const APP_MONITOR_RESOURCE_TYPE: &str = "AppMonitor";
+/// The `resourceType` this service's `ConflictException` reports for an app monitor.
+///
+/// Recorded behavior: the duplicate-name conflict `CreateAppMonitor` answers names the
+/// resource's type as RUM's own product noun, not the model's shape or resource name.
+/// It is the ONLY error of this service that reports a `resourceType` at all — the
+/// not-found refusals leave the member off the wire (see
+/// [`crate::ops::types::ResourceNotFoundException`]).
+pub const APP_MONITOR_RESOURCE_TYPE: &str = "RUM application";
 
 /// The most app monitors this emulator holds at once.
 ///
@@ -761,15 +767,24 @@ pub fn metric_destination_role_refusal(
     }
 }
 
-/// `ResourceNotFoundException` for a name or id that names no stored app monitor. The
-/// message is built from the request, so it names the value given.
+/// `ResourceNotFoundException` for a name or id that names no stored app monitor.
+///
+/// The message is built from the request: the literal prefix `Resource not found `
+/// followed by the value the request identified the monitor by, verbatim and with no
+/// trailing period. That construction is RUM's own, and it is the same for every
+/// operation that resolves an app monitor — recorded across this service's app-monitor
+/// reads and writes, its metrics-destination calls and its resource-policy calls. The
+/// body carries NOTHING else: `resourceName`/`resourceType` are off the wire for this
+/// shape (see [`crate::ops::types::ResourceNotFoundException`]).
 pub fn app_monitor_not_found(name_or_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("App monitor {name_or_id} does not exist."),
-        resource_name: name_or_id.to_string(),
-        resource_type: Some(APP_MONITOR_RESOURCE_TYPE.to_string()),
+        message: format!("{NOT_FOUND_MESSAGE_PREFIX}{name_or_id}"),
     }
 }
+
+/// The literal the app-monitor not-found message starts with, ahead of the requested
+/// name or id.
+pub const NOT_FOUND_MESSAGE_PREFIX: &str = "Resource not found ";
 
 /// The name of the CloudWatch Logs group an app monitor's telemetry is copied into.
 ///
@@ -808,27 +823,20 @@ pub fn access_denied(denial: &authorization::Denied) -> AccessDeniedException {
 /// (it names the `Name` asked for), this one carries NOTHING from the request: the
 /// recorded corpus unit `rum.untag-resource-unknown-resource-rejected` pins the message
 /// for an unknown ARN as this exact sentence, and it is the same sentence whatever ARN the
-/// request carried — the ARN itself is reported in the `resourceName` member instead. So
-/// it is a constant here rather than a format string.
+/// request carried. So it is a constant here rather than a format string.
 pub const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
 /// `ResourceNotFoundException` for a `ResourceArn` that names no resource this service
 /// holds — the not-found refusal every tagging operation answers (HTTP 404).
 ///
-/// `message` is the service's own constant wording ([`TAGGED_RESOURCE_NOT_FOUND_MESSAGE`]).
-/// `resourceName` is the ARN the request carried, since the ARN is the only way the caller
-/// named the resource, and `resourceType` is reported only for an ARN whose resource
-/// segment names an app monitor — for any other ARN the type is not something this service
-/// knows.
-pub fn tagged_resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
-    let app_monitor = resource_arn
-        .split(':')
-        .nth(5)
-        .is_some_and(|resource| resource.starts_with(&format!("{APP_MONITOR_RESOURCE}/")));
+/// `message` is the service's own constant wording ([`TAGGED_RESOURCE_NOT_FOUND_MESSAGE`])
+/// and is the whole body: like every other not-found of this service, the refusal reports
+/// no `resourceName` and no `resourceType` (see
+/// [`crate::ops::types::ResourceNotFoundException`]). The ARN is therefore taken only to
+/// decide that nothing matched it, which the caller already knows it sent.
+pub fn tagged_resource_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: TAGGED_RESOURCE_NOT_FOUND_MESSAGE.to_string(),
-        resource_name: resource_arn.to_string(),
-        resource_type: app_monitor.then(|| APP_MONITOR_RESOURCE_TYPE.to_string()),
     }
 }
 
@@ -1038,13 +1046,24 @@ pub fn policy_revision_mismatch(provided: &str) -> InvalidPolicyRevisionIdExcept
 }
 
 /// `ConflictException` for a create whose `Name` a stored app monitor already holds.
+///
+/// Like the not-found message, this one is built from the request: the literal `Resource `,
+/// the requested name verbatim, and the literal ` already exists`, with no trailing
+/// period. Unlike it, the body also reports the resource — `resourceName` is the name the
+/// request asked for and `resourceType` is [`APP_MONITOR_RESOURCE_TYPE`] — because RUM
+/// does serialize both members on this error.
 pub fn app_monitor_already_exists(name: &str) -> ConflictException {
     ConflictException {
-        message: format!("App monitor {name} already exists."),
+        message: format!("{CONFLICT_MESSAGE_PREFIX}{name}{CONFLICT_MESSAGE_SUFFIX}"),
         resource_name: name.to_string(),
         resource_type: Some(APP_MONITOR_RESOURCE_TYPE.to_string()),
     }
 }
+
+/// The literals the duplicate-name conflict message brackets the requested name with.
+pub const CONFLICT_MESSAGE_PREFIX: &str = "Resource ";
+/// See [`CONFLICT_MESSAGE_PREFIX`].
+pub const CONFLICT_MESSAGE_SUFFIX: &str = " already exists";
 
 /// What separates the components of a continuation token's resume key: a control
 /// character none of the components that precede the last one can contain (an

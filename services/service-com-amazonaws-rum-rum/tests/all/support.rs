@@ -135,6 +135,51 @@ pub(crate) fn is_modelled_app_monitor_id(id: &str) -> bool {
     shaped && version && variant
 }
 
+/// The `message` of an error body, under either spelling the member may arrive as.
+///
+/// ONE definition for every suite: a restJson1 error body carries the modelled `message`
+/// member, but an SDK and some AWS frontends spell it `Message`, so a suite that pinned
+/// only one spelling would pass or fail on the casing rather than on the text. Takes the
+/// parsed body rather than a `Reply`, so the suites that still own their own reply type
+/// can use it too.
+pub(crate) fn message(document: &Value) -> Option<&str> {
+    document["message"]
+        .as_str()
+        .or_else(|| document["Message"].as_str())
+}
+
+/// A `PutRumEvents` body carrying two events of different types, for the monitor whose
+/// id is `id`.
+///
+/// Shared, because more than one suite needs a well-formed batch: the lifecycle suite to
+/// show the events land on the monitor the id names, and the error-body suite to reach
+/// the not-found refusal for an id that names none.
+pub(crate) fn rum_events_body(id: &str) -> Value {
+    json!({
+        "BatchId": "11111111-2222-4333-8444-555555555555",
+        "AppMonitorDetails": {"name": "any", "id": id, "version": "1.0.0"},
+        "UserDetails": {
+            "userId": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "sessionId": "ffffffff-eeee-4ddd-8ccc-bbbbbbbbbbbb",
+        },
+        "RumEvents": [
+            {
+                "id": "12345678-1234-4234-8234-123456789012",
+                "timestamp": 1_704_067_200,
+                "type": "com.amazon.rum.page_view_event",
+                "metadata": "{\"version\":\"1.0.0\"}",
+                "details": "{\"pageId\":\"/home\"}",
+            },
+            {
+                "id": "22345678-1234-4234-8234-123456789012",
+                "timestamp": 1_704_067_260,
+                "type": "com.amazon.rum.js_error_event",
+                "details": "{\"message\":\"boom\"}",
+            },
+        ],
+    })
+}
+
 /// The `Tags` of a reported shape, with an omitted member read as the empty map it
 /// stands for: restJson1 draws no distinction between an absent map member and an empty
 /// one.
