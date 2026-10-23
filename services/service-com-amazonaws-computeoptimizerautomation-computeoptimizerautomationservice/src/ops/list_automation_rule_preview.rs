@@ -285,29 +285,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ListAutomationRulePreviewErrorModeled::OptInRequiredException(refusal).into(),
             );
         }
-        let matching: Vec<PreviewResult> = guard
-            .recommended_actions
-            .iter_in_order()
-            // An action that records no `accountId` belongs to no account, so no
-            // scope covers it.
-            .filter(|action| {
-                action.account_id.as_deref().is_some_and(|account_id| {
-                    crate::state::account_in_scope(account_id, scope.as_deref())
-                })
-            })
-            .filter(|action| {
-                action
-                    .recommended_action_type
-                    .as_ref()
-                    .is_some_and(|action_type| {
-                        input.recommended_action_types.contains(action_type)
-                    })
-            })
-            .filter(|action| crate::state::action_matches_criteria(action, &criteria))
-            .skip(offset)
-            .take(page_size.saturating_add(1))
-            .map(crate::state::preview_result_for)
-            .collect();
+        // The selection itself — scope, requested action types, criteria — is
+        // `crate::state::previewed_actions`, so this operation and
+        // `ListAutomationRulePreviewSummaries` report over exactly the same set
+        // of actions for the same request.
+        let matching: Vec<PreviewResult> = crate::state::previewed_actions(
+            &guard.recommended_actions,
+            scope.as_deref(),
+            &input.recommended_action_types,
+            &criteria,
+        )
+        .skip(offset)
+        .take(page_size.saturating_add(1))
+        .map(crate::state::preview_result_for)
+        .collect();
 
         // One extra result was taken: its presence is what says another page
         // exists, and the token resumes exactly where this page stopped.

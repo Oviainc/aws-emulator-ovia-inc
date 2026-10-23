@@ -19,6 +19,8 @@ mod automation_events;
 mod automation_rule_lifecycle;
 #[path = "all/automation_rule_preview.rs"]
 mod automation_rule_preview;
+#[path = "all/automation_rule_preview_summaries.rs"]
+mod automation_rule_preview_summaries;
 #[path = "all/enrollment_gate.rs"]
 mod enrollment_gate;
 #[path = "all/error_payloads.rs"]

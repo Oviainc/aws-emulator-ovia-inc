@@ -69,6 +69,11 @@ fn gated_calls() -> Vec<(&'static str, Value, u16)> {
             json!({"ruleType": "AccountRule", "recommendedActionTypes": ["UpgradeEbsVolumeType"]}),
             200,
         ),
+        (
+            "ListAutomationRulePreviewSummaries",
+            json!({"ruleType": "AccountRule", "recommendedActionTypes": ["UpgradeEbsVolumeType"]}),
+            200,
+        ),
         ("ListTagsForResource", json!({"resourceArn": arn}), 404),
         ("CreateAutomationRule", minimal_rule("gate-rule"), 200),
         (
