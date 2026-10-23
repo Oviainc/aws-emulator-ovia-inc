@@ -59,16 +59,21 @@
 //! limits do that, and each refuses (yields no value) rather than recursing, allocating
 //! or looping further:
 //!
-//! * **Before the YAML loader sees the body** — [`guard_yaml_body`] bounds its length and
-//!   the NESTING the recursive loader can descend into (flow collections open at once,
-//!   compact indicators per line, leading indentation), none of which grows with how big
-//!   a flat template is. The loader's own recursion is NOT abortable from an
-//!   `EventReceiver` (`on_event` returns `()`), and exhausting the stack aborts the
-//!   process rather than unwinding, so that nesting has to be refused BEFORE `load` is
-//!   called. The JSON spelling does not go through it at all: `serde_json` reads it under
-//!   its own nesting limit.
+//! * **Before any tree is built** — [`document`] refuses a body past the documented
+//!   `TemplateBody` maximum, whichever spelling it is in: `serde_json`'s own limit bounds
+//!   nesting DEPTH, not how many bytes or nodes a FLAT body carries, so the length bound
+//!   cannot live in the YAML guard alone. [`guard_yaml_body`] then bounds the NESTING the
+//!   recursive YAML loader can descend into (flow collections open at once, compact
+//!   indicators per line, leading indentation), none of which grows with how big a flat
+//!   template is. The loader's own recursion is NOT abortable from an `EventReceiver`
+//!   (`on_event` returns `()`), and exhausting the stack aborts the process rather than
+//!   unwinding, so that nesting has to be refused BEFORE `load` is called.
 //! * **While the tree is built** — [`MAX_TEMPLATE_NODES`] nodes and
-//!   [`MAX_TEMPLATE_DEPTH`] levels, plus the documented per-template quotas on
+//!   [`MAX_TEMPLATE_DEPTH`] levels for the YAML spelling, counted as its builder builds;
+//!   the node bound is checked by [`within_node_bound`] for the JSON tree `serde_json`
+//!   builds in one go, whose nesting is already bounded by that reader's own recursion
+//!   limit (the YAML loader needs its own because an `EventReceiver` cannot abort `load`).
+//!   Plus the documented per-template quotas on
 //!   [resources](MAX_RESOURCES_PER_TEMPLATE), [outputs](MAX_OUTPUTS_PER_TEMPLATE) and
 //!   [parameters](MAX_PARAMETERS_PER_TEMPLATE): a body past one of those is not a template
 //!   CloudFormation would accept, and this reader answers `None` for it rather than
@@ -110,6 +115,13 @@ pub const MAX_RESOURCES_PER_TEMPLATE: usize = 500;
 /// The documented CloudFormation quota ("Outputs — maximum number of outputs that you can
 /// declare in a template: 200").
 pub const MAX_OUTPUTS_PER_TEMPLATE: usize = 200;
+
+/// The most bytes a template's own `Description` carries.
+///
+/// "Description: … must be a literal string that's between 0 and 1024 bytes in length",
+/// which is also the `@length(min: 1, max: 1024)` the model puts on the `Description`
+/// members that report it (`ValidateTemplateOutput$Description`).
+pub const MAX_DESCRIPTION_BYTES: usize = 1024;
 
 /// The most attributes one provisioned resource records for `Fn::GetAtt` to read.
 ///
@@ -233,8 +245,9 @@ impl Default for Budget {
 }
 
 /// Pre-flight bounds on an untrusted YAML body, applied BEFORE the loader builds a tree
-/// from it. Only the YAML spelling needs this: the JSON spelling is read by `serde_json`,
-/// which enforces its own nesting limit.
+/// from it. Only the YAML spelling needs these: the JSON spelling is read by `serde_json`,
+/// which enforces its own nesting limit. (The body LENGTH is bounded for both spellings in
+/// [`document`]; it is re-checked here so this guard holds on its own terms.)
 ///
 /// What has to be bounded is how deep the loader can RECURSE, because an `EventReceiver`
 /// cannot abort `load` (`on_event` returns `()`) and because exhausting the stack aborts
@@ -402,19 +415,49 @@ pub struct DeclaredOutput {
     pub condition: Option<String>,
 }
 
+/// One parameter a template declares, as the template spells it.
+///
+/// A declaration keeps every member a client READING a template is told about
+/// (`ValidateTemplate` reports `TemplateParameter$ParameterKey`, `$DefaultValue`,
+/// `$NoEcho` and `$Description`), not only the two a deployment evaluates expressions
+/// with — this is the one reader of the `Parameters` section.
+#[derive(Debug, Clone)]
+pub struct DeclaredParameter {
+    /// The name the section keys this declaration by, which is what a `Ref` names and
+    /// what a stack operation passes a `Parameter$ParameterKey` for.
+    pub key: String,
+    /// `Type` (required): "The data type for the parameter". What decides whether a
+    /// `Ref` to it resolves to one value or to a LIST of them: "CommaDelimitedList: An
+    /// array of literal strings that are separated by commas", and likewise every
+    /// `List<…>` type.
+    pub declared_type: Option<String>,
+    /// `Default`, where the declaration gives a scalar one: "A value of the appropriate
+    /// type for the template to use if no value is specified when a stack is created".
+    /// Only a scalar default is a value a `Ref` can resolve to without knowing the
+    /// parameter's type; a `List<Number>` default is left to the request.
+    pub default: Option<String>,
+    /// `NoEcho`: "Whether to mask the parameter value to prevent it from being displayed
+    /// in the console, command line tools, or API" — `false` where the declaration omits
+    /// it, which is the documented default.
+    pub no_echo: bool,
+    /// `Description`: "A string of up to 4000 characters that describes the parameter".
+    pub description: Option<String>,
+}
+
 /// A template body, as this service reads it.
 #[derive(Debug, Clone, Default)]
 pub struct Template {
     /// The template's own `Description`, which is where CloudFormation takes
     /// `Stack$Description` from.
     pub description: Option<String>,
-    /// `Parameters`, with each declared parameter's `Default` where it has a string one:
-    /// the value a `Ref` to that parameter resolves to when the request supplied none.
-    pub parameter_defaults: BTreeMap<String, String>,
-    /// Each declared parameter's `Type`, which is what decides whether a `Ref` to it
-    /// resolves to one value or to a LIST of them: "CommaDelimitedList: An array of
-    /// literal strings that are separated by commas", and likewise every `List<…>` type.
-    pub parameter_types: BTreeMap<String, String>,
+    /// The `Parameters` section: one entry per declared parameter, in the order the
+    /// reader walked the section. The SINGLE record of what a template declares as a
+    /// parameter — [`Self::parameter_defaults`] and [`Self::parameter_types`] are views
+    /// of it, so nothing holds a second copy.
+    pub parameters: Vec<DeclaredParameter>,
+    /// The `Transform` section: the names of the macros the template declares, in
+    /// declaration order (`ValidateTemplateOutput$DeclaredTransforms`).
+    pub transforms: Vec<String>,
     /// The `Mappings` section, which `Fn::FindInMap` reads.
     pub mappings: Value,
     /// The `Conditions` section, which `Fn::If` and a resource's or output's own
@@ -422,6 +465,137 @@ pub struct Template {
     pub conditions: Value,
     pub resources: Vec<DeclaredResource>,
     pub outputs: Vec<DeclaredOutput>,
+}
+
+impl Template {
+    /// Each declared parameter's `Default` where it has a scalar one: the value a `Ref`
+    /// to that parameter resolves to when the request supplied none.
+    ///
+    /// Builds the map on each call (the declarations are the stored form), so a caller
+    /// that needs it more than once binds it to a local rather than calling in a loop.
+    pub fn parameter_defaults(&self) -> BTreeMap<String, String> {
+        self.parameters
+            .iter()
+            .filter_map(|parameter| {
+                parameter
+                    .default
+                    .clone()
+                    .map(|default| (parameter.key.clone(), default))
+            })
+            .collect()
+    }
+
+    /// Each declared parameter's `Type`, which is what decides whether a `Ref` to it
+    /// resolves to one value or to a LIST of them.
+    ///
+    /// Allocates per call, the same way [`Self::parameter_defaults`] does.
+    pub fn parameter_types(&self) -> BTreeMap<String, String> {
+        self.parameters
+            .iter()
+            .filter_map(|parameter| {
+                parameter
+                    .declared_type
+                    .clone()
+                    .map(|declared_type| (parameter.key.clone(), declared_type))
+            })
+            .collect()
+    }
+}
+
+/// The `Capability` value that acknowledges a template's IAM resources when
+/// CloudFormation generates their names (the model's `Capability` enum).
+pub const CAPABILITY_IAM: &str = "CAPABILITY_IAM";
+
+/// The `Capability` value that acknowledges a template's IAM resources when the template
+/// gives one of them a CUSTOM name (the model's `Capability` enum).
+pub const CAPABILITY_NAMED_IAM: &str = "CAPABILITY_NAMED_IAM";
+
+/// The IAM resource types a template has to be acknowledged for, each with the property
+/// a resource of that type takes a CUSTOM name from (`None` for a type that has no such
+/// property).
+///
+/// Source: "Acknowledging IAM resources in CloudFormation templates" in the
+/// CloudFormation User Guide, which lists these resource types as the ones requiring
+/// `CAPABILITY_IAM`, and "you must specify `CAPABILITY_NAMED_IAM` if you have IAM
+/// resources with custom names" for the named form.
+const IAM_CAPABILITY_RESOURCES: &[(&str, Option<&str>)] = &[
+    ("AWS::IAM::AccessKey", None),
+    ("AWS::IAM::Group", Some("GroupName")),
+    ("AWS::IAM::InstanceProfile", Some("InstanceProfileName")),
+    ("AWS::IAM::ManagedPolicy", Some("ManagedPolicyName")),
+    ("AWS::IAM::OIDCProvider", None),
+    ("AWS::IAM::Policy", None),
+    ("AWS::IAM::Role", Some("RoleName")),
+    ("AWS::IAM::SAMLProvider", None),
+    ("AWS::IAM::ServerCertificate", None),
+    ("AWS::IAM::ServiceLinkedRole", None),
+    ("AWS::IAM::User", Some("UserName")),
+    ("AWS::IAM::UserToGroupAddition", None),
+];
+
+/// The capabilities a template's own declarations require, and the resources that
+/// required them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequiredCapabilities {
+    /// The `Capability` values, without repetition
+    /// (`ValidateTemplateOutput$Capabilities`). Empty for a template that declares
+    /// nothing needing acknowledgement.
+    pub capabilities: Vec<String>,
+    /// `CapabilitiesReason`: "the list of resources that generated the values in the
+    /// Capabilities response element" — `None` when there are no capabilities to
+    /// explain.
+    pub reason: Option<String>,
+}
+
+/// What a template has to be acknowledged for: the IAM resources it declares.
+///
+/// A template declaring any of [`IAM_CAPABILITY_RESOURCES`] requires
+/// [`CAPABILITY_IAM`], and one that gives such a resource a custom name requires
+/// [`CAPABILITY_NAMED_IAM`] instead — "if your stack template contains IAM resources
+/// with custom names, you must specify CAPABILITY_NAMED_IAM". A resource the template
+/// declares under a condition still counts: the acknowledgement is about what the
+/// template CONTAINS, which is what the request is held to before any condition is
+/// evaluated.
+pub fn required_capabilities(template: &Template) -> RequiredCapabilities {
+    let mut types: Vec<&str> = Vec::new();
+    let mut named = false;
+    for resource in &template.resources {
+        let Some((resource_type, name_property)) = IAM_CAPABILITY_RESOURCES
+            .iter()
+            .find(|(known, _)| *known == resource.resource_type)
+        else {
+            continue;
+        };
+        if !types.contains(resource_type) {
+            types.push(resource_type);
+        }
+        // A custom name is one the TEMPLATE sets: the property's presence is what makes
+        // it custom, whatever expression spells it.
+        if let Some(property) = name_property {
+            if resource
+                .properties
+                .get(property)
+                .is_some_and(|name| !name.is_null())
+            {
+                named = true;
+            }
+        }
+    }
+    if types.is_empty() {
+        return RequiredCapabilities::default();
+    }
+    let capability = if named {
+        CAPABILITY_NAMED_IAM
+    } else {
+        CAPABILITY_IAM
+    };
+    RequiredCapabilities {
+        capabilities: vec![capability.to_string()],
+        reason: Some(format!(
+            "The following resource(s) require capabilities: [{}]",
+            types.join(", ")
+        )),
+    }
 }
 
 /// Read a template body, whether it is spelled as JSON or as YAML.
@@ -446,11 +620,43 @@ pub fn description(body: &str) -> Option<String> {
 /// JSON is tried first because YAML 1.2 is a superset of JSON and `serde_json` reads the
 /// JSON spelling exactly (and far more cheaply) than a YAML event walk would, under its
 /// own nesting limit.
+///
+/// The body's LENGTH is refused here, before either reader runs and for both spellings: a
+/// tree costs several times the bytes it was read from (the sections below are cloned out
+/// of it), and `serde_json`'s own limit bounds nesting depth rather than size, so a large
+/// FLAT body would otherwise be read and copied unbounded.
 fn document(body: &str) -> Option<Value> {
+    if body.len() > super::TEMPLATE_BODY_MAX_BYTES {
+        return None;
+    }
     if let Ok(value) = ::serde_json::from_str::<Value>(body) {
-        return Some(value);
+        // `serde_json` bounds how deep it recurses but counts no nodes, so the tree it
+        // built is held to the same node bound the YAML builder applies as it builds.
+        return within_node_bound(&value).then_some(value);
     }
     yaml_document(body)
+}
+
+/// Whether a built tree is within [`MAX_TEMPLATE_NODES`] nodes.
+///
+/// Iterative, with an explicit stack: a recursive walk of a caller-supplied tree would
+/// spend the process stack on nesting the caller chose. The pending stack cannot outgrow
+/// the node count, which is what the bound refuses.
+fn within_node_bound(document: &Value) -> bool {
+    let mut nodes = 0usize;
+    let mut pending: Vec<&Value> = vec![document];
+    while let Some(value) = pending.pop() {
+        nodes += 1;
+        if nodes > MAX_TEMPLATE_NODES {
+            return false;
+        }
+        match value {
+            Value::Array(items) => pending.extend(items.iter()),
+            Value::Object(entries) => pending.extend(entries.values()),
+            _ => {}
+        }
+    }
+    true
 }
 
 /// The sections of a parsed template this service reads, or `None` when a section is past
@@ -483,20 +689,29 @@ fn template_of(document: &Value) -> Option<Template> {
             return None;
         }
         for (name, declaration) in parameters {
-            // Only a string `Default` is a value a `Ref` can resolve to without knowing
-            // the parameter's type; a `List<Number>` default is left to the request.
-            if let Some(default) = declaration.get("Default").and_then(scalar_text) {
-                template.parameter_defaults.insert(name.clone(), default);
-            }
-            // "Type (required): The data type for the parameter" — kept because a
-            // list-typed parameter's value is an ARRAY to every function that reads it.
-            if let Some(declared_type) = declaration.get("Type").and_then(Value::as_str) {
-                template
-                    .parameter_types
-                    .insert(name.clone(), declared_type.to_string());
-            }
+            template.parameters.push(DeclaredParameter {
+                key: name.clone(),
+                // "Type (required): The data type for the parameter" — kept because a
+                // list-typed parameter's value is an ARRAY to every function that reads
+                // it.
+                declared_type: declaration
+                    .get("Type")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                // Only a scalar `Default` is a value a `Ref` can resolve to without
+                // knowing the parameter's type; a `List<Number>` default is left to the
+                // request.
+                default: declaration.get("Default").and_then(scalar_text),
+                no_echo: declaration.get("NoEcho").is_some_and(flag),
+                description: declaration
+                    .get("Description")
+                    .and_then(Value::as_str)
+                    .filter(|description| !description.is_empty())
+                    .map(ToString::to_string),
+            });
         }
     }
+    template.transforms = declared_transforms(document.get("Transform"));
     if let Some(resources) = document.get("Resources").and_then(Value::as_object) {
         if resources.len() > MAX_RESOURCES_PER_TEMPLATE {
             return None;
@@ -553,6 +768,42 @@ fn template_of(document: &Value) -> Option<Template> {
         }
     }
     Some(template)
+}
+
+/// The names the `Transform` section declares.
+///
+/// "The optional Transform section … specifies one or more macros that CloudFormation
+/// uses to process your template", spelled as a single name or as a list of them, and a
+/// macro entry may be the name alone or an object carrying `Name` beside the macro's
+/// `Parameters` — so the NAME is what is reported either way, and an entry that names
+/// nothing contributes nothing.
+fn declared_transforms(section: Option<&Value>) -> Vec<String> {
+    fn transform_name(entry: &Value) -> Option<String> {
+        match entry {
+            Value::String(name) => Some(name.clone()),
+            Value::Object(_) => entry
+                .get("Name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            _ => None,
+        }
+    }
+    match section {
+        Some(Value::Array(entries)) => entries.iter().filter_map(transform_name).collect(),
+        Some(entry) => transform_name(entry).into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// A template scalar as the boolean CloudFormation reads it: a true boolean, or the text
+/// a JSON template spells one as (`"NoEcho": "true"`), case-insensitively. Anything else
+/// is not a boolean and reads as `false`.
+fn flag(value: &Value) -> bool {
+    match value {
+        Value::Bool(flag) => *flag,
+        Value::String(text) => text.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
 }
 
 /// A scalar as the text an intrinsic function substitutes for it. A number or a boolean
@@ -2168,7 +2419,17 @@ fn intrinsic(
         // encoder the wire serializer already uses for every Smithy blob.
         "Fn::Base64" => {
             let source = text(argument, scope, depth + 1, budget)?;
-            Some(Resolved::Text(::aws_smithy_types::base64::encode(source)))
+            // Base64 expands its input by 4/3, so the encoded SIZE is refused before the
+            // string is built and charged to the budget once it is — the same bound every
+            // other text-producing arm is held to, so nesting one inside another cannot
+            // multiply what one request allocates.
+            if 4 * source.len().div_ceil(3) > MAX_RESOLVED_TEXT_BYTES {
+                return None;
+            }
+            bounded(
+                Resolved::Text(::aws_smithy_types::base64::encode(source)),
+                budget,
+            )
         }
         // "The intrinsic function Fn::Cidr returns an array of CIDR address blocks."
         "Fn::Cidr" => cidr(argument, scope, depth, budget),

@@ -36,7 +36,7 @@ const ACCOUNT_ID: &str = "000000000000";
 /// the resources it produced — each with its evaluated `properties`.
 fn deployed(body: &str, parameters: &[(&str, &str)]) -> Vec<StoredResource> {
     let declared = template::parse(body).expect("the template body is readable");
-    let mut values: BTreeMap<String, String> = declared.parameter_defaults.clone();
+    let mut values: BTreeMap<String, String> = declared.parameter_defaults();
     for (key, value) in parameters {
         values.insert((*key).to_string(), (*value).to_string());
     }
@@ -46,13 +46,14 @@ fn deployed(body: &str, parameters: &[(&str, &str)]) -> Vec<StoredResource> {
         stack_id: STACK_ID,
     };
     let mut budget = Budget::new();
+    let parameter_types = declared.parameter_types();
     let no_resources: BTreeMap<String, StoredResource> = BTreeMap::new();
     // The deployment's scope before any resource is resolved, exactly as
     // `StoredStack::deploy_template` builds it.
     let declaring = Scope {
         stack,
         parameters: &values,
-        parameter_types: &declared.parameter_types,
+        parameter_types: &parameter_types,
         resources: &no_resources,
         mappings: &declared.mappings,
         conditions: &declared.conditions,

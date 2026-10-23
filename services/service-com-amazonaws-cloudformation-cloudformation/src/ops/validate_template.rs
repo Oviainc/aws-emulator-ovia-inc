@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ValidateTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ValidateTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ValidateTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What this operation answers is computed from the template body the request carries:
+//! it READS that body (CloudFormation reads a template as JSON or, failing that, as
+//! YAML) and reports what the body declares. Nothing is written — "Validates a specified
+//! template" is a verdict on the request's own input, not a resource — so two callers
+//! validating the same body get the same answer and neither changes what a later one
+//! sees.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +78,17 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::template;
+
+/// What a body that is neither valid JSON nor valid YAML — or one past a documented
+/// per-template quota, which [`template::parse`] refuses the same way — is refused with.
+///
+/// "CloudFormation first checks if the template is valid JSON. If it isn't,
+/// CloudFormation checks if the template is valid YAML. If both these checks fail,
+/// CloudFormation returns a template validation error."
+const TEMPLATE_FORMAT_ERROR: &str = "Template format error: the template body is not \
+     well-formed JSON or YAML, or declares more than a template's documented maximum \
+     number of resources, outputs or parameters";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -149,18 +157,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ValidateTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ValidateTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ValidateTemplate"))
+        // A verdict on the REQUEST's template body: this operation reads no stored
+        // resource and writes none, so neither the engine nor the request metadata is
+        // part of the answer.
+        let _ = (ctx, &self.engine);
+        // "Conditional: You must pass TemplateURL or TemplateBody. If both are passed,
+        // only TemplateBody is used" (`ValidateTemplateInput$TemplateBody`).
+        // Borrowed, never copied: the body may be 51,200 bytes and nothing below needs
+        // to own it.
+        let template_body: &str = match (&input.template_body, &input.template_url) {
+            (Some(body), _) => body.as_str(),
+            // A `TemplateURL` names a template in an Amazon S3 bucket or a Systems
+            // Manager document, which would have to be fetched over the network — this
+            // emulator makes no outbound connections. Answered 501 rather than with a
+            // verdict on a template nobody read.
+            (None, Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "ValidateTemplate with TemplateURL (fetching a template from Amazon S3)",
+                ))
+            }
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    "Either TemplateBody or TemplateURL must be specified",
+                ))
+            }
+        };
+        // The documented `TemplateBody` maximum, which the model carries no `@length`
+        // for — the same rule every operation that takes a body is held to.
+        crate::state::validate_template_body(template_body)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        let Some(template) = template::parse(template_body) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                TEMPLATE_FORMAT_ERROR,
+            ));
+        };
+        // "Resources (required): Specifies the stack resources and their properties" is
+        // the one section a template cannot leave out, and an entry carrying no `Type`
+        // ("Type: required") declares no resource — so a body whose `Resources` section
+        // is missing, empty or untyped is refused rather than reported as valid.
+        if template.resources.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "Template format error: At least one Resources member must be defined.",
+            ));
+        }
+        if template
+            .description
+            .as_ref()
+            .is_some_and(|description| description.len() > template::MAX_DESCRIPTION_BYTES)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Template format error: Description must be no longer than {} bytes",
+                template::MAX_DESCRIPTION_BYTES
+            )));
+        }
+        let required = template::required_capabilities(&template);
+        Ok(ValidateTemplateOutput {
+            // One `TemplateParameter` per parameter the template declares, carrying what
+            // the declaration says: a template declaring no `Parameters` section reports
+            // the empty list rather than nothing, because "no parameters" is itself the
+            // answer a client validating a template before a stack operation reads.
+            // `NoEcho` is reported for every parameter, `false` being its documented
+            // default.
+            parameters: Some(
+                template
+                    .parameters
+                    .iter()
+                    .map(|parameter| TemplateParameter {
+                        parameter_key: Some(parameter.key.clone()),
+                        default_value: parameter.default.clone(),
+                        no_echo: Some(parameter.no_echo),
+                        description: parameter.description.clone(),
+                    })
+                    .collect(),
+            ),
+            // "The description found within the template."
+            description: template.description.clone(),
+            // "The capabilities found within the template": reported only where the
+            // template declares something that has to be acknowledged, together with the
+            // resources that generated them.
+            capabilities: (!required.capabilities.is_empty()).then_some(required.capabilities),
+            capabilities_reason: required.reason,
+            // "A list of the transforms that are declared in the template."
+            declared_transforms: (!template.transforms.is_empty())
+                .then(|| template.transforms.clone()),
+        })
     }
 }

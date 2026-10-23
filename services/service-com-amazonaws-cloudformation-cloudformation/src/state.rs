@@ -591,7 +591,7 @@ impl StoredStack {
         // "Default: A value of the appropriate type for the template to use if no value
         // is specified when a stack is created" — the request's values win over the
         // template's declared defaults.
-        let mut parameters = declared.parameter_defaults.clone();
+        let mut parameters = declared.parameter_defaults();
         for parameter in &self.parameters {
             parameters.insert(parameter.key.clone(), parameter.value.clone());
         }
@@ -604,12 +604,13 @@ impl StoredStack {
         // evaluated out of it, so the total work one request can ask for is bounded.
         let mut budget = template::Budget::new();
         let no_resources = BTreeMap::new();
+        let parameter_types = declared.parameter_types();
         // The deployment's scope with no resource resolved yet, which is what
         // `provision` turns into the stack's resources.
         let scope = template::Scope {
             stack,
             parameters: &parameters,
-            parameter_types: &declared.parameter_types,
+            parameter_types: &parameter_types,
             resources: &no_resources,
             mappings: &declared.mappings,
             conditions: &declared.conditions,
@@ -1462,7 +1463,7 @@ pub fn parameters_in_force(
     supplied: Vec<StoredParameter>,
 ) -> Vec<StoredParameter> {
     let declared = template::parse(template_body)
-        .map(|parsed| parsed.parameter_defaults)
+        .map(|parsed| parsed.parameter_defaults())
         .unwrap_or_default();
     let supplied_by_key: ::std::collections::HashMap<&str, &StoredParameter> = supplied
         .iter()
