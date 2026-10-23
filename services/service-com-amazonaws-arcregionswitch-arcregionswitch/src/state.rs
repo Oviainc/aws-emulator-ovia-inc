@@ -32,7 +32,10 @@ use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_types::DateTime;
 
-use crate::ops::types::{AbbreviatedPlan, ExecutionEvent, Plan, StepState};
+use crate::ops::types::{
+    AbbreviatedPlan, ExecutionBlockConfiguration, ExecutionEvent, Plan, Route53HealthCheck, Step,
+    StepState,
+};
 
 /// How long after `StartPlanExecution` the clock owes an execution its outcome.
 ///
@@ -64,6 +67,19 @@ pub const EVENT_EXECUTION_PENDING: &str = "executionPending";
 
 /// The `ExecutionEventType` recorded when an execution reaches [`FAILED`].
 pub const EVENT_EXECUTION_FAILED: &str = "executionFailed";
+
+/// The Region a request that carries no SigV4 credential scope is attributed to.
+/// Matches the Region generated emulators default to.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The `Route53HealthCheckStatus` this emulator reports for a health check it lists,
+/// from the model's `Route53HealthCheckStatus` enum
+/// (`smithy_query(query="shape", shape="Route53HealthCheckStatus", model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`).
+///
+/// Nothing in this emulator probes a Route 53 record's endpoint, so no health state has
+/// been observed for it: `unknown` is the modelled value for exactly that. Reporting
+/// `healthy` or `unhealthy` would claim an observation nothing made.
+pub const HEALTH_CHECK_STATUS_UNKNOWN: &str = "unknown";
 
 /// The most plans this emulator stores. Not an AWS quota — AWS publishes its own, which
 /// this does not claim to reproduce — but the ceiling that keeps an unauthenticated
@@ -161,6 +177,72 @@ impl StoredPlan {
     /// the Region that is not `region` is unique when `region` is one of them.
     pub fn counterpart_region(&self, region: &str) -> Option<String> {
         self.plan.regions.iter().find(|r| *r != region).cloned()
+    }
+
+    /// The Route 53 health checks this plan configures, as
+    /// `ListRoute53HealthChecks` reports them: one per (hosted zone, record name,
+    /// Region) triple any `Route53HealthCheck` execution block of its workflows names,
+    /// deduplicated and in ascending order of that triple so paging over them is stable.
+    ///
+    /// The triples come from the stored `Route53HealthCheckConfiguration`s: the block's
+    /// `hostedZoneId` and `recordName`, with the `region` of each of its `recordSets`.
+    /// `region` is a required member of `Route53HealthCheck`, and a record set's
+    /// `region` is the only Region the stored configuration names, so a block whose
+    /// record sets name none contributes nothing — this emulator does not read the
+    /// hosted zone from Route 53 to discover the record sets a configuration left out.
+    ///
+    /// `healthCheckId` is absent and `status` is [`HEALTH_CHECK_STATUS_UNKNOWN`]: no
+    /// Route 53 health check was created for the record, and nothing probed it.
+    pub fn route53_health_checks(&self) -> Vec<Route53HealthCheck> {
+        let mut found: BTreeSet<(String, String, String)> = BTreeSet::new();
+        for workflow in &self.plan.workflows {
+            collect_route53_health_checks(
+                workflow.steps.as_deref().unwrap_or_default(),
+                &mut found,
+            );
+        }
+        found
+            .into_iter()
+            .map(
+                |(hosted_zone_id, record_name, region)| Route53HealthCheck {
+                    hosted_zone_id,
+                    record_name,
+                    health_check_id: None,
+                    status: Some(HEALTH_CHECK_STATUS_UNKNOWN.to_string()),
+                    region,
+                },
+            )
+            .collect()
+    }
+}
+
+/// Collect the `(hostedZoneId, recordName, region)` triples the `Route53HealthCheck`
+/// blocks reachable from `steps` name, descending into the steps a `Parallel` block
+/// nests.
+///
+/// The walk keeps its own stack rather than recursing: how deeply `parallelConfig`
+/// nests is chosen by whoever created the plan, so recursion would let one request
+/// grow the call stack.
+fn collect_route53_health_checks(steps: &[Step], found: &mut BTreeSet<(String, String, String)>) {
+    let mut pending: Vec<&Step> = steps.iter().collect();
+    while let Some(step) = pending.pop() {
+        match &step.execution_block_configuration {
+            ExecutionBlockConfiguration::parallelConfig(nested) => {
+                pending.extend(nested.steps.iter());
+            }
+            ExecutionBlockConfiguration::route53HealthCheckConfig(config) => {
+                for record_set in config.record_sets.iter().flatten() {
+                    if let Some(region) = record_set.region.as_ref() {
+                        found.insert((
+                            config.hosted_zone_id.clone(),
+                            config.record_name.clone(),
+                            region.clone(),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -491,4 +573,17 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsArcregionswitchArcregionswitchState>)
+}
+
+/// The Region a request is scoped to: the Region of its SigV4 credential scope, or
+/// [`DEFAULT_REGION`] when it carries none.
+///
+/// This service's plans are global (their ARN has an empty Region segment), so a
+/// request's Region matters only to the `...InRegion` operations, which report what the
+/// Region they were called in holds.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }

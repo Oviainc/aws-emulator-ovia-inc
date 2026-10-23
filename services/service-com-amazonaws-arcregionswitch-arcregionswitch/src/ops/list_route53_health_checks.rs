@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRoute53HealthChecks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRoute53HealthChecks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRoute53HealthChecks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Amazon Route 53 health checks of one Region switch plan, computed from
+//! the plan this service persists: every `(hostedZoneId, recordName, region)` triple a
+//! `Route53HealthCheck` execution block of the plan's workflows names, filtered by the
+//! request's `hostedZoneId` and `recordName` when they are given, and paged by
+//! `maxResults`/`nextToken`. See [`crate::state::StoredPlan::route53_health_checks`]
+//! for the projection, including why `healthCheckId` is absent and `status` is
+//! `unknown`.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +157,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRoute53HealthChecks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRoute53HealthChecksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRoute53HealthChecks"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRoute53HealthChecksErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Region switch plan store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The token is a position in the filtered list of health checks; the only ones
+        // this service hands out are positions strictly inside it. A token it never
+        // issued is an invalid argument, which this operation models its own 400 for.
+        let offset = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => match token.parse::<usize>() {
+                Ok(offset) => offset,
+                Err(_) => {
+                    return Err(ListRoute53HealthChecksErrorModeled::IllegalArgumentException(
+                        IllegalArgumentException {
+                            message: format!(
+                                "nextToken is not a pagination token this service issued: {token}"
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        // `maxResults` is constrained `@range(1..100)`; an absent one asks for as many as
+        // that range allows.
+        let page_size = crate::state::page_size(input.max_results);
+
+        // `@readonly`: the only write is `settle`, which materialises the state changes the
+        // clock already made due — owed at the same instant whether or not anybody called.
+        // Every handler settles, so no two readers disagree about the current state.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(record) = store.plans.get(&input.arn) else {
+            return Err(ListRoute53HealthChecksErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("No plan found for arn {}", input.arn),
+                },
+            )
+            .into());
+        };
+
+        // Both filters select by exact value, as the stored configuration records them;
+        // an absent filter selects everything.
+        let health_checks: Vec<Route53HealthCheck> = record
+            .route53_health_checks()
+            .into_iter()
+            .filter(|check| {
+                input
+                    .hosted_zone_id
+                    .as_deref()
+                    .is_none_or(|hosted_zone_id| hosted_zone_id == check.hosted_zone_id)
+                    && input
+                        .record_name
+                        .as_deref()
+                        .is_none_or(|record_name| record_name == check.record_name)
+            })
+            .collect();
+
+        let total = health_checks.len();
+        if offset >= total.max(1) {
+            return Err(ListRoute53HealthChecksErrorModeled::IllegalArgumentException(
+                IllegalArgumentException {
+                    message: format!(
+                        "nextToken is not a pagination token this service issued: it resumes at \
+                         {offset}, at or past the last of the {total} health checks of plan {}",
+                        input.arn
+                    ),
+                },
+            )
+            .into());
+        }
+        let end = offset.saturating_add(page_size).min(total);
+        let page: Vec<Route53HealthCheck> =
+            health_checks.get(offset..end).unwrap_or_default().to_vec();
+
+        Ok(ListRoute53HealthChecksOutput {
+            health_checks: Some(page),
+            // A token only when a further page exists, so a caller paginating until the
+            // token is null terminates.
+            next_token: (end < total).then(|| end.to_string()),
+        })
     }
 }
+
