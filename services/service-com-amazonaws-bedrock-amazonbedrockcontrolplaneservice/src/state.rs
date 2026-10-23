@@ -8,6 +8,11 @@
 //! THIS struct through [`service_state`], so a guardrail created by one request is
 //! the guardrail every later request sees.
 //!
+//! It also holds the account's model invocation logging configuration — the single
+//! settings record `ops/{get,put,delete}_model_invocation_logging_configuration.rs`
+//! share, so the configuration one request stores is the configuration the next
+//! request reads back.
+//!
 //! The record shapes, and the conversions between the `*PolicyConfig` shapes a
 //! request carries and the `*Policy` shapes a response carries, live here rather
 //! than in one operation's file because six operations share them (a file under
@@ -30,7 +35,7 @@ use crate::ops::types::{
     GuardrailSensitiveInformationPolicyConfig, GuardrailTopic, GuardrailTopicConfig,
     GuardrailTopicPolicy, GuardrailTopicPolicyConfig, GuardrailTopicsTier,
     GuardrailTopicsTierConfig, GuardrailWord, GuardrailWordConfig, GuardrailWordPolicy,
-    GuardrailWordPolicyConfig, Tag,
+    GuardrailWordPolicyConfig, LoggingConfig, Tag,
 };
 
 /// The working version every guardrail always has, as `GuardrailDraftVersion`
@@ -252,6 +257,9 @@ impl Guardrail {
 ///   its live versions, including when a SINGLE version is deleted
 ///   ([`Guardrail::remove_version`]).
 ///
+/// * `model_invocation_logging` is a single optional settings record, which a put
+///   replaces rather than appends to.
+///
 /// So the whole store is bounded by the live resources the quotas admit, and no
 /// sequence of requests — including create/delete cycles with fresh idempotency
 /// tokens — can grow it past them.
@@ -268,6 +276,17 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many guardrail ids this store has minted; the uniqueness half of a
     /// minted id.
     pub minted_guardrails: u64,
+    /// The model invocation logging configuration currently in force, as
+    /// `PutModelInvocationLoggingConfiguration` last stored it, or `None` while none
+    /// is configured (nothing was ever put, or
+    /// `DeleteModelInvocationLoggingConfiguration` removed it).
+    ///
+    /// ONE record, not a map: model invocation logging is a single account-level
+    /// settings record rather than a resource a caller can create more than one of,
+    /// so a put REPLACES this field whole and the store cannot grow by putting
+    /// again. It is keyed by nothing for the same reason the guardrail store is not
+    /// keyed by region: this store models the one account the emulator serves.
+    pub model_invocation_logging: Option<LoggingConfig>,
 }
 
 impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
