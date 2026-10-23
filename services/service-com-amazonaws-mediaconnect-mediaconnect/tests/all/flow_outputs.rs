@@ -437,6 +437,175 @@ async fn add_flow_outputs_refuses_what_it_cannot_add() {
     }
 }
 
+/// One `MediaStreamOutputConfigurations` entry for the media stream `media_stream_name`,
+/// sending to `destination_ip`.
+fn media_stream_output_configuration(media_stream_name: &str, destination_ip: &str) -> Value {
+    json!({
+        "encodingName": "jxsv",
+        "mediaStreamName": media_stream_name,
+        "destinationConfigurations": [
+            {
+                "destinationIp": destination_ip,
+                "destinationPort": 6000,
+                "interface": { "name": "vpc-1" }
+            }
+        ],
+        "encodingParameters": { "compressionFactor": 8.0, "encoderProfile": "high" }
+    })
+}
+
+/// Assert the stored `configurations` are the `requested` ones, with the one member no
+/// request can carry — `DestinationConfiguration$OutboundIp`, "the IP address that the
+/// receiver requires in order to establish a connection with the flow" — assigned by the
+/// SERVICE from the documentation-range pool its egress addresses are drawn from
+/// (`service_..::state::assigned_egress_ip`).
+fn assert_media_stream_output_configurations(
+    case: &str,
+    configurations: &Value,
+    requested: &Value,
+) {
+    let stored = configurations.as_array().cloned().unwrap_or_default();
+    let wanted = requested.as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        stored.len(),
+        wanted.len(),
+        "case {case:?}: one configuration per requested configuration, got {configurations:?}"
+    );
+    for (position, (configuration, request)) in stored.iter().zip(wanted.iter()).enumerate() {
+        for member in ["encodingName", "mediaStreamName", "encodingParameters"] {
+            assert_eq!(
+                configuration[member], request[member],
+                "case {case:?}: configuration {position} {member}, got {configuration:?}"
+            );
+        }
+        let destinations = configuration["destinationConfigurations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let wanted_destinations = request["destinationConfigurations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            destinations.len(),
+            wanted_destinations.len(),
+            "case {case:?}: configuration {position} destination count, got {configuration:?}"
+        );
+        for (destination, want) in destinations.iter().zip(wanted_destinations.iter()) {
+            for member in ["destinationIp", "destinationPort", "interface"] {
+                assert_eq!(
+                    destination[member], want[member],
+                    "case {case:?}: configuration {position} destination {member}, got \
+                     {destination:?}"
+                );
+            }
+            let outbound = destination["outboundIp"].as_str().unwrap_or_default();
+            assert!(
+                (1..=254).any(|host| {
+                    service_com_amazonaws_mediaconnect_mediaconnect::state::assigned_egress_ip(host)
+                        == outbound
+                }),
+                "case {case:?}: configuration {position} outboundIp is an address the service \
+                 assigns from its egress pool, got {destination:?}"
+            );
+        }
+    }
+}
+
+/// The members of an output request that the stored record carries beyond the plain ones:
+/// its media stream associations and its router integration settings. Both the operations
+/// that ADD an output to a flow store them, so both are read back through DescribeFlow.
+#[tokio::test]
+async fn an_added_output_persists_its_media_stream_and_router_integration_settings() {
+    let emulator = Emulator::new();
+
+    let case = "an output created with media stream associations";
+    let created_configurations = json!([media_stream_output_configuration("ms-1", "198.51.100.60")]);
+    let (status, code, created) = emulator
+        .create_flow(json!({
+            "name": "flow-output-media-streams",
+            "source": { "name": "src", "protocol": "rtp", "whitelistCidr": "10.0.0.0/16" },
+            "mediaStreams": [
+                { "mediaStreamId": 1, "mediaStreamName": "ms-1", "mediaStreamType": "video" },
+                { "mediaStreamId": 2, "mediaStreamName": "ms-2", "mediaStreamType": "audio" }
+            ],
+            "outputs": [{
+                "name": "created",
+                "protocol": "st2110-jpegxs",
+                "port": 7100,
+                "mediaStreamOutputConfigurations": created_configurations,
+                "routerIntegrationState": "ENABLED"
+            }],
+        }))
+        .await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (201, None),
+        "case {case:?}: the flow under test must be created, got {status} {code:?}: {created}"
+    );
+    let flow_arn = created["flow"]["flowArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let stored = described_outputs(&emulator, case, &flow_arn).await;
+    let output = stored.first().cloned().unwrap_or(Value::Null);
+    assert_media_stream_output_configurations(
+        case,
+        &output["mediaStreamOutputConfigurations"],
+        &created_configurations,
+    );
+    assert_eq!(
+        output["routerIntegrationState"].as_str(),
+        Some("ENABLED"),
+        "case {case:?}: the output reports the router integration state it was created \
+         with, got {output:?}"
+    );
+
+    let case = "an output added with media stream associations";
+    let added_configurations = json!([
+        media_stream_output_configuration("ms-1", "198.51.100.61"),
+        media_stream_output_configuration("ms-2", "198.51.100.62")
+    ]);
+    let (status, code, body) = add_flow_outputs(
+        &emulator,
+        &flow_arn,
+        json!([{
+            "name": "added",
+            "protocol": "st2110-jpegxs",
+            "port": 7102,
+            "mediaStreamOutputConfigurations": added_configurations
+        }]),
+    )
+    .await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (201, None),
+        "case {case:?}: expected 201 with no error, got {status} {code:?}: {body}"
+    );
+    assert_media_stream_output_configurations(
+        case,
+        &body["outputs"][0]["mediaStreamOutputConfigurations"],
+        &added_configurations,
+    );
+    // "Indicates if router integration is enabled or disabled on the flow output" is
+    // reported on every output, so one added without it reports the disabled state.
+    assert_eq!(
+        body["outputs"][0]["routerIntegrationState"].as_str(),
+        Some("DISABLED"),
+        "case {case:?}: an output added without a router integration state reports the \
+         disabled one, got {body}"
+    );
+
+    // The round trip: DescribeFlow reports what the add answered.
+    let after = described_outputs(&emulator, case, &flow_arn).await;
+    assert_eq!(
+        after.last().cloned().unwrap_or(Value::Null),
+        body["outputs"][0],
+        "case {case:?}: DescribeFlow reports the record the add answered, got {after:?}"
+    );
+}
+
 /// `count` output requests, named `out-<n>` from `first`, so a case can fill a flow to a
 /// known number of outputs.
 fn numbered_outputs(first: usize, count: usize) -> Value {
