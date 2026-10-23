@@ -3,7 +3,12 @@
 //! @op InvokeRestApi
 //!
 //! Resolves the STORED environment the request names and refuses a name that resolves to
-//! nothing with the operation's modeled 404.
+//! nothing with HTTP 404. This operation is served through the environment-scoped data
+//! endpoint (`@endpoint` host prefix `env.`), whose front door words that refusal and
+//! carries it as its own document payload — a root-level JSON string with no error-code
+//! member — rather than as a serialized modeled exception; the status and the
+//! `x-amzn-errortype` code stay the modeled ones. The reshaping lives in
+//! [`crate::service::env_endpoint`], which serves this operation.
 //!
 //! What this emulator does NOT do is the call itself: `InvokeRestApi` forwards to the
 //! Apache Airflow REST API of the environment's web server, and no Apache Airflow runs in
@@ -181,12 +186,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         drop(store);
 
         if !known {
-            // There is no web server to invoke anything on: the modeled
-            // `ResourceNotFoundException` (HTTP 404), the same refusal every operation
-            // addressed by `Name` answers.
+            // There is no web server to invoke anything on. This operation is served
+            // through the environment data endpoint's proxy (`@endpoint` host prefix
+            // `env.`), so the refusal is that endpoint's: HTTP 404 with the modeled
+            // `ResourceNotFoundException` code, and the endpoint's own fixed wording,
+            // which names no environment. `crate::service::env_endpoint` then carries it
+            // as the endpoint's document payload instead of as a serialized exception
+            // object.
             return Err(InvokeRestApiErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::environment_not_found_message(&input.name)),
+                    message: Some(
+                        crate::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());
