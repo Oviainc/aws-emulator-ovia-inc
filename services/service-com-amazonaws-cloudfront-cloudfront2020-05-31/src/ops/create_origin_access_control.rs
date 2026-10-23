@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOriginAccessControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOriginAccessControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOriginAccessControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists ONE origin access control and reports the record it stored: the id and the
+//! version token are MINTED here, the configuration is stored whole, and every later
+//! read of that control answers from the record rather than from the request that
+//! created it.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +147,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOriginAccessControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOriginAccessControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOriginAccessControl"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        let config = input.origin_access_control_config;
+        let mut store = state.lock();
+        // Materialise whatever the clock owes the rest of the store before this call
+        // reads it, as every handler here does. A control itself has no transition owed:
+        // the model gives it no status, so one this service accepts is usable at once.
+        store.settle(::std::time::SystemTime::now());
+
+        // "A name to identify the origin access control. You can specify up to 64
+        // characters." The member carries no `@length` in the model, so the documented
+        // bound is refused here — with the refusal this operation models for an unusable
+        // argument — BEFORE anything is minted.
+        let name_length = config.name.chars().count();
+        if name_length > crate::state::MAX_ORIGIN_ACCESS_CONTROL_NAME {
+            return Err(CreateOriginAccessControlErrorModeled::InvalidArgument(
+                crate::state::origin_access_control_name_too_long(name_length),
+            )
+            .into());
+        }
+
+        // "An origin access control with the specified parameters already exists": the
+        // conflict is over the whole set of parameters, so a request asking for exactly
+        // what a stored control already asks for names THAT control rather than a second
+        // one, and is refused leaving it untouched. A request that differs in any member
+        // describes a different control and creates one.
+        if let Some(existing) = store.origin_access_control_with_config(&config) {
+            let message = crate::state::origin_access_control_already_exists_message(&existing.id);
+            return Err(
+                CreateOriginAccessControlErrorModeled::OriginAccessControlAlreadyExists(
+                    OriginAccessControlAlreadyExists {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The number of origin access controls in your Amazon Web Services account
+        // exceeds the maximum allowed." A control record is what a later read answers
+        // from, so it cannot be evicted: the bound is an entry count refused BEFORE
+        // anything is minted.
+        if store.origin_access_controls.len() >= crate::state::MAX_ORIGIN_ACCESS_CONTROLS {
+            return Err(
+                CreateOriginAccessControlErrorModeled::TooManyOriginAccessControls(
+                    TooManyOriginAccessControls {
+                        message: Some(format!(
+                            "The number of origin access controls in your Amazon Web Services \
+                             account exceeds the maximum allowed ({})",
+                            crate::state::MAX_ORIGIN_ACCESS_CONTROLS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.allocate_origin_access_control_id();
+        let etag = store.next_etag();
+        let stored = crate::state::StoredOriginAccessControl {
+            id: id.clone(),
+            // Stored whole: a later read answers from this record, never from the request
+            // that was served.
+            config,
+            etag: etag.clone(),
+        };
+        // Read from the record just built, never from the request.
+        let origin_access_control = stored.to_origin_access_control();
+        let location =
+            crate::state::location_uri(&crate::state::origin_access_control_path(&id));
+        store.origin_access_controls.insert(id, stored);
+
+        Ok(CreateOriginAccessControlOutput {
+            // "Contains an origin access control."
+            origin_access_control: Some(origin_access_control),
+            // "The URL of the origin access control."
+            location: Some(location),
+            // "The version identifier for the current version of the origin access
+            // control" — the token an `If-Match` against this control is checked against.
+            e_tag: Some(etag),
+        })
     }
 }
