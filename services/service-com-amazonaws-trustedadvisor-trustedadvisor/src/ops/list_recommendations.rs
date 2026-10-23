@@ -104,16 +104,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// A modelled `date-time` as milliseconds since the Unix epoch, so a filter
-/// bound and a stored `lastUpdatedAt` are compared on one scale. `to_millis` is
-/// the exact conversion — going through seconds as an `f64` could move an
-/// inclusive bound by a millisecond.
-fn millis_of(value: &::aws_smithy_types::DateTime) -> i64 {
-    value.to_millis().unwrap_or(i64::MAX)
-}
-
 /// The stored recommendation, as the modelled `RecommendationSummary`, with its
 /// `name` in the language the request asked for (`None` when it named none).
+///
+/// The date-time conversion both bounds go through is
+/// [`crate::state::millis_of`], shared with the organization-level listing.
 ///
 /// `statusReason` is left absent: the store records no discrepancy in how a
 /// status was determined, and the member is optional.
@@ -240,8 +235,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `afterLastUpdatedAt` / `beforeLastUpdatedAt` are inclusive bounds on
         // the stored `lastUpdatedAt`; every other filter is an equality (or
         // membership) test. An absent filter keeps every recommendation.
-        let after = input.after_last_updated_at.as_ref().map(millis_of);
-        let before = input.before_last_updated_at.as_ref().map(millis_of);
+        let after = input
+            .after_last_updated_at
+            .as_ref()
+            .map(crate::state::millis_of);
+        let before = input
+            .before_last_updated_at
+            .as_ref()
+            .map(crate::state::millis_of);
 
         let matching: Vec<(String, RecommendationSummary)> = state
             .recommendations

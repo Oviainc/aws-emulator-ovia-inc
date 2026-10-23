@@ -17,6 +17,8 @@ mod cost_optimizing_aggregates;
 mod localized_text;
 #[path = "all/organization_recommendation_lifecycle.rs"]
 mod organization_recommendation_lifecycle;
+#[path = "all/organization_recommendations.rs"]
+mod organization_recommendations;
 #[path = "all/recommendation_loop.rs"]
 mod recommendation_loop;
 #[path = "all/state_roundtrip.rs"]

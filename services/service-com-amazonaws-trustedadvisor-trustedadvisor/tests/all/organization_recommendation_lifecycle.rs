@@ -109,14 +109,14 @@ fn emulator() -> MultiServiceRouter {
 /// pattern `OrganizationRecommendationArn` declares (no region and no account
 /// segment). Each seeded check aggregates into
 /// `<check id>-organization-recommendation`.
-fn organization_recommendation_arn(check_id: &str) -> String {
+pub(crate) fn organization_recommendation_arn(check_id: &str) -> String {
     format!(
         "arn:aws:trustedadvisor:::organization-recommendation/{check_id}-organization-recommendation"
     )
 }
 
 /// The modelled URI of `GetOrganizationRecommendation` for one seeded check.
-fn get_path(check_id: &str) -> String {
+pub(crate) fn get_path(check_id: &str) -> String {
     format!(
         "/v1/organization-recommendations/{}",
         label(&organization_recommendation_arn(check_id))
@@ -131,7 +131,7 @@ fn lifecycle_path(check_id: &str) -> String {
 
 /// The `organizationRecommendation` one read reports, or a panic naming the
 /// response that carried none.
-async fn read(router: &MultiServiceRouter, case: &str, check_id: &str) -> Value {
+pub(crate) async fn read(router: &MultiServiceRouter, case: &str, check_id: &str) -> Value {
     let (status, body) = call(router, "GET", &get_path(check_id), None).await;
     assert_eq!(
         status, 200,

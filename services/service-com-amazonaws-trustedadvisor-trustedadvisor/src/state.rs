@@ -28,7 +28,8 @@
 //! * [`organization_recommendations`](ComAmazonawsTrustedadvisorTrustedadvisorState::organization_recommendations) —
 //!   keyed by organization-recommendation ARN, which is what
 //!   `GetOrganizationRecommendation` and
-//!   `UpdateOrganizationRecommendationLifecycle` take as their `@httpLabel`.
+//!   `UpdateOrganizationRecommendationLifecycle` take as their `@httpLabel`,
+//!   and what `ListOrganizationRecommendations` reports in that key order.
 //!
 //! A recommendation does NOT keep a list of its resource ARNs: a resource
 //! carries its owning `recommendation_arn`, so
@@ -228,6 +229,14 @@ pub fn now_millis() -> i64 {
         .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
 }
 
+/// A modelled `date-time` as milliseconds since the Unix epoch, so a filter
+/// bound and a stored `lastUpdatedAt` are compared on one scale. `to_millis` is
+/// the exact conversion — going through seconds as an `f64` could move an
+/// inclusive bound by a millisecond. The inverse of [`date_time`].
+pub fn millis_of(value: &::aws_smithy_types::DateTime) -> i64 {
+    value.to_millis().unwrap_or(i64::MAX)
+}
+
 /// Milliseconds since the Unix epoch as the modelled `date-time` timestamp.
 ///
 /// `from_millis` is the exact conversion: going through seconds as an `f64`
@@ -368,8 +377,12 @@ pub struct RecommendationEntry {
 }
 
 /// A recommendation for the accounts of an AWS Organizations organization: the
-/// unit `GetOrganizationRecommendation` and
+/// unit `ListOrganizationRecommendations`, `GetOrganizationRecommendation` and
 /// `UpdateOrganizationRecommendationLifecycle` work on.
+///
+/// Its lifecycle stage, update reason and resolution instant are its OWN: an
+/// organization recommendation is a separate resource from the member accounts'
+/// recommendations, so moving one does not move the other.
 ///
 /// The organization-level view of one check's findings, so it carries the same
 /// classification members as the account-level [`RecommendationEntry`] and
