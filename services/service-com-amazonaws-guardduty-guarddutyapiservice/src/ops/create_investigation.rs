@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInvestigation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInvestigation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: initiates an investigation on the caller's detector and persists it in
+//! [`crate::state`], where `GetInvestigation` reads it back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInvestigation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules, all from this operation's own documentation:
+//!
+//! * the feature is available only through the Regions the doc lists
+//!   ([`crate::state::INVESTIGATION_REGIONS`]);
+//! * `DetectorId` must name a detector this account/Region holds;
+//! * "the AI_ANALYST feature must be enabled on your detector", else the call is DENIED
+//!   with HTTP 403;
+//! * the preview limits — 10 investigations per account per day, 100 in total — refuse a
+//!   create past either one;
+//! * `ClientToken` is `@idempotencyToken`, so a replayed create returns the investigation
+//!   the first call initiated and initiates no second one.
+//!
+//! An accepted investigation starts `RUNNING`. The ANALYSIS itself is produced by Amazon
+//! Bedrock models, which this emulator does not have, so it never synthesises a summary,
+//! risk level or confidence: the run it cannot perform ends in the modelled `FAILED`
+//! status carrying [`crate::state::INVESTIGATION_ENGINE_UNAVAILABLE`] as its `Error`,
+//! once the clock owes that transition.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +179,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInvestigation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInvestigationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInvestigation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateInvestigationErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        // "This feature is available in the following Amazon Web Services Regions:
+        // …" (`smithy_query(query="doc",shape="CreateInvestigation")`) — an
+        // endpoint outside that catalogue does not serve the operation.
+        if !crate::state::investigations_available_in(&region) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::INVESTIGATION_REGION_MESSAGE,
+            ));
+        }
+
+        let mut state = state.lock();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            return Err(detector_rejection(&input.detector_id));
+        };
+
+        // `ClientToken` is `@idempotencyToken`: a replayed create returns the
+        // investigation the first call initiated, and consumes none of the limits
+        // below, rather than initiating a second one.
+        let token = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+        if let Some(token) = token.as_deref() {
+            if let Some(existing) = detector.investigation_for_token(token) {
+                return Ok(CreateInvestigationOutput {
+                    investigation_id: existing.id.clone(),
+                });
+            }
+        }
+
+        // "To use this operation, the AI_ANALYST feature must be enabled on your
+        // detector" (`smithy_query(query="doc",shape="CreateInvestigation")`): a
+        // detector without it is not entitled to the operation, which is the 403
+        // the model declares, not a 400.
+        if detector.feature_status(crate::state::FEATURE_AI_ANALYST) != crate::state::ENABLED {
+            return Err(access_denied(
+                crate::state::INVESTIGATION_FEATURE_DENIED_MESSAGE,
+            ));
+        }
+
+        // "During the preview, you can initiate up to 10 investigations per account
+        // per day, with a total limit of 100 investigations per account."
+        if detector.investigations.len() >= crate::state::INVESTIGATIONS_PER_ACCOUNT {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::investigation_total_limit_message(),
+            ));
+        }
+        let day_start =
+            crate::state::now_millis().saturating_sub(crate::state::INVESTIGATION_DAY_MILLIS);
+        if detector.investigations_started_since(day_start) >= crate::state::INVESTIGATIONS_PER_DAY
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::investigation_daily_limit_message(),
+            ));
+        }
+
+        let now = state.tick_millis();
+        let id = state.mint_investigation_id();
+        // The account this emulator serves: "The account that initiated the
+        // investigation" (`smithy_query(shape="Investigation")`).
+        let triggered_by = ::engine::emulator_account_id().to_string();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // The detector was resolved above under the same lock, so it cannot
+            // have gone away; answer the modelled server fault rather than panic.
+            return Err(CreateInvestigationErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        detector.investigations.insert(
+            id.clone(),
+            crate::state::InvestigationRecord::started(
+                id.clone(),
+                input.trigger_prompt.clone(),
+                triggered_by,
+                region,
+                token,
+                now,
+            ),
+        );
+
+        Ok(CreateInvestigationOutput {
+            investigation_id: id,
+        })
     }
+}
+
+/// Refuse a `DetectorId` the store does not resolve.
+///
+/// This operation declares `AccessDeniedException` (HTTP 403) beside
+/// `BadRequestException`, and the caller's PERMISSION on the detector is decided
+/// before the detector is resolved: an id the account/Region does not hold is
+/// answered as an authorization failure, which discloses nothing about whether the
+/// id names anything. A value that cannot be a `DetectorId` at all never named a
+/// resource to be authorized on, so it stays the parameter failure every operation
+/// in this service answers it with (HTTP 400).
+fn detector_rejection(detector_id: &str) -> CreateInvestigationError {
+    if crate::state::is_detector_id(detector_id) {
+        access_denied(crate::state::not_authorized_message(
+            crate::state::DETECTOR_ID_MEMBER,
+        ))
+    } else {
+        crate::scaffolded::Scaffolded::invalid_input(crate::state::invalid_parameter_message(
+            crate::state::DETECTOR_ID_MEMBER,
+        ))
+    }
+}
+
+/// Deny the request the way the model declares it: HTTP 403 `AccessDeniedException`,
+/// with `type` carrying the error class the body's `__type` discriminator also
+/// carries (`smithy_query(shape="AccessDeniedException")` — `Type` is "The error
+/// type").
+fn access_denied(message: impl Into<String>) -> CreateInvestigationError {
+    CreateInvestigationErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(message.into()),
+        r#type: Some("AccessDeniedException".to_string()),
+    })
+    .into()
 }

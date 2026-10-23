@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartPipelineExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartPipelineExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: resolves the pipeline the request names (by name or by ARN) in
+//! `crate::state`, refuses a run the stored pipeline cannot support — an unknown
+//! pipeline or version, a pipeline whose delete is in flight, a parameter its definition
+//! does not declare, a selected step or reference execution that does not resolve — then
+//! records one `PipelineExecution` under a minted `PipelineExecutionArn` and stamps the
+//! pipeline's `LastRunTime`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartPipelineExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The run itself is NOT performed: a pipeline step's work (training, processing,
+//! transform, Lambda, callback) needs a runtime this emulator does not have, so the
+//! execution starts `Executing` and the clock owes it the modelled failure state with
+//! [`crate::state::PIPELINE_EXECUTION_NOT_RUN`] as its reason, rather than a `Succeeded`
+//! status for work nothing ran.
+//!
+//! Every member the run persists is bounded by the model — `PipelineParameters` at
+//! `len 0..200` of `len 0..1024` values, the display name and description by their own
+//! lengths — and the one member whose generated type carries no length,
+//! `SelectiveExecutionConfig.SelectedSteps`, is refused outside
+//! [`crate::state::MIN_SELECTED_STEPS`]..=[`crate::state::MAX_SELECTED_STEPS`] before the
+//! store is even locked, so neither the work this handler does nor the size of the record
+//! it keeps is proportional to the request's own length.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +173,240 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartPipelineExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartPipelineExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartPipelineExecution"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // Checked BEFORE the shared store is locked, because it is request-derived
+        // alone: `SelectedStepList` is modelled `len 1..50`, and a list outside that
+        // bound, or one naming a step twice, is refused here so neither the membership
+        // walk below nor the record it would persist is proportional to the request's
+        // own length. One step is selected once: a repeat selects nothing further.
+        let selected_steps: ::std::collections::BTreeSet<String> = match &input
+            .selective_execution_config
+        {
+            None => ::std::collections::BTreeSet::new(),
+            Some(selective) => {
+                let count = selective.selected_steps.len();
+                if !(crate::state::MIN_SELECTED_STEPS..=crate::state::MAX_SELECTED_STEPS)
+                    .contains(&count)
+                {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "SelectiveExecutionConfig.SelectedSteps names {count} steps; it must \
+                         name between {} and {} steps",
+                        crate::state::MIN_SELECTED_STEPS,
+                        crate::state::MAX_SELECTED_STEPS
+                    )));
+                }
+                let selected: ::std::collections::BTreeSet<String> = selective
+                    .selected_steps
+                    .iter()
+                    .map(|step| step.step_name.clone())
+                    .collect();
+                if selected.len() != count {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "SelectiveExecutionConfig.SelectedSteps names the same step more than \
+                         once",
+                    ));
+                }
+                selected
+            }
+        };
+
+        // `PipelineNameOrArn` denotes the same pipeline in either form and the store is
+        // keyed by name, so the ARN form is reduced the way every other `ArnOrName`
+        // reader in this service reduces it.
+        let name = crate::state::name_from_arn_or_name(&input.pipeline_name).to_string();
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // A pipeline whose removal the clock already owes is gone before this call reads
+        // the store, so nothing can be run on it.
+        store.settle_pipeline_deletions(now);
+
+        let Some(pipeline) = store.pipelines.get(&name) else {
+            // Never a 200 carrying an ARN nothing resolves: an execution of a pipeline
+            // that does not exist is refused, and nothing is persisted.
+            return Err(StartPipelineExecutionErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Pipeline {} does not exist.",
+                    crate::state::resource_arn(&region, "pipeline", &name)
+                )),
+            })
+            .into());
+        };
+        // A pipeline whose deletion is in flight (`PipelineStatus` `Deleting`, the other
+        // member of the modelled enum) is no longer runnable: starting a run on it
+        // conflicts with the delete already under way.
+        if pipeline.status != crate::state::PIPELINE_STATUS_ACTIVE {
+            return Err(StartPipelineExecutionErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Pipeline {} is {} and cannot start an execution.",
+                        pipeline.arn, pipeline.status
+                    )),
+                },
+            )
+            .into());
+        }
+        // A pipeline here carries exactly one version, the one creating it minted, so no
+        // other version id names anything this account holds — the same resolution
+        // `DescribePipeline` makes of the same member.
+        let version = input
+            .pipeline_version_id
+            .unwrap_or(crate::state::PIPELINE_INITIAL_VERSION);
+        if version != crate::state::PIPELINE_INITIAL_VERSION {
+            return Err(StartPipelineExecutionErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Pipeline {} does not have a version with id {version}.",
+                    pipeline.arn
+                )),
+            })
+            .into());
+        }
+        let pipeline_arn = pipeline.arn.clone();
+        let definition = pipeline.definition.clone();
+        // `ParallelismConfiguration`'s doc: this configuration, if specified, "overrides
+        // the parallelism configuration of the parent pipeline for this specific run" —
+        // so the run carries its own when it names one and the pipeline's otherwise.
+        let parallelism_configuration = input
+            .parallelism_configuration
+            .clone()
+            .or_else(|| pipeline.parallelism_configuration.clone());
+
+        // `ClientRequestToken` makes the operation idempotent — "an idempotent operation
+        // completes no more than once" — so a retry of the very call that started an
+        // execution answers that execution's ARN and starts no second run. The token is
+        // scoped to the pipeline whose execution it started, since a token is not a
+        // record of its own.
+        if let Some(existing) =
+            store.pipeline_execution_by_token(&name, &input.client_request_token)
+        {
+            return Ok(StartPipelineExecutionOutput {
+                pipeline_execution_arn: Some(existing.arn.clone()),
+            });
+        }
+
+        // `Parameter$Name`'s doc: "This parameter name must match a named parameter in
+        // the pipeline definition." The definition is the stored one, so what a run may
+        // assign is read from the pipeline rather than taken on the request's word, and
+        // one parameter takes one value.
+        let supplied = input.pipeline_parameters.clone().unwrap_or_default();
+        let declared_parameters: ::std::collections::BTreeSet<String> =
+            crate::state::pipeline_definition_parameter_names(&definition)
+                .into_iter()
+                .collect();
+        let mut assigned: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for parameter in &supplied {
+            if !declared_parameters.contains(&parameter.name) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "PipelineParameters names the parameter {}, which the pipeline \
+                     definition of {pipeline_arn} does not declare",
+                    parameter.name
+                )));
+            }
+            if !assigned.insert(parameter.name.as_str()) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "PipelineParameters assigns the parameter {} more than one value",
+                    parameter.name
+                )));
+            }
+        }
+
+        // A selective run names steps of THIS pipeline's definition, and copies input
+        // collaterals from a reference execution of the same pipeline
+        // (`SelectiveExecutionConfig`'s member docs), so both are resolved against the
+        // store before anything is persisted. The selection was already bounded and
+        // de-duplicated above, so this walk is proportional to the model's `len 1..50`.
+        if let Some(selective) = &input.selective_execution_config {
+            let declared_steps: ::std::collections::BTreeSet<String> =
+                crate::state::pipeline_definition_step_names(&definition)
+                    .into_iter()
+                    .collect();
+            for step in &selected_steps {
+                if !declared_steps.contains(step) {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "SelectiveExecutionConfig selects the step {step}, which the \
+                         pipeline definition of {pipeline_arn} does not declare"
+                    )));
+                }
+            }
+            if let Some(source) = &selective.source_pipeline_execution_arn {
+                let resolves = store
+                    .pipeline_executions
+                    .get(source)
+                    .is_some_and(|execution| execution.pipeline_name == name);
+                if !resolves {
+                    return Err(StartPipelineExecutionErrorModeled::ResourceNotFound(
+                        ResourceNotFound {
+                            message: Some(format!(
+                                "Pipeline execution {source} is not an execution of pipeline \
+                                 {pipeline_arn}."
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // The store is bounded, so a caller starting runs cannot grow it without end.
+        // `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.pipeline_executions_below_quota() {
+            return Err(StartPipelineExecutionErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for pipeline executions is {}, with \
+                         current utilization of {} and a request delta of 1.",
+                        crate::state::PIPELINE_EXECUTION_QUOTA,
+                        store.pipeline_executions.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The execution id is the server's to generate: it names a resource the caller
+        // did not name, so it is derived from nothing in the request.
+        let arn = crate::state::pipeline_execution_arn(
+            &pipeline_arn,
+            &crate::state::mint_opaque_resource_id(),
+        );
+        store.pipeline_executions.insert(
+            arn.clone(),
+            crate::state::PipelineExecution {
+                arn: arn.clone(),
+                pipeline_name: name.clone(),
+                pipeline_arn,
+                display_name: input.pipeline_execution_display_name,
+                description: input.pipeline_execution_description,
+                // A started run is non-terminal: `Executing` is what SageMaker reports
+                // for it, and the clock owes its terminal status
+                // `PIPELINE_EXECUTION_ENDS_AFTER` from here — stored, never slept on.
+                status: crate::state::PIPELINE_EXECUTION_STATUS_EXECUTING.to_string(),
+                failure_reason: None,
+                parameters: supplied,
+                parallelism_configuration,
+                selective_execution_config: input.selective_execution_config,
+                pipeline_version_id: version,
+                mlflow_experiment_name: input.mlflow_experiment_name,
+                client_request_token: input.client_request_token,
+                created_by: crate::state::caller_user_context(ctx),
+                creation_time: now,
+                last_modified_time: now,
+                ends_at: now + crate::state::PIPELINE_EXECUTION_ENDS_AFTER,
+            },
+        );
+        // `DescribePipeline`'s `LastRunTime` is when the pipeline was last run, which is
+        // this instant: starting a run is what moves it.
+        if let Some(pipeline) = store.pipelines.get_mut(&name) {
+            pipeline.last_run_time = Some(now);
+        }
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(StartPipelineExecutionOutput {
+            pipeline_execution_arn: Some(arn),
+        })
     }
 }
