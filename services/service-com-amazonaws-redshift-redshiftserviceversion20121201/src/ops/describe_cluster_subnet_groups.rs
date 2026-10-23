@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeClusterSubnetGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeClusterSubnetGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeClusterSubnetGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the cluster subnet groups this service's store holds, one page at a
+//! time: all of them by default, or the one a `ClusterSubnetGroupName` names, and
+//! only those the request's tag filters admit. A pure report — it writes nothing,
+//! and a name that names no group is `ClusterSubnetGroupNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -116,11 +112,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribeClusterSubnetGroupsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeClusterSubnetGroups")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeClusterSubnetGroups",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeClusterSubnetGroupsErrorModeled {
     ClusterSubnetGroupNotFoundFault(ClusterSubnetGroupNotFoundFault),
     InvalidTagFault(InvalidTagFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -172,20 +175,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeClusterSubnetGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeClusterSubnetGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeClusterSubnetGroups"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeClusterSubnetGroupsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A pure report: nothing here changes what a later caller sees, and a
+        // subnet group has no status the clock owes a transition on.
+        let store = state.lock();
+
+        // Refuse before doing any work: a name that names no group is answered
+        // without walking the store. The stored name is the folded form, so the
+        // caller's spelling is folded once here and reused by the filter below.
+        let wanted = input
+            .cluster_subnet_group_name
+            .as_deref()
+            .map(st::normalized_subnet_group_name);
+        if let Some(requested) = input.cluster_subnet_group_name.as_deref() {
+            if store.subnet_group(requested).is_none() {
+                return Err(
+                    DescribeClusterSubnetGroupsErrorModeled::ClusterSubnetGroupNotFoundFault(
+                        ClusterSubnetGroupNotFoundFault {
+                            message: Some(format!(
+                                "Cluster subnet group '{requested}' does not exist."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Select by REFERENCE, then clone only the page: the work done under the
+        // state lock is proportional to the page, not to the whole store.
+        let matched: Vec<&ClusterSubnetGroup> = store
+            .subnet_groups
+            .iter()
+            .filter(|group| {
+                wanted.as_deref().is_none_or(|folded| {
+                    group.cluster_subnet_group_name.as_deref() == Some(folded)
+                }) && st::tags_match(
+                    group.tags.as_deref().unwrap_or_default(),
+                    input.tag_keys.as_deref(),
+                    input.tag_values.as_deref(),
+                )
+            })
+            .collect();
+
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeClusterSubnetGroupsOutput {
+            cluster_subnet_groups: Some(
+                matched[start..end].iter().map(|g| (*g).clone()).collect(),
+            ),
+            marker: next_marker,
+        })
     }
 }

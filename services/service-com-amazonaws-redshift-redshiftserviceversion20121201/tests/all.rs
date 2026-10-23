@@ -21,6 +21,8 @@ mod cluster_parameters;
 mod cluster_versions;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/existence_preconditions.rs"]
+mod existence_preconditions;
 #[path = "all/modify_cluster_parameter_group.rs"]
 mod modify_cluster_parameter_group;
 #[path = "all/orderable_cluster_options.rs"]
@@ -31,3 +33,5 @@ mod snapshot_restore;
 mod state_roundtrip;
 #[path = "all/static_catalog.rs"]
 mod static_catalog;
+#[path = "all/storage_summary.rs"]
+mod storage_summary;

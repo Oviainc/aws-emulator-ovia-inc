@@ -3,8 +3,9 @@
 //! Engine state for the com-amazonaws-redshift-redshiftserviceversion20121201 service.
 //!
 //! One store per emulator, holding the provisioned-cluster control plane: the
-//! clusters, the snapshots taken of them, and the cluster parameter groups they
-//! are configured from. Every collection keeps INSERTION ORDER, so the `Marker`
+//! clusters, the snapshots taken of them, and the cluster parameter groups and
+//! cluster subnet groups they are configured from. Every collection keeps
+//! INSERTION ORDER, so the `Marker`
 //! cursor the paginated `Describe*` operations hand out is a stable, resumable
 //! offset into the same sequence a later page walks.
 //!
@@ -17,8 +18,8 @@
 //! `creating` -> `available` transitions (see [`PROVISIONING_SPAN`]).
 
 use crate::ops::types::{
-    AvailabilityZone, Cluster, ClusterParameterGroup, ClusterVersion, Parameter, Snapshot,
-    SupportedPlatform,
+    AvailabilityZone, Cluster, ClusterParameterGroup, ClusterSubnetGroup, ClusterVersion,
+    Parameter, Snapshot, Subnet, SupportedPlatform,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -673,6 +674,49 @@ pub const CLUSTER_QUOTA: usize = 1_000;
 /// because a cluster accumulates snapshots over its life.
 pub const SNAPSHOT_QUOTA: usize = 10_000;
 
+/// How many cluster subnet groups the account's own groups may number before
+/// `CreateClusterSubnetGroup` refuses with the modelled
+/// `ClusterSubnetGroupQuotaExceededFault`.
+///
+/// The same reasoning as [`CLUSTER_QUOTA`]: Amazon Redshift publishes an
+/// adjustable quota on subnet groups per account per Region, and this emulator
+/// models neither Service Quotas nor an account's adjustments, so this is the
+/// emulator's OWN bound on
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::subnet_groups`]
+/// rather than a claim about any account's limit.
+pub const SUBNET_GROUP_QUOTA: usize = 1_000;
+
+/// How many subnets one cluster subnet group may hold before
+/// `CreateClusterSubnetGroup` refuses with the modelled
+/// `ClusterSubnetQuotaExceededFault`.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterSubnetGroupMessage",
+/// member="SubnetIds")` — "A maximum of 20 subnets can be modified in a single
+/// request."
+pub const SUBNETS_PER_SUBNET_GROUP_QUOTA: usize = 20;
+
+/// `ClusterSubnetGroup$SubnetGroupStatus` for a group whose every subnet
+/// resolved.
+///
+/// Source: `smithy_query(query="doc", shape="ClusterSubnetGroup",
+/// member="SubnetGroupStatus")` — "Possible values are Complete, Incomplete and
+/// Invalid." Every subnet this service admits is one it stored, so a stored group
+/// is always `Complete`.
+pub const SUBNET_GROUP_STATUS_COMPLETE: &str = "Complete";
+
+/// `Subnet$SubnetStatus` for a subnet of a stored group.
+pub const SUBNET_STATUS_ACTIVE: &str = "Active";
+
+/// The `Cluster$IpAddressType` values a subnet group of this service supports.
+///
+/// Source: `smithy_query(query="doc", shape="ClusterSubnetGroup",
+/// member="SupportedClusterIpAddressTypes")` — "Possible values are ipv4 and
+/// dualstack" — with `Ipv6CidrBlockNotFoundFault`'s own "There are no subnets in
+/// your VPC with associated IPv6 CIDR blocks. To use dual-stack mode, associate
+/// an IPv6 CIDR block with each subnet in your VPC": this service models no IPv6
+/// CIDR block on a subnet, so a stored group supports `ipv4` alone.
+pub const SUPPORTED_CLUSTER_IP_ADDRESS_TYPES: [&str; 1] = ["ipv4"];
+
 /// How many `SortingEntities` one `DescribeClusterSnapshots` request may carry.
 ///
 /// `SnapshotAttributeToSortBy` declares three values, so a request naming more
@@ -784,6 +828,14 @@ pub struct StoredSnapshot {
 pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// Every provisioned cluster, keyed by `ClusterIdentifier`, in creation order.
     pub clusters: Vec<StoredCluster>,
+    /// Every cluster subnet group, keyed by `ClusterSubnetGroupName`, in creation
+    /// order.
+    ///
+    /// The modelled shape IS the whole record — a subnet group carries no status
+    /// the clock moves and nothing the `ClusterSubnetGroup` shape has no member
+    /// for — so unlike the collections around it this one needs no `Stored*`
+    /// wrapper.
+    pub subnet_groups: Vec<ClusterSubnetGroup>,
     /// Every snapshot, keyed by `SnapshotIdentifier`, in creation order.
     pub snapshots: Vec<StoredSnapshot>,
     /// Every cluster parameter group, keyed by `ParameterGroupName`, in creation
@@ -811,6 +863,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     fn default() -> Self {
         Self {
             clusters: Vec::new(),
+            subnet_groups: Vec::new(),
             snapshots: Vec::new(),
             parameter_groups: default_parameter_groups(),
             cluster_versions: published_cluster_versions(),
@@ -892,6 +945,57 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             }) || snapshot_arn
                 .is_some_and(|wanted| s.snapshot.snapshot_arn.as_deref() == Some(wanted))
         })
+    }
+
+    /// The stored cluster subnet group with this name, if any.
+    ///
+    /// The name is compared as stored: a group's name is held in the documented
+    /// lower-case form (see [`normalized_subnet_group_name`]), so the caller's
+    /// spelling is folded before it is looked up.
+    pub fn subnet_group(&self, name: &str) -> Option<&ClusterSubnetGroup> {
+        let wanted = normalized_subnet_group_name(name);
+        self.subnet_groups
+            .iter()
+            .find(|g| g.cluster_subnet_group_name.as_deref() == Some(wanted.as_str()))
+    }
+
+    /// The total storage the snapshots this store holds occupy, in megabytes.
+    ///
+    /// Source: `smithy_query(query="doc", shape="CustomerStorageMessage",
+    /// member="TotalBackupSizeInMegaBytes")` — "The total amount of storage
+    /// currently used for snapshots": the sum of each stored snapshot's own
+    /// `Snapshot$TotalBackupSizeInMegaBytes` ("The size of the complete set of
+    /// backup data that would be used to restore the cluster"), so deleting a
+    /// snapshot lowers it with no separate bookkeeping. A snapshot whose record
+    /// carries no size contributes nothing.
+    pub fn total_backup_size_in_mega_bytes(&self) -> f64 {
+        // `fold` from `+0.0` rather than `sum()`: the standard library's `Sum`
+        // for `f64` folds from `-0.0`, so an empty store would report negative
+        // zero — a value that renders as `-0.0` and is not what "nothing is
+        // backed up" is.
+        self.snapshots
+            .iter()
+            .filter_map(|stored| stored.snapshot.total_backup_size_in_mega_bytes)
+            .fold(0.0, |total, size| total + size)
+    }
+
+    /// The total storage the clusters this store holds have provisioned, in
+    /// megabytes.
+    ///
+    /// Source: `smithy_query(query="doc", shape="CustomerStorageMessage",
+    /// member="TotalProvisionedStorageInMegaBytes")` — "The total amount of
+    /// storage currently provisioned": the sum of each stored cluster's own
+    /// `Cluster$TotalStorageCapacityInMegaBytes` ("The total storage capacity of
+    /// the cluster in megabytes"), so creating or deleting a cluster moves it
+    /// with no separate bookkeeping. A cluster whose record carries no capacity
+    /// contributes nothing.
+    pub fn total_provisioned_storage_in_mega_bytes(&self) -> f64 {
+        // Folded from `+0.0` for the same reason as
+        // [`Self::total_backup_size_in_mega_bytes`].
+        self.clusters
+            .iter()
+            .filter_map(|stored| stored.cluster.total_storage_capacity_in_mega_bytes)
+            .fold(0.0, |total, capacity| total + capacity as f64)
     }
 
     /// The stored cluster parameter group with this name, if any.
@@ -1006,6 +1110,38 @@ pub const PARAMETER_GROUP_NAME_RULE: IdentifierRule = IdentifierRule {
 /// is stored as a lower-case string." The rule admits only ASCII alphanumerics
 /// and hyphens, so ASCII folding is the whole of it.
 pub fn normalized_parameter_group_name(requested: &str) -> String {
+    requested.to_ascii_lowercase()
+}
+
+/// The rule for a cluster subnet group name (`ClusterSubnetGroupName`).
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterSubnetGroupMessage",
+/// member="ClusterSubnetGroupName")` — "Must contain no more than 255
+/// alphanumeric characters or hyphens. Must not be "Default". Must be unique for
+/// all subnet groups that are created by your Amazon Web Services account."
+/// Mixed case is ACCEPTED and folded by [`normalized_subnet_group_name`] rather
+/// than refused, because the same doc says "Amazon Redshift stores the value as a
+/// lowercase string".
+pub const SUBNET_GROUP_NAME_RULE: IdentifierRule = IdentifierRule {
+    member: "ClusterSubnetGroupName",
+    max_len: 255,
+    lowercase_only: false,
+};
+
+/// The one name a cluster subnet group may not take, compared in the stored
+/// (folded) form.
+///
+/// Source: the same doc sentence as [`SUBNET_GROUP_NAME_RULE`] — "Must not be
+/// "Default"".
+pub const RESERVED_SUBNET_GROUP_NAME: &str = "default";
+
+/// The form a cluster subnet group name is STORED and reported in.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterSubnetGroupMessage",
+/// member="ClusterSubnetGroupName")` — "Amazon Redshift stores the value as a
+/// lowercase string." The rule admits only ASCII alphanumerics and hyphens, so
+/// ASCII folding is the whole of it.
+pub fn normalized_subnet_group_name(requested: &str) -> String {
     requested.to_ascii_lowercase()
 }
 
@@ -1317,6 +1453,25 @@ pub fn derived_vpc_id(cluster_subnet_group_name: &str) -> String {
         "vpc-{}",
         short_digest(&format!("vpc/{cluster_subnet_group_name}"), 17)
     )
+}
+
+/// The subnet record a cluster subnet group reports for one of its subnet ids.
+///
+/// The Availability Zone is derived from the subnet id and the Region the group
+/// was created in, so the same subnet always reports the same zone and a group
+/// spanning several subnets spans the zones they resolve to. This service models
+/// no EC2 subnet inventory, so the id a request names is the id the group holds.
+pub fn subnet_record(subnet_identifier: &str, region: &str) -> Subnet {
+    let zones = region_availability_zones(region);
+    let index = digest_byte(&format!("subnet/{subnet_identifier}")) as usize % zones.len();
+    Subnet {
+        subnet_identifier: Some(subnet_identifier.to_string()),
+        // Built by the one helper every `AvailabilityZone` this service emits is
+        // built by, so a subnet's zone reports the same platforms as the same
+        // zone reported anywhere else.
+        subnet_availability_zone: Some(availability_zone(&zones[index])),
+        subnet_status: Some(SUBNET_STATUS_ACTIVE.to_string()),
+    }
 }
 
 /// Build the snapshot record a manual snapshot of `cluster` reports.

@@ -104,6 +104,9 @@ pub mod describe_resize_types;
 pub mod describe_scheduled_actions_types;
 pub mod describe_snapshot_copy_grants_types;
 pub mod describe_snapshot_schedules_types;
+// HAND-AUTHORED, not emitted by the generator: `DescribeStorage` binds Smithy's
+// `Unit` input, which the op-stub generator declines to type.
+pub mod describe_storage_types;
 pub mod describe_table_restore_status_types;
 pub mod describe_tags_types;
 pub mod describe_usage_limits_types;
@@ -339,6 +342,8 @@ pub use describe_scheduled_actions_types::*;
 pub use describe_snapshot_copy_grants_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_snapshot_schedules_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use describe_storage_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_table_restore_status_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
