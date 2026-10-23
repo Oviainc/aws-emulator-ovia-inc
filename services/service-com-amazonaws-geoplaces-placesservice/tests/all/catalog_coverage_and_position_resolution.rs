@@ -123,9 +123,12 @@ async fn a_query_naming_a_place_resolves_to_it_and_round_trips_through_get_place
         },
         LandmarkRow {
             // A place with no name of its own: its `Title` is the assembled label.
+            // Queried by its English name, which the entry holds beside its own
+            // text: with no `Language` asked for the label comes back in the
+            // entry's own language, "the default language for the entry".
             case: "simferopol",
             query: "Simferopol",
-            title: "Simferopol, Crimea, Ukraine",
+            title: "Сімферополь, Україна",
             country: "UKR",
         },
     ];
@@ -785,11 +788,11 @@ async fn a_position_resolves_only_to_the_places_that_cover_it() {
             expected: Some(("Tour Eiffel", "Paris", "IDF", "FR")),
         },
         PositionRow {
-            // Inland Crimea: no settlement there, so the region covering it is
-            // the finest place that does.
+            // Inland Crimea: the rural district covering it is the finest place
+            // that does, named in the entry's own language.
             case: "crimea",
             at: [33.958_76, 45.468_24],
-            expected: Some(("Crimea, Ukraine", "", "43", "UA")),
+            expected: Some(("Первомайський район, Україна", "Первомайський район", "43", "UA")),
         },
         PositionRow {
             case: "south-atlantic",
@@ -950,7 +953,8 @@ struct AttributionRow {
 ///
 /// The rows are the views that claim the territory and one that does not, plus the
 /// same views applied to an undisputed place, which must answer alike under all of
-/// them.
+/// them. Each attribution's country is named in that attribution's OWN language,
+/// because no `Language` is asked for and the entry's own is the fallback.
 #[tokio::test]
 async fn a_political_view_reattributes_only_the_disputed_places() {
     /// A position inland in Crimea, which the catalog holds a region record for.
@@ -963,34 +967,34 @@ async fn a_political_view_reattributes_only_the_disputed_places() {
         AttributionRow {
             case: "no-view",
             view: None,
-            country: ("UA", "Ukraine"),
+            country: ("UA", "Україна"),
         },
         AttributionRow {
             case: "ukrainian-view-alpha3",
             view: Some("UKR"),
-            country: ("UA", "Ukraine"),
+            country: ("UA", "Україна"),
         },
         AttributionRow {
             case: "ukrainian-view-alpha2",
             view: Some("UA"),
-            country: ("UA", "Ukraine"),
+            country: ("UA", "Україна"),
         },
         AttributionRow {
             case: "russian-view-alpha3",
             view: Some("RUS"),
-            country: ("RU", "Russia"),
+            country: ("RU", "Россия"),
         },
         AttributionRow {
             case: "russian-view-alpha2",
             view: Some("RU"),
-            country: ("RU", "Russia"),
+            country: ("RU", "Россия"),
         },
         AttributionRow {
             // A third country's view takes no side the record knows of, so the
             // default attribution stands.
             case: "japanese-view",
             view: Some("JPN"),
-            country: ("UA", "Ukraine"),
+            country: ("UA", "Україна"),
         },
     ];
 

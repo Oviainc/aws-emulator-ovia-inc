@@ -128,11 +128,21 @@ pub fn table_names(page: &Value) -> Vec<String> {
 /// structure (the `__type` tag the catalog writes onto a nested `PrincipalPermissions`)
 /// is not read as a mismatch: the rule under test is that what the client sent comes
 /// back, not that the server adds nothing.
+///
+/// A `null` expectation means the member carries no value: awsJson omits an absent
+/// member, so absent or explicitly null both satisfy it.
 pub fn assert_echoed(case: &str, sent: &Value, got: &Value) {
     match sent {
+        Value::Null => assert!(
+            got.is_null(),
+            "case {case}: expected no value, got {got}"
+        ),
         Value::Object(members) => {
             for (member, value) in members {
                 let Some(actual) = got.get(member) else {
+                    if value.is_null() {
+                        continue;
+                    }
                     if value.is_object() || value.is_array() {
                         panic!("case {case}: member {member} is absent from the response {got}");
                     }

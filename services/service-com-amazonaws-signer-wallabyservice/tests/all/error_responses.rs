@@ -49,12 +49,13 @@ const CERTIFICATE_ARN: &str = "arn:aws:acm:us-west-2:000000000000:certificate/ab
 /// The signing platforms this suite puts profiles on, and whether a profile on
 /// each one must carry `signingMaterial`.
 ///
-/// The first four are the code-signing platforms AWS Signer publishes a signing
-/// configuration for and issues the certificate for itself (the ids of
-/// `crate::state::SIGNING_PLATFORM_CATALOG`); the rest are platforms outside that
-/// catalog, whose profile holds the certificate its signatures are issued under
-/// and so cannot be created without naming it. Source: the recorded wire
-/// behaviour of `PutSigningProfile` (see the rule on
+/// The first five are the signing platforms this emulator publishes (the ids of
+/// `crate::state::SIGNING_PLATFORM_CATALOG`): the four code-signing platforms
+/// AWS Signer issues the certificate for itself, plus the container-image
+/// platform, whose profile holds the certificate its signatures are issued
+/// under. The rest are platforms outside that catalog, which likewise cannot be
+/// created without naming the certificate. Source: the recorded wire behaviour
+/// of `PutSigningProfile` (see the rule on
 /// `crate::state::platform_requires_signing_material`).
 const PLATFORM_CASES: &[(&str, bool)] = &[
     ("AWSLambda-SHA384-ECDSA", false),

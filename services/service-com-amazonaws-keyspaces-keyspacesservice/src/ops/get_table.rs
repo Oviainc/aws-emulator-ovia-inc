@@ -195,6 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
 
         let mut store = state.lock();
+        // The service-managed keyspaces and their system tables are part of the account
+        // before any call.
+        store.ensure_service_managed_catalog(&region);
         // Reporting, not mutating: `settle` only materialises the status changes the clock
         // had already made due at this instant, so this report shows what any caller would
         // have seen now whether or not anybody read the table.
@@ -217,29 +220,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             keyspace_name: table.keyspace_name.clone(),
             table_name: table.table_name.clone(),
             resource_arn: table.resource_arn.clone(),
-            creation_timestamp: Some(::aws_smithy_types::DateTime::from(
-                table.creation_timestamp,
-            )),
+            // Every member from here down is one only a `CreateTable` (or a later
+            // `UpdateTable`) could have filled, so a service-managed system table — which
+            // no call created — reports none of them rather than a setting nobody
+            // configured. The model makes each of them optional; only the three names and
+            // the ARN above are `@required`.
+            creation_timestamp: table.creation_timestamp.map(::aws_smithy_types::DateTime::from),
             status: Some(table.status.clone()),
-            schema_definition: Some(table.schema_definition.clone()),
-            capacity_specification: Some(CapacitySpecificationSummary {
-                throughput_mode: table.capacity_specification.throughput_mode.clone(),
-                read_capacity_units: table.capacity_specification.read_capacity_units,
-                write_capacity_units: table.capacity_specification.write_capacity_units,
-                // Set by an `UpdateTable` that moved this table's throughput mode to
-                // PAY_PER_REQUEST, and absent while no update ever has.
-                last_update_to_pay_per_request_timestamp: table
-                    .last_update_to_pay_per_request
-                    .map(::aws_smithy_types::DateTime::from),
+            schema_definition: table.schema_definition.clone(),
+            capacity_specification: table.capacity_specification.as_ref().map(|capacity| {
+                CapacitySpecificationSummary {
+                    throughput_mode: capacity.throughput_mode.clone(),
+                    read_capacity_units: capacity.read_capacity_units,
+                    write_capacity_units: capacity.write_capacity_units,
+                    // Set by an `UpdateTable` that moved this table's throughput mode to
+                    // PAY_PER_REQUEST, and absent while no update ever has.
+                    last_update_to_pay_per_request_timestamp: table
+                        .last_update_to_pay_per_request
+                        .map(::aws_smithy_types::DateTime::from),
+                }
             }),
-            encryption_specification: Some(table.encryption_specification.clone()),
-            point_in_time_recovery: Some(PointInTimeRecoverySummary {
-                status: table.point_in_time_recovery.status.clone(),
-                // The earliest point a restore can target is when continuous backups
-                // began, which for a table created with PITR enabled is its creation.
-                earliest_restorable_timestamp: (table.point_in_time_recovery.status
-                    == crate::state::POINT_IN_TIME_RECOVERY_ENABLED)
-                    .then(|| ::aws_smithy_types::DateTime::from(table.creation_timestamp)),
+            encryption_specification: table.encryption_specification.clone(),
+            point_in_time_recovery: table.point_in_time_recovery.as_ref().map(|recovery| {
+                PointInTimeRecoverySummary {
+                    status: recovery.status.clone(),
+                    // The earliest point a restore can target is when continuous backups
+                    // began, which for a table created with PITR enabled is its creation.
+                    earliest_restorable_timestamp: (recovery.status
+                        == crate::state::POINT_IN_TIME_RECOVERY_ENABLED)
+                        .then_some(table.creation_timestamp)
+                        .flatten()
+                        .map(::aws_smithy_types::DateTime::from),
+                }
             }),
             ttl: table.ttl.clone(),
             default_time_to_live: table.default_time_to_live,

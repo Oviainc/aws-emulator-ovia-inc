@@ -463,3 +463,86 @@ async fn deleting_the_stack_deletes_the_cluster_it_created() {
          cluster, got {listed}"
     );
 }
+
+/// An `AWS::ECS::Service` declared on a cluster the SAME template declares reports the ARN
+/// Amazon ECS identifies it by, and that ARN carries the cluster the stack really created.
+///
+/// A service ARN is `service/<cluster>/<name>`, so the value a stack hands back is only
+/// addressable if the cluster segment names the cluster the stack created — which the
+/// declaration names by `Ref` of another resource, the case a crate-local suite cannot
+/// drive because the cluster has to EXIST in Amazon ECS for the stack to complete.
+#[tokio::test]
+async fn an_ecs_services_reported_arn_carries_the_cluster_the_stack_created() {
+    let router = build_router();
+    let case = "a service on a cluster the same template declares";
+    let template = concat!(
+        "Resources:\n",
+        "  AppCluster:\n",
+        "    Type: AWS::ECS::Cluster\n",
+        "    Properties:\n",
+        "      ClusterName: checkout-cluster\n",
+        "  AppService:\n",
+        "    Type: AWS::ECS::Service\n",
+        "    Properties:\n",
+        "      ServiceName: checkout-service\n",
+        "      Cluster: !Ref AppCluster\n",
+        "      DesiredCount: 1\n",
+        "Outputs:\n",
+        "  ClusterName:\n",
+        "    Value: !Ref AppCluster\n",
+        "  ServiceArn:\n",
+        "    Value: !Ref AppService\n",
+        "  ServiceName:\n",
+        "    Value: !GetAtt AppService.Name\n",
+    );
+    create_stack(&router, case, "checkout-stack", template).await;
+    tokio::time::sleep(PAST_THE_SPAN).await;
+    let described = describe_stack(&router, case, "checkout-stack").await;
+    assert_eq!(
+        xml_text(&described, "StackStatus").as_deref(),
+        Some("CREATE_COMPLETE"),
+        "case {case:?}: expected the stack to have completed; status reason {:?}",
+        xml_text(&described, "StackStatusReason")
+    );
+
+    let outputs = outputs_of(&described);
+    assert_eq!(
+        outputs.get("ClusterName").map(String::as_str),
+        Some("checkout-cluster"),
+        "case {case:?}: expected the cluster the template named, got {outputs:?}"
+    );
+    assert_eq!(
+        outputs.get("ServiceName").map(String::as_str),
+        Some("checkout-service"),
+        "case {case:?}: expected the service the template named, got {outputs:?}"
+    );
+    assert_eq!(
+        outputs.get("ServiceArn").map(String::as_str),
+        Some(
+            format!("arn:aws:ecs:{REGION}:{ACCOUNT_ID}:service/checkout-cluster/checkout-service")
+                .as_str()
+        ),
+        "case {case:?}: expected the service ARN to carry the cluster hosting it, got \
+         {outputs:?}"
+    );
+
+    // The cluster segment of that ARN names a cluster Amazon ECS really holds, which is
+    // what makes the reported ARN usable against the service that owns it.
+    let (status, described_cluster) = ecs(
+        &router,
+        "DescribeClusters",
+        &json!({ "clusters": ["checkout-cluster"] }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected ecs DescribeClusters to answer 200, got {status} with body \
+         {described_cluster}"
+    );
+    assert_eq!(
+        described_cluster["clusters"][0]["clusterName"].as_str(),
+        Some("checkout-cluster"),
+        "case {case:?}: expected Amazon ECS to hold the cluster the service ARN names, got \
+         {described_cluster}"
+    );
+}

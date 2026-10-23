@@ -16,8 +16,8 @@
 //! generalises over: the form and length of `name`/`version` (plain, symbols, non-ASCII,
 //! each modelled bound and one past it), which version of one name is addressed, which
 //! of two domains holds a same-named type, which registration-time defaults the record
-//! carries, how the record reached `DEPRECATED` (addressed directly or via the
-//! `DeprecateDomain` cascade), and the way a triple fails to name a stored record.
+//! carries, whether the domain holding it is itself deprecated, and the way a triple
+//! fails to name a stored record.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_swf_simpleworkflowservice::ops::types::REGISTRATION_STATUS_VALUES;
@@ -471,12 +471,13 @@ async fn deleting_a_registered_type_is_refused_and_removes_nothing() {
 }
 
 #[tokio::test]
-async fn a_type_the_domain_cascade_deprecated_can_be_deleted() {
-    // `DeprecateDomain` "also deprecates all activity and workflow types registered in
-    // the domain", so a record can reach DEPRECATED without ever being addressed
-    // directly — and the rule is about the STORED status, not about which call set it.
+async fn a_type_in_a_deprecated_domain_still_needs_its_own_deprecation() {
+    // Deprecating the DOMAIN leaves the types registered in it REGISTERED, so a delete
+    // addressed at one of them is still refused until that type itself is deprecated:
+    // the rule follows the type's STORED status, which only a call addressing the type
+    // moves.
     let emulator = Emulator::new();
-    let domain = "cascade-deprecated";
+    let domain = "deprecated-domain";
     register_domain(&emulator, domain, domain).await;
     let cases = type_cases();
     for case in &cases {
@@ -492,12 +493,35 @@ async fn a_type_the_domain_cascade_deprecated_can_be_deleted() {
     }
 
     emulator
-        .ok("cascade", "DeprecateDomain", &json!({ "name": domain }))
+        .ok(
+            "deprecate domain",
+            "DeprecateDomain",
+            &json!({ "name": domain }),
+        )
         .await;
 
     for case in &cases {
-        let cascaded = describe_type(&emulator, case.case, domain, &case.name, &case.version).await;
-        assert_deprecated(case.case, &cascaded);
+        let after_domain =
+            describe_type(&emulator, case.case, domain, &case.name, &case.version).await;
+        assert_registered(case.case, &after_domain);
+
+        let (status, body) = emulator
+            .call(
+                "DeleteWorkflowType",
+                &type_request(domain, &case.name, &case.version),
+            )
+            .await;
+        let code = error_code(&body);
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "TypeNotDeprecatedFault"),
+            "case {:?}: a type in a deprecated domain is still REGISTERED and cannot be \
+             deleted, got {status} {code} with {body:?}",
+            case.case
+        );
+
+        // Its own deprecation is what makes the identical delete succeed.
+        deprecate_type(&emulator, case.case, domain, &case.name, &case.version).await;
         delete_type(&emulator, case.case, domain, &case.name, &case.version).await;
         assert_type_absent(&emulator, case.case, domain, &case.name, &case.version).await;
     }

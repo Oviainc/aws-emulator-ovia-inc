@@ -26,7 +26,7 @@ use crate::ops::types::{
     CreateCollectionGroupDetail, CurrentCapacity, DeleteCollectionDetail, FipsEndpoints,
     IamFederationConfigOptions, IamIdentityCenterConfigOptions, LifecyclePolicyDetail,
     LifecyclePolicyErrorDetail, SamlConfigOptions, SecurityConfigDetail, SecurityConfigSummary,
-    SecurityPolicyDetail, Tag, VectorOptions,
+    SecurityPolicyDetail, Tag, UpdateCollectionGroupDetail, VectorOptions,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -553,6 +553,46 @@ impl CollectionGroupRecord {
         }
     }
 
+    /// The `UpdateCollectionGroupDetail` body for this record — the one place this crate
+    /// renders that shape, so an update cannot report a group differently from the read
+    /// that follows it.
+    pub fn update_detail(&self) -> UpdateCollectionGroupDetail {
+        UpdateCollectionGroupDetail {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            capacity_limits: self.capacity_limits.clone(),
+            created_date: Some(self.created_date),
+            last_modified_date: Some(self.last_modified_date),
+            generation: Some(self.generation.clone()),
+        }
+    }
+
+    /// Apply the members an `UpdateCollectionGroup` request named, leaving a member it did
+    /// NOT name at its stored value: both are optional on a request whose `id` already
+    /// identifies the group, and neither is documented as clearing what is stored — the
+    /// same partial-write rule [`AccountSettingsRecord::apply`] follows.
+    ///
+    /// `capacityLimits` is replaced WHOLE rather than merged member by member: the request
+    /// carries `CollectionGroupCapacityLimits` as one structure ("Updated capacity limits
+    /// for the collection group"), so the limits the request states are the limits the
+    /// group has. Every write stamps `lastModifiedDate`.
+    pub fn apply_update(
+        &mut self,
+        description: Option<String>,
+        capacity_limits: Option<CollectionGroupCapacityLimits>,
+        written_at: i64,
+    ) {
+        if description.is_some() {
+            self.description = description;
+        }
+        if capacity_limits.is_some() {
+            self.capacity_limits = capacity_limits;
+        }
+        self.last_modified_date = written_at;
+    }
+
     /// The group's current search and indexing capacity.
     ///
     /// Nothing in this emulator runs OCUs, so the only capacity a group demonstrably
@@ -668,6 +708,49 @@ impl AccountSettingsRecord {
     }
 }
 
+/// The members ONE write to a stored policy replaces, as `UpdateAccessPolicy` and
+/// `UpdateSecurityPolicy` carry them.
+///
+/// Both operations model `description` and `policy` as OPTIONAL on a request whose
+/// `type`/`name` already identify the policy, and neither is documented as clearing the
+/// stored value, so a member the request did not name keeps what is stored — the same
+/// partial-write rule [`AccountSettingsRecord::apply`] follows. The other two members are
+/// server-derived: every write mints a fresh `policyVersion`
+/// (see [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::next_policy_version`])
+/// and stamps `lastModifiedDate`.
+#[derive(Debug, Clone)]
+pub struct PolicyWrite {
+    /// The `description` the request named, or `None` when it named none.
+    pub description: Option<String>,
+    /// The PARSED `policy` document the request named, or `None` when it named none.
+    pub policy: Option<::aws_smithy_types::Document>,
+    /// The freshly minted `PolicyVersion` this write stores.
+    pub policy_version: String,
+    /// The epoch-millisecond instant of the write, which becomes `lastModifiedDate`.
+    pub written_at: i64,
+}
+
+impl PolicyWrite {
+    /// Apply this write to one stored policy's mutable members: the ONE place the merge
+    /// rule lives, so a data access policy and a security policy cannot drift apart.
+    fn apply(
+        self,
+        description: &mut Option<String>,
+        policy: &mut ::aws_smithy_types::Document,
+        policy_version: &mut String,
+        last_modified_date: &mut i64,
+    ) {
+        if self.description.is_some() {
+            *description = self.description;
+        }
+        if let Some(document) = self.policy {
+            *policy = document;
+        }
+        *policy_version = self.policy_version;
+        *last_modified_date = self.written_at;
+    }
+}
+
 /// One stored security policy, keyed by its `(type, name)` pair.
 #[derive(Debug, Clone)]
 pub struct SecurityPolicyRecord {
@@ -699,6 +782,16 @@ impl SecurityPolicyRecord {
             created_date: Some(self.created_date),
             last_modified_date: Some(self.last_modified_date),
         }
+    }
+
+    /// Apply `write` to this record; see [`PolicyWrite`] for the rule it follows.
+    pub fn apply(&mut self, write: PolicyWrite) {
+        write.apply(
+            &mut self.description,
+            &mut self.policy,
+            &mut self.policy_version,
+            &mut self.last_modified_date,
+        );
     }
 }
 
@@ -809,6 +902,16 @@ impl AccessPolicyRecord {
             created_date: Some(self.created_date),
             last_modified_date: Some(self.last_modified_date),
         }
+    }
+
+    /// Apply `write` to this record; see [`PolicyWrite`] for the rule it follows.
+    pub fn apply(&mut self, write: PolicyWrite) {
+        write.apply(
+            &mut self.description,
+            &mut self.policy,
+            &mut self.policy_version,
+            &mut self.last_modified_date,
+        );
     }
 }
 
@@ -1231,6 +1334,18 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
         Some(record)
     }
 
+    /// Remove the data access policy `(kind, name)` identifies, dropping every idempotency
+    /// token that named it with it — so a later read of that pair raises
+    /// `ResourceNotFoundException`, exactly as [`Self::remove_security_policy`] does for a
+    /// security policy.
+    pub fn remove_access_policy(&mut self, kind: &str, name: &str) -> Option<AccessPolicyRecord> {
+        let record = self
+            .access_policies
+            .remove(&(kind.to_string(), name.to_string()))?;
+        self.forget_tokens_for(&policy_token_value(kind, name));
+        Some(record)
+    }
+
     /// Remove the security configuration `id` names, dropping every idempotency token
     /// that named it with it.
     pub fn remove_security_config(&mut self, id: &str) -> Option<SecurityConfigRecord> {
@@ -1244,6 +1359,11 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     /// `None` both when the token is new and when the record it created has since been
     /// deleted — a replay cannot resurrect a deleted resource, so a stale token simply
     /// falls through to the operation's normal path.
+    ///
+    /// The handler SCOPES what this answers to the resource its request addresses: a token
+    /// spent again on another resource is a request for that other resource, which is still
+    /// served on its own terms rather than answered with the record the token first
+    /// created. Every caller in `src/ops/` therefore filters on the addressed identity.
     pub fn replayed_collection(&self, operation: &str, token: &str) -> Option<&CollectionRecord> {
         let id = self
             .idempotency_tokens
@@ -1297,7 +1417,17 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     /// Remember that `operation` with `token` created the record keyed `key`, evicting
     /// the oldest token first if that would push the map past
     /// [`MAX_IDEMPOTENCY_TOKENS`].
+    ///
+    /// FIRST write wins: a token names the request it was first spent on, so spending it
+    /// again on another resource leaves the entry alone — the other resource is created on
+    /// its own terms, and a later retry of the FIRST request still replays that one. The
+    /// entry is dropped only with the record it names ([`Self::forget_tokens_for`]), after
+    /// which the same token may name a new record.
     pub fn remember_token(&mut self, operation: &str, token: &str, key: &str) {
+        let entry = idempotency_key(operation, token);
+        if self.idempotency_tokens.contains_key(&entry) {
+            return;
+        }
         while self.idempotency_tokens.len() >= MAX_IDEMPOTENCY_TOKENS {
             match self.idempotency_token_order.pop_front() {
                 Some(oldest) => {
@@ -1312,7 +1442,6 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
                 }
             }
         }
-        let entry = idempotency_key(operation, token);
         if self
             .idempotency_tokens
             .insert(entry.clone(), key.to_string())
@@ -1605,6 +1734,13 @@ fn audit_field(value: &str) -> String {
 pub enum AuditOutcome {
     /// A policy was minted and stored.
     PolicyCreated,
+    /// A stored policy was replaced by a write (`UpdateAccessPolicy`).
+    PolicyUpdated,
+    /// A stored policy was removed (`DeleteAccessPolicy`).
+    PolicyDeleted,
+    /// The `policyVersion` the write carried is not the stored one, so the write was
+    /// refused (409 `ConflictException`).
+    VersionMismatch,
     /// A replayed `clientToken` answered the record its first call created; nothing was
     /// written.
     IdempotentReplay,
@@ -1629,6 +1765,9 @@ impl AuditOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::PolicyCreated => "policy-created",
+            Self::PolicyUpdated => "policy-updated",
+            Self::PolicyDeleted => "policy-deleted",
+            Self::VersionMismatch => "version-mismatch",
             Self::IdempotentReplay => "idempotent-replay",
             Self::PolicyRead => "policy-read",
             Self::SettingsUpdated => "settings-updated",

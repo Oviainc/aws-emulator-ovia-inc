@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBranches
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBranches`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBranches::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the branch names one repository holds, from the branches that repository's
+//! record carries in [`crate::state`]: a repository with no branch yet answers 200
+//! with an EMPTY list (which is how a caller tells an empty repository from a missing
+//! one — a missing one is `RepositoryDoesNotExistException`), and every branch a write
+//! created is listed from then on. Nothing here writes, so a list cannot change what
+//! the next caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +82,19 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Branch names per page.
+///
+/// `ListBranches` is `@paginated` (`inputToken`/`outputToken` `nextToken`, `items`
+/// `branches`) but the model declares no `maxResults` member and CodeCommit documents
+/// no page size for it, so this is the EMULATOR's own page size; what the contract
+/// fixes is the paging behaviour (a token out while more remain, that token in
+/// resuming exactly where the page ended), not the number. It is the page size
+/// `ListRepositories` in this crate already uses, and it is far above the store's own
+/// `MAX_BRANCHES_PER_REPOSITORY`, so no repository a caller can build is ever handed
+/// back truncated. It is `pub` so this crate's tests page over a larger stored set
+/// without assuming the number.
+pub const PAGE_SIZE: usize = 1_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -161,18 +172,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBranches` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBranchesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBranches"))
+        let _ = ctx;
+        // `repositoryName` is `@required` with `length 1..100` and pattern
+        // `^[\w\.-]+$`, so an absent or malformed name is already refused at the
+        // boundary (as `RepositoryNameRequiredException` /
+        // `InvalidRepositoryNameException`, see `crate::service`): reaching here means
+        // the name is well formed and may or may not name a live repository.
+        let repository_name = &input.repository_name;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let store = state.lock();
+
+        let repository = store.repositories.get(repository_name).ok_or_else(|| {
+            ListBranchesErrorModeled::RepositoryDoesNotExistException(
+                RepositoryDoesNotExistException {
+                    message: Some(format!("the repository {repository_name} does not exist")),
+                },
+            )
+        })?;
+
+        // The repository's branches are keyed by name in a `BTreeMap`, so this walk is
+        // already in name order: paging over it is stable, and a page boundary falls at
+        // the same place for the same stored set.
+        let names: Vec<&String> = repository.branches.keys().collect();
+        let start = match input.next_token.as_deref() {
+            None => 0usize,
+            // The token this operation hands out is the offset the next page starts
+            // at, so anything that is not an offset into the current list is not a
+            // token this service issued.
+            Some(token) => token
+                .parse::<usize>()
+                .ok()
+                .filter(|offset| *offset <= names.len())
+                .ok_or_else(|| {
+                    ListBranchesErrorModeled::InvalidContinuationTokenException(
+                        InvalidContinuationTokenException {
+                            message: Some(format!("the continuation token {token} is not valid")),
+                        },
+                    )
+                })?,
+        };
+        let end = names.len().min(start.saturating_add(PAGE_SIZE));
+
+        Ok(ListBranchesOutput {
+            // Present and empty for a repository that holds no branch yet: an empty
+            // list is the answer, and it is what tells an existing empty repository
+            // apart from one that does not exist.
+            branches: Some(
+                names[start..end]
+                    .iter()
+                    .map(|name| (*name).clone())
+                    .collect(),
+            ),
+            next_token: (end < names.len()).then(|| end.to_string()),
+        })
     }
 }

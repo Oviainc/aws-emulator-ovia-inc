@@ -235,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A rollback goes to the SAME deployment group, so it resolves the
             // same deployment targets as the deployment it rolls back, and its
             // terminal status follows from them the same way.
-            let target_count = deployment.target_count;
+            let targets = deployment.targets.clone();
 
             // The id of the rollback deployment, minted only when the caller asked
             // for a rollback AND this deployment group has a revision to go back
@@ -332,7 +332,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // against the rollback yet.
                     error_information: None,
                     lifecycle_hook_executions: Vec::new(),
-                    target_count,
+                    targets,
                     terminates_original_instances,
                     termination_wait_millis,
                     instance_termination_wait_time_started: false,

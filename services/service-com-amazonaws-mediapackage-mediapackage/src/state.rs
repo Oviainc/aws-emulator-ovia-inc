@@ -665,6 +665,16 @@ pub const DEFAULT_ORIGINATION: &str = "ALLOW";
 /// playback will be disabled for the OriginEndpoint" — a window of zero seconds.
 pub const DEFAULT_STARTOVER_WINDOW_SECONDS: i32 = 0;
 
+/// The smallest `StartoverWindowSeconds` with startover playback ENABLED.
+///
+/// The member is the "maximum duration (seconds) of content to retain for startover
+/// playback", and the model documents that an unspecified one DISABLES startover playback
+/// for the endpoint ([`DEFAULT_STARTOVER_WINDOW_SECONDS`], zero) — so a window of zero
+/// seconds retains no content and one second is the smallest that retains any. This is the
+/// bound [`OriginEndpointRecord::startover_enabled`] reads, and nothing else decides what
+/// "startover enabled" means for this service.
+pub const MIN_ENABLED_STARTOVER_WINDOW_SECONDS: i32 = 1;
+
 /// `TimeDelaySeconds`' default. The model documents "If not specified, there will be no
 /// time delay in effect for the OriginEndpoint" — a delay of zero seconds.
 pub const DEFAULT_TIME_DELAY_SECONDS: i32 = 0;
@@ -939,6 +949,19 @@ impl OriginEndpointRecord {
         } else {
             None
         }
+    }
+
+    /// Whether this endpoint retains a window of content for STARTOVER (time-shift)
+    /// playback — the already-published content a later read of the endpoint can reach
+    /// back into.
+    ///
+    /// Read off the STORED record, so it answers for the window the endpoint carries now,
+    /// whichever write (a create or an update) last set it, and an absent member answers
+    /// the service default the way every projection of the record does.
+    pub fn startover_enabled(&self) -> bool {
+        self.startover_window_seconds
+            .unwrap_or(DEFAULT_STARTOVER_WINDOW_SECONDS)
+            >= MIN_ENABLED_STARTOVER_WINDOW_SECONDS
     }
 
     /// The modelled `OriginEndpoint` shape for this record.
@@ -1278,6 +1301,19 @@ pub fn instant_invalid(member: &str) -> ServiceError {
 /// member the caller has to fix (`startTime` names a real instant).
 pub fn harvest_window_invalid() -> ServiceError {
     member_invalid("endTime", "must be later than the start time")
+}
+
+/// `UnprocessableEntityException` (422) for a submission whose origin endpoint retains no
+/// startover window.
+///
+/// A harvest reads already-published content back out of the endpoint's startover
+/// (time-shift) window, so an endpoint with startover playback disabled
+/// ([`OriginEndpointRecord::startover_enabled`]) holds nothing a harvest could export.
+/// Decided against the STORED endpoint, so it is reported the way everything this service
+/// decides against state is — a list of reasons for the member the caller has to fix,
+/// which for this rule is the one naming the endpoint.
+pub fn startover_required(member: &str) -> ServiceError {
+    ServiceError::unprocessable_state(member, "must have startover enabled")
 }
 
 /// The IAM store a harvest job's destination role is resolved against.

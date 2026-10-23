@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCollectionGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCollectionGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCollectionGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the description and the capacity limits this request names into the
+//! `CollectionGroupRecord` its `id` addresses, stamps `lastModifiedDate`, and answers from
+//! the record it wrote — so a following `BatchGetCollectionGroup` reports exactly what this
+//! call stored.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +147,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCollectionGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCollectionGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCollectionGroup"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateCollectionGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The relation between a capacity floor and its own ceiling, which no single
+        // member's own `@range` can express. The limits the request names are the limits
+        // the group will have, so they are checked as one structure — the same check
+        // `CreateCollectionGroup` applies.
+        if let Some(limits) = &input.capacity_limits {
+            if let Err(message) = crate::state::validate_capacity_limits(limits) {
+                return Err(UpdateCollectionGroupErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+
+        // A replayed `clientToken` is a RETRY of the write this call already performed, so
+        // it answers that record and writes nothing rather than stamping a second
+        // `lastModifiedDate` for one write.
+        if let Some(token) = input.client_token.as_deref() {
+            let replayed = store
+                .replayed_collection_group(Self::NAME, token)
+                .filter(|record| record.id == input.id)
+                .map(crate::state::CollectionGroupRecord::update_detail);
+            if let Some(detail) = replayed {
+                return Ok(UpdateCollectionGroupOutput {
+                    update_collection_group_detail: Some(detail),
+                });
+            }
+        }
+
+        let written_at = crate::state::now_epoch_millis();
+        // This operation models no `ResourceNotFoundException`, so an `id` that addresses
+        // no stored group is refused as the invalid input it is — `ValidationException`,
+        // the only client refusal the model declares for a request this handler can
+        // neither apply nor conflict with.
+        let Some(record) = store.collection_groups.get_mut(&input.id) else {
+            return Err(UpdateCollectionGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "id {} does not identify a collection group in this account",
+                        input.id
+                    )),
+                },
+            )
+            .into());
+        };
+        record.apply_update(input.description, input.capacity_limits, written_at);
+        // Rendered from the record that is now STORED, so the update cannot report anything
+        // a later `BatchGetCollectionGroup` would not.
+        let detail = record.update_detail();
+        if let Some(token) = input.client_token.as_deref() {
+            store.remember_token(Self::NAME, token, &input.id);
+        }
+
+        Ok(UpdateCollectionGroupOutput {
+            update_collection_group_detail: Some(detail),
+        })
     }
 }

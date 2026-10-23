@@ -20,6 +20,12 @@
 //! [`ComAmazonawsBackupsearchCryobackupsearchserviceState::settle`], which every handler
 //! calls first: a read therefore reports what the clock has already made due and never
 //! advances a job because it was polled.
+//!
+//! WHICH status that is follows from the job's resolved scope, not from the operation
+//! that started it: [`scan_outcome`] turns the recovery points a scope resolved to
+//! ([`ComAmazonawsBackupsearchCryobackupsearchserviceState::recovery_points_in_scope`])
+//! into the terminal status the scan is owed, and the `StatusMessage` that status comes
+//! with travels with it.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -47,19 +53,27 @@ pub const FAILED: &str = "FAILED";
 /// or a scan that failed. `RUNNING` and `STOPPING` are the two transient ones.
 pub const TERMINAL_STATES: &[&str] = &[COMPLETED, STOPPED, FAILED];
 
+/// The statuses `StopSearchJob` is already satisfied by.
+///
+/// The operation is `@idempotent` and asks for ONE end state: the job stopped. A job
+/// that is `STOPPED` is in that state and one that is `STOPPING` is on its way to it, so
+/// a repeat has nothing left to do and answers the empty 200 the model declares. Only a
+/// terminal status this operation does NOT produce ([`COMPLETED`], [`FAILED`]) is a
+/// genuine conflict, because the job ended in a state the caller's request cannot reach.
+pub const STOP_SATISFIED_STATES: &[&str] = &[STOPPING, STOPPED];
+
 /// The search-job statuses an export may be started from.
 ///
 /// An export transmits the RESULTS of a search job, so the scan has to have finished
 /// producing them: a search job still scanning (`RUNNING`) or still winding down
 /// (`STOPPING`) has no settled result set to export, and `FAILED` is terminal but
-/// produced none. AWS documents no precondition, so this set is the emulator's own rule,
-/// chosen so that an export is only ever started from a status the job never leaves and
-/// that produced results; a start from any other status is refused rather than accepted
-/// into a success nothing could back.
+/// produced none. The service's own recordings confirm this set — an export started for
+/// a search job that ended `FAILED` is refused — and a start from any other status is
+/// refused rather than accepted into a success nothing could back.
 pub const EXPORTABLE_SEARCH_JOB_STATES: &[&str] = &[COMPLETED, STOPPED];
 
-/// How long after the call that starts a transition the clock owes the next status
-/// (`RUNNING` -> `COMPLETED` after `StartSearchJob`, `STOPPING` -> `STOPPED` after
+/// How long after the call that starts a transition the clock owes the next status (the
+/// terminal status [`scan_outcome`] gives a new search job, `STOPPING` -> `STOPPED` after
 /// `StopSearchJob`, and an export job's `RUNNING` -> `COMPLETED` after
 /// `StartSearchResultExportJob`).
 ///
@@ -111,6 +125,17 @@ pub const MAX_TAG_VALUE_LENGTH: usize = 256;
 /// The ARN resource segment of a search job: `search-job/<SearchJobIdentifier>`.
 pub const SEARCH_JOB_RESOURCE: &str = "search-job";
 
+/// How many times an identifier mint draws a UUID while the one it drew is already held
+/// (see [`ComAmazonawsBackupsearchCryobackupsearchserviceState::mint_identifier`]). A
+/// UUIDv4 has 122 bits of entropy, so one re-draw is already past what this store can
+/// expect to need; the bound is what makes the mint provably terminating.
+const UUID_MINT_ATTEMPTS: usize = 8;
+
+/// The server fault's text when a mint could not draw an identifier this store does not
+/// already hold — a broken random source, which is a server problem and never a reason
+/// to hand the caller a resource id another record already uses.
+pub const MINT_EXHAUSTED: &str = "a unique job identifier could not be minted";
+
 /// The ARN resource segment of an export job: `export-job/<ExportJobIdentifier>`.
 pub const EXPORT_JOB_RESOURCE: &str = "export-job";
 
@@ -124,6 +149,17 @@ pub const MAX_EXPORT_JOBS: usize = 5_000;
 /// The one wording of the server fault every handler answers with when this emulator's
 /// search-job store cannot be reached, so the text cannot drift between operations.
 pub const STORE_UNAVAILABLE: &str = "the search job store is unavailable";
+
+/// The `StatusMessage` a search job whose scope resolved to no recovery point carries.
+///
+/// The model documents `StatusMessage` only as the text returned "for ... jobs with
+/// issues", so it states no wording — but the service's recordings do: a `StartSearchJob`
+/// whose `SearchScope` matches nothing is accepted and then settles to [`FAILED`] with
+/// THIS sentence, which carries none of the request's data and is the same for every such
+/// job. Being request-independent is what makes it the service's fixed template for this
+/// outcome rather than one call's example text, so the settle path takes it from here.
+pub const SCOPE_EMPTY: &str =
+    "Search scope is empty. Revise search scope input and retry search job";
 
 /// The text this service's `ResourceNotFoundException` carries when a job identifier
 /// names nothing.
@@ -230,9 +266,10 @@ pub struct SearchJob {
     /// of the same body under the same `ClientToken` is idempotent; a different body
     /// under that token is a conflict.
     pub request_fingerprint: String,
-    /// The status the clock owes this job, and the instant it is owed from. `None` for
-    /// a job in a terminal status, which owes nothing.
-    pub next_status_due: Option<(SystemTime, &'static str)>,
+    /// The status the clock owes this job, the instant it is owed from, and the
+    /// `StatusMessage` that status comes with (`None` for one that needs no message).
+    /// `None` for a job in a terminal status, which owes nothing.
+    pub next_status_due: Option<(SystemTime, &'static str, Option<&'static str>)>,
 }
 
 impl SearchJob {
@@ -241,13 +278,20 @@ impl SearchJob {
         TERMINAL_STATES.contains(&self.status.as_str())
     }
 
+    /// Whether this job is already in, or already on its way to, the end state
+    /// `StopSearchJob` asks for (see [`STOP_SATISFIED_STATES`]).
+    pub fn is_stop_satisfied(&self) -> bool {
+        STOP_SATISFIED_STATES.contains(&self.status.as_str())
+    }
+
     /// Apply the owed status transition if the clock has already made it due.
     ///
     /// The scan's progress is brought to the scope it was given — a scan that ran to
     /// `COMPLETED` has scanned everything in scope and matched exactly the results it
-    /// recorded; one that was `STOPPED` keeps the progress it had reached.
+    /// recorded; one that was `STOPPED` keeps the progress it had reached, and one that
+    /// `FAILED` never got through its scope, so it keeps the progress it had too.
     fn settle(&mut self, now: SystemTime) {
-        let Some((due, next)) = self.next_status_due else {
+        let Some((due, next, message)) = self.next_status_due else {
             return;
         };
         if now < due {
@@ -256,6 +300,9 @@ impl SearchJob {
         self.status = next.to_string();
         self.next_status_due = None;
         self.completion_time = Some(timestamp(due));
+        // The status and the message that status comes with are written together, so a
+        // record can never explain a failure it has not reached, nor reach one silently.
+        self.status_message = message.map(ToString::to_string);
         if next == COMPLETED {
             self.current_search_progress = CurrentSearchProgress {
                 recovery_points_scanned_count: self
@@ -328,16 +375,31 @@ pub struct ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// Every search job, keyed by its `SearchJobIdentifier`.
     pub search_jobs: HashMap<String, SearchJob>,
     /// Identifiers in creation order, so `ListSearchJobs` pages deterministically.
+    /// `ListSearchJobs` walks this backwards (see
+    /// [`jobs_newest_first`](Self::jobs_newest_first)).
     pub job_order: Vec<String>,
-    /// How many identifiers this store has minted; the next one is the one after.
-    minted: u64,
+    /// The recovery points of this account a search job's `SearchScope` is resolved
+    /// against — the backup index the Backup data plane builds, which is what a scan
+    /// actually scans.
+    ///
+    /// A recovery point exists for this account only once that data plane holds one, and
+    /// nothing in THIS service creates one — no operation it models takes a backup or
+    /// indexes one — so in a running emulator this stays EMPTY: every scope resolves to
+    /// nothing and every scan therefore settles to the `FAILED`/[`SCOPE_EMPTY`] outcome
+    /// the service answers for an empty scope, which is exactly what the recordings show.
+    /// The `COMPLETED` branch of [`scan_outcome`] is reached as soon as this holds a
+    /// recovery point the scope selects: a test seeds them, and a future Backup data
+    /// plane in this emulator would write them here rather than teach the scan a second
+    /// source. The resolution is COUNTED from here ([`recovery_points_in_scope`](
+    /// Self::recovery_points_in_scope)) rather than assumed by a handler, so every member
+    /// a job reports about its scope — and the terminal status it settles to — follows the
+    /// records this store holds.
+    pub recovery_points: Vec<SearchJobBackupsResult>,
     /// Every export job, keyed by its `ExportJobIdentifier`.
     pub export_jobs: HashMap<String, ExportJob>,
     /// Export-job identifiers in creation order, so `ListSearchResultExportJobs` pages
     /// deterministically.
     pub export_job_order: Vec<String>,
-    /// How many export-job identifiers this store has minted.
-    minted_export_jobs: u64,
 }
 
 impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
@@ -379,12 +441,35 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
         self.search_jobs.get_mut(&identifier)
     }
 
-    /// Every job in creation order. `job_order` and `search_jobs` are written together,
-    /// so an identifier in the order always resolves.
-    pub fn jobs_in_order(&self) -> impl Iterator<Item = &SearchJob> {
+    /// Every job NEWEST-CREATED FIRST, which is the sequence `ListSearchJobs` filters
+    /// and pages: the service reports the most recently created job first, so a
+    /// single-page read is "the latest search job".
+    ///
+    /// `job_order` holds the identifiers in creation order and is only ever appended to,
+    /// so walking it backwards is exactly newest-first and is stable across calls.
+    /// `job_order` and `search_jobs` are written together, so an identifier in the order
+    /// always resolves.
+    pub fn jobs_newest_first(&self) -> impl Iterator<Item = &SearchJob> {
         self.job_order
             .iter()
+            .rev()
             .filter_map(|identifier| self.search_jobs.get(identifier))
+    }
+
+    /// The recovery points this store holds that `scope` selects — the scan's resolved
+    /// scope, and so what a search job over that scope has to get through.
+    ///
+    /// A recovery point is in scope when its resource type is one the scope names and
+    /// every filter the scope carries admits it; a filter the records cannot be judged
+    /// against (a tag filter: a recovery point record here carries no tags, nor does the
+    /// model give it any) admits none, because this store holds nothing that can be
+    /// shown to match it.
+    pub fn recovery_points_in_scope(&self, scope: &SearchScope) -> Vec<SearchJobBackupsResult> {
+        self.recovery_points
+            .iter()
+            .filter(|point| in_scope(point, scope))
+            .cloned()
+            .collect()
     }
 
     /// The job the `StartSearchJob` call carrying `token` minted, if that call was
@@ -408,16 +493,21 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
         self.search_jobs.insert(job.identifier.clone(), job);
     }
 
-    /// A fresh `SearchJobIdentifier` no job in this store holds.
+    /// A fresh `SearchJobIdentifier` no job in this store holds, or `None` when no free
+    /// one could be drawn (see [`fresh_identifier`](Self::fresh_identifier)), which the
+    /// caller answers as a server fault rather than by handing out a held identifier.
     ///
-    /// `GenericId` carries no pattern or length in the model, so what the member
-    /// promises is an opaque string that identifies one job: this one counts the jobs
-    /// the store has minted, so it is unique, monotonic in creation order and stable
-    /// across reads, and no part of it is derived from the request. The caller STORES
-    /// what this returns — nothing recomputes it.
-    pub fn mint_identifier(&mut self) -> String {
-        self.minted = self.minted.saturating_add(1);
-        format!("searchjob-{:012}", self.minted)
+    /// `GenericId` carries no pattern or length in the model, but the service's
+    /// recordings show what it mints: a UUID, which is also the only shape the service's
+    /// own job-identifier guard accepts. So this draws a version-4 UUID — unique, opaque,
+    /// not derived from the request and not reproducible across runs, which is what keeps
+    /// two independently started jobs from colliding on id. The caller STORES what this
+    /// returns; nothing recomputes it.
+    pub fn mint_identifier(&self) -> Option<String> {
+        let sequence = self.search_jobs.len() as u64;
+        self.fresh_identifier(sequence, |store, candidate| {
+            store.search_jobs.contains_key(candidate)
+        })
     }
 
     /// The export job `identifier` names, or `None` when this account holds no such
@@ -456,14 +546,160 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
         self.export_jobs.insert(job.identifier.clone(), job);
     }
 
-    /// A fresh `ExportJobIdentifier` no export job in this store holds.
+    /// A fresh `ExportJobIdentifier` no export job in this store holds, or `None` when
+    /// no free one could be drawn.
     ///
-    /// Minted exactly like [`mint_identifier`](Self::mint_identifier): `GenericId`
-    /// carries no pattern, so the member promises only an opaque, unique string, and no
-    /// part of it comes from the request. The caller STORES what this returns.
-    pub fn mint_export_identifier(&mut self) -> String {
-        self.minted_export_jobs = self.minted_export_jobs.saturating_add(1);
-        format!("exportjob-{:012}", self.minted_export_jobs)
+    /// Minted exactly like [`mint_identifier`](Self::mint_identifier), and for the same
+    /// reason: both members are the model's `GenericId`, both are minted by this one
+    /// service, and what it mints for a job is a UUID.
+    pub fn mint_export_identifier(&self) -> Option<String> {
+        let sequence = self.export_jobs.len() as u64;
+        self.fresh_identifier(sequence, |store, candidate| {
+            store.export_jobs.contains_key(candidate)
+        })
+    }
+
+    /// A version-4 UUID this store does not already hold, as `taken` decides what
+    /// "hold" means. One mint for every identifier this service hands out, so two of
+    /// them cannot disagree about the shape of an id.
+    ///
+    /// A UUIDv4 collides with 122 bits of entropy behind it, so the re-draw is BOUNDED
+    /// rather than a `loop`: the function terminates on its own. Exhausting the bound
+    /// would mean a broken random source, and the answer is then `None` — never an
+    /// identifier the store already holds, which a caller would insert over an existing
+    /// record.
+    fn fresh_identifier(
+        &self,
+        sequence: u64,
+        taken: impl Fn(&Self, &str) -> bool,
+    ) -> Option<String> {
+        (0..UUID_MINT_ATTEMPTS)
+            .map(|attempt| new_uuid(sequence.wrapping_add(attempt as u64)))
+            .find(|candidate| !taken(self, candidate))
+    }
+}
+
+/// A fresh identifier in the shape this service's recordings show it mints: a version-4
+/// UUID, `8-4-4-4-12` lowercase hex with the version and variant bits RFC 4122 §4.4
+/// fixes.
+///
+/// The 128 bits come from three sources hashed together with SHA-256 (the `sha2` crate)
+/// and hex-encoded (the `hex` crate): the OS-seeded randomness a `RandomState` draws, the
+/// system clock in nanoseconds, and `sequence` — a number the store varies per draw, so
+/// two draws in the same nanosecond cannot collide. Nothing here comes from the request,
+/// and nothing is reproducible across runs. An id names a resource for correlation; a
+/// credential would come from `ctx.credential_store()` instead, never from here.
+fn new_uuid(sequence: u64) -> String {
+    use ::sha2::{Digest, Sha256};
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let mut hasher = Sha256::new();
+    hasher.update(RandomState::new().hash_one(sequence).to_le_bytes());
+    hasher.update(nanos.to_le_bytes());
+    hasher.update(sequence.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // RFC 4122 §4.4: the version nibble is 4, and the variant's two top bits are `10`.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = ::hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// Whether `point` is one of the recovery points `scope` selects.
+///
+/// Every member of `SearchScope` is a filter over the backup index: the resource type
+/// (the model allows exactly one), the recovery-point and source-resource ARNs, the
+/// window the backup was created in, and the backup's tags. A filter the request leaves
+/// out admits everything; a filter it carries admits only what matches it, and a record
+/// that cannot be judged against a filter it carries (no creation time against a creation
+/// window, no tags at all against a tag filter) is not selected, because nothing shows it
+/// to be in scope.
+fn in_scope(point: &SearchJobBackupsResult, scope: &SearchScope) -> bool {
+    // `BackupResourceTypes` is @required and @length(min: 1, max: 1), so it always names
+    // a type and is never "no filter": a record whose type it does not name is out of
+    // scope. (The ARN lists below read an EMPTY list the other way round, as no filter at
+    // all, because the model makes them optional with @length(min: 0).)
+    if !scope
+        .backup_resource_types
+        .iter()
+        .any(|wanted| point.resource_type.as_deref() == Some(wanted.as_str()))
+    {
+        return false;
+    }
+    if !arn_admits(scope.backup_resource_arns.as_deref(), point.backup_resource_arn.as_deref()) {
+        return false;
+    }
+    if !arn_admits(scope.source_resource_arns.as_deref(), point.source_resource_arn.as_deref()) {
+        return false;
+    }
+    if let Some(window) = scope.backup_resource_creation_time.as_ref() {
+        let Some(created) = point.backup_creation_time.map(instant_key) else {
+            return false;
+        };
+        // "only created after"/"only created before" the given instant, with the bound
+        // itself in scope: the filter names the edge of the window, not a point outside it.
+        if window
+            .created_after
+            .is_some_and(|after| created < instant_key(after))
+            || window
+                .created_before
+                .is_some_and(|before| created > instant_key(before))
+        {
+            return false;
+        }
+    }
+    // A tag filter: a recovery point carries no tags in this model, so no record this
+    // store holds can be shown to carry the ones the scope asks for. Revisit this branch
+    // if `SearchJobBackupsResult` ever gains a tags member (or the records written into
+    // `recovery_points` carry tags some other way): it would then have to MATCH the
+    // filter rather than exclude everything.
+    scope
+        .backup_resource_tags
+        .as_ref()
+        .is_none_or(|tags| tags.is_empty())
+}
+
+/// Whether an ARN filter admits `candidate`: an absent or empty list is no filter at all,
+/// and a list admits exactly the ARNs it names.
+fn arn_admits(filter: Option<&[String]>, candidate: Option<&str>) -> bool {
+    match filter {
+        None => true,
+        Some([]) => true,
+        Some(arns) => candidate.is_some_and(|arn| arns.iter().any(|wanted| wanted == arn)),
+    }
+}
+
+/// A `DateTime` as a totally ordered key, so two instants can be compared: the model's
+/// timestamps carry seconds and sub-second nanos, and `DateTime` itself is not `Ord`.
+fn instant_key(instant: DateTime) -> (i64, u32) {
+    (instant.secs(), instant.subsec_nanos())
+}
+
+/// The terminal status the clock owes a scan over `recovery_points_in_scope` recovery
+/// points, with the `StatusMessage` that status comes with.
+///
+/// A scan that had something to get through ends `COMPLETED` and explains nothing. A
+/// scope that resolved to NO recovery point is a terminal failure — there was nothing to
+/// search — and the service says so in the message, so a caller branching on a terminal
+/// status takes its failure path instead of reading results that were never produced.
+pub fn scan_outcome(recovery_points_in_scope: usize) -> (&'static str, Option<&'static str>) {
+    if recovery_points_in_scope == 0 {
+        (FAILED, Some(SCOPE_EMPTY))
+    } else {
+        (COMPLETED, None)
     }
 }
 
@@ -515,9 +751,15 @@ pub fn decode_next_token(
     Ok(offset)
 }
 
-/// One page of `items` starting at `offset`, with the token that resumes after it
-/// (`None` on the last page, which is how a paginating client knows to stop). The token
-/// carries `context`, the sequence it indexes.
+/// One page of `items` starting at `offset`, with the token that resumes after it. The
+/// token carries `context`, the sequence it indexes.
+///
+/// A page carries a `NextToken` whenever it is FULL — it holds as many entries as the
+/// requested page size — because a full page is all this call was asked for and says
+/// nothing about what follows it. A short page is the end of the sequence and carries
+/// none, which is how a paginating client knows to stop: it follows the token until a
+/// page comes back short, and the page a token at the very end of the sequence resumes
+/// is the empty one.
 pub fn page<T: Clone>(
     items: &[T],
     offset: usize,
@@ -526,7 +768,7 @@ pub fn page<T: Clone>(
 ) -> (Vec<T>, Option<String>) {
     let end = offset.saturating_add(max_results).min(items.len());
     let page = items[offset.min(items.len())..end].to_vec();
-    let next = (end < items.len()).then(|| encode_next_token(context, end));
+    let next = (page.len() == max_results).then(|| encode_next_token(context, end));
     (page, next)
 }
 

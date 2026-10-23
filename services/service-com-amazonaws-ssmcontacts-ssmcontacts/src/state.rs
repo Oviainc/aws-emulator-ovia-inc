@@ -142,8 +142,8 @@ pub struct RotationRecord {
 /// stopped.
 ///
 /// `DescribeEngagement` rebuilds its whole response from this record, so every modelled
-/// member of that response is held here rather than recomputed. `StartEngagement` (still
-/// a scaffold stub, with its own issue) is the operation that inserts one.
+/// member of that response is held here rather than recomputed. `StartEngagement` is the
+/// operation that inserts one.
 #[derive(Debug, Clone)]
 pub struct EngagementRecord {
     /// The `EngagementArn`, which is also this record's key in [`engagements`].
@@ -205,10 +205,14 @@ pub struct ComAmazonawsSsmcontactsSsmcontactsState {
     /// stops and `DescribeEngagement` reports; nothing in this service removes one, since
     /// the model has no delete for an engagement.
     ///
-    /// Unbounded by any constant here because the only operation that can insert into it
-    /// is `StartEngagement`, which is still a scaffold stub: the bound belongs with the
-    /// create, the way [`MAX_CONTACTS`] sits with `CreateContact`.
+    /// Bounded by [`MAX_ENGAGEMENTS`], which sits with `StartEngagement` — the only
+    /// operation that inserts — the way [`MAX_CONTACTS`] sits with `CreateContact`.
     pub engagements: BTreeMap<String, EngagementRecord>,
+    /// How many engagements this store has ever started. Feeds the engagement ARN's opaque
+    /// id, so two engagements of the SAME contact are still two resources with two ARNs —
+    /// nothing about the request distinguishes them, since the model declares no unique
+    /// name for an engagement.
+    pub engagements_started: u64,
     /// `(operation, IdempotencyToken)` -> the ARN that token's first call minted, so a
     /// retried create answers with the same resource instead of minting a second one.
     ///
@@ -298,6 +302,7 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
         if self.contacts.contains_key(arn)
             || self.contact_channels.contains_key(arn)
             || self.rotations.contains_key(arn)
+            || self.engagements.contains_key(arn)
         {
             return Some(arn.clone());
         }
@@ -417,6 +422,13 @@ pub const MAX_CONTACT_CHANNELS: usize = 50_000;
 /// `ServiceQuotaExceededException` `CreateRotation` declares. See [`MAX_CONTACTS`].
 pub const MAX_ROTATIONS: usize = 10_000;
 
+/// The same bound for engagements. Nothing in this service deletes an engagement — the
+/// model declares no delete for one — so without a ceiling N `StartEngagement` calls leave
+/// N resident records for ever. `StartEngagement` models no quota error, so a create past
+/// this ceiling is refused with the `ValidationException` it does model. See
+/// [`MAX_CONTACTS`].
+pub const MAX_ENGAGEMENTS: usize = 50_000;
+
 /// How many tags one resource holds.
 ///
 /// This is the MODEL's bound, not the emulator's: `TagsList` — the shape both
@@ -491,6 +503,20 @@ pub fn contact_channel_arn(region: &str, alias: &str, name: &str, sequence: u64)
 pub fn rotation_arn(region: &str, name: &str, sequence: u64) -> String {
     let id = opaque_uuid(&["rotation", name, &sequence.to_string()].join("\u{1f}"));
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("rotation/{id}"))
+}
+
+/// An engagement's ARN:
+/// `arn:aws:ssm-contacts:<region>:<account>:engagement/<contact alias>/<id>`.
+///
+/// The engaged contact's alias is the first segment, exactly as Incident Manager names an
+/// engagement after the contact or escalation plan it engages. An engagement has no
+/// caller-chosen unique name — the model declares none, and the same contact may be engaged
+/// any number of times — so the id is derived from the alias plus the store's own
+/// engagement counter: deterministic for a given sequence of calls, and distinct for every
+/// engagement the store starts.
+pub fn engagement_arn(region: &str, alias: &str, sequence: u64) -> String {
+    let id = opaque_uuid(&["engagement", alias, &sequence.to_string()].join("\u{1f}"));
+    ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("engagement/{alias}/{id}"))
 }
 
 /// The activation code delivered to a contact channel on its `sequence`-th delivery.

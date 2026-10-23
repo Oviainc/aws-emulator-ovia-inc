@@ -352,8 +352,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let group_config = group.deployment_config_name.clone();
             let group_style = group.deployment_style.clone();
             // The targets this deployment group resolves, which is what decides
-            // the terminal status the clock owes the deployment.
-            let target_count = crate::state::deployment_target_count(state, group);
+            // the terminal status the clock owes the deployment, and what the
+            // deployment reports as its targets from here on.
+            let targets = crate::state::deployment_targets(state, group);
             // What this deployment owes the original environment: a blue/green
             // group that terminates its instances holds the deployment open for
             // the wait it configured.
@@ -484,7 +485,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // yet: both are written as the deployment runs.
                 error_information: None,
                 lifecycle_hook_executions: Vec::new(),
-                target_count,
+                targets,
                 terminates_original_instances,
                 termination_wait_millis,
                 instance_termination_wait_time_started: false,

@@ -172,7 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `DashboardId` is "the name or ARN for the dashboard": a bare name addresses
         // the caller's own Region, an ARN the Region it carries. An identifier that
-        // can name no dashboard is answered the same way as one that names none.
+        // can name no dashboard is answered the same way as one that names none —
+        // and CloudTrail Lake states that refusal, in the words every dashboard
+        // operation shares, without naming the identifier back. The resource-policy
+        // surface states the same situation in its OWN recorded words ("The dashboard
+        // was not found.", `state::ResourceKind::not_found_message`), so the two are
+        // deliberately not one sentence.
         let record = store
             .resolve_dashboard_mut(&input.dashboard_id, &region, now)
             .ok_or_else(|| {

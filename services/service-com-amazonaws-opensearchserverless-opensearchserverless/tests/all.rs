@@ -23,6 +23,8 @@ mod collection_lifecycle;
 mod lifecycle_policy;
 #[path = "all/policies_stats.rs"]
 mod policies_stats;
+#[path = "all/policy_and_group_writes.rs"]
+mod policy_and_group_writes;
 #[path = "all/security_configs.rs"]
 mod security_configs;
 #[path = "all/state_roundtrip.rs"]

@@ -344,7 +344,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let export_identifier = state.mint_export_identifier();
+        let export_identifier = state.mint_export_identifier().ok_or_else(|| {
+            StartSearchResultExportJobError::from(
+                StartSearchResultExportJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::MINT_EXHAUSTED.to_string(),
+                        retry_after_seconds: None,
+                    },
+                ),
+            )
+        })?;
         let arn = crate::state::export_job_arn(
             ctx.identity().signing_name(),
             &crate::state::request_region(ctx),

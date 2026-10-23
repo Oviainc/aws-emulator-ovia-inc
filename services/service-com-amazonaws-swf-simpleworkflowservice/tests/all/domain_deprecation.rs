@@ -6,15 +6,15 @@
 //! `workflow_execution_lifecycle` already builds.
 //!
 //! The rule every case here asserts: `DeprecateDomain` moves the ONE stored domain
-//! record it names from `REGISTERED` to `DEPRECATED` and, with it, every activity and
-//! workflow type registered in that domain (the operation's doc: "Deprecating a domain
-//! also deprecates all activity and workflow types registered in the domain"), leaving
-//! executions started before the call running ("Executions that were started before the
-//! domain was deprecated continues to run"); a name that no stored domain carries is
-//! refused with HTTP 400 `UnknownResourceFault` and a domain that is already deprecated
-//! with HTTP 400 `DomainDeprecatedFault` ("Returned when the specified domain has been
-//! deprecated"), each naming the requested domain in its message, and neither of which
-//! changes what a later caller sees.
+//! record it names from `REGISTERED` to `DEPRECATED` and changes nothing else — the
+//! activity and workflow types registered in that domain keep their own
+//! `RegistrationStatus` (a type's status moves only for a call addressing that type),
+//! and executions started before the call keep running ("Executions that were started
+//! before the domain was deprecated continues to run"); a name that no stored domain
+//! carries is refused with HTTP 400 `UnknownResourceFault` and a domain that is already
+//! deprecated with HTTP 400 `DomainDeprecatedFault` ("Returned when the specified domain
+//! has been deprecated"), each naming the requested domain in its message, and neither
+//! of which changes what a later caller sees.
 //!
 //! The tables below vary what that rule generalises over: which kinds of type the
 //! domain holds and how many (none, one, several names, several versions of one name,
@@ -196,15 +196,16 @@ fn domain_cases() -> Vec<DomainCase> {
             retention: "7",
             types: vec![workflow(("orders", "1.0"))],
         },
-        // Activity types only: the cascade is over BOTH registries, not just the
-        // workflow one.
+        // Activity types only: the rule is over BOTH registries, not just the workflow
+        // one.
         DomainCase {
             domain: "activities-only-domain",
             retention: "3",
             types: vec![activity(("pack", "1.0")), activity(("pack", "2.0"))],
         },
         // Several distinct names AND several versions of one name, of both kinds, so
-        // the cascade is over every stored type rather than one per name or per kind.
+        // the rule is checked over every stored type rather than one per name or per
+        // kind.
         DomainCase {
             domain: "many-types.domain_1",
             retention: "90",
@@ -229,7 +230,7 @@ fn domain_cases() -> Vec<DomainCase> {
 }
 
 #[tokio::test]
-async fn deprecating_a_domain_moves_its_record_and_cascades_to_its_types() {
+async fn deprecating_a_domain_moves_its_own_record_only() {
     let emulator = Emulator::new();
     let cases = domain_cases();
     for case in &cases {
@@ -277,37 +278,30 @@ async fn deprecating_a_domain_moves_its_record_and_cascades_to_its_types() {
             case.domain
         );
 
-        // Every type registered in this domain is deprecated with it, and carries a
-        // deprecationDate at or after its own creationDate.
+        // Every type registered in this domain keeps its own status: the domain's
+        // deprecation is not propagated onto them, so each still reads back REGISTERED
+        // with no deprecationDate.
         for ty in &case.types {
             let described = describe_type(&emulator, case.domain, case.domain, *ty).await;
             assert_eq!(
                 modelled_status(case.domain, &described, "/typeInfo/status"),
-                "DEPRECATED",
-                "case {:?}: type {ty:?} must be deprecated with its domain, got {described:?}",
+                "REGISTERED",
+                "case {:?}: type {ty:?} keeps its own status when its domain is \
+                 deprecated, got {described:?}",
                 case.domain
             );
-            let creation = timestamp_at(&described, "/typeInfo/creationDate").unwrap_or_else(|| {
-                panic!("case {:?}: no creationDate in {described:?}", case.domain)
-            });
-            let deprecation =
-                timestamp_at(&described, "/typeInfo/deprecationDate").unwrap_or_else(|| {
-                    panic!(
-                        "case {:?}: type {ty:?} must report a deprecationDate, got {described:?}",
-                        case.domain
-                    )
-                });
-            assert!(
-                deprecation >= creation,
-                "case {:?}: type {ty:?} deprecationDate {deprecation} must be at or after \
-                 creationDate {creation}, got {described:?}",
+            assert_eq!(
+                timestamp_at(&described, "/typeInfo/deprecationDate"),
+                None,
+                "case {:?}: type {ty:?} must carry no deprecationDate after its domain \
+                 was deprecated, got {described:?}",
                 case.domain
             );
         }
 
         // One call addresses ONE record: the domains deprecated earlier stay
-        // deprecated, and the ones not yet addressed are still REGISTERED with their
-        // types untouched.
+        // deprecated, and the ones not yet addressed are still REGISTERED. Every type of
+        // every domain is REGISTERED throughout, deprecated domain or not.
         for (other_index, other) in cases.iter().enumerate() {
             let expected = if other_index <= index {
                 "DEPRECATED"
@@ -327,9 +321,9 @@ async fn deprecating_a_domain_moves_its_record_and_cascades_to_its_types() {
                 let described = describe_type(&emulator, other.domain, other.domain, *ty).await;
                 assert_eq!(
                     modelled_status(other.domain, &described, "/typeInfo/status"),
-                    expected,
-                    "case {:?}: after deprecating {:?}, type {ty:?} must be {expected}, \
-                     got {described:?}",
+                    "REGISTERED",
+                    "case {:?}: after deprecating {:?}, type {ty:?} must still be \
+                     REGISTERED, got {described:?}",
                     other.domain,
                     case.domain
                 );
@@ -365,9 +359,9 @@ async fn deprecating_an_already_deprecated_domain_is_refused() {
         };
 
         // Repeated attempts are each refused the same way; none of them is a silent
-        // re-deprecation that re-dates the types. The fault's message is the name of
-        // the domain it refers to, so it is request-derived and therefore a
-        // requirement, over every name shape the table covers.
+        // re-deprecation. The fault's message is the name of the domain it refers to, so
+        // it is request-derived and therefore a requirement, over every name shape the
+        // table covers.
         for round in 1..=3 {
             let round_case = format!("{} refusal #{round}", case.domain);
             let (status, body) = emulator
@@ -404,7 +398,7 @@ async fn deprecating_an_already_deprecated_domain_is_refused() {
             let described = describe_type(&emulator, case.domain, case.domain, *ty).await;
             assert_eq!(
                 &described, expected,
-                "case {:?}: a refused deprecation must not re-date type {ty:?}, \
+                "case {:?}: a refused deprecation must not change type {ty:?}, \
                  got {described:?}",
                 case.domain
             );

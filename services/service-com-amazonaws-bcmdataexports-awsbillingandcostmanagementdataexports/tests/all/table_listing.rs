@@ -47,12 +47,18 @@ fn default_value_of(property: &Value) -> Option<&str> {
     property.get("DefaultValue").and_then(Value::as_str)
 }
 
-/// The only table properties whose value the caller WRITES rather than picks from a
-/// published list — a billing view ARN and a filter expression (AWS Data Exports table
-/// dictionary) — so they are the only ones that may report an empty `ValidValues`. Every
-/// other property publishes the values it accepts, and `catalog_dictionary.rs` pins each
-/// of those lists.
-const FREE_FORM_PROPERTIES: &[&str] = &["BILLING_VIEW_ARN", "FILTER"];
+/// The only table property whose value the caller WRITES rather than picks from a
+/// published list and that the dictionary publishes NO list at all for — the billing view
+/// ARN (AWS Data Exports table dictionary) — so it is the only one that may report an
+/// empty `ValidValues`. Every other property publishes the values it accepts, the
+/// recommendations filter publishing the wildcard `*`, and `catalog_dictionary.rs` pins
+/// each of those lists.
+const FREE_FORM_PROPERTIES: &[&str] = &["BILLING_VIEW_ARN"];
+
+/// The WILDCARD valid value: a property that publishes it accepts any value the caller
+/// writes, so its `DefaultValue` need not appear in the list (AWS Data Exports table
+/// dictionary).
+const WILDCARD_VALID_VALUE: &str = "*";
 
 /// Call `ListTables` with the paging members a case sets, requiring HTTP 200.
 async fn list_tables(client: &Client, max_results: Option<i64>, token: Option<&str>) -> Value {
@@ -244,7 +250,9 @@ async fn every_listed_table_satisfies_the_modelled_table_contract() {
             );
             if let Some(default_value) = default_value_of(property) {
                 assert!(
-                    valid_values.is_empty() || valid_values.contains(&default_value),
+                    valid_values.is_empty()
+                        || valid_values.contains(&WILDCARD_VALID_VALUE)
+                        || valid_values.contains(&default_value),
                     "case {name:?}/{property_name}: DefaultValue {default_value:?} must be one of {valid_values:?}"
                 );
             }

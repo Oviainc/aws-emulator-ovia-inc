@@ -191,9 +191,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "StartTime: … those that occur on or after this time" (inclusive);
-        // "EndTime: … up to, but not including, the EndTime" (exclusive).
-        let start_time = input.start_time.map(|at| at.as_secs_f64());
-        let end_time = input.end_time.map(|at| at.as_secs_f64());
+        // "EndTime: … up to, but not including, the EndTime" (exclusive). Both
+        // bounds are compared as EXACT instants (`crate::state::instant_key`):
+        // a window that opens on one event's timestamp must not take in an event
+        // a microsecond older, which a comparison in `f64` epoch seconds cannot
+        // resolve.
+        let start_time = input.start_time.map(|at| crate::state::instant_key(&at));
+        let end_time = input.end_time.map(|at| crate::state::instant_key(&at));
 
         // "Specifies the maximum number of events that can be returned,
         // beginning with the most recent event": the answer is ordered by the
@@ -255,15 +259,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })
             .filter(|event| {
-                let at = event.event_date.as_secs_f64();
+                let at = crate::state::instant_key(&event.event_date);
                 start_time.is_none_or(|start| at >= start) && end_time.is_none_or(|end| at < end)
             })
             .collect();
         matching.sort_by(|left, right| {
-            right
-                .event_date
-                .as_secs_f64()
-                .total_cmp(&left.event_date.as_secs_f64())
+            crate::state::instant_key(&right.event_date)
+                .cmp(&crate::state::instant_key(&left.event_date))
                 .then_with(|| right.sequence.cmp(&left.sequence))
         });
 
@@ -286,7 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .and_then(|sequence| {
                         store.events.iter().find(|event| event.sequence == sequence)
                     })
-                    .map(|event| (event.event_date.as_secs_f64(), event.sequence))
+                    .map(|event| (crate::state::instant_key(&event.event_date), event.sequence))
                     .ok_or_else(|| {
                         DescribeEventsError::invalid_parameter_value(format!(
                             "Invalid NextToken: {token}"
@@ -294,7 +296,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })?;
                 matching
                     .iter()
-                    .position(|event| (event.event_date.as_secs_f64(), event.sequence) <= boundary)
+                    .position(|event| {
+                        (crate::state::instant_key(&event.event_date), event.sequence) <= boundary
+                    })
                     // Every event this answer holds is newer than the boundary,
                     // so the next page is empty.
                     .unwrap_or(matching.len())

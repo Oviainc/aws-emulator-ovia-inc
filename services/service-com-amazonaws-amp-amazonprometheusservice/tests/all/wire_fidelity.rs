@@ -17,8 +17,9 @@
 use crate::workspace_lifecycle::{text, Amp, Reply};
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
     JSON_CONTENT_TYPE, LOGGING_NOT_FOUND_MESSAGE, POLICY_NOT_FOUND_MESSAGE,
-    QUERY_LOGGING_NOT_FOUND_MESSAGE, RESOURCE_NOT_FOUND_MESSAGE, RESPONSE_CONTENT_TYPE,
-    RULE_GROUPS_NAMESPACE_NOT_FOUND_MESSAGE, VALIDATION_REASON, WORKSPACE_NOT_FOUND_MESSAGE,
+    QUERY_LOGGING_NOT_FOUND_MESSAGE, RESOURCE_NOT_FOUND_CODE, RESOURCE_NOT_FOUND_MESSAGE,
+    RESPONSE_CONTENT_TYPE, RULE_GROUPS_NAMESPACE_NOT_FOUND_MESSAGE, VALIDATION_REASON,
+    WORKSPACE_NOT_FOUND_MESSAGE,
 };
 use service_com_amazonaws_amp_amazonprometheusservice::EmulatedService;
 
@@ -673,27 +674,54 @@ async fn a_missing_subresource_reports_one_constant_message() {
             POLICY_NOT_FOUND_MESSAGE,
             workspace_id.clone(),
         ),
-        (
-            "ListTagsForResource for an ARN no workspace carries",
-            "GET",
-            format!("/tags/{}", encode_label(&unknown_arn)),
-            String::new(),
-            RESOURCE_NOT_FOUND_MESSAGE,
-            unknown_arn.clone(),
-        ),
-        (
-            "TagResource for an ARN no workspace carries",
-            "POST",
-            format!("/tags/{}", encode_label(&unknown_arn)),
-            serde_json::json!({ "tags": { "team": "metrics" } }).to_string(),
-            RESOURCE_NOT_FOUND_MESSAGE,
-            unknown_arn.clone(),
-        ),
     ];
 
     for (case, method, uri, body, expected, resource_id) in cases {
         let reply = amp.call(method, &uri, region, &body).await;
         assert_missing(&reply, case, expected, &resource_id);
+    }
+
+    // The ARN-addressed `/tags/{resourceArn}` operations are the exception: an ARN that
+    // resolves to nothing is answered with `state::RESOURCE_NOT_FOUND_CODE` at 404
+    // carrying `state::RESOURCE_NOT_FOUND_MESSAGE` — the code aps is recorded answering
+    // there — and that synthetic shape carries `message` alone, so there is no
+    // `resourceId` member to report the ARN in. `tests/all/rejection_codes.rs` holds the
+    // rule to a table of ARN types and all three operations.
+    for (case, method, body) in [
+        ("ListTagsForResource for an ARN no workspace carries", "GET", String::new()),
+        (
+            "TagResource for an ARN no workspace carries",
+            "POST",
+            serde_json::json!({ "tags": { "team": "metrics" } }).to_string(),
+        ),
+    ] {
+        let reply = amp
+            .call(
+                method,
+                &format!("/tags/{}", encode_label(&unknown_arn)),
+                region,
+                &body,
+            )
+            .await;
+        assert_eq!(
+            reply.status, 404,
+            "case {case:?}: expected status 404, got {reply:?}"
+        );
+        assert_eq!(
+            reply.error_code(),
+            RESOURCE_NOT_FOUND_CODE,
+            "case {case:?}: unexpected error code, got {reply:?}"
+        );
+        let message = text(&reply.body["message"]);
+        assert_eq!(
+            message, RESOURCE_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected the constant message {RESOURCE_NOT_FOUND_MESSAGE:?}, \
+             got {message:?}"
+        );
+        assert!(
+            !message.contains(&unknown_arn),
+            "case {case:?}: the message must not carry the requested ARN, got {message:?}"
+        );
     }
 }
 

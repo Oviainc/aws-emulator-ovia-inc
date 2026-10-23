@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRetainedMessages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRetainedMessages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRetainedMessages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Summarises every retained message the account holds — one entry per topic a
+//! `Publish` with `retain=true` left a message on, in a stable topic order, carrying
+//! the topic, the payload's SIZE in bytes, the QoS and when it was stored. It never
+//! carries a payload: `GetRetainedMessage` is what answers with one. A page is bounded
+//! by `maxResults` and continued with the `nextToken` the previous page returned.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +153,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRetainedMessages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRetainedMessagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRetainedMessages"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListRetainedMessagesErrorModeled::InternalFailureException(
+                InternalFailureException::new("An unexpected error has occurred."),
+            )
+        })?;
+
+        // `nextToken` is this service's own offset into the ordered retained topics, so
+        // a token that is not one is an invalid request rather than an empty page — the
+        // same token form `ListNamedShadowsForThing` continues a page with.
+        let offset = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => token.parse::<usize>().map_err(|_| {
+                ListRetainedMessagesErrorModeled::InvalidRequestException(
+                    InvalidRequestException::new(format!("the nextToken '{token}' is not valid")),
+                )
+            })?,
+        };
+        // A request that names no `maxResults` gets at most the top of the modelled
+        // range, so one unparameterised call cannot return a page that grows with the
+        // number of retained topics. A value outside that range never reaches this
+        // handler — the framework refuses it against the model — so the clamp only
+        // pins the bound the model already states.
+        let page_size = input.max_results.map_or(
+            crate::state::MAX_RETAINED_MESSAGE_PAGE_SIZE,
+            |max_results| {
+                max_results.clamp(1, crate::state::MAX_RETAINED_MESSAGE_PAGE_SIZE as i32) as usize
+            },
+        );
+
+        let guard = state.lock();
+        // Reporting only: summarising the retained messages neither consumes nor
+        // rewrites one — MQTT keeps a retained message until it is overwritten or
+        // cleared, so a later reader sees exactly what this call saw.
+        let total = guard.retained_messages.len();
+        let page: Vec<RetainedMessageSummary> = guard
+            .retained_messages
+            .values()
+            .skip(offset)
+            .take(page_size)
+            .map(|retained| RetainedMessageSummary {
+                topic: Some(retained.topic.clone()),
+                // A SUMMARY carries the payload's SIZE, never its bytes.
+                payload_size: retained.payload.len() as i64,
+                qos: retained.qos,
+                last_modified_time: retained.last_modified_time_millis,
+            })
+            .collect();
+        drop(guard);
+
+        // The token is the offset the NEXT page starts at, and is absent once this page
+        // reached the end of the store — which is what tells a paginating caller to stop.
+        let consumed = offset.saturating_add(page.len());
+        let next_token = (consumed < total).then(|| consumed.to_string());
+
+        Ok(ListRetainedMessagesOutput {
+            retained_topics: Some(page),
+            next_token,
+        })
     }
 }
+

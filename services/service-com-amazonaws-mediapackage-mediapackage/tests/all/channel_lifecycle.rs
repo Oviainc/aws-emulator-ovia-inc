@@ -59,14 +59,18 @@ fn authorization() -> String {
     )
 }
 
-/// One request/response round trip: the HTTP status and the parsed JSON body (`Null` for
-/// an empty body).
-pub(crate) async fn call(
+/// One request/response round trip, answering the WHOLE response — status, headers and
+/// body — as the router served it.
+///
+/// [`call`] is this call with the body parsed; a suite whose subject is a response HEADER
+/// (how a bodyless answer is framed, say) needs the headers too, so both forms go through
+/// this one dispatch and cannot drift apart.
+pub(crate) async fn dispatch(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
     body: Option<&Value>,
-) -> (u16, Value) {
+) -> http::Response<Bytes> {
     let payload = body.map(|b| b.to_string()).unwrap_or_default();
     let request = http::Request::builder()
         .method(method)
@@ -75,7 +79,18 @@ pub(crate) async fn call(
         .header("content-type", "application/json")
         .body(Bytes::from(payload))
         .expect("a well-formed request");
-    let response = router.dispatch(request).await;
+    router.dispatch(request).await
+}
+
+/// One request/response round trip: the HTTP status and the parsed JSON body (`Null` for
+/// an empty body).
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
+    let response = dispatch(router, method, uri, body).await;
     let status = response.status().as_u16();
     let bytes = response.into_body();
     let parsed = serde_json::from_slice(&bytes).unwrap_or(Value::Null);

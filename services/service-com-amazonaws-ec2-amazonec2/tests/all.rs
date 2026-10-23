@@ -70,6 +70,8 @@ mod mac_dedicated_hosts;
 mod modify_subnet_attribute;
 #[path = "all/secondary_networks.rs"]
 mod secondary_networks;
+#[path = "all/secondary_subnets.rs"]
+mod secondary_subnets;
 #[path = "all/security_group_filter_limits.rs"]
 mod security_group_filter_limits;
 #[path = "all/security_groups.rs"]
@@ -78,6 +80,8 @@ mod security_groups;
 mod snapshot_block_public_access;
 #[path = "all/spot_placement_scores.rs"]
 mod spot_placement_scores;
+#[path = "all/stale_security_groups.rs"]
+mod stale_security_groups;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/transit_gateway_acceptance.rs"]

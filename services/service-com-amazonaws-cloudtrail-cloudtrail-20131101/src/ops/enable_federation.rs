@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableFederation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableFederation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableFederation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Turns Lake query federation on for one CloudTrail Lake event data store,
+//! addressed either by its ARN or by the id suffix of that ARN.
+//!
+//! It MUTATES the stored store: the federation role the request names is persisted
+//! and the federation status moves off `DISABLED` into the transient `ENABLING`,
+//! which the clock settles into `ENABLED` after
+//! [`crate::state::FEDERATION_SETTLE_AFTER`] — so the answer reports `ENABLING` and
+//! a later read reports `ENABLED`. A store already carrying a federation, or one
+//! whose federation is still moving, is refused rather than re-federated.
 //!
 //! ## Shape of an operation
 //!
@@ -213,18 +214,204 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableFederation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableFederationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableFederation"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            EnableFederationErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "EnableFederation needs the CloudTrail event data store registry, \
+                         which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `EventDataStore` is either a store ARN or the id suffix of one; a value
+        // that can be read as neither names no store in any account. The identifier
+        // is read here rather than through
+        // `ComAmazonawsCloudtrailCloudtrail20131101State::event_data_store` so the
+        // refusal below can name the ARN it addressed.
+        let identifier = crate::state::parse_event_data_store_identifier(&input.event_data_store)
+            .map_err(|rejection| {
+            EnableFederationErrorModeled::EventDataStoreARNInvalidException(
+                EventDataStoreARNInvalidException {
+                    message: Some(rejection.message(&region)),
+                },
+            )
+        })?;
+
+        let Some(record) = store.addressed_event_data_store_mut(&identifier, &region) else {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                EnableFederationErrorModeled::EventDataStoreNotFoundException(
+                    EventDataStoreNotFoundException {
+                        message: Some(crate::state::event_data_store_not_found_message(
+                            &identifier.arn(&region),
+                        )),
+                    },
+                ),
+                NOT_FOUND_STATUS,
+            ));
+        };
+
+        // A federation transition the clock already owed this store was due
+        // whatever this call does, so it is materialised before the status below is
+        // read: a federation that has finished turning on must not read `ENABLING`
+        // for ever.
+        record.settle_federation(now);
+
+        // The role is the one Lake Formation and Glue reach the store's data
+        // through — "The federation role must exist in your account" (model doc for
+        // `EnableFederationRequest$FederationRoleArn`) — so a value that is not an
+        // IAM role ARN at all names no role anywhere. The modelled pattern admits
+        // such a value, so it is refused here, with the error the model carries for
+        // a parameter that is not valid. A malformed parameter is answered before
+        // the store's own state, so a caller that got the role wrong is told about
+        // the role whatever state the store it named is in.
+        if !is_iam_role_arn(&input.federation_role_arn) {
+            return Err(EnableFederationErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "FederationRoleArn '{}' is not valid: the ARN of a federation role \
+                         is arn:<partition>:iam::<account-id>:role/<role-name>.",
+                        input.federation_role_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A store awaiting deletion is what the modelled
+        // `InactiveEventDataStoreException` reports: there is no lake left to
+        // federate. `is_queryable` is this crate's name for that condition — the
+        // store is live — and `disable_federation` refuses on the same call.
+        if !record.status.is_queryable() {
+            return Err(
+                EnableFederationErrorModeled::InactiveEventDataStoreException(
+                    InactiveEventDataStoreException {
+                        message: Some(format!(
+                            "The event data store {} is inactive: its status is {}.",
+                            record.arn(),
+                            record.status.as_wire()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A federation change already under way has to settle before another call
+        // can move it — "You are trying to update a resource when another request
+        // is in progress" (model doc for `ConcurrentModificationException`). A
+        // status the clock still owes a transition on (`FederationState::settled`
+        // answers `Some`) is exactly one that is in flight.
+        if record.federation_status.settled().is_some() {
+            return Err(
+                EnableFederationErrorModeled::ConcurrentModificationException(
+                    ConcurrentModificationException {
+                        message: Some(format!(
+                            "The federation status of event data store {} is {}: another \
+                             request is in progress. Allow sufficient wait time for the \
+                             previous request to complete, then retry your request.",
+                            record.arn(),
+                            record.federation_status.as_wire()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A store that already carries a federation is refused with the one error
+        // this operation models for a store whose Lake query federation is on;
+        // federation comes off through `DisableFederation`, not by enabling it
+        // twice. Unlike `DisableFederation` — which takes no role, so a repeat call
+        // has nothing to apply and simply writes nothing — this call carries a
+        // `FederationRoleArn` that cannot be applied to a store already federated,
+        // so answering it with a success would silently drop what the caller asked
+        // for.
+        if record.federation_status == crate::state::FederationState::Enabled {
+            return Err(
+                EnableFederationErrorModeled::EventDataStoreFederationEnabledException(
+                    EventDataStoreFederationEnabledException {
+                        message: Some(format!(
+                            "Lake query federation is already enabled on the event data \
+                             store {}. To change it, run the DisableFederation operation \
+                             first.",
+                            record.arn()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        record.federation_status = crate::state::FederationState::Enabling;
+        record.federation_settles_at = Some(now + crate::state::FEDERATION_SETTLE_AFTER);
+        record.federation_role_arn = Some(input.federation_role_arn.clone());
+        record.updated_at = Some(now);
+
+        Ok(EnableFederationOutput {
+            event_data_store_arn: Some(record.arn()),
+            federation_status: Some(record.federation_status.as_wire().to_string()),
+            federation_role_arn: record.federation_role_arn.clone(),
+        })
     }
+}
+
+/// The HTTP status this service answers a not-found refusal with.
+///
+/// The model annotates `EventDataStoreNotFoundException` `@httpError(404)`, but
+/// CloudTrail answers 400 for it on the wire: the recorded response for this very
+/// operation is `HTTP 400` with `__type` `EventDataStoreNotFoundException` and a
+/// `Message` naming the store's ARN. The error CODE is the model's; only the status
+/// is stated here, through [`crate::scaffolded::Scaffolded::modeled_with_status`] —
+/// the same way `get_event_data_store` states it.
+const NOT_FOUND_STATUS: u16 = 400;
+
+/// The ARN vendor (service namespace) field an IAM resource carries.
+const IAM_VENDOR: &str = "iam";
+
+/// The resource prefix an IAM role's ARN carries in its resource field. IAM writes
+/// a role only in the `role/<name>` form, never as `role:<name>`.
+const IAM_ROLE_RESOURCE_PREFIX: &str = "role/";
+
+/// The characters besides ASCII letters and digits an IAM role name may carry, from
+/// the pattern AWS documents for a role name (`[\w+=,.@-]+`). `/` is not among them:
+/// it separates the role's PATH segments, which [`is_iam_role_arn`] splits on.
+const IAM_ROLE_NAME_PUNCTUATION: [char; 7] = ['_', '+', '=', ',', '.', '@', '-'];
+
+/// Whether `value` is an IAM role ARN —
+/// `arn:<partition>:iam::<account-id>:role/<role-name>`, the form a federation role
+/// takes.
+///
+/// The ARN itself is read through `service_common::arn`, this tree's ONE ARN parse,
+/// so this file does not split a value into fields again. What it adds are the
+/// conditions an IAM ROLE ARN carries on top of a well-formed ARN: IAM is global, so
+/// the Region field is empty; a role belongs to an account, so the account field is
+/// not; and the resource is a `role/<name>` — IAM writes no `role:<name>` form —
+/// where the name may be preceded by path segments
+/// (`role/service-role/lake-federation`). Every segment is checked against the
+/// character set IAM documents for a role name, which is what keeps a resource field
+/// carrying a colon from reading as a role.
+fn is_iam_role_arn(value: &str) -> bool {
+    let Some(arn) = service_common::arn::parse_of(value, IAM_VENDOR) else {
+        return false;
+    };
+    let Some(name) = arn.resource.strip_prefix(IAM_ROLE_RESOURCE_PREFIX) else {
+        return false;
+    };
+    arn.region.is_empty()
+        && !arn.account.is_empty()
+        && !name.is_empty()
+        && name.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment.chars().all(|character| {
+                    character.is_ascii_alphanumeric()
+                        || IAM_ROLE_NAME_PUNCTUATION.contains(&character)
+                })
+        })
 }

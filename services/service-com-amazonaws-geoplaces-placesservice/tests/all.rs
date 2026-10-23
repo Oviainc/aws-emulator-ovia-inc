@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/catalog_coverage_and_position_resolution.rs"]
 mod catalog_coverage_and_position_resolution;
+#[path = "all/localized_projection_and_granularity.rs"]
+mod localized_projection_and_granularity;
 #[path = "all/places_catalog.rs"]
 mod places_catalog;
 #[path = "all/result_item_composition.rs"]

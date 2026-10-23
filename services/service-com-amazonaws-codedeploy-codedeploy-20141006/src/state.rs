@@ -44,13 +44,45 @@ pub const DEPLOYMENT_STATUS_IN_PROGRESS: &str = "InProgress";
 pub const DEPLOYMENT_STATUS_SUCCEEDED: &str = "Succeeded";
 /// See [`DEPLOYMENT_STATUS_CREATED`]. The terminal status of a deployment whose
 /// deployment group resolved no target to deploy to (see
-/// [`deployment_target_count`]), and the one a deployment reaches when something
+/// [`deployment_targets`]), and the one a deployment reaches when something
 /// that is part of it failed — a lifecycle event hook reporting a failed
 /// validation, say.
 pub const DEPLOYMENT_STATUS_FAILED: &str = "Failed";
 /// See [`DEPLOYMENT_STATUS_CREATED`]: the status a deployment a caller stopped
 /// holds.
 pub const DEPLOYMENT_STATUS_STOPPED: &str = "Stopped";
+
+/// The `DeploymentTargetType` of a target of an EC2/on-premises deployment
+/// (`smithy_query(query="shape",shape="DeploymentTargetType")`: InstanceTarget |
+/// LambdaTarget | ECSTarget | CloudFormationTarget).
+pub const DEPLOYMENT_TARGET_TYPE_INSTANCE: &str = "InstanceTarget";
+/// See [`DEPLOYMENT_TARGET_TYPE_INSTANCE`]: the type of a Lambda deployment's
+/// target.
+pub const DEPLOYMENT_TARGET_TYPE_LAMBDA: &str = "LambdaTarget";
+/// See [`DEPLOYMENT_TARGET_TYPE_INSTANCE`]: the type of an Amazon ECS
+/// deployment's target.
+pub const DEPLOYMENT_TARGET_TYPE_ECS: &str = "ECSTarget";
+
+/// The `TargetStatus` of a target the deployment has not finished with; see
+/// [`target_status`]. The named statuses here are the ones this service MAPS a
+/// deployment's progress onto; the catalogue of every value the member accepts
+/// is the generated `crate::ops::types::TARGET_STATUS_VALUES`, which is what a
+/// filter's value is checked against.
+pub const TARGET_STATUS_IN_PROGRESS: &str = "InProgress";
+/// See [`TARGET_STATUS_IN_PROGRESS`].
+pub const TARGET_STATUS_PENDING: &str = "Pending";
+/// See [`TARGET_STATUS_IN_PROGRESS`].
+pub const TARGET_STATUS_SUCCEEDED: &str = "Succeeded";
+/// See [`TARGET_STATUS_IN_PROGRESS`].
+pub const TARGET_STATUS_FAILED: &str = "Failed";
+/// See [`TARGET_STATUS_IN_PROGRESS`].
+pub const TARGET_STATUS_SKIPPED: &str = "Skipped";
+
+/// The `TargetLabel` of a target in the ORIGINAL environment of a blue/green
+/// deployment, which is the only label this service resolves; see
+/// [`deployment_targets`]. The catalogue of every value the member accepts is
+/// the generated `crate::ops::types::TARGET_LABEL_VALUES`.
+pub const TARGET_LABEL_BLUE: &str = "Blue";
 
 /// The two `LifecycleEventStatus` values a validation function may report
 /// (`smithy_query(query="shape",shape="LifecycleEventStatus")` carries six:
@@ -138,6 +170,58 @@ pub fn deployment_group_not_found(deployment_group_name: &str) -> String {
 pub fn deployment_not_found(deployment_id: &str) -> String {
     format!("The deployment {deployment_id} could not be found")
 }
+
+/// `DeploymentNotStartedException` (HTTP 400): the deployment id the request
+/// asked about, in the same form as [`deployment_not_found`] — an operation over
+/// a deployment's targets is refused with this before the deployment has started
+/// (see [`Deployment::is_started`]).
+pub fn deployment_not_started(deployment_id: &str) -> String {
+    format!("The deployment {deployment_id} has not started")
+}
+
+/// `InvalidTargetFilterNameException` (HTTP 400): the shape's own sentence, with
+/// the filter name the caller sent after the delimiter. The names a target
+/// filter may carry are the members of `TargetFilterName`
+/// (`smithy_query(query="shape",shape="TargetFilterName")`: TargetStatus |
+/// ServerInstanceLabel).
+pub fn invalid_target_filter_name(name: &str) -> String {
+    format!("The target filter name is invalid: {}", echoed(name))
+}
+
+/// `InvalidInstanceStatusException` (HTTP 400): the shape's own sentence, with
+/// the status the caller asked to filter on. The statuses that exist are the
+/// members of `TargetStatus` (`crate::ops::types::TARGET_STATUS_VALUES`).
+pub fn invalid_target_status(value: &str) -> String {
+    format!(
+        "The specified instance status does not exist: {}",
+        echoed(value)
+    )
+}
+
+/// `InvalidInstanceTypeException` (HTTP 400): the shape's own sentence, with the
+/// label the caller asked to filter on. The labels that exist are the members of
+/// `TargetLabel` (`crate::ops::types::TARGET_LABEL_VALUES`).
+pub fn invalid_instance_label(value: &str) -> String {
+    format!(
+        "An invalid instance type was specified for instances in a blue/green deployment: {}",
+        echoed(value)
+    )
+}
+
+/// `InvalidDeploymentInstanceTypeException` (HTTP 400): the shape's own
+/// sentence, interpolating nothing from the request.
+///
+/// An "instance type" here is the ENVIRONMENT an instance belongs to — the
+/// `TargetLabel` of Blue or Green, as `InvalidInstanceTypeException` spells out
+/// ("Valid values include 'Blue' for an original environment and 'Green' for a
+/// replacement environment") — and only a blue/green deployment has two
+/// environments to tell apart. So a request that selects targets by instance
+/// type against an in-place deployment is refused with this rather than answered
+/// with the empty page that would suggest the deployment simply has no such
+/// target.
+pub const INSTANCE_TYPE_ON_IN_PLACE_DEPLOYMENT: &str =
+    "An instance type was specified for an in-place deployment. Instance types are supported \
+     for blue/green deployments only";
 
 /// `DeploymentConfigDoesNotExistException` (HTTP 400): the configuration name
 /// after the delimiter, in the same form as the other not-found sentences. Only
@@ -660,10 +744,16 @@ pub struct Deployment {
     /// The results reported for this deployment's lifecycle event hooks, in the
     /// order they were reported.
     pub lifecycle_hook_executions: Vec<LifecycleEventHookExecution>,
-    /// How many deployment targets the deployment group resolved for this
-    /// deployment, which is what decides its terminal status; see
-    /// [`deployment_target_count`] and [`terminal_status`].
-    pub target_count: usize,
+    /// The deployment targets the deployment group resolved for this deployment,
+    /// in resolution order, as they were resolved WHEN it was created.
+    ///
+    /// A deployment deploys to the fleet its group selected at the moment it
+    /// started, so this is a SNAPSHOT: deregistering an instance or retargeting
+    /// the group afterwards cannot change which targets a past deployment went
+    /// to. How many there are is also what decides the deployment's terminal
+    /// status; see [`deployment_targets`], [`Deployment::target_count`] and
+    /// [`terminal_status`].
+    pub targets: Vec<DeploymentTargetSnapshot>,
     /// Whether this deployment terminates the instances of the original (blue)
     /// environment after traffic routing: true only for a blue/green deployment
     /// whose group chose the `TERMINATE` action, which is also exactly when the
@@ -702,7 +792,48 @@ pub struct LifecycleEventHookExecution {
     pub update_time_ms: i64,
 }
 
+/// One deployment target, as the deployment that resolved it holds it.
+///
+/// The id is the one CodeDeploy reports for a target of that compute platform,
+/// which the model states per platform
+/// (`smithy_query(query="doc",shape="BatchGetDeploymentTargetsInput",member="targetIds")`):
+/// an EC2/on-premises instance id, a Lambda function name, or an Amazon ECS
+/// `<clustername>:<servicename>` pair.
+#[derive(Debug, Clone)]
+pub struct DeploymentTargetSnapshot {
+    /// The id this target is reported and looked up under.
+    ///
+    /// `None` for a target this emulator resolves but cannot NAME: a Lambda
+    /// deployment's target is the function its revision's AppSpec names, and
+    /// CodeDeploy's own state holds no revision content for this emulator to
+    /// read it from (the same gap [`deployment_targets`] documents for EC2
+    /// inventory). Such a target still counts towards the deployment's outcome;
+    /// it is simply not one a client can list or fetch by id.
+    pub target_id: Option<String>,
+    /// A `DeploymentTargetType` (`smithy_query(query="shape",shape="DeploymentTargetType")`:
+    /// InstanceTarget | LambdaTarget | ECSTarget | CloudFormationTarget).
+    pub target_type: String,
+    /// The `TargetLabel` this target carries, for a target of an EC2/on-premises
+    /// deployment that HAS one; see [`deployment_targets`].
+    pub instance_label: Option<String>,
+}
+
 impl Deployment {
+    /// How many targets this deployment resolved, which is what decides its
+    /// terminal status ([`terminal_status`]).
+    pub fn target_count(&self) -> usize {
+        self.targets.len()
+    }
+
+    /// Whether this deployment has STARTED, which is what
+    /// `DeploymentNotStartedException` refuses an operation over its targets
+    /// for: a deployment the clock has not yet owed its start
+    /// ([`deployment_start_due`]) has deployed to nothing, so it has no target
+    /// state to report.
+    pub fn is_started(&self) -> bool {
+        self.start_time_ms.is_some()
+    }
+
     /// The instant this deployment's traffic routing is complete, which is when
     /// a termination wait starts and from which it is measured.
     pub fn traffic_routing_complete_at_ms(&self) -> i64 {
@@ -1003,7 +1134,7 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
                 && deployment.complete_time_ms.is_none()
                 && deployment.completes_at_ms <= now_ms
             {
-                deployment.status = terminal_status(deployment.target_count).to_string();
+                deployment.status = terminal_status(deployment.target_count()).to_string();
                 deployment.complete_time_ms = Some(deployment.completes_at_ms);
             }
             deployment.complete_time_ms.is_none()
@@ -1310,11 +1441,7 @@ pub fn deployment_completion_due(create_time_ms: i64) -> i64 {
 /// its value — held to the range the model documents for that member
 /// ([`MAX_TERMINATION_WAIT_MINUTES`]).
 pub fn termination_wait(group: &DeploymentGroup) -> (bool, i64) {
-    let blue_green = group
-        .deployment_style
-        .as_ref()
-        .and_then(|style| style.deployment_type.as_deref())
-        == Some(DEPLOYMENT_TYPE_BLUE_GREEN);
+    let blue_green = group_is_blue_green(group);
     let option = group
         .blue_green_deployment_configuration
         .as_ref()
@@ -1405,50 +1532,134 @@ pub fn malformed_deployment_id_message(deployment_id: &str) -> String {
     )
 }
 
-/// How many deployment targets `group` selects, as this emulator can resolve
-/// them.
+/// The deployment targets `group` selects, as this emulator can resolve them,
+/// in resolution order.
 ///
 /// CodeDeploy resolves a deployment's targets from its deployment group, and a
 /// deployment that resolves none runs to `Failed` rather than reporting success
 /// for a revision that reached nothing (the AWS CodeDeploy User Guide's "Error
 /// codes" gives that failure the [`ERROR_CODE_NO_INSTANCES`] code). What this
 /// emulator can resolve, per compute platform
-/// (`smithy_query(query="shape",shape="ComputePlatform")`):
+/// (`smithy_query(query="shape",shape="ComputePlatform")`), and the id each
+/// target is reported under (the format the model states per platform, see
+/// [`DeploymentTargetSnapshot`]):
 ///
-/// * `ECS`: the group's `ecsServices` — one target per cluster/service pair.
+/// * `ECS`: the group's `ecsServices` — one target per cluster/service pair,
+///   reported as `<clustername>:<servicename>`.
 /// * `Lambda`: a Lambda deployment has exactly one target, the function the
 ///   revision's AppSpec names — whatever the revision holds, there is one of
-///   them — so a Lambda group never resolves none.
-/// * `Server` (EC2/on-premises): the instances the group selects. The instances
-///   this emulator HOLDS are the on-premises ones registered with it, so they
-///   are resolved from that registry through the group's
-///   `onPremisesInstanceTagFilters` and `onPremisesTagSet` (see
+///   them — so a Lambda group never resolves none. That function's NAME lives
+///   inside the revision, which CodeDeploy's state does not hold, so the target
+///   is resolved without an id (see [`DeploymentTargetSnapshot::target_id`]).
+/// * `Server` (EC2/on-premises): the instances the group selects, reported under
+///   their instance ids. The instances this emulator HOLDS are the on-premises
+///   ones registered with it, so they are resolved from that registry through
+///   the group's `onPremisesInstanceTagFilters` and `onPremisesTagSet` (see
 ///   [`group_selects_instance`]). An `ec2TagFilter`, an `ec2TagSet` or an Auto
 ///   Scaling group names EC2 inventory, which CodeDeploy's state does not keep
 ///   and which this emulator reads from no other service, so those selectors
 ///   resolve nothing.
-pub fn deployment_target_count(
+///
+/// A target of a blue/green deployment group carries the `TargetLabel` of the
+/// environment it belongs to: the instances the group selects are the ORIGINAL
+/// environment, which the model's `InstanceTarget$instanceLabel` calls `BLUE`
+/// ("whether the instance is an original target (BLUE) or a replacement target
+/// (GREEN)"). The replacement environment is provisioned from EC2 inventory this
+/// emulator does not keep, so it resolves no `GREEN` target; an in-place
+/// deployment has no two environments, so its targets carry no label at all.
+pub fn deployment_targets(
     state: &ComAmazonawsCodedeployCodedeploy20141006State,
     group: &DeploymentGroup,
-) -> usize {
+) -> Vec<DeploymentTargetSnapshot> {
     match group.compute_platform.as_str() {
-        "ECS" => group.ecs_services.len(),
-        // Lambda: one target per deployment; see the note above.
-        "Lambda" => 1,
+        "ECS" => group
+            .ecs_services
+            .iter()
+            .map(|service| DeploymentTargetSnapshot {
+                target_id: Some(format!(
+                    "{}:{}",
+                    service.cluster_name.clone().unwrap_or_default(),
+                    service.service_name.clone().unwrap_or_default()
+                )),
+                target_type: DEPLOYMENT_TARGET_TYPE_ECS.to_string(),
+                instance_label: None,
+            })
+            .collect(),
+        // Lambda: one target per deployment, named inside the revision; see the
+        // note above.
+        "Lambda" => vec![DeploymentTargetSnapshot {
+            target_id: None,
+            target_type: DEPLOYMENT_TARGET_TYPE_LAMBDA.to_string(),
+            instance_label: None,
+        }],
         // Server (EC2/on-premises), which is what `computePlatform` holds here
         // when it is neither of the two above — the member is the modelled enum
         // Server | Lambda | ECS. A value outside that enum could not reach the
         // store, and would resolve nothing either: a platform this emulator
         // cannot target has no targets to report.
-        _ => state
-            .on_premises_instance_order
-            .iter()
-            .filter_map(|name| state.on_premises_instances.get(name))
-            // A deregistered instance keeps its record but is no longer part of
-            // the fleet, so a deployment cannot target it.
-            .filter(|instance| instance.is_registered())
-            .filter(|instance| group_selects_instance(group, &instance.tags))
-            .count(),
+        _ => {
+            let instance_label = group_is_blue_green(group).then(|| TARGET_LABEL_BLUE.to_string());
+            state
+                .on_premises_instance_order
+                .iter()
+                .filter_map(|name| state.on_premises_instances.get(name))
+                // A deregistered instance keeps its record but is no longer part
+                // of the fleet, so a deployment cannot target it.
+                .filter(|instance| instance.is_registered())
+                .filter(|instance| group_selects_instance(group, &instance.tags))
+                .map(|instance| DeploymentTargetSnapshot {
+                    target_id: Some(instance.instance_name.clone()),
+                    target_type: DEPLOYMENT_TARGET_TYPE_INSTANCE.to_string(),
+                    instance_label: instance_label.clone(),
+                })
+                .collect()
+        }
+    }
+}
+
+/// How many deployment targets `group` selects, as this emulator can resolve
+/// them: the targets it resolves ([`deployment_targets`]), counted.
+#[cfg(test)]
+fn deployment_target_count(
+    state: &ComAmazonawsCodedeployCodedeploy20141006State,
+    group: &DeploymentGroup,
+) -> usize {
+    deployment_targets(state, group).len()
+}
+
+/// Whether `group` deploys blue/green, which is what gives its targets an
+/// environment label (`smithy_query(query="shape",shape="DeploymentType")`:
+/// IN_PLACE | BLUE_GREEN).
+fn group_is_blue_green(group: &DeploymentGroup) -> bool {
+    group
+        .deployment_style
+        .as_ref()
+        .and_then(|style| style.deployment_type.as_deref())
+        == Some(DEPLOYMENT_TYPE_BLUE_GREEN)
+}
+
+/// The `TargetStatus` each target of `deployment` carries.
+///
+/// A deployment's targets are where its revision is being installed, so a
+/// target's status follows the deployment's own progress: this emulator
+/// deploys to every target of a deployment together, so each of them is as far
+/// along as the deployment is. `TargetStatus`
+/// (`smithy_query(query="shape",shape="TargetStatus")`: Pending | InProgress |
+/// Succeeded | Failed | Skipped | Unknown | Ready) maps onto `DeploymentStatus`
+/// one for one here: a deployment still running has `InProgress` targets, a
+/// finished one has targets that `Succeeded` or `Failed` with it, and a
+/// deployment a caller STOPPED leaves its targets `Skipped` — the revision was
+/// never finished on them. A deployment the clock has not started yet has
+/// `Pending` targets, which no listing reaches: an operation over the targets of
+/// a deployment that has not started is refused with
+/// `DeploymentNotStartedException` (see [`Deployment::is_started`]).
+pub fn target_status(deployment: &Deployment) -> &'static str {
+    match deployment.status.as_str() {
+        DEPLOYMENT_STATUS_SUCCEEDED => TARGET_STATUS_SUCCEEDED,
+        DEPLOYMENT_STATUS_FAILED => TARGET_STATUS_FAILED,
+        DEPLOYMENT_STATUS_STOPPED => TARGET_STATUS_SKIPPED,
+        _ if deployment.is_started() => TARGET_STATUS_IN_PROGRESS,
+        _ => TARGET_STATUS_PENDING,
     }
 }
 
@@ -1813,7 +2024,7 @@ fn deployment_error_information(
     if let Some(recorded) = deployment.error_information.clone() {
         return Some(recorded);
     }
-    (deployment.status == DEPLOYMENT_STATUS_FAILED && deployment.target_count == 0).then(|| {
+    (deployment.status == DEPLOYMENT_STATUS_FAILED && deployment.target_count() == 0).then(|| {
         crate::ops::types::ErrorInformation {
             code: Some(ERROR_CODE_NO_INSTANCES.to_string()),
             message: Some(

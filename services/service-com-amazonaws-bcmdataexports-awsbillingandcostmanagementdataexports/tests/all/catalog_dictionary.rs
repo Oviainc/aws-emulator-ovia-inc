@@ -7,9 +7,9 @@
 //! table or column that showed the defect:
 //!
 //! 1. A column's `Type` names the KIND of data it stores, in the dictionary's mixed-case
-//!    vocabulary — `String`, `Number`, `Double`, `Integer`, `Timestamp`, `Boolean`,
-//!    `Map` — and every column carries the dictionary's `Description` for it, within the
-//!    modelled bound. No column reports a storage-engine type name (`STRING`,
+//!    vocabulary — `String`, `Number`, `Double`, `Timestamp`, `Boolean`, `Map` — and
+//!    every column carries the dictionary's `Description` for it, within the modelled
+//!    bound. No column reports a storage-engine type name (`STRING`,
 //!    `MAP<STRING,STRING>`). Which token a column carries is ITS schema's: the cost and
 //!    usage dictionary measures costs with `Number`, the recommendations dictionary with
 //!    `Double`.
@@ -46,7 +46,6 @@ const COLUMN_TYPE_VOCABULARY: &[&str] = &[
     "String",
     "Number",
     "Double",
-    "Integer",
     "Timestamp",
     "Boolean",
     "Map",
@@ -99,23 +98,20 @@ const PUBLISHED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             ("usage_account_id", "String"),
             ("usage_period_end", "Timestamp"),
             ("location", "String"),
-            ("total_scope_2_mbm_emissions_value", "Number"),
+            ("total_scope_2_mbm_emissions_value", "Double"),
             ("total_scope_2_mbm_emissions_unit", "String"),
         ],
     ),
     (
         "COST_AND_USAGE_DASHBOARD",
         &[
-            // The view's own aggregate dimensions and measures …
+            // The dashboard's aggregate dimensions and measures — the whole of its
+            // published column set.
             ("billing_period", "Timestamp"),
             ("usage_date", "Timestamp"),
             ("linked_account_name", "String"),
             ("unblended_cost", "Number"),
             ("ri_sp_upfront_fees", "Number"),
-            // … beside the cost and usage columns it carries over unchanged.
-            ("bill_payer_account_id", "String"),
-            ("line_item_usage_amount", "Number"),
-            ("resource_tags", "Map"),
         ],
     ),
     (
@@ -141,13 +137,14 @@ const PUBLISHED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("implementation_effort", "String"),
             ("rollback_possible", "Boolean"),
-            // The recommendations dictionary measures money and percentages with
-            // `Double`, counts days with `Integer` and carries the resource's tags as
-            // text — tokens of its own, not the cost and usage dictionary's.
-            ("recommendation_lookback_period_in_days", "Integer"),
+            // The recommendations dictionary publishes every numeric column — money,
+            // percentages and the lookback day count alike — as `Double`, and the
+            // resource's tags as a key-value map: tokens of its own, not the cost and
+            // usage dictionary's.
+            ("recommendation_lookback_period_in_days", "Double"),
             ("estimated_monthly_cost_before_discount", "Double"),
             ("estimated_savings_percentage_after_discount", "Double"),
-            ("tags", "String"),
+            ("tags", "Map"),
         ],
     ),
     (
@@ -180,9 +177,9 @@ const PUBLISHED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
 /// different schemas, not one schema under two names.
 const FOCUS_1_2_ONLY_COLUMN: &str = "ServiceSubcategory";
 
-/// One published table property: its name, the values it accepts (empty for a free-form
-/// property) and the value it assumes when a request does not name it (`None` for a
-/// property the dictionary publishes no default for).
+/// One published table property: its name, the values it accepts (the wildcard `*`, or
+/// empty, for a free-form property) and the value it assumes when a request does not
+/// name it (`None` for a property the dictionary publishes no default for).
 type PropertyRow = (
     &'static str,
     &'static [&'static str],
@@ -191,7 +188,7 @@ type PropertyRow = (
 
 /// The table properties the dictionary publishes for a table, in the order it publishes
 /// them, with the values each accepts and the value it assumes when a request does not
-/// name it. An empty value list is a free-form property.
+/// name it. An empty value list, or the wildcard `*`, is a free-form property.
 const PUBLISHED_PROPERTIES: &[(&str, &[PropertyRow])] = &[
     ("CARBON_EMISSIONS", &[("BILLING_VIEW_ARN", &[], Some(""))]),
     (
@@ -235,27 +232,25 @@ const PUBLISHED_PROPERTIES: &[(&str, &[PropertyRow])] = &[
                 &["TRUE", "FALSE"],
                 Some("FALSE"),
             ),
-            ("FILTER", &[], Some("{}")),
+            // Free-form, and advertised as such by the wildcard: a client validating a
+            // TableConfigurations value against this list has to see that any JSON
+            // filter is legal.
+            ("FILTER", &["*"], Some("{}")),
         ],
     ),
     ("FOCUS_1_0_AWS", &[("BILLING_VIEW_ARN", &[], Some(""))]),
     (
         "FOCUS_1_0_AWS_PREVIEW",
-        &[
-            ("DEPRECATED", &["TRUE"], Some("TRUE")),
-            ("BILLING_VIEW_ARN", &[], Some("")),
-        ],
+        // The one thing the dictionary publishes about a superseded preview table.
+        &[("DEPRECATED", &["TRUE"], Some("TRUE"))],
     ),
     (
         "FOCUS_1_2_AWS",
-        &[
-            (
-                "TIME_GRANULARITY",
-                &["DAILY", "MONTHLY", "HOURLY"],
-                Some("HOURLY"),
-            ),
-            ("BILLING_VIEW_ARN", &[], Some("")),
-        ],
+        &[(
+            "TIME_GRANULARITY",
+            &["DAILY", "MONTHLY", "HOURLY"],
+            Some("HOURLY"),
+        )],
     ),
 ];
 
@@ -553,7 +548,7 @@ const FREE_FORM_CASES: &[(&str, &str, &str)] = &[
         "arn:aws:billing::123456789012:billingview/custom-view",
     ),
     (
-        "FOCUS_1_2_AWS",
+        "FOCUS_1_0_AWS",
         "BILLING_VIEW_ARN",
         "arn:aws:billing::210987654321:billingview/primary",
     ),

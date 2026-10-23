@@ -205,19 +205,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let key = (input.r#type.clone(), input.name.clone());
         let mut store = state.lock();
 
         // A replayed `clientToken` is a retry of the call that created the policy, so it
-        // answers that policy instead of creating or conflicting with a second one.
+        // answers that policy instead of creating or conflicting with a second one. The
+        // replay is scoped to the pair THIS request names: a token spent again on a
+        // different `(type, name)` is a request for another policy, which is still created
+        // rather than answered with the first one.
         if let Some(token) = input.client_token.as_deref() {
-            if let Some(record) = store.replayed_security_policy(Self::NAME, token) {
+            let replayed = store
+                .replayed_security_policy(Self::NAME, token)
+                .filter(|record| record.kind == key.0 && record.name == key.1)
+                .map(crate::state::SecurityPolicyRecord::detail);
+            if let Some(detail) = replayed {
                 return Ok(CreateSecurityPolicyOutput {
-                    security_policy_detail: Some(record.detail()),
+                    security_policy_detail: Some(detail),
                 });
             }
         }
 
-        let key = (input.r#type.clone(), input.name.clone());
         if store.security_policies.contains_key(&key) {
             return Err(CreateSecurityPolicyErrorModeled::ConflictException(
                 ConflictException {

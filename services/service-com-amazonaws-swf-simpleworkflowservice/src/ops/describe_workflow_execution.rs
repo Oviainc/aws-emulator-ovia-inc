@@ -144,22 +144,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let guard = state.lock();
-        let unknown = || {
+        // An `UnknownResourceFault` message names the resource the lookup failed on and
+        // nothing else: the domain when no domain is stored under that name, otherwise
+        // the requested execution, in the
+        // `WorkflowExecution=[workflowId=.., runId=..]` form every execution-scoped
+        // operation of this service uses. The domain the lookup was scoped to is never
+        // appended to that clause.
+        let unknown_execution = || {
             DescribeWorkflowExecutionErrorModeled::UnknownResourceFault(UnknownResourceFault {
-                message: Some(format!(
-                    "Unknown execution: WorkflowExecution=[workflowId={}, runId={}] in domain {}",
-                    input.execution.workflow_id, input.execution.run_id, input.domain
+                message: Some(crate::state::unknown_execution_message(
+                    &input.execution.workflow_id,
+                    &input.execution.run_id,
                 )),
             })
         };
-        let domain = guard.domains.get(&input.domain).ok_or_else(unknown)?;
+        let domain = guard.domains.get(&input.domain).ok_or_else(|| {
+            DescribeWorkflowExecutionErrorModeled::UnknownResourceFault(UnknownResourceFault {
+                message: Some(format!("Unknown domain: {}", input.domain)),
+            })
+        })?;
         let execution = domain
             .executions
             .get(&(
                 input.execution.workflow_id.clone(),
                 input.execution.run_id.clone(),
             ))
-            .ok_or_else(unknown)?;
+            .ok_or_else(unknown_execution)?;
 
         Ok(DescribeWorkflowExecutionOutput {
             execution_info: execution.info(),

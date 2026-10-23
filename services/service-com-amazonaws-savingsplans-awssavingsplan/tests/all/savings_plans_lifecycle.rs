@@ -22,8 +22,8 @@ use smithy_server_runtime::MultiServiceRouter;
 /// One answer from the emulator: the HTTP status, the wire error code (empty on
 /// success) and the parsed body.
 ///
-/// `pub(crate)` so a sibling suite in this test crate drives the emulator
-/// through the same harness rather than standing up a second one.
+/// `pub(crate)` so the sibling suites of this test target share one harness
+/// rather than each standing up a second one.
 pub(crate) struct Answer {
     pub(crate) status: u16,
     pub(crate) code: String,
@@ -94,39 +94,64 @@ impl Emulator {
         Answer { status, code, body }
     }
 
-    /// Every offering in the catalog (one unpaged call).
-    async fn all_offerings(&self) -> Vec<Value> {
-        let answer = self
-            .call("DescribeSavingsPlansOfferings", json!({ "maxResults": 0 }))
-            .await;
-        assert_eq!(
-            answer.status, 200,
-            "unpaged offering search: expected 200, got {} {:?}",
-            answer.status, answer.body
-        );
-        answer.list("searchResults").to_vec()
+    /// Every offering a search admits, walked through the search's own cursor.
+    ///
+    /// The catalog is bigger than the largest page a caller may ask for
+    /// (`PageSize` tops out at 1000), and the search answers with the cursor its
+    /// scan reached, so "the whole result set" is a WALK: ask for the largest
+    /// page and resume the token until the search answers none.
+    pub(crate) async fn search_offerings(&self, request: &Value) -> Vec<Value> {
+        let mut found: Vec<Value> = Vec::new();
+        let mut next: Option<String> = None;
+        loop {
+            let mut page_request = request.clone();
+            page_request["maxResults"] = json!(1000);
+            if let Some(token) = &next {
+                page_request["nextToken"] = json!(token);
+            }
+            let answer = self
+                .call("DescribeSavingsPlansOfferings", page_request.clone())
+                .await;
+            assert_eq!(
+                answer.status, 200,
+                "offering search {page_request}: expected 200, got {} {:?}",
+                answer.status, answer.body
+            );
+            found.extend(answer.list("searchResults").iter().cloned());
+            next = answer
+                .get("nextToken")
+                .as_str()
+                .map(std::string::ToString::to_string);
+            if next.is_none() {
+                return found;
+            }
+        }
+    }
+
+    /// Every offering in the catalog.
+    pub(crate) async fn all_offerings(&self) -> Vec<Value> {
+        self.search_offerings(&json!({})).await
     }
 
     /// An offering with this plan type, payment option and term. Plan types
     /// that are scoped to a region have one per region; the first is as good as
     /// any for a purchase.
-    pub(crate) async fn offering(&self, plan_type: &str, payment_option: &str, duration: i64) -> Value {
-        let answer = self
-            .call(
-                "DescribeSavingsPlansOfferings",
-                json!({
-                    "planTypes": [plan_type],
-                    "paymentOptions": [payment_option],
-                    "durations": [duration],
-                    "maxResults": 0,
-                }),
-            )
+    pub(crate) async fn offering(
+        &self,
+        plan_type: &str,
+        payment_option: &str,
+        duration: i64,
+    ) -> Value {
+        let results = self
+            .search_offerings(&json!({
+                "planTypes": [plan_type],
+                "paymentOptions": [payment_option],
+                "durations": [duration],
+            }))
             .await;
-        let results = answer.list("searchResults");
         assert!(
             !results.is_empty(),
-            "case {plan_type}/{payment_option}/{duration}: expected an offering, got {:?}",
-            answer.body
+            "case {plan_type}/{payment_option}/{duration}: expected an offering, got none"
         );
         results[0].clone()
     }
@@ -223,39 +248,39 @@ async fn offering_search_applies_every_filter() {
     let cases: Vec<(&str, Value, Predicate)> = vec![
         (
             "planTypes with one value",
-            json!({ "planTypes": ["Compute"], "maxResults": 0 }),
+            json!({ "planTypes": ["Compute"], "maxResults": 1000 }),
             Box::new(|o: &Value| text(o, "planType") == "Compute"),
         ),
         (
             "planTypes with two values",
-            json!({ "planTypes": ["EC2Instance", "SageMaker"], "maxResults": 0 }),
+            json!({ "planTypes": ["EC2Instance", "SageMaker"], "maxResults": 1000 }),
             Box::new(|o: &Value| {
                 matches!(text(o, "planType").as_str(), "EC2Instance" | "SageMaker")
             }),
         ),
         (
             "paymentOptions",
-            json!({ "paymentOptions": ["All Upfront"], "maxResults": 0 }),
+            json!({ "paymentOptions": ["All Upfront"], "maxResults": 1000 }),
             Box::new(|o: &Value| text(o, "paymentOption") == "All Upfront"),
         ),
         (
             "durations",
-            json!({ "durations": [THREE_YEARS], "maxResults": 0 }),
+            json!({ "durations": [THREE_YEARS], "maxResults": 1000 }),
             Box::new(|o: &Value| o.get("durationSeconds").and_then(Value::as_i64) == Some(THREE_YEARS)),
         ),
         (
             "currencies",
-            json!({ "currencies": ["EUR"], "maxResults": 0 }),
+            json!({ "currencies": ["EUR"], "maxResults": 1000 }),
             Box::new(|o: &Value| text(o, "currency") == "EUR"),
         ),
         (
             "currencies with two values",
-            json!({ "currencies": ["EUR", "CNY"], "maxResults": 0 }),
+            json!({ "currencies": ["EUR", "CNY"], "maxResults": 1000 }),
             Box::new(|o: &Value| matches!(text(o, "currency").as_str(), "EUR" | "CNY")),
         ),
         (
             "productType covered by one plan type",
-            json!({ "productType": "Lambda", "maxResults": 0 }),
+            json!({ "productType": "Lambda", "maxResults": 1000 }),
             Box::new(|o: &Value| {
                 o.get("productTypes")
                     .and_then(Value::as_array)
@@ -264,7 +289,7 @@ async fn offering_search_applies_every_filter() {
         ),
         (
             "productType covered by several plan types",
-            json!({ "productType": "EC2", "maxResults": 0 }),
+            json!({ "productType": "EC2", "maxResults": 1000 }),
             Box::new(|o: &Value| {
                 o.get("productTypes")
                     .and_then(Value::as_array)
@@ -273,24 +298,24 @@ async fn offering_search_applies_every_filter() {
         ),
         (
             "serviceCodes",
-            json!({ "serviceCodes": ["AmazonSageMaker"], "maxResults": 0 }),
+            json!({ "serviceCodes": ["AmazonSageMaker"], "maxResults": 1000 }),
             Box::new(|o: &Value| text(o, "serviceCode") == "AmazonSageMaker"),
         ),
         (
             "operations",
-            json!({ "operations": ["RunInstances"], "maxResults": 0 }),
+            json!({ "operations": ["RunInstances"], "maxResults": 1000 }),
             Box::new(|o: &Value| text(o, "operation") == "RunInstances"),
         ),
         (
             "usageTypes",
-            json!({ "usageTypes": ["us-east-1-EC2SP:m5"], "maxResults": 0 }),
-            Box::new(|o: &Value| text(o, "usageType") == "us-east-1-EC2SP:m5"),
+            json!({ "usageTypes": ["us-east-1-EC2SP:m5:1yrAllUpfront"], "maxResults": 1000 }),
+            Box::new(|o: &Value| text(o, "usageType") == "us-east-1-EC2SP:m5:1yrAllUpfront"),
         ),
         (
             "property filter on region",
             json!({
                 "filters": [{ "name": "region", "values": ["cn-north-1"] }],
-                "maxResults": 0,
+                "maxResults": 1000,
             }),
             has_property("region", "cn-north-1"),
         ),
@@ -298,7 +323,7 @@ async fn offering_search_applies_every_filter() {
             "property filter on instanceFamily",
             json!({
                 "filters": [{ "name": "instanceFamily", "values": ["c5"] }],
-                "maxResults": 0,
+                "maxResults": 1000,
             }),
             has_property("instanceFamily", "c5"),
         ),
@@ -308,7 +333,7 @@ async fn offering_search_applies_every_filter() {
                 "planTypes": ["Compute"],
                 "paymentOptions": ["No Upfront"],
                 "durations": [ONE_YEAR],
-                "maxResults": 0,
+                "maxResults": 1000,
             }),
             Box::new(|o: &Value| {
                 text(o, "planType") == "Compute"
@@ -321,22 +346,14 @@ async fn offering_search_applies_every_filter() {
             json!({
                 "planTypes": ["Compute"],
                 "filters": [{ "name": "instanceFamily", "values": ["m5"] }],
-                "maxResults": 0,
+                "maxResults": 1000,
             }),
             Box::new(|_: &Value| false),
         ),
     ];
 
     for (case, request, predicate) in cases {
-        let answer = emulator
-            .call("DescribeSavingsPlansOfferings", request.clone())
-            .await;
-        assert_eq!(
-            answer.status, 200,
-            "case {case:?}: expected 200, got {} {:?}",
-            answer.status, answer.body
-        );
-        let got = answer.list("searchResults");
+        let got = emulator.search_offerings(&request).await;
         let expected: Vec<&Value> = catalog.iter().filter(|o| predicate(o)).collect();
         assert_eq!(
             got.len(),
@@ -345,7 +362,7 @@ async fn offering_search_applies_every_filter() {
             expected.len(),
             got.len()
         );
-        for offering in got {
+        for offering in &got {
             assert!(
                 predicate(offering),
                 "case {case:?}: filter admitted an offering it should not: {offering:?}"
@@ -360,17 +377,13 @@ async fn offering_search_applies_every_filter() {
         .get("offeringId")
         .cloned()
         .expect("every offering carries an id");
-    let answer = emulator
-        .call(
-            "DescribeSavingsPlansOfferings",
-            json!({ "offeringIds": [wanted], "maxResults": 0 }),
-        )
+    let found = emulator
+        .search_offerings(&json!({ "offeringIds": [wanted.clone()] }))
         .await;
     assert_eq!(
-        answer.list("searchResults").len(),
+        found.len(),
         1,
-        "case offeringIds: expected one offering for {wanted:?}, got {:?}",
-        answer.body
+        "case offeringIds: expected one offering for {wanted:?}, got {found:?}"
     );
 }
 
@@ -447,7 +460,7 @@ async fn offering_search_pages_the_catalog() {
         .map(|o| text(o, "offeringId"))
         .collect();
 
-    for page_size in [1_usize, 7, 50, 1000] {
+    for page_size in [13_usize, 97, 1000] {
         let mut seen: Vec<String> = Vec::new();
         let mut next: Option<String> = None;
         let mut pages = 0_usize;
@@ -469,18 +482,32 @@ async fn offering_search_pages_the_catalog() {
                 .get("nextToken")
                 .as_str()
                 .map(std::string::ToString::to_string);
-            if next.is_some() {
-                assert_eq!(
-                    results.len(),
-                    page_size,
-                    "case page size {page_size}: a page before the last must be full, got {}",
-                    results.len()
+            // The search answers with the cursor to resume at: every answer
+            // carries one until a resumed one has no more results to return.
+            if pages == 0 {
+                assert!(
+                    next.is_some(),
+                    "case page size {page_size}: the first answer must carry a cursor, got {next:?}"
                 );
             }
+            assert!(
+                results.len() <= page_size,
+                "case page size {page_size}: a page must not exceed maxResults, got {}",
+                results.len()
+            );
             seen.extend(results.iter().map(|o| text(o, "offeringId")));
+            // A page shorter than `maxResults` is only ever the end of the
+            // result set: the search does not serve arbitrarily short pages.
+            assert!(
+                results.len() == page_size || seen.len() == catalog.len(),
+                "case page size {page_size}: a page of {} offerings is shorter than maxResults without ending the catalog ({} of {} seen)",
+                results.len(),
+                seen.len(),
+                catalog.len()
+            );
             pages += 1;
             assert!(
-                pages <= catalog.len() + 1,
+                pages <= catalog.len() + 2,
                 "case page size {page_size}: paging did not terminate after {pages} pages"
             );
             if next.is_none() {
@@ -633,7 +660,7 @@ async fn a_purchase_round_trips_through_describe() {
                     { "name": "region", "values": ["eu-west-1"] },
                     { "name": "instanceFamily", "values": ["c5"] },
                 ],
-                "maxResults": 0,
+                "maxResults": 1000,
             }),
         )
         .await;
@@ -1523,7 +1550,7 @@ async fn describe_plans_filters_and_pages() {
                             { "name": "region", "values": ["us-east-1"] },
                             { "name": "instanceFamily", "values": ["m5"] },
                         ],
-                        "maxResults": 0,
+                        "maxResults": 1000,
                     }),
                 )
                 .await;

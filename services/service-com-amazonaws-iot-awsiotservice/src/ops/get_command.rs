@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCommand
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCommand`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCommand::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! READS the command recorded under `commandId` and reports it: it clones what
+//! `CreateCommand` persisted, so the two cannot drift. It is a REPORTING operation —
+//! "Gets information about the specified command" — so it writes nothing at all, and a
+//! `commandId` the store does not hold is the modelled `ResourceNotFoundException`
+//! (HTTP 404) rather than a 200 carrying no command.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +162,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCommand` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCommandErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCommand"))
+        // This operation reports a command; it needs no request metadata to do it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetCommandErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A read NEVER writes: the store is only borrowed, and what it hands back is a
+        // clone of the persisted record, so two reads of one command are identical and
+        // a later caller sees exactly what the writer left.
+        let store = state.lock();
+        let Some(command) = store.commands.get(&input.command_id) else {
+            return Err(GetCommandErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Command {} does not exist", input.command_id)),
+                },
+            )
+            .into());
+        };
+        Ok(command.view())
     }
 }

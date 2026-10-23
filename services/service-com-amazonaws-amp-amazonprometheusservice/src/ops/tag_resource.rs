@@ -2,7 +2,9 @@
 
 //! @op TagResource
 //! IMPLEMENTED: merges tags into the stored workspace the `resourceArn` names — a new
-//! key is appended, an existing key's value replaced.
+//! key is appended, an existing key's value replaced. An ARN that resolves to no live
+//! resource is refused with `NotFoundException` (404), the code aps answers on this
+//! ARN-addressed path (`crate::state::arn_not_found`).
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -174,14 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resolved = store.workspace_id_of_arn(&input.resource_arn);
         let Some(workspace) = resolved.and_then(|workspace_id| store.workspaces.get_mut(&workspace_id))
         else {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
-                    resource_id: input.resource_arn.clone(),
-                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
-                },
-            )
-            .into());
+            // An ARN that resolves to no live resource: 404 with the code aps answers on
+            // the ARN-addressed tagging path, whatever resource type the ARN names (see
+            // `crate::state::arn_not_found`).
+            return Err(crate::state::arn_not_found());
         };
 
         // The ACCUMULATED tag map is bounded by `TAGS_PER_RESOURCE_LIMIT`: a merge that

@@ -28,7 +28,9 @@
 //! (`contact_updates::onboard`/`set_replication_set`), which writes the replication set the
 //! handlers read: that is the only way to reach it, because Incident Manager's
 //! `CreateReplicationSet` is deprecated and refuses every call. Engagements are seeded into
-//! the same store, because `StartEngagement` is still a scaffold stub with its own issue.
+//! the same store rather than started through `StartEngagement`, so each row's stored
+//! engagement is fixed and independent of the clock; `StartEngagement`'s own suite
+//! (`start_engagement.rs`) asserts what a start persists.
 
 use std::time::{Duration, SystemTime};
 
@@ -106,8 +108,8 @@ impl ReasonCase {
     }
 }
 
-/// A row of the engagement catalog: one engagement as `StartEngagement` would have
-/// persisted it, plus the `Reason` the stop under test carries.
+/// A row of the engagement catalog: one engagement as `StartEngagement` persists one, plus
+/// the `Reason` the stop under test carries.
 ///
 /// The rows differ along the members the modelled engagement admits — `PublicSubject` /
 /// `PublicContent` present and absent, an `IncidentId` present and absent, an empty
@@ -153,7 +155,7 @@ impl EngagementRow {
         )
     }
 
-    /// The record `StartEngagement` would have persisted for this row.
+    /// The record `StartEngagement` persists for this row.
     fn record(&self) -> EngagementRecord {
         EngagementRecord {
             arn: self.arn(),

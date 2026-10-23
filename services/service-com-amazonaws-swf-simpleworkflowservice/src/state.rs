@@ -139,11 +139,10 @@ impl WorkflowTypeRecord {
         self.status == STATUS_DEPRECATED
     }
 
-    /// Move this type off `REGISTERED` as of `at`: the one-way status move every
-    /// deprecation of a workflow type makes, whether `DeprecateWorkflowType` addressed
-    /// this record directly or [`Domain::deprecate`] cascaded to it. A record that is
-    /// already deprecated keeps the `deprecationDate` its own deprecation gave it, so
-    /// no later call can rewrite an instant that already happened.
+    /// Move this type off `REGISTERED` as of `at`: the status move `DeprecateWorkflowType`
+    /// makes on the record it addresses. A record that is already deprecated keeps the
+    /// `deprecationDate` its own deprecation gave it, so no later call can rewrite an
+    /// instant that already happened.
     pub fn deprecate(&mut self, at: DateTime) {
         if self.is_deprecated() {
             return;
@@ -211,6 +210,33 @@ impl ActivityTypeRecord {
             name: self.name.clone(),
             version: self.version.clone(),
         }
+    }
+
+    /// Whether this type is deprecated, i.e. whether its stored `RegistrationStatus`
+    /// is [`STATUS_DEPRECATED`].
+    pub fn is_deprecated(&self) -> bool {
+        self.status == STATUS_DEPRECATED
+    }
+
+    /// Move this type off `REGISTERED` as of `at`: the status move
+    /// `DeprecateActivityType` makes on the record it addresses. A record that is
+    /// already deprecated keeps the `deprecationDate` its own deprecation gave it, so
+    /// no later call can rewrite an instant that already happened.
+    pub fn deprecate(&mut self, at: DateTime) {
+        if self.is_deprecated() {
+            return;
+        }
+        self.status = STATUS_DEPRECATED.to_string();
+        self.deprecation_date = Some(at);
+    }
+
+    /// Return this type to `REGISTERED`, the move `UndeprecateActivityType` makes.
+    /// `ActivityTypeInfo.deprecationDate`'s doc scopes that stamp to a deprecated type
+    /// ("If DEPRECATED, the date and time DeprecateActivityType was called"), so a
+    /// record back on `REGISTERED` reports none.
+    pub fn undeprecate(&mut self) {
+        self.status = STATUS_REGISTERED.to_string();
+        self.deprecation_date = None;
     }
 
     /// The `ActivityTypeInfo` every activity-type reader returns, built from what is
@@ -678,22 +704,16 @@ impl Domain {
         self.status == STATUS_DEPRECATED
     }
 
-    /// Deprecate this domain as of `at`, cascading to every type registered in it.
-    /// `DeprecateDomain`'s doc: "Deprecating a domain also deprecates all activity and
-    /// workflow types registered in the domain." A type that was already deprecated
-    /// keeps the `deprecationDate` its own deprecation gave it, so the cascade cannot
-    /// rewrite an instant that already happened.
-    pub fn deprecate(&mut self, at: DateTime) {
+    /// Deprecate this domain: the ONE record's own `RegistrationStatus` moves to
+    /// [`STATUS_DEPRECATED`] and nothing else in the domain changes. The status of a
+    /// registered workflow or activity type is that type's own, moved only by a call
+    /// addressing that type (`DeprecateActivityType` / `DeprecateWorkflowType`), which is
+    /// what Amazon SWF reports: a type registered before a domain's deprecation still
+    /// reads back `REGISTERED` from `DescribeWorkflowType` / `DescribeActivityType`
+    /// afterwards. Executions are untouched too — "Executions that were started before
+    /// the domain was deprecated continues to run."
+    pub fn deprecate(&mut self) {
         self.status = STATUS_DEPRECATED.to_string();
-        for workflow_type in self.workflow_types.values_mut() {
-            workflow_type.deprecate(at);
-        }
-        for activity_type in self.activity_types.values_mut() {
-            if activity_type.status != STATUS_DEPRECATED {
-                activity_type.status = STATUS_DEPRECATED.to_string();
-                activity_type.deprecation_date = Some(at);
-            }
-        }
     }
 
     /// How many decision tasks are waiting in `task_list` across this domain — what
@@ -795,6 +815,61 @@ pub fn domain_name_from_arn(arn: &str) -> Option<&str> {
     }
     let name = resource.strip_prefix(DOMAIN_RESOURCE_PREFIX)?;
     (!name.is_empty()).then_some(name)
+}
+
+/// What Amazon SWF reports when a delete addresses a type that is still `REGISTERED`:
+/// the state of the record, in one fixed sentence that names nothing out of the request,
+/// so every refused delete of an activity or a workflow type carries exactly this
+/// message.
+pub const TYPE_NOT_DEPRECATED_MESSAGE: &str =
+    "The type is currently registered and cannot be deleted in its current state";
+
+/// The `ActivityType` kind name a type-scoped fault message carries, as the modelled
+/// shape is named.
+pub const ACTIVITY_TYPE_KIND: &str = "ActivityType";
+
+/// The `WorkflowType` kind name a type-scoped fault message carries, as the modelled
+/// shape is named.
+pub const WORKFLOW_TYPE_KIND: &str = "WorkflowType";
+
+/// How Amazon SWF names one type in a fault message: `<Kind>=[name=.., version=..]`,
+/// built from the requested identity alone. `kind` is [`ACTIVITY_TYPE_KIND`] or
+/// [`WORKFLOW_TYPE_KIND`].
+///
+/// This is the whole clause of a type-scoped fault — the domain the lookup was scoped
+/// to is never part of it, so one message form serves every operation that reports a
+/// type, whichever domain the request addressed.
+pub fn type_reference(kind: &str, name: &str, version: &str) -> String {
+    format!("{kind}=[name={name}, version={version}]")
+}
+
+/// The `UnknownResourceFault` message for an activity type no stored record of the
+/// addressed domain carries: the requested identity and nothing else.
+pub fn unknown_activity_type_message(name: &str, version: &str) -> String {
+    format!(
+        "Unknown type: {}",
+        type_reference(ACTIVITY_TYPE_KIND, name, version)
+    )
+}
+
+/// The `UnknownResourceFault` message for a workflow type no stored record of the
+/// addressed domain carries: the requested identity and nothing else.
+pub fn unknown_workflow_type_message(name: &str, version: &str) -> String {
+    format!(
+        "Unknown type: {}",
+        type_reference(WORKFLOW_TYPE_KIND, name, version)
+    )
+}
+
+/// The `UnknownResourceFault` message for an execution no stored run of the addressed
+/// domain carries: `Unknown execution: WorkflowExecution=[workflowId=.., runId=..]`,
+/// built from the requested execution alone.
+///
+/// As with [`type_reference`], the domain the lookup was scoped to is NOT part of the
+/// clause: every execution-scoped reader of this service reports a missing run this
+/// way, whichever domain the request named.
+pub fn unknown_execution_message(workflow_id: &str, run_id: &str) -> String {
+    format!("Unknown execution: WorkflowExecution=[workflowId={workflow_id}, runId={run_id}]")
 }
 
 /// The region this request was signed for, defaulting to [`DEFAULT_REGION`] when the

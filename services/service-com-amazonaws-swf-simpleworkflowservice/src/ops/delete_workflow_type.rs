@@ -82,11 +82,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// What Amazon SWF reports when a delete addresses a type that is still `REGISTERED`:
-/// the state of the record, in one fixed sentence that names nothing out of the request,
-/// so every refused delete carries exactly this message.
-pub const TYPE_NOT_DEPRECATED_MESSAGE: &str =
-    "The type is currently registered and cannot be deleted in its current state";
+/// What Amazon SWF reports when a delete addresses a type that is still `REGISTERED`.
+/// Shared with every other delete of a type, in [`crate::state`]: the sentence reports
+/// the state of the record and names nothing out of the request, so it is identical
+/// whichever type kind was addressed.
+pub const TYPE_NOT_DEPRECATED_MESSAGE: &str = crate::state::TYPE_NOT_DEPRECATED_MESSAGE;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -202,9 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(workflow_type) = domain.workflow_types.get(&key) else {
             return Err(DeleteWorkflowTypeErrorModeled::UnknownResourceFault(
                 UnknownResourceFault {
-                    message: Some(format!(
-                        "Unknown type: WorkflowType=[name={}, version={}]",
-                        input.workflow_type.name, input.workflow_type.version
+                    message: Some(crate::state::unknown_workflow_type_message(
+                        &input.workflow_type.name,
+                        &input.workflow_type.version,
                     )),
                 },
             )

@@ -11,9 +11,9 @@
 //! [`crate::state::HARVEST_OUTCOME`] for the span and the terminal status, and
 //! `settle_harvest_jobs` on the state struct for where it is materialised.
 //!
-//! ## What this handler decides about the harvest window and the destination role
+//! ## What this handler decides about the harvest window, the endpoint and the destination role
 //!
-//! A submission is accepted only when it can be carried out, and both checks happen
+//! A submission is accepted only when it can be carried out, and every check happens
 //! before the store is touched, so a refused submission persists nothing:
 //!
 //! * the WINDOW is an interval of media, so `EndTime` must name an instant LATER than
@@ -23,16 +23,21 @@
 //!   reads them as ISO-8601 instants itself — text that is not an instant is refused as
 //!   that member's own failure — and stores them as SENT, because the bounds the caller
 //!   gets back are the caller's own text;
+//! * the ENDPOINT has to hold content a harvest can export: a harvest reads already
+//!   published content back out of the origin endpoint's STARTOVER (time-shift) window,
+//!   so an endpoint whose startover playback is disabled retains nothing to harvest and
+//!   the submission is refused ([`crate::state::OriginEndpointRecord::startover_enabled`],
+//!   read off the stored endpoint);
 //! * the DESTINATION ROLE is the identity MediaPackage writes the harvested content as,
 //!   so the role's trust policy has to grant `mediapackage.amazonaws.com`
 //!   `sts:AssumeRole`. The role is resolved against the account's IAM records in the same
 //!   engine and read through the one shared trust-policy evaluator
 //!   ([`crate::state::harvest_role_refusal`]).
 //!
-//! Both answer the modelled `UnprocessableEntityException` (422) keyed by the member the
-//! caller has to fix. A window outside the endpoint's startover period is NOT refused
-//! here: nothing published states that bound for this service in a form this emulator can
-//! apply, so guessing it would refuse submissions AWS accepts.
+//! All three answer the modelled `UnprocessableEntityException` (422) keyed by the member
+//! the caller has to fix. Whether the harvest window lies INSIDE the endpoint's startover
+//! period is NOT decided here: nothing published states that bound for this service in a
+//! form this emulator can apply, so guessing it would refuse submissions AWS accepts.
 //!
 //! ## Shape of an operation
 //!
@@ -264,6 +269,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(endpoint) = state.origin_endpoints.get(&input.origin_endpoint_id) else {
             return Err(crate::state::member_not_found("originEndpointId").into());
         };
+        // A harvest exports content the endpoint has ALREADY published, which an endpoint
+        // keeps only for as long as its startover (time-shift) window retains it: an
+        // endpoint with startover playback disabled retains nothing, so there is nothing
+        // for the job to harvest and the submission is refused — keyed by the member that
+        // names the endpoint, decided against the stored record, and before the store is
+        // written, so nothing is persisted and no later read reports a phantom job.
+        if !endpoint.startover_enabled() {
+            return Err(crate::state::startover_required("originEndpointId").into());
+        }
         // The channel harvested is the one the STORED endpoint packages; the request does
         // not carry it and the response must not invent it.
         let channel_id = endpoint.channel_id.clone();

@@ -58,12 +58,22 @@ async fn create_endpoints(router: &MultiServiceRouter) {
     for channel in channels {
         create_channel(router, channel).await;
     }
-    for (endpoint, channel) in ENDPOINTS {
+    // Each fixture endpoint retains a STARTOVER window, because that is the content a
+    // harvest exports: a submission naming an endpoint with startover playback disabled is
+    // refused, which `tests/all/harvest_startover.rs` is the suite for. The windows differ
+    // per endpoint so no case here depends on one particular span.
+    for (index, (endpoint, channel)) in ENDPOINTS.iter().enumerate() {
+        let startover_window_seconds = 3_600 * (index as i64 + 1);
         let (status, body) = call(
             router,
             "POST",
             "/origin_endpoints",
-            Some(&json!({ "channelId": channel, "id": endpoint, "hlsPackage": {} })),
+            Some(&json!({
+                "channelId": channel,
+                "id": endpoint,
+                "hlsPackage": {},
+                "startoverWindowSeconds": startover_window_seconds
+            })),
         )
         .await;
         assert_eq!(

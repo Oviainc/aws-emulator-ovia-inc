@@ -10,7 +10,7 @@
 //!   read reports that stored document, revision and status;
 //! * `revisionId` is an optimistic lock — absent it acts regardless, otherwise it must
 //!   name the revision the workspace currently holds (`NO_POLICY` when it holds none),
-//!   and any other value is refused with `ConflictException` (409) having changed
+//!   and any other value is refused with `ValidationException` (400) having changed
 //!   nothing;
 //! * `clientToken` makes a put idempotent, so a replay mints no second revision;
 //! * a policy moves `CREATING`/`UPDATING` -> `ACTIVE` and `DELETING` -> gone on the
@@ -305,7 +305,7 @@ async fn put_persists_the_document_and_describe_reads_it_back() {
 
 /// Which revision id a put of a workspace that ALREADY holds a policy may name: absent
 /// or the current revision is accepted, and every other value is the stale writer the
-/// optimistic lock exists to refuse — `ConflictException` (409), with the stored policy
+/// optimistic lock exists to refuse — `ValidationException` (400), with the stored policy
 /// left exactly as it was.
 #[tokio::test]
 async fn the_revision_lock_accepts_only_the_current_revision() {
@@ -436,13 +436,13 @@ async fn the_revision_lock_accepts_only_the_current_revision() {
             );
         } else {
             assert_eq!(
-                reply.status, 409,
-                "case {:?}: a put naming {revision:?} must be refused with 409, got {reply:?}",
+                reply.status, 400,
+                "case {:?}: a put naming {revision:?} must be refused with 400, got {reply:?}",
                 case.name
             );
             assert_eq!(
                 reply.error_code(),
-                "ConflictException",
+                "ValidationException",
                 "case {:?}: unexpected error code, got {reply:?}",
                 case.name
             );
@@ -549,14 +549,14 @@ async fn the_first_put_takes_the_no_policy_revision() {
                 );
             } else {
                 assert_eq!(
-                    reply.status, 409,
-                    "case {:?} on {workspace_id}: the first put must be refused with 409, \
+                    reply.status, 400,
+                    "case {:?} on {workspace_id}: the first put must be refused with 400, \
                      got {reply:?}",
                     case.name
                 );
                 assert_eq!(
                     reply.error_code(),
-                    "ConflictException",
+                    "ValidationException",
                     "case {:?} on {workspace_id}: unexpected error code, got {reply:?}",
                     case.name
                 );
@@ -791,7 +791,7 @@ async fn delete_makes_the_policy_observably_gone() {
 }
 
 /// A delete naming a revision the policy is not at is the same stale writer a put's
-/// lock refuses: `ConflictException` (409), with the policy still attached.
+/// lock refuses: `ValidationException` (400), with the policy still attached.
 #[tokio::test]
 async fn delete_refuses_a_revision_the_policy_is_not_at() {
     let region = "eu-central-1";
@@ -834,12 +834,12 @@ async fn delete_refuses_a_revision_the_policy_is_not_at() {
         )
         .await;
         assert_eq!(
-            refused.status, 409,
-            "case {case:?}: a delete naming {named:?} must be refused with 409, got {refused:?}"
+            refused.status, 400,
+            "case {case:?}: a delete naming {named:?} must be refused with 400, got {refused:?}"
         );
         assert_eq!(
             refused.error_code(),
-            "ConflictException",
+            "ValidationException",
             "case {case:?}: unexpected error code, got {refused:?}"
         );
         assert_eq!(

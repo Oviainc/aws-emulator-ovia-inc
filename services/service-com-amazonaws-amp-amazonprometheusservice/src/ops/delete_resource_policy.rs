@@ -241,16 +241,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // The same optimistic lock a put takes: a `revisionId` that does not name
             // the policy's current revision would delete a revision the caller never
-            // read — ConflictException (409).
+            // read. The value the caller sent is what is wrong, so it is refused as the
+            // modelled ValidationException (400) naming `revisionId`, exactly as a put
+            // refuses it (`crate::state::stale_revision_rejection`).
             if !crate::state::revision_matches(Some(policy), input.revision_id.as_deref()) {
-                return Err(DeleteResourcePolicyErrorModeled::ConflictException(
-                    ConflictException {
-                        message: "The revisionId does not name the current revision of \
-                                  the resource-based policy"
-                            .to_string(),
-                        resource_id: input.workspace_id.clone(),
-                        resource_type: crate::state::POLICY_RESOURCE_TYPE.to_string(),
-                    },
+                return Err(DeleteResourcePolicyErrorModeled::ValidationException(
+                    crate::state::stale_revision_rejection(),
                 )
                 .into());
             }

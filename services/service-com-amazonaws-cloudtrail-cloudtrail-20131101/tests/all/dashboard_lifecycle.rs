@@ -607,7 +607,9 @@ async fn a_new_dashboard_is_creating_until_the_clock_settles_it() {
 }
 
 /// RULE: an identifier that names no stored dashboard is not found — whichever of the
-/// two forms it is written in, and whether it could name one at all.
+/// two forms it is written in, and whether it could name one at all — and CloudTrail
+/// Lake states that refusal in its own fixed words, without naming the identifier
+/// back.
 #[tokio::test]
 async fn an_identifier_naming_no_dashboard_is_not_found() {
     let emulator = Emulator::new();
@@ -643,8 +645,8 @@ async fn an_identifier_naming_no_dashboard_is_not_found() {
         // The refusal is CloudTrail's own fixed not-found text, the same for every
         // identifier that names nothing: it reports no part of the request.
         assert_eq!(
-            reply.body["Message"],
-            json!(state::DASHBOARD_NOT_FOUND_MESSAGE),
+            reply.message(),
+            state::DASHBOARD_NOT_FOUND_MESSAGE,
             "case {case:?}: expected the not-found message, got {reply:?}"
         );
     }
