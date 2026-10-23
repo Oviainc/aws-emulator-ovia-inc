@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRevision
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRevision`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRevision::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored revision `RevisionId` of data set `DataSetId`,
+//! exactly as `CreateRevision` left it in state. A read: it changes nothing, so
+//! repeating it answers the identical record. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +164,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRevision` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRevisionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRevisionErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // `@readonly`: this handler only reads. Both ids are `@httpLabel` with pattern
+        // ^[a-zA-Z0-9]{30,40}$, so an id of the wrong shape was already refused as a
+        // 400 `ValidationException` before this handler ran; reaching here, each id is
+        // well-formed but may name nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRevision"))
+        // A revision belongs to exactly one data set — the URI nests it under
+        // `/v1/data-sets/{DataSetId}/revisions/{RevisionId}` and the store keeps the
+        // revisions inside their data set — so the lookup is scoped to the named data
+        // set: a revision of some OTHER data set is as absent here as one that was
+        // never created.
+        let stored = {
+            let store = state.lock();
+            let Some(data_set) = store.data_sets.get(&input.data_set_id) else {
+                return Err(GetRevisionErrorModeled::ResourceNotFoundException(
+                    crate::state::data_set_not_found(&input.data_set_id),
+                )
+                .into());
+            };
+            data_set.revisions.get(&input.revision_id).cloned()
+        };
+        let Some(stored) = stored else {
+            return Err(GetRevisionErrorModeled::ResourceNotFoundException(
+                crate::state::revision_not_found(&input.revision_id),
+            )
+            .into());
+        };
+
+        Ok(GetRevisionOutput {
+            arn: Some(stored.arn),
+            comment: stored.comment,
+            created_at: Some(stored.created_at),
+            data_set_id: Some(stored.data_set_id),
+            finalized: stored.finalized,
+            id: Some(stored.id),
+            source_id: stored.source_id,
+            // An untagged revision carries no `Tags` member at all rather than an empty
+            // map, which is what `CreateRevision` and `GetDataSet` already answer with.
+            tags: (!stored.tags.is_empty()).then_some(stored.tags),
+            updated_at: Some(stored.updated_at),
+            revocation_comment: stored.revocation_comment,
+            revoked: stored.revoked,
+            revoked_at: stored.revoked_at,
+        })
     }
 }
