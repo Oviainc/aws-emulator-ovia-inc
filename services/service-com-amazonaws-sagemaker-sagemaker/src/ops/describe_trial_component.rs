@@ -221,12 +221,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Metrics are emitted by a running job through SageMaker Metrics; nothing has
             // reported any for a component created through this API.
             metrics: None,
-            // Lineage membership is reported only for the entities this emulator places
-            // in the default lineage group (`state::lineage_group_arn`, which the artifact
-            // handlers use); nothing places a trial component in one while
-            // `AssociateTrialComponent` and the rest of the lineage surface are stubs, so
-            // none is reported rather than claiming a membership that was never recorded.
-            lineage_group_arn: None,
+            // A trial component is a lineage entity, so it belongs to the default lineage
+            // group of the Region it was created in — the group `CreateTrialComponent`
+            // materialised there (`state::ensure_lineage_group`) and
+            // `DescribeLineageGroup` reports. Read from the component's own stored Region,
+            // the way `DescribeArtifact` and `DescribeAction` report theirs, so the
+            // membership does not follow whichever Region the reader signed for.
+            lineage_group_arn: Some(crate::state::lineage_group_arn(&component.region)),
         })
     }
 }

@@ -182,6 +182,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One instant for both times: an action nothing has modified reports a
         // `LastModifiedTime` equal to its `CreationTime`.
         let now = ::std::time::SystemTime::now();
+        // A lineage entity belongs to the Region's default lineage group, and SageMaker
+        // models no `CreateLineageGroup`: the service materialises that group when the
+        // first entity is put in it. `DescribeAction` reports this Region's
+        // `LineageGroupArn`, so the group that ARN names has to exist from here on —
+        // `DescribeLineageGroup` reads the same record. A group the Region already holds
+        // is left exactly as it is, and the create is never refused for the
+        // lineage-group bound: this call is about the action (`ensure_lineage_group`
+        // warns about that bound itself, for every caller).
+        let materialised_group =
+            store.ensure_lineage_group(&region, crate::state::DEFAULT_LINEAGE_GROUP, now);
         store.actions.insert(
             arn.clone(),
             crate::state::Action {
@@ -205,6 +215,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         drop(store);
 
+        // Both resources this call brought into being are recorded: the action, and the
+        // lineage group if this is the call that materialised it.
+        if let Some(group_arn) = materialised_group {
+            crate::state::record_state_change(Self::NAME, &group_arn, ctx);
+        }
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(CreateActionOutput {
             action_arn: Some(arn),

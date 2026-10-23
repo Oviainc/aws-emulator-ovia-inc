@@ -28,7 +28,9 @@ use service_com_amazonaws_sagemaker_sagemaker::state::{
     PARTNER_APP_DEFAULT_PAGE_SIZE,
 };
 
-use crate::inference_deployment_lifecycle::{error_code, str_field, Emulator, ACCOUNT};
+use crate::inference_deployment_lifecycle::{
+    epoch_seconds, error_code, str_field, Emulator, ACCOUNT,
+};
 
 /// The page ceiling the service applies whatever `MaxResults` asks for.
 const PAGE_CEILING: usize = MAX_PAGE_SIZE as usize;
@@ -145,13 +147,6 @@ fn creation_time(summary: &Value) -> f64 {
         .get("CreationTime")
         .and_then(Value::as_f64)
         .unwrap_or_else(|| panic!("expected a CreationTime timestamp in {summary}"))
-}
-
-/// A stored instant as epoch seconds, to compare against what a summary reports.
-fn epoch_seconds(at: SystemTime) -> f64 {
-    at.duration_since(SystemTime::UNIX_EPOCH)
-        .expect("a clock after the epoch")
-        .as_secs_f64()
 }
 
 /// RULE: `ListPartnerApps` reports one `PartnerAppSummary` per stored app, carrying that

@@ -183,6 +183,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A lineage entity belongs to the Region's default lineage group, and SageMaker
+        // models no `CreateLineageGroup`: the service materialises that group when the
+        // first entity is put in it, so creating a context is one of the calls that makes
+        // it exist and `DescribeLineageGroup` reports it from here on — which is the group
+        // this context's own `LineageGroupArn` names. A group the Region already holds is
+        // left exactly as it is, and the create is never refused for the lineage-group
+        // bound: this call is about the context.
+        let materialised_group =
+            store.ensure_lineage_group(&region, crate::state::DEFAULT_LINEAGE_GROUP, now);
         store.contexts.insert(
             arn.clone(),
             crate::state::Context {
@@ -206,6 +215,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         drop(store);
 
+        // Both resources this call brought into being are recorded: the context, and the
+        // lineage group if this is the call that materialised it.
+        if let Some(group_arn) = materialised_group {
+            crate::state::record_state_change(Self::NAME, &group_arn, ctx);
+        }
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(CreateContextOutput {
             context_arn: Some(arn),

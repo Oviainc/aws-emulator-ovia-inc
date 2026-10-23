@@ -27,6 +27,11 @@ use crate::inference_deployment_lifecycle::{error_code, str_field, Emulator, ACC
 /// than echoing the constant under test.
 const KIND: &str = "experiment-trial-component";
 
+/// The lineage group every lineage entity belongs to (`state::DEFAULT_LINEAGE_GROUP`),
+/// spelled out here so the test pins the wire form rather than echoing the constant under
+/// test.
+const DEFAULT_LINEAGE_GROUP: &str = "sagemaker-default-lineage-group";
+
 /// A name of exactly `length` characters that satisfies `ExperimentEntityName`'s pattern
 /// `^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,119}$`.
 fn name_of_length(length: usize) -> String {
@@ -350,15 +355,29 @@ async fn describe_trial_component_replays_exactly_what_create_stored() {
              modifies the component, got {described:?}"
         );
 
-        // Nothing has produced a source job, a metric or a lineage group for a component
-        // created through this API, so the emulator reports none rather than inventing one.
-        for member in ["Source", "Sources", "Metrics", "LineageGroupArn"] {
+        // Nothing has produced a source job or a metric for a component created through
+        // this API, so the emulator reports none rather than inventing one.
+        for member in ["Source", "Sources", "Metrics"] {
             assert!(
                 described.get(member).is_none(),
                 "case {case}: {member} must be absent for an API-created component, \
                  got {described:?}"
             );
         }
+
+        // A trial component IS a lineage entity, so it belongs to the default lineage
+        // group of the Region it was created in — the group the create materialised there,
+        // the same membership `DescribeArtifact` and `DescribeAction` report.
+        assert_eq!(
+            described.get("LineageGroupArn").and_then(Value::as_str),
+            Some(
+                format!(
+                    "arn:aws:sagemaker:us-east-1:{ACCOUNT}:lineage-group/{DEFAULT_LINEAGE_GROUP}"
+                )
+                .as_str()
+            ),
+            "case {case}: LineageGroupArn, got {described:?}"
+        );
 
         // `CreatedBy` and `LastModifiedBy` name the IAM identity the request signed with;
         // nothing has modified the component, so the two agree.
@@ -743,4 +762,96 @@ async fn describe_trial_component_refuses_a_component_that_does_not_exist() {
         "a refused read must not have created the component it named, got {status} with \
          {refused:?}"
     );
+}
+
+/// RULE: a trial component is a lineage entity, so it belongs to the default lineage group
+/// of the Region it was CREATED in — the group that create materialised there, which
+/// `DescribeLineageGroup` reports — and that membership does not follow whichever Region a
+/// later reader signs for.
+#[tokio::test]
+async fn a_trial_component_belongs_to_its_region_s_default_lineage_group() {
+    // Rows differ along the Region the create signed for, including the emulator default
+    // and Regions in three other partitions' worth of prefixes, so the reported group is
+    // the component's own rather than a constant.
+    for region in ["us-east-1", "eu-west-3", "ap-southeast-2", "ca-central-1"] {
+        let emulator = Emulator::new();
+        let name = format!("component-in-{region}");
+        let expected =
+            format!("arn:aws:sagemaker:{region}:{ACCOUNT}:lineage-group/{DEFAULT_LINEAGE_GROUP}");
+
+        let (created_status, created) = emulator
+            .call_in(
+                region,
+                "CreateTrialComponent",
+                &json!({ "TrialComponentName": &name }),
+            )
+            .await;
+        assert_eq!(
+            created_status, 200,
+            "case {region}: CreateTrialComponent, got {created_status} with {created}"
+        );
+
+        // Read in the creating Region: the component reports its Region's group.
+        let (described_status, described) = emulator
+            .call_in(
+                region,
+                "DescribeTrialComponent",
+                &json!({ "TrialComponentName": &name }),
+            )
+            .await;
+        assert_eq!(
+            described_status, 200,
+            "case {region}: DescribeTrialComponent, got {described_status} with {described}"
+        );
+        assert_eq!(
+            described.get("LineageGroupArn").and_then(Value::as_str),
+            Some(expected.as_str()),
+            "case {region}: LineageGroupArn, got {described:?}"
+        );
+
+        // And the group the create materialised is reportable in that Region, so the ARN
+        // the component carries names a group that really exists.
+        let (group_status, group) = emulator
+            .call_in(
+                region,
+                "DescribeLineageGroup",
+                &json!({ "LineageGroupName": DEFAULT_LINEAGE_GROUP }),
+            )
+            .await;
+        assert_eq!(
+            group_status, 200,
+            "case {region}: DescribeLineageGroup, got {group_status} with {group}"
+        );
+        assert_eq!(
+            group.get("LineageGroupArn").and_then(Value::as_str),
+            Some(expected.as_str()),
+            "case {region}: the group's own ARN, got {group:?}"
+        );
+
+        // A reader signing for another Region resolves the component by its account-wide
+        // name and still gets the CREATING Region's group, not its own.
+        let elsewhere = if region == "us-east-1" {
+            "eu-central-1"
+        } else {
+            "us-east-1"
+        };
+        let (elsewhere_status, from_elsewhere) = emulator
+            .call_in(
+                elsewhere,
+                "DescribeTrialComponent",
+                &json!({ "TrialComponentName": &name }),
+            )
+            .await;
+        assert_eq!(
+            elsewhere_status, 200,
+            "case {region}: a read from {elsewhere}, got {elsewhere_status} with \
+             {from_elsewhere}"
+        );
+        assert_eq!(
+            from_elsewhere.get("LineageGroupArn").and_then(Value::as_str),
+            Some(expected.as_str()),
+            "case {region}: a read from {elsewhere} must report the creating Region's \
+             group, got {from_elsewhere:?}"
+        );
+    }
 }

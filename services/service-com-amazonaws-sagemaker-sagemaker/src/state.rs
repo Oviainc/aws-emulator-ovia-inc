@@ -19,6 +19,11 @@
 //! have a name at all), so the ARN — which carries the Region and the account beside the
 //! name — is what identifies one of them.
 //!
+//! The lineage groups the account's lineage entities belong to are kept the same way,
+//! keyed by `(Region, LineageGroupName)` because a lineage group is a REGIONAL resource —
+//! with no `Create*` of their own, because SageMaker models none: see
+//! [`ComAmazonawsSagemakerSagemakerState::ensure_lineage_group`].
+//!
 //! Studio apps live here too, keyed by the [`AppKey`] their five input members name
 //! rather than by a bare name, because that tuple — domain, owning user profile or
 //! space, app type, app name — is what identifies one app. The ML Lineage entities
@@ -133,13 +138,21 @@ pub const MODEL_CARD_QUOTA: usize = 1_000;
 pub const MODEL_CARD_VERSION_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const PROCESSING_JOB_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`]. Bounds the lineage-group store as a whole, across Regions: a
+/// group is materialised per Region, so this is the total the store holds rather than a
+/// per-Region count. Declared last in this block, with the lineage-group record and its
+/// two accessors at the END of this file, so a service growing another store does not
+/// collide with the lineage-group one.
+pub const LINEAGE_GROUP_QUOTA: usize = 1_000;
 
 /// The lineage group every lineage entity this account creates belongs to.
 ///
 /// SageMaker ML Lineage Tracking gives an account one lineage group per Region,
 /// `sagemaker-default-lineage-group`, and reports its ARN as the `LineageGroupArn` of
 /// each entity in it; this emulator models no other lineage group, so every artifact
-/// reports this one.
+/// reports this one. It is also the group the lineage-entity creates materialise through
+/// [`ComAmazonawsSagemakerSagemakerState::ensure_lineage_group`], so that
+/// `DescribeLineageGroup` reports the group those entities are in.
 pub const DEFAULT_LINEAGE_GROUP: &str = "sagemaker-default-lineage-group";
 
 /// How long after `CreateProcessingJob` the clock owes the job's move out of
@@ -1436,6 +1449,12 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub trial_components: BTreeMap<String, TrialComponent>,
     /// Keyed by `ProcessingJobName`.
     pub processing_jobs: BTreeMap<String, ProcessingJob>,
+    /// Keyed by `(Region, LineageGroupName)`: a lineage group is a REGIONAL resource
+    /// (see [`lineage_group_arn`], "the ARN of the Region's default lineage group"), so
+    /// the Region a lineage entity materialised it in is part of its identity and a
+    /// reader signing for another Region does not find it. See [`LineageGroup`], at the
+    /// end of this module with the rest of the lineage-group slice.
+    pub lineage_groups: BTreeMap<(String, String), LineageGroup>,
     /// Keyed by the partner app's `app-...` id. See [`PartnerApp`], at the end of this
     /// module with the rest of the partner-AI-app slice.
     pub partner_apps: BTreeMap<String, PartnerApp>,
@@ -1766,6 +1785,9 @@ pub fn does_not_exist(entity: &str, arn: &str) -> String {
 
 /// The entity label [`does_not_exist`] names a lineage action by.
 pub const ACTION_ENTITY: &str = "Action";
+
+/// The entity label [`does_not_exist`] names a lineage group by.
+pub const LINEAGE_GROUP_ENTITY: &str = "Lineage group";
 
 /// The entity label [`does_not_exist`] names a pipeline by.
 pub const PIPELINE_ENTITY: &str = "Pipeline";
@@ -3198,6 +3220,115 @@ impl ComAmazonawsSagemakerSagemakerState {
 }
 
 // ---------------------------------------------------------------------------
+// The lineage-group slice: the record `DescribeLineageGroup` reports, and the two
+// accessors the reader and the lineage-entity creates reach it through. Kept at the end
+// of the module, with its own inherent `impl` block, the way the lineage-action and
+// workload-configuration slices above are.
+// ---------------------------------------------------------------------------
+
+/// A lineage group, as `DescribeLineageGroup` reports it.
+///
+/// SageMaker models no `CreateLineageGroup`: a lineage group comes into being with the
+/// account's lineage entities (every artifact, action, context and trial component
+/// belongs to one), so a record here is materialised through
+/// [`ComAmazonawsSagemakerSagemakerState::ensure_lineage_group`] rather than by a create
+/// handler — and a group nothing has materialised is simply absent from the store, which
+/// is what the modelled `ResourceNotFound` reports.
+#[derive(Debug, Clone)]
+pub struct LineageGroup {
+    pub name: String,
+    pub arn: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub created_by: Option<UserContext>,
+    pub last_modified_by: Option<UserContext>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+}
+
+impl ComAmazonawsSagemakerSagemakerState {
+    /// The lineage group `region` holds under `name`, or `None` when no lineage entity
+    /// has materialised it there.
+    ///
+    /// A lineage group is regional, so the Region is half the key: a group materialised
+    /// by an entity created in one Region is not reported to a caller signing for
+    /// another, which is what keeps a replayed `LineageGroupArn` naming the Region the
+    /// reader signed for.
+    pub fn lineage_group(&self, region: &str, name: &str) -> Option<&LineageGroup> {
+        self.lineage_groups
+            .get(&(region.to_string(), name.to_string()))
+    }
+
+    /// Materialise the lineage group `name` in `region` unless the store already holds
+    /// it, and answer the ARN of the group this call CREATED.
+    ///
+    /// This is the ONLY way a lineage group enters the store, because SageMaker models no
+    /// `CreateLineageGroup`: the service materialises a group when the account's lineage
+    /// entities put something in it, so the lineage-entity creates call this with
+    /// [`DEFAULT_LINEAGE_GROUP`] — `CreateArtifact`, `CreateAction`, `CreateContext` and
+    /// `CreateTrialComponent` all do. Readers never call it: a reporting operation must
+    /// not mint a resource.
+    ///
+    /// `DisplayName` is the group's own name: nothing in the API supplies one for a group
+    /// the service materialises itself, and "if `DisplayName` isn't specified, the name is
+    /// displayed" is the rule every other SageMaker entity's model doc states.
+    /// `CreatedBy`/`LastModifiedBy` stay absent — there is no Studio user context behind a
+    /// group the service created, and an invented one would be a value no request made.
+    ///
+    /// `None` means nothing changed: either that Region already held that group (so a
+    /// second entity does not move its stored instants), or the store is at
+    /// [`LINEAGE_GROUP_QUOTA`] and cannot take another, which bounds the growth a caller
+    /// varying the Region or the name could otherwise cause. A caller that gets
+    /// `Some(arn)` records the state change under that ARN, so a materialised group is
+    /// auditable like any create. The at-the-bound case is WARNED about here rather than
+    /// by each caller, so every lineage-entity create reports it the same way and none
+    /// can drift.
+    pub fn ensure_lineage_group(
+        &mut self,
+        region: &str,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<String> {
+        // Read before the entry() borrow, so the bound is checked against the same store
+        // this insert grows.
+        let at_capacity = self.lineage_groups.len() >= LINEAGE_GROUP_QUOTA;
+        match self
+            .lineage_groups
+            .entry((region.to_string(), name.to_string()))
+        {
+            ::std::collections::btree_map::Entry::Occupied(_) => None,
+            ::std::collections::btree_map::Entry::Vacant(_) if at_capacity => {
+                // Visible rather than silent: past the bound the entity this call creates
+                // still reports its Region's lineage-group ARN, which
+                // `DescribeLineageGroup` cannot answer until the store is back under it.
+                tracing::warn!(
+                    lineage_group = name,
+                    region,
+                    bound = LINEAGE_GROUP_QUOTA,
+                    "the lineage-group store is at its bound, so this Region's lineage \
+                     group was not materialised"
+                );
+                None
+            }
+            ::std::collections::btree_map::Entry::Vacant(slot) => {
+                let arn = resource_arn(region, "lineage-group", name);
+                slot.insert(LineageGroup {
+                    name: name.to_string(),
+                    arn: arn.clone(),
+                    display_name: Some(name.to_string()),
+                    description: None,
+                    created_by: None,
+                    last_modified_by: None,
+                    creation_time: now,
+                    last_modified_time: now,
+                });
+                Some(arn)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The MLflow tracking-server slice: `CreateMlflowTrackingServer` and
 // `DescribeMlflowTrackingServer`. Kept together as its own slice, rather than spread
 // through the blocks around it, so this one resource kind reads as one block.
@@ -3338,6 +3469,11 @@ pub const TRIAL_COMPONENT_QUOTA: usize = 1_000;
 pub struct TrialComponent {
     pub name: String,
     pub arn: String,
+    /// The Region the create signed for, kept beside the ARN the way [`Artifact`] and
+    /// [`Action`] keep theirs: a trial component is a lineage entity, so a reader reports
+    /// the lineage group of the Region the component was created in (see
+    /// [`lineage_group_arn`]) rather than of the Region the READER happens to sign for.
+    pub region: String,
     /// Never `None`: `DisplayName`'s model doc says "If DisplayName isn't specified,
     /// TrialComponentName is displayed", so a create without one stores the name.
     pub display_name: String,
