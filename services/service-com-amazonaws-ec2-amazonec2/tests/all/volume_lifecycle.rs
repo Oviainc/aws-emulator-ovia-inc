@@ -30,10 +30,10 @@ use super::ec2_query::{call, element, elements, error_code, filters, indexed};
 
 /// The Region every call here is signed for; the zone names and ids the assertions use
 /// are derived from it.
-const REGION: &str = "us-west-2";
+pub(super) const REGION: &str = "us-west-2";
 
 /// A `(key, value)` request parameter.
-fn p(key: &str, value: impl Into<String>) -> (String, String) {
+pub(super) fn p(key: &str, value: impl Into<String>) -> (String, String) {
     (key.to_string(), value.into())
 }
 
@@ -52,7 +52,7 @@ type FilterRow = (&'static str, Params, Vec<String>);
 
 /// Wait until every clock-owed transition started before now has certainly fallen due.
 /// Derived from the service's own span, not a literal, so the two cannot drift.
-async fn past_the_transition() {
+pub(super) async fn past_the_transition() {
     tokio::time::sleep(TRANSITION_DELAY + Duration::from_millis(200)).await;
 }
 
@@ -69,16 +69,16 @@ async fn describe(router: &MultiServiceRouter, params: &[(String, String)]) -> (
 }
 
 /// The first zone of the signed Region, which most rows create into.
-fn zone_name(index: usize) -> String {
+pub(super) fn zone_name(index: usize) -> String {
     availability_zones_in_region(REGION)[index].zone_name.clone()
 }
 
-fn zone_id(index: usize) -> String {
+pub(super) fn zone_id(index: usize) -> String {
     availability_zones_in_region(REGION)[index].zone_id.clone()
 }
 
 /// A `VolumeId` is `vol-` followed by 8 or 17 lowercase hex digits.
-fn is_volume_id(candidate: &str) -> bool {
+pub(super) fn is_volume_id(candidate: &str) -> bool {
     let Some(suffix) = candidate.strip_prefix("vol-") else {
         return false;
     };
@@ -118,7 +118,7 @@ async fn described_ids(
 
 /// The IOPS a volume type needs on creation, as `Iops` parameters: "Required for io1 and
 /// io2 volumes" (`CreateVolumeRequest$Iops`), at the bottom of that type's range.
-fn required_iops(volume_type: &str) -> Vec<(String, String)> {
+pub(super) fn required_iops(volume_type: &str) -> Vec<(String, String)> {
     VOLUME_IOPS_RANGES
         .iter()
         .find(|(name, _, _)| *name == volume_type && matches!(*name, "io1" | "io2"))
