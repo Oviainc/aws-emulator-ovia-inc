@@ -518,38 +518,56 @@ async fn an_access_key_belongs_to_one_bucket_in_one_region() {
         "case cross-bucket delete: the refused delete left the key in place"
     );
 
-    // The same bucket NAME in two Regions is two buckets, so their key sets are
-    // separate and neither Region's delete reaches the other's key.
-    let shared = "shared-keyed-bucket";
-    create_bucket(&emulator, Some("us-east-2"), shared).await;
-    create_bucket(&emulator, Some("eu-central-1"), shared).await;
-    let (east, _) = mint(&emulator, Some("us-east-2"), shared).await;
+    // A bucket belongs to the Region it was created in, so its access keys are reached
+    // only through that Region: every access-key call made in another Region names no
+    // bucket at all, and leaves the key where it is. (The name cannot be taken by a
+    // second bucket in that other Region either — a bucket's name is its address in the
+    // one object storage namespace this emulator serves, which `bucket_lifecycle.rs`
+    // pins.)
+    let regional = "regional-keyed-bucket";
+    create_bucket(&emulator, Some("us-east-2"), regional).await;
+    let (east, _) = mint(&emulator, Some("us-east-2"), regional).await;
     let east_id = east["accessKeyId"].as_str().unwrap_or_default().to_string();
 
     assert_eq!(
-        read_key_ids(&emulator, Some("us-east-2"), shared).await,
+        read_key_ids(&emulator, Some("us-east-2"), regional).await,
         vec![east_id.clone()],
         "case two Regions: the Region the key was minted in reports it"
     );
-    assert_eq!(
-        read_key_ids(&emulator, Some("eu-central-1"), shared).await,
-        Vec::<String>::new(),
-        "case two Regions: the other Region's bucket of that name holds no key"
-    );
-    let (status, missing) = emulator
-        .call_in(
-            Some("eu-central-1"),
+    let elsewhere: &[(&str, &str, Value)] = &[
+        (
+            "reading the keys from another Region",
+            "GetBucketAccessKeys",
+            json!({"bucketName": regional}),
+        ),
+        (
+            "minting a key from another Region",
+            "CreateBucketAccessKey",
+            json!({"bucketName": regional}),
+        ),
+        (
+            "deleting the key from another Region",
             "DeleteBucketAccessKey",
-            json!({"bucketName": shared, "accessKeyId": &east_id}),
-        )
-        .await;
+            json!({"bucketName": regional, "accessKeyId": &east_id}),
+        ),
+    ];
+    for (case, operation, body) in elsewhere {
+        let (status, missing) = emulator
+            .call_in(Some("eu-central-1"), operation, body.clone())
+            .await;
+        assert_eq!(
+            status, 404,
+            "case {case}: expected a 404, got {status} {missing:?}"
+        );
+        assert_eq!(
+            error_code(&missing),
+            "NotFoundException",
+            "case {case}: expected NotFoundException, got {missing:?}"
+        );
+    }
     assert_eq!(
-        status, 404,
-        "case two Regions: deleting another Region's key must be a 404, got {status} {missing:?}"
-    );
-    assert_eq!(
-        read_key_ids(&emulator, Some("us-east-2"), shared).await,
+        read_key_ids(&emulator, Some("us-east-2"), regional).await,
         vec![east_id],
-        "case two Regions: the refused delete left the key in place"
+        "case two Regions: the refused calls left the key in place"
     );
 }

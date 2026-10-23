@@ -11,6 +11,12 @@
 //! projected from the record this call just wrote by `input_description`, never
 //! from the request in flight.
 //!
+//! The id is resolved through the LIVE input lookup (`state::live_input`): a delete
+//! this service has accepted keeps the record readable in `DELETING` and then in the
+//! terminal `DELETED`, but the id names nothing a caller may still change, so such a
+//! request is answered with the modelled `NotFoundException` (404) before anything is
+//! written — exactly as an id no input ever had is.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -185,9 +191,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this update ran.
         state.settle(::std::time::SystemTime::now());
 
-        if !state.inputs.contains_key(&input.input_id) {
+        if state.live_input(&input.input_id).is_none() {
+            // Absent and already deleted are ONE refusal: a delete this service
+            // has accepted leaves the record readable in `DELETING` and then in
+            // the terminal `DELETED`, but the id names nothing a caller may
+            // still change, so the mutation is answered with this operation's
+            // modelled `NotFoundException` (404) and nothing is written. The
+            // message tells the two apart; the status and the code do not.
+            let message = if state.inputs.contains_key(&input.input_id) {
+                crate::state::already_deleted_message(&crate::state::deleted_input_subject(
+                    &input.input_id,
+                ))
+            } else {
+                crate::state::not_found_message("Input", &input.input_id)
+            };
             return Err(UpdateInputErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message("Input", &input.input_id)),
+                message: Some(message),
             })
             .into());
         }

@@ -838,6 +838,54 @@ async fn a_global_database_created_from_a_stored_cluster_adopts_it() {
                 );
             }
         }
+        // And the reference holds in the OTHER direction: the adopted cluster reports the
+        // global database it now belongs to, so the two records cannot disagree about the
+        // membership.
+        let member = expect_ok(
+            case,
+            call(
+                &router,
+                "DescribeDBClusters",
+                &[("DBClusterIdentifier", source.as_str())],
+            )
+            .await,
+        );
+        assert_eq!(
+            text(&member, "GlobalClusterIdentifier"),
+            global,
+            "case {case:?}: the adopted cluster must name the global database it joined, \
+             got {member}"
+        );
+        // A cluster belongs to at most ONE global database: a second global create naming
+        // the same source is refused for the cluster's state, and stores nothing — which
+        // is what keeps the first global database's member list pointing at a cluster that
+        // still points back.
+        let second = format!("emu-global-readopt-{index}");
+        expect_error(
+            case,
+            call(
+                &router,
+                "CreateGlobalCluster",
+                &[
+                    ("GlobalClusterIdentifier", second.clone()),
+                    ("SourceDBClusterIdentifier", name_source(&source)),
+                ],
+            )
+            .await,
+            400,
+            "InvalidDBClusterStateFault",
+        );
+        expect_error(
+            case,
+            call(
+                &router,
+                "DescribeGlobalClusters",
+                &[("GlobalClusterIdentifier", second.as_str())],
+            )
+            .await,
+            404,
+            "GlobalClusterNotFoundFault",
+        );
     }
 
     // The counterpart, which the row above is the complement of: a source nothing created

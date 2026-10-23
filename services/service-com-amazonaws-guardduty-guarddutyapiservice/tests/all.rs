@@ -25,6 +25,8 @@ mod findings_feedback;
 mod investigation_lifecycle;
 #[path = "all/ip_set_lifecycle.rs"]
 mod ip_set_lifecycle;
+#[path = "all/member_accounts.rs"]
+mod member_accounts;
 #[path = "all/member_association.rs"]
 mod member_association;
 #[path = "all/modeled_constraint_refusals.rs"]

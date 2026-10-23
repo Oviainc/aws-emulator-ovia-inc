@@ -37,6 +37,8 @@ mod ops_name_bindings;
 mod remove_flow_output;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/revoke_flow_entitlement.rs"]
+mod revoke_flow_entitlement;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_flow.rs"]

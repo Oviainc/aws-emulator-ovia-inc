@@ -181,15 +181,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle(now);
 
         let Some(group) = state
-            .input_security_groups
-            .get_mut(&input.input_security_group_id)
+            .live_input_security_group(&input.input_security_group_id)
+            .map(|group| group.id.clone())
+            .and_then(|id| state.input_security_groups.get_mut(&id))
         else {
+            // Absent and already deleted are ONE refusal, for the reason
+            // `UpdateInput` states: a deleted group's record stays readable in
+            // the terminal `DELETED` state, but the id names no group a caller
+            // may still change, so the mutation is answered with this
+            // operation's modelled `NotFoundException` (404) and nothing is
+            // written.
+            let message = if state
+                .input_security_groups
+                .contains_key(&input.input_security_group_id)
+            {
+                crate::state::already_deleted_message(&format!(
+                    "Input security group {}",
+                    input.input_security_group_id
+                ))
+            } else {
+                format!(
+                    "Input security group not found: {}",
+                    input.input_security_group_id
+                )
+            };
             return Err(UpdateInputSecurityGroupErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "Input security group not found: {}",
-                        input.input_security_group_id
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

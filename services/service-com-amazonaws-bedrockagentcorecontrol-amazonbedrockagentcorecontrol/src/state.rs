@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol service.
 //!
-//! Two resources are persisted here:
+//! Three resources are persisted here:
 //!
 //! * the agent runtime (`/runtimes/`): one [`AgentRuntimeRecord`] per
 //!   `agentRuntimeId`, each holding every version that has ever been published
@@ -10,7 +10,10 @@
 //!   `ListAgentRuntimeVersions` all read one store;
 //! * the gateway (`/gateways/`): one [`GatewayRecord`] per `gatewayId`, each
 //!   holding the targets configured on it ([`GatewayTargetRecord`]), because a
-//!   target is addressed only through its gateway.
+//!   target is addressed only through its gateway;
+//! * the memory (`/memories/`): one [`MemoryRecord`] per `memoryId`, holding the
+//!   configuration the caller supplied and the strategies minted for it, so
+//!   `GetMemory` and any later memory read answer from one store.
 //!
 //! Helpers the handlers share (the region a request was signed for, the
 //! canonical ARNs, id minting, the clock-owed status transition, the response
@@ -18,7 +21,7 @@
 //! rather than in any one `ops/` file, so create/get/list/update/delete cannot
 //! drift from each other.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -26,10 +29,11 @@ use crate::ops::types::{
     CertificateConfiguration, CreateGatewayOutput, CreateGatewayTargetOutput,
     CredentialProviderConfiguration, FilesystemConfiguration, GatewayInterceptorConfiguration,
     GatewayPolicyEngineConfiguration, GatewayProtocolConfiguration, GetGatewayOutput,
-    GetGatewayTargetOutput, LifecycleConfiguration, McpTargetConfiguration, MetadataConfiguration,
-    NetworkConfiguration, PrivateEndpoint, ProtocolConfiguration, RequestHeaderConfiguration,
-    RuntimeMetadataConfiguration, TargetConfiguration, ValidationException,
-    ValidationExceptionField, WorkloadIdentityDetails,
+    GetGatewayTargetOutput, IndexedKey, LifecycleConfiguration, McpTargetConfiguration, Memory,
+    MemoryStrategy, MetadataConfiguration, NamespaceKeyEntry, NetworkConfiguration, PrivateEndpoint,
+    ProtocolConfiguration, RequestHeaderConfiguration, RuntimeMetadataConfiguration,
+    StreamDeliveryResources, TargetConfiguration, ValidationException, ValidationExceptionField,
+    WorkloadIdentityDetails,
 };
 
 /// The ARN namespace (and sigv4 signing name) this service stamps on its
@@ -137,6 +141,47 @@ pub const MAX_VERSIONS_PER_RUNTIME: usize = 1_000;
 /// `^([1-9][0-9]{0,4})$`, so five digits. A runtime that has published this many
 /// versions can publish no more, whatever has since been deleted.
 pub const MAX_AGENT_RUNTIME_VERSION: u32 = 99_999;
+
+/// `MemoryStatus` members this service drives. The enum's full value list is
+/// `CREATING | ACTIVE | FAILED | DELETING | UPDATING`
+/// (`smithy_query shape=MemoryStatus`).
+pub const MEMORY_STATUS_CREATING: &str = "CREATING";
+pub const MEMORY_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `MemoryStrategyStatus` members a strategy of a memory this emulator drives
+/// reports. The enum's full value list is `CREATING | ACTIVE | DELETING |
+/// FAILED` (`smithy_query shape=MemoryStrategyStatus`).
+pub const MEMORY_STRATEGY_STATUS_CREATING: &str = "CREATING";
+pub const MEMORY_STRATEGY_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// How long a freshly created memory stays in its transient status (`CREATING`)
+/// before the clock owes it `ACTIVE`.
+///
+/// AWS documents no duration for this transition, so the span is chosen: short
+/// enough to keep a client script quick, long enough that a caller acting
+/// straight after the call still observes the transient status.
+pub const MEMORY_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+/// How many memories this emulator will hold.
+///
+/// The real service caps memories per account per Region with a service quota,
+/// and `CreateMemory` models `ServiceQuotaExceededException` (HTTP 402) for
+/// exceeding one. The number is NOT a fidelity claim about the published quota:
+/// it is the emulator's own ceiling, set generously so no realistic workflow
+/// meets it, so that a caller looping on create cannot grow this process's
+/// memory without bound.
+pub const MAX_MEMORIES: usize = 1_000;
+
+/// How many strategies one memory will hold.
+///
+/// `MemoryStrategyInputList` carries no `length` constraint, so the boundary
+/// walk bounds the requested list at nothing and the handler refuses a longer
+/// one with `CreateMemory`'s modelled `ServiceQuotaExceededException` — the real
+/// service caps strategies per memory with a service quota too. Like the other
+/// ceilings here the number is the emulator's own, set generously so no
+/// realistic workflow meets it, so that neither the work one request implies nor
+/// the strategies a stored memory retains grows without bound.
+pub const MAX_STRATEGIES_PER_MEMORY: usize = 100;
 
 /// How many `clientToken` -> result records are kept for idempotent replay.
 ///
@@ -461,13 +506,102 @@ impl GatewayTargetRecord {
     }
 }
 
+/// One AgentCore Memory resource: everything the caller configured, the
+/// strategies minted for it, and the status the clock drives.
+///
+/// The strategies are stored as the `MemoryStrategy` the wire reports, minus the
+/// status — that one member is the clock's, so it is computed on every read
+/// ([`Self::memory`]) rather than frozen into the record.
+#[derive(Debug, Clone)]
+pub struct MemoryRecord {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub encryption_key_arn: Option<String>,
+    pub memory_execution_role_arn: Option<String>,
+    /// `eventExpiryDuration`, in days, as the caller set it.
+    pub event_expiry_duration: i32,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// The status until [`settles_at`](Self::settles_at) passes.
+    pub transient_status: String,
+    /// The status from [`settles_at`](Self::settles_at) onwards.
+    pub settled_status: String,
+    /// The instant the transient status is owed its transition. Stored, never
+    /// slept on: a read materialises the transition the clock already made due.
+    pub settles_at: SystemTime,
+    pub strategies: Vec<MemoryStrategy>,
+    pub indexed_keys: Option<Vec<IndexedKey>>,
+    pub namespace_keys: Option<Vec<NamespaceKeyEntry>>,
+    pub stream_delivery_resources: Option<StreamDeliveryResources>,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl MemoryRecord {
+    /// The status this memory reports at `now`: the transient one until the
+    /// transition the clock owes comes due, the settled one afterwards.
+    pub fn status_at(&self, now: SystemTime) -> &str {
+        if now < self.settles_at {
+            &self.transient_status
+        } else {
+            &self.settled_status
+        }
+    }
+
+    /// This memory as the `Memory` shape every operation that reports one
+    /// carries, rendered from the stored record so a create and a later read
+    /// cannot differ on a member no state justifies.
+    pub fn memory(&self, now: SystemTime) -> Memory {
+        // A strategy is created with its memory, so it is `CREATING` for exactly
+        // as long as the memory is and `ACTIVE` once the memory is.
+        let strategy_status = if self.status_at(now) == MEMORY_STATUS_CREATING {
+            MEMORY_STRATEGY_STATUS_CREATING
+        } else {
+            MEMORY_STRATEGY_STATUS_ACTIVE
+        };
+        let strategies = self
+            .strategies
+            .iter()
+            .map(|strategy| MemoryStrategy {
+                status: Some(strategy_status.to_string()),
+                ..strategy.clone()
+            })
+            .collect();
+        Memory {
+            arn: self.arn.clone(),
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            encryption_key_arn: self.encryption_key_arn.clone(),
+            memory_execution_role_arn: self.memory_execution_role_arn.clone(),
+            event_expiry_duration: self.event_expiry_duration,
+            status: self.status_at(now).to_string(),
+            // Reported only for a status that HAS a reason; a memory this
+            // emulator drives reaches ACTIVE, which has none.
+            failure_reason: None,
+            created_at: timestamp(self.created_at),
+            updated_at: timestamp(self.updated_at),
+            strategies: Some(strategies),
+            indexed_keys: self.indexed_keys.clone(),
+            namespace_keys: self.namespace_keys.clone(),
+            stream_delivery_resources: self.stream_delivery_resources.clone(),
+            // Set only on a memory another resource (a harness) manages, and no
+            // operation of this service creates one, so a memory carries none.
+            managed_by_resource_arn: None,
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol. A handler reaches it through [`service_state`].
 ///
 /// Every map here is caller-driven growth, so every one is bounded:
 /// [`MAX_AGENT_RUNTIMES`] caps the runtimes (and with them the 1:1 name index),
 /// [`MAX_VERSIONS_PER_RUNTIME`] caps the versions one runtime accumulates,
-/// [`MAX_GATEWAYS`] caps the gateways (and with them their 1:1 name index) and
-/// [`MAX_TARGETS_PER_GATEWAY`] the targets one gateway holds, and the
+/// [`MAX_GATEWAYS`] caps the gateways (and with them their 1:1 name index),
+/// [`MAX_TARGETS_PER_GATEWAY`] the targets one gateway holds, [`MAX_MEMORIES`]
+/// the memories (and with them their 1:1 name index) and
+/// [`MAX_STRATEGIES_PER_MEMORY`] the strategies one memory holds, and the
 /// idempotency records are capped at [`MAX_REMEMBERED_CLIENT_TOKENS`] with
 /// oldest-first eviction plus removal when the resource they name is deleted.
 #[derive(Debug, Default)]
@@ -486,6 +620,14 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// `ConflictException` ("The name must be unique within your account").
     /// One entry per stored gateway.
     pub gateway_names: BTreeMap<String, String>,
+    /// Every memory, keyed by `memoryId` — the identifier every memory route
+    /// addresses it by. The key order is the deterministic list order a memory
+    /// listing pages over.
+    pub memories: BTreeMap<String, MemoryRecord>,
+    /// `name` -> `memoryId`, so a duplicate name at create time is a
+    /// `ConflictException` ("The name must be unique within your account").
+    /// One entry per stored memory.
+    pub memory_names: BTreeMap<String, String>,
     /// `<operation>/<clientToken>` -> the (runtime, version) that token first
     /// produced, so a replayed Create/Update answers with its first result
     /// instead of minting a second runtime or a second version. The key carries
@@ -507,6 +649,15 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// The keys of [`Self::gateway_idempotency`] in the order they were first
     /// recorded, so the oldest record is the one evicted at the ceiling.
     gateway_idempotency_order: VecDeque<String>,
+    /// `<operation>/<clientToken>` -> the memory that token first produced, so a
+    /// replayed `CreateMemory` answers with its first result instead of minting
+    /// a second memory. Separate from the maps above because the record is
+    /// validated against a different store; the key carries the operation for
+    /// the same reason as there.
+    memory_idempotency: BTreeMap<String, String>,
+    /// The keys of [`Self::memory_idempotency`] in the order they were first
+    /// recorded, so the oldest record is the one evicted at the ceiling.
+    memory_idempotency_order: VecDeque<String>,
     /// Bumped on every mint, so two runtimes created in the same instant with
     /// the same name still get distinct ids.
     mint_counter: u64,
@@ -556,19 +707,12 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
         let Some(token) = client_token else {
             return;
         };
-        let key = token_key(operation, &token);
-        if self
-            .idempotency
-            .insert(key.clone(), (agent_runtime_id.to_string(), version))
-            .is_none()
-        {
-            self.idempotency_order.push_back(key);
-        }
-        while self.idempotency_order.len() > MAX_REMEMBERED_CLIENT_TOKENS {
-            if let Some(oldest) = self.idempotency_order.pop_front() {
-                self.idempotency.remove(&oldest);
-            }
-        }
+        remember_token(
+            &mut self.idempotency,
+            &mut self.idempotency_order,
+            token_key(operation, &token),
+            (agent_runtime_id.to_string(), version),
+        );
     }
 
     /// Drop the idempotency records naming a runtime that no longer exists.
@@ -654,16 +798,12 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
         let Some(token) = client_token else {
             return;
         };
-        let key = token_key(operation, &token);
-        let record = (gateway_id.to_string(), target_id.map(str::to_string));
-        if self.gateway_idempotency.insert(key.clone(), record).is_none() {
-            self.gateway_idempotency_order.push_back(key);
-        }
-        while self.gateway_idempotency_order.len() > MAX_REMEMBERED_CLIENT_TOKENS {
-            if let Some(oldest) = self.gateway_idempotency_order.pop_front() {
-                self.gateway_idempotency.remove(&oldest);
-            }
-        }
+        remember_token(
+            &mut self.gateway_idempotency,
+            &mut self.gateway_idempotency_order,
+            token_key(operation, &token),
+            (gateway_id.to_string(), target_id.map(str::to_string)),
+        );
     }
 
     /// Drop the idempotency records naming a gateway that no longer exists, for
@@ -674,12 +814,107 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
         self.gateway_idempotency_order
             .retain(|token| live.contains_key(token));
     }
+
+    /// Mint a `memoryId` for `name` that no stored memory holds: `name` + `-` +
+    /// 10 alphanumerics, per `MemoryId`'s pattern
+    /// `^[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$` (min length 12, which
+    /// the 11 characters the suffix contributes already satisfy for any `Name`).
+    pub fn mint_memory_id(&mut self, name: &str, at: SystemTime) -> String {
+        loop {
+            self.mint_counter = self.mint_counter.wrapping_add(1);
+            let candidate = format!("{name}-{}", suffix_for(name, self.mint_counter, at));
+            if !self.memories.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Mint a `strategyId` none of `minted` holds, for a strategy named
+    /// `strategy_name`. `MemoryStrategyId` carries the same pattern as
+    /// `MemoryId`, so the id has the same shape; `minted` is the ids already
+    /// minted for the memory being created, which the store does not hold yet.
+    pub fn mint_memory_strategy_id(
+        &mut self,
+        strategy_name: &str,
+        at: SystemTime,
+        minted: &BTreeSet<String>,
+    ) -> String {
+        loop {
+            self.mint_counter = self.mint_counter.wrapping_add(1);
+            let candidate = format!(
+                "{strategy_name}-{}",
+                suffix_for(strategy_name, self.mint_counter, at)
+            );
+            if !minted.contains(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// The memory a previous request to `operation` carrying this `clientToken`
+    /// produced, if the record is still held and the memory still exists.
+    pub fn replayed_memory_result(
+        &self,
+        operation: &str,
+        client_token: Option<&str>,
+    ) -> Option<String> {
+        let memory_id = self.memory_idempotency.get(&token_key(operation, client_token?))?;
+        self.memories
+            .contains_key(memory_id)
+            .then(|| memory_id.clone())
+    }
+
+    /// Record what a `clientToken` produced for `operation`, evicting the oldest
+    /// record once [`MAX_REMEMBERED_CLIENT_TOKENS`] are held. An evicted token is
+    /// indistinguishable from one whose idempotency window has passed: the next
+    /// request carrying it is served as a fresh one.
+    pub fn remember_memory_client_token(
+        &mut self,
+        operation: &str,
+        client_token: Option<String>,
+        memory_id: &str,
+    ) {
+        let Some(token) = client_token else {
+            return;
+        };
+        remember_token(
+            &mut self.memory_idempotency,
+            &mut self.memory_idempotency_order,
+            token_key(operation, &token),
+            memory_id.to_string(),
+        );
+    }
 }
 
 /// One idempotency key: the operation the token was presented to, then the
 /// token itself, so the two operations' tokens cannot collide.
 fn token_key(operation: &str, client_token: &str) -> String {
     format!("{operation}/{client_token}")
+}
+
+/// Record what one `clientToken` produced, in the map/order pair of whichever
+/// store holds it, evicting the oldest record once
+/// [`MAX_REMEMBERED_CLIENT_TOKENS`] are held. An evicted token is
+/// indistinguishable from one whose idempotency window has passed: the next
+/// request carrying it is served as a fresh one.
+///
+/// Shared by every `remember_*_client_token` above — the stores differ only in
+/// what a token produced — so the ceiling and the eviction rule cannot drift
+/// between them.
+fn remember_token<V>(
+    records: &mut BTreeMap<String, V>,
+    order: &mut VecDeque<String>,
+    key: String,
+    produced: V,
+) {
+    if records.insert(key.clone(), produced).is_none() {
+        order.push_back(key);
+    }
+    while order.len() > MAX_REMEMBERED_CLIENT_TOKENS {
+        if let Some(oldest) = order.pop_front() {
+            records.remove(&oldest);
+        }
+    }
 }
 
 /// The 10-character id suffix: SHA-256 over the name, the mint counter and the
@@ -751,6 +986,12 @@ pub fn workload_identity_arn(region: &str, resource_id: &str) -> String {
 /// `GatewayArn`'s pattern.
 pub fn gateway_arn(region: &str, gateway_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("gateway/{gateway_id}"))
+}
+
+/// `arn:aws:bedrock-agentcore:{region}:{account}:memory/{memoryId}` —
+/// `MemoryArn`'s pattern.
+pub fn memory_arn(region: &str, memory_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("memory/{memory_id}"))
 }
 
 /// The gateway's endpoint, in the form AWS returns for a Bedrock AgentCore

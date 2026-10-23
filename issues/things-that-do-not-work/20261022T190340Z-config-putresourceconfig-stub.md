@@ -33,3 +33,23 @@ AssertionError: expected ValidationException for an unregistered resource type, 
 Boot the config emulator
 Call PutResourceConfig and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Status note (left by the GetDiscoveredResourceCounts fixer)
+`PutResourceConfig` no longer answers 501: implementing `GetDiscoveredResourceCounts`
+needed a writer for the discovered-resource inventory, so the handler was implemented
+in that change (it records a custom resource type into
+`state.discovered_resources`, refusing a reserved organization or a malformed registry
+type name, a `Configuration` that is not valid JSON or over 64 KB, a request with no
+running configuration recorder, and a new resource past the 100,000 active custom
+resources limit), and its `//! SCAFFOLDED, NOT IMPLEMENTED:` census line was deleted.
+This issue stays open for the scope that change did not cover:
+
+* the resource type is not checked against anything registered with CloudFormation —
+  only against the type-name form and the reserved organizations;
+* nothing reads a recorded `Configuration` document back yet, because
+  `GetResourceConfigHistory` and `BatchGetResourceConfig` are still scaffolds with
+  issues of their own;
+* `DeleteResourceConfig`, which records a resource's deletion, is still a scaffold.
+
+Its recorded unit (`config.resource-config-history-chronological-ordering`) also needs
+`GetResourceConfigHistory`, so it is still blocked.

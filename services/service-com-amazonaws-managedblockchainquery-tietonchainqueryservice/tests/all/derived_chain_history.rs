@@ -45,13 +45,15 @@ use crate::chain_query_slice::{hashes, Emulator, NetworkFixture};
 ///
 /// * the mixed-case hex form an Ethereum mainnet wallet is written in (the wallet the
 ///   recorded trace queried — one row, not the rule);
-/// * the base58 form a Bitcoin address is written in;
+/// * the base58 alphabet a Bitcoin address is written in, over a body no fixture
+///   produced (a PUBLISHED Bitcoin address would not do: those the index holds, which
+///   is what `state::derived`'s catalog is for);
 /// * a lowercase bech32-shaped address;
 /// * a hyphenated label;
 /// * the shortest and the longest the pattern admits.
 const STRANGERS: [&str; 6] = [
     "0x28C6C06298d514Db089934071355E5743bf21d60",
-    "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+    "1NotASeededBitcoinAddressAtAll",
     "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
     "a-stranger-with-hyphens",
     "aaaaaaaaaaaaa",

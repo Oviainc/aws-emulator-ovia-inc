@@ -15,10 +15,11 @@
 //! through the same `MultiServiceRouter` the production router builds — using the
 //! `Emulator` harness `config_setup_and_rule_loop` already defines. The discovered
 //! resources themselves are seeded in the store the way a handler reaches it
-//! (`service_state`, as the other suites of this crate seed state with): the operations
-//! that record a configuration item for a resource are still scaffolds
-//! (`PutResourceConfig`/`DeleteResourceConfig`), so no implemented operation writes the
-//! inventory yet, and the reader's rule is pinned over inventories a table states.
+//! (`service_state`, as the other suites of this crate seed state with), so the
+//! reader's rule is pinned over inventories a table states, including deleted
+//! resources, which no implemented operation records yet (`DeleteResourceConfig` is
+//! still a scaffold). `PutResourceConfig`, which records a resource's configuration
+//! item, is exercised against this reader in `config_discovered_resource_counts`.
 
 use std::time::{Duration, SystemTime};
 
@@ -122,6 +123,9 @@ async fn emulator_discovering(resources: &[Discovered]) -> Emulator {
                     resource_id: resource.resource_id.clone(),
                     resource_name: resource.resource_name.map(str::to_string),
                     deleted_at: resource.deleted.then(deletion_time),
+                    // A resource seeded here carries no recorded configuration item:
+                    // what a listing reports is its identity, not its configuration.
+                    ..DiscoveredResourceEntry::default()
                 },
             );
         }

@@ -770,6 +770,34 @@ impl MemberRecord {
     }
 }
 
+/// The modelled `Member` a read reports for one stored member account.
+///
+/// `ListMembers` and `GetMembers` both report the `Members` list, so the projection
+/// lives here once: two reads of one member must not disagree.
+///
+/// `MasterId` and `AdministratorId` are both "the administrator account ID"
+/// (`smithy_query(shape="Member")`) — the same fact under the old and the current
+/// name — so both carry the account that owns the detector this member hangs off.
+pub fn member_view(
+    member: &MemberRecord,
+    administrator: &str,
+) -> crate::ops::types::shared_types::Member {
+    crate::ops::types::shared_types::Member {
+        account_id: member.account_id.clone(),
+        // The member account's own detector is not a resource this emulator holds;
+        // the member is optional, so it is absent rather than invented.
+        detector_id: None,
+        master_id: administrator.to_string(),
+        administrator_id: Some(administrator.to_string()),
+        email: member.email.clone(),
+        relationship_status: member.relationship_status.clone(),
+        // No invitation is modelled yet (`InviteMembers` is still a scaffold), so
+        // there is no instant at which one was sent.
+        invited_at: None,
+        updated_at: iso8601(member.updated_at_millis),
+    }
+}
+
 impl Detector {
     /// The status of one feature, or [`DISABLED`] when the detector does not carry
     /// it.
@@ -844,6 +872,22 @@ impl Detector {
         self.investigations
             .values()
             .find(|investigation| investigation.client_token.as_deref() == Some(token))
+    }
+
+    /// The member account ids this detector administers, in account-id order.
+    ///
+    /// `only_associated` narrows the answer to the members that are ASSOCIATED
+    /// with the administrator ([`MemberRecord::is_associated`]), which is the
+    /// distinction `ListMembers` exposes: "whether to only return associated
+    /// members or to return all members (including members who haven't been
+    /// invited yet or have been disassociated)"
+    /// (`smithy_query(query="doc",shape="ListMembersRequest",member="OnlyAssociated")`).
+    pub fn member_ids(&self, only_associated: bool) -> Vec<String> {
+        self.members
+            .values()
+            .filter(|member| !only_associated || member.is_associated())
+            .map(|member| member.account_id.clone())
+            .collect()
     }
 
     /// How many investigations this detector holds that were initiated at or after
@@ -1039,6 +1083,21 @@ impl IpSetRecord {
         self.status_due_millis = None;
     }
 }
+
+// ---------------------------------------------------------------------------
+// ListMembers
+// ---------------------------------------------------------------------------
+
+/// The wire name of `ListMembers`'s `OnlyAssociated` query parameter
+/// (`smithy_query(operation="ListMembers")`), for the same reason as
+/// [`DETECTOR_ID_MEMBER`]: it is what a rejection names.
+pub const ONLY_ASSOCIATED_MEMBER: &str = "onlyAssociated";
+
+/// How GuardDuty refuses an `AccountDetail.Email` that is not formatted the way
+/// [`is_member_email`]'s documented rules require: the service's own wording for
+/// that rule, which names the member it refuses rather than echoing the value.
+pub const MEMBER_EMAIL_FORMAT_MESSAGE: &str =
+    "The request failed because provided `emailId` was formatted incorrectly.";
 
 // ---------------------------------------------------------------------------
 // Investigations

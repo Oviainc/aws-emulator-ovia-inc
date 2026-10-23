@@ -29,6 +29,9 @@ mod cloud_watch_alarm_template_groups;
 #[path = "all/cloud_watch_alarm_templates.rs"]
 mod cloud_watch_alarm_templates;
 
+#[path = "all/deleted_resource_mutation.rs"]
+mod deleted_resource_mutation;
+
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 

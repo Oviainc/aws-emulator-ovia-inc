@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resolve_dashboard_mut(&input.dashboard_id, &region, now)
             .ok_or_else(|| {
                 GetDashboardErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!("Unknown dashboard: {}", input.dashboard_id)),
+                    message: Some(crate::state::DASHBOARD_NOT_FOUND_MESSAGE.to_string()),
                 })
             })?;
 

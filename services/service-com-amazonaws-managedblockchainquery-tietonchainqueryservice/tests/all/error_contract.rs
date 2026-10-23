@@ -28,7 +28,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_managedblockchainquery_tietonchainqueryservice::ops::types::QUERY_NETWORK_VALUES;
 
-use crate::chain_query_slice::{error_code, Emulator};
+use crate::chain_query_slice::{error_code, unseeded_bitcoin_address, Emulator};
 
 /// `ChainAddress`'s `@pattern`, as a message must report it: the model spells it
 /// `^[-A-Za-z0-9]{13,74}$` and the anchors are not part of the expression a value has to
@@ -599,9 +599,13 @@ async fn list_filtered_transaction_events_serves_only_the_bitcoin_networks() {
         .collect();
 
     for network in &values {
+        // The row varies the NETWORK alone, so the filter carries an address this
+        // operation accepts on the networks it serves: a well-formed Bitcoin address.
         let body = json!({
             "network": network,
-            "addressIdentifierFilter": {"transactionEventToAddress": [VALID_ADDRESS]},
+            "addressIdentifierFilter": {
+                "transactionEventToAddress": [unseeded_bitcoin_address()],
+            },
         });
         let (status, answer) = emulator.post("/list-filtered-transaction-events", &body).await;
         if BITCOIN_NETWORKS.contains(&network.as_str()) {

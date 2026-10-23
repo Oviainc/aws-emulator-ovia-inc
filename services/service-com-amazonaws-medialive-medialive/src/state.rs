@@ -28,6 +28,16 @@
 //! longer *currently using* anything, so it leaves the derived `Inputs`,
 //! `Channels` and `AttachedChannels` lists.
 //!
+//! A kept record is READABLE, not writable: once a delete has been accepted for
+//! an id, that id names no resource a caller may still change. Every MUTATION
+//! therefore resolves its id through the live lookups
+//! ([`ComAmazonawsMedialiveMedialiveState::live_input`],
+//! [`ComAmazonawsMedialiveMedialiveState::live_channel_mut`],
+//! [`ComAmazonawsMedialiveMedialiveState::live_input_security_group`], and the
+//! tag writers' own private `resource_tags_mut`) and answers a dead id with its
+//! own modelled not-found error, while a read goes on reporting the record in
+//! its terminal state.
+//!
 //! A channel's schedule lives on its own [`ChannelRecord`], as the
 //! [`ChannelSchedule`] of the [`schedules`] slice: the actions
 //! `BatchUpdateSchedule` created and `DeleteSchedule` clears, swept of the ones
@@ -705,6 +715,18 @@ impl ChannelRecord {
     /// reporting the channel in that state instead of losing it.
     pub fn is_deleted(&self) -> bool {
         self.state == channel_state::DELETED
+    }
+
+    /// Whether a delete has already been accepted for this channel — it is in
+    /// the transient `DELETING` state the clock owes the terminal one, or in
+    /// that terminal `DELETED` state itself.
+    ///
+    /// The notion a MUTATION of the channel resolves against: an id whose
+    /// delete the service has accepted names no channel a caller may still
+    /// change, exactly as [`InputRecord::is_delete_accepted`] does for an
+    /// input.
+    pub fn is_delete_accepted(&self) -> bool {
+        self.is_deleted() || self.state == channel_state::DELETING
     }
 
     /// Put the channel into `state` as of `now` and owe `to` once
@@ -1839,6 +1861,40 @@ impl ComAmazonawsMedialiveMedialiveState {
         partners
     }
 
+    /// The input `id` names while it is still LIVE: a record whose delete this
+    /// service has not accepted.
+    ///
+    /// The lookup a MUTATION of an input goes through. A delete never drops the
+    /// record — it keeps it in `DELETING` and then in the terminal `DELETED`, so
+    /// a reader goes on reporting it — but that record is no longer a resource a
+    /// caller may change, so a mutation resolves the id through here and refuses
+    /// a dead one with its own modelled not-found error. Reads keep using
+    /// [`Self::inputs`] / [`Self::input_description`] directly.
+    pub fn live_input(&self, id: &str) -> Option<&InputRecord> {
+        self.inputs
+            .get(id)
+            .filter(|input| !input.is_delete_accepted())
+    }
+
+    /// The channel `id` names while it is still LIVE, for the same reason as
+    /// [`Self::live_input`]: a channel whose delete has been accepted is no
+    /// longer a channel a caller may change (its schedule included).
+    pub fn live_channel_mut(&mut self, id: &str) -> Option<&mut ChannelRecord> {
+        self.channels
+            .get_mut(id)
+            .filter(|channel| !channel.is_delete_accepted())
+    }
+
+    /// The input security group `id` names while it is still LIVE, for the same
+    /// reason as [`Self::live_input`]: a group `DeleteInputSecurityGroup` has
+    /// put in the terminal `DELETED` state is no longer a group a caller may
+    /// change.
+    pub fn live_input_security_group(&self, id: &str) -> Option<&InputSecurityGroupRecord> {
+        self.input_security_groups
+            .get(id)
+            .filter(|group| !group.is_deleted())
+    }
+
     /// The `InputState` of one stored input: the deletion a delete started
     /// first — `DELETING` until the clock makes it due and the terminal
     /// `DELETED` afterwards — and otherwise `ATTACHED` exactly while some
@@ -2330,29 +2386,44 @@ impl ComAmazonawsMedialiveMedialiveState {
     }
 
     /// The tag map of the resource `arn` names, to write through, or `None`
-    /// when this store holds no resource with that ARN.
+    /// when this store holds no resource with that ARN that is still live.
     ///
     /// The map handed back is the resource's OWN, so a tag written here is on
     /// the resource itself: the resource's describe and
     /// [`Self::resource_tags`] read the one map rather than two copies that
     /// could drift.
     ///
+    /// A resource whose delete has been accepted is NOT handed out: tagging and
+    /// untagging change a resource's configuration, so they resolve the ARN
+    /// through the same live lookup every other mutation uses
+    /// ([`Self::live_input`]) and the tag writers answer a dead ARN with their
+    /// modelled not-found error. The READ path ([`Self::resource_tags`]) keeps
+    /// resolving a deleted resource, whose record stays in the account.
+    ///
     /// PRIVATE: the per-resource tag bounds are invariants of
     /// [`Self::insert_resource_tags`], which is the only way a tag is written,
     /// so no handler can grow a resource's tag map past them.
     fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut HashMap<String, String>> {
         match self.tagged_resource(arn)? {
-            TaggedResource::Channel(id) => {
-                self.channels.get_mut(&id).map(|record| &mut record.tags)
-            }
-            TaggedResource::Input(id) => self.inputs.get_mut(&id).map(|record| &mut record.tags),
+            TaggedResource::Channel(id) => self
+                .channels
+                .get_mut(&id)
+                .filter(|record| !record.is_delete_accepted())
+                .map(|record| &mut record.tags),
+            TaggedResource::Input(id) => self
+                .inputs
+                .get_mut(&id)
+                .filter(|record| !record.is_delete_accepted())
+                .map(|record| &mut record.tags),
             TaggedResource::InputSecurityGroup(id) => self
                 .input_security_groups
                 .get_mut(&id)
+                .filter(|record| !record.is_deleted())
                 .map(|record| &mut record.tags),
             TaggedResource::SdiSource(id) => self
                 .sdi_sources
                 .get_mut(&id)
+                .filter(|record| !record.is_deleted())
                 .map(|record| &mut record.tags),
             TaggedResource::SignalMap(id) => self
                 .signal_maps
@@ -2676,6 +2747,28 @@ pub fn is_resource_arn(arn: &str) -> bool {
 /// from the request. One helper, so no two operations word it two ways.
 pub fn not_found_message(resource_type: &str, identifier: &str) -> String {
     format!("{resource_type} {identifier} not found")
+}
+
+/// The message a mutation refused on an id whose delete has already been
+/// accepted carries: the subject the request named, then `already deleted` —
+/// the distinction the real service draws between an id that was deleted and
+/// one that never existed (both answered 404). One helper for the same reason
+/// as [`not_found_message`].
+///
+/// `subject` is how the refusal names what was deleted, which is the wording
+/// each resource's recorded refusal uses: the input refusal recorded in the
+/// `medialive.input-lifecycle-url-pull` behavioural check names the REQUEST
+/// MEMBER and its value (`inputId=<id>`), while this service's other refusals
+/// name the resource type and its id.
+pub fn already_deleted_message(subject: &str) -> String {
+    format!("{subject} already deleted")
+}
+
+/// How a refusal on a deleted input names it: the `InputId` member as the wire
+/// spells it, then the id the request carried — composed from the request, like
+/// every other message this service writes.
+pub fn deleted_input_subject(input_id: &str) -> String {
+    format!("inputId={input_id}")
 }
 
 /// The message a delete refused on an input a channel still attaches carries:

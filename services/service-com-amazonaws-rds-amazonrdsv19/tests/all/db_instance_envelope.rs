@@ -581,16 +581,14 @@ async fn an_instance_that_belongs_to_no_cluster_reports_no_cluster_member_port()
     let case = "an explicit port, no cluster";
     let identifier = "emu-env-cluster-member";
     // `DBClusterIdentifier` is NOT supplied: `CreateDBInstance` resolves it against this
-    // service's DB cluster records before admitting the instance, and this service holds
-    // none — every operation that could create a cluster (`CreateDBCluster`,
-    // `RestoreDBClusterFromSnapshot`, `RestoreDBClusterToPointInTime`) is still a
-    // scaffolded 501 — so no instance here is a cluster member and the refusal for one
-    // that names a cluster is pinned in `docdb_query_surface`. That is what this test
-    // reads back: the port the create named is the port the instance listens on, while
+    // service's DB cluster records before admitting the instance, and no cluster was
+    // created in this router, so this instance belongs to none and the refusal for one
+    // that names a cluster nothing created is pinned in `docdb_query_surface` (the
+    // admitted-member path is pinned in `db_clusters`). That is what this test reads back:
+    // the port the create named is the port the instance listens on, while
     // `DbInstancePort` — the CLUSTER MEMBER's port, "if the DB instance is part of a DB
     // cluster, this can be a different port than the DB cluster port" — stays zero,
-    // whatever port was asked for. Its non-zero branch becomes reachable when one of
-    // those operations can store a cluster.
+    // whatever port was asked for.
     let created = create_instance(
         &router,
         case,

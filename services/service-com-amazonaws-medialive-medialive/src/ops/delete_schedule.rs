@@ -154,15 +154,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(now);
 
-        let channel = state.channels.get_mut(&input.channel_id).ok_or_else(|| {
+        // The channel is resolved through the LIVE lookup, for the reason
+        // `BatchUpdateSchedule` states: a channel whose delete this service has
+        // accepted owns no schedule a caller may still clear, so the mutation is
+        // answered with this operation's modelled `NotFoundException` (404).
+        let deleted = state
+            .channels
+            .get(&input.channel_id)
+            .is_some_and(crate::state::ChannelRecord::is_delete_accepted);
+        let channel = state.live_channel_mut(&input.channel_id).ok_or_else(|| {
+            let message = if deleted {
+                crate::state::already_deleted_message(&format!("Channel {}", input.channel_id))
+            } else {
+                crate::state::not_found_message("Channel", &input.channel_id)
+            };
             DeleteScheduleErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message("Channel", &input.channel_id)),
+                message: Some(message),
             })
         })?;
 
-        // Every action, in whatever state the channel is in: the schedule is the
-        // channel's, and this operation deletes all of it. Already empty is the
-        // same answer, so the delete is idempotent.
+        // Every action, in whatever state the live channel is in: the schedule
+        // is the channel's, and this operation deletes all of it. Already empty
+        // is the same answer, so the delete is idempotent.
         channel.schedule.clear();
 
         Ok(DeleteScheduleOutput {})
