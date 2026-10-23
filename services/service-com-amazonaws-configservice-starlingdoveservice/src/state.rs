@@ -197,6 +197,15 @@ pub const RECORDER_STATUS_SETTLE_AFTER: Duration = Duration::from_millis(500);
 /// 150 is the Config rules service quota (managed plus custom rules per Region).
 pub const CONFIG_RULES_QUOTA: usize = 150;
 
+/// The most customer managed configuration recorders this account and Region can
+/// hold. Config allows exactly ONE ("One customer managed configuration recorder per
+/// account per Region ... You can have only one customer managed configuration
+/// recorder for each account for each Amazon Web Services Region", the
+/// `PutConfigurationRecorder` doc), after which it refuses a second with
+/// `MaxNumberOfConfigurationRecordersExceededException` — which states this limit
+/// (see [`max_configuration_recorders_message`]).
+pub const CUSTOMER_MANAGED_RECORDERS_QUOTA: usize = 1;
+
 /// The most configuration aggregators this account and Region can hold, after which
 /// `PutConfigurationAggregator` refuses a new one with `LimitExceededException`
 /// (`LimitExceededException`: "For PutConfigurationAggregator API, this exception is
@@ -1680,12 +1689,16 @@ pub fn decode_page_token(token: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// How Config words `NoAvailableConfigurationRecorderException`, the refusal every
-/// operation that needs a customer managed configuration recorder answers when the
-/// account and Region holds none (the shape's own doc: "There are no customer managed
-/// configuration recorders available to record your resources. Use the
-/// PutConfigurationRecorder operation to create the customer managed configuration
-/// recorder"). One constant, so those operations word it identically.
+/// How Config words `NoAvailableConfigurationRecorderException` on an operation for
+/// which no per-operation text is known: a paraphrase of the shape's own doc ("There
+/// are no customer managed configuration recorders available to record your
+/// resources. Use the PutConfigurationRecorder operation to create the customer
+/// managed configuration recorder").
+///
+/// `PutConfigRule` and `PutDeliveryChannel` do NOT use this: each carries the fixed
+/// message AWS emits for its own precondition
+/// ([`NO_RECORDER_TO_PUT_CONFIG_RULE`], [`NO_RECORDER_TO_PUT_DELIVERY_CHANNEL`]), so
+/// a client can tell from the message which precondition failed.
 pub const NO_AVAILABLE_CONFIGURATION_RECORDER_MESSAGE: &str =
     "there are no customer managed configuration recorders available; use \
      PutConfigurationRecorder to create one";
@@ -1718,16 +1731,93 @@ pub fn decode_pending_aggregation_request_token(token: &str) -> Option<(String, 
     well_formed.then(|| (account.to_string(), region.to_string()))
 }
 
-/// How Config words `NoSuchConfigRuleException` for a request that named a rule this
-/// account does not hold.
+/// How Config words `NoSuchConfigRuleException` for a request that named ONE rule
+/// this account does not hold, through a single-name member (`ConfigRuleName`).
 ///
-/// The message is BUILT FROM THE REQUEST — it quotes the `ConfigRuleName` the caller
-/// sent and names the member to check — so every operation that refuses an absent
-/// rule words it the same way.
+/// The message is BUILT FROM THE REQUEST — it quotes the name the caller sent and
+/// names the member to check — so every operation that looks a rule up by a single
+/// name words it the same way. An operation that looks rules up through a LIST
+/// member words it as [`NO_SUCH_CONFIG_RULES`] instead: the message follows
+/// the shape of the member that named the rule, and a list cannot be quoted back as
+/// one name.
 pub fn no_such_config_rule_message(name: &str) -> String {
     format!(
         "The ConfigRule '{name}' provided in the request is invalid. Please check the \
          configRule name."
+    )
+}
+
+/// How Config words `NoSuchConfigRuleException` for a request that named rules
+/// through a LIST member (`ConfigRuleNames`), one of which this account does not
+/// hold.
+///
+/// A list-shaped lookup reports the plural form and quotes no name: the refusal is
+/// about the list as a whole, so it names the member to check and leaves the caller
+/// to compare the list it sent against the rules it holds. See
+/// [`no_such_config_rule_message`] for the single-name form.
+pub const NO_SUCH_CONFIG_RULES: &str = "One or more ConfigRules provided in the request are \
+                                        invalid. Please check the configRule names.";
+
+/// How Config words `NoSuchConfigurationRecorderException`.
+///
+/// A FIXED message for the class — it quotes nothing from the request — so every
+/// operation that fails to find a configuration recorder answers with exactly this
+/// text, whether the request named the recorder by name or by ARN.
+pub const NO_SUCH_CONFIGURATION_RECORDER: &str =
+    "The name of the configuration recorder you entered cannot be found. Verify the \
+     configuration recorder name, and try again.";
+
+/// How `PutConfigRule` words `NoAvailableConfigurationRecorderException`.
+///
+/// A FIXED message for this operation's precondition: the class is shared with
+/// `PutDeliveryChannel` (see [`NO_RECORDER_TO_PUT_DELIVERY_CHANNEL`]), and each
+/// operation states the precondition that failed rather than the class, so a client
+/// can tell the two apart from the message alone.
+pub const NO_RECORDER_TO_PUT_CONFIG_RULE: &str =
+    "You must create a configuration recorder before you can create or update a Config rule.";
+
+/// How `PutDeliveryChannel` words `NoAvailableConfigurationRecorderException`. See
+/// [`NO_RECORDER_TO_PUT_CONFIG_RULE`] for why the two differ.
+pub const NO_RECORDER_TO_PUT_DELIVERY_CHANNEL: &str =
+    "Configuration recorder is not available to put delivery channel.";
+
+/// How `StartConfigurationRecorder` words `NoAvailableDeliveryChannelException`: a
+/// FIXED message naming the precondition that failed.
+pub const NO_DELIVERY_CHANNEL_TO_START_RECORDER: &str =
+    "Delivery channel is not available to start configuration recorder.";
+
+/// How Config words `NoSuchDeliveryChannelException` for a request that named a
+/// delivery channel this account does not hold.
+///
+/// BUILT FROM THE REQUEST — it quotes the channel name the caller sent — so every
+/// operation that refuses an absent channel words it the same way.
+pub fn no_such_delivery_channel_message(name: &str) -> String {
+    format!("Cannot find delivery channel with specified name '{name}'.")
+}
+
+/// How Config words `LastDeliveryChannelDeleteFailedException`: the delete of the
+/// account's last delivery channel while its configuration recorder is running.
+///
+/// BUILT FROM THE REQUEST — it quotes the channel name the caller asked to delete.
+pub fn last_delivery_channel_delete_failed_message(name: &str) -> String {
+    format!(
+        "Failed to delete last specified delivery channel with name '{name}', because there \
+         is a running configuration recorder."
+    )
+}
+
+/// How Config words `MaxNumberOfConfigurationRecordersExceededException`.
+///
+/// The message states THE SERVICE'S OWN LIMIT ([`CUSTOMER_MANAGED_RECORDERS_QUOTA`])
+/// and nothing of the request or the environment: naming the Region would make one
+/// account's refusal read differently from another's for the same cause. The two
+/// spaces after "recorder" are the service's own rendering (it interpolates an empty
+/// recorder designation there), not a typo.
+pub fn max_configuration_recorders_message() -> String {
+    format!(
+        "Failed to put configuration recorder  because you have reached the limit for the \
+         maximum number of customer managed configuration records: \
+         ({CUSTOMER_MANAGED_RECORDERS_QUOTA})"
     )
 }
 
