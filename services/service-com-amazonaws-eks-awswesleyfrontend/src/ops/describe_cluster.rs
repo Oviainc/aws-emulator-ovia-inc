@@ -148,11 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 cluster: Some(record.to_cluster()),
             }),
             None => Err(DescribeClusterErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    cluster_name: Some(input.name.clone()),
-                    message: Some(format!("No cluster found for name: {}.", input.name)),
-                    ..Default::default()
-                },
+                crate::state::cluster_not_found(&input.name),
             )
             .into()),
         }

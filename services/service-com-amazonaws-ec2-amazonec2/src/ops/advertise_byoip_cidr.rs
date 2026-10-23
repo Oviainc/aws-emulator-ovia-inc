@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AdvertiseByoipCidr
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AdvertiseByoipCidr`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AdvertiseByoipCidr::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: advertises the stored BYOIP address range the request names, moving it out
+//! of `provisioned` towards `advertised`, and answers with the range as it now stands. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +146,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AdvertiseByoipCidr` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AdvertiseByoipCidrErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AdvertiseByoipCidr"))
+        // `ctx` carries request metadata only; this operation reads none of it — a BYOIP
+        // range carries the network border group it was provisioned in itself. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The address range, in CIDR notation" (`Cidr`): a value that is not a CIDR block
+        // of either family names no range, so there is nothing to look up. The range is
+        // canonicalised so one range cannot be named two ways.
+        let cidr = state::canonical_byoip_cidr(&input.cidr).map_err(|_| {
+            state::invalid_parameter_value(format!(
+                "Invalid value '{cidr}' for Cidr. It must be an IPv4 or IPv6 address range in \
+                 CIDR notation",
+                cidr = input.cidr,
+            ))
+        })?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // named resource, so it is answered once the request's own form has been checked
+        // and before anything is resolved; every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A range whose own move has fallen due is already `advertised`, so whether this
+        // call is admissible is asked of the state it is ACTUALLY in.
+        store.materialize_due_transitions();
+
+        // "Advertises an IPv4 or IPv6 address range THAT IS PROVISIONED for use with your
+        // Amazon Web Services resources": a range this account has not brought to AWS is no
+        // range of its own to advertise, which is EC2's `InvalidCidr.NotFound` — the code
+        // the provision and release paths of this same store already answer it with.
+        let record = store
+            .byoip_cidrs
+            .get_mut(&cidr)
+            .ok_or_else(|| state::invalid_cidr_not_found(&cidr))?;
+
+        // "`provisioned`: The address range is provisioned AND CAN BE ADVERTISED. The range
+        // is not currently advertised" (`ByoipCidr$State`) — the one state an advertisement
+        // may start from. Every other state, including the
+        // `provisioned-not-publicly-advertisable` of a range that "cannot be advertised",
+        // is refused and nothing is written.
+        let current = record.state().to_string();
+        if current != state::BYOIP_CIDR_STATE_PROVISIONED {
+            return Err(state::incorrect_state(format!(
+                "The address range '{cidr}' is in state '{current}'; only a range in state \
+                 '{provisioned}' can be advertised",
+                provisioned = state::BYOIP_CIDR_STATE_PROVISIONED,
+            )));
+        }
+
+        // "You can choose a network border group for Local Zones when you provision and
+        // advertise a BYOIPv4 CIDR" (`NetworkBorderGroup`): the group is a property of the
+        // provisioned range, so a request naming a different one names a range this account
+        // did not provision there.
+        if let Some(requested) = input.network_border_group.as_deref() {
+            let provisioned = record
+                .byoip_cidr
+                .network_border_group
+                .as_deref()
+                .unwrap_or_default();
+            if requested != provisioned {
+                return Err(state::invalid_parameter_value(format!(
+                    "The address range '{cidr}' is provisioned in the network border group \
+                     '{provisioned}', not in '{requested}'"
+                )));
+            }
+        }
+
+        // "The public 2-byte or 4-byte ASN that you want to advertise" (`Asn`): only an ASN
+        // already associated with the range can be advertised with it — the associations the
+        // range carries are what say which those are.
+        if let Some(asn) = input.asn.as_deref() {
+            let associated = record
+                .byoip_cidr
+                .asn_associations
+                .iter()
+                .flatten()
+                .any(|association| association.asn.as_deref() == Some(asn));
+            if !associated {
+                return Err(state::invalid_parameter_value(format!(
+                    "The ASN '{asn}' is not associated with the address range '{cidr}'"
+                )));
+            }
+        }
+
+        // "It can take a few minutes before traffic to the specified addresses starts
+        // routing to Amazon Web Services because of BGP propagation delays": the range is
+        // answered in the non-terminal `pending-advertising` it enters now, with the clock
+        // owing it `advertised`.
+        record.byoip_cidr.state = Some(state::BYOIP_CIDR_STATE_PENDING_ADVERTISING.to_string());
+        record.pending = Some(state::PendingStateMove::starting_now(
+            state::BYOIP_CIDR_STATE_ADVERTISED,
+        ));
+
+        Ok(AdvertiseByoipCidrOutput {
+            byoip_cidr: Some(record.byoip_cidr.clone()),
+        })
     }
 }

@@ -11,7 +11,9 @@
 //! a member it omits leaves the stored setting untouched. The two request-only wrapper
 //! shapes — `UpdateFailoverConfig` and `UpdateMaintenance`, whose members are each
 //! individually optional — are merged the same way, member by member, into the
-//! `FailoverConfig` / `Maintenance` the flow holds. The members whose target IS the
+//! `FailoverConfig` / `Maintenance` the flow holds (the `UpdateFailoverConfig` merge is
+//! [`crate::state::merged_failover_config`], shared with UpdateBridge, which applies the
+//! same request shape to the same stored shape). The members whose target IS the
 //! stored shape (`MonitoringConfig`, `NdiConfig`, `EncodingConfig`) carry the whole
 //! setting, so the value in the request becomes the setting.
 //!
@@ -200,8 +202,8 @@ fn not_found(identifier: &str) -> UpdateFlowError {
 /// The maintenance setting the flow holds after `update` is applied to `stored`.
 ///
 /// `UpdateMaintenance`'s members are each individually optional, so this is a member-wise
-/// merge: a member the request carries replaces its counterpart, one it omits keeps the
-/// stored value. `Maintenance$MaintenanceDeadline` has no counterpart in the request shape
+/// merge (the same shape of merge as [`crate::state::merged_failover_config`]): a member
+/// the request carries replaces its counterpart, one it omits keeps the stored value. `Maintenance$MaintenanceDeadline` has no counterpart in the request shape
 /// — it is the service's own deadline for a window that is actually scheduled — so it is
 /// carried over untouched unless the window is rescheduled.
 ///
@@ -227,33 +229,6 @@ fn merged_maintenance(stored: Option<&Maintenance>, update: &UpdateMaintenance) 
         merged.maintenance_start_hour = Some(DEFAULT_MAINTENANCE_START_HOUR.to_string());
     }
     merged
-}
-
-/// The failover setting the flow holds after `update` is applied to `stored`.
-///
-/// `UpdateFailoverConfig` mirrors `FailoverConfig` member for member and every member is
-/// optional, so this is the same member-wise merge as [`merged_maintenance`]. The merged
-/// result is resolved through [`crate::state::resolved_failover_config`], so the window
-/// MediaConnect assigns a failover config that names none is the same here as on the
-/// create path.
-fn merged_failover_config(
-    stored: Option<&FailoverConfig>,
-    update: &UpdateFailoverConfig,
-) -> FailoverConfig {
-    let mut merged = stored.cloned().unwrap_or_default();
-    if let Some(mode) = update.failover_mode.clone() {
-        merged.failover_mode = Some(mode);
-    }
-    if let Some(window) = update.recovery_window {
-        merged.recovery_window = Some(window);
-    }
-    if let Some(priority) = update.source_priority.clone() {
-        merged.source_priority = Some(priority);
-    }
-    if let Some(state) = update.state.clone() {
-        merged.state = Some(state);
-    }
-    crate::state::resolved_failover_config(merged)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -357,7 +332,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => flow.maintenance.clone(),
         };
         let source_failover_config = match input.source_failover_config.as_ref() {
-            Some(update) => Some(merged_failover_config(
+            Some(update) => Some(crate::state::merged_failover_config(
                 flow.source_failover_config.as_ref(),
                 update,
             )),

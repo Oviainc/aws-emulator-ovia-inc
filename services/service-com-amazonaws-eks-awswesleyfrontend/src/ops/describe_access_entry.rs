@@ -125,16 +125,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        // This read addresses ONE resource — the `(cluster, access entry)` pair — so
+        // the miss is reported without naming either half and without any of the
+        // exception's identity members: see [`crate::state::resource_not_found`].
         let not_found = || {
             DescribeAccessEntryError::from(
                 DescribeAccessEntryErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        cluster_name: Some(input.cluster_name.clone()),
-                        message: Some(
-                            crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
-                        ),
-                        ..Default::default()
-                    },
+                    crate::state::resource_not_found(),
                 ),
             )
         };

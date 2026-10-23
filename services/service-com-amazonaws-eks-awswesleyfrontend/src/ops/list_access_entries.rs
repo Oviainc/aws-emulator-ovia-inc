@@ -207,12 +207,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clusters
             .get(&(region.clone(), input.cluster_name.clone()))
         else {
+            // This listing resolves the CLUSTER only — the entries it enumerates hang
+            // off it — so the cluster is the resource it reports missing, named in the
+            // message and in `clusterName` ([`state::cluster_not_found`]).
             return Err(ListAccessEntriesErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    cluster_name: Some(input.cluster_name.clone()),
-                    message: Some(state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                    ..Default::default()
-                },
+                state::cluster_not_found(&input.cluster_name),
             )
             .into());
         };

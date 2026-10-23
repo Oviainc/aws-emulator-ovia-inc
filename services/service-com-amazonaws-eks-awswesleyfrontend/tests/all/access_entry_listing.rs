@@ -23,7 +23,7 @@
 use std::collections::BTreeSet;
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    access_policy_arn, encode_page_token, ACCESS_POLICY_NAMES, RESOURCE_NOT_FOUND_MESSAGE,
+    access_policy_arn, cluster_not_found_message, encode_page_token, ACCESS_POLICY_NAMES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -228,21 +228,24 @@ async fn listing_a_cluster_that_does_not_exist_is_not_found() {
 
     // Rows differ along WHY the cluster is not in the store for this request: it
     // was never created, its name differs in case, and it lives in another region.
-    let cases: Vec<(&str, Answer)> = vec![
+    let cases: Vec<(&str, &str, Answer)> = vec![
         (
             "a cluster that was never created",
+            "absent",
             list_entries(&router, "absent", "").await,
         ),
         (
             "a cluster name differing only in case",
+            "PRESENT",
             list_entries(&router, "PRESENT", "").await,
         ),
         (
             "the right name in another region",
+            "present",
             list_entries_in(&router, "eu-west-1", "present", "").await,
         ),
     ];
-    for (case, answer) in &cases {
+    for (case, cluster, answer) in &cases {
         assert_eq!(
             answer.status, 404,
             "case {case:?}: expected 404, got {answer:?}"
@@ -252,12 +255,19 @@ async fn listing_a_cluster_that_does_not_exist_is_not_found() {
             Some("ResourceNotFoundException"),
             "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
         );
-        // One not-found message across the whole access-entry slice: a client
-        // branches on the code, not the text.
+        // This listing resolves the CLUSTER and nothing else, so the cluster is the
+        // resource it reports missing: the message names it, and `clusterName`
+        // carries it. (The access-entry READS, which resolve the `(cluster, entry)`
+        // pair, report the generic sentence with no member instead.)
         assert_eq!(
             answer.body["message"].as_str(),
-            Some(RESOURCE_NOT_FOUND_MESSAGE),
-            "case {case:?}: expected the slice's not-found message, got {answer:?}"
+            Some(cluster_not_found_message(cluster).as_str()),
+            "case {case:?}: expected the message to name the missing cluster, got {answer:?}"
+        );
+        assert_eq!(
+            answer.body["clusterName"].as_str(),
+            Some(*cluster),
+            "case {case:?}: expected clusterName to name the missing cluster, got {answer:?}"
         );
     }
 }

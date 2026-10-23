@@ -169,7 +169,29 @@
 //! cannot grow the store for free. A connection sits in `PendingAcceptance` until the
 //! SERVICE OWNER accepts or rejects it (`AcceptVpcEndpointConnections` /
 //! `RejectVpcEndpointConnections`), which is an action rather than an instant, so —
-//! unlike a `pending` VPC — nothing beside it records a clock-owed transition.
+//! unlike a `pending` VPC — nothing beside it records a clock-owed transition until the
+//! owner acts: once `AcceptVpcEndpointConnections` has, the connection is `Pending` and
+//! [`ComAmazonawsEc2Amazonec2State::vpc_endpoint_connection_moves`] holds the instant the
+//! clock owes it `Available`.
+//!
+//! ## VPC endpoints, endpoint services, transit gateway attachments and IPAM pools
+//!
+//! Each of these is held as the modelled shape its own operations report —
+//! [`ComAmazonawsEc2Amazonec2State::vpc_endpoints`],
+//! [`ComAmazonawsEc2Amazonec2State::vpc_endpoint_services`],
+//! [`ComAmazonawsEc2Amazonec2State::transit_gateway_attachments`],
+//! [`ComAmazonawsEc2Amazonec2State::transit_gateway_multicast_domains`],
+//! [`ComAmazonawsEc2Amazonec2State::transit_gateway_route_table_announcements`] and
+//! [`ComAmazonawsEc2Amazonec2State::ipam_pools`] — keyed in a [`BTreeMap`] by the id that
+//! names it, for the same reasons the VPC store
+//! holds [`Vpc`]s. A fresh account holds none of them: every one is created by a request,
+//! so each store starts empty, and the `insert_*` writer beside each is the ONE way a
+//! record is stored so its id and its byte charge cannot be minted two ways. Where an
+//! operation leaves a resource in a NON-TERMINAL state — an accepted attachment, an
+//! announcement a delete started on, a range whose advertisement was asked for — the
+//! record carries the [`PendingStateMove`] the clock owes it, which
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies — the BYOIP range
+//! above included, whose record carries one beside the release it may owe.
 //!
 //! ## VPC Block Public Access exclusions
 //!
@@ -324,17 +346,23 @@ use crate::ops::types::{
     CapacityBlock,
     CreateVolumeOutput, DescribeFastLaunchImagesSuccessItem, DisableFastLaunchOutput,
     EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
-    Instance, InstanceApplicationStatus,
+    Instance, InstanceApplicationStatus, IpamPool,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
-    LaunchTemplate, MacHost, Monitoring, OperatorResponse, Placement,
+    LaunchTemplate, MacHost, Monitoring, OperatorResponse, PeeringAttachmentStatus, Placement,
     PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry,
     RequestLaunchTemplateData, RunInstancesOutput, SecondaryNetwork,
-    SecondaryNetworkIpv4CidrBlockAssociation, SecurityGroup, SpotPlacementScore, StateReason,
-    Subnet, Tag,
+    SecondaryNetworkIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
+    SpotPlacementScore, StateReason,
+    Subnet, SubnetAssociation, Tag,
     TagSpecification,
-    TransitGateway, TransitGatewayOptions, TransitGatewayRequestOptions, TransitGatewayRouteTable,
-    UserIdGroupPair, Vpc, VpcBlockPublicAccessExclusion, VpcCidrBlockAssociation, VpcCidrBlockState,
+    TransitGateway, TransitGatewayClientVpnAttachment,
+    TransitGatewayMulticastDomainAssociation, TransitGatewayOptions,
+    TransitGatewayPeeringAttachment, TransitGatewayRequestOptions,
+    TransitGatewayRouteTable, TransitGatewayRouteTableAnnouncement,
+    TransitGatewayVpcAttachment,
+    UserIdGroupPair, Vpc, VpcBlockPublicAccessExclusion, VpcCidrBlockAssociation,
+    VpcCidrBlockState, VpcEndpoint,
     VpcEndpointConnection,
 };
 use crate::scaffolded::Scaffolded;
@@ -1122,6 +1150,37 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs. Ordered by endpoint id, which is the order
     /// `DescribeVpcEndpointConnections` reports and pages over.
     pub vpc_endpoint_connections: BTreeMap<String, VpcEndpointConnection>,
+    /// The state move an acceptance owes a VPC endpoint connection, by `VpcEndpointId` —
+    /// the connection counterpart of [`Self::vpc_available_at`], beside the connection
+    /// store rather than inside it because that store holds the modelled shape itself.
+    /// `AcceptVpcEndpointConnections` leaves the connection in the non-terminal `Pending`
+    /// state, so the clock owes it `Available` [`TRANSITION_DELAY`] later; a connection
+    /// nothing has accepted has no entry here.
+    pub vpc_endpoint_connection_moves: BTreeMap<String, PendingStateMove>,
+    /// Every VPC endpoint service configuration the account owns, by `ServiceId`, as the
+    /// modelled [`ServiceConfiguration`] shape itself. This is the set a `ServiceId` a
+    /// request names is resolved against, so an id naming no service of the account is
+    /// refused rather than read as "no connections".
+    pub vpc_endpoint_services: BTreeMap<String, ServiceConfiguration>,
+    /// Every VPC endpoint the account holds, by `VpcEndpointId`, as the modelled
+    /// [`VpcEndpoint`] shape itself. Ordered by id, which is the order
+    /// `DescribeVpcEndpoints` reports and pages over.
+    pub vpc_endpoints: BTreeMap<String, VpcEndpoint>,
+    /// Every transit gateway attachment the account holds, by
+    /// `TransitGatewayAttachmentId` — ONE map for every kind of attachment, because one id
+    /// space serves them all and an id therefore identifies at most one attachment of one
+    /// kind. See [`TransitGatewayAttachmentRecord`].
+    pub transit_gateway_attachments: BTreeMap<String, TransitGatewayAttachmentRecord>,
+    /// Every transit gateway multicast domain the account holds, by
+    /// `TransitGatewayMulticastDomainId`, each with its subnet associations.
+    pub transit_gateway_multicast_domains: BTreeMap<String, TransitGatewayMulticastDomainRecord>,
+    /// Every transit gateway route table announcement the account holds, by
+    /// `TransitGatewayRouteTableAnnouncementId`.
+    pub transit_gateway_route_table_announcements:
+        BTreeMap<String, TransitGatewayRouteTableAnnouncementRecord>,
+    /// Every IPAM pool the account holds, by `IpamPoolId`, as the modelled [`IpamPool`]
+    /// shape itself.
+    pub ipam_pools: BTreeMap<String, IpamPool>,
     /// Every VPC Block Public Access exclusion the account holds, by `ExclusionId` — see
     /// the module docs. Ordered by id, which is the order
     /// `DescribeVpcBlockPublicAccessExclusions` reports and pages over.
@@ -1189,6 +1248,13 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
+            vpc_endpoint_connection_moves: BTreeMap::new(),
+            vpc_endpoint_services: BTreeMap::new(),
+            vpc_endpoints: BTreeMap::new(),
+            transit_gateway_attachments: BTreeMap::new(),
+            transit_gateway_multicast_domains: BTreeMap::new(),
+            transit_gateway_route_table_announcements: BTreeMap::new(),
+            ipam_pools: BTreeMap::new(),
             vpc_block_public_access_exclusions: BTreeMap::new(),
             import_image_tasks: BTreeMap::new(),
             import_image_task_client_tokens: HashMap::new(),
@@ -2316,6 +2382,69 @@ impl ComAmazonawsEc2Amazonec2State {
                     true
                 }
             }
+        });
+        // The resources whose own record carries the move the clock owes it
+        // ([`PendingStateMove`]): a transit gateway attachment an acceptance or a rejection
+        // left transient, one subnet association of a multicast domain, a route table
+        // announcement a delete started on, and a BYOIP range whose advertisement was asked
+        // for. Each move was due at its instant whether or not anybody called, so applying
+        // it here changes nothing a later caller would not have seen anyway.
+        for record in self.transit_gateway_attachments.values_mut() {
+            if let Some(state) = record
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string)
+            {
+                record.view.set_state(&state);
+                record.pending = None;
+            }
+        }
+        for domain in self.transit_gateway_multicast_domains.values_mut() {
+            for association in &mut domain.associations {
+                if let Some(state) = association
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.due_by(now))
+                    .map(str::to_string)
+                {
+                    association.state = state;
+                    association.pending = None;
+                }
+            }
+        }
+        for record in self.transit_gateway_route_table_announcements.values_mut() {
+            if let Some(state) = record
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string)
+            {
+                record.view.state = Some(state);
+                record.pending = None;
+            }
+        }
+        for record in self.byoip_cidrs.values_mut() {
+            if let Some(state) = record
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string)
+            {
+                record.byoip_cidr.state = Some(state);
+                record.pending = None;
+            }
+        }
+        let connections = &mut self.vpc_endpoint_connections;
+        self.vpc_endpoint_connection_moves.retain(|endpoint_id, pending| {
+            if now < pending.due_at {
+                return true;
+            }
+            if let Some(connection) = connections.get_mut(endpoint_id) {
+                connection.vpc_endpoint_state = Some(pending.to.clone());
+            }
+            // The move is applied once; nothing is owed on this connection any more.
+            false
         });
         self.complete_due_import_image_tasks(now);
     }
@@ -3910,14 +4039,12 @@ pub fn volume_payload_bytes(
 /// and the long id form, as the model's own `^vol-([0-9a-f]{8}|[0-9a-f]{17})$` style
 /// id patterns read. EC2 answers `InvalidVolumeID.Malformed` for anything else,
 /// BEFORE it looks the id up.
+///
+/// The rule itself is [`prefixed_id_is_well_formed`], which every resource of this module
+/// asks, so the EC2 id form is defined in exactly one place; only the prefix is this
+/// function's own.
 pub fn volume_id_is_well_formed(id: &str) -> bool {
-    let Some(suffix) = id.strip_prefix("vol-") else {
-        return false;
-    };
-    matches!(suffix.len(), 8 | 17)
-        && suffix
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    prefixed_id_is_well_formed("vol", id)
 }
 
 /// Refuse a volume id the request named that this service cannot resolve: a malformed
@@ -6530,6 +6657,14 @@ pub struct ByoipCidrRecord {
     /// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`], from the addresses
     /// the account holds out of the range then.
     pub released_at: Option<Instant>,
+    /// The state move an ADVERTISEMENT owes the range, for a range `AdvertiseByoipCidr` left
+    /// in `pending-advertising`; `None` for a range nothing is advertising.
+    ///
+    /// Beside [`Self::released_at`] rather than folded into it because the two owe different
+    /// things: a release's outcome is decided at its due instant from the addresses the
+    /// account holds then, while an advertisement's is known when it is asked for, so it is
+    /// carried as the [`PendingStateMove`] every other record of this store uses.
+    pub pending: Option<PendingStateMove>,
 }
 
 impl ByoipCidrRecord {
@@ -6542,6 +6677,7 @@ impl ByoipCidrRecord {
                 ..ByoipCidr::default()
             },
             released_at: None,
+            pending: None,
         }
     }
 
@@ -8216,6 +8352,18 @@ impl ComAmazonawsEc2Amazonec2State {
 /// request.
 pub const VPC_ENDPOINT_CONNECTION_ID_PREFIX: &str = "vpce-conn";
 
+/// The id prefix a stored VPC endpoint is minted with: `vpce-`, as
+/// `DescribeVpcEndpoints`'s own evidence of an unknown endpoint id (`vpce-…`) spells it.
+pub const VPC_ENDPOINT_ID_PREFIX: &str = "vpce";
+
+/// The id prefix a stored VPC endpoint SERVICE configuration is minted with.
+///
+/// `vpce-svc-` rather than `vpce-`: a service id and an endpoint id are different
+/// resources, and an endpoint id is therefore one whose prefix is `vpce-` and which is
+/// NOT one of the longer `vpce-svc-`/`vpce-conn-` forms — see
+/// [`vpc_endpoint_id_is_well_formed`].
+pub const VPC_ENDPOINT_SERVICE_ID_PREFIX: &str = "vpce-svc";
+
 /// Every state a VPC endpoint connection can be in, as the `vpc-endpoint-state` FILTER
 /// spells it paired with the member of the model's `State` enum that names the same state.
 ///
@@ -8246,6 +8394,10 @@ pub const VPC_ENDPOINT_STATE_PENDING_ACCEPTANCE: &str = "PendingAcceptance";
 
 /// A connection whose endpoint is in service: the `State` enum's `Available` member.
 pub const VPC_ENDPOINT_STATE_AVAILABLE: &str = "Available";
+
+/// A connection the service owner has accepted and that is not in service yet: the `State`
+/// enum's `Pending` member, the non-terminal state an acceptance leaves it in.
+pub const VPC_ENDPOINT_STATE_PENDING: &str = "Pending";
 
 /// What one stored VPC endpoint connection is created with, beside the connection id the
 /// store mints itself.
@@ -8405,6 +8557,707 @@ pub fn vpc_endpoint_connection_payload_bytes(connection: &VpcEndpointConnection)
         .saturating_add(dns_bytes)
         .saturating_add(text_bytes(connection.vpc_endpoint_owner.as_ref()))
         .saturating_add(text_bytes(connection.vpc_endpoint_region.as_ref()))
+}
+
+// =============================================================================
+// A state move the clock owes, for the records that carry their own
+// =============================================================================
+
+/// A state a record is due to move to, and the instant the clock owes it.
+///
+/// The generic form of [`PendingTransition`], which is an instance's: a resource an
+/// operation hands back in a NON-TERMINAL state ([`TRANSIT_GATEWAY_ATTACHMENT_STATE_PENDING`]
+/// after an acceptance, say) still owes the move to its terminal one, and that move was due
+/// at its instant whether or not anybody called again. The instant is RECORDED rather than
+/// slept for, and [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it
+/// once the clock has passed it. A resource an operation hands back ready carries none.
+#[derive(Debug, Clone)]
+pub struct PendingStateMove {
+    /// The state the record moves to once `due_at` has passed.
+    pub to: String,
+    /// When the move falls due, on the same monotonic clock and at the same
+    /// [`TRANSITION_DELAY`] span as every other transition this store owes.
+    pub due_at: Instant,
+}
+
+impl PendingStateMove {
+    /// The move to `to`, falling due [`TRANSITION_DELAY`] from now.
+    pub fn starting_now(to: impl Into<String>) -> Self {
+        Self {
+            to: to.into(),
+            due_at: Instant::now() + TRANSITION_DELAY,
+        }
+    }
+
+    /// The move, if it has come due by `now`.
+    fn due_by(&self, now: Instant) -> Option<&str> {
+        (now >= self.due_at).then_some(self.to.as_str())
+    }
+}
+
+/// Whether `id` is a well-formed EC2 resource id of the kind `prefix` names.
+///
+/// An EC2 resource id is `<prefix>-<hex>`, with 8 or 17 lowercase hexadecimal digits — the
+/// short and the long id form, as the model's own id patterns read
+/// (`^vpc-([0-9a-f]{8}|[0-9a-f]{17})$`). The generic form of
+/// [`volume_id_is_well_formed`], for the resources whose own `@pattern` the model does not
+/// publish (`smithy_query(query="shape",shape="TransitGatewayAttachmentId")` is a plain
+/// `String`): EC2 answers that resource's `Invalid<Kind>.Malformed` for anything else,
+/// BEFORE it looks the id up, so a caller can tell "not an id of this kind" from "no such
+/// resource".
+pub fn prefixed_id_is_well_formed(prefix: &str, id: &str) -> bool {
+    let Some(suffix) = id
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Whether `id` is a well-formed VPC ENDPOINT id, as opposed to an id of one of the two
+/// other resources whose ids also begin `vpce-`.
+///
+/// [`VPC_ENDPOINT_SERVICE_ID_PREFIX`] and [`VPC_ENDPOINT_CONNECTION_ID_PREFIX`] extend the
+/// endpoint's own prefix, so the prefix alone cannot separate them; it is the hex suffix
+/// that does, an endpoint id carrying nothing but hex digits where those two carry `svc-`
+/// or `conn-` first.
+pub fn vpc_endpoint_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(VPC_ENDPOINT_ID_PREFIX, id)
+}
+
+// =============================================================================
+// Transit gateway attachments
+// =============================================================================
+
+/// The id prefix every transit gateway attachment is minted with, whatever resource it
+/// attaches: one `TransitGatewayAttachmentId` space serves them all, which is why
+/// [`ComAmazonawsEc2Amazonec2State::transit_gateway_attachments`] is one map.
+pub const TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX: &str = "tgw-attach";
+
+/// The id prefix a transit gateway multicast domain is minted with.
+pub const TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_PREFIX: &str = "tgw-mcast-domain";
+
+/// The id prefix a transit gateway route table announcement is minted with.
+pub const TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT_ID_PREFIX: &str = "tgw-rtb-announce";
+
+/// An attachment waiting for the owner of the attached resource to accept it: the
+/// `TransitGatewayAttachmentState` enum's `pendingAcceptance` member.
+pub const TRANSIT_GATEWAY_ATTACHMENT_STATE_PENDING_ACCEPTANCE: &str = "pendingAcceptance";
+
+/// An attachment whose acceptance is being carried out: the
+/// `TransitGatewayAttachmentState` enum's `pending` member.
+pub const TRANSIT_GATEWAY_ATTACHMENT_STATE_PENDING: &str = "pending";
+
+/// An attachment in service: the `TransitGatewayAttachmentState` enum's `available` member.
+pub const TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE: &str = "available";
+
+/// An attachment whose rejection is being carried out: the
+/// `TransitGatewayAttachmentState` enum's `rejecting` member.
+pub const TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTING: &str = "rejecting";
+
+/// An attachment the owner of the attached resource refused: the
+/// `TransitGatewayAttachmentState` enum's `rejected` member.
+pub const TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTED: &str = "rejected";
+
+/// `pendingAcceptance` as the OTHER state enum spells it:
+/// `TransitGatewayClientVpnAttachment$State` targets `TransitGatewayAttachmentStatusType`,
+/// whose members are hyphenated (`pending-acceptance`, `pending`, `rejected`, `available`,
+/// `deleting`, `deleted`) rather than camel-cased. One state, two spellings, both part of
+/// the contract — see [`TransitGatewayAttachmentView::states`].
+pub const CLIENT_VPN_ATTACHMENT_STATE_PENDING_ACCEPTANCE: &str = "pending-acceptance";
+
+/// The `TransitGatewayAttachmentResourceType` of a VPC attachment: `vpc`.
+pub const TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_VPC: &str = "vpc";
+
+/// The `TransitGatewayAttachmentResourceType` of a transit gateway peering attachment:
+/// `tgw-peering`.
+pub const TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_PEERING: &str = "tgw-peering";
+
+/// The `TransitGatewayAttachmentResourceType` of a Client VPN attachment: `client-vpn`.
+pub const TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_CLIENT_VPN: &str = "client-vpn";
+
+/// How one kind of attachment spells the states an acceptance or a rejection walks through.
+///
+/// The two state enums the model gives attachments name the same states with different
+/// spellings, so the spellings are a property of the KIND rather than literals at a call
+/// site: see [`TRANSIT_GATEWAY_ATTACHMENT_STATE_PENDING_ACCEPTANCE`] and
+/// [`CLIENT_VPN_ATTACHMENT_STATE_PENDING_ACCEPTANCE`].
+#[derive(Debug, Clone, Copy)]
+pub struct TransitGatewayAttachmentStates {
+    /// Waiting for the owner of the attached resource to accept.
+    pub pending_acceptance: &'static str,
+    /// The non-terminal state an accepted attachment passes through.
+    pub accepting: &'static str,
+    /// In service: what an accepted attachment reaches.
+    pub available: &'static str,
+    /// The non-terminal state a rejected attachment passes through.
+    pub rejecting: &'static str,
+    /// Refused: what a rejected attachment reaches.
+    pub rejected: &'static str,
+}
+
+/// One transit gateway attachment, as the modelled shape its own describe reports.
+///
+/// Every kind shares the `TransitGatewayAttachmentId` space, so they share one store; each
+/// kind keeps the shape the operations that report it answer with, so a member a writer
+/// sets round-trips without a field-by-field copy.
+#[derive(Debug, Clone)]
+pub enum TransitGatewayAttachmentView {
+    /// A VPC attachment (`AcceptTransitGatewayVpcAttachment`,
+    /// `RejectTransitGatewayVpcAttachment`).
+    Vpc(TransitGatewayVpcAttachment),
+    /// A transit gateway peering attachment (`AcceptTransitGatewayPeeringAttachment`).
+    Peering(TransitGatewayPeeringAttachment),
+    /// A Client VPN attachment (`AcceptTransitGatewayClientVpnAttachment`).
+    ClientVpn(TransitGatewayClientVpnAttachment),
+}
+
+impl TransitGatewayAttachmentView {
+    /// How this kind spells the states of an acceptance and a rejection.
+    ///
+    /// `TransitGatewayAttachmentStatusType` — the Client VPN attachment's state enum — has
+    /// no member for the transient state of a rejection, so for that kind `rejecting` is
+    /// the terminal `rejected` itself.
+    pub fn states(&self) -> TransitGatewayAttachmentStates {
+        match self {
+            Self::Vpc(_) | Self::Peering(_) => TransitGatewayAttachmentStates {
+                pending_acceptance: TRANSIT_GATEWAY_ATTACHMENT_STATE_PENDING_ACCEPTANCE,
+                accepting: TRANSIT_GATEWAY_ATTACHMENT_STATE_PENDING,
+                available: TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE,
+                rejecting: TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTING,
+                rejected: TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTED,
+            },
+            Self::ClientVpn(_) => TransitGatewayAttachmentStates {
+                pending_acceptance: CLIENT_VPN_ATTACHMENT_STATE_PENDING_ACCEPTANCE,
+                accepting: TRANSIT_GATEWAY_ATTACHMENT_STATE_PENDING,
+                available: TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE,
+                rejecting: TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTED,
+                rejected: TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTED,
+            },
+        }
+    }
+
+    /// The attachment's `TransitGatewayAttachmentResourceType`.
+    pub fn resource_type(&self) -> &'static str {
+        match self {
+            Self::Vpc(_) => TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_VPC,
+            Self::Peering(_) => TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_PEERING,
+            Self::ClientVpn(_) => TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_CLIENT_VPN,
+        }
+    }
+
+    /// The id of the resource this attachment attaches, which is what a report of the
+    /// attachment names as its `ResourceId`.
+    pub fn resource_id(&self) -> Option<&str> {
+        match self {
+            Self::Vpc(attachment) => attachment.vpc_id.as_deref(),
+            Self::Peering(attachment) => attachment
+                .accepter_tgw_info
+                .as_ref()
+                .and_then(|info| info.transit_gateway_id.as_deref()),
+            Self::ClientVpn(attachment) => attachment.client_vpn_endpoint_id.as_deref(),
+        }
+    }
+
+    /// The account that owns the resource this attachment attaches.
+    pub fn resource_owner_id(&self) -> Option<&str> {
+        match self {
+            Self::Vpc(attachment) => attachment.vpc_owner_id.as_deref(),
+            Self::Peering(attachment) => attachment
+                .accepter_tgw_info
+                .as_ref()
+                .and_then(|info| info.owner_id.as_deref()),
+            Self::ClientVpn(attachment) => attachment.client_vpn_owner_id.as_deref(),
+        }
+    }
+
+    /// The attachment's current state.
+    pub fn state(&self) -> Option<&str> {
+        match self {
+            Self::Vpc(attachment) => attachment.state.as_deref(),
+            Self::Peering(attachment) => attachment.state.as_deref(),
+            Self::ClientVpn(attachment) => attachment.state.as_deref(),
+        }
+    }
+
+    /// Move the attachment to `state`.
+    ///
+    /// A peering attachment also carries a `Status`, which is the status OF that state
+    /// (`TransitGatewayPeeringAttachment$Status` — "the status of the transit gateway
+    /// peering attachment"), so it is moved with it rather than left naming the previous
+    /// one.
+    pub fn set_state(&mut self, state: &str) {
+        match self {
+            Self::Vpc(attachment) => attachment.state = Some(state.to_string()),
+            Self::Peering(attachment) => {
+                attachment.state = Some(state.to_string());
+                attachment.status = Some(PeeringAttachmentStatus {
+                    code: Some(state.to_string()),
+                    message: None,
+                });
+            }
+            Self::ClientVpn(attachment) => attachment.state = Some(state.to_string()),
+        }
+    }
+
+    /// Stamp `attachment_id` onto the attachment, which the store mints rather than taking
+    /// from a request.
+    fn set_attachment_id(&mut self, attachment_id: &str) {
+        match self {
+            Self::Vpc(attachment) => {
+                attachment.transit_gateway_attachment_id = Some(attachment_id.to_string());
+            }
+            Self::Peering(attachment) => {
+                attachment.transit_gateway_attachment_id = Some(attachment_id.to_string());
+            }
+            Self::ClientVpn(attachment) => {
+                attachment.transit_gateway_attachment_id = Some(attachment_id.to_string());
+            }
+        }
+    }
+
+    /// The caller-chosen bytes this attachment holds: its tags, the only member of any kind
+    /// that a caller sizes.
+    fn payload_bytes(&self) -> usize {
+        match self {
+            Self::Vpc(attachment) => tag_list_bytes(attachment.tags.as_deref().unwrap_or_default()),
+            Self::Peering(attachment) => {
+                tag_list_bytes(attachment.tags.as_deref().unwrap_or_default())
+            }
+            Self::ClientVpn(_) => 0,
+        }
+    }
+}
+
+/// One stored transit gateway attachment: the modelled view its describe reports, plus the
+/// state move the clock still owes it.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayAttachmentRecord {
+    /// The attachment itself.
+    pub view: TransitGatewayAttachmentView,
+    /// The move to the terminal state of an acceptance or a rejection, for an attachment
+    /// one of those left in a transient state; `None` for an attachment that owes none.
+    pub pending: Option<PendingStateMove>,
+}
+
+impl TransitGatewayAttachmentRecord {
+    /// Put the attachment into `transient` now and owe it `terminal`
+    /// [`TRANSITION_DELAY`] later.
+    ///
+    /// The span is never zero, so a caller acting straight after the accepting or rejecting
+    /// call still sees the transient state and the state errors that go with it.
+    pub fn begin_move(&mut self, transient: &str, terminal: &str) {
+        self.view.set_state(transient);
+        self.pending = Some(PendingStateMove::starting_now(terminal));
+    }
+}
+
+/// One subnet's association with a transit gateway multicast domain.
+///
+/// Flattened rather than holding the modelled
+/// [`TransitGatewayMulticastDomainAssociation`], which carries exactly one subnet: the
+/// association IS per subnet, so the record is per subnet and [`Self::view`] builds the
+/// modelled shape when one is reported.
+#[derive(Debug, Clone)]
+pub struct MulticastDomainAssociationRecord {
+    /// The attachment whose resource is associated with the domain.
+    pub transit_gateway_attachment_id: String,
+    /// The resource the attachment attaches.
+    pub resource_id: String,
+    /// That resource's `TransitGatewayAttachmentResourceType`.
+    pub resource_type: String,
+    /// The account that owns the resource.
+    pub resource_owner_id: String,
+    /// The associated subnet.
+    pub subnet_id: String,
+    /// The association's state, a member of
+    /// `TransitGatewayMulitcastDomainAssociationState`.
+    pub state: String,
+    /// The move to `associated` an acceptance owes this association.
+    pub pending: Option<PendingStateMove>,
+}
+
+impl MulticastDomainAssociationRecord {
+    /// The modelled association a report of this record answers with.
+    pub fn view(&self) -> TransitGatewayMulticastDomainAssociation {
+        TransitGatewayMulticastDomainAssociation {
+            transit_gateway_attachment_id: Some(self.transit_gateway_attachment_id.clone()),
+            resource_id: Some(self.resource_id.clone()),
+            resource_type: Some(self.resource_type.clone()),
+            resource_owner_id: Some(self.resource_owner_id.clone()),
+            subnet: Some(self.subnet_view()),
+        }
+    }
+
+    /// The modelled subnet association this record is.
+    pub fn subnet_view(&self) -> SubnetAssociation {
+        SubnetAssociation {
+            subnet_id: Some(self.subnet_id.clone()),
+            state: Some(self.state.clone()),
+        }
+    }
+}
+
+/// An association waiting for the domain owner to accept it: the
+/// `TransitGatewayMulitcastDomainAssociationState` enum's `pendingAcceptance` member.
+pub const MULTICAST_ASSOCIATION_STATE_PENDING_ACCEPTANCE: &str = "pendingAcceptance";
+
+/// An association being carried out: that enum's `associating` member.
+pub const MULTICAST_ASSOCIATION_STATE_ASSOCIATING: &str = "associating";
+
+/// An association in force: that enum's `associated` member.
+pub const MULTICAST_ASSOCIATION_STATE_ASSOCIATED: &str = "associated";
+
+/// One transit gateway multicast domain and the resources associated with it.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayMulticastDomainRecord {
+    /// The domain's own id, minted by the store.
+    pub transit_gateway_multicast_domain_id: String,
+    /// The transit gateway the domain belongs to.
+    pub transit_gateway_id: String,
+    /// The account that owns the domain.
+    pub owner_id: String,
+    /// The domain's state, a member of `TransitGatewayMulticastDomainState`.
+    pub state: String,
+    /// The subnet associations of the domain, one per (attachment, subnet).
+    pub associations: Vec<MulticastDomainAssociationRecord>,
+}
+
+/// One stored transit gateway route table announcement.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayRouteTableAnnouncementRecord {
+    /// The announcement itself, as the modelled shape its operations answer with.
+    pub view: TransitGatewayRouteTableAnnouncement,
+    /// The move to `deleted` a delete owes this announcement.
+    pub pending: Option<PendingStateMove>,
+}
+
+/// An announcement in force: the `TransitGatewayRouteTableAnnouncementState` enum's
+/// `available` member.
+pub const ANNOUNCEMENT_STATE_AVAILABLE: &str = "available";
+
+/// An announcement a delete has started on: that enum's `deleting` member.
+pub const ANNOUNCEMENT_STATE_DELETING: &str = "deleting";
+
+/// An announcement a delete has finished with: that enum's `deleted` member.
+pub const ANNOUNCEMENT_STATE_DELETED: &str = "deleted";
+
+// =============================================================================
+// IPAM pools, and the one BYOIP state the release path has no word for
+// =============================================================================
+
+/// The id prefix an IPAM pool is minted with.
+pub const IPAM_POOL_ID_PREFIX: &str = "ipam-pool";
+
+/// A range whose advertisement has been asked for and is not in force yet: the
+/// `ByoipCidrState` enum's `pending-advertising` member.
+///
+/// The rest of that catalog, the store of ranges ([`ByoipCidrRecord`]) and the CIDR
+/// canonicalisation ([`canonical_byoip_cidr`]) are the BYOIP section above — this is the one
+/// member the provision/release path has no use for, and an advertisement is the only
+/// operation that puts a range into it.
+pub const BYOIP_CIDR_STATE_PENDING_ADVERTISING: &str = "pending-advertising";
+
+/// The `IpamScopeType` of a pool in the public scope, which is the only scope a BYOIP CIDR
+/// can be moved into: "Only used for provisioning IP address CIDRs to pools in the public
+/// scope" (`IpamPool$PublicIpSource`).
+pub const IPAM_SCOPE_TYPE_PUBLIC: &str = "public";
+
+/// The `AddressFamily` of an IPv4 pool or range.
+pub const ADDRESS_FAMILY_IPV4: &str = "ipv4";
+
+/// The `AddressFamily` of an IPv6 pool or range.
+pub const ADDRESS_FAMILY_IPV6: &str = "ipv6";
+
+/// The address family a canonical BYOIP range belongs to, as `AddressFamily` spells it.
+pub fn byoip_cidr_address_family(cidr: &str) -> &'static str {
+    if cidr.contains(':') {
+        ADDRESS_FAMILY_IPV6
+    } else {
+        ADDRESS_FAMILY_IPV4
+    }
+}
+
+// =============================================================================
+// Error codes of the resources above
+// =============================================================================
+
+/// `InvalidTransitGatewayAttachmentID.NotFound` (HTTP 400): the request named a transit
+/// gateway attachment id this account holds no attachment for.
+pub const INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND: &str =
+    "InvalidTransitGatewayAttachmentID.NotFound";
+
+/// `InvalidTransitGatewayAttachmentID.Malformed` (HTTP 400): the request named something
+/// that is not a transit gateway attachment id at all.
+pub const INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED: &str =
+    "InvalidTransitGatewayAttachmentID.Malformed";
+
+/// `InvalidTransitGatewayMulticastDomainId.NotFound` (HTTP 400).
+pub const INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_NOT_FOUND: &str =
+    "InvalidTransitGatewayMulticastDomainId.NotFound";
+
+/// `InvalidTransitGatewayMulticastDomainId.Malformed` (HTTP 400).
+pub const INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_MALFORMED: &str =
+    "InvalidTransitGatewayMulticastDomainId.Malformed";
+
+/// `InvalidTransitGatewayRouteTableAnnouncementId.NotFound` (HTTP 400).
+pub const INVALID_TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT_ID_NOT_FOUND: &str =
+    "InvalidTransitGatewayRouteTableAnnouncementId.NotFound";
+
+/// `InvalidTransitGatewayRouteTableAnnouncementId.Malformed` (HTTP 400).
+pub const INVALID_TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT_ID_MALFORMED: &str =
+    "InvalidTransitGatewayRouteTableAnnouncementId.Malformed";
+
+/// `InvalidVpcEndpointId.NotFound` (HTTP 400): the request named a VPC endpoint id this
+/// account holds no endpoint for.
+pub const INVALID_VPC_ENDPOINT_ID_NOT_FOUND: &str = "InvalidVpcEndpointId.NotFound";
+
+/// `InvalidVpcEndpointId.Malformed` (HTTP 400).
+pub const INVALID_VPC_ENDPOINT_ID_MALFORMED: &str = "InvalidVpcEndpointId.Malformed";
+
+/// `InvalidVpcEndpointServiceId.NotFound` (HTTP 400): the request named a VPC endpoint
+/// service id this account holds no endpoint service for.
+pub const INVALID_VPC_ENDPOINT_SERVICE_ID_NOT_FOUND: &str =
+    "InvalidVpcEndpointServiceId.NotFound";
+
+/// `InvalidVpcEndpointServiceId.Malformed` (HTTP 400).
+pub const INVALID_VPC_ENDPOINT_SERVICE_ID_MALFORMED: &str =
+    "InvalidVpcEndpointServiceId.Malformed";
+
+/// `InvalidIpamPoolId.NotFound` (HTTP 400): the request named an IPAM pool id this account
+/// holds no pool for.
+pub const INVALID_IPAM_POOL_ID_NOT_FOUND: &str = "InvalidIpamPoolId.NotFound";
+
+/// `InvalidIpamPoolId.Malformed` (HTTP 400).
+pub const INVALID_IPAM_POOL_ID_MALFORMED: &str = "InvalidIpamPoolId.Malformed";
+
+/// Refuse an id of the kind `prefix` names that this service cannot resolve: a malformed
+/// one with `malformed`, an unknown one with `not_found`, in that order — the order the
+/// service asks the two questions in, so "not an id of this kind" is never reported as "no
+/// such resource".
+///
+/// The ONE place that ordering lives, so every resource of this module answers it the same
+/// way; [`require_known_volume`] is the same contract written out for volumes.
+pub fn require_well_formed_id<E>(
+    prefix: &str,
+    id: &str,
+    malformed: &'static str,
+) -> Result<(), Scaffolded<E>> {
+    if prefixed_id_is_well_formed(prefix, id) {
+        return Ok(());
+    }
+    Err(Scaffolded::service_error(
+        malformed,
+        400,
+        format!("Invalid id: '{id}'"),
+    ))
+}
+
+/// Refuse a request that named a resource id this account holds no resource for: HTTP 400
+/// with `code`, which is that resource's own `Invalid<Kind>.NotFound`.
+pub fn id_not_found<E>(code: &'static str, kind: &str, id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(code, 400, format!("The {kind} '{id}' does not exist"))
+}
+
+/// What the owner of an attached resource decided about a transit gateway attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentDecision {
+    /// Accept it: "Accepts a request to attach a VPC to a transit gateway"
+    /// (`AcceptTransitGatewayVpcAttachment`).
+    Accept,
+    /// Reject it: "Rejects a request to attach a VPC to a transit gateway"
+    /// (`RejectTransitGatewayVpcAttachment`).
+    Reject,
+}
+
+impl AttachmentDecision {
+    /// The decision as the refusal below names it.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Accept => "accepted",
+            Self::Reject => "rejected",
+        }
+    }
+}
+
+/// Act on the transit gateway attachment `attachment_id` names, and answer it as it now
+/// stands.
+///
+/// The ONE place the rule every accepting and rejecting operation of the attachment family
+/// follows is written: "the attachment must be in the `pendingAcceptance` state"
+/// (`AcceptTransitGatewayVpcAttachment`), so an attachment in any other state is refused
+/// with `IncorrectState` and nothing is written; an accepted one moves to the transient
+/// state of an acceptance with the clock owing it `available`, a rejected one to the
+/// transient state of a rejection with `rejected` owed.
+///
+/// `resource_type` is the
+/// `TransitGatewayAttachmentResourceType` the calling operation acts on — every kind shares
+/// one id space, so an id naming an attachment of ANOTHER kind names no attachment this
+/// operation can act on and is refused as unknown. The CALLER refuses a malformed
+/// `attachment_id` first, before its own `DryRun` arm, so that nothing here depends on the
+/// request's form.
+pub fn decide_transit_gateway_attachment<E>(
+    store: &mut ComAmazonawsEc2Amazonec2State,
+    attachment_id: &str,
+    resource_type: &'static str,
+    decision: AttachmentDecision,
+) -> Result<TransitGatewayAttachmentView, Scaffolded<E>> {
+    // The clock first: an attachment whose move has fallen due is already in its terminal
+    // state, so whether this call is admissible is asked of the state the attachment is
+    // ACTUALLY in rather than of the one it was left in.
+    store.materialize_due_transitions();
+    let record = store
+        .transit_gateway_attachments
+        .get_mut(attachment_id)
+        .filter(|record| record.view.resource_type() == resource_type)
+        .ok_or_else(|| {
+            id_not_found(
+                INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
+                "transit gateway attachment ID",
+                attachment_id,
+            )
+        })?;
+    let states = record.view.states();
+    if record.view.state() != Some(states.pending_acceptance) {
+        return Err(incorrect_state(format!(
+            "The transit gateway attachment '{attachment_id}' is in state '{state}'; only an \
+             attachment in state '{pending_acceptance}' can be {verb}",
+            state = record.view.state().unwrap_or_default(),
+            pending_acceptance = states.pending_acceptance,
+            verb = decision.verb(),
+        )));
+    }
+    match decision {
+        AttachmentDecision::Accept => record.begin_move(states.accepting, states.available),
+        AttachmentDecision::Reject => record.begin_move(states.rejecting, states.rejected),
+    }
+    Ok(record.view.clone())
+}
+
+/// The server error a handler answers when the attachment this module just resolved for it
+/// turns out to be of another kind — which the resolution above has already ruled out, so
+/// reaching it means this module is inconsistent with itself rather than that the request
+/// was wrong.
+pub fn unexpected_attachment_kind<E>(attachment_id: &str) -> Scaffolded<E> {
+    internal_error(format!(
+        "the attachment '{attachment_id}' resolved a moment ago is not of the kind this \
+         operation acts on"
+    ))
+}
+
+// =============================================================================
+// Writers for the resources above
+// =============================================================================
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Store a transit gateway attachment and answer the `TransitGatewayAttachmentId` it
+    /// was given.
+    ///
+    /// The id is minted here rather than taken from `view`, the way
+    /// [`Self::insert_vpc_endpoint_connection`] mints a connection id, and the
+    /// caller-chosen bytes the record holds are charged here, so no path can store them
+    /// uncharged.
+    pub fn insert_transit_gateway_attachment(
+        &mut self,
+        mut view: TransitGatewayAttachmentView,
+    ) -> String {
+        let attachment_id = self.next_id(TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX);
+        view.set_attachment_id(&attachment_id);
+        self.add_stored_bytes(view.payload_bytes());
+        self.transit_gateway_attachments.insert(
+            attachment_id.clone(),
+            TransitGatewayAttachmentRecord {
+                view,
+                pending: None,
+            },
+        );
+        attachment_id
+    }
+
+    /// Store a transit gateway multicast domain and answer the
+    /// `TransitGatewayMulticastDomainId` it was given.
+    pub fn insert_transit_gateway_multicast_domain(
+        &mut self,
+        mut record: TransitGatewayMulticastDomainRecord,
+    ) -> String {
+        let domain_id = self.next_id(TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_PREFIX);
+        record.transit_gateway_multicast_domain_id = domain_id.clone();
+        // The caller-chosen bytes a domain holds are the ids of the associations written
+        // with it, charged here like every other writer's so no path can store them
+        // uncharged.
+        let association_bytes: usize = record
+            .associations
+            .iter()
+            .map(|association| {
+                association.transit_gateway_attachment_id.len()
+                    + association.resource_id.len()
+                    + association.subnet_id.len()
+            })
+            .sum();
+        self.add_stored_bytes(association_bytes);
+        self.transit_gateway_multicast_domains
+            .insert(domain_id.clone(), record);
+        domain_id
+    }
+
+    /// Store a transit gateway route table announcement and answer the
+    /// `TransitGatewayRouteTableAnnouncementId` it was given.
+    pub fn insert_transit_gateway_route_table_announcement(
+        &mut self,
+        mut view: TransitGatewayRouteTableAnnouncement,
+    ) -> String {
+        let announcement_id = self.next_id(TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT_ID_PREFIX);
+        view.transit_gateway_route_table_announcement_id = Some(announcement_id.clone());
+        self.add_stored_bytes(tag_list_bytes(view.tags.as_deref().unwrap_or_default()));
+        self.transit_gateway_route_table_announcements.insert(
+            announcement_id.clone(),
+            TransitGatewayRouteTableAnnouncementRecord {
+                view,
+                pending: None,
+            },
+        );
+        announcement_id
+    }
+
+    /// Store one of the account's own VPC endpoint service configurations and answer the
+    /// `ServiceId` it was given.
+    pub fn insert_vpc_endpoint_service(&mut self, mut view: ServiceConfiguration) -> String {
+        let service_id = self.next_id(VPC_ENDPOINT_SERVICE_ID_PREFIX);
+        view.service_id = Some(service_id.clone());
+        self.add_stored_bytes(tag_list_bytes(view.tags.as_deref().unwrap_or_default()));
+        self.vpc_endpoint_services.insert(service_id.clone(), view);
+        service_id
+    }
+
+    /// Store a VPC endpoint and answer the `VpcEndpointId` it was given.
+    pub fn insert_vpc_endpoint(&mut self, mut view: VpcEndpoint) -> String {
+        let endpoint_id = self.next_id(VPC_ENDPOINT_ID_PREFIX);
+        view.vpc_endpoint_id = Some(endpoint_id.clone());
+        self.add_stored_bytes(tag_list_bytes(view.tags.as_deref().unwrap_or_default()));
+        self.vpc_endpoints.insert(endpoint_id.clone(), view);
+        endpoint_id
+    }
+
+    /// Store an IPAM pool and answer the `IpamPoolId` it was given.
+    pub fn insert_ipam_pool(&mut self, mut view: IpamPool) -> String {
+        let pool_id = self.next_id(IPAM_POOL_ID_PREFIX);
+        view.ipam_pool_id = Some(pool_id.clone());
+        view.ipam_pool_arn = Some(::engine::emulator_arn(
+            "ec2",
+            view.ipam_region.as_deref().unwrap_or(DEFAULT_REGION),
+            &format!("ipam-pool/{pool_id}"),
+        ));
+        self.add_stored_bytes(
+            tag_list_bytes(view.tags.as_deref().unwrap_or_default())
+                + view.description.as_deref().unwrap_or_default().len(),
+        );
+        self.ipam_pools.insert(pool_id.clone(), view);
+        pool_id
+    }
 }
 
 /// The fixed overhead one stored VPC endpoint connection costs whatever it carries: the

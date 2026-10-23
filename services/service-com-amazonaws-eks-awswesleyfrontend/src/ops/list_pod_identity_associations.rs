@@ -272,14 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 ListPodIdentityAssociationsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        cluster_name: Some(input.cluster_name.clone()),
-                        message: Some(format!(
-                            "No cluster found for name: {}.",
-                            input.cluster_name
-                        )),
-                        ..Default::default()
-                    },
+                    crate::state::cluster_not_found(&input.cluster_name),
                 )
                 .into(),
             );
