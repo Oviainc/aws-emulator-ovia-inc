@@ -3,8 +3,9 @@
 //! Engine state for the com-amazonaws-guardduty-guarddutyapiservice service.
 //!
 //! GuardDuty's control plane is rooted at the *detector*: one per account per
-//! Region. Everything the detector owns — its findings and its filters — hangs off
-//! the [`Detector`] record, so `DeleteDetector` cascades by dropping one map entry.
+//! Region. Everything the detector owns — its findings, its filters and its threat
+//! lists — hangs off the [`Detector`] record, so `DeleteDetector` cascades by
+//! dropping one map entry.
 //!
 //! A Malware Protection plan is NOT one of those: it is created against an S3
 //! bucket rather than against a detector, so [`MalwareProtectionPlan`] hangs off
@@ -546,6 +547,11 @@ pub const DETECTOR_ID_MEMBER: &str = "detectorId";
 /// (`smithy_query(operation="ListDetectors")`), for the same reason.
 pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
 
+/// The wire name of the `ThreatIntelSetId` member, as the request carries it in the
+/// URI (`smithy_query(operation="GetThreatIntelSet")` renders it
+/// `threatIntelSetId`).
+pub const THREAT_INTEL_SET_ID_MEMBER: &str = "threatIntelSetId";
+
 /// The wire name of the `ScanResourceCriteria` member of
 /// `UpdateMalwareScanSettings` (`jsonName` `scanResourceCriteria`), for the same
 /// reason.
@@ -606,6 +612,20 @@ pub fn not_owned_message(member: &str) -> String {
 /// request was signed for, so the rejection does not name it.
 pub const DETECTOR_ALREADY_EXISTS_MESSAGE: &str =
     "The request is rejected because a detector already exists for the current account.";
+
+/// Classify a minted id the store does not resolve, naming the member that carried
+/// it: a value that is not an id of that form at all is a parameter failure, a
+/// well-formed one this account/Region does not hold is an ownership failure.
+///
+/// One rule for every member that carries a minted id, so `detectorId` and
+/// `threatIntelSetId` are refused the same way.
+pub fn minted_id_rejection(member: &str, id: &str) -> String {
+    if is_minted_id(id) {
+        not_owned_message(member)
+    } else {
+        invalid_parameter_message(member)
+    }
+}
 
 /// The length of an AWS account id: the 12 characters `AccountId` is constrained
 /// to (`len 12..12` — `smithy_query(shape="AccountId")`). The model constrains the
@@ -761,11 +781,7 @@ pub fn not_authorized_message(member: &str) -> String {
 /// detector id at all is a parameter failure, a well-formed one this
 /// account/Region does not hold is an ownership failure.
 pub fn detector_id_rejection(detector_id: &str) -> String {
-    if is_detector_id(detector_id) {
-        not_owned_message(DETECTOR_ID_MEMBER)
-    } else {
-        invalid_parameter_message(DETECTOR_ID_MEMBER)
-    }
+    minted_id_rejection(DETECTOR_ID_MEMBER, detector_id)
 }
 
 /// The wire name of the `MalwareProtectionPlanId` member, as the request carries
@@ -1144,6 +1160,9 @@ pub struct Detector {
     /// This detector's filters, keyed by filter name. `DeleteDetector` drops them
     /// with the detector.
     pub filters: BTreeMap<String, FilterRecord>,
+    /// This detector's ThreatIntelSets, keyed by minted `ThreatIntelSetId`.
+    /// `DeleteDetector` drops them with the detector.
+    pub threat_intel_sets: BTreeMap<String, ThreatIntelSetRecord>,
     /// This detector's investigations, keyed by investigation id. They hang off the
     /// detector like its findings and filters, so `DeleteDetector` drops them with
     /// it.
@@ -1250,6 +1269,27 @@ impl Detector {
             || (DISABLED.to_string(), self.updated_at_millis),
             |f| (f.status.clone(), f.updated_at_millis),
         )
+    }
+
+    /// Materialise every threat list's clock-owed status change, so no two readers
+    /// of this detector disagree about where a list has got to.
+    pub fn settle_threat_intel_sets(&mut self, now_millis: i64) {
+        for set in self.threat_intel_sets.values_mut() {
+            set.settle(now_millis);
+        }
+    }
+
+    /// The threat list `id`, if this detector holds it.
+    pub fn threat_intel_set(&self, id: &str) -> Option<&ThreatIntelSetRecord> {
+        self.threat_intel_sets.get(id)
+    }
+
+    /// The threat list a create carrying `token` already minted, if any — the
+    /// `@idempotencyToken` lookup, scoped to the detector the list hangs off.
+    pub fn threat_intel_set_for_token(&self, token: &str) -> Option<&ThreatIntelSetRecord> {
+        self.threat_intel_sets
+            .values()
+            .find(|set| set.client_token.as_deref() == Some(token))
     }
 
     /// Set one feature's status, recording `now` as its `UpdatedAt`. Adds the
@@ -1725,6 +1765,96 @@ pub struct FilterRecord {
     /// `FilterVersion`: 1 for a filter nothing has updated.
     pub version: i64,
 }
+
+/// One ThreatIntelSet: a list of "known malicious IP addresses" GuardDuty generates
+/// findings from (`smithy_query(query="doc",shape="CreateThreatIntelSet")`).
+///
+/// The list is owned by the detector it was created under, so `DeleteDetector`
+/// drops it with the detector.
+#[derive(Debug, Clone)]
+pub struct ThreatIntelSetRecord {
+    /// The minted `ThreatIntelSetId`, the id a read resolves it by.
+    pub id: String,
+    /// "A user-friendly ThreatIntelSet name"
+    /// (`smithy_query(operation="CreateThreatIntelSet")`).
+    pub name: String,
+    /// `ThreatIntelSetFormat`: the format of the file that contains the list.
+    pub format: String,
+    /// "The URI of the file that contains the ThreatIntelSet", stored verbatim: it
+    /// is caller text, so a read hands back exactly what the create wrote.
+    pub location: String,
+    /// The account that owns the bucket the location names, when the create said.
+    pub expected_bucket_owner: Option<String>,
+    /// "The tags to be added to a new threat list resource".
+    pub tags: BTreeMap<String, String>,
+    /// The `@idempotencyToken` the create carried, so a replayed create returns the
+    /// list the first call minted instead of minting a second one.
+    pub client_token: Option<String>,
+    pub created_at_millis: i64,
+    /// `ThreatIntelSetStatus`, as a read reports it.
+    pub status: String,
+    /// The status the CLOCK owes this list and the instant it comes due, or `None`
+    /// when nothing is outstanding. See [`Self::settle`].
+    pub pending_status: Option<(String, i64)>,
+}
+
+impl ThreatIntelSetRecord {
+    /// Materialise the status change the clock has ALREADY made due.
+    ///
+    /// The change is owed at its due instant whether or not anybody called, so a
+    /// reporting operation may apply it: it shows no caller anything it would not
+    /// have seen anyway, and it never moves a status the clock does not owe.
+    pub fn settle(&mut self, now_millis: i64) {
+        let Some((next, due)) = self.pending_status.as_ref() else {
+            return;
+        };
+        if now_millis >= *due {
+            self.status = next.clone();
+            self.pending_status = None;
+        }
+    }
+}
+
+/// How many ThreatIntelSets one detector may hold.
+///
+/// AWS publishes a quota of 6 threat lists per account per Region for GuardDuty,
+/// and a detector is the account's single resource in a Region ("you can have only
+/// one detector per account per Region" —
+/// `smithy_query(query="doc",shape="CreateDetector")`), so the account's quota is
+/// the detector's.
+///
+/// The quota is also what BOUNDS this store: without it a caller varying or
+/// omitting `ClientToken` would grow [`Detector::threat_intel_sets`] by one entry
+/// per request, and the `@idempotencyToken` scan over it
+/// ([`Detector::threat_intel_set_for_token`]) would grow with it.
+pub const THREAT_INTEL_SETS_PER_DETECTOR: usize = 6;
+
+/// The message a `CreateThreatIntelSet` past [`THREAT_INTEL_SETS_PER_DETECTOR`] is
+/// refused with. It names the limit, never the caller's values.
+pub fn threat_intel_set_limit_message() -> String {
+    format!(
+        "The request is rejected because the account has reached the limit of {THREAT_INTEL_SETS_PER_DETECTOR} threat lists."
+    )
+}
+
+/// `ThreatIntelSetStatus`: the status a list that is not in use reports
+/// (`smithy_query(shape="ThreatIntelSetStatus")`).
+pub const THREAT_INTEL_SET_INACTIVE: &str = "INACTIVE";
+/// The TRANSIENT status a list the create asked to activate reports until the
+/// activation that create started comes due. See [`ThreatIntelSetRecord::settle`].
+pub const THREAT_INTEL_SET_ACTIVATING: &str = "ACTIVATING";
+/// The status an activated list reports once its activation is due.
+pub const THREAT_INTEL_SET_ACTIVE: &str = "ACTIVE";
+
+/// How long a list the create asked to activate spends in
+/// [`THREAT_INTEL_SET_ACTIVATING`] before the clock owes it
+/// [`THREAT_INTEL_SET_ACTIVE`].
+///
+/// AWS documents no duration for ingesting and activating a threat list, so this
+/// span is CHOSEN: non-zero, so a caller reading straight after the create still
+/// observes the transient status the real service reports, and short enough that
+/// the activation lands without anybody sleeping on it.
+pub const THREAT_INTEL_SET_ACTIVATION_SPAN_MILLIS: i64 = 500;
 
 /// A Malware Protection plan: the resource `CreateMalwareProtectionPlan` mints for
 /// one protected S3 bucket.

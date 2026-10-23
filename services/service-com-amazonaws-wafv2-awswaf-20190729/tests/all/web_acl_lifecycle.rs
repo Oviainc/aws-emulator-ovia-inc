@@ -119,7 +119,7 @@ fn assert_error_code(body: &Value, expected: &str, case: &str) {
 /// `^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$` — the form the model pins for
 /// `EntityId` and `LockToken` (`smithy_query(query="shape",shape="LockToken")`),
 /// checked by hand so the test target needs no regex engine.
-fn is_model_uuid(value: &str) -> bool {
+pub(crate) fn is_model_uuid(value: &str) -> bool {
     let groups: Vec<&str> = value.split('-').collect();
     groups.len() == 5
         && groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
@@ -1559,8 +1559,9 @@ async fn state_changing_calls_leave_an_audit_record() {
 /// (`smithy_query(query="shape",shape="Statement")` → `IPSetReferenceStatement`,
 /// `RuleGroupReferenceStatement`, `RegexPatternSetReferenceStatement`,
 /// `ManagedRuleGroupStatement`), plus a reference reached only through a nested
-/// statement and one naming an entity that exists in the OTHER scope. Only IP sets
-/// have a store in this slice, so only an IP set reference can resolve.
+/// statement and one naming an entity that exists in the OTHER scope. Rule groups
+/// are covered by [`crate::rule_group_lifecycle`], which references one that
+/// EXISTS; the row here is a rule group ARN naming nothing stored.
 #[tokio::test]
 async fn rule_references_must_name_a_stored_entity() {
     let waf = Waf::new();
@@ -1611,7 +1612,7 @@ async fn rule_references_must_name_a_stored_entity() {
             false,
         ),
         (
-            "a RuleGroupReferenceStatement, with no rule group store",
+            "a RuleGroupReferenceStatement naming nothing stored",
             json!({ "RuleGroupReferenceStatement": { "ARN": &unknown_rule_group } }),
             false,
         ),

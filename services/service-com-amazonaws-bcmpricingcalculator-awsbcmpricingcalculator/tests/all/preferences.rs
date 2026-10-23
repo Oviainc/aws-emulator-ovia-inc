@@ -6,12 +6,18 @@
 //!
 //! The RULE every suite here asserts: `GetPreferences` reports exactly the rate-type
 //! record `UpdatePreferences` last stored, member by member — a supplied selection
-//! replaces the stored one, an omitted one keeps its stored value, and a selection
-//! nobody ever stated is not reported at all. The rows of each table differ along what
-//! the rule generalises over: which members a request carries, which `RateType` values,
-//! how many of them, and in which order.
+//! replaces the stored one, an omitted one keeps its stored value, and all three
+//! selections are reported whether or not anybody ever wrote them (an account that never
+//! wrote one has the effective selection `state::DEFAULT_RATE_TYPE_SELECTION`). The rows
+//! of each table differ along what the rule generalises over: which members a request
+//! carries, which `RateType` values, how many of them, and in which order.
+//!
+//! Writing the record is gated on the caller's account class; these suites therefore
+//! drive an emulator that may write (`Emulator::new`). The gate is pinned in
+//! `account_class_gate`.
 
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_bcmpricingcalculator_awsbcmpricingcalculator::state;
 
 use crate::bill_scenario_lifecycle::{error_code, Emulator};
 
@@ -76,19 +82,21 @@ async fn get_preferences(emulator: &Emulator, case: &str) -> Value {
 }
 
 #[tokio::test]
-async fn a_store_nobody_wrote_reports_no_selection_and_a_read_changes_nothing() {
+async fn a_store_nobody_wrote_reports_the_effective_selection_and_a_read_changes_nothing() {
     let emulator = Emulator::new();
 
     // Two consecutive reads of an untouched store: a reporting operation must not
     // change what the next caller sees, and an account that never stated a preference
-    // has none to report (every member is optional and the service documents no
-    // selection it applies in the account's place).
+    // still has the rate types its bills are quoted with — `RateTypes` is `@length 1..3`,
+    // so there is no legitimate empty or absent selection to report.
+    let effective = json!([state::DEFAULT_RATE_TYPE_SELECTION]);
     for read in ["first read", "second read"] {
         let body = get_preferences(&emulator, read).await;
         for member in SELECTION_MEMBERS {
-            assert!(
-                body.get(member).is_none(),
-                "case {read:?} member {member}: expected no selection reported, got {body}"
+            assert_eq!(
+                body.get(member),
+                Some(&effective),
+                "case {read:?} member {member}: expected {effective}, got {body}"
             );
         }
     }

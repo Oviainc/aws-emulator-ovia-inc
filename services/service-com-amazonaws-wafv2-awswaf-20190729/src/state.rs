@@ -22,9 +22,9 @@ use ::aws_smithy_schema_server::constraints::{
 };
 
 use crate::ops::types::{
-    IPSet, OnSourceDDoSProtectionConfig, Rule, Statement, Tag, WAFAssociatedItemException,
-    WAFDuplicateItemException, WAFInvalidParameterException, WAFLimitsExceededException,
-    WAFNonexistentItemException, WAFOptimisticLockException, WebACL,
+    IPSet, LabelSummary, OnSourceDDoSProtectionConfig, Rule, RuleGroup, Statement, Tag,
+    WAFAssociatedItemException, WAFDuplicateItemException, WAFInvalidParameterException,
+    WAFLimitsExceededException, WAFNonexistentItemException, WAFOptimisticLockException, WebACL,
 };
 
 /// The `Scope` values the model declares
@@ -166,6 +166,19 @@ pub struct IpSetEntry {
     pub tags: Vec<Tag>,
 }
 
+/// A RuleGroup as stored: the modelled shape plus its scope, lock token and tags.
+#[derive(Debug, Clone)]
+pub struct RuleGroupEntry {
+    /// The scope the rule group was created in.
+    pub scope: String,
+    /// Exactly what `GetRuleGroup` answers with.
+    pub rule_group: RuleGroup,
+    /// The current optimistic-lock token, rotated on every successful mutation.
+    pub lock_token: String,
+    /// Tags given at create time (`ListTagsForResource` is a separate gap issue).
+    pub tags: Vec<Tag>,
+}
+
 /// What an ARN in [`ComAmazonawsWafv2Awswaf20190729State::arn_index`] resolves to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceRef {
@@ -185,12 +198,10 @@ pub enum ResourceRef {
     },
     /// A rule group, by `(Scope, Id)`.
     ///
-    /// Nothing is indexed under this variant yet: rule groups have no store,
-    /// because `CreateRuleGroup` is still a scaffolded 501 tracked as its own gap
-    /// issue. It is named here because the index resolves an ARN to its resource
-    /// KIND, and `rulegroup` is one of the kinds a wafv2 ARN can carry — so a
-    /// reference to one resolves to nothing rather than being mistaken for a
-    /// resource of another kind. See
+    /// `CreateRuleGroup` indexes every rule group it mints under this variant, so a
+    /// `rulegroup` ARN resolves to the rule group it names and to nothing else: the
+    /// index resolves an ARN to its resource KIND as well as to its identity, so a
+    /// reference of one kind is never mistaken for a resource of another. See
     /// [`ComAmazonawsWafv2Awswaf20190729State::holds_rule_group`].
     RuleGroup {
         /// The scope the rule group lives in.
@@ -211,6 +222,11 @@ pub struct ComAmazonawsWafv2Awswaf20190729State {
     pub ip_sets: HashMap<(String, String), IpSetEntry>,
     /// `(Scope, Name)` → `Id`: duplicate-name detection and Name+Id lookup.
     pub ip_set_names: HashMap<(String, String), String>,
+    /// Rule groups by `(Scope, Id)`.
+    pub rule_groups: HashMap<(String, String), RuleGroupEntry>,
+    /// `(Scope, Name)` to `Id`, for rule groups: duplicate-name detection and
+    /// Name+Id lookup.
+    pub rule_group_names: HashMap<(String, String), String>,
     /// Every resource ARN this service minted, so a by-ARN lookup resolves from
     /// state instead of parsing the ARN back apart.
     pub arn_index: HashMap<String, ResourceRef>,
@@ -273,6 +289,39 @@ impl ComAmazonawsWafv2Awswaf20190729State {
             .count()
     }
 
+    /// The rule group stored under `(scope, id)` when it is also the one called
+    /// `name`. See [`Self::web_acl`].
+    pub fn rule_group(&self, scope: &str, name: &str, id: &str) -> Option<&RuleGroupEntry> {
+        let entry = self.rule_groups.get(&(scope.to_string(), id.to_string()))?;
+        (entry.rule_group.name == name).then_some(entry)
+    }
+
+    /// How many rule groups this scope already holds. See
+    /// [`MAX_RULE_GROUPS_PER_SCOPE`].
+    pub fn rule_groups_in_scope(&self, scope: &str) -> usize {
+        self.rule_groups
+            .keys()
+            .filter(|(stored_scope, _)| stored_scope == scope)
+            .count()
+    }
+
+    /// Every rule group ARN this scope holds, with the group's declared
+    /// `Capacity`.
+    ///
+    /// This is what prices a `RuleGroupReferenceStatement` in
+    /// [`web_acl_capacity`]: `RuleGroup$Capacity` is "the web ACL capacity units
+    /// (WCUs) required for this rule group", fixed at creation, so a web ACL rule
+    /// that runs a rule group consumes exactly that group's declared capacity. It
+    /// is read out of state BEFORE a save writes through it, so a handler can hold
+    /// it while it borrows the entry it is about to update.
+    pub fn rule_group_capacities(&self, scope: &str) -> HashMap<String, i64> {
+        self.rule_groups
+            .values()
+            .filter(|entry| entry.scope == scope)
+            .map(|entry| (entry.rule_group.arn.clone(), entry.rule_group.capacity))
+            .collect()
+    }
+
     /// Why a reference in `rules` cannot be resolved, if any cannot.
     ///
     /// WAF resolves a rule statement's reference when the rule is SAVED: a
@@ -286,19 +335,21 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     /// being deleted and keeps a rule that names a missing one from being stored.
     ///
     /// Each of the model's four reference-bearing statements is resolved against
-    /// this service's own stores. An `IPSetReferenceStatement` resolves through
-    /// [`Self::arn_index`], and only to an IP set in the SAME scope, because a scope
-    /// is a namespace. The other three — `RuleGroupReferenceStatement`,
-    /// `ManagedRuleGroupStatement` and `RegexPatternSetReferenceStatement` — name
-    /// entity kinds this emulator has no store for yet (`CreateRuleGroup`,
-    /// `CreateRegexPatternSet` and the managed-rule-group catalogue are still
-    /// scaffolded 501s, tracked as separate gap issues), so every reference to one
-    /// names nothing that exists and is refused here. The `Some` it answers is the
-    /// DIAGNOSTIC for the refusal's audit record — the response itself carries
-    /// [`NONEXISTENT_ITEM_MESSAGE`], the constant sentence that exception type always
-    /// carries. That is also what keeps
-    /// [`web_acl_capacity`] from pricing a statement whose cost is the referenced
-    /// group's own capacity: no stored rule list can carry one.
+    /// this service's own stores. An `IPSetReferenceStatement` and a
+    /// `RuleGroupReferenceStatement` resolve through [`Self::arn_index`], each only
+    /// to a resource of its own kind in the SAME scope, because a scope is a
+    /// namespace. The other two — `ManagedRuleGroupStatement` and
+    /// `RegexPatternSetReferenceStatement` — name entity kinds this emulator has no
+    /// store for yet (`CreateRegexPatternSet` and the managed-rule-group catalogue
+    /// are still scaffolded 501s, tracked as separate gap issues), so every
+    /// reference to one names nothing that exists and is refused here. The `Some` it
+    /// answers is the DIAGNOSTIC for the refusal's audit record — the response
+    /// itself carries [`NONEXISTENT_ITEM_MESSAGE`], the constant sentence that
+    /// exception type always carries. That is also what keeps
+    /// [`web_acl_capacity`] from pricing a statement whose cost it cannot know: a
+    /// stored rule list can only carry a reference to a rule group this service
+    /// holds, whose declared `Capacity` is exactly that statement's cost, and never
+    /// a managed-rule-group or regex-pattern-set reference.
     ///
     /// Walked with an explicit worklist, like [`validate_statement_nesting`]: the
     /// tree is supplied by the request.
@@ -321,10 +372,19 @@ impl ComAmazonawsWafv2Awswaf20190729State {
                 }
             }
             if let Some(reference) = statement.rule_group_reference_statement.as_ref() {
-                return Some(format!(
-                    "No RuleGroup with the ARN {} exists in scope {scope}",
-                    reference.arn
-                ));
+                let resolved = matches!(
+                    self.arn_index.get(&reference.arn),
+                    Some(ResourceRef::RuleGroup {
+                        scope: stored_scope,
+                        ..
+                    }) if stored_scope == scope
+                );
+                if !resolved {
+                    return Some(format!(
+                        "No RuleGroup with the ARN {} exists in scope {scope}",
+                        reference.arn
+                    ));
+                }
             }
             if let Some(reference) = statement.regex_pattern_set_reference_statement.as_ref() {
                 return Some(format!(
@@ -352,13 +412,13 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     /// `rulegroup` AND be indexed as one: an ARN of another kind, or one naming a
     /// rule group that was never created, resolves to nothing.
     ///
-    /// Rule groups have no store yet — `CreateRuleGroup` is a scaffolded 501,
-    /// tracked as its own gap issue — so nothing is indexed under a `rulegroup`
-    /// ARN today and every such reference is unresolvable. That is the same stance
-    /// [`Self::unresolvable_rule_reference`] already takes for a
+    /// A rule group is indexed under [`ResourceRef::RuleGroup`] by
+    /// `CreateRuleGroup`, so this answers `true` for a rule group this service
+    /// holds and `false` for an ARN of another kind or one naming a rule group that
+    /// was never created. That is the same stance
+    /// [`Self::unresolvable_rule_reference`] takes for a
     /// `RuleGroupReferenceStatement`: a reference WAF cannot resolve is refused
-    /// rather than stored as though it were live. The resolution is read from the
-    /// index, so it starts answering `true` the moment rule groups are stored.
+    /// rather than stored as though it were live.
     pub fn holds_rule_group(&self, arn: &str) -> bool {
         arn_resource_kind(arn) == Some(RULE_GROUP_ARN_KIND)
             && matches!(self.arn_index.get(arn), Some(ResourceRef::RuleGroup { .. }))
@@ -408,6 +468,11 @@ pub const MAX_WEB_ACLS_PER_SCOPE: usize = 100;
 /// The most IP sets this service stores per scope; see [`MAX_WEB_ACLS_PER_SCOPE`].
 /// WAF's published quota is 100 IP sets per Region per scope.
 pub const MAX_IP_SETS_PER_SCOPE: usize = 100;
+
+/// The most rule groups this service stores per scope; see
+/// [`MAX_WEB_ACLS_PER_SCOPE`]. WAF's published quota is 100 rule groups per Region
+/// per scope.
+pub const MAX_RULE_GROUPS_PER_SCOPE: usize = 100;
 
 /// The most addresses one IP set holds: WAF's published quota is 10,000 IP
 /// addresses or ranges per IP set. It bounds how large a single stored entry can
@@ -511,6 +576,51 @@ pub fn validate_statement_nesting(rules: &[Rule]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Where a `RuleGroupReferenceStatement` may appear, if `rules` puts one
+/// somewhere it may not. `Err` carries the reason, for the refusal's message.
+///
+/// The model states the placement rule on the statement itself
+/// (`smithy_query(query="doc",shape="RuleGroupReferenceStatement")`): "You cannot
+/// nest a `RuleGroupReferenceStatement`, for example for use inside a
+/// `NotStatement` or `OrStatement`. You cannot use a rule group reference
+/// statement inside another rule group. You can only reference a rule group as a
+/// top-level statement within a rule that you define in a web ACL." So a reference
+/// is well placed ONLY as a rule's own top-level statement, and only in a web ACL:
+/// `top_level_allowed` is `true` for a web ACL save and `false` for a rule group
+/// save. A misplacement is a parameter WAF does not accept rather than a dangling
+/// reference, so it is answered with `WAFInvalidParameterException` ("Your nested
+/// statement isn't valid. You might have tried to nest a statement that can’t be
+/// nested", from that error's own doc) — and it is judged BEFORE the reference is
+/// resolved, because a well-placed reference is what resolution is defined over.
+///
+/// Walked with an explicit worklist, like [`validate_statement_nesting`]: the tree
+/// is supplied by the request.
+pub fn misplaced_rule_group_reference(rules: &[Rule], top_level_allowed: bool) -> Option<String> {
+    for rule in rules {
+        if !top_level_allowed && rule.statement.rule_group_reference_statement.is_some() {
+            return Some(format!(
+                "the rule {:?} carries a RuleGroupReferenceStatement; a rule group \
+                 can only be referenced from a rule of a web ACL, not from a rule \
+                 of another rule group",
+                rule.name
+            ));
+        }
+        let mut pending: Vec<&Statement> = nested_statements(&rule.statement);
+        while let Some(statement) = pending.pop() {
+            if statement.rule_group_reference_statement.is_some() {
+                return Some(format!(
+                    "the rule {:?} nests a RuleGroupReferenceStatement inside another \
+                     statement; a rule group can only be referenced by a rule's \
+                     top-level statement",
+                    rule.name
+                ));
+            }
+            pending.extend(nested_statements(statement));
+        }
+    }
+    None
 }
 
 /// `true` when `statement`, or anything nested inside it, is an
@@ -685,11 +795,19 @@ pub fn resource_arn(
     )
 }
 
-/// `awswaf:<account ID>:webacl:<web ACL name>:` — the prefix the
-/// `WebACL$LabelNamespace` doc specifies for every label a rule in this web ACL
-/// adds.
-pub fn web_acl_label_namespace(name: &str) -> String {
-    format!("awswaf:{}:webacl:{name}:", ::engine::emulator_account_id())
+/// `awswaf:<account ID>:<kind>:<entity name>:` — the prefix the `LabelNamespace`
+/// member of a label-bearing entity specifies for every label a rule in it adds.
+///
+/// One helper for every entity kind, because both docs give the same shape with
+/// only the kind segment differing: `WebACL$LabelNamespace` is
+/// "awswaf:<account ID>:webacl:<web ACL name>:" and `RuleGroup$LabelNamespace` is
+/// "awswaf:<account ID>:rulegroup:<rule group name>:". `kind` is the same resource
+/// segment an ARN carries, so pass the `…_ARN_KIND` constant for the entity.
+pub fn label_namespace(kind: &str, name: &str) -> String {
+    format!(
+        "awswaf:{}:{kind}:{name}:",
+        ::engine::emulator_account_id()
+    )
 }
 
 /// Check one `Addresses` entry against the set's declared `IPAddressVersion`.
@@ -751,20 +869,33 @@ pub fn validate_cidr(address: &str, ip_address_version: &str) -> Result<(), Stri
 /// Guide publishes for each rule statement in its rule-statement list; a logical
 /// statement costs the sum of what it nests.
 ///
-/// Two costs this slice cannot know are never reached rather than guessed: a
-/// `RuleGroupReferenceStatement` costs the referenced rule group's own capacity and
-/// a `ManagedRuleGroupStatement` costs the managed group's, and neither rule groups
-/// (`CreateRuleGroup`) nor the managed catalogue
-/// (`ListAvailableManagedRuleGroups`) is implemented yet — both are separate gap
-/// issues, as is `CheckCapacity`. A statement referencing either names nothing this
-/// service holds, so it is refused on ingress by
-/// [`ComAmazonawsWafv2Awswaf20190729State::unresolvable_rule_reference`] and no
-/// stored rule list can carry one: this function never has to price a reference
-/// whose cost it cannot know, and no caller is handed an understated `Capacity`.
-pub fn web_acl_capacity(rules: &[Rule]) -> i64 {
+/// One cost is not a constant: a `RuleGroupReferenceStatement` costs the
+/// referenced rule group's own `Capacity` — "the web ACL capacity units (WCUs)
+/// required for this rule group", fixed when the group is created — so
+/// `rule_group_capacities` carries `ARN` → `Capacity` for the scope being saved
+/// into, as [`ComAmazonawsWafv2Awswaf20190729State::rule_group_capacities`] reads
+/// it out of state. A reference naming a rule group this service does not hold is
+/// refused on ingress by
+/// [`ComAmazonawsWafv2Awswaf20190729State::unresolvable_rule_reference`], so every
+/// reference a stored rule list carries is in that map.
+///
+/// The one cost that is still never reached rather than guessed is a
+/// `ManagedRuleGroupStatement`'s: it costs the managed group's capacity and the
+/// managed catalogue (`ListAvailableManagedRuleGroups`) is not implemented yet — a
+/// separate gap issue, as is `CheckCapacity`. Such a statement names nothing this
+/// service holds and is refused on ingress too, so this function never has to
+/// price a reference whose cost it cannot know, and no caller is handed an
+/// understated `Capacity`.
+pub fn web_acl_capacity(rules: &[Rule], rule_group_capacities: &HashMap<String, i64>) -> i64 {
     rules
         .iter()
-        .map(|rule| statement_capacity(&rule.statement, MAX_STATEMENT_NESTING_DEPTH))
+        .map(|rule| {
+            statement_capacity(
+                &rule.statement,
+                MAX_STATEMENT_NESTING_DEPTH,
+                rule_group_capacities,
+            )
+        })
         .sum()
 }
 
@@ -806,7 +937,11 @@ pub const RATE_BASED_CUSTOM_KEYS_WCU: i64 = 30;
 /// [`statement_references_ip_set`]: a caller-supplied tree deeper than
 /// [`MAX_STATEMENT_NESTING_DEPTH`] is refused on ingress, and this budget is the
 /// second line of defence so no request can drive the recursion past it.
-fn statement_capacity(statement: &Statement, depth_budget: u32) -> i64 {
+fn statement_capacity(
+    statement: &Statement,
+    depth_budget: u32,
+    rule_group_capacities: &HashMap<String, i64>,
+) -> i64 {
     if depth_budget == 0 {
         return 0;
     }
@@ -849,9 +984,18 @@ fn statement_capacity(statement: &Statement, depth_budget: u32) -> i64 {
             capacity += RATE_BASED_CUSTOM_KEYS_WCU;
         }
     }
+    // A rule group reference costs the referenced group's declared capacity, which
+    // `rule_group_capacities` carries for every rule group of this scope. A
+    // reference naming one this service does not hold never reaches here.
+    if let Some(reference) = statement.rule_group_reference_statement.as_ref() {
+        capacity += rule_group_capacities
+            .get(&reference.arn)
+            .copied()
+            .unwrap_or_default();
+    }
     capacity += nested_statements(statement)
         .into_iter()
-        .map(|nested| statement_capacity(nested, depth_budget - 1))
+        .map(|nested| statement_capacity(nested, depth_budget - 1, rule_group_capacities))
         .sum::<i64>();
     capacity
 }
@@ -922,12 +1066,16 @@ pub fn apply_rule_defaults(rules: &mut [Rule]) {
 ///   collection of them, not an unknown one.
 /// * `OnSourceDDoSProtectionConfig` — [`DEFAULT_ALB_LOW_REPUTATION_MODE`].
 /// * `Capacity` — [`web_acl_capacity`] of the stored rules, which is why it is
-///   computed AFTER the rule defaults are applied.
-pub fn apply_web_acl_defaults(web_acl: &mut WebACL) {
+///   computed AFTER the rule defaults are applied. `rule_group_capacities` prices
+///   the rule-group references the tree carries; see [`web_acl_capacity`].
+pub fn apply_web_acl_defaults(
+    web_acl: &mut WebACL,
+    rule_group_capacities: &HashMap<String, i64>,
+) {
     web_acl.description = stored_description(web_acl.description.take());
     let mut rules = web_acl.rules.take().unwrap_or_default();
     apply_rule_defaults(&mut rules);
-    web_acl.capacity = web_acl_capacity(&rules);
+    web_acl.capacity = web_acl_capacity(&rules, rule_group_capacities);
     web_acl.rules = Some(rules);
     web_acl.on_source_d_do_s_protection_config = Some(
         web_acl
@@ -937,6 +1085,79 @@ pub fn apply_web_acl_defaults(web_acl: &mut WebACL) {
                 alb_low_reputation_mode: DEFAULT_ALB_LOW_REPUTATION_MODE.to_string(),
             }),
     );
+}
+
+/// The labels a rule group's rules ADD to matching requests, deduplicated and in
+/// a stable order.
+///
+/// `RuleGroup$AvailableLabels` is "the labels that one or more rules in this rule
+/// group add to matching web requests. These labels are defined in the
+/// `RuleLabels` for a Rule", so it is DERIVED from the stored rules rather than
+/// carried in the request. Each entry is the label as the rule specified it
+/// (`LabelSummary$Name` is "an individual label specification"); the prefix every
+/// one of them acquires at match time is reported separately, as
+/// [`label_namespace`].
+pub fn rule_group_available_labels(rules: &[Rule]) -> Vec<LabelSummary> {
+    let names: ::std::collections::BTreeSet<&str> = rules
+        .iter()
+        .flat_map(|rule| rule.rule_labels.as_deref().unwrap_or_default())
+        .map(|label| label.name.as_str())
+        .collect();
+    names
+        .into_iter()
+        .map(|name| LabelSummary {
+            name: Some(name.to_string()),
+        })
+        .collect()
+}
+
+/// The labels a rule group's rules MATCH AGAINST, deduplicated and in a stable
+/// order.
+///
+/// `RuleGroup$ConsumedLabels` is "the labels that one or more rules in this rule
+/// group match against in label match statements. These labels are defined in a
+/// `LabelMatchStatement` specification, in the Statement definition of a rule", so
+/// it is derived from the stored rules the way [`rule_group_available_labels`] is —
+/// and from the whole statement tree, because a `LabelMatchStatement` can sit
+/// inside any nesting [`nested_statements`] enumerates.
+pub fn rule_group_consumed_labels(rules: &[Rule]) -> Vec<LabelSummary> {
+    let mut keys: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
+    let mut pending: Vec<&Statement> = rules.iter().map(|rule| &rule.statement).collect();
+    while let Some(statement) = pending.pop() {
+        if let Some(label_match) = statement.label_match_statement.as_ref() {
+            keys.insert(label_match.key.clone());
+        }
+        pending.extend(nested_statements(statement));
+    }
+    keys.into_iter()
+        .map(|key| LabelSummary { name: Some(key) })
+        .collect()
+}
+
+/// Materialise, on a rule group about to be stored, every member WAF derives or
+/// defaults server-side on a save.
+///
+/// The rule-group counterpart of [`apply_web_acl_defaults`], so a rule group reads
+/// back the same way however it was last saved:
+///
+/// * `Description` — [`stored_description`].
+/// * `Rules` — always a list, for the same reason the web ACL's is: a rule group
+///   with no rules has an empty collection of them, not an unknown one.
+/// * `AvailableLabels` / `ConsumedLabels` — derived from the stored rules by
+///   [`rule_group_available_labels`] and [`rule_group_consumed_labels`], which is
+///   why they are computed AFTER the rule defaults are applied.
+///
+/// `Capacity` is NOT derived here: unlike `WebACL$Capacity`, a rule group's is
+/// "the web ACL capacity units (WCUs) required for this rule group", which the
+/// create call declares and "you cannot change it after creation" — so the
+/// declared value is what is stored and reported.
+pub fn apply_rule_group_defaults(rule_group: &mut RuleGroup) {
+    rule_group.description = stored_description(rule_group.description.take());
+    let mut rules = rule_group.rules.take().unwrap_or_default();
+    apply_rule_defaults(&mut rules);
+    rule_group.available_labels = Some(rule_group_available_labels(&rules));
+    rule_group.consumed_labels = Some(rule_group_consumed_labels(&rules));
+    rule_group.rules = Some(rules);
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -991,6 +1212,14 @@ pub const FIELD_RESOURCE_ARN: &str = "RESOURCE_ARN";
 /// [`FIELD_RESOURCE_ARN`].
 pub const FIELD_WEB_ACL: &str = "WEB_ACL";
 
+/// The `ParameterExceptionField` value naming a rule group. See
+/// [`FIELD_RESOURCE_ARN`].
+pub const FIELD_RULE_GROUP: &str = "RULE_GROUP";
+
+/// The `ParameterExceptionField` value naming a `RuleGroupReferenceStatement`. See
+/// [`FIELD_RESOURCE_ARN`].
+pub const FIELD_RULE_GROUP_REFERENCE_STATEMENT: &str = "RULE_GROUP_REFERENCE_STATEMENT";
+
 /// The `ParameterExceptionField` value naming a `Scope`. See
 /// [`FIELD_RESOURCE_ARN`].
 pub const FIELD_SCOPE_VALUE: &str = "SCOPE_VALUE";
@@ -1021,6 +1250,14 @@ pub const ARN_NOT_VALID_REASON: &str = "The ARN isn't valid. A valid ARN begins 
 /// (`arn:…:wafv2:…:<global|regional>/rulegroup/<name>/<id>`, the form
 /// [`resource_arn`] mints).
 pub const RULE_GROUP_ARN_KIND: &str = "rulegroup";
+
+/// The resource-kind segment a web ACL's ARN carries. See
+/// [`RULE_GROUP_ARN_KIND`].
+pub const WEB_ACL_ARN_KIND: &str = "webacl";
+
+/// The resource-kind segment an IP set's ARN carries. See
+/// [`RULE_GROUP_ARN_KIND`].
+pub const IP_SET_ARN_KIND: &str = "ipset";
 
 /// `WAFInvalidParameterException` as WAF returns it: the structured `Field`,
 /// `Parameter` and `Reason` the model gives this one exception, and the message

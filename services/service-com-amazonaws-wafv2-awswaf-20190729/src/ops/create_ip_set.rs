@@ -266,7 +266,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = crate::state::new_uuid();
         let lock_token = crate::state::new_uuid();
-        let arn = crate::state::resource_arn(&input.scope, &region, "ipset", &input.name, &id);
+        let arn = crate::state::resource_arn(
+            &input.scope,
+            &region,
+            crate::state::IP_SET_ARN_KIND,
+            &input.name,
+            &id,
+        );
         let ip_set = IPSet {
             name: input.name.clone(),
             id: id.clone(),

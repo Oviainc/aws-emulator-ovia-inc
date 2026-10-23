@@ -1054,18 +1054,13 @@ impl ConfigRuleEntry {
     /// at least one is compliant and none is not, and `INSUFFICIENT_DATA` when no
     /// result places it either way (which includes a rule nothing has evaluated).
     pub fn compliance(&self) -> &'static str {
-        let has = |compliance_type: &str| {
+        // One roll-up rule for the whole service: see
+        // [`resource_evaluation::roll_up_compliance`].
+        resource_evaluation::roll_up_compliance(
             self.evaluation_results
                 .values()
-                .any(|recorded| recorded.compliance_type == compliance_type)
-        };
-        if has(COMPLIANCE_TYPE_NON_COMPLIANT) {
-            COMPLIANCE_TYPE_NON_COMPLIANT
-        } else if has(COMPLIANCE_TYPE_COMPLIANT) {
-            COMPLIANCE_TYPE_COMPLIANT
-        } else {
-            COMPLIANCE_TYPE_INSUFFICIENT_DATA
-        }
+                .map(|recorded| recorded.compliance_type.as_str()),
+        )
     }
 
     /// This rule's modelled `Compliance`: the `ComplianceType` it rolls up to
@@ -1431,11 +1426,15 @@ pub type ResourceEvaluationPageKey = (::std::cmp::Reverse<i128>, String);
 /// The evaluation's OUTCOME is not part of this record: deciding whether the resource
 /// details comply means running every proactive Config rule against them, which this
 /// emulator has no rule engine for — the same reason
-/// [`ConfigRuleEntry::evaluation_results`] stays empty and
-/// `GetResourceEvaluationSummary` is still scaffolded. What is persisted is what the
-/// control plane owns and what the list path reports: the id Config minted, the mode
-/// the evaluation runs in, when its execution started, the deployment context it
-/// belongs to, the resource details it was handed and the timeout it runs under.
+/// [`ConfigRuleEntry::evaluation_results`] holds only the results something recorded.
+/// `GetResourceEvaluationSummary` therefore DERIVES the status and the compliance it
+/// reports from this record, the rules in state and the clock (see
+/// [`resource_evaluation`]), and an execution that would have to run a rule's
+/// implementation is reported as the modelled failure rather than as a synthesised
+/// verdict. What is persisted here is what the control plane owns and what the list
+/// path reports: the id Config minted, the mode the evaluation runs in, when its
+/// execution started, the deployment context it belongs to, the resource details it
+/// was handed and the timeout it runs under.
 #[derive(Debug, Clone)]
 pub struct ResourceEvaluationEntry {
     /// The `ResourceEvaluationId` Config minted for this execution.
@@ -1755,6 +1754,14 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
         None
     }
 }
+
+// The part of the resource-evaluation surface the SUMMARY derives — the status an
+// execution has reached and the compliance it places the resource at — lives in
+// `state/resource_evaluation.rs` and is re-exported here, so a handler reaches its
+// names as `crate::state::<name>`. Declared beside the store accessor, away from the
+// import list, the constants and the test module where other fixes land.
+pub mod resource_evaluation;
+pub use resource_evaluation::*;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

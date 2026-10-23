@@ -25,6 +25,8 @@ mod branch_create;
 mod branch_creation;
 #[path = "all/comment_content_deletion.rs"]
 mod comment_content_deletion;
+#[path = "all/comment_deleted_refusals.rs"]
+mod comment_deleted_refusals;
 #[path = "all/comment_lifecycle.rs"]
 mod comment_lifecycle;
 #[path = "all/commit_reads.rs"]
