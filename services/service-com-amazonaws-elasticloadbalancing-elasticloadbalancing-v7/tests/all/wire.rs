@@ -141,10 +141,9 @@ pub(crate) fn param(key: &str, value: &str) -> (String, String) {
 ///
 /// The reader below is deliberately tiny and test-only. awsQuery response envelopes are
 /// flat element trees with one default `xmlns` and no attributes, comments, CDATA or
-/// namespace prefixes, so reading them needs no XML library — and keeping these suites
-/// dependency-free keeps `Cargo.lock` out of the change, which matters because the
-/// landing merge treats any file both sides touch as a conflict and every other landing
-/// rewrites the lock. It is NOT a general XML parser and nothing outside `tests/` uses it.
+/// namespace prefixes, so reading them needs no XML library — and no crates.io XML parser
+/// is pulled in for test-only use of it. It is NOT a general XML parser and nothing
+/// outside `tests/` uses it.
 #[derive(Debug, Default)]
 pub(crate) struct Element {
     pub(crate) name: String,

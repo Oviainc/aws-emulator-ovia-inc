@@ -415,7 +415,8 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
                     params: &[("LoadBalancerName", "router-classic-elb")],
                     expected_status: 400,
                     expected_code: Some("InvalidAction"),
-                    expected_body_contains: &["<ErrorResponse", "ConfigureHealthCheck"],
+                    // The refusal names BOTH halves of the pair it could not resolve.
+                    expected_body_contains: &["<ErrorResponse", "ConfigureHealthCheck", V2_VERSION],
                 },
                 Call {
                     // A version no Elastic Load Balancing model declares: refused the same

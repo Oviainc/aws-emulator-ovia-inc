@@ -221,8 +221,8 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for V2FrontDoor<Eng> {
 /// action/version pair it cannot resolve with.
 ///
 /// Held as a field on the service and handed back from `Service::override_operation`,
-/// which is the one seam that sees the request body before the model's routing table
-/// resolves it.
+/// which is the one seam that sees the request body — where the `Version` field is —
+/// before the model's routing table resolves it.
 pub struct UnsupportedApiVersionOperation;
 
 impl ErasedOperation for UnsupportedApiVersionOperation {
