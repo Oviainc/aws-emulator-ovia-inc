@@ -7,7 +7,10 @@
 //! `LastUpdatedTime` and records the `UPDATE_IN_PROGRESS` event. The template the stack
 //! now carries is DEPLOYED: its resources and its outputs are re-evaluated, and take
 //! effect when the update completes, so a caller reading mid-update still sees the values
-//! in force.
+//! in force. A resource the new template declares anew is CREATED in the service that
+//! owns it, and one it no longer declares is deleted there, exactly as on a create
+//! (see [`crate::state::provisioning`]); a resource an owning service refuses leaves the
+//! stack in `UPDATE_FAILED` with that service's own refusal as the reason.
 //!
 //! Members this slice stores but has nothing to act on, because it performs no resource
 //! updates: `StackPolicyBody` (replaces the stack's policy, which `GetStackPolicy`
@@ -291,7 +294,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // "Conditional: You must specify only one of the following parameters:
         // TemplateBody, TemplateURL, or set the UsePreviousTemplate to true."
         let template_sources = [
@@ -436,7 +438,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "No updates are to be performed.",
             ));
         }
-
+        // Everything above read the store; nothing below it does until the template has
+        // been deployed.
         let operation_id = crate::state::new_operation_id();
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that create or delete the stack's resources run after it, and each of

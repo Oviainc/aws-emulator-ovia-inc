@@ -70,7 +70,8 @@
 //! not (`RepositoryName` / `RepositoryCatalogData.RepositoryDescription` against
 //! `repositoryName` / `catalogData.description`), so that arm maps the members the resource
 //! reference publishes one by one, and sends nothing for a property the template leaves
-//! out.
+//! out; and for `AWS::ECS::Cluster` they are the same members in a different CASE, with one
+//! renamed, so that arm re-cases them.
 //!
 //! A type with no entry there is left DECLARED-ONLY: [`StoredResource::materialised`]
 //! stays `false` and nothing is created in any service. Such a resource still carries the

@@ -21,6 +21,8 @@ mod change_set_lifecycle;
 mod error_envelope;
 #[path = "all/extension_registry.rs"]
 mod extension_registry;
+#[path = "all/provisioned_resources.rs"]
+mod provisioned_resources;
 #[path = "all/resolved_properties.rs"]
 mod resolved_properties;
 #[path = "all/scratch.rs"]

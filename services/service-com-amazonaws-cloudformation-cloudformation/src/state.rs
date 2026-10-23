@@ -64,6 +64,11 @@
 //! terminal status, so a stack always reports the resources and outputs of the template
 //! that finished deploying.
 //!
+//! CREATING those resources in the services that own them is [`provisioning`], which the
+//! deploying operation drives with no lock held — and which leaves the stack
+//! `CREATE_FAILED` with the owning service's own refusal as the reason rather than
+//! reporting a success whose resources do not exist.
+//!
 //! ## The extension registry
 //!
 //! Beside the stacks and their change sets the store holds this account and Region's
@@ -586,6 +591,10 @@ impl StoredStack {
     /// values in force rather than the ones the update is about to install. A template
     /// this service cannot read declares nothing, and leaves the stack with no resources
     /// and no outputs rather than with the previous template's.
+    ///
+    /// What this computes is what the resources ARE; CREATING them in the services that
+    /// own them is [`provisioning::reconcile`](provisioning::reconcile), which the
+    /// deploying operation calls with these records once the store is unlocked.
     pub fn deploy_template(&mut self) {
         let Some(declared) = self
             .template_body

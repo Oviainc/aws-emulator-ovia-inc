@@ -24,6 +24,10 @@
 //!   `RepositoryCatalogData.RepositoryDescription` against the API's `repositoryName` and
 //!   `catalogData.description`), so its arm maps the members AWS's resource reference
 //!   publishes one by one, and sends nothing for a property the template leaves out;
+//! * `AWS::ECS::Cluster`'s are the same members under a different CASE — the Amazon ECS
+//!   model spells them in lower camel case, and renames one (`ClusterSettings` sets
+//!   `settings`) — so its arm names the properties `CreateCluster` takes and re-cases each
+//!   value;
 //! * `AWS::SQS::Queue`'s properties are the queue's ATTRIBUTES, named identically on both
 //!   sides, so its arm passes them through as `CreateQueue`'s `Attributes` map, lifting
 //!   out the two that are not attributes (the name CloudFormation decides, and the tag
@@ -37,7 +41,9 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use super::provisioning::{call_json_rpc, Refusal, AWS_JSON_1_0, AWS_JSON_1_1};
-use super::template::{ECR_PUBLIC_REPOSITORY, FIREHOSE_DELIVERY_STREAM, SQS_QUEUE};
+use super::template::{
+    ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, FIREHOSE_DELIVERY_STREAM, SQS_QUEUE,
+};
 use super::StoredResource;
 
 /// The services whose resources this emulator creates. One variant per resource type.
@@ -45,6 +51,7 @@ use super::StoredResource;
 pub(super) enum Provisioner {
     FirehoseDeliveryStream,
     EcrPublicRepository,
+    EcsCluster,
     SqsQueue,
 }
 
@@ -54,6 +61,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
     match resource_type {
         FIREHOSE_DELIVERY_STREAM => Some(Provisioner::FirehoseDeliveryStream),
         ECR_PUBLIC_REPOSITORY => Some(Provisioner::EcrPublicRepository),
+        ECS_CLUSTER => Some(Provisioner::EcsCluster),
         SQS_QUEUE => Some(Provisioner::SqsQueue),
         _ => None,
     }
@@ -72,6 +80,7 @@ impl Provisioner {
         match self {
             Self::FirehoseDeliveryStream => create_delivery_stream(ctx, region, resource).await,
             Self::EcrPublicRepository => create_public_repository(ctx, region, resource).await,
+            Self::EcsCluster => create_cluster(ctx, region, resource).await,
             Self::SqsQueue => create_queue(ctx, region, resource).await,
         }
     }
@@ -93,6 +102,7 @@ impl Provisioner {
             Self::EcrPublicRepository => {
                 delete_public_repository(ctx, region, physical_resource_id).await
             }
+            Self::EcsCluster => delete_cluster(ctx, region, physical_resource_id).await,
             Self::SqsQueue => delete_queue(ctx, region, physical_resource_id).await,
         }
     }
@@ -280,6 +290,144 @@ async fn delete_public_repository(
         Ok(_) => Ok(()),
         Err(refusal) if refusal.code == REPOSITORY_NOT_FOUND => Ok(()),
         Err(refusal) => Err(refusal.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Amazon ECS: AWS::ECS::Cluster
+// ---------------------------------------------------------------------------
+
+/// Amazon ECS's signing name and `X-Amz-Target` prefix, from its model (`sigv4Name: ecs`,
+/// service shape `AmazonEC2ContainerServiceV20141113`), which speaks `awsJson1_1`.
+const ECS_SIGNING_NAME: &str = "ecs";
+const ECS_TARGET_PREFIX: &str = "AmazonEC2ContainerServiceV20141113";
+
+/// The error code Amazon ECS answers for a cluster it does not hold
+/// (`ClusterNotFoundException`: "The specified cluster wasn't found").
+const CLUSTER_NOT_FOUND: &str = "ClusterNotFoundException";
+
+/// The `AWS::ECS::Cluster` properties `CreateCluster` takes, as (property, member) pairs.
+///
+/// Source: AWS's CloudFormation resource reference for the type, member by member against
+/// the `CreateClusterRequest` shape. The Amazon ECS model spells its members in LOWER
+/// CAMEL case, so each value's own members are re-cased by [`lower_camel_members`], and
+/// one property's documented name is not its member's at all — a cluster's
+/// `ClusterSettings` sets `settings` ("The setting to use when creating a cluster").
+/// A property these pairs do not name is one `CreateCluster` has no member for; the
+/// cluster's `ClusterName` is set from the physical id instead.
+const ECS_CLUSTER_MEMBERS: &[(&str, &str)] = &[
+    ("CapacityProviders", "capacityProviders"),
+    ("ClusterSettings", "settings"),
+    ("Configuration", "configuration"),
+    (
+        "DefaultCapacityProviderStrategy",
+        "defaultCapacityProviderStrategy",
+    ),
+    ("ServiceConnectDefaults", "serviceConnectDefaults"),
+    ("Tags", "tags"),
+];
+
+/// Create the cluster an `AWS::ECS::Cluster` declares, so a client reading the stack's
+/// outputs and then calling Amazon ECS against that cluster (`ListTasks`,
+/// `DescribeClusters`) finds it there rather than a `ClusterNotFoundException`.
+///
+/// `Ref` of this type returns the cluster NAME, which is this resource's physical id, so
+/// the cluster is created under exactly the name the stack reports for it; the ARN it
+/// reports back is the resource's real identity and replaces the computed one.
+async fn create_cluster(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<BTreeMap<String, String>, Refusal> {
+    let mut request = Map::new();
+    if let Value::Object(properties) = &resource.properties {
+        for (property, member) in ECS_CLUSTER_MEMBERS {
+            if let Some(value) = properties.get(*property) {
+                request.insert((*member).to_string(), lower_camel_members(value));
+            }
+        }
+    }
+    request.insert(
+        "clusterName".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    let reported = call_json_rpc(
+        ctx,
+        ECS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ECS_TARGET_PREFIX}.CreateCluster"),
+        &Value::Object(request),
+    )
+    .await?;
+    let mut attributes = BTreeMap::new();
+    if let Some(arn) = reported
+        .get("cluster")
+        .and_then(|cluster| cluster.get("clusterArn"))
+        .and_then(Value::as_str)
+    {
+        attributes.insert("Arn".to_string(), arn.to_string());
+    }
+    Ok(attributes)
+}
+
+/// Delete the cluster a stack created. A cluster Amazon ECS no longer holds
+/// (`ClusterNotFoundException`) is already in the state the delete asks for; one that
+/// still holds active services or tasks is NOT deleted, and that refusal is what the stack
+/// reports.
+async fn delete_cluster(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), String> {
+    let request = serde_json::json!({ "cluster": physical_resource_id });
+    match call_json_rpc(
+        ctx,
+        ECS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ECS_TARGET_PREFIX}.DeleteCluster"),
+        &request,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == CLUSTER_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal.to_string()),
+    }
+}
+
+/// One property value with every member name inside it in LOWER CAMEL case, which is how
+/// a service whose model spells its members that way names the very same members a
+/// CloudFormation property names in upper camel case (`ClusterSettings: [{Name, Value}]`
+/// is `settings: [{name, value}]`).
+///
+/// The walk recurses over a tree the template reader already bounded in depth and node
+/// count (`super::template`'s `MAX_TEMPLATE_DEPTH` / `MAX_TEMPLATE_NODES`), so a
+/// caller-supplied body cannot drive it deeper than that constant. It is applied only
+/// where every member inside the property is a modelled name: a property carrying a MAP of
+/// caller data (a container definition's `DockerLabels`) would have its keys re-cased too,
+/// and no property of the type above carries one.
+fn lower_camel_members(value: &Value) -> Value {
+    match value {
+        Value::Object(members) => Value::Object(
+            members
+                .iter()
+                .map(|(name, member)| (lower_camel(name), lower_camel_members(member)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(lower_camel_members).collect()),
+        scalar => scalar.clone(),
+    }
+}
+
+/// One member name with its first character lowered, which is the whole difference
+/// between such a property's documented name and the member it sets.
+fn lower_camel(name: &str) -> String {
+    let mut characters = name.chars();
+    match characters.next() {
+        Some(first) => first.to_lowercase().chain(characters).collect(),
+        None => String::new(),
     }
 }
 

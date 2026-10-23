@@ -6,7 +6,10 @@
 //! transition — `CREATE_IN_PROGRESS` → `CREATE_COMPLETE` for a `CREATE` change set (the one
 //! that created the stack in `REVIEW_IN_PROGRESS`), `UPDATE_IN_PROGRESS` →
 //! `UPDATE_COMPLETE` for an `UPDATE` one — so `DescribeStacks` reports the stack settling
-//! just as it does after `CreateStack`/`UpdateStack`.
+//! just as it does after `CreateStack`/`UpdateStack`. Executing it also DEPLOYS that
+//! template, which creates the resources it declares in the services that own them
+//! (`crate::state::provisioning`) and settles the stack in the FAILED status of the
+//! operation it opened when one of them refuses.
 //!
 //! The change set itself moves to `EXECUTE_IN_PROGRESS` and reaches `EXECUTE_COMPLETE`
 //! with the stack, and "CloudFormation deletes all other change sets associated with the
@@ -179,7 +182,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // "If you specified the name of a change set, specify the stack name ... that's
         // associated with the change set": only an ARN names a change set on its own.
         crate::state::require_stack_for_change_set_name(

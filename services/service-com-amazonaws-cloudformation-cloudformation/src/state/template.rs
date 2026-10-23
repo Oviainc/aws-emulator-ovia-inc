@@ -1635,6 +1635,11 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::DynamoDB::Table",
     "AWS::EC2::SecurityGroup",
     ECR_PUBLIC_REPOSITORY,
+    ECR_REPOSITORY,
+    ECS_CLUSTER,
+    ECS_TASK_DEFINITION,
+    ELB_LOAD_BALANCER,
+    ELB_TARGET_GROUP,
     "AWS::IAM::Role",
     FIREHOSE_DELIVERY_STREAM,
     "AWS::Lambda::Function",
@@ -1802,6 +1807,121 @@ fn return_values(
                 ),
             );
             (name.to_string(), attributes)
+        }
+        // "Ref returns the repository name"; Fn::GetAtt: Arn, RepositoryUri. The URI is
+        // the registry host of the account and Region plus the repository's name
+        // ("The format is `aws_account_id.dkr.ecr.region.amazonaws.com/repository-name`"),
+        // which is what a container image reference built from this stack's output pulls
+        // from — and exactly what Amazon ECR's own `CreateRepository` answers.
+        ECR_REPOSITORY => {
+            // "A repository name must start with a letter and can only contain lowercase
+            // letters, numbers, hyphens, underscores, and forward slashes"
+            // (`RepositoryName`'s pattern is lower case only), so the name CloudFormation
+            // GENERATES for a repository the template does not name is lower-cased; a name
+            // the template declared is reported exactly as it wrote it.
+            let repository = match properties.get("RepositoryName") {
+                Some(_) => name.to_string(),
+                None => name.to_lowercase(),
+            };
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    "ecr",
+                    region,
+                    &format!("repository/{repository}"),
+                ),
+            );
+            attributes.insert(
+                "RepositoryUri".to_string(),
+                format!(
+                    "{}.dkr.ecr.{region}.{URL_SUFFIX}/{repository}",
+                    ::emulator_server::emulator_account_id()
+                ),
+            );
+            (repository, attributes)
+        }
+        // "Ref returns the cluster name"; Fn::GetAtt: Arn. This is the type
+        // `super::provisioning` creates in Amazon ECS itself, so the cluster a stack's
+        // output names is one `ecs ListTasks` finds.
+        ECS_CLUSTER => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("ecs", region, &format!("cluster/{name}")),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the Amazon Resource Name (ARN) of the task definition";
+        // Fn::GetAtt: TaskDefinitionArn.
+        //
+        // A task definition is identified by its FAMILY and a revision, not by a name
+        // property ("the family and revision (family:revision)"), so the family is the
+        // declared `Family` — evaluated through the template's intrinsics, as every
+        // declared name is — and the revision is the FIRST one, which is the revision the
+        // registration a stack declaring a family makes carries. A later registration of
+        // the same family is numbered by Amazon ECS, and nothing here re-reads that
+        // number.
+        ECS_TASK_DEFINITION => {
+            let family = properties
+                .get("Family")
+                .and_then(|value| text(value, scope, 0, budget))
+                .unwrap_or_else(|| name.to_string());
+            let arn = ::emulator_server::emulator_arn(
+                "ecs",
+                region,
+                &format!("task-definition/{family}:{FIRST_TASK_DEFINITION_REVISION}"),
+            );
+            attributes.insert("TaskDefinitionArn".to_string(), arn.clone());
+            (arn, attributes)
+        }
+        // "Ref returns the ARN of the load balancer"; Fn::GetAtt: DNSName,
+        // LoadBalancerFullName, LoadBalancerName (CanonicalHostedZoneID is a value AWS
+        // allocated per Region — nothing computes it — and SecurityGroups is list-valued,
+        // so neither is carried).
+        //
+        // Both the ARN and the DNS name carry an id Elastic Load Balancing ASSIGNS
+        // (`.../loadbalancer/app/<name>/<id>`, `<name>-<id>.<region>.elb.amazonaws.com`,
+        // prefixed `internal-` for an internal scheme), in the same 16-character form that
+        // service mints, and the ARN's type segment is the one its own ARNs carry: `app`
+        // for an Application Load Balancer, `net` for a Network one, `gwy` for a Gateway
+        // one.
+        ELB_LOAD_BALANCER => {
+            let id = service_assigned_label(ELB_LOAD_BALANCER_ID_SALT, name, ELB_ID_HEX_DIGITS);
+            let type_code = load_balancer_type_code(properties, scope, budget);
+            let path = format!("{type_code}/{name}/{id}");
+            let internal = properties
+                .get("Scheme")
+                .and_then(|value| text(value, scope, 0, budget))
+                .as_deref()
+                == Some(ELB_SCHEME_INTERNAL);
+            let prefix = if internal { "internal-" } else { "" };
+            attributes.insert(
+                "DNSName".to_string(),
+                format!("{prefix}{name}-{id}.{region}.elb.{URL_SUFFIX}"),
+            );
+            attributes.insert("LoadBalancerFullName".to_string(), path.clone());
+            attributes.insert("LoadBalancerName".to_string(), name.to_string());
+            (
+                ::emulator_server::emulator_arn(
+                    "elasticloadbalancing",
+                    region,
+                    &format!("loadbalancer/{path}"),
+                ),
+                attributes,
+            )
+        }
+        // "Ref returns the ARN of the target group"; Fn::GetAtt: TargetGroupArn,
+        // TargetGroupFullName, TargetGroupName (LoadBalancerArns is list-valued, so it is
+        // not carried). The full name is the ARN's own resource path,
+        // `targetgroup/<name>/<id>`, with the same service-assigned id form.
+        ELB_TARGET_GROUP => {
+            let id = service_assigned_label(ELB_TARGET_GROUP_ID_SALT, name, ELB_ID_HEX_DIGITS);
+            let path = format!("targetgroup/{name}/{id}");
+            let arn =
+                ::emulator_server::emulator_arn("elasticloadbalancing", region, &path);
+            attributes.insert("TargetGroupArn".to_string(), arn.clone());
+            attributes.insert("TargetGroupFullName".to_string(), path);
+            attributes.insert("TargetGroupName".to_string(), name.to_string());
+            (arn, attributes)
         }
         // "Ref returns the DBClusterIdentifier"; Fn::GetAtt: DBClusterArn,
         // DBClusterResourceId, Endpoint.Address, Endpoint.Port, ReadEndpoint.Address
@@ -2044,6 +2164,62 @@ pub const SQS_QUEUE: &str = "AWS::SQS::Queue";
 /// ECR Public model's `awsService.cloudFormationName` (`ECRPUBLIC`): the type is what a
 /// template spells.
 pub const ECR_PUBLIC_REPOSITORY: &str = "AWS::ECR::PublicRepository";
+
+/// An Amazon ECR repository's resource type (ECR's model: `cloudFormationName: ECR`).
+pub const ECR_REPOSITORY: &str = "AWS::ECR::Repository";
+
+/// An Amazon ECS cluster's resource type (ECS's model: `cloudFormationName: ECS`). This
+/// is the type `super::provisioning` creates in Amazon ECS itself.
+pub const ECS_CLUSTER: &str = "AWS::ECS::Cluster";
+
+/// An Amazon ECS task definition's resource type.
+pub const ECS_TASK_DEFINITION: &str = "AWS::ECS::TaskDefinition";
+
+/// An Elastic Load Balancing v2 load balancer's resource type (that model's
+/// `cloudFormationName: ElasticLoadBalancingV2`).
+pub const ELB_LOAD_BALANCER: &str = "AWS::ElasticLoadBalancingV2::LoadBalancer";
+
+/// An Elastic Load Balancing v2 target group's resource type.
+pub const ELB_TARGET_GROUP: &str = "AWS::ElasticLoadBalancingV2::TargetGroup";
+
+/// The revision a task definition registered for a family the account does not hold yet
+/// carries: "the first task definition that you registered to a family is given a revision
+/// of 1".
+const FIRST_TASK_DEFINITION_REVISION: u32 = 1;
+
+/// How many characters the id Elastic Load Balancing assigns a load balancer, a target
+/// group or a listener carries: 16 lowercase hexadecimal, the form that service's own
+/// `mint_id` produces (`.../app/my-load-balancer/50dc6c495c0c9188`).
+const ELB_ID_HEX_DIGITS: usize = 16;
+
+/// The salts those ids are derived under (see [`service_assigned_label`]) — one PER KIND,
+/// because Elastic Load Balancing keeps the two name spaces apart (a load balancer and a
+/// target group may carry the same name) while the ids it assigns them are distinct.
+const ELB_LOAD_BALANCER_ID_SALT: &str = "elasticloadbalancing/loadbalancer-id";
+const ELB_TARGET_GROUP_ID_SALT: &str = "elasticloadbalancing/targetgroup-id";
+
+/// The `Scheme` value of an INTERNAL load balancer, whose DNS name carries the
+/// `internal-` prefix.
+const ELB_SCHEME_INTERNAL: &str = "internal";
+
+/// The segment a load balancer's ARN carries for its `Type`: "`app` for an Application
+/// Load Balancer, `net` for a Network Load Balancer, `gwy` for a Gateway Load Balancer",
+/// with `application` the modelled default for the property.
+fn load_balancer_type_code(
+    properties: &Value,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> &'static str {
+    match properties
+        .get("Type")
+        .and_then(|value| text(value, scope, 0, budget))
+        .as_deref()
+    {
+        Some("network") => "net",
+        Some("gateway") => "gwy",
+        _ => "app",
+    }
+}
 
 /// Fill in each resource's evaluated `Properties`, against the whole set of resources the
 /// template declares.
