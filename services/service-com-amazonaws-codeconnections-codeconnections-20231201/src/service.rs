@@ -105,6 +105,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // one rule serves both forms. A target whose final segment names no modeled
         // operation resolves to `None` and is left to the generated routing table,
         // which renders the protocol's own routing failure.
+        //
+        // The rule is protocol-general rather than service-specific, so it belongs in
+        // the framework's own `routing_key_from_x_amz_target`; `vendor/` is read-only
+        // here, so the gap is filed as
+        // `issues/things-that-do-not-work/20261023T000000Z-gap-smithy-schema-server-x-amz-target-split-at-the-first-dot.md`
+        // and this override should be deleted once that lands.
         let target = req.headers().get("x-amz-target")?;
         let operation = target.rsplit_once('.').map_or(target, |(_, op)| op);
         self.entry.routing_table().get(operation)

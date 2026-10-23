@@ -19,6 +19,8 @@ mod git_sync;
 mod host_association;
 #[path = "all/modeled_input_refusals.rs"]
 mod modeled_input_refusals;
+#[path = "all/repository_link_lifecycle.rs"]
+mod repository_link_lifecycle;
 #[path = "all/resource_sync_status.rs"]
 mod resource_sync_status;
 #[path = "all/state_roundtrip.rs"]
