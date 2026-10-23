@@ -19,6 +19,8 @@ mod async_invocation;
 mod capacity_provider_bounds;
 #[path = "all/capacity_providers.rs"]
 mod capacity_providers;
+#[path = "all/event_source_mappings.rs"]
+mod event_source_mappings;
 #[path = "all/function_aliases.rs"]
 mod function_aliases;
 #[path = "all/function_code_update.rs"]

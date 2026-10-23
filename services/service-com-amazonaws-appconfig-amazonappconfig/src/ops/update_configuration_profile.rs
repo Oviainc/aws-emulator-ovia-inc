@@ -192,9 +192,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(application) = store.applications.get_mut(&input.application_id) else {
             return Err(UpdateConfigurationProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No application with id {} exists.",
-                        input.application_id
+                    message: Some(crate::state::application_not_found(
+                        &input.application_id,
                     )),
                     resource_name: Some(input.application_id),
                 },
@@ -204,15 +203,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(profile) = application.profiles.get_mut(&input.configuration_profile_id) else {
             return Err(UpdateConfigurationProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No configuration profile with id {} exists in application {}.",
-                        input.configuration_profile_id, input.application_id
+                    message: Some(crate::state::configuration_profile_not_found(
+                        &input.application_id,
+                        &input.configuration_profile_id,
                     )),
                     resource_name: Some(input.configuration_profile_id),
                 },
             )
             .into());
         };
+
+        // The same cross-field rule `CreateConfigurationProfile` applies, applied to the
+        // record this update would leave behind. `LocationUri` is not a member of this
+        // request, so a profile whose location needs a `RetrievalRoleArn` (the model's
+        // `RetrievalRoleArn` doc: not required for CodePipeline or the AppConfig hosted
+        // store, required for every other source) must still have one afterwards.
+        // Checked BEFORE anything is written, so a refused update changes nothing.
+        let next_retrieval_role_arn = input
+            .retrieval_role_arn
+            .clone()
+            .or_else(|| profile.retrieval_role_arn.clone());
+        if crate::state::location_uri_requires_retrieval_role(&profile.location_uri)
+            && next_retrieval_role_arn.is_none()
+        {
+            return Err(UpdateConfigurationProfileErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::retrieval_role_required_message(
+                        &profile.location_uri,
+                    )),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
 
         // An update carries only the members the caller means to change, so a member the
         // request omits keeps the value the profile already holds. `LocationUri` and

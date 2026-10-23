@@ -37,10 +37,25 @@ pub(crate) fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// Send one request and return `(status, parsed body)`. An empty body parses to
-/// `Value::Null`, which is how a 204 is asserted.
+/// Send one request, signed for [`REGION`], and return `(status, parsed body)`. An
+/// empty body parses to `Value::Null`, which is how a 204 is asserted.
 pub(crate) async fn call(
     emulator: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    call_in_region(emulator, REGION, method, uri, body).await
+}
+
+/// Send one request signed for `region` and return `(status, parsed body)`.
+///
+/// The SigV4 credential scope is what routes the request to this service and what
+/// names the region its endpoints are reported in, so a suite that asserts on a
+/// region-bearing value drives this directly; [`call`] is this with [`REGION`].
+pub(crate) async fn call_in_region(
+    emulator: &MultiServiceRouter,
+    region: &str,
     method: &str,
     uri: &str,
     body: Option<Value>,
@@ -49,16 +64,14 @@ pub(crate) async fn call(
         Some(value) => Bytes::from(serde_json::to_vec(value).expect("serialize request body")),
         None => Bytes::new(),
     };
-    // The SigV4 credential scope is what routes the request to this service and what
-    // names the region its endpoints are reported in.
     let request = http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", format!("apigateway.{REGION}.amazonaws.com"))
+        .header("host", format!("apigateway.{region}.amazonaws.com"))
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTAPIGWV2/20261021/{REGION}/apigateway/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDTESTAPIGWV2/20261021/{region}/apigateway/aws4_request, \
                  SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000"
             ),
         )
@@ -233,9 +246,14 @@ async fn create_api_persists_the_record_get_api_reports_back() {
         let api_id = as_str(&created, "apiId");
         assert_minted_id(case.label, "ApiId", &api_id);
 
+        // The host is the api's own, in the request's region; the scheme follows the
+        // api's protocol type (see `api_endpoint_scheme.rs` for the table over that).
         assert_eq!(
             as_str(&created, "apiEndpoint"),
-            format!("https://{api_id}.execute-api.{REGION}.amazonaws.com"),
+            format!(
+                "{}://{api_id}.execute-api.{REGION}.amazonaws.com",
+                crate::api_endpoint_scheme::expected_scheme(&as_str(&created, "protocolType"))
+            ),
             "case {:?}: ApiEndpoint must be the api's own execute-api host in the request's region, got {created}",
             case.label
         );

@@ -24,8 +24,8 @@
 //!
 //! Every size a request can choose here is bounded: the expression's length, token
 //! count and parenthesis nesting (see [`tokenize`] and [`Parser`]), and the page the
-//! response carries ([`MAX_PAGE_BYTES`]), so one `Query` cannot drive unbounded work
-//! or an unbounded response.
+//! response carries ([`crate::state::MAX_PAGE_BYTES`]), so one `Query` cannot drive
+//! unbounded work or an unbounded response.
 //!
 //! ## Shape of an operation
 //!
@@ -260,6 +260,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The most data one page of a `Query` response carries, which is the store's own
+/// page budget: "A single Query operation can retrieve a maximum of 1 MB of data"
+/// (`Query$Limit` and "Paginating table query results"). A page that stops there
+/// reports a `LastEvaluatedKey`, so the caller pages on, and one request cannot
+/// amplify into a response the size of a partition.
+use crate::state::MAX_PAGE_BYTES;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -461,12 +468,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The most data one page of a `Query` response carries: "A single Query operation
-/// can retrieve a maximum of 1 MB of data" (`Query$Limit` and "Paginating table query
-/// results"). A page that stops here reports a `LastEvaluatedKey`, so the caller
-/// pages on, and one request cannot amplify into a response the size of a partition.
-const MAX_PAGE_BYTES: i64 = 1024 * 1024;
 
 /// The most a `KeyConditionExpression` may carry: "Maximum length of any expression
 /// string is 4 KB" ("Service, Account, and Table Quotas"), and derived ceilings on

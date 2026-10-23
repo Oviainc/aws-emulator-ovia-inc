@@ -202,9 +202,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Err(
             DeleteDeploymentStrategyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No deployment strategy with id {} exists.",
-                        input.deployment_strategy_id
+                    message: Some(crate::state::deployment_strategy_not_found(
+                        &input.deployment_strategy_id,
                     )),
                     resource_name: Some(input.deployment_strategy_id),
                 },

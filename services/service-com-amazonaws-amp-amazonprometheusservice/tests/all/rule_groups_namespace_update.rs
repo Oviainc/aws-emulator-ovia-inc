@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 
 /// `PUT /workspaces/{workspaceId}/rulegroupsnamespaces/{name}` —
 /// PutRuleGroupsNamespace. `data` is a blob, so it travels base64-encoded on `restJson1`.
-async fn put_namespace(
+pub(crate) async fn put_namespace(
     amp: &Amp,
     region: &str,
     workspace_id: &str,
@@ -45,12 +45,12 @@ async fn put_namespace(
 }
 
 /// The update request body: just the replacement rules file, base64-encoded.
-fn put_body(data: &[u8]) -> serde_json::Value {
+pub(crate) fn put_body(data: &[u8]) -> serde_json::Value {
     serde_json::json!({ "data": aws_smithy_types::base64::encode(data) })
 }
 
 /// The bytes a blob member carries, decoded from the base64 the response holds.
-fn blob(case: &str, value: &serde_json::Value) -> Vec<u8> {
+pub(crate) fn blob(case: &str, value: &serde_json::Value) -> Vec<u8> {
     let encoded = value.as_str().unwrap_or_else(|| {
         panic!("case {case:?}: a blob member must be a base64 string, got {value:?}")
     });

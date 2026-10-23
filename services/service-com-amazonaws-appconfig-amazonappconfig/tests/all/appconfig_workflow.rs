@@ -137,6 +137,28 @@ pub(crate) async fn json_call(
     send(router, method, uri, "application/json", payload, &[]).await
 }
 
+/// A retrieval role of the shape the model's `RoleArn` pattern demands
+/// (`^((arn):(aws|…):(iam)::\d{12}:role[/].*)$`).
+///
+/// Every `LocationUri` but the hosted store and a CodePipeline pipeline needs one: "A
+/// retrieval role ARN is not required for configurations stored in CodePipeline or the
+/// AppConfig hosted configuration store. It is required for all other sources that store
+/// your configuration" (the model's `RetrievalRoleArn` documentation).
+pub(crate) const RETRIEVAL_ROLE: &str = "arn:aws:iam::000000000000:role/appconfig-retrieval";
+
+/// `body` with a `RetrievalRoleArn` added when its `LocationUri` needs one, so a row can
+/// name a location without restating the rule.
+pub(crate) fn with_required_retrieval_role(mut body: serde_json::Value) -> serde_json::Value {
+    let needs_role = body
+        .get("LocationUri")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(state::location_uri_requires_retrieval_role);
+    if needs_role && body.get("RetrievalRoleArn").is_none() {
+        body["RetrievalRoleArn"] = serde_json::Value::from(RETRIEVAL_ROLE);
+    }
+    body
+}
+
 /// Create an application and return its minted id.
 pub(crate) async fn create_application(router: &MultiServiceRouter, name: &str) -> String {
     let answer = json_call(
@@ -422,7 +444,7 @@ async fn environments_and_profiles_round_trip_with_their_optional_members() {
         );
         assert_eq!(
             created.string("State").as_deref(),
-            Some("READY_FOR_DEPLOYMENT"),
+            Some(state::ENVIRONMENT_READY_FOR_DEPLOYMENT),
             "case {case:?}: a new environment has nothing deploying into it, got {:?}",
             created.string("State")
         );
@@ -492,6 +514,7 @@ async fn environments_and_profiles_round_trip_with_their_optional_members() {
         if !validators.is_null() {
             body["Validators"] = validators.clone();
         }
+        let body = with_required_retrieval_role(body);
         let created = json_call(
             &router,
             "POST",
@@ -904,8 +927,8 @@ async fn predefined_strategies_deploy_and_the_deployment_reads_back() {
         .await;
         assert_eq!(
             environment_state.string("State").as_deref(),
-            Some("DEPLOYING"),
-            "case {case:?}: an environment with a deployment in flight is DEPLOYING, got {:?}",
+            Some(state::ENVIRONMENT_DEPLOYING),
+            "case {case:?}: an environment with a deployment in flight is Deploying, got {:?}",
             environment_state.string("State")
         );
     }
@@ -1027,7 +1050,9 @@ async fn semantic_rules_the_schema_cannot_express_are_refused_with_bad_request()
             &router,
             "POST",
             &format!("/applications/{application}/configurationprofiles"),
-            &serde_json::json!({ "Name": format!("profile-{case}"), "LocationUri": location_uri }),
+            &with_required_retrieval_role(
+                serde_json::json!({ "Name": format!("profile-{case}"), "LocationUri": location_uri }),
+            ),
         )
         .await;
         assert_eq!(
@@ -1424,7 +1449,7 @@ async fn deployment_numbers_increase_per_environment() {
         .await;
         assert_eq!(
             environment_state.string("State").as_deref(),
-            Some("READY_FOR_DEPLOYMENT"),
+            Some(state::ENVIRONMENT_READY_FOR_DEPLOYMENT),
             "case {case:?}: an environment with nothing in flight is ready, got {:?}",
             environment_state.string("State")
         );

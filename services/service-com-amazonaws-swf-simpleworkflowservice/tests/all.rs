@@ -47,3 +47,5 @@ mod tag_resource_value_fidelity;
 mod unknown_resource_messages;
 #[path = "all/workflow_execution_lifecycle.rs"]
 mod workflow_execution_lifecycle;
+#[path = "all/workflow_type_undeprecation.rs"]
+mod workflow_type_undeprecation;

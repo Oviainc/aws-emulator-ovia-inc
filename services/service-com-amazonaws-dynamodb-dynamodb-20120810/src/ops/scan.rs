@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Scan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Scan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: walks the stored table — "accessing every item in a table" — in
+//! stored primary-key order, reporting `Count`/`ScannedCount` and the
+//! `LastEvaluatedKey` computed from the page it stopped on.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Scan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The page stops at the caller's `Limit` ("the maximum number of items to
+//! evaluate") and in any case at the store's 1 MB dataset budget
+//! ([`crate::state::MAX_PAGE_BYTES`]), and `ExclusiveStartKey` resumes strictly after
+//! the key a previous page reported. A page reports a `LastEvaluatedKey` when it
+//! stopped with items still left to evaluate, which is what lets a caller tell the
+//! last page from a full one — "If LastEvaluatedKey is not empty, it does not
+//! necessarily mean that there is more data in the result set", so a page that ends
+//! exactly on the last item is free to report none. A parallel scan
+//! (`Segment`/`TotalSegments`) hands each worker a disjoint share of the table's
+//! items, so the segments together evaluate every item exactly once
+//! ([`Segmentation`]).
+//!
+//! Secondary indexes (`IndexName`), result filters (`FilterExpression`, the legacy
+//! `ScanFilter`/`ConditionalOperator`) and projections (`ProjectionExpression`,
+//! the legacy `AttributesToGet`) are refused with the scaffold's 501 and are their
+//! own gap issues — exactly as `Query` refuses the same members. `ConsistentRead`
+//! needs no handling beyond its effect on `ConsumedCapacity`: this store holds one
+//! copy of each item, so a scan of it always sees every completed write.
+//!
+//! A table whose resource-based policy denies the caller `dynamodb:Scan` is
+//! answered `AccessDeniedException` instead of its items.
 //!
 //! ## Shape of an operation
 //!
@@ -241,6 +257,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The most data one page of a `Scan` response carries, which is the store's own page
+/// budget: "If the total size of scanned items exceeds the maximum dataset size limit
+/// of 1 MB, the scan completes and results are returned to the user" (the `Scan`
+/// doc). A page that stops there reports a `LastEvaluatedKey`, so the caller pages on,
+/// and one request cannot amplify into a response the size of a table.
+use crate::state::MAX_PAGE_BYTES;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -314,18 +337,268 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Scan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ScanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Scan"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+
+        if let Some(member) = unsupported_member(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "Scan with {member}"
+            )));
+        }
+        // "ALL_ATTRIBUTES - Returns all of the item attributes from the specified
+        // table or index" is the default for a table scan; COUNT "returns the number
+        // of matching items, rather than the matching items themselves"
+        // (`Scan$Select`). The projected forms are "allowed only when querying an
+        // index", which this slice does not serve.
+        let count_only = match input.select.as_deref() {
+            None | Some("ALL_ATTRIBUTES") => false,
+            Some("COUNT") => true,
+            Some(other) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "Scan with Select {other}"
+                )))
+            }
+        };
+        // A substitution token has nothing to substitute into unless the request
+        // carries an expression, and this slice serves none, so one supplied here is
+        // refused rather than silently ignored.
+        if let Some(member) = substitution_without_expression(&input) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "{member} can only be specified when using expressions"
+            )));
+        }
+        let segmentation = Segmentation::resolve(input.segment, input.total_segments)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        let table = store.active_table(&region, &name, now).map_err(lift)?;
+        // A table whose resource-based policy denies the caller this action answers
+        // the denial, not its items: the deny is decided before anything is read.
+        if let Some(denial) = crate::state::policy_denial(table, "dynamodb:Scan", now) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
+        // "The data type for ExclusiveStartKey must be String, Number or Binary. No
+        // set data types are allowed" — the store's key reader holds the map to this
+        // table's own key schema.
+        let resumed = input
+            .exclusive_start_key
+            .as_ref()
+            .map(|start| table.key_of_key_map(start))
+            .transpose()
+            .map_err(lift)?;
+
+        // The walk is over the whole stored table in primary-key order, which is the
+        // order a `LastEvaluatedKey` resumes from. Segment membership is decided from
+        // each item's position in that total order, NOT from the position within one
+        // page, so a later page of the same segment sees the same share of the table.
+        let evaluated = table
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| segmentation.owns(*position))
+            .map(|(_, entry)| entry)
+            // "Use this value to start a new operation, EXCLUDING this value in the
+            // new request" (`Scan$LastEvaluatedKey`).
+            .filter(|(key, _)| resumed.as_ref().is_none_or(|resumed| *key > resumed));
+
+        // "A single Scan operation first reads up to the maximum number of items set
+        // (if using the Limit parameter) or a maximum of 1 MB of data" (the `Scan`
+        // doc), so the page — and the work this request can ask for — is bounded
+        // BEFORE any item is cloned, whether or not the caller named a `Limit`.
+        let limit = input
+            .limit
+            .map_or(usize::MAX, |limit| usize::try_from(limit).unwrap_or(0));
+        let mut page: Vec<(&crate::state::ItemKey, &crate::state::Item)> = Vec::new();
+        let mut page_size: i64 = 0;
+        let mut truncated = false;
+        for (key, item) in evaluated {
+            let size = crate::state::item_size(item);
+            // The first item always fits, the way DynamoDB always returns at least
+            // one item it read; after that the page stops BEFORE the item that would
+            // carry it past the budget, so the response is bounded BY the budget
+            // rather than by the budget plus one item.
+            if page.len() >= limit
+                || (!page.is_empty() && page_size.saturating_add(size) > MAX_PAGE_BYTES)
+            {
+                truncated = true;
+                break;
+            }
+            page_size = page_size.saturating_add(size);
+            page.push((key, item));
+        }
+
+        // "The primary key of the item where the operation stopped" — reported when
+        // the walk stopped with items left to evaluate; "If LastEvaluatedKey is
+        // empty, then the 'last page' of results has been processed". A page that
+        // ends exactly on the table's last item reports none, which the member's own
+        // doc allows ("If LastEvaluatedKey is not empty, it does not necessarily mean
+        // that there is more data in the result set") and `Query` answers alike.
+        let last_evaluated_key = if truncated {
+            page.last().map(|(_, item)| table.key_attributes(item))
+        } else {
+            None
+        };
+        // Nothing is filtered out after the walk (no filter is served here), so every
+        // item evaluated is an item returned: "If you did not use a FilterExpression
+        // in the scan request, then Count is the same as ScannedCount".
+        let count = i32::try_from(page.len()).unwrap_or(i32::MAX);
+        let items = if count_only {
+            None
+        } else {
+            Some(page.iter().map(|(_, item)| (*item).clone()).collect())
+        };
+
+        Ok(ScanOutput {
+            items,
+            count,
+            scanned_count: count,
+            last_evaluated_key,
+            consumed_capacity: crate::state::consumed_capacity(
+                input.return_consumed_capacity.as_deref(),
+                &name,
+                crate::state::read_capacity_units(
+                    page_size,
+                    input.consistent_read.unwrap_or(false),
+                ),
+            ),
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> ScanError {
+    ScanErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> ScanError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            ScanErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
+    }
+}
+
+/// The first input member present that this slice does not serve, if any. The same
+/// members `Query` declines, for the same reason: each is its own gap issue.
+fn unsupported_member(input: &ScanInput) -> Option<&'static str> {
+    if input.index_name.is_some() {
+        return Some("IndexName");
+    }
+    if input.filter_expression.is_some() {
+        return Some("FilterExpression");
+    }
+    if input.scan_filter.as_ref().is_some_and(|map| !map.is_empty()) {
+        return Some("ScanFilter");
+    }
+    if input.conditional_operator.is_some() {
+        return Some("ConditionalOperator");
+    }
+    if input.projection_expression.is_some() {
+        return Some("ProjectionExpression");
+    }
+    if input
+        .attributes_to_get
+        .as_ref()
+        .is_some_and(|names| !names.is_empty())
+    {
+        return Some("AttributesToGet");
+    }
+    None
+}
+
+/// The substitution map this request carries with no expression to substitute into:
+/// `ExpressionAttributeNames` holds "substitution tokens for attribute names in an
+/// expression" and `ExpressionAttributeValues` "values that can be substituted in an
+/// expression" (those members' docs), so neither has a meaning on its own.
+fn substitution_without_expression(input: &ScanInput) -> Option<&'static str> {
+    if input
+        .expression_attribute_names
+        .as_ref()
+        .is_some_and(|names| !names.is_empty())
+    {
+        return Some("ExpressionAttributeNames");
+    }
+    if input
+        .expression_attribute_values
+        .as_ref()
+        .is_some_and(|values| !values.is_empty())
+    {
+        return Some("ExpressionAttributeValues");
+    }
+    None
+}
+
+/// Which share of the table one `Scan` request evaluates.
+///
+/// "TotalSegments represents the total number of segments into which the Scan
+/// operation will be divided ... Segment identifies an individual segment to be
+/// scanned by an application worker" (`Scan$TotalSegments` / `Scan$Segment`). The
+/// contract is that the segments together cover the table and no two of them cover
+/// the same item — WHICH item falls in which segment is not part of it — so this
+/// store shares the items out by their position in the one stored key order. A
+/// request that names neither member is the sequential scan: one segment, holding
+/// everything.
+#[derive(Debug, Clone, Copy)]
+struct Segmentation {
+    segment: usize,
+    total: usize,
+}
+
+impl Segmentation {
+    /// Bind the request's `Segment`/`TotalSegments` pair, which is all-or-nothing:
+    /// "If you provide Segment, you must also provide TotalSegments" and "If you
+    /// specify TotalSegments, you must also specify Segment", with "the value for
+    /// Segment ... greater than or equal to 0, and less than the value provided for
+    /// TotalSegments".
+    fn resolve(segment: Option<i32>, total: Option<i32>) -> Result<Self, String> {
+        match (segment, total) {
+            (None, None) => Ok(Self {
+                segment: 0,
+                total: 1,
+            }),
+            (Some(_), None) => Err(
+                "The TotalSegments parameter is required but was not present in the request when \
+                 Segment parameter is present"
+                    .to_string(),
+            ),
+            (None, Some(_)) => Err(
+                "The Segment parameter is required but was not present in the request when \
+                 parameter TotalSegments is present"
+                    .to_string(),
+            ),
+            (Some(segment), Some(total)) => {
+                if segment >= total {
+                    return Err(format!(
+                        "The Segment parameter is zero-based and must be less than parameter \
+                         TotalSegments: Segment: {segment} is not less than TotalSegments: {total}"
+                    ));
+                }
+                // Both members' modelled ranges are non-negative, and they are
+                // checked before this handler runs, so the conversions cannot fail.
+                Ok(Self {
+                    segment: usize::try_from(segment).unwrap_or(0),
+                    total: usize::try_from(total).unwrap_or(1).max(1),
+                })
+            }
+        }
+    }
+
+    /// Whether the item at `position` in the table's key order belongs to this
+    /// request's segment.
+    fn owns(&self, position: usize) -> bool {
+        position % self.total == self.segment
     }
 }

@@ -23,6 +23,8 @@ mod automation_rule_preview;
 mod enrollment_gate;
 #[path = "all/error_payloads.rs"]
 mod error_payloads;
+#[path = "all/recommended_action_summaries.rs"]
+mod recommended_action_summaries;
 #[path = "all/recommended_actions.rs"]
 mod recommended_actions;
 #[path = "all/resource_tagging.rs"]

@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecommendedActionSummaries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecommendedActionSummaries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecommendedActionSummaries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Aggregates the recommended actions the store holds — the same
+//! [`crate::state::RecommendedActionStore`] `ListRecommendedActions` reports —
+//! into the account-wide summary keyed
+//! [`ALL_RECOMMENDED_ACTION_SUMMARY_KEY`], narrowed by `filters` exactly as that
+//! operation narrows its list, and paged by `maxResults` with an opaque
+//! `nextToken` that resumes where the previous page stopped.
+//! `@paginated(inputToken: nextToken, outputToken: nextToken,
+//! items: recommendedActionSummaries)`.
+//!
+//! The summary is reported whether or not any action matched: an account whose
+//! resources have not been analysed yet is summarised as zero actions and zero
+//! savings, not as no summary at all. `total` holds how many actions matched and
+//! the sum of their `estimatedMonthlySavings`.
+//!
+//! A recommended action is produced by Compute Optimizer's own analysis of a
+//! resource, so no operation of THIS API creates one: this handler only reads
+//! what the store holds, and it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +171,225 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRecommendedActionSummaries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecommendedActionSummariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecommendedActionSummaries"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListRecommendedActionSummariesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the service is not mounted on a state-bearing engine".into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        // `RecommendedActionFilter$name` is typed as the
+        // `RecommendedActionFilterName` value set, but a name outside it is
+        // refused here too so a filter is never silently ignored — the same
+        // refusal `ListRecommendedActions` gives for the same filter list, since
+        // both operations narrow the same actions with it. The refusal echoes no
+        // request value, like every other refusal of this service.
+        if crate::state::unknown_recommended_action_filter_name(&filters).is_some() {
+            return Err(invalid_parameter(crate::state::constraint_report(
+                "filters.member.name",
+                &format!(
+                    "Member must satisfy enum value set: [{}]",
+                    RECOMMENDED_ACTION_FILTER_NAME_VALUES.join(", ")
+                ),
+            )));
+        }
+
+        // The page token carries this operation's name and the filters it was
+        // taken with, so resuming a walk with different filters, or with a token
+        // another operation issued, is refused rather than answered with a page
+        // of a different result set.
+        let filter_fingerprint = crate::state::fingerprint(&(Self::NAME, &filters));
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) = crate::state::decode_page_token(token) else {
+                    return Err(invalid_parameter(crate::state::constraint_report(
+                        "nextToken",
+                        "Member must be a token returned by a previous \
+                         ListRecommendedActionSummaries call",
+                    )));
+                };
+                if cursor.filter_fingerprint != filter_fingerprint {
+                    return Err(invalid_parameter(crate::state::constraint_report(
+                        "nextToken",
+                        "Member must be a token returned for the same filters",
+                    )));
+                }
+                cursor.offset
+            }
+        };
+
+        // `maxResults` carries a member `@range` of min 1 / max 100
+        // (`smithy_query(query="shape",shape="ListRecommendedActionSummariesRequest")`),
+        // enforced by the generated request walk BEFORE this handler runs — so
+        // the page size is only defaulted here, never validated, and the
+        // `.max(1)` is a floor against a zero page, which would return nothing
+        // while carrying a token whose offset never advances.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::DEFAULT_MAX_RESULTS),
+        )
+        .unwrap_or(1)
+        .max(1);
+
+        let guard = state.lock();
+        // The service-wide enrollment gate, AHEAD of filter evaluation: an
+        // account that is not opted in is refused the whole call rather than
+        // told there are no recommended actions to summarise. See
+        // `crate::state::…::opt_in_required`.
+        if let Some(refusal) = guard.opt_in_required() {
+            return Err(
+                ListRecommendedActionSummariesErrorModeled::OptInRequiredException(refusal).into(),
+            );
+        }
+
+        // Every matching action is counted into the ONE account-wide aggregate
+        // (see [`ALL_RECOMMENDED_ACTION_SUMMARY_KEY`]), so the summary exists
+        // whether or not anything matched: a store nothing has been analysed
+        // into is summarised as zero actions and zero savings, never as no
+        // summary at all.
+        let mut aggregate = Aggregate::default();
+        for action in guard
+            .recommended_actions
+            .iter_in_order()
+            .filter(|action| crate::state::recommended_action_matches_filters(action, &filters))
+        {
+            aggregate.add(action.estimated_monthly_savings.as_ref());
+        }
+        let summaries = vec![RecommendedActionSummary {
+            key: ALL_RECOMMENDED_ACTION_SUMMARY_KEY.to_string(),
+            total: aggregate.into_total(),
+        }];
+
+        // The page walk is the same one every paginated list of this service
+        // performs — one summary beyond the page is what says another page
+        // exists, and the token resumes exactly where this page stopped. There
+        // is one summary, so a first page always ends the walk; the walk is
+        // written over the sequence rather than around that single row, so it
+        // stays correct for a key set the service may report more of.
+        let total_summaries = summaries.len();
+        let page: Vec<RecommendedActionSummary> = summaries
+            .into_iter()
+            .skip(offset)
+            .take(page_size)
+            .collect();
+        let has_more = offset.saturating_add(page.len()) < total_summaries;
+        let next_token = has_more.then(|| {
+            crate::state::encode_page_token(&crate::state::PageCursor {
+                offset: offset + page.len(),
+                filter_fingerprint,
+            })
+        });
+
+        Ok(ListRecommendedActionSummariesOutput {
+            recommended_action_summaries: Some(page),
+            next_token,
+        })
     }
+}
+
+/// The `key` of the summary that covers EVERY recommended action the call
+/// matched, rather than one slice of them.
+///
+/// `RecommendedActionSummary$key` is "the grouping key used to categorize the
+/// recommended actions in this summary"
+/// (`smithy_query(query="shape",shape="RecommendedActionSummary")`), and the
+/// model enumerates no key set for it — unlike `AutomationEventSummary`, which
+/// carries its grouping as a `SummaryDimension` list keyed by the modelled
+/// `SummaryDimensionKey`. The one key the service's own responses show is this
+/// aggregate over all of them, so it is the one this emulator reports: a key for
+/// a dimension no response groups by would be invented vocabulary, and a client
+/// reads these keys off the wire.
+const ALL_RECOMMENDED_ACTION_SUMMARY_KEY: &str = "ALL_Recommended_Action_Summary";
+
+/// The `savingsEstimationMode` an aggregate reports when the estimates it summed
+/// do not agree on one, and when it summed none at all.
+///
+/// Both figures of [`EstimatedMonthlySavings`] are summed either way, so the mode
+/// only says which of them the estimate was computed for; before discounts is
+/// the conservative reading, exactly as it is for an `estimatedMonthlySavings`
+/// criterion whose estimate names a mode this model does not declare.
+const CONSERVATIVE_SAVINGS_ESTIMATION_MODE: &str = "BeforeDiscount";
+
+/// The totals accumulated over a set of recommended actions.
+#[derive(Debug, Clone, Default)]
+struct Aggregate {
+    /// How many actions were summarised, whether or not they carry an estimate.
+    count: i32,
+    before_discount_savings: f64,
+    after_discount_savings: f64,
+    /// The currency of the FIRST estimate summed, in record order, or `None`
+    /// when no action summarised carries an estimate. Compute Optimizer
+    /// denominates an account's estimates in one currency, so a set that
+    /// mixes currencies is not something its analysis produces; the emulator
+    /// converts nothing, so the sum is reported in that first currency.
+    currency: Option<String>,
+    /// The `savingsEstimationMode` every estimate summed so far agrees on, or
+    /// `None` once two of them disagree (or before any was summed).
+    savings_estimation_mode: Option<String>,
+    /// Whether two summed estimates disagreed on the mode, so that a later
+    /// agreeing one cannot restore it.
+    mixed_savings_estimation_mode: bool,
+}
+
+impl Aggregate {
+    /// Count one more action, adding its estimate when it has one.
+    fn add(&mut self, savings: Option<&EstimatedMonthlySavings>) {
+        self.count = self.count.saturating_add(1);
+        let Some(savings) = savings else {
+            return;
+        };
+        self.before_discount_savings += savings.before_discount_savings;
+        self.after_discount_savings += savings.after_discount_savings;
+        if self.currency.is_none() {
+            self.currency = Some(savings.currency.clone());
+        }
+        match &self.savings_estimation_mode {
+            Some(mode) if mode != &savings.savings_estimation_mode => {
+                self.savings_estimation_mode = None;
+                self.mixed_savings_estimation_mode = true;
+            }
+            Some(_) => {}
+            None if !self.mixed_savings_estimation_mode => {
+                self.savings_estimation_mode = Some(savings.savings_estimation_mode.clone());
+            }
+            None => {}
+        }
+    }
+
+    /// These totals as the modelled `RecommendedActionTotal`.
+    fn into_total(self) -> RecommendedActionTotal {
+        RecommendedActionTotal {
+            recommended_action_count: self.count,
+            estimated_monthly_savings: EstimatedMonthlySavings {
+                // `currency` is a free-form string, so a total no estimate named
+                // a currency for names none rather than one the emulator made
+                // up; its two sums are zero.
+                currency: self.currency.unwrap_or_default(),
+                before_discount_savings: self.before_discount_savings,
+                after_discount_savings: self.after_discount_savings,
+                savings_estimation_mode: self
+                    .savings_estimation_mode
+                    .unwrap_or_else(|| CONSERVATIVE_SAVINGS_ESTIMATION_MODE.to_string()),
+            },
+        }
+    }
+}
+
+fn invalid_parameter(message: String) -> ListRecommendedActionSummariesError {
+    ListRecommendedActionSummariesErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

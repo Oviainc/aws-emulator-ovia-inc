@@ -4,8 +4,10 @@
 //! IMPLEMENTED: persists a new rule groups namespace under its workspace and answers
 //! from the PERSISTED record. The namespace starts in `CREATING` and the clock owes its
 //! move to `ACTIVE` ([`crate::state::TRANSITION_DELAY`]); `clientToken` makes the call
-//! idempotent, and a name the workspace already holds is refused with
-//! `ConflictException`.
+//! idempotent, a name the workspace already holds is refused with
+//! `ConflictException`, and a rules file declaring a rule group whose name exceeds the
+//! documented combined-length bound with the namespace name is refused
+//! `ValidationException`.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -196,6 +198,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::member_validation_failed(
                     "tags",
                     &crate::state::reserved_tag_key_requirement(),
+                ),
+            )
+            .into());
+        }
+
+        // "The combined length of a rule group namespace and a rule group name cannot
+        // exceed 721 UTF-8 bytes" — the `<important>` callout this operation's own
+        // documentation carries. The bound spans TWO members (the namespace `name` and
+        // each rule group name the `data` blob declares), so no single member is at
+        // fault: the request is refused as a whole with `ValidationException` (400),
+        // before anything is stored.
+        if crate::state::rule_group_name_bound_exceeded(&input.name, &input.data) {
+            return Err(CreateRuleGroupsNamespaceErrorModeled::ValidationException(
+                crate::state::request_validation_failed(
+                    &crate::state::rule_group_name_bound_requirement(),
                 ),
             )
             .into());

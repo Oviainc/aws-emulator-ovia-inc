@@ -170,9 +170,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(strategy) = store.resolve_strategy(&input.deployment_strategy_id) else {
             return Err(GetDeploymentStrategyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No deployment strategy with id {} exists.",
-                        input.deployment_strategy_id
+                    message: Some(crate::state::deployment_strategy_not_found(
+                        &input.deployment_strategy_id,
                     )),
                     resource_name: Some(input.deployment_strategy_id),
                 },

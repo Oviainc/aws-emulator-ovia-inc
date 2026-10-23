@@ -239,15 +239,21 @@ pub fn account_setting_spec(name: &str) -> Result<&'static AccountSettingSpec, F
         })
 }
 
-/// The `LayerAvailability` of a blob the repository holds. The other two values the
-/// enum carries are not reachable from this store: `ARCHIVED` belongs to an image whose
-/// storage class is archive (`UpdateImageStorageClass`, still a 501 stub, is the only
-/// thing that archives one, so every stored image is [`ACTIVE_IMAGE_STATUS`]), and
-/// `UNAVAILABLE` describes a blob the registry has a record of but cannot serve, which
-/// this store never holds — a blob is either in a repository or absent from it.
+/// The `LayerAvailability` of a blob the repository holds and can serve.
+///
+/// The third value the enum carries is not reachable from this store: `ARCHIVED`
+/// belongs to an image whose storage class is archive (`UpdateImageStorageClass`, still
+/// a 501 stub, is the only thing that archives one, so every stored image is
+/// [`ACTIVE_IMAGE_STATUS`]).
 pub const AVAILABLE_LAYER_AVAILABILITY: &str = "AVAILABLE";
 
-/// The `LayerFailureCode` for a well-formed digest no repository blob answers to.
+/// The `LayerAvailability` of a layer the repository does not hold: the digest is a
+/// content digest, so it addresses a layer, and that layer is simply not here — which is
+/// what a push client asks about before uploading a blob.
+pub const UNAVAILABLE_LAYER_AVAILABILITY: &str = "UNAVAILABLE";
+
+/// The `LayerFailureCode` for a request entry that carries no digest at all, so it
+/// addresses no layer to report on.
 pub const MISSING_LAYER_DIGEST_FAILURE: &str = "MissingLayerDigest";
 
 /// The `LayerFailureCode` for a requested digest that is not a content digest at all.
@@ -2101,18 +2107,18 @@ pub fn check_tag_count(existing: &[Tag], incoming: &[Tag]) -> Result<(), Fault> 
     Ok(())
 }
 
+/// The content digest of a blob: `sha256:<hex>` over its bytes, which is how a registry
+/// addresses content it was handed — a layer assembled from uploaded parts as much as a
+/// manifest.
+pub fn content_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
 /// The content digest of an image manifest: `sha256:<hex>` over the manifest bytes,
 /// which is how a registry addresses a manifest it was handed.
 pub fn manifest_digest(manifest: &str) -> String {
     content_digest(manifest.as_bytes())
-}
-
-/// The content digest of `content`: `sha256:<hex>` over the bytes, the form a registry
-/// addresses any content it holds by — a manifest ([`manifest_digest`]) and the layer
-/// blob `CompleteLayerUpload` assembles out of an upload's parts alike.
-pub fn content_digest(content: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("sha256:{}", hex::encode(Sha256::digest(content)))
 }
 
 /// The media type a manifest declares about itself, for a push that named none.

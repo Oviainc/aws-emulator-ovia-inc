@@ -21,7 +21,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{Action, DeploymentEvent, Monitor, Parameter, Validator};
+use crate::ops::types::{
+    Action, DeletionProtectionSettings, DeploymentEvent, Monitor, Parameter, Validator,
+    VendedMetricsSettings,
+};
+
+pub mod feature_flags;
 
 /// `DeploymentState` values this service moves a deployment through. Each is a member
 /// of `DEPLOYMENT_STATE_VALUES` in `crate::ops::types` (the model's `DeploymentState`
@@ -32,11 +37,33 @@ pub const DEPLOYMENT_BAKING: &str = "BAKING";
 /// See [`DEPLOYMENT_DEPLOYING`].
 pub const DEPLOYMENT_COMPLETE: &str = "COMPLETE";
 
-/// `EnvironmentState` values this service moves an environment through, from
-/// `ENVIRONMENT_STATE_VALUES` in `crate::ops::types`.
-pub const ENVIRONMENT_READY_FOR_DEPLOYMENT: &str = "READY_FOR_DEPLOYMENT";
+/// `EnvironmentState` values this service moves an environment through — the WIRE
+/// values, which for this one enum are NOT the model's member names.
+///
+/// `ENVIRONMENT_STATE_VALUES` in `crate::ops::types` lists the member names
+/// (`READY_FOR_DEPLOYMENT`, `DEPLOYING`, …), but AppConfig serves `Environment$State`
+/// in the CamelCase form its API Reference lists as that member's valid values —
+/// `ReadyForDeployment | Deploying | RollingBack | RolledBack | Reverted` — and that
+/// is what every recorded response carries. The shipped model JSON in
+/// `smithy-model/` carries no `@enumValue` trait on the enum's members, so the
+/// generated value list fell back to the member names; the recorded wire form is
+/// authoritative and these constants are the single place the service spells it.
+///
+/// Every other enum this module names a value of (`DeploymentState`, `GrowthType`,
+/// `DeploymentEventType`, `TriggeredBy`) is served as its member name, exactly as the
+/// AppConfig API Reference lists those members' valid values, so their constants are
+/// unchanged.
+pub const ENVIRONMENT_READY_FOR_DEPLOYMENT: &str = "ReadyForDeployment";
 /// See [`ENVIRONMENT_READY_FOR_DEPLOYMENT`].
-pub const ENVIRONMENT_DEPLOYING: &str = "DEPLOYING";
+pub const ENVIRONMENT_DEPLOYING: &str = "Deploying";
+/// See [`ENVIRONMENT_READY_FOR_DEPLOYMENT`]. No operation moves an environment here
+/// yet — AppConfig enters it only while rolling a deployment back — so the value is
+/// carried for completeness of the wire catalog.
+pub const ENVIRONMENT_ROLLING_BACK: &str = "RollingBack";
+/// See [`ENVIRONMENT_ROLLING_BACK`].
+pub const ENVIRONMENT_ROLLED_BACK: &str = "RolledBack";
+/// See [`ENVIRONMENT_ROLLING_BACK`].
+pub const ENVIRONMENT_REVERTED: &str = "Reverted";
 
 /// `GrowthType` values, from `GROWTH_TYPE_VALUES` in `crate::ops::types`.
 pub const GROWTH_LINEAR: &str = "LINEAR";
@@ -109,6 +136,15 @@ pub const BYTES_PER_KILOBYTE: f32 = 1024.0;
 /// `BYTES_MEASURE_VALUES` in `crate::ops::types`.
 pub const BYTES_MEASURE_KILOBYTES: &str = "KILOBYTES";
 
+/// The message AppConfig refuses an over-sized hosted configuration with.
+///
+/// A FIXED service-owned constant, not a sentence built from the request: the recorded
+/// refusal carries exactly this text whatever the payload's size, and
+/// `PayloadTooLargeException`'s own `Measure` / `Limit` / `Size` members are what
+/// report the numbers. The emulator must not substitute prose of its own here — a
+/// client that surfaces the service's message would then show emulator internals.
+pub const CONTENT_SIZE_LIMIT_EXCEEDED_MESSAGE: &str = "Content size limit exceeded.";
+
 /// How many deployment records an environment keeps.
 ///
 /// AppConfig retains an environment's deployment history; this emulator retains the most
@@ -122,11 +158,50 @@ pub const MAX_RETAINED_DEPLOYMENTS_PER_ENVIRONMENT: usize = 200;
 /// model documents on `CreateConfigurationProfile`'s `LocationUri` member.
 pub const HOSTED_LOCATION_URI: &str = "hosted";
 
+/// The `LocationUri` prefix that selects a CodePipeline pipeline: "For an Amazon Web
+/// Services CodePipeline pipeline, specify the URI in the following format:
+/// `codepipeline`://<pipeline name>", as the model documents on
+/// `CreateConfigurationProfile`'s `LocationUri` member.
+pub const CODEPIPELINE_LOCATION_PREFIX: &str = "codepipeline://";
+
+/// Whether a configuration profile stored at `location_uri` needs a `RetrievalRoleArn`.
+///
+/// The model's own `RetrievalRoleArn` documentation states the rule: "A retrieval role
+/// ARN is not required for configurations stored in CodePipeline or the AppConfig hosted
+/// configuration store. It is required for all other sources that store your
+/// configuration." So a role is required for every location except those two — the
+/// member is optional in the model, which makes this a server-side cross-field rule
+/// rather than one the schema walk can refuse.
+pub fn location_uri_requires_retrieval_role(location_uri: &str) -> bool {
+    location_uri != HOSTED_LOCATION_URI
+        && !location_uri.starts_with(CODEPIPELINE_LOCATION_PREFIX)
+}
+
+/// How AppConfig refuses a configuration profile whose `LocationUri` needs a
+/// `RetrievalRoleArn` the request did not carry.
+///
+/// A cross-field rule, stated in the same `N validation error detected: …` envelope the
+/// boundary validator uses for a modelled constraint, naming the member that was null
+/// and the uri that made it required — so the message is derived from the request, not
+/// from a stored sentence.
+pub fn retrieval_role_required_message(location_uri: &str) -> String {
+    format!(
+        "1 validation error detected: Value null at 'retrievalRoleArn' failed to satisfy \
+         constraint: Member must not be null if the request has the following uri: \
+         {location_uri}"
+    )
+}
+
 /// The `Type` values a configuration profile accepts. The model's own
 /// `CreateConfigurationProfile` `Type` documentation says: "When calling this API, enter
 /// one of the following values for `Type`: `AWS.AppConfig.FeatureFlags`,
 /// `AWS.Freeform`."
-pub const CONFIGURATION_PROFILE_TYPES: &[&str] = &["AWS.AppConfig.FeatureFlags", "AWS.Freeform"];
+pub const CONFIGURATION_PROFILE_TYPES: &[&str] = &[FEATURE_FLAGS_PROFILE_TYPE, "AWS.Freeform"];
+
+/// The configuration profile `Type` whose hosted configuration content AppConfig runs
+/// through the feature-flags helper extension before storing it; see
+/// [`feature_flags`].
+pub const FEATURE_FLAGS_PROFILE_TYPE: &str = "AWS.AppConfig.FeatureFlags";
 
 /// This service's namespace in an ARN: the third colon-separated section of every ARN
 /// that addresses an AppConfig resource. An ARN naming any other service addresses no
@@ -993,11 +1068,267 @@ pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
 }
 
+// =============================================================================
+// `ResourceNotFoundException` messages
+// =============================================================================
+
+/// How AppConfig words a `ResourceNotFoundException`, as the recorded refusals show it:
+///
+/// ```text
+/// <Resource kind> with <Label> <value>[, <Label> <value>]… and <Label> <value> \
+///     could not be found for account <account id>
+/// ```
+///
+/// The sentence is DERIVED from the request — the kind of resource that was looked up,
+/// every identifier the request used to scope that lookup under AppConfig's own label
+/// for it, and the account the lookup was scoped to — so each builder below takes the
+/// request's values and nothing is stored. The account is always
+/// [`::engine::emulator_account_id`], the single account a generated emulator presents.
+///
+/// `terminator` is the sentence's final punctuation: the recorded messages end with a
+/// full stop for every resource except the hosted configuration version, whose recorded
+/// message ends without one, so it is passed in per resource rather than appended here.
+fn not_found_message(kind: &str, identifiers: &[(&str, &str)], terminator: &str) -> String {
+    format!(
+        "{kind} with {} could not be found for account {}{terminator}",
+        identifier_phrase(identifiers),
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The identifier clause of a [`not_found_message`]: each `<Label> <value>` pair in the
+/// order the resource's path nests them, comma-separated with `and` before the last and
+/// the Oxford comma kept from three identifiers on — the form the recorded hosted
+/// configuration version message uses.
+fn identifier_phrase(identifiers: &[(&str, &str)]) -> String {
+    let parts: Vec<String> = identifiers
+        .iter()
+        .map(|(label, value)| format!("{label} {value}"))
+        .collect();
+    match parts.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [leading @ .., last] => format!("{}, and {last}", leading.join(", ")),
+    }
+}
+
+/// AppConfig ends a not-found message with a full stop …
+const NOT_FOUND_FULL_STOP: &str = ".";
+/// … except the hosted configuration version's, which the recorded refusal ends without
+/// one.
+const NOT_FOUND_NO_FULL_STOP: &str = "";
+
+/// `Message` for an application the account does not hold.
+pub fn application_not_found(application_id: &str) -> String {
+    not_found_message(
+        "Application",
+        &[("Id", application_id)],
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+/// `Message` for an environment the named application does not hold.
+pub fn environment_not_found(application_id: &str, environment_id: &str) -> String {
+    not_found_message(
+        "Environment",
+        &[
+            ("Application Id", application_id),
+            ("Environment Id", environment_id),
+        ],
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+/// `Message` for a configuration profile the named application does not hold.
+pub fn configuration_profile_not_found(
+    application_id: &str,
+    configuration_profile_id: &str,
+) -> String {
+    not_found_message(
+        "Configuration Profile",
+        &[
+            ("Application Id", application_id),
+            ("Configuration Profile Id", configuration_profile_id),
+        ],
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+/// `Message` for a hosted configuration version the named profile does not hold.
+pub fn hosted_configuration_version_not_found(
+    application_id: &str,
+    configuration_profile_id: &str,
+    version_number: i32,
+) -> String {
+    not_found_message(
+        "Hosted Configuration Version",
+        &[
+            ("Application Id", application_id),
+            ("Configuration Profile Id", configuration_profile_id),
+            ("Version", &version_number.to_string()),
+        ],
+        NOT_FOUND_NO_FULL_STOP,
+    )
+}
+
+/// `Message` for a deployment number the named environment never issued.
+pub fn deployment_not_found(
+    application_id: &str,
+    environment_id: &str,
+    deployment_number: i32,
+) -> String {
+    not_found_message(
+        "Deployment",
+        &[
+            ("Application Id", application_id),
+            ("Environment Id", environment_id),
+            ("Deployment Number", &deployment_number.to_string()),
+        ],
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+/// `Message` for a deployment strategy that is neither created nor predefined.
+pub fn deployment_strategy_not_found(deployment_strategy_id: &str) -> String {
+    not_found_message(
+        "Deployment Strategy",
+        &[("Id", deployment_strategy_id)],
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+/// `Message` for an extension no `ExtensionIdentifier` resolves to.
+pub fn extension_not_found(extension_identifier: &str) -> String {
+    not_found_message(
+        "Extension",
+        &[("Id", extension_identifier)],
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+/// `Message` for a `ResourceArn` that addresses no resource this service holds — the
+/// identifier the tagging operations scope their lookup with.
+pub fn resource_arn_not_found(resource_arn: &str) -> String {
+    not_found_message("Resource", &[("Arn", resource_arn)], NOT_FOUND_FULL_STOP)
+}
+
+/// `Message` for a version an extension does not hold.
+pub fn extension_version_not_found(extension_identifier: &str, version_number: i32) -> String {
+    not_found_message(
+        "Extension",
+        &[
+            ("Id", extension_identifier),
+            ("Version Number", &version_number.to_string()),
+        ],
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+// =============================================================================
+// Account-level settings
+// =============================================================================
+
+/// AppConfig's documented default protection period: "The default interval specified by
+/// `ProtectionPeriodInMinutes` is 60", from the model's `DeletionProtectionSettings`
+/// documentation.
+pub const DEFAULT_PROTECTION_PERIOD_IN_MINUTES: i32 = 60;
+
+/// The account's AppConfig settings: what `GetAccountSettings` reports and what
+/// `UpdateAccountSettings` writes.
+///
+/// An account that has never called `UpdateAccountSettings` is not unconfigured — it is
+/// running on AppConfig's documented defaults — so [`Default`] is those defaults rather
+/// than absent values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSettingsRecord {
+    /// Whether deletion protection is on. Off until a caller turns it on: AppConfig
+    /// documents the protection period's default but describes deletion protection
+    /// itself as something a caller configures.
+    pub deletion_protection_enabled: bool,
+    /// The interval deletion protection watches for configuration reads over, in
+    /// minutes. Defaults to [`DEFAULT_PROTECTION_PERIOD_IN_MINUTES`]; the model's
+    /// `DeletionProtectionDuration` bounds a written value to 15..=1440, which the
+    /// schema walk enforces before any handler runs.
+    pub protection_period_in_minutes: i32,
+    /// Whether vended metrics are enabled, or `None` while nobody has set them: the
+    /// model states no default for `VendedMetricsSettings$Enabled`, so none is
+    /// substituted and the member is not reported until it has been written.
+    pub vended_metrics_enabled: Option<bool>,
+}
+
+impl Default for AccountSettingsRecord {
+    fn default() -> Self {
+        Self {
+            deletion_protection_enabled: false,
+            protection_period_in_minutes: DEFAULT_PROTECTION_PERIOD_IN_MINUTES,
+            vended_metrics_enabled: None,
+        }
+    }
+}
+
+impl AccountSettingsRecord {
+    /// This record's deletion protection as the model's `DeletionProtectionSettings`.
+    ///
+    /// Both members always have a value to report: `Enabled` is a flag, and
+    /// `ProtectionPeriodInMinutes` carries AppConfig's documented default until a write
+    /// replaces it.
+    pub fn deletion_protection(&self) -> DeletionProtectionSettings {
+        DeletionProtectionSettings {
+            enabled: Some(self.deletion_protection_enabled),
+            protection_period_in_minutes: Some(self.protection_period_in_minutes),
+        }
+    }
+
+    /// This record's vended metrics as the model's `VendedMetricsSettings`, or `None`
+    /// while nobody has set them: the model states no default for
+    /// `VendedMetricsSettings$Enabled`, so reporting one would be fabricating it.
+    pub fn vended_metrics(&self) -> Option<VendedMetricsSettings> {
+        self.vended_metrics_enabled
+            .map(|enabled| VendedMetricsSettings {
+                enabled: Some(enabled),
+            })
+    }
+
+    /// Apply one `UpdateAccountSettings` request to this record.
+    ///
+    /// `UpdateAccountSettings` is a `PATCH`: a member the request omits keeps the value
+    /// the account already holds, and that applies inside `DeletionProtection` too —
+    /// naming only `Enabled` leaves the stored protection period alone. The written
+    /// values are already within the model's bounds, because the schema walk refuses a
+    /// `ProtectionPeriodInMinutes` outside `DeletionProtectionDuration`'s 15..=1440
+    /// range before this handler runs.
+    pub fn apply(
+        &mut self,
+        deletion_protection: Option<&DeletionProtectionSettings>,
+        vended_metrics: Option<&VendedMetricsSettings>,
+    ) {
+        if let Some(deletion_protection) = deletion_protection {
+            if let Some(enabled) = deletion_protection.enabled {
+                self.deletion_protection_enabled = enabled;
+            }
+            if let Some(period) = deletion_protection.protection_period_in_minutes {
+                self.protection_period_in_minutes = period;
+            }
+        }
+        if let Some(vended_metrics) = vended_metrics {
+            if let Some(enabled) = vended_metrics.enabled {
+                self.vended_metrics_enabled = Some(enabled);
+            }
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-appconfig-amazonappconfig. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAppconfigAmazonappconfigState {
     /// Every application, by application id.
     pub applications: HashMap<String, Application>,
+    /// This account's AppConfig settings, as `UpdateAccountSettings` last wrote them —
+    /// [`AccountSettingsRecord::default`] (AppConfig's documented defaults) until it
+    /// does. Account-scoped rather than per-application: the settings surface is
+    /// `/settings`, with no resource in its path.
+    pub account_settings: AccountSettingsRecord,
     /// Deployment strategies this account created, by strategy id.
     ///
     /// PRIVATE on purpose: [`Self::try_insert_strategy`] is the only way in, so the
