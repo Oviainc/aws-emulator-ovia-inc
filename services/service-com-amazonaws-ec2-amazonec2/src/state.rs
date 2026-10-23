@@ -511,6 +511,21 @@
 //! of progress an active task reports is derived per read, being a fact of elapsed time
 //! that no store could hold.
 //!
+//! ## Spot Instance requests
+//!
+//! [`ComAmazonawsEc2Amazonec2State::spot_instance_requests`] holds the Spot Instance
+//! requests `RequestSpotInstances` mints as [`SpotInstanceRequestRecord`]s: the modelled
+//! [`SpotInstanceRequest`] `DescribeSpotInstanceRequests` reports, plus the fulfillment the
+//! clock owes an `open` request and the instant its own `ValidUntil` expires it. Keyed by
+//! `SpotInstanceRequestId` in a [`BTreeMap`], like every other store here, so a pagination
+//! token can name the id the next page starts at. A request AWS hands back is `open`, so
+//! both moves are owed by the clock and applied once by
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_spot_instance_requests`] — and the
+//! fulfillment LAUNCHES an instance into
+//! [`ComAmazonawsEc2Amazonec2State::instances`], which is why an instance carries the
+//! [`InstanceRecord::spot_instance_request_id`] of the request that launched it rather than
+//! Spot Instances being kept in a store of their own.
+//!
 //! ## Placement groups
 //!
 //! [`ComAmazonawsEc2Amazonec2State::placement_groups`] holds the account's placement
@@ -751,6 +766,7 @@ pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "instance-type",
     "instance.group-id",
     "instance.group-name",
+    "instance-lifecycle",
     "key-name",
     "launch-index",
     "monitoring-state",
@@ -758,6 +774,7 @@ pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "private-dns-name",
     "private-ip-address",
     "reservation-id",
+    "spot-instance-request-id",
     "subnet-id",
     "tag-key",
 ];
@@ -891,6 +908,11 @@ pub struct InstanceRecord {
     pub disable_api_termination: bool,
     pub tags: BTreeMap<String, String>,
     pub client_token: Option<String>,
+    /// The Spot Instance request this instance was launched to fulfill, for an instance
+    /// that was: "if the request is a Spot Instance request, the ID of the request"
+    /// (`Instance$SpotInstanceRequestId`). `None` for an on-demand launch, which is what
+    /// makes the instance's reported `InstanceLifecycle` absent too.
+    pub spot_instance_request_id: Option<String>,
 }
 
 /// One stored reservation: the unit of state one `RunInstances` call creates.
@@ -1513,6 +1535,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// The state of the account's *block public access for snapshots* setting — see the
     /// module docs.
     ///
+    /// Every Spot Instance request the account holds, by `SpotInstanceRequestId` — see the
+    /// module docs. Ordered by id, which is the order `DescribeSpotInstanceRequests`
+    /// reports and pages over.
+    pub spot_instance_requests: BTreeMap<String, SpotInstanceRequestRecord>,
+    /// A `RequestSpotInstances` `ClientToken` and the request ids that call minted, so a
+    /// repeat of the same request answers with those requests instead of asking for more
+    /// capacity. One token names EVERY request of the one call, because one call mints
+    /// `InstanceCount` of them — the same arrangement as
+    /// [`Self::dedicated_host_client_tokens`].
+    pub spot_instance_request_client_tokens: HashMap<String, Vec<String>>,
     /// A `&'static str` so only a member of the modelled `SnapshotBlockPublicAccessState`
     /// catalog can ever be stored here: the word comes from this module's own constants,
     /// never from a request. Read it through
@@ -1591,6 +1623,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_block_public_access_exclusions: BTreeMap::new(),
             import_image_tasks: BTreeMap::new(),
             import_image_task_client_tokens: HashMap::new(),
+            spot_instance_requests: BTreeMap::new(),
+            spot_instance_request_client_tokens: HashMap::new(),
             placement_groups: BTreeMap::new(),
             // "Public sharing is not blocked" is where an account that has never called
             // `EnableSnapshotBlockPublicAccess` sits.
@@ -2877,6 +2911,7 @@ impl ComAmazonawsEc2Amazonec2State {
         // documents, so they are read off the wall clock rather than `now`.
         self.expire_due_address_transfers(SystemTime::now());
         self.complete_due_import_image_tasks(now);
+        self.materialize_due_spot_instance_requests(now);
     }
 
     /// The modelled `Instance` for one stored instance.
@@ -2931,6 +2966,14 @@ impl ComAmazonawsEc2Amazonec2State {
             ),
             client_token: instance.client_token.clone(),
             tags: Some(tag_list(&instance.tags)),
+            // "spot - the instance is a Spot Instance" (`Instance$InstanceLifecycle`) is
+            // reported only for an instance a Spot Instance request launched; an
+            // on-demand instance has no lifecycle word and no request id.
+            instance_lifecycle: instance
+                .spot_instance_request_id
+                .as_ref()
+                .map(|_| INSTANCE_LIFECYCLE_SPOT.to_string()),
+            spot_instance_request_id: instance.spot_instance_request_id.clone(),
             ..Default::default()
         }
     }
@@ -3005,6 +3048,17 @@ impl ComAmazonawsEc2Amazonec2State {
                     .filter_map(|(_, group_name)| group_name.clone())
                     .collect(),
             ),
+            // "instance-lifecycle - Indicates whether this is a Spot Instance" and
+            // "spot-instance-request-id - The ID of the Spot Instance request"
+            // (`DescribeInstancesRequest$Filters`): an on-demand instance holds no value
+            // for either, so a filter naming one selects only Spot Instances.
+            "instance-lifecycle" => single(
+                instance
+                    .spot_instance_request_id
+                    .as_ref()
+                    .map(|_| INSTANCE_LIFECYCLE_SPOT.to_string()),
+            ),
+            "spot-instance-request-id" => single(instance.spot_instance_request_id.clone()),
             "key-name" => single(instance.key_name.clone()),
             "launch-index" => single(Some(instance.ami_launch_index.to_string())),
             "monitoring-state" => single(Some(instance.monitoring_state.clone())),
@@ -3081,10 +3135,18 @@ pub fn filter_name_supported(name: &str) -> bool {
 /// The caller-chosen bytes one stored instance holds.
 ///
 /// Only the members whose length the REQUEST chose count: an id, a state or a
-/// timestamp this emulator mints is a fixed size.
+/// timestamp this emulator mints is a fixed size. EVERY such member counts, though —
+/// the image id, the instance type, the subnet, the key pair name and the zone are
+/// cloned onto every instance a launch mints just as its user data is, so leaving them
+/// out would let one request retain bytes the store's ceiling never saw.
 pub fn instance_payload_bytes(record: &InstanceRecord) -> usize {
     record.user_data.as_ref().map_or(0, String::len)
         + record.client_token.as_ref().map_or(0, String::len)
+        + record.image_id.as_ref().map_or(0, String::len)
+        + record.instance_type.len()
+        + record.subnet_id.as_ref().map_or(0, String::len)
+        + record.key_name.as_ref().map_or(0, String::len)
+        + record.placement_az.len()
         + tag_bytes(&record.tags)
         + record
             .security_groups
@@ -6425,11 +6487,17 @@ pub fn image_is_deprecated(image: &Image, now: SystemTime) -> bool {
 
 /// Refuse a request that named an AMI id the account can see no image for, the way EC2
 /// does: HTTP 400 `InvalidAMIID.NotFound`.
+///
+/// The message is EC2's own: it names the ids it could not resolve as a BRACKETED list,
+/// because the refusal is made over the ids the request supplied — "The image id
+/// '[ami-12345678]' does not exist" is what the real service answers, recorded by the
+/// corpus unit `ec2.op-contract-request-spot-instances`. A refusal here names the one id at
+/// fault.
 pub fn invalid_ami_id_not_found<E>(image_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_AMI_ID_NOT_FOUND,
         400,
-        format!("The image id '{image_id}' does not exist"),
+        format!("The image id '[{image_id}]' does not exist"),
     )
 }
 
@@ -12578,6 +12646,652 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 // ---------------------------------------------------------------------------
+// Spot Instance requests
+// ---------------------------------------------------------------------------
+//
+// A Spot Instance request is a STANDING ORDER for capacity, not a resource that is
+// finished when the call returns: "the request becomes active at this date and time and
+// remains active until all instances launch, the request expires, or the request is
+// canceled" (`RequestSpotInstancesRequest$ValidFrom`). So a stored request carries the
+// modelled `SpotInstanceRequest` the describes report plus the two moves the CLOCK owes
+// it — the fulfillment that launches its instance, and the expiry its own `ValidUntil`
+// makes due — each applied once by
+// [`ComAmazonawsEc2Amazonec2State::materialize_due_spot_instance_requests`], which
+// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] calls.
+//
+// Fulfilling a request LAUNCHES AN INSTANCE into this store's own instance lifecycle —
+// "the instance ID, if an instance has been launched to fulfill the Spot Instance
+// request" (`SpotInstanceRequest$InstanceId`) — so a Spot Instance is one instance of
+// this account like any other, reported by `DescribeInstances` with the
+// `spot` lifecycle and the id of the request that launched it.
+
+// The modelled shapes this slice reads, named HERE rather than in the module's shared
+// `use crate::ops::types::{..}` list at the top, the way the VM import slice does it.
+use crate::ops::types::{SpotInstanceRequest, SpotInstanceStatus};
+
+/// "`open` - The request is waiting to be fulfilled" — the `SpotInstanceState` enum's
+/// `open` member, which is where every request a `RequestSpotInstances` mints starts.
+pub const SPOT_REQUEST_STATE_OPEN: &str = "open";
+
+/// "`active` - The request is fulfilled and has an associated Spot Instance" — the
+/// `SpotInstanceState` enum's `active` member.
+pub const SPOT_REQUEST_STATE_ACTIVE: &str = "active";
+
+/// "`closed` - The request is unfulfillable" — the `SpotInstanceState` enum's `closed`
+/// member, which an expired request lands in.
+pub const SPOT_REQUEST_STATE_CLOSED: &str = "closed";
+
+/// "`cancelled` - The request was canceled" — the `SpotInstanceState` enum's `cancelled`
+/// member.
+pub const SPOT_REQUEST_STATE_CANCELLED: &str = "cancelled";
+
+/// The status code of a request that has been submitted and not yet evaluated, the first
+/// of the Spot request status codes `SpotInstanceStatus$Code` points at.
+pub const SPOT_STATUS_PENDING_EVALUATION: &str = "pending-evaluation";
+
+/// The status code of a request whose instance has been launched.
+pub const SPOT_STATUS_FULFILLED: &str = "fulfilled";
+
+/// The status code of a request whose own validity window ended before it was fulfilled.
+pub const SPOT_STATUS_SCHEDULE_EXPIRED: &str = "schedule-expired";
+
+/// The status code of a request that could not be fulfilled for want of capacity.
+pub const SPOT_STATUS_CAPACITY_NOT_AVAILABLE: &str = "capacity-not-available";
+
+/// The description [`SPOT_STATUS_PENDING_EVALUATION`] carries: "The description for the
+/// status code" (`SpotInstanceStatus$Message`). An EXAMPLE wording of the code, which is
+/// what clients branch on.
+pub const SPOT_STATUS_MESSAGE_PENDING_EVALUATION: &str =
+    "Your Spot request has been submitted for review, and is pending evaluation.";
+
+/// The description [`SPOT_STATUS_FULFILLED`] carries.
+pub const SPOT_STATUS_MESSAGE_FULFILLED: &str = "Your Spot request is fulfilled.";
+
+/// The description [`SPOT_STATUS_SCHEDULE_EXPIRED`] carries.
+pub const SPOT_STATUS_MESSAGE_SCHEDULE_EXPIRED: &str =
+    "Your Spot request has expired because the end of its validity period was reached.";
+
+/// The description [`SPOT_STATUS_CAPACITY_NOT_AVAILABLE`] carries.
+pub const SPOT_STATUS_MESSAGE_CAPACITY_NOT_AVAILABLE: &str =
+    "There is no Spot capacity available that matches your request.";
+
+/// The id prefix of a Spot Instance request, the form
+/// `SpotInstanceRequest$SpotInstanceRequestId` carries.
+pub const SPOT_INSTANCE_REQUEST_ID_PREFIX: &str = "sir";
+
+/// [`SPOT_INSTANCE_REQUEST_ID_PREFIX`] and the hyphen that separates it from the id's hex
+/// suffix, as one static, so recognising an id allocates nothing on the request path.
+pub const SPOT_INSTANCE_REQUEST_ID_PREFIX_WITH_HYPHEN: &str = "sir-";
+
+/// "`one-time`" — the `SpotInstanceType` enum's `one-time` member, and the type
+/// `RequestSpotInstancesRequest$Type` documents as its default ("Default: one-time").
+pub const SPOT_INSTANCE_TYPE_ONE_TIME: &str = "one-time";
+
+/// "`persistent`" — the `SpotInstanceType` enum's other member.
+pub const SPOT_INSTANCE_TYPE_PERSISTENT: &str = "persistent";
+
+/// The whole `SpotInstanceType` catalog, which the `type` filter selects over.
+pub const SPOT_INSTANCE_TYPES: [&str; 2] = [
+    SPOT_INSTANCE_TYPE_ONE_TIME,
+    SPOT_INSTANCE_TYPE_PERSISTENT,
+];
+
+/// "The behavior when a Spot Instance is interrupted. The default is terminate"
+/// (`RequestSpotInstancesRequest$InstanceInterruptionBehavior`): the
+/// `InstanceInterruptionBehavior` enum's `terminate` member.
+pub const INSTANCE_INTERRUPTION_BEHAVIOR_TERMINATE: &str = "terminate";
+
+/// The resource type a `RequestSpotInstances` `TagSpecification` may name: "The value for
+/// ResourceType must be spot-instances-request, otherwise the Spot Instance request fails"
+/// (`RequestSpotInstancesRequest$TagSpecifications`).
+pub const SPOT_REQUEST_TAGGABLE_RESOURCE: &str = "spot-instances-request";
+
+/// How long a Spot Instance request stays valid when the request names no `ValidUntil`.
+///
+/// DOCUMENTED, not chosen: "By default, the request is valid for 7 days from the date the
+/// request was created" (`RequestSpotInstancesRequest$ValidUntil`).
+pub const DEFAULT_SPOT_REQUEST_VALIDITY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How many Spot Instances one `RequestSpotInstances` call may ask for.
+///
+/// CHOSEN for the same reason as [`MAX_INSTANCES_PER_RUN`], and equal to it: "the maximum
+/// number of Spot Instances to launch" (`RequestSpotInstancesRequest$InstanceCount`)
+/// arrives as a plain integer with no modelled `@range`, and one request mints a stored
+/// record — and later an instance — per unit of it.
+pub const MAX_SPOT_INSTANCES_PER_REQUEST: i32 = MAX_INSTANCES_PER_RUN;
+
+/// How many Spot Instance requests this emulator stores before `RequestSpotInstances` is
+/// refused.
+///
+/// CHOSEN, like [`MAX_STORED_IMPORT_IMAGE_TASKS`] and for the same reason: nothing here
+/// reclaims a closed request, so the store needs a ceiling that is not the process's
+/// memory. The caller-chosen BYTES of each request are charged against
+/// [`MAX_STORED_BYTES`] separately ([`spot_instance_request_payload_bytes`]).
+pub const MAX_STORED_SPOT_INSTANCE_REQUESTS: usize = 4_096;
+
+/// "`spot` - the instance is a Spot Instance" — the `InstanceLifecycleType` enum's `spot`
+/// member, which is what an instance launched to fulfill a Spot Instance request reports
+/// as its `InstanceLifecycle`.
+pub const INSTANCE_LIFECYCLE_SPOT: &str = "spot";
+
+/// The `MonitoringState` enum's `enabled` member, which an instance launched with detailed
+/// monitoring reports.
+pub const MONITORING_STATE_ENABLED: &str = "enabled";
+
+/// The `MonitoringState` enum's `disabled` member, which an instance launched without
+/// detailed monitoring reports ("Default: Disabled",
+/// `RequestSpotLaunchSpecification$Monitoring`).
+pub const MONITORING_STATE_DISABLED: &str = "disabled";
+
+/// The product description of a Spot request for a Linux AMI: "`product-description` - The
+/// product description associated with the instance (`Linux/UNIX` | `Windows`)"
+/// (`DescribeSpotInstanceRequestsRequest$Filters`), and a member of the modelled
+/// `RIProductDescription` catalog.
+pub const PRODUCT_DESCRIPTION_LINUX_UNIX: &str = "Linux/UNIX";
+
+/// The product description of a Spot request for a Windows AMI, from the same sentence.
+pub const PRODUCT_DESCRIPTION_WINDOWS: &str = IMAGE_PLATFORM_WINDOWS;
+
+/// EC2's code for a Spot Instance request id no request of the account has.
+pub const INVALID_SPOT_INSTANCE_REQUEST_ID_NOT_FOUND: &str =
+    "InvalidSpotInstanceRequestID.NotFound";
+
+/// EC2's code for something that is not a Spot Instance request id at all.
+pub const INVALID_SPOT_INSTANCE_REQUEST_ID_MALFORMED: &str =
+    "InvalidSpotInstanceRequestID.Malformed";
+
+/// The furthest ahead this emulator carries an instant computed from a caller-supplied
+/// date: a century.
+///
+/// `Instant + Duration` and `SystemTime + Duration` PANIC when the sum is not
+/// representable, and a `ValidFrom` / `ValidUntil` is an unbounded timestamp off a single
+/// request, so every due instant computed from one is capped here and added with CHECKED
+/// arithmetic ([`due_instant`], [`due_system_time`]). A request valid for longer than this
+/// process will ever run is indistinguishable from one valid for a century, so the cap
+/// changes nothing a caller can observe — and no request can reach the overflow.
+pub const MAX_CLOCK_HORIZON: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+/// `Instant::now()` plus `delay`, capped at [`MAX_CLOCK_HORIZON`] and added with checked
+/// arithmetic: a delay this platform's monotonic clock cannot represent is halved until it
+/// can, so a caller-supplied date can never panic a handler.
+pub fn due_instant(delay: Duration) -> Instant {
+    let now = Instant::now();
+    let mut wanted = delay.min(MAX_CLOCK_HORIZON);
+    loop {
+        match now.checked_add(wanted) {
+            Some(due_at) => return due_at,
+            None if wanted.is_zero() => return now,
+            None => wanted /= 2,
+        }
+    }
+}
+
+/// The wall-clock counterpart of [`due_instant`]: `base` plus `delay`, capped and checked
+/// the same way, for the instant a move is reported to have fallen due.
+pub fn due_system_time(base: SystemTime, delay: Duration) -> SystemTime {
+    let mut wanted = delay.min(MAX_CLOCK_HORIZON);
+    loop {
+        match base.checked_add(wanted) {
+            Some(at) => return at,
+            None if wanted.is_zero() => return base,
+            None => wanted /= 2,
+        }
+    }
+}
+
+/// A move the clock owes one Spot Instance request, with the instants it falls due on.
+///
+/// The same shape, and the same reasons for both fields, as [`FastLaunchTransition`]:
+/// `due_at` is monotonic because it is only ever compared against the clock, and `at` is
+/// the wall-clock instant the move fell due, which the request reports as its status
+/// `UpdateTime` once the move has been applied.
+#[derive(Debug, Clone)]
+pub struct SpotTransition {
+    /// The instant from which the move is due.
+    pub due_at: Instant,
+    /// The wall-clock instant the move falls due.
+    pub at: SystemTime,
+}
+
+impl SpotTransition {
+    /// A move due `delay` from now, on both clocks.
+    ///
+    /// `delay` can come from a caller's `ValidFrom`, so both instants are computed by the
+    /// capped, checked helpers rather than by the panicking `+`.
+    pub fn due_in(delay: Duration) -> Self {
+        Self {
+            due_at: due_instant(delay),
+            at: due_system_time(SystemTime::now(), delay),
+        }
+    }
+}
+
+/// One stored Spot Instance request: the modelled [`SpotInstanceRequest`] every operation
+/// that reports one answers with, plus the facts that shape carries no member for.
+///
+/// The stored view is the truth about the request — `RequestSpotInstances` answers it and
+/// `DescribeSpotInstanceRequests` reports it, so the two cannot describe one request
+/// differently — and every clock-owed move is written onto it ONCE
+/// ([`ComAmazonawsEc2Amazonec2State::materialize_due_spot_instance_requests`]), because a
+/// fulfillment MINTS an instance that has to be the same in every later read.
+#[derive(Debug, Clone)]
+pub struct SpotInstanceRequestRecord {
+    /// The request as the model shapes it, carrying the state reached so far.
+    pub view: SpotInstanceRequest,
+    /// The fulfillment the clock owes this request while it is `open`, or `None` once it
+    /// has been fulfilled, has expired or could not be fulfilled at all.
+    pub fulfillment: Option<SpotTransition>,
+    /// The instant this request stops being valid, on the monotonic clock: the
+    /// `ValidUntil` the view reports, which is compared against the clock here and never
+    /// reported from here, so a wall-clock adjustment cannot un-expire a request.
+    pub valid_until_at: Instant,
+    /// The Region the request was made in, which the instance a fulfillment launches
+    /// needs for its private DNS name. Not a member of any modelled Spot shape.
+    pub region: String,
+}
+
+/// The caller-chosen bytes one stored Spot Instance request holds: the launch
+/// specification's user data, the ids and names the launch named, the zone it placed the
+/// instance in, its tags, the launch and Availability Zone groups, the maximum price and
+/// the `ClientToken` the token map keeps for it. Everything else on the record — the id,
+/// the state, the status code, the type and the interruption behaviour — is derived here or
+/// drawn from a closed catalog, so it is fixed-size.
+///
+/// The ONE definition of that charge: `RequestSpotInstances` asks it before the write and
+/// charges exactly it, per request it mints. It also COVERS the caller-chosen bytes of the
+/// instance a fulfillment later launches ([`instance_payload_bytes`]), which is what bounds
+/// that launch's own charge: the instance carries no caller-chosen member its request does
+/// not — and the one member it can hold that the request did not name, the zone the service
+/// picks when the request named none, is a name out of the Region's own zone set rather
+/// than anything a caller sized.
+pub fn spot_instance_request_payload_bytes(
+    view: &SpotInstanceRequest,
+    client_token: Option<&str>,
+) -> usize {
+    let launch = view.launch_specification.as_ref();
+    // The zone the instance is placed in: named by the request when it names one, and
+    // retained on the instance a fulfillment launches, so it is charged here too.
+    let placement_bytes = launch
+        .and_then(|launch| launch.placement.as_ref())
+        .and_then(|placement| placement.availability_zone.as_ref())
+        .map_or(0, String::len);
+    let group_bytes: usize = launch.map_or(0, |launch| {
+        launch
+            .security_groups
+            .iter()
+            .flatten()
+            .map(|group| {
+                group.group_id.as_ref().map_or(0, String::len)
+                    + group.group_name.as_ref().map_or(0, String::len)
+            })
+            .sum()
+    });
+    launch
+        .and_then(|launch| launch.user_data.as_ref())
+        .map_or(0, String::len)
+        .saturating_add(
+            launch
+                .and_then(|launch| launch.image_id.as_ref())
+                .map_or(0, String::len),
+        )
+        .saturating_add(
+            launch
+                .and_then(|launch| launch.key_name.as_ref())
+                .map_or(0, String::len),
+        )
+        .saturating_add(
+            launch
+                .and_then(|launch| launch.subnet_id.as_ref())
+                .map_or(0, String::len),
+        )
+        .saturating_add(
+            launch
+                .and_then(|launch| launch.instance_type.as_ref())
+                .map_or(0, String::len),
+        )
+        .saturating_add(group_bytes)
+        .saturating_add(placement_bytes)
+        .saturating_add(tag_list_bytes(view.tags.as_deref().unwrap_or_default()))
+        .saturating_add(view.launch_group.as_ref().map_or(0, String::len))
+        .saturating_add(view.availability_zone_group.as_ref().map_or(0, String::len))
+        .saturating_add(view.spot_price.as_ref().map_or(0, String::len))
+        .saturating_add(client_token.map_or(0, str::len))
+}
+
+/// Whether `id` is a well-formed Spot Instance request id.
+///
+/// `sir-` followed by 8 or 17 lowercase hexadecimal digits — the short and the long id
+/// form every EC2 resource id takes, read the same way
+/// [`import_image_task_id_is_well_formed`] reads an import task's.
+pub fn spot_instance_request_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix(SPOT_INSTANCE_REQUEST_ID_PREFIX_WITH_HYPHEN) else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Refuse something that is not a Spot Instance request id at all: HTTP 400
+/// [`INVALID_SPOT_INSTANCE_REQUEST_ID_MALFORMED`]. There is nothing to look up for it, so
+/// it is refused before any lookup, the way this service answers every malformed resource
+/// id.
+pub fn require_well_formed_spot_instance_request_id<E>(
+    request_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if spot_instance_request_id_is_well_formed(request_id) {
+        return Ok(());
+    }
+    Err(crate::scaffolded::Scaffolded::service_error(
+        INVALID_SPOT_INSTANCE_REQUEST_ID_MALFORMED,
+        400,
+        format!("Invalid id: '{request_id}'"),
+    ))
+}
+
+/// Refuse a request that named a Spot Instance request id no request of the account has:
+/// HTTP 400 [`INVALID_SPOT_INSTANCE_REQUEST_ID_NOT_FOUND`].
+pub fn invalid_spot_instance_request_id_not_found<E>(
+    request_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_SPOT_INSTANCE_REQUEST_ID_NOT_FOUND,
+        400,
+        format!("The spot instance request ID '{request_id}' does not exist"),
+    )
+}
+
+/// A modelled timestamp as a wall-clock instant: the inverse of
+/// [`system_time_to_date_time`], for a `ValidFrom` / `ValidUntil` the caller named and the
+/// service has to compare against the clock.
+pub fn date_time_to_system_time(at: ::aws_smithy_types::DateTime) -> SystemTime {
+    let offset = Duration::new(at.secs().unsigned_abs(), at.subsec_nanos());
+    if at.secs() >= 0 {
+        UNIX_EPOCH.checked_add(offset).unwrap_or(UNIX_EPOCH)
+    } else {
+        UNIX_EPOCH.checked_sub(offset).unwrap_or(UNIX_EPOCH)
+    }
+}
+
+/// How far `at` is in the future, or [`Duration::ZERO`] when it is not in the future.
+pub fn duration_until(at: SystemTime) -> Duration {
+    at.duration_since(SystemTime::now()).unwrap_or_default()
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another Spot Instance request fits inside the store's ceiling
+    /// ([`MAX_STORED_SPOT_INSTANCE_REQUESTS`]).
+    ///
+    /// The same contract as [`Self::has_import_image_task_capacity`]: a create asks first,
+    /// for every request the call would mint, and refuses instead of growing the store
+    /// past its ceiling.
+    pub fn has_spot_instance_request_capacity(&self, wanted: usize) -> bool {
+        self.spot_instance_requests
+            .len()
+            .saturating_add(wanted)
+            <= MAX_STORED_SPOT_INSTANCE_REQUESTS
+    }
+
+    /// Store one Spot Instance request under a freshly minted id, and answer that id.
+    ///
+    /// The one writer of a Spot Instance request: the id comes from the store's own mint,
+    /// the view's own `SpotInstanceRequestId` is set from it, and the record's bytes are
+    /// charged against [`MAX_STORED_BYTES`] by the one definition of that charge, so no
+    /// caller can store a request the byte budget has not been told about.
+    pub fn insert_spot_instance_request(
+        &mut self,
+        mut view: SpotInstanceRequest,
+        fulfillment: Option<SpotTransition>,
+        valid_until_at: Instant,
+        region: &str,
+        client_token: Option<&str>,
+    ) -> String {
+        let request_id = self.next_id(SPOT_INSTANCE_REQUEST_ID_PREFIX);
+        view.spot_instance_request_id = Some(request_id.clone());
+        self.add_stored_bytes(spot_instance_request_payload_bytes(&view, client_token));
+        self.spot_instance_requests.insert(
+            request_id.clone(),
+            SpotInstanceRequestRecord {
+                view,
+                fulfillment,
+                valid_until_at,
+                region: region.to_string(),
+            },
+        );
+        request_id
+    }
+
+    /// Apply every move the clock owed a Spot Instance request by `now`.
+    ///
+    /// Reached only through [`Self::materialize_due_transitions`], so a reporting operation
+    /// observes these moves without having caused them: each was owed at this instant
+    /// whether or not anybody called. Two moves, in this order, because a request whose
+    /// validity ended before its fulfillment fell due was never fulfillable:
+    ///
+    /// 1. EXPIRY — "for a one-time request, the request remains active until all instances
+    ///    launch, the request is canceled, or the `validUntil` date and time is reached"
+    ///    (`SpotInstanceRequest$ValidUntil`): an `open` request whose window has closed is
+    ///    [`SPOT_REQUEST_STATE_CLOSED`] with the status code
+    ///    [`SPOT_STATUS_SCHEDULE_EXPIRED`].
+    /// 2. FULFILLMENT — "the instance ID, if an instance has been launched to fulfill the
+    ///    Spot Instance request" (`SpotInstanceRequest$InstanceId`): the request becomes
+    ///    [`SPOT_REQUEST_STATE_ACTIVE`] with the status code [`SPOT_STATUS_FULFILLED`] and
+    ///    an instance of this account's own instance store. It is a WRITE rather than a
+    ///    derive for the same reason an import's completion is: it mints an instance every
+    ///    later read has to agree on.
+    pub fn materialize_due_spot_instance_requests(&mut self, now: Instant) {
+        let expired: Vec<String> = self
+            .spot_instance_requests
+            .iter()
+            .filter(|(_, record)| {
+                record.view.state.as_deref() == Some(SPOT_REQUEST_STATE_OPEN)
+                    && now >= record.valid_until_at
+            })
+            .map(|(request_id, _)| request_id.clone())
+            .collect();
+        for request_id in expired {
+            let Some(record) = self.spot_instance_requests.get_mut(&request_id) else {
+                continue;
+            };
+            record.view.state = Some(SPOT_REQUEST_STATE_CLOSED.to_string());
+            // The window closed when `ValidUntil` was reached, not when somebody next
+            // asked, so that is the instant the status update reports.
+            record.view.status = Some(SpotInstanceStatus {
+                code: Some(SPOT_STATUS_SCHEDULE_EXPIRED.to_string()),
+                message: Some(SPOT_STATUS_MESSAGE_SCHEDULE_EXPIRED.to_string()),
+                update_time: record.view.valid_until,
+            });
+            // Nothing is owed on a request that can no longer be fulfilled.
+            record.fulfillment = None;
+        }
+
+        let due: Vec<String> = self
+            .spot_instance_requests
+            .iter()
+            .filter(|(_, record)| {
+                record.view.state.as_deref() == Some(SPOT_REQUEST_STATE_OPEN)
+                    && record
+                        .fulfillment
+                        .as_ref()
+                        .is_some_and(|fulfillment| now >= fulfillment.due_at)
+            })
+            .map(|(request_id, _)| request_id.clone())
+            .collect();
+        for request_id in due {
+            self.fulfill_spot_instance_request(&request_id);
+        }
+    }
+
+    /// Launch the instance one due Spot Instance request asked for, and move the request to
+    /// `active` / `fulfilled`.
+    ///
+    /// Every launch parameter comes off the request's own stored launch specification, so
+    /// the instance is the one the request described; the request keeps its tags (they tag
+    /// "the Spot Instance request on creation",
+    /// `RequestSpotInstancesRequest$TagSpecifications`, not the instance).
+    ///
+    /// A request this store has no room to launch for — no instance slot, or no private
+    /// address left — stays `open` carrying [`SPOT_STATUS_CAPACITY_NOT_AVAILABLE`], which
+    /// is what the real service reports for a request it cannot place, and owes nothing
+    /// further.
+    ///
+    /// The instance's own byte charge is made by [`Self::insert_instance`] and is NOT asked
+    /// for again here, because `RequestSpotInstances` already asked for it: every
+    /// caller-chosen string the instance holds is one
+    /// [`spot_instance_request_payload_bytes`] charged for the request that launched it, so
+    /// the store's byte ceiling was cleared before this move was ever owed.
+    fn fulfill_spot_instance_request(&mut self, request_id: &str) {
+        let Some(record) = self.spot_instance_requests.get(request_id) else {
+            return;
+        };
+        let launch = record.view.launch_specification.clone().unwrap_or_default();
+        let region = record.region.clone();
+        let at = record
+            .fulfillment
+            .as_ref()
+            .map_or_else(SystemTime::now, |fulfillment| fulfillment.at);
+        let availability_zone = launch
+            .placement
+            .as_ref()
+            .and_then(|placement| placement.availability_zone.clone())
+            .or_else(|| {
+                availability_zones_in_region(&region)
+                    .first()
+                    .map(|zone| zone.zone_name.clone())
+            })
+            .unwrap_or_else(|| region.clone());
+
+        if self.instances.len() >= MAX_STORED_INSTANCES {
+            self.leave_spot_instance_request_unplaced(request_id, at);
+            return;
+        }
+        let Some(private_ip) = self.allocate_private_ip() else {
+            self.leave_spot_instance_request_unplaced(request_id, at);
+            return;
+        };
+
+        // A Spot Instance is its own reservation: one instance launched by one request.
+        let reservation_id = self.mint_reservation_id();
+        self.insert_reservation(ReservationRecord {
+            reservation_id: reservation_id.clone(),
+            owner_id: ::engine::emulator_account_id().to_string(),
+            requester_id: None,
+            instance_ids: Vec::new(),
+        });
+        let instance_id = self.mint_instance_id();
+        let instance_type = launch
+            .instance_type
+            .clone()
+            .unwrap_or_else(|| DEFAULT_INSTANCE_TYPE.to_string());
+        self.insert_instance(InstanceRecord {
+            instance_id: instance_id.clone(),
+            reservation_id,
+            image_id: launch.image_id.clone(),
+            instance_type: instance_type.clone(),
+            key_name: launch.key_name.clone(),
+            subnet_id: launch.subnet_id.clone(),
+            security_groups: launch
+                .security_groups
+                .iter()
+                .flatten()
+                .map(|group| (group.group_id.clone(), group.group_name.clone()))
+                .collect(),
+            private_dns_name: private_dns_name(&private_ip, &region),
+            private_ip,
+            // A public address comes from a default-VPC subnet or an Elastic IP, neither of
+            // which this slice models — the same answer `RunInstances` gives.
+            public_ip: None,
+            // An instance AWS has just launched is `pending`; the clock owes it `running`,
+            // on the same span as every other transition of this crate.
+            state: InstanceStateName::Pending,
+            pending_transition: Some(PendingTransition::starting_now(InstanceStateName::Running)),
+            state_transition_reason: None,
+            state_reason: None,
+            // The instance was launched when the fulfillment fell due, not when somebody
+            // next asked about it.
+            launch_time: at,
+            ami_launch_index: 0,
+            user_data: launch.user_data.clone(),
+            placement_az: availability_zone.clone(),
+            monitoring_state: if launch
+                .monitoring
+                .as_ref()
+                .is_some_and(|monitoring| monitoring.enabled)
+            {
+                MONITORING_STATE_ENABLED.to_string()
+            } else {
+                MONITORING_STATE_DISABLED.to_string()
+            },
+            architecture: architecture_for(&instance_type),
+            ebs_optimized: launch.ebs_optimized.unwrap_or(false),
+            // Hibernation is `InstanceInterruptionBehavior`'s business for a Spot
+            // Instance, and the launch specification carries no hibernation member.
+            hibernation_configured: false,
+            disable_api_termination: false,
+            // The request's tags tag the REQUEST; nothing tags the instance.
+            tags: BTreeMap::new(),
+            client_token: None,
+            spot_instance_request_id: Some(request_id.to_string()),
+        });
+
+        if let Some(record) = self.spot_instance_requests.get_mut(request_id) {
+            record.view.state = Some(SPOT_REQUEST_STATE_ACTIVE.to_string());
+            record.view.status = Some(SpotInstanceStatus {
+                code: Some(SPOT_STATUS_FULFILLED.to_string()),
+                message: Some(SPOT_STATUS_MESSAGE_FULFILLED.to_string()),
+                update_time: Some(system_time_to_date_time(at)),
+            });
+            record.view.instance_id = Some(instance_id);
+            // "The Availability Zone in which the request is launched" — known only now
+            // that it has been launched. Its zone ID is deliberately NOT set beside it:
+            // "either launchedAvailabilityZone or launchedAvailabilityZoneId can be
+            // specified, but not both" (`SpotInstanceRequest$LaunchedAvailabilityZone`).
+            record.view.launched_availability_zone = Some(availability_zone);
+            record.fulfillment = None;
+        }
+    }
+
+    /// Leave one due Spot Instance request `open` carrying
+    /// [`SPOT_STATUS_CAPACITY_NOT_AVAILABLE`]: there was no capacity in this store to
+    /// place its instance in.
+    fn leave_spot_instance_request_unplaced(&mut self, request_id: &str, at: SystemTime) {
+        if let Some(record) = self.spot_instance_requests.get_mut(request_id) {
+            record.view.status = Some(SpotInstanceStatus {
+                code: Some(SPOT_STATUS_CAPACITY_NOT_AVAILABLE.to_string()),
+                message: Some(SPOT_STATUS_MESSAGE_CAPACITY_NOT_AVAILABLE.to_string()),
+                update_time: Some(system_time_to_date_time(at)),
+            });
+            record.fulfillment = None;
+        }
+    }
+
+    /// The product description a Spot request for `image_id` carries: which operating
+    /// system the Spot Instance runs, read off the AMI the launch names when this account
+    /// can see it.
+    ///
+    /// An AMI this store does not hold leaves the description at the Linux one, which is
+    /// what the overwhelming majority of AMIs are and what EC2 reports for an AMI with no
+    /// `Platform` of its own ("the value is `windows` for Windows AMIs; otherwise blank",
+    /// `Image$Platform`).
+    pub fn spot_product_description(&self, image_id: Option<&str>) -> &'static str {
+        let windows = image_id
+            .and_then(|image_id| self.images.get(image_id))
+            .is_some_and(|image| {
+                image
+                    .platform
+                    .as_deref()
+                    .is_some_and(|platform| platform.eq_ignore_ascii_case(IMAGE_PLATFORM_WINDOWS))
+            });
+        if windows {
+            PRODUCT_DESCRIPTION_WINDOWS
+        } else {
+            PRODUCT_DESCRIPTION_LINUX_UNIX
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Secondary subnets
 // ---------------------------------------------------------------------------
 
@@ -13916,3 +14630,4 @@ pub fn allowed_images_settings_full<E>(region: &str, full: AllowedImagesSettings
         )),
     }
 }
+
