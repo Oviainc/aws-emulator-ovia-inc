@@ -47,6 +47,8 @@ mod pending_activity_task_count;
 mod poll_for_decision_task;
 #[path = "all/request_cancel_workflow_execution.rs"]
 mod request_cancel_workflow_execution;
+#[path = "all/signal_history_pagination.rs"]
+mod signal_history_pagination;
 #[path = "all/signal_workflow_execution.rs"]
 mod signal_workflow_execution;
 #[path = "all/state_roundtrip.rs"]
