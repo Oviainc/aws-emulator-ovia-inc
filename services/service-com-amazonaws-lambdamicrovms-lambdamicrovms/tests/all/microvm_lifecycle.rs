@@ -16,7 +16,7 @@ use smithy_server_runtime::MultiServiceRouter;
 pub(crate) const REGION: &str = "us-west-2";
 
 /// The canonical emulator account id (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Comfortably longer than every clock-owed span in `crate::state` (each is 500 ms), so
 /// by the time this has passed the transition is due even on a loaded machine. The
@@ -1025,11 +1025,6 @@ async fn unknown_identifiers_answer_resource_not_found() {
             "DELETE",
             "/2025-09-09/microvms/mvm-00000000deadbeef".to_string(),
         ),
-        (
-            "list filtered by an absent image",
-            "GET",
-            "/2025-09-09/microvms?imageIdentifier=absent".to_string(),
-        ),
     ];
 
     for (case, method, uri) in rows {
@@ -1045,8 +1040,8 @@ async fn unknown_identifiers_answer_resource_not_found() {
         );
     }
 
-    // Running from an absent image, or an absent version of a present one, is the
-    // same 404.
+    // Running from an absent image, or a version of a present image that is not its
+    // active one, is the same 404.
     for (case, body) in [
         ("absent image", json!({"imageIdentifier": "absent"})),
         (

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! IMPLEMENTED. Resolves `resourceArn` through the store's ARN index and MERGES the
-//! supplied tags into that resource's own tag map, so a key already present is
-//! overwritten and every other key is kept. `ListTagsForResource` then reports the
-//! merged map. An ARN no resource in the store owns is a `NotFoundException`.
+//! IMPLEMENTED. PARSES `resourceArn` first — a value that is not a resource ARN of
+//! this service is a `BadRequestException` (400), before any lookup — and then
+//! resolves it through the store's ARN index and MERGES the supplied tags into that
+//! resource's own tag map, so a key already present is overwritten and every other
+//! key is kept. `ListTagsForResource` then reports the merged map. A well-formed ARN
+//! no resource in the store owns is a `NotFoundException` (404).
 //!
 //! The cluster is the only taggable resource this slice holds; nodegroups, add-ons,
 //! Fargate profiles and the rest reach the same index as their own slices land.
@@ -49,7 +51,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::MAX_TAGS_PER_RESOURCE;
+use crate::state::{is_eks_resource_arn, MAX_TAGS_PER_RESOURCE};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -130,6 +132,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // THE INPUT FIRST: `resourceArn` names "the resource to add tags to", so a
+        // value that is not a resource ARN of this service names nothing this API can
+        // address — a syntax failure on the input, which is what
+        // `BadRequestException` ("the request contains a semantic error") reports.
+        // Nothing is looked up for it: "you sent garbage" and "the resource is gone"
+        // are different answers to a caller, and only the second is a `NotFound`.
+        if !is_eks_resource_arn(&input.resource_arn) {
+            return Err(
+                TagResourceErrorModeled::BadRequestException(crate::state::invalid_resource_arn())
+                    .into(),
+            );
+        }
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceError::from(TagResourceErrorModeled::ServerException(ServerException {
                 message: Some("the eks emulator store is unavailable".to_string()),

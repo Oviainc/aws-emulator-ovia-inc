@@ -791,6 +791,17 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             .filter(|existing| *existing != rule_arn)
     }
 
+    /// The pricing plan a name is taken by, when it is not `plan_arn`'s own name — the
+    /// uniqueness index behind "The name must be unique to each pricing plan", decided
+    /// the same way as for a rule so a rename to the name already held is not a
+    /// conflict.
+    pub fn conflicting_pricing_plan_name(&self, name: &str, plan_arn: &str) -> Option<&str> {
+        self.pricing_plan_names
+            .get(name)
+            .map(String::as_str)
+            .filter(|existing| *existing != plan_arn)
+    }
+
     /// The group an account is already associated with, when it is not `group_arn`.
     pub fn conflicting_association(&self, account_id: &str, group_arn: &str) -> Option<&str> {
         self.account_associations

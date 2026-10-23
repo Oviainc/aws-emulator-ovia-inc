@@ -521,7 +521,9 @@ async fn a_request_within_every_modelled_constraint_reaches_the_operation() {
             "PUT",
             "/update-pricing-plan",
             json!({ "Arn": VALID_PLAN_ARN, "Name": "StillScaffolded" }),
-            501,
+            // Implemented: no pricing plan answers to this ARN, so the operation's own
+            // `ResourceNotFoundException` is what comes back.
+            404,
         ),
         (
             "UpdatePricingRule with a conforming bare rule id",

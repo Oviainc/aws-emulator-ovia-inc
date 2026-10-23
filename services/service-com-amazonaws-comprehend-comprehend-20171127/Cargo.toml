@@ -43,6 +43,10 @@ lingua = { version = "1.8", default-features = false, features = [
 # VADER sentiment engine behind DetectSentiment: a rule-based English sentiment
 # analyser returning positive/negative/neutral proportions and a compound score.
 vader_sentiment = "0.1"
+# Toxicity engine behind DetectToxicContent: an English profanity/abuse analyser
+# that classifies a string into categories (profane, offensive, sexual, mean) each
+# at a mild/moderate/severe level.
+rustrict = "0.7"
 # Regular-expression engine behind the PII recognizer in ops::contains_pii_entities:
 # it matches each PII entity type's published form over the submitted document.
 regex = "1.12"

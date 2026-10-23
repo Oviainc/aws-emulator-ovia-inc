@@ -19,3 +19,6 @@ mod state_roundtrip;
 
 #[path = "all/timestamp_and_state_reason_wire.rs"]
 mod timestamp_and_state_reason_wire;
+
+#[path = "all/validation_message_wording.rs"]
+mod validation_message_wording;

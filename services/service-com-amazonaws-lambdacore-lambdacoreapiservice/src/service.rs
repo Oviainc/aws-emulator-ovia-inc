@@ -111,16 +111,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) so this service can
+        // state it its own way.
+        //
+        // AWS states it as the `400 ValidationException` envelope the framework already
+        // renders — `N validation error(s) detected: Value '<value>' at '<member path>'
+        // failed to satisfy constraint: <requirement>` — with ONE difference: a
+        // `@pattern` requirement quotes the expression a value has to satisfy, without
+        // the `^` / `$` the model writes around it. That wording is AWS's rather than
+        // this service's, so it lives once in `service-common`
+        // (`service_common::validation::unanchored` is the one renderer of that rule);
+        // the CHECK still runs the model's pattern as written, and every other
+        // requirement, every member path and the envelope stay the framework's.
+        //
+        // `None` for anything that is not a constraint refusal — an unauthenticated
+        // caller keeps the framework's 403 code and wording.
+        service_common::aws_validation_refusal(refusal)
     }
 
     fn override_routing_error(

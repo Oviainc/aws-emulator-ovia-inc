@@ -35,6 +35,8 @@ mod cluster_versions;
 mod connected_clusters;
 #[path = "all/encryption_config_association.rs"]
 mod encryption_config_association;
+#[path = "all/error_class_selection.rs"]
+mod error_class_selection;
 #[path = "all/identity_provider_config.rs"]
 mod identity_provider_config;
 #[path = "all/identity_provider_config_not_found.rs"]

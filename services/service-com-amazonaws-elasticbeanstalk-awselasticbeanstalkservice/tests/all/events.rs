@@ -123,11 +123,29 @@ fn at_secs(event_date: &str, case: &str) -> f64 {
     crate::harness::instant(event_date, case)
 }
 
-/// `secs` as the ISO-8601 timestamp the query protocol reads a timestamp from.
-fn as_timestamp(secs: f64, case: &str) -> String {
-    DateTime::from_secs_f64(secs)
+/// An `EventDate` as the exact `(epoch seconds, subsecond nanos)` pair an instant is
+/// ORDERED by.
+///
+/// The ordering key is the service's own ([`eb::state::instant_key`]), not a second
+/// copy of it, so this suite and the handler cannot disagree about how two instants
+/// compare. The pair, not [`at_secs`]: an epoch second count near 1.8e9 leaves an
+/// `f64` barely half a microsecond of resolution, so two reported dates a microsecond
+/// apart — the precision these timestamps are reported at — can round to the same
+/// `f64`, and a window assertion built on `f64` would then disagree with the order the
+/// REPORTED values are in.
+fn at_parts(event_date: &str, case: &str) -> (i64, u32) {
+    let parsed = DateTime::from_str(event_date, Format::DateTime)
+        .unwrap_or_else(|error| panic!("case {case:?}: {event_date:?} is not a timestamp: {error}"));
+    eb::state::instant_key(&parsed)
+}
+
+/// The instant `delta_secs` whole seconds from `parts`, rendered as a timestamp: a
+/// bound outside the log, built from a reported date so it keeps that date's
+/// subsecond part.
+fn shifted_timestamp(parts: (i64, u32), delta_secs: i64, case: &str) -> String {
+    DateTime::from_secs_and_nanos(parts.0 + delta_secs, parts.1)
         .fmt(Format::DateTime)
-        .unwrap_or_else(|error| panic!("case {case:?}: {secs} is not a renderable timestamp: {error}"))
+        .unwrap_or_else(|error| panic!("case {case:?}: {parts:?} is not renderable: {error}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,75 +1062,78 @@ async fn the_time_window_includes_start_time_and_excludes_end_time() {
         9,
         "case {case:?}: expected one activity of three events per CreateApplication, got {all:?}"
     );
-    let dates: Vec<f64> = all
+    // Every reported date as the exact `(seconds, subsecond nanos)` pair the window
+    // is asserted on, so a pair of events a microsecond apart is ordered here the
+    // same way the service must order them.
+    let dates: Vec<(i64, u32)> = all
         .iter()
-        .map(|event| at_secs(&event.event_date, case))
+        .map(|event| at_parts(&event.event_date, case))
         .collect();
     let newest = all[0].event_date.clone();
     let oldest = all[all.len() - 1].event_date.clone();
-    let newest_secs = dates[0];
-    let oldest_secs = dates[dates.len() - 1];
-    let future = as_timestamp(newest_secs + 3600.0, case);
-    let past = as_timestamp(oldest_secs - 3600.0, case);
+    let newest_parts = dates[0];
+    let oldest_parts = dates[dates.len() - 1];
+    let future = shifted_timestamp(newest_parts, 3_600, case);
+    let past = shifted_timestamp(oldest_parts, -3_600, case);
 
     // Each row is a window and the bounds it stands for: `StartTime` is "those
     // that occur ON OR AFTER this time", `EndTime` is "up to, but NOT
     // INCLUDING, the EndTime".
     struct WindowCase<'a> {
         filters: Vec<(&'a str, &'a str)>,
-        /// The inclusive lower bound the filters stand for, in epoch seconds.
-        start: Option<f64>,
-        /// The exclusive upper bound the filters stand for, in epoch seconds.
-        end: Option<f64>,
+        /// The inclusive lower bound the filters stand for.
+        start: Option<(i64, u32)>,
+        /// The exclusive upper bound the filters stand for.
+        end: Option<(i64, u32)>,
     }
     let table: Vec<WindowCase<'_>> = vec![
         WindowCase {
             filters: vec![("StartTime", oldest.as_str())],
-            start: Some(oldest_secs),
+            start: Some(oldest_parts),
             end: None,
         },
         WindowCase {
             filters: vec![("StartTime", newest.as_str())],
-            start: Some(newest_secs),
+            start: Some(newest_parts),
             end: None,
         },
         WindowCase {
             filters: vec![("StartTime", past.as_str())],
-            start: Some(oldest_secs - 3600.0),
+            start: Some((oldest_parts.0 - 3_600, oldest_parts.1)),
             end: None,
         },
         WindowCase {
             filters: vec![("StartTime", future.as_str())],
-            start: Some(newest_secs + 3600.0),
+            start: Some((newest_parts.0 + 3_600, newest_parts.1)),
             end: None,
         },
         WindowCase {
             filters: vec![("EndTime", oldest.as_str())],
             start: None,
-            end: Some(oldest_secs),
+            end: Some(oldest_parts),
         },
         WindowCase {
             filters: vec![("EndTime", newest.as_str())],
             start: None,
-            end: Some(newest_secs),
+            end: Some(newest_parts),
         },
         WindowCase {
             filters: vec![("EndTime", past.as_str())],
             start: None,
-            end: Some(oldest_secs - 3600.0),
+            end: Some((oldest_parts.0 - 3_600, oldest_parts.1)),
         },
         WindowCase {
             filters: vec![("EndTime", future.as_str())],
             start: None,
-            end: Some(newest_secs + 3600.0),
+            end: Some((newest_parts.0 + 3_600, newest_parts.1)),
         },
         WindowCase {
             filters: vec![
                 ("StartTime", oldest.as_str()),
                 ("EndTime", newest.as_str()),
             ],
-            start: Some(oldest_secs),
-            end: Some(newest_secs),
+            start: Some(oldest_parts),
+            end: Some(newest_parts),
         },
     ];
 
@@ -1133,7 +1154,7 @@ async fn the_time_window_includes_start_time_and_excludes_end_time() {
             all.len()
         );
         for event in &selected {
-            let at = at_secs(&event.event_date, &case);
+            let at = at_parts(&event.event_date, &case);
             assert!(
                 start.is_none_or(|start| at >= start),
                 "case {case:?}: {:?} is before StartTime",
@@ -1161,4 +1182,88 @@ async fn the_time_window_includes_start_time_and_excludes_end_time() {
         all.len(),
         "case {case:?}: StartTime and EndTime at one instant must partition the log, got {from_newest:?} and {until_newest:?}"
     );
+}
+
+#[tokio::test]
+async fn a_bound_echoed_back_from_a_reported_date_windows_on_that_very_instant() {
+    let emulator = Emulator::new();
+    let case = "echoed bound";
+
+    // No sleep between the calls, so the log holds events recorded inside the same
+    // millisecond: the rule under test is that a bound a client takes from a
+    // reported `EventDate` and sends back names THAT instant, however close two
+    // events are, and the rows are every reported date in such a log.
+    for name in ["echo-app-a", "echo-app-b", "echo-app-c", "echo-app-d"] {
+        ok(
+            &emulator,
+            case,
+            "CreateApplication",
+            &[("ApplicationName", name)],
+        )
+        .await;
+    }
+
+    let all = events_of(&emulator, case, &[]).await;
+    assert!(
+        all.len() >= 4,
+        "case {case:?}: expected the CreateApplication activities to be logged, got {all:?}"
+    );
+    let dates: Vec<(i64, u32)> = all
+        .iter()
+        .map(|event| at_parts(&event.event_date, case))
+        .collect();
+
+    for (index, event) in all.iter().enumerate() {
+        let bound = event.event_date.as_str();
+        let at = dates[index];
+        let row = format!("bound {bound:?}");
+
+        // "StartTime: … those that occur on or after this time" (inclusive) and
+        // "EndTime: … up to, but not including, the EndTime" (exclusive) at ONE
+        // instant partition the log, and each side holds exactly the dates on its
+        // side of that instant.
+        let from = events_of(&emulator, &row, &[("StartTime", bound)]).await;
+        let until = events_of(&emulator, &row, &[("EndTime", bound)]).await;
+
+        let expected_from = dates.iter().filter(|date| **date >= at).count();
+        let expected_until = dates.iter().filter(|date| **date < at).count();
+        assert_eq!(
+            from.len(),
+            expected_from,
+            "case {row:?}: expected {expected_from} events on or after it, got {from:?}"
+        );
+        assert_eq!(
+            until.len(),
+            expected_until,
+            "case {row:?}: expected {expected_until} events before it, got {until:?}"
+        );
+        assert_eq!(
+            from.len() + until.len(),
+            all.len(),
+            "case {row:?}: the inclusive start and the exclusive end must partition \
+             the log, got {from:?} and {until:?}"
+        );
+        assert!(
+            from.iter()
+                .any(|reported| reported.event_date == event.event_date),
+            "case {row:?}: the event the bound was read from occurs on that instant, \
+             so StartTime must select it, got {from:?}"
+        );
+        for reported in &from {
+            let reported_at = at_parts(&reported.event_date, &row);
+            assert!(
+                reported_at >= at,
+                "case {row:?}: {:?} is before the bound",
+                reported.event_date
+            );
+        }
+        for reported in &until {
+            let reported_at = at_parts(&reported.event_date, &row);
+            assert!(
+                reported_at < at,
+                "case {row:?}: {:?} is at or after the bound",
+                reported.event_date
+            );
+        }
+    }
 }

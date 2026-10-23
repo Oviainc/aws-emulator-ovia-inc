@@ -99,6 +99,18 @@
 //! Keyed by `VolumeId` in a [`BTreeMap`], the same stable order the VPC and subnet stores
 //! are kept in, so a pagination token can name the id the next page starts at.
 //!
+//! ## Verified Access trust providers
+//!
+//! [`ComAmazonawsEc2Amazonec2State::verified_access_trust_providers`] holds the account's
+//! Verified Access trust providers as the modelled
+//! [`crate::ops::types::VerifiedAccessTrustProvider`] shape itself — the one
+//! `CreateVerifiedAccessTrustProvider` answers with and
+//! `DescribeVerifiedAccessTrustProviders` reports — keyed by
+//! `VerifiedAccessTrustProviderId` in a [`BTreeMap`], the same stable order the VPC and
+//! subnet stores are kept in, so a pagination token can name the id the next page starts
+//! at. The shape carries no status member: AWS hands a trust provider back ready, so the
+//! clock owes it no transition and there is nothing to derive on read.
+//!
 //! ## Secondary networks
 //!
 //! [`ComAmazonawsEc2Amazonec2State::secondary_networks`] holds the account's secondary
@@ -1063,6 +1075,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// calls again. A subnet AWS hands over ready — a default VPC's default subnets — never
     /// has an entry here.
     pub subnet_available_at: BTreeMap<String, Instant>,
+    /// Every Verified Access trust provider the account holds, by
+    /// `VerifiedAccessTrustProviderId`, as the modelled
+    /// [`crate::ops::types::VerifiedAccessTrustProvider`] shape itself — so a member a
+    /// writer sets round-trips through `DescribeVerifiedAccessTrustProviders` without a
+    /// field-by-field copy. Ordered by id, which is the order that describe reports and
+    /// pages over.
+    pub verified_access_trust_providers:
+        BTreeMap<String, crate::ops::types::VerifiedAccessTrustProvider>,
+    /// A `CreateVerifiedAccessTrustProvider` `ClientToken` and the trust provider id it
+    /// minted, so a repeat of the same request answers with that trust provider instead
+    /// of creating a second one.
+    pub verified_access_trust_provider_client_tokens: HashMap<String, String>,
     /// Every AMI the account can see, by `ImageId`, as the modelled [`Image`] shape itself
     /// — the Amazon-published catalog a fresh account already has (see the module docs)
     /// plus any image a writer stores later. Ordered by id, which is the order the
@@ -1272,6 +1296,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_attributes: BTreeMap::new(),
             subnets: BTreeMap::new(),
             subnet_available_at: BTreeMap::new(),
+            verified_access_trust_providers: BTreeMap::new(),
+            verified_access_trust_provider_client_tokens: HashMap::new(),
             local_gateway_route_table_virtual_interface_group_associations: BTreeMap::new(),
             images: BTreeMap::new(),
             security_groups: BTreeMap::new(),
@@ -5074,6 +5100,192 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsEc2Amazonec2State>)
+}
+
+// =============================================================================
+// Verified Access trust providers
+// =============================================================================
+
+/// The id prefix a Verified Access trust provider is minted under.
+///
+/// EC2 names the resource's ids `vatp-<hex>`, the same `<prefix>-<hex>` form every other
+/// EC2 resource id takes, so [`ComAmazonawsEc2Amazonec2State::next_id`] mints them.
+pub const VERIFIED_ACCESS_TRUST_PROVIDER_ID_PREFIX: &str = "vatp";
+
+/// The one `ResourceType` a `CreateVerifiedAccessTrustProvider` tag specification may
+/// name: "The tags to assign to the Verified Access trust provider"
+/// (`CreateVerifiedAccessTrustProviderRequest$TagSpecifications`), spelled as the
+/// modelled `ResourceType` enum spells it
+/// (`smithy_query(query="shape",shape="ResourceType")`).
+pub const VERIFIED_ACCESS_TRUST_PROVIDER_TAGGABLE_RESOURCE: &str =
+    "verified-access-trust-provider";
+
+/// `TrustProviderType`'s `user` (`smithy_query(query="shape",shape="TrustProviderType")`).
+pub const TRUST_PROVIDER_TYPE_USER: &str = "user";
+
+/// `TrustProviderType`'s `device`.
+pub const TRUST_PROVIDER_TYPE_DEVICE: &str = "device";
+
+/// `UserTrustProviderType`'s `oidc`
+/// (`smithy_query(query="shape",shape="UserTrustProviderType")`) — the one user-based
+/// kind that is OpenID Connect, so the one `OidcOptions` describe.
+pub const USER_TRUST_PROVIDER_TYPE_OIDC: &str = "oidc";
+
+/// How many Verified Access trust providers this emulator stores before
+/// `CreateVerifiedAccessTrustProvider` is refused.
+///
+/// CHOSEN, like [`MAX_STORED_VOLUMES`] and for the same reason: nothing in this emulator
+/// reclaims a stored trust provider, so the store needs a ceiling that is not the
+/// process's memory. It is well above the published per-Region Verified Access quota a
+/// test would exercise. A count ceiling is not a memory bound on its own — see
+/// [`MAX_STORED_BYTES`] — so the caller-chosen bytes of each record are charged against
+/// that budget too ([`verified_access_trust_provider_payload_bytes`]).
+pub const MAX_VERIFIED_ACCESS_TRUST_PROVIDERS: usize = 1_000;
+
+/// The largest page `DescribeVerifiedAccessTrustProviders` serves, and the page it serves
+/// when the request names no size.
+///
+/// The top of the modelled `MaxResults` range, `range 5..200`
+/// (`smithy_query(query="operation",operation="DescribeVerifiedAccessTrustProviders")`),
+/// so a request that names no page size is answered with the largest page the operation
+/// can be ASKED for and the `NextToken` path behaves the same either way.
+pub const MAX_VERIFIED_ACCESS_TRUST_PROVIDERS_PAGE_SIZE: usize = 200;
+
+/// EC2's code for a Verified Access trust provider id that names no trust provider of the
+/// account.
+///
+/// EC2's model declares no error shape at all (see [`crate::scaffolded::ServiceError`]),
+/// and the service answers `Invalid<Resource>Id.NotFound` for an id of a resource it
+/// cannot resolve — `InvalidVolume.NotFound`, `InvalidLaunchTemplateId.NotFound` — so
+/// that is the code this resource's id gets.
+pub const INVALID_VERIFIED_ACCESS_TRUST_PROVIDER_ID_NOT_FOUND: &str =
+    "InvalidVerifiedAccessTrustProviderId.NotFound";
+
+/// EC2's quota code for one Verified Access trust provider too many, named the way every
+/// other per-resource EC2 quota code is (`VolumeLimitExceeded`,
+/// `LaunchTemplateLimitExceeded`).
+pub const VERIFIED_ACCESS_TRUST_PROVIDER_LIMIT_EXCEEDED: &str =
+    "VerifiedAccessTrustProviderLimitExceeded";
+
+/// The caller-chosen bytes one stored trust provider holds for the process's lifetime:
+/// every string the REQUEST chose the length of, plus the client token the token map
+/// keeps.
+///
+/// The ids, the timestamps and the trust-provider kinds are the service's own or come from
+/// a modelled enum, so they are bounded already and not counted here. One definition of
+/// the charge, so a writer cannot store bytes the store's budget never saw.
+pub fn verified_access_trust_provider_payload_bytes(
+    provider: &crate::ops::types::VerifiedAccessTrustProvider,
+    client_token: Option<&str>,
+) -> usize {
+    let text = |value: &Option<String>| value.as_ref().map_or(0, String::len);
+    let mut bytes = tag_list_bytes(provider.tags.as_deref().unwrap_or_default())
+        .saturating_add(text(&provider.description))
+        .saturating_add(text(&provider.policy_reference_name))
+        .saturating_add(client_token.map_or(0, str::len));
+    if let Some(options) = provider.oidc_options.as_ref() {
+        bytes = bytes
+            .saturating_add(text(&options.issuer))
+            .saturating_add(text(&options.authorization_endpoint))
+            .saturating_add(text(&options.token_endpoint))
+            .saturating_add(text(&options.user_info_endpoint))
+            .saturating_add(text(&options.client_id))
+            .saturating_add(text(&options.client_secret))
+            .saturating_add(text(&options.scope));
+    }
+    if let Some(options) = provider.device_options.as_ref() {
+        bytes = bytes
+            .saturating_add(text(&options.tenant_id))
+            .saturating_add(text(&options.public_signing_key_url));
+    }
+    if let Some(options) = provider.native_application_oidc_options.as_ref() {
+        bytes = bytes
+            .saturating_add(text(&options.public_signing_key_endpoint))
+            .saturating_add(text(&options.issuer))
+            .saturating_add(text(&options.authorization_endpoint))
+            .saturating_add(text(&options.token_endpoint))
+            .saturating_add(text(&options.user_info_endpoint))
+            .saturating_add(text(&options.client_id))
+            .saturating_add(text(&options.scope));
+    }
+    if let Some(sse) = provider.sse_specification.as_ref() {
+        bytes = bytes.saturating_add(text(&sse.kms_key_arn));
+    }
+    bytes
+}
+
+/// Refuse a request that named a Verified Access trust provider id this account holds no
+/// trust provider for: HTTP 400
+/// [`INVALID_VERIFIED_ACCESS_TRUST_PROVIDER_ID_NOT_FOUND`].
+///
+/// One code covers an id of any shape: an id this service never minted names no trust
+/// provider of the account whether or not it reads like one. The message names the id the
+/// REQUEST gave, in the wording the real service answers this resource with
+/// ("VerifiedAccessTrustProvider <id> does not exist"), so a client reading the text sees
+/// which id it was.
+pub fn invalid_verified_access_trust_provider_id_not_found<E>(
+    trust_provider_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_VERIFIED_ACCESS_TRUST_PROVIDER_ID_NOT_FOUND,
+        400,
+        format!("VerifiedAccessTrustProvider {trust_provider_id} does not exist"),
+    )
+}
+
+/// Refuse a create that would take the store past
+/// [`MAX_VERIFIED_ACCESS_TRUST_PROVIDERS`]: HTTP 400
+/// [`VERIFIED_ACCESS_TRUST_PROVIDER_LIMIT_EXCEEDED`].
+pub fn verified_access_trust_provider_limit_exceeded<E>(
+    message: impl Into<String>,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        VERIFIED_ACCESS_TRUST_PROVIDER_LIMIT_EXCEEDED,
+        400,
+        message,
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another Verified Access trust provider fits inside the store's ceiling
+    /// ([`MAX_VERIFIED_ACCESS_TRUST_PROVIDERS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
+    /// with [`verified_access_trust_provider_limit_exceeded`] when it answers `false`.
+    pub fn has_verified_access_trust_provider_capacity(&self) -> bool {
+        self.verified_access_trust_providers.len() < MAX_VERIFIED_ACCESS_TRUST_PROVIDERS
+    }
+
+    /// Store `provider` under a freshly minted `VerifiedAccessTrustProviderId`, charge the
+    /// caller-chosen bytes it and `client_token` retain against the store's byte budget,
+    /// and answer the id it was given.
+    ///
+    /// The id is minted HERE rather than by the writer, so a trust provider never shares
+    /// an id with another resource of this store, and the record is written with that id on
+    /// it so no reader has to learn the key twice. The charge happens at the insert the way
+    /// [`Self::insert_vpc`] charges a VPC's tags, so no path can store those bytes
+    /// uncharged; a create still asks
+    /// [`Self::has_verified_access_trust_provider_capacity`] and
+    /// [`Self::would_exceed_stored_bytes`] first so it can refuse instead of overshooting.
+    pub fn insert_verified_access_trust_provider(
+        &mut self,
+        mut provider: crate::ops::types::VerifiedAccessTrustProvider,
+        client_token: Option<&str>,
+    ) -> String {
+        let trust_provider_id = self.next_id(VERIFIED_ACCESS_TRUST_PROVIDER_ID_PREFIX);
+        provider.verified_access_trust_provider_id = Some(trust_provider_id.clone());
+        self.add_stored_bytes(verified_access_trust_provider_payload_bytes(
+            &provider,
+            client_token,
+        ));
+        if let Some(token) = client_token {
+            self.verified_access_trust_provider_client_tokens
+                .insert(token.to_string(), trust_provider_id.clone());
+        }
+        self.verified_access_trust_providers
+            .insert(trust_provider_id.clone(), provider);
+        trust_provider_id
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9967,31 +10179,81 @@ pub const VOLUME_STATE_DELETED: &str = "deleted";
 /// for.
 pub const RECYCLE_BIN_PAGE_SIZE_RANGE: (i32, i32) = (5, 500);
 
+/// The bytes one entry of the Recycle Bin holds.
+///
+/// The ONE definition of that charge, the way [`volume_payload_bytes`] is for a volume: the
+/// fixed [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs — so an entry carrying
+/// no optional text is NOT free against [`MAX_STORED_BYTES`] — plus the text the entry
+/// carries over from the volume it was derived from, which is text a request chose.
+pub fn volume_recycle_bin_entry_payload_bytes(entry: &VolumeRecycleBinInfo) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(entry.volume_type.as_deref().map_or(0, str::len))
+        .saturating_add(entry.outpost_arn.as_deref().map_or(0, str::len))
+        .saturating_add(entry.snapshot_id.as_deref().map_or(0, str::len))
+        .saturating_add(entry.source_volume_id.as_deref().map_or(0, str::len))
+}
+
 impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another entry fits inside the Recycle Bin's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]).
+    ///
+    /// The same contract as [`Self::has_transit_gateway_attachment_capacity`]: a caller asks
+    /// this BEFORE moving anything and refuses the request with EC2's own quota code when it
+    /// answers `false`, and [`Self::move_volume_to_recycle_bin`] asks it again for itself, so
+    /// no path can get past the ceiling by forgetting to. The ceiling is needed because
+    /// nothing in this emulator reclaims an entry of the bin, so without it a sequence of
+    /// create-then-delete requests would grow memory without bound.
+    pub fn has_volume_recycle_bin_capacity(&self) -> bool {
+        self.volumes_in_recycle_bin.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
     /// Move the stored volume `volume_id` into the Recycle Bin, where it stays for
     /// `retention`, and answer the entry a report of the bin now holds for it.
     ///
-    /// `None` when the store holds no such volume. The entry is DERIVED from the stored
+    /// The entry is DERIVED from the stored
     /// volume rather than taken from a request, so a volume's size, type, zone and
     /// provisioning cannot read differently inside the bin from outside it; `retention` is
     /// the retention period of the Recycle Bin rule that covered the volume, which is a fact
     /// of that rule (Amazon Recycle Bin, "Retention rules") and so is given by the caller.
+    ///
+    /// `None` when the store holds no such volume, when the bin is at
+    /// [`MAX_STORED_RECORDS_PER_STORE`], or when `now + retention` is not a representable
+    /// instant. In each case NOTHING was removed and nothing stored — every fallible step is
+    /// taken before the first mutation — so a refused move leaves the volume where it was
+    /// instead of losing it between the two stores.
     pub fn move_volume_to_recycle_bin(
         &mut self,
         volume_id: &str,
         now: SystemTime,
         retention: Duration,
     ) -> Option<VolumeRecycleBinInfo> {
+        if !self.has_volume_recycle_bin_capacity() {
+            return None;
+        }
+        // "The date and time when the volume is to be permanently deleted from the Recycle
+        // Bin" is `now` plus the retention period the rule carries, and `SystemTime + Duration`
+        // PANICS when that instant is not representable. The retention period comes from the
+        // caller, so the sum is asked for with `checked_add` and the move is refused rather
+        // than unwinding — and it is asked BEFORE the volume is removed.
+        let exit_at = now.checked_add(retention)?;
         let record = self.volumes.remove(volume_id)?;
-        if let Some(token) = self
+        let client_token = self
             .volume_client_tokens
             .iter()
             .find(|(_, minted)| minted.as_str() == volume_id)
-            .map(|(token, _)| token.clone())
-        {
-            self.volume_client_tokens.remove(&token);
+            .map(|(token, _)| token.clone());
+        if let Some(token) = &client_token {
+            self.volume_client_tokens.remove(token);
         }
         let view = record.view;
+        // Give back exactly what `CreateVolume` charged for this volume, the way
+        // [`Self::remove_fpga_image`] does for an FPGA image: the byte budget stays the sum of
+        // what the store actually holds, and the entry stored below is charged for itself.
+        self.release_stored_bytes(volume_payload_bytes(
+            view.tags.as_deref().unwrap_or_default(),
+            view.kms_key_id.as_deref(),
+            client_token.as_deref(),
+        ));
         let entry = VolumeRecycleBinInfo {
             volume_id: view.volume_id.clone(),
             volume_type: view.volume_type.clone(),
@@ -10013,8 +10275,9 @@ impl ComAmazonawsEc2Amazonec2State {
             // date and time when the volume is to be permanently deleted from the Recycle
             // Bin", which is when the retention period that covered it runs out.
             recycle_bin_enter_time: Some(system_time_to_date_time(now)),
-            recycle_bin_exit_time: Some(system_time_to_date_time(now + retention)),
+            recycle_bin_exit_time: Some(system_time_to_date_time(exit_at)),
         };
+        self.add_stored_bytes(volume_recycle_bin_entry_payload_bytes(&entry));
         self.volumes_in_recycle_bin
             .insert(volume_id.to_string(), entry.clone());
         Some(entry)

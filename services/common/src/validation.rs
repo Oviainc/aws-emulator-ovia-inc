@@ -94,7 +94,10 @@
 //!   while ~26 service crates still carry their own inlined copy
 //!   (`grep -rln 'fn unanchored' services/*/src`), each pinned by that service's own
 //!   recordings and tests; deleting those copies in favour of this one is the migration's
-//!   own change, and nothing new should inline the rule again.
+//!   own change, and nothing new should inline the rule again. The copies that are not
+//!   wired to this one still decline to drop the pair around a top-level alternation, which
+//!   the recordings show AWS dropping ([`unanchored`] explains why); that difference goes
+//!   away as each is deleted.
 //!
 //! Two parts still belong here and are not here yet:
 //!
@@ -409,59 +412,41 @@ fn rendered_list(elements: &[&str]) -> String {
 /// that service's own recordings; those copies are to be DELETED in favour of this one by the
 /// change that owns that migration, and nothing new should inline the rule again.
 ///
-/// The pair is dropped only when BOTH ends carry it AND the pair WRAPS the whole
-/// expression: a `^` alone, or a `$` alone, is an expression anchored at one end — a
-/// different expression, not an anchored spelling of this one — and in an alternation
-/// (`^a$|^b$`, `^a|b$`) the outer `^` and `$` govern only their own branch, so dropping
-/// them would state an expression the service never evaluated. Both are then emitted
-/// verbatim. A `$` that is ESCAPED is a literal dollar, not an anchor, so it stays. (The
-/// older per-crate copies drop a trailing `$` without either check, so this one is the
-/// stricter of the two renderings.)
+/// The pair is dropped POSITIONALLY: the leading `^` and the trailing `$`, and only when
+/// BOTH ends carry one. A `^` alone, or a `$` alone, is an expression anchored at one end —
+/// a different expression, not an anchored spelling of this one — so it is emitted
+/// verbatim, as is an expression that carries no `^` at its start or no `$` at its end
+/// because its own branches carry them (`(^a$)|(^b$)`). A `$` that is ESCAPED is a literal
+/// dollar, not an anchor, so it stays and nothing is dropped.
+///
+/// WHY POSITIONALLY, and not only when the pair demonstrably wraps the whole expression:
+/// the published `@pattern` is the service's own full-match expression with that pair
+/// written around it by the model, so recovering the expression the service advertises is
+/// the textual inverse of that wrapping. The recordings show it applied to a pattern whose
+/// top-level alternation makes the pair's placement semantically significant —
+/// `com.amazonaws.lambdacore#NetworkConnectorName` is modelled
+/// `^(arn:…:network-connector:…)|[a-zA-Z0-9_-]{1,64}$` and a refusal of
+/// `CreateNetworkConnector$Name` quotes `(arn:…:network-connector:…)|[a-zA-Z0-9_-]{1,64}` —
+/// so a renderer that declined the strip there would state an expression AWS never
+/// publishes. The CHECK always runs the model's pattern as written; only this rendering
+/// drops the pair.
+///
+/// THE CONSEQUENCE, stated plainly: an expression whose own branches carry the pair at the
+/// ends (`^a$|^b$`, `^a|b$`) is quoted as `a$|^b` / `a|b`, which does NOT describe the same
+/// language as the model's text. That is the rule's faithful output, not an oversight: such
+/// a model text is itself the wrapping of an expression that already anchored a branch, and
+/// what AWS publishes is that inner expression. A model that means an alternation of
+/// whole-value branches parenthesises them (`(^a$)|(^b$)`), which carries no outer pair and
+/// is quoted verbatim. Every one of these forms is a row in the module's own table test.
 #[must_use]
 pub fn unanchored(regex: &str) -> String {
     let Some(body) = regex.strip_prefix('^') else {
         return regex.to_string();
     };
     match body.strip_suffix('$') {
-        Some(inner) if !ends_with_escape(inner) && wraps_whole_expression(inner) => {
-            inner.to_string()
-        }
+        Some(inner) if !ends_with_escape(inner) => inner.to_string(),
         _ => regex.to_string(),
     }
-}
-
-/// Whether a `^`/`$` pair around `text` anchors the WHOLE expression, which is what a
-/// whole-value pattern's pair does.
-///
-/// It does not when `text` carries an anchor of its own (so the outer pair belongs to the
-/// branches of an alternation, `^a$|^b$`), nor when `text` alternates at the top level
-/// (`^a|b$`, where the `^` governs only the first branch and the `$` only the last). A `^`,
-/// `$` or `|` inside a character class is a literal or a negation marker rather than an
-/// anchor or an alternation, and one inside a group alternates only within that group
-/// (`^(a|b)$` IS wrapped), so the scan tracks class and group context. Escapes are honoured
-/// throughout.
-fn wraps_whole_expression(text: &str) -> bool {
-    let mut escaped = false;
-    let mut in_class = false;
-    let mut depth = 0_usize;
-    for character in text.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match character {
-            '\\' => escaped = true,
-            '[' if !in_class => in_class = true,
-            ']' if in_class => in_class = false,
-            _ if in_class => {}
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            '^' | '$' => return false,
-            '|' if depth == 0 => return false,
-            _ => {}
-        }
-    }
-    true
 }
 
 /// Whether `text` ends in an escape — an odd number of trailing backslashes, so the
@@ -929,10 +914,51 @@ impl ShapeSerializer for SubmittedValues {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_elision_of, list_of_element, Submitted, SubmittedValues, MAX_RECORDED_BYTES,
-        MAX_RECORDED_LEAVES, MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
+        is_elision_of, list_of_element, unanchored, Submitted, SubmittedValues,
+        MAX_RECORDED_BYTES, MAX_RECORDED_LEAVES, MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
     };
     use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+
+    /// RULE: a `@pattern` is quoted as the model's expression minus the leading `^` and the
+    /// trailing `$` the model writes around the service's own full-match expression — the
+    /// pair dropped positionally, and only when both ends carry one.
+    #[test]
+    fn a_pattern_loses_the_anchor_pair_the_model_wraps_it_in() {
+        // (case, the modelled expression, the expression a clause quotes)
+        let rows: [(&str, &str, &str); 11] = [
+            ("a wrapped character class", r"^[a-z]+$", r"[a-z]+"),
+            ("a wrapped group", r"^([\p{L}\p{N}_.:/=+\-@]*)$", r"([\p{L}\p{N}_.:/=+\-@]*)"),
+            // The recorded case: the pair is dropped even though the expression
+            // alternates at the top level (`NetworkConnectorName`, lambdacore).
+            (
+                "a wrapped top-level alternation",
+                r"^(arn:aws:lambda:[a-z-]+-\d:\d{12}:network-connector:[a-z0-9-]+)|[a-zA-Z0-9_-]{1,64}$",
+                r"(arn:aws:lambda:[a-z-]+-\d:\d{12}:network-connector:[a-z0-9-]+)|[a-zA-Z0-9_-]{1,64}",
+            ),
+            ("anchored at the start only", r"^arn:aws.*", r"^arn:aws.*"),
+            ("anchored at the end only", r"[0-9]{12}$", r"[0-9]{12}$"),
+            ("no anchor at all", r"\d{3}", r"\d{3}"),
+            // Anchored inside its branches rather than at its ends: no outer pair.
+            ("anchors inside the branches", r"(^a$)|(^b$)", r"(^a$)|(^b$)"),
+            // The same two branches WITHOUT the parentheses carry the pair at the ends,
+            // so the pair is what is dropped — the rule's faithful output even though the
+            // result describes another language. See this function's doc comment.
+            ("branches sharing the outer pair", r"^a$|^b$", r"a$|^b"),
+            ("one branch anchored at each end", r"^a|b$", r"a|b"),
+            // An escaped trailing `$` is a literal dollar, not the end anchor.
+            ("an escaped trailing dollar", r"^costs\$", r"^costs\$"),
+            // An escaped backslash before the `$` leaves the `$` an anchor.
+            ("an escaped backslash then the anchor", r"^[a-z]\\$", r"[a-z]\\"),
+        ];
+        for (case, modelled, expected) in rows {
+            let actual = unanchored(modelled);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {modelled:?} to be quoted as {expected:?}, got \
+                 {actual:?}"
+            );
+        }
+    }
 
     /// RULE: the collection is COMPLETE only while every string-rendered leaf was
     /// recorded; any leaf one of the stated bounds drops marks it incomplete, which is what

@@ -29,5 +29,7 @@ mod policies_stats;
 mod policy_and_group_writes;
 #[path = "all/security_configs.rs"]
 mod security_configs;
+#[path = "all/security_policy_listing.rs"]
+mod security_policy_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

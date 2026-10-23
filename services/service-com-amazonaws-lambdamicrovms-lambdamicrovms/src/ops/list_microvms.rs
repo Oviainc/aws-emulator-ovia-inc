@@ -5,7 +5,15 @@
 //! Pages through the persisted MicroVMs in creation order, honouring the
 //! `imageIdentifier` / `imageVersion` filters and the `@paginated` contract
 //! (`maxResults` caps the page; a `nextToken` is returned, and accepted, while more
-//! remain).
+//! remain). A filter value that selects no MicroVM yields a terminal empty page —
+//! `items` is `@required`, so it is always projected, empty included.
+//!
+//! Because of that, nothing in this handler constructs the modelled
+//! `ResourceNotFoundException`: the only identifier it reads is a FILTER, and a filter
+//! that matches nothing is an empty page, not a missing resource. The variant stays on
+//! the error enum because the model declares it for this operation — do not re-add a
+//! lookup-style refusal for `imageIdentifier`. The only refusal left here is the 400
+//! `ValidationException` for a `nextToken` this service did not mint.
 //!
 //! ## Shape of an operation
 //!
@@ -165,26 +173,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(::std::time::Instant::now());
 
-        // The `imageIdentifier` filter names an image, by name or ARN; filtering on
-        // one that does not exist is a 404, not an empty page.
-        let image_arn_filter = match input.image_identifier.as_deref() {
-            Some(identifier) => match store.image(identifier) {
-                Some(image) => Some(image.image_arn.clone()),
-                None => {
-                    // Same not-found envelope as every other image lookup: a
-                    // request-derived message, no `resourceType`/`resourceId`.
-                    return Err(ListMicrovmsErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: crate::state::image_not_found_message(identifier),
-                            resource_type: None,
-                            resource_id: None,
-                        },
-                    )
-                    .into());
-                }
-            },
-            None => None,
-        };
+        // `imageIdentifier` is a FILTER ("Optional filter to list only MicroVMs running
+        // the specified image"), not the resource this call addresses, so it SELECTS: it
+        // resolves to the `imageArn` the stored MicroVMs carry, and an identifier that
+        // selects no MicroVM yields an empty page rather than a refusal.
+        //
+        // Both forms `MicrovmImageIdentifier` documents ("The ARN or ID of the
+        // MicroVmImage") select: an identifier that names a stored image selects that
+        // image's ARN, and an identifier that names none is still matched against the
+        // `imageArn` on each MicroVM — so an ARN whose image record has since been
+        // deleted keeps selecting the MicroVMs that run it.
+        let image_arn_filter = input.image_identifier.as_deref().map(|identifier| {
+            store
+                .image(identifier)
+                .map_or_else(|| identifier.to_string(), |image| image.image_arn.clone())
+        });
 
         let after = match input.next_token.as_deref() {
             Some(token) => Some(decode_token(token)?),
