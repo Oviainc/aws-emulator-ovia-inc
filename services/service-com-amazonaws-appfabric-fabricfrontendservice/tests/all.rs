@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/app_bundle_ingestion_lifecycle.rs"]
 mod app_bundle_ingestion_lifecycle;
+#[path = "all/ingestion_deletion.rs"]
+mod ingestion_deletion;
 #[path = "all/ingestion_destination_lifecycle.rs"]
 mod ingestion_destination_lifecycle;
 #[path = "all/resource_tags.rs"]

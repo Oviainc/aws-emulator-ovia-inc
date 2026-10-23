@@ -287,7 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ingestion_type: input.ingestion_type,
             // IngestionState = enabled | disabled. A new ingestion is created
             // disabled and only StartIngestion enables it.
-            state: "disabled".to_string(),
+            state: crate::state::INGESTION_STATE_DISABLED.to_string(),
             created_at,
             updated_at: created_at,
             tags: input.tags.unwrap_or_default(),
