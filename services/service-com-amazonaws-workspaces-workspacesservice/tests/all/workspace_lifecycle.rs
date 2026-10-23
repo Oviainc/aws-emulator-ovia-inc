@@ -23,8 +23,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use service_com_amazonaws_workspaces_workspacesservice::ops::types::WorkspaceRequest;
 use service_com_amazonaws_workspaces_workspacesservice::state::{
-    service_state, ERROR_CODE_WORKSPACE_INVALID_STATE, ERROR_CODE_WORKSPACE_NOT_FOUND,
-    MAX_STORED_WORKSPACES, MESSAGE_WORKSPACE_NOT_FOUND, TRANSITION_DELAY,
+    service_state, DEFAULT_RUNNING_MODE, ERROR_CODE_WORKSPACE_INVALID_STATE,
+    ERROR_CODE_WORKSPACE_NOT_FOUND, MAX_STORED_WORKSPACES, MESSAGE_WORKSPACE_NOT_FOUND,
+    TRANSITION_DELAY,
 };
 use service_com_amazonaws_workspaces_workspacesservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -174,7 +175,10 @@ fn reported_ids(case: &Value, body: &Value) -> Vec<String> {
 }
 
 /// The one described WorkSpace matching `workspace_id`.
-async fn describe_one(router: &MultiServiceRouter, workspace_id: &str) -> Value {
+///
+/// `pub(crate)`: see [`emulator_with_engine`] — the suites beside this one read a
+/// WorkSpace back through this rather than copying the call.
+pub(crate) async fn describe_one(router: &MultiServiceRouter, workspace_id: &str) -> Value {
     let filters = json!({ "WorkspaceIds": [workspace_id] });
     let (status, body) = call(router, "DescribeWorkspaces", &filters).await;
     assert_eq!(
@@ -595,9 +599,13 @@ async fn create_reports_per_item_failures_without_a_top_level_error() {
 
     for (request, expected_code) in cases {
         // The echo carries the submitted request, with `Tags` reported as a list even
-        // for a request that sent none (see `create_workspaces_validation`).
+        // for a request that sent none and `WorkspaceProperties` reported as the
+        // effective property set (see `create_workspaces_effective_properties`); none of
+        // these cases submits any property, so the effective set is the default running
+        // mode on its own.
         let mut echoed = request.clone();
         echoed["Tags"] = json!([]);
+        echoed["WorkspaceProperties"] = json!({ "RunningMode": DEFAULT_RUNNING_MODE });
         let (status, body) =
             call(&router, "CreateWorkspaces", &json!({ "Workspaces": [request] })).await;
         assert_eq!(
