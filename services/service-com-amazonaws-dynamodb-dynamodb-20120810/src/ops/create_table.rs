@@ -18,10 +18,12 @@
 //! consistent"); vector indexes, streams, SSE and the other members this slice does not
 //! store are refused with the scaffold's 501 and filed as their own gap issues.
 //!
-//! The table is stored under the REGION the request was signed for, because that is
-//! the scope a table name is unique in ("table names must be unique within each
-//! Region" — the doc below), so the same name in a second region is a second,
-//! independent table rather than a conflict.
+//! The table is stored under the REGION the request's endpoint names
+//! ([`crate::state::request_region`], which reads it from the credential scope or from
+//! the endpoint host, whichever the request carries), because that is the scope a table
+//! name is unique in ("table names must be unique within each Region" — the doc below),
+//! so the same name in a second region is a second, independent table rather than a
+//! conflict.
 //!
 //! The scaffold channel in [`crate::scaffolded`] still carries this operation's
 //! refusals: `validation` for a bad request, and `not_implemented` for a member of
