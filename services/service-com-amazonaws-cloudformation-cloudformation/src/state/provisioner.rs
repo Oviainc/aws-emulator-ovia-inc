@@ -40,6 +40,11 @@
 //!   sides, so its arm passes them through as `CreateQueue`'s `Attributes` map, lifting
 //!   out the two that are not attributes (the name CloudFormation decides, and the tag
 //!   list the create takes as its own member);
+//! * `AWS::SNS::Topic`'s are the topic's attributes in the same way, with the three that
+//!   are not attributes lifted out (the name, the tag list and the data-protection policy,
+//!   each a `CreateTopic` member of its own), the inline `Subscription` list made by
+//!   `Subscribe` calls on the created topic, and `DeliveryStatusLogging` written as the
+//!   per-protocol feedback attributes SNS names;
 //! * `AWS::FIS::ExperimentTemplate`'s are the same members in lower camel case, but its
 //!   `Targets` and `Actions` are MAPS keyed by names the template chose (as are a target's
 //!   `ResourceTags` and `Parameters` and an action's `Parameters` and `Targets`), so its
@@ -61,11 +66,12 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use super::provisioning::{
-    call_json_rpc, call_rest_json, Created, Refusal, AWS_JSON_1_0, AWS_JSON_1_1,
+    call_json_rpc, call_query, call_rest_json, xml_element, xml_entry_map, Created, Refusal,
+    AWS_JSON_1_0, AWS_JSON_1_1,
 };
 use super::template::{
     ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
-    SQS_QUEUE,
+    SNS_TOPIC, SQS_QUEUE,
 };
 use super::StoredResource;
 
@@ -89,6 +95,7 @@ pub(super) enum Provisioner {
     CodePipelinePipeline,
     EcsCluster,
     SqsQueue,
+    SnsTopic,
     FisExperimentTemplate,
 }
 
@@ -103,6 +110,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CODEPIPELINE_PIPELINE => Some(Provisioner::CodePipelinePipeline),
         ECS_CLUSTER => Some(Provisioner::EcsCluster),
         SQS_QUEUE => Some(Provisioner::SqsQueue),
+        SNS_TOPIC => Some(Provisioner::SnsTopic),
         FIS_EXPERIMENT_TEMPLATE => Some(Provisioner::FisExperimentTemplate),
         _ => None,
     }
@@ -126,6 +134,7 @@ impl Provisioner {
             Self::CodePipelinePipeline => create_pipeline(ctx, region, resource).await,
             Self::EcsCluster => create_cluster(ctx, region, resource).await,
             Self::SqsQueue => create_queue(ctx, region, resource).await,
+            Self::SnsTopic => create_topic(ctx, region, resource).await,
             Self::FisExperimentTemplate => {
                 create_experiment_template(ctx, region, resource).await
             }
@@ -159,6 +168,7 @@ impl Provisioner {
             }
             Self::EcsCluster => delete_cluster(ctx, region, physical_resource_id).await,
             Self::SqsQueue => delete_queue(ctx, region, physical_resource_id).await,
+            Self::SnsTopic => delete_topic(ctx, region, physical_resource_id).await,
             Self::FisExperimentTemplate => {
                 delete_experiment_template(ctx, region, physical_resource_id).await
             }
@@ -196,6 +206,7 @@ impl Provisioner {
             }
             Self::EcsCluster => describe_cluster(ctx, region, physical_resource_id).await,
             Self::SqsQueue => describe_queue(ctx, region, physical_resource_id).await,
+            Self::SnsTopic => describe_topic(ctx, region, physical_resource_id).await,
             Self::FisExperimentTemplate => {
                 describe_experiment_template(ctx, region, physical_resource_id).await
             }
@@ -1492,6 +1503,338 @@ fn tag_map(tags: &Value) -> Map<String, Value> {
                     }
                     let value = tag.get("Value").map(attribute_text).unwrap_or_default();
                     Some((key.to_string(), Value::String(value)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Amazon SNS: AWS::SNS::Topic
+// ---------------------------------------------------------------------------
+
+/// Amazon SNS's signing name and API version, from its model (`sigv4Name: sns`, service
+/// shape `AmazonSimpleNotificationService`, `version: 2010-03-31`), which speaks
+/// `awsQuery` — so its calls ride on [`call_query`] rather than on [`call_json_rpc`].
+const SNS_SIGNING_NAME: &str = "sns";
+const SNS_API_VERSION: &str = "2010-03-31";
+
+/// The error code SNS answers for a topic ARN no topic answers to: `NotFoundException`'s
+/// own `awsQueryError` code, which is what an awsQuery client branches on.
+const NOT_FOUND: &str = "NotFound";
+
+/// The properties of an `AWS::SNS::Topic` that are NOT topic attributes, each a member of
+/// `CreateTopic` in its own right or a call of its own:
+///
+/// * `TopicName` is the one value CloudFormation decides, and the create's `Name` member;
+/// * `Tags` is the create's own tag list;
+/// * `DataProtectionPolicy` is the create's own member ("The body of the policy document
+///   you want to use for this topic");
+/// * `Subscription` is a list of subscriptions, which are `Subscribe` calls on the topic
+///   once it exists.
+const NON_ATTRIBUTE_PROPERTIES: &[&str] =
+    &["TopicName", "Tags", "DataProtectionPolicy", "Subscription"];
+
+/// The property whose entries are the per-protocol delivery-status attributes.
+const DELIVERY_STATUS_LOGGING: &str = "DeliveryStatusLogging";
+
+/// How a `DeliveryStatusLogging` entry's `Protocol` is spelled in the delivery-status
+/// attribute names SNS documents: a `sqs` entry's role ARN is the topic's
+/// `SQSSuccessFeedbackRoleArn`, a `http/s` entry's its `HTTPSuccessFeedbackRoleArn`.
+///
+/// Source: the `Protocol` value set AWS's resource reference publishes for
+/// `AWS::SNS::Topic`'s `LoggingConfig`, against the attribute names
+/// `SetTopicAttributes` documents. A protocol outside this set is passed through as the
+/// template spells it, so SNS's own validation is what refuses it rather than a name
+/// invented here.
+const LOGGING_PROTOCOL_PREFIXES: &[(&str, &str)] = &[
+    ("http/s", "HTTP"),
+    ("sqs", "SQS"),
+    ("lambda", "Lambda"),
+    ("firehose", "Firehose"),
+    ("application", "Application"),
+];
+
+/// The members of one `LoggingConfig`, named identically on both sides once the protocol's
+/// prefix is in front of them. `Protocol` itself is the prefix, not a member.
+const LOGGING_CONFIG_MEMBERS: &[&str] = &[
+    "SuccessFeedbackRoleArn",
+    "SuccessFeedbackSampleRate",
+    "FailureFeedbackRoleArn",
+];
+
+/// Create the topic an `AWS::SNS::Topic` declares, and the subscriptions it declares on it.
+///
+/// A topic's configuration is its ATTRIBUTES, so the call is `CreateTopic` with the topic's
+/// name — the one thing CloudFormation decides, which is the last segment of the ARN its
+/// `Ref` resolves to — and the attribute map [`topic_attributes`] reads off the declared
+/// properties.
+///
+/// The ARN the create answers with is reported back as the resource's `TopicArn`
+/// attribute. It is the SAME ARN the type's published return values computed
+/// (`arn:aws:sns:<region>:<account>:<name>`), because both are built from the one account
+/// id this emulator mints and the topic's own name — and SNS keys a topic by exactly that
+/// ARN, so the handle the stack publishes addresses the topic this call created however a
+/// client reaches SNS.
+async fn create_topic(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let mut parameters = vec![("Name".to_string(), topic_name(resource))];
+    for (index, (name, value)) in topic_attributes(&resource.properties).iter().enumerate() {
+        let entry = index + 1;
+        parameters.push((format!("Attributes.entry.{entry}.key"), name.clone()));
+        parameters.push((format!("Attributes.entry.{entry}.value"), value.clone()));
+    }
+    for (index, (key, value)) in topic_tags(&resource.properties).iter().enumerate() {
+        let member = index + 1;
+        parameters.push((format!("Tags.member.{member}.Key"), key.clone()));
+        parameters.push((format!("Tags.member.{member}.Value"), value.clone()));
+    }
+    if let Some(policy) = resource.properties.get("DataProtectionPolicy") {
+        parameters.push(("DataProtectionPolicy".to_string(), attribute_text(policy)));
+    }
+    let answered = call_query(
+        ctx,
+        SNS_SIGNING_NAME,
+        region,
+        SNS_API_VERSION,
+        "CreateTopic",
+        &parameters,
+    )
+    .await?;
+    let arn = xml_element(&answered, "TopicArn")
+        .filter(|arn| !arn.is_empty())
+        .ok_or_else(|| Refusal {
+            code: "InternalFailure".to_string(),
+            message: "Amazon SNS answered CreateTopic without a TopicArn".to_string(),
+        })?;
+
+    // "The SNS subscriptions (endpoints) for this topic" — declared inline on the topic,
+    // so they are subscriptions of the topic this call just created.
+    for subscription in declared_subscriptions(&resource.properties) {
+        let mut parameters = vec![("TopicArn".to_string(), arn.clone())];
+        parameters.extend(subscription);
+        let subscribed = call_query(
+            ctx,
+            SNS_SIGNING_NAME,
+            region,
+            SNS_API_VERSION,
+            "Subscribe",
+            &parameters,
+        )
+        .await;
+        if let Err(refusal) = subscribed {
+            // The resource the template declares is the topic AND the subscriptions on
+            // it, so a subscription SNS refuses fails the resource. The stack records no
+            // physical id for a resource whose create failed, so nothing would ever
+            // delete the topic this call already made: it is deleted here, before the
+            // refusal propagates, and what the stack reports is SNS's own refusal.
+            delete_topic(ctx, region, &arn)
+                .await
+                .map_err(|failure| Refusal {
+                    code: refusal.code.clone(),
+                    message: format!(
+                        "{refusal}; the topic it created was left behind: {failure}"
+                    ),
+                })?;
+            return Err(refusal);
+        }
+    }
+
+    let mut attributes = BTreeMap::new();
+    attributes.insert("TopicArn".to_string(), arn);
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the topic a stack created. A topic SNS no longer has (`NotFound`) is already in
+/// the state the delete asks for.
+///
+/// The topic is addressed by its ARN, which is this resource's physical id — "Ref returns
+/// the topic ARN" for this type.
+async fn delete_topic(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let parameters = vec![("TopicArn".to_string(), physical_resource_id.to_string())];
+    match call_query(
+        ctx,
+        SNS_SIGNING_NAME,
+        region,
+        SNS_API_VERSION,
+        "DeleteTopic",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The topic's configuration as Amazon SNS reports it, for drift detection.
+///
+/// A topic SNS no longer has (`NotFound`) was deleted. A topic's configuration IS its
+/// attribute map, named identically to this type's properties ([`topic_attributes`]), so
+/// the attributes are the actual configuration compared against the declared one and a
+/// topic whose display name was changed outside the stack is MODIFIED. The map the query
+/// protocol serializes as `<entry><key/><value/></entry>` is read back as the JSON object
+/// the comparison takes.
+async fn describe_topic(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![("TopicArn".to_string(), physical_resource_id.to_string())];
+    match call_query(
+        ctx,
+        SNS_SIGNING_NAME,
+        region,
+        SNS_API_VERSION,
+        "GetTopicAttributes",
+        &parameters,
+    )
+    .await
+    {
+        Ok(answered) => Ok(Some(Value::Object(xml_entry_map(&answered, "Attributes")))),
+        Err(refusal) if refusal.code == NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The NAME of the topic a resource record describes: the `TopicName` its type's published
+/// return values carry, which is the name the template asked for or the
+/// `<stack>-<logical id>-<suffix>` name CloudFormation generated — never the physical id,
+/// which for this type is the topic's ARN.
+///
+/// A record with no such attribute (one whose attribute budget was spent) falls back to the
+/// last segment of that ARN, which is the topic's name.
+fn topic_name(resource: &StoredResource) -> String {
+    if let Some(name) = resource.attributes.get("TopicName") {
+        return name.clone();
+    }
+    resource
+        .physical_resource_id
+        .rsplit(':')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The `Attributes` map an `AWS::SNS::Topic`'s declared properties are, as `CreateTopic`
+/// takes them.
+///
+/// This type's properties ARE the topic's own attributes, named identically on both sides
+/// (`DisplayName`, `FifoTopic`, `KmsMasterKeyId`, `SignatureVersion`, `TracingConfig`,
+/// `ArchivePolicy`, `ContentBasedDeduplication`, `FifoThroughputScope`): CloudFormation's
+/// property names for the type are the attribute names
+/// `CreateTopic`/`SetTopicAttributes` document. So every property is passed through under
+/// its own name except the ones that are not attributes ([`NON_ATTRIBUTE_PROPERTIES`]) and
+/// `DeliveryStatusLogging`, whose entries are the per-protocol attributes
+/// [`delivery_status_attributes`] names.
+///
+/// An attribute value is a STRING on the wire, so a number or a boolean the template wrote
+/// as such is rendered as the text it is, and the policy attributes — documented as JSON
+/// objects — as the compact JSON of the object declared. A property SNS does not know is
+/// not filtered out here: the owning service's own validation is what judges an attribute,
+/// and its refusal leaves the stack `CREATE_FAILED` rather than a topic configured
+/// differently from the template.
+fn topic_attributes(properties: &Value) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::new();
+    let Some(properties) = properties.as_object() else {
+        return attributes;
+    };
+    for (property, value) in properties {
+        if NON_ATTRIBUTE_PROPERTIES.contains(&property.as_str()) {
+            continue;
+        }
+        if property == DELIVERY_STATUS_LOGGING {
+            attributes.extend(delivery_status_attributes(value));
+            continue;
+        }
+        attributes.insert(property.clone(), attribute_text(value));
+    }
+    attributes
+}
+
+/// The topic attributes a `DeliveryStatusLogging` list declares: one entry per member each
+/// of its `LoggingConfig`s carries, under that config's protocol prefix
+/// ([`LOGGING_PROTOCOL_PREFIXES`]).
+///
+/// A member the config does not declare is absent. `Protocol` is required on a
+/// `LoggingConfig`, so an entry carrying none is a template error: its members go through
+/// under their BARE names, which are not topic attribute names, so SNS refuses them — the
+/// same way an unknown protocol spelling goes through as the template wrote it. Neither is
+/// dropped, which would configure the topic differently from what the template declared
+/// while the stack still completed.
+fn delivery_status_attributes(declared: &Value) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::new();
+    for config in declared.as_array().map(Vec::as_slice).unwrap_or_default() {
+        let prefix = config
+            .get("Protocol")
+            .and_then(Value::as_str)
+            .map_or("", |protocol| {
+                LOGGING_PROTOCOL_PREFIXES
+                    .iter()
+                    .find(|(declared, _)| declared.eq_ignore_ascii_case(protocol))
+                    .map_or(protocol, |(_, prefix)| prefix)
+            });
+        for member in LOGGING_CONFIG_MEMBERS {
+            if let Some(value) = config.get(*member) {
+                attributes.insert(format!("{prefix}{member}"), attribute_text(value));
+            }
+        }
+    }
+    attributes
+}
+
+/// The `Tags` list an `AWS::SNS::Topic`'s `Tags` property is, as `CreateTopic` takes it:
+/// the same `{Key, Value}` pairs, since SNS's own `Tag` shape spells its members `Key` and
+/// `Value` too. A tag with no key is not a tag and is dropped rather than sent as an empty
+/// one.
+fn topic_tags(properties: &Value) -> Vec<(String, String)> {
+    properties
+        .get("Tags")
+        .and_then(Value::as_array)
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|tag| {
+                    let key = tag.get("Key").and_then(Value::as_str)?;
+                    if key.is_empty() {
+                        return None;
+                    }
+                    Some((
+                        key.to_string(),
+                        tag.get("Value").map(attribute_text).unwrap_or_default(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `Subscribe` parameters each entry of a `Subscription` property declares: its
+/// `Protocol` and its `Endpoint`, named identically on both sides. A member the entry does
+/// not declare is absent from the call, so SNS's own validation is what refuses an
+/// incomplete subscription.
+fn declared_subscriptions(properties: &Value) -> Vec<Vec<(String, String)>> {
+    properties
+        .get("Subscription")
+        .and_then(Value::as_array)
+        .map(|declared| {
+            declared
+                .iter()
+                .map(|subscription| {
+                    ["Protocol", "Endpoint"]
+                        .iter()
+                        .filter_map(|member| {
+                            let value = subscription.get(*member)?;
+                            Some(((*member).to_string(), attribute_text(value)))
+                        })
+                        .collect()
                 })
                 .collect()
         })

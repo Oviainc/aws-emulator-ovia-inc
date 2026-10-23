@@ -43,7 +43,9 @@
 //! This module is the part that is the SAME for every resource type: reconciling what a
 //! deployment declares against what the stack already has ([`reconcile`]), deleting what
 //! it replaced or what the stack's own deletion owes ([`delete`]), and the in-process,
-//! signed transport each of those calls rides on ([`call_json_rpc`]). The part that is
+//! signed transport each of those calls rides on ([`call_json_rpc`] for a service whose
+//! model declares awsJson, [`call_query`] for one that declares awsQuery — the wire is the
+//! called service's, not this one's). The part that is
 //! per type — which service owns it, and the create and delete calls that make its
 //! resources exist — is [`super::provisioner`], reached only through
 //! [`provisioner_for`](super::provisioner::provisioner_for), so adding a resource type
@@ -483,6 +485,60 @@ pub(super) async fn call_json_rpc(
     Err(refusal_of(status, &document))
 }
 
+/// The media type an awsQuery request carries: its parameters are a form body, not a
+/// document ("the request is sent as `application/x-www-form-urlencoded`"). Read only by
+/// [`call_query`], which is the one place this module writes such a body.
+const FORM_URLENCODED: &str = "application/x-www-form-urlencoded";
+
+/// Call one awsQuery operation of another emulated service in-process and read the XML
+/// document it answers with. `Err(refusal)` is the service's own refusal: the
+/// `awsQueryError` code it carries, and the message it worded.
+///
+/// `version` is the API version that service's model declares (`2010-03-31` for Amazon
+/// SNS), which an awsQuery request names beside the action. `parameters` are the request's
+/// members in the awsQuery spelling — `Attributes.entry.<n>.key`, `Tags.member.<n>.Key` —
+/// percent-encoded here, so a value carrying `&` or `=` cannot be read as a second
+/// parameter.
+///
+/// A 501 is a refusal like any other, exactly as it is for [`call_json_rpc`]: the
+/// difference between the two is only the wire the called service publishes.
+pub(super) async fn call_query(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    signing_name: &str,
+    region: &str,
+    version: &str,
+    action: &str,
+    parameters: &[(String, String)],
+) -> Result<String, Refusal> {
+    let mut body = format!("Action={action}&Version={version}");
+    for (name, value) in parameters {
+        body.push('&');
+        body.push_str(&::percent_encoding::utf8_percent_encode(name, FORM_VALUE).to_string());
+        body.push('=');
+        body.push_str(&::percent_encoding::utf8_percent_encode(value, FORM_VALUE).to_string());
+    }
+    let headers = vec![("content-type", FORM_URLENCODED.to_string())];
+    let (status, payload) =
+        dispatch(ctx, signing_name, region, "POST", "/", headers, body.into_bytes())
+        .await
+        .map_err(|message| Refusal {
+            code: "InternalFailure".to_string(),
+            message,
+        })?;
+    let document = String::from_utf8_lossy(&payload).into_owned();
+    if (200..300).contains(&status) {
+        return Ok(document);
+    }
+    // An awsQuery error answer is `<ErrorResponse><Error><Code/><Message/></Error>…`, and
+    // the code is the one the model's `awsQueryError` trait fixes for that error shape
+    // (`NotFoundException` -> `NotFound`), which is what a client branches on.
+    Err(Refusal {
+        code: xml_element(&document, "Code")
+            .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}")),
+        message: xml_element(&document, "Message").unwrap_or_default(),
+    })
+}
+
 /// Call one REST-JSON operation of another emulated service in-process and read its answer
 /// document. `Err(refusal)` is that service's own refusal, exactly as for
 /// [`call_json_rpc`].
@@ -521,6 +577,123 @@ pub(super) async fn call_rest_json(
     Err(refusal_of(status, &document))
 }
 
+/// What an awsQuery parameter name or value is percent-encoded against: everything
+/// outside the UNRESERVED set of RFC 3986 (`A-Z a-z 0-9 - _ . ~`) is escaped, which is
+/// what an AWS SDK sends and what the SigV4 canonical request assumes.
+const FORM_VALUE: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
+/// The text of the first `<tag>` element of an XML document, with its entities decoded, or
+/// `None` where the document carries no such element.
+///
+/// A LEAF element's text: the character data between that element's own tags, concatenated,
+/// which is what the members read through it are (`<TopicArn>`, `<Code>`, `<Message>`).
+/// It keeps no element depth, so reading a member that HOLDS other elements — or one whose
+/// name repeats inside itself — needs a depth-aware reader rather than this helper.
+///
+/// Read with the same XML reader the emulator's own restXml services use, so an escaped
+/// value (`&amp;`, `&lt;`) comes back as the text the answering service wrote rather than
+/// as its escaping.
+pub(super) fn xml_element(document: &str, tag: &str) -> Option<String> {
+    use ::quick_xml::events::Event;
+
+    let mut reader = ::quick_xml::Reader::from_str(document);
+    reader.config_mut().trim_text(false);
+    let mut inside = false;
+    let mut text = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) if start.local_name().as_ref() == tag.as_bytes() => {
+                inside = true;
+            }
+            Ok(Event::Text(found)) if inside => {
+                text.push_str(&found.xml10_content().unwrap_or_default());
+            }
+            Ok(Event::End(end)) if inside && end.local_name().as_ref() == tag.as_bytes() => {
+                return Some(text);
+            }
+            // An empty element (`<TopicArn/>`) is the empty value of that element.
+            Ok(Event::Empty(empty)) if empty.local_name().as_ref() == tag.as_bytes() => {
+                return Some(String::new());
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// The map an awsQuery answer carries under `parent`, as the JSON object the rest of this
+/// module compares: one entry per `<entry><key>…</key><value>…</value></entry>`, which is
+/// how the query protocol serializes a map member (`Attributes` on
+/// `GetTopicAttributes`).
+///
+/// Only the entries of THAT parent element: the walk starts at its start tag and stops at
+/// its end tag, so a second map elsewhere in the document is not folded into this one. An
+/// entry with no `<key>` is not an entry and is skipped; a `<value>` the answer leaves
+/// empty is the empty string, which is what the answering service reported.
+pub(super) fn xml_entry_map(document: &str, parent: &str) -> ::serde_json::Map<String, Value> {
+    use ::quick_xml::events::Event;
+
+    const ENTRY: &[u8] = b"entry";
+    const KEY: &[u8] = b"key";
+    const VALUE: &[u8] = b"value";
+
+    let mut reader = ::quick_xml::Reader::from_str(document);
+    reader.config_mut().trim_text(false);
+    let mut entries = ::serde_json::Map::new();
+    let mut inside = false;
+    // The entry being read: its key and its value, each `Some` once its element opened.
+    let mut key: Option<String> = None;
+    let mut value: Option<String> = None;
+    let mut reading: Option<&[u8]> = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) => match start.local_name().as_ref() {
+                name if name == parent.as_bytes() => inside = true,
+                ENTRY if inside => {
+                    key = None;
+                    value = None;
+                }
+                KEY if inside => {
+                    key = Some(String::new());
+                    reading = Some(KEY);
+                }
+                VALUE if inside => {
+                    value = Some(String::new());
+                    reading = Some(VALUE);
+                }
+                _ => {}
+            },
+            Ok(Event::Text(found)) if reading.is_some() => {
+                let text = found.xml10_content().unwrap_or_default();
+                let held = match reading {
+                    Some(KEY) => key.as_mut(),
+                    Some(VALUE) => value.as_mut(),
+                    _ => None,
+                };
+                if let Some(held) = held {
+                    held.push_str(&text);
+                }
+            }
+            Ok(Event::End(end)) => match end.local_name().as_ref() {
+                name if name == parent.as_bytes() => return entries,
+                ENTRY if inside => {
+                    if let Some(key) = key.take() {
+                        entries.insert(key, Value::String(value.take().unwrap_or_default()));
+                    }
+                }
+                KEY | VALUE => reading = None,
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => return entries,
+            Ok(_) => {}
+        }
+    }
+}
+
 /// A service's error answer as the code it carries and the message it worded. The code is
 /// the last segment of the awsJson `__type`
 /// (`com.amazonaws.firehose#ResourceInUseException` -> `ResourceInUseException`), which is
@@ -550,8 +723,9 @@ fn refusal_of(status: u16, document: &Value) -> Refusal {
 /// owns the resource is the one that serves the call.
 ///
 /// `method` and `uri` are the called operation's own HTTP binding: an RPC protocol binds
-/// every operation to `POST /` and names what it acts on in its document, while a REST
-/// protocol binds each operation to its own method and path.
+/// every operation to `POST /` and names what it acts on in its document — or, for
+/// awsQuery, in its form body — while a REST protocol binds each operation to its own
+/// method and path.
 async fn dispatch(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     signing_name: &str,

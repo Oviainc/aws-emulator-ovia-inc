@@ -19,3 +19,9 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 handler returns an error, so it never has to construct a value.
 
 // SKIPPED: GetAccountSettings — unsupported shape construct: operation 'GetAccountSettings' has a Unit/absent input, which the generator does not emit yet
+//
+// RESOLVED: `GetAccountSettings` is now hand-authored at
+// `src/ops/get_account_settings.rs` (with its Unit input declared in
+// `src/ops/types/get_account_settings_types.rs`), so it is in the service's
+// `operations(...)` allow-list and serves `GET /settings`. The line above is kept as
+// the record of why it was skipped.

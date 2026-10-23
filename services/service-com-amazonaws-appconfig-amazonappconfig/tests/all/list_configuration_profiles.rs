@@ -26,7 +26,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::appconfig_workflow::{
-    create_application, create_profile, create_profile_from, json_call, router, Answer,
+    create_application, create_profile, create_profile_from, json_call, router,
+    with_required_retrieval_role, Answer,
 };
 
 /// The `Type` values the model's own `Type` documentation lists ("When calling this API,
@@ -90,15 +91,23 @@ fn ids(page: &[Value], case: &str) -> Vec<String> {
 }
 
 /// The created record `CreateConfigurationProfile` reported for `body`, as JSON.
+///
+/// `body` is passed through [`with_required_retrieval_role`], so a row can name a
+/// `LocationUri` AppConfig cannot read without a role without restating that rule.
 async fn created_profile(
     router: &MultiServiceRouter,
     application: &str,
     case: &str,
     body: &Value,
 ) -> Value {
-    create_profile_from(router, application, case, body)
-        .await
-        .json()
+    create_profile_from(
+        router,
+        application,
+        case,
+        &with_required_retrieval_role(body.clone()),
+    )
+    .await
+    .json()
 }
 
 /// One validator of a given `ValidatorType` (`JSON_SCHEMA` | `LAMBDA`, the values the

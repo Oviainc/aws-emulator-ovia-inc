@@ -4,7 +4,9 @@
 //! IMPLEMENTED: replaces the rules file an EXISTING rule groups namespace holds, in the
 //! PERSISTED record, and answers from that record. The namespace moves to `UPDATING` and
 //! the clock owes its move back to `ACTIVE` ([`crate::state::TRANSITION_DELAY`]);
-//! `clientToken` makes the call idempotent while that update is in flight, a namespace
+//! `clientToken` makes the call idempotent while that update is in flight, a rules file
+//! declaring a rule group whose name exceeds the documented combined-length bound with
+//! the namespace name is refused `ValidationException`, a namespace
 //! the workspace does not hold is refused `ResourceNotFoundException`, and a namespace or
 //! workspace that is not `ACTIVE` is refused `ConflictException`. Tags are left exactly
 //! as they are: "You can't use this operation to add tags to an existing rule groups
@@ -183,6 +185,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // "The combined length of a rule group namespace and a rule group name cannot
+        // exceed 721 UTF-8 bytes" — the `<important>` callout this operation's own
+        // documentation carries. The bound spans TWO members (the namespace `name` and
+        // each rule group name the `data` blob declares), so no single member is at
+        // fault: the request is refused as a whole with `ValidationException` (400),
+        // before anything is stored.
+        if crate::state::rule_group_name_bound_exceeded(&input.name, &input.data) {
+            return Err(PutRuleGroupsNamespaceErrorModeled::ValidationException(
+                crate::state::request_validation_failed(
+                    &crate::state::rule_group_name_bound_requirement(),
+                ),
+            )
+            .into());
+        }
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

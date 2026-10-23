@@ -174,9 +174,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(application) = store.applications.get(&input.application_id) else {
             return Err(GetConfigurationProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No application with id {} exists.",
-                        input.application_id
+                    message: Some(crate::state::application_not_found(
+                        &input.application_id,
                     )),
                     resource_name: Some(input.application_id),
                 },
@@ -186,9 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(profile) = application.profiles.get(&input.configuration_profile_id) else {
             return Err(GetConfigurationProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No configuration profile with id {} exists in application {}.",
-                        input.configuration_profile_id, input.application_id
+                    message: Some(crate::state::configuration_profile_not_found(
+                        &input.application_id,
+                        &input.configuration_profile_id,
                     )),
                     resource_name: Some(input.configuration_profile_id),
                 },

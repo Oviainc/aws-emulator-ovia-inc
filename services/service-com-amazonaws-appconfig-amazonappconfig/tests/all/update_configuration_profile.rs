@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::appconfig_workflow::{
-    create_application, create_profile_from, is_modelled_id, json_call, router, Answer,
+    create_application, create_profile_from, is_modelled_id, json_call, router,
+    with_required_retrieval_role, Answer,
 };
 
 /// A retrieval role of the shape the model's `RoleArn` pattern demands
@@ -264,6 +265,7 @@ async fn an_update_cannot_change_where_a_configuration_lives_or_what_type_it_is(
         if let Some(profile_type) = profile_type {
             body["Type"] = Value::from(*profile_type);
         }
+        let body = with_required_retrieval_role(body);
         let created = create_profile_from(&router, &application, case, &body).await;
         let id = created
             .string("Id")

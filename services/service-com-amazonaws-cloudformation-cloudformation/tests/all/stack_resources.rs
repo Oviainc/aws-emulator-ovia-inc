@@ -221,10 +221,10 @@ fn resource_cases() -> Vec<ResourceCase> {
             // The ORDER dimension: declared Topic, Bucket, Alpha and reported by logical
             // id. Alpha is also a type the return-value catalogue does not carry, which
             // reports its physical NAME as its physical resource id, while the topic's
-            // documented `Ref` is its ARN rather than its name. Every type here is one
-            // this emulator does not provision, so the stack completes with CloudFormation
-            // alone mounted; a type it DOES provision is created in its owning service
-            // (`core/router/tests/all/cloudformation_provisions_sqs_queues.rs`).
+            // documented `Ref` is its ARN rather than its name. The topic is really
+            // created in Amazon SNS, which this crate's harness mounts beside
+            // CloudFormation; what the stack and SNS must agree about is
+            // `core/router/tests/all/cloudformation_provisions_sns_topics.rs`.
             case: "three resources of three types, declared out of logical-id order",
             stack_name: "mixed",
             template: concat!(
