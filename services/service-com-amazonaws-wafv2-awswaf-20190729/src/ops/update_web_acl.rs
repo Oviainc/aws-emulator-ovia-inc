@@ -312,6 +312,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A rule group can only be referenced by a rule's own top-level statement,
+        // which is judged before any reference is resolved.
+        if let Some(reason) = crate::state::misplaced_rule_group_reference(
+            input.rules.as_deref().unwrap_or_default(),
+            true,
+        ) {
+            return Err(UpdateWebACLErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_RULE_GROUP_REFERENCE_STATEMENT,
+                    "Rules",
+                    &reason,
+                ),
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateWebACLErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {
@@ -372,6 +388,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Read out of state before the entry is borrowed mutably, so the derived
+        // `Capacity` can price every rule-group reference the new tree carries.
+        let rule_group_capacities = state.rule_group_capacities(&input.scope);
         // The checks above hold an immutable borrow, so the entry is resolved again —
         // by the same triple, under the same lock — to write through.
         let Some(entry) = state.web_acl_mut(&input.scope, &input.name, &input.id) else {
@@ -400,7 +419,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         entry.web_acl.on_source_d_do_s_protection_config = input.on_source_d_do_s_protection_config;
         entry.web_acl.application_config = input.application_config;
         entry.web_acl.monetization_config = input.monetization_config;
-        crate::state::apply_web_acl_defaults(&mut entry.web_acl);
+        crate::state::apply_web_acl_defaults(&mut entry.web_acl, &rule_group_capacities);
 
         // The token rotates on every successful mutation, so the one the caller just
         // used stops working.

@@ -21,6 +21,8 @@ mod collection_group_lifecycle;
 mod collection_lifecycle;
 #[path = "all/lifecycle_policy.rs"]
 mod lifecycle_policy;
+#[path = "all/policies_stats.rs"]
+mod policies_stats;
 #[path = "all/security_configs.rs"]
 mod security_configs;
 #[path = "all/state_roundtrip.rs"]
