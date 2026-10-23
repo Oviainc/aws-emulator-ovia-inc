@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkerConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWorkerConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWorkerConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a worker configuration's delete: the stored configuration moves to
+//! `DELETING` and the clock, not the next call, drops it from the store
+//! [`crate::state::TRANSITION_SPAN`] later — after which
+//! `DescribeWorkerConfiguration` answers the modelled `NotFoundException`
+//! (HTTP 404). A repeat of the delete while it is still in flight answers the
+//! same ARN and `DELETING` without restarting that clock, the way the modelled
+//! `@idempotent` trait on this operation calls for.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +156,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWorkerConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWorkerConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWorkerConfiguration"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteWorkerConfigurationErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some("the kafkaconnect store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let _ = ctx;
+        let mut state = store.lock();
+        state.settle_due();
+
+        let Some(worker) = state
+            .worker_configurations
+            .get_mut(&input.worker_configuration_arn)
+        else {
+            return Err(DeleteWorkerConfigurationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::invalid_parameter_because(
+                        "workerConfigurationArn",
+                        crate::state::RESOURCE_DOES_NOT_EXIST,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The first delete starts the clock; a repeat while the configuration is
+        // still DELETING answers the same state and leaves the due instant where
+        // it was, so retrying the call never postpones the removal.
+        if worker.state != crate::state::WORKER_CONFIGURATION_DELETING {
+            worker.state = crate::state::WORKER_CONFIGURATION_DELETING.to_string();
+            worker.pending = Some(crate::state::PendingChange::in_a_moment(
+                crate::state::PendingKind::Remove,
+            ));
+        }
+
+        Ok(DeleteWorkerConfigurationOutput {
+            worker_configuration_arn: Some(worker.arn.clone()),
+            worker_configuration_state: Some(worker.state.clone()),
+        })
     }
 }

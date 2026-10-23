@@ -31,6 +31,13 @@
 //!   call that created the capability is answered with that capability instead of a
 //!   conflict.
 //!
+//! ORDER: `clusterName` is this operation's `@httpLabel`, so the cluster it names is
+//! resolved BEFORE any member of the body is judged and before `roleArn` is resolved
+//! against IAM. A create against a cluster that does not exist therefore reports the
+//! missing cluster (404), never a complaint about a sibling member; only the pass-role
+//! authorization (403), which is decided from the value alone and names no resource of
+//! this service, precedes it.
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -304,15 +311,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = SystemTime::now();
 
-        // AUTHORIZATION BEFORE THE PARENT RESOURCE: `roleArn` is a role the capability
-        // has Amazon EKS assume ("This role must have a trust policy that allows the EKS
-        // service principal to assume it"), so it is subject to the same two rules every
-        // caller-supplied role of this service is — whether this caller may pass it at
-        // all ([`state::pass_role_refusal`]), and then whether it is a role IAM holds
-        // that lets the Amazon EKS service principal assume it
-        // ([`state::service_principal_trust_violation`]). Both run before the store is
-        // locked: the second is a call out to IAM, and an authorization failure precedes
-        // any report about the cluster the request named.
+        // AUTHORIZATION FIRST: `roleArn` is a role the capability has Amazon EKS assume,
+        // so whether THIS caller may hand it over at all is decided from the value
+        // alone ([`state::pass_role_refusal`]) — a permission question that needs no
+        // state and precedes every report about the resources the request names.
         match state::pass_role_refusal(&input.role_arn) {
             None => {}
             Some(why) => {
@@ -322,6 +324,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
+
+        // THE PARENT RESOURCE NEXT, BEFORE ANY OTHER MEMBER IS JUDGED: `clusterName` is
+        // this operation's `@httpLabel`, and a capability hangs off ONE cluster in the
+        // region the request is signed for, so a `clusterName` this store does not hold
+        // is answered with the one rule this resource has for an unknown parent — the
+        // same 404 `DescribeCapability`, `DeleteCapability` and `ListCapabilities` give.
+        // It is resolved before the body is validated and before `roleArn` is resolved
+        // against IAM, so a create against a cluster that does not exist reports the
+        // MISSING CLUSTER rather than a complaint about a sibling member: the caller's
+        // recovery is to create the parent and retry.
+        //
+        // The lock is taken for the resolution alone and released again, because the IAM
+        // call below is an `await` and this store's guard is not held across one.
+        let cluster_exists = {
+            let mut guard = store.lock();
+            guard.materialize_due_transitions(now);
+            guard
+                .clusters
+                .contains_key(&(region.clone(), input.cluster_name.clone()))
+        };
+        if !cluster_exists {
+            return Err(CreateCapabilityErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_not_found(&input.cluster_name),
+            )
+            .into());
+        }
+
+        // The cluster resolved, so the role it names can be resolved too: IAM holds the
+        // role and its trust policy must let the Amazon EKS service principal assume it
+        // ("This role must have a trust policy that allows the EKS service principal to
+        // assume it" — [`state::service_principal_trust_violation`]). It runs with no
+        // lock held: it is a call out to another service.
         if let Some(why) = state::service_principal_trust_violation(
             ctx,
             &region,
@@ -336,11 +370,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = store.lock();
         guard.materialize_due_transitions(now);
 
-        // THE PARENT RESOURCE NEXT: a capability hangs off ONE cluster in the region
-        // the request is signed for, so a `clusterName` this store does not hold is
-        // answered with the one rule this resource has for an unknown parent — the
-        // same 404 `DescribeCapability`, `DeleteCapability` and `ListCapabilities`
-        // give — before anything about the rest of the request is reported.
+        // The lock was released for the IAM call, so the cluster is resolved again — and
+        // reported the same way when a delete landed in between.
         let Some(cluster_status) = guard
             .clusters
             .get(&(region.clone(), input.cluster_name.clone()))

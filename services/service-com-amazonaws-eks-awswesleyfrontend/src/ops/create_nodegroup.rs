@@ -13,6 +13,15 @@
 //! from the request alone (`diskSize`, `remoteAccess`, id-versus-name) are
 //! enforced below.
 //!
+//! ORDER: `clusterName` is this operation's `@httpLabel`, so the cluster it names is
+//! resolved BEFORE any member of the body is judged and before `subnets` is resolved
+//! against EC2. A create against a cluster that does not exist therefore reports the
+//! missing cluster — `ResourceNotFoundException` (404), naming only the cluster, the
+//! same 404 every other cluster-scoped operation of this service gives (see the
+//! `extra_errors` widening below) — never a complaint about a sibling member; only the
+//! pass-role authorization (403), which is decided from the value alone and names no
+//! resource of this service, precedes it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -208,11 +217,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // which this one does not list — is widened in through `extra_errors`: `nodeRole` is a role
 // Amazon EKS passes to the node group's instances, so a role the caller may not pass is a
 // PERMISSION failure (403) rather than a bad parameter, exactly as it is on `CreateCluster`.
-// `ResourceNotFoundException` is widened in for the same reason: it is the 404 this SERVICE
-// gives an unresolvable resource (`DescribeNodegroup`, `CreateAddon`, `CreateCapability` and
-// every other operation that resolves a cluster declare it), and a `clusterName` that names
-// no cluster is exactly that — absence, which a client retries after creating the parent,
-// not a 400 bad request.
+// `ResourceNotFoundException` is widened in for the same kind of reason: it is the 404 this
+// SERVICE gives an unresolvable resource (`DescribeNodegroup`, `CreateAddon`,
+// `CreateCapability` and every other operation that resolves a cluster declare it), and a
+// `clusterName` — an @httpLabel, so a request can name a cluster that does not exist — that
+// names no cluster is exactly that: absence, which a client retries after creating the
+// parent, not a 400 bad request. The widening keeps ONE rule across the resource instead of
+// inventing a second one here.
 #[smithy_macros::operation_error(
     "com.amazonaws.eks#CreateNodegroup",
     extra_errors = ["AccessDeniedException", "ResourceNotFoundException"]
@@ -285,6 +296,19 @@ fn invalid_parameter(
     .into()
 }
 
+/// The 404 this operation answers for a `clusterName` that resolves to nothing.
+///
+/// The cluster is the resource whose absence is reported, so the payload names only it —
+/// `clusterName` and the sentence built from the request — and never the node group the
+/// request asked for: see [`crate::state::cluster_not_found`] for the one rule this
+/// service's not-found payloads follow.
+fn cluster_not_found(cluster_name: &str) -> CreateNodegroupError {
+    CreateNodegroupErrorModeled::ResourceNotFoundException(crate::state::cluster_not_found(
+        cluster_name,
+    ))
+    .into()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateNodegroup<Eng>
 {
@@ -328,39 +352,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A node group belongs to one cluster, and a cluster name identifies a
-        // cluster only within one region, so the cluster is resolved in the
-        // region the request is signed for. "Amazon EKS clusters and node groups
-        // are Amazon Web Services Region specific"
-        // (`ResourceNotFoundException`).
+        // THE PARENT RESOURCE NEXT, BEFORE ANY OTHER MEMBER IS JUDGED: `clusterName` is
+        // this operation's `@httpLabel`, a node group belongs to one cluster, and a
+        // cluster name identifies a cluster only within one region, so the cluster is
+        // resolved in the region the request is signed for — "Amazon EKS clusters and
+        // node groups are Amazon Web Services Region specific"
+        // (`ResourceNotFoundException`) — before the body is validated and before the
+        // `subnets` are resolved against EC2 below, as `CreateCapability` resolves its
+        // own. A create against a cluster that does not exist therefore reports the
+        // MISSING CLUSTER, so the caller's recovery (create the parent, retry) is the one
+        // the answer points at.
+        //
+        // The lock is taken only to resolve it and is released again, because the EC2
+        // call below is an `await` and this store's guard is not held across one.
         let cluster_key = (region.clone(), input.cluster_name.clone());
-        // A `clusterName` that resolves to no cluster is ABSENCE, and this service
-        // reports absence one way: the 404 `ResourceNotFoundException` naming the
-        // cluster ([`state::cluster_not_found`]), exactly as `CreateAddon`,
-        // `CreateCapability` and `CreateAccessEntry` do for the same miss. It names
-        // only the resource it could not resolve, so `nodegroupName` — a node group
-        // that was never created — stays unset.
-        let cluster_not_found = || {
-            CreateNodegroupError::from(CreateNodegroupErrorModeled::ResourceNotFoundException(
-                state::cluster_not_found(&input.cluster_name),
-            ))
-        };
-
-        // THE PARENT RESOURCE BEFORE THE REST OF THE REQUEST, as `CreateCapability`
-        // resolves its own: a request that names no cluster is answered for the cluster,
-        // whatever else it carries. The lock is taken only to resolve it, because the
-        // subnet resolution below is a call out to another service.
         {
             let mut guard = store.lock();
             guard.materialize_due_transitions(now);
             if !guard.clusters.contains_key(&cluster_key) {
-                return Err(cluster_not_found());
+                return Err(cluster_not_found(&input.cluster_name));
             }
         }
 
-        // The node group's Auto Scaling group launches its nodes into the subnets the
-        // request names, so those subnets have to exist — resolved against EC2, which
-        // owns them, exactly as `CreateCluster` resolves its own
+        // The cluster resolved, so the resources the body names can be resolved too: the
+        // node group's Auto Scaling group launches its nodes into the subnets the request
+        // names, so those subnets have to exist — resolved against EC2, which owns them,
+        // exactly as `CreateCluster` resolves its own
         // ([`state::unresolved_subnet_refusal`]). It runs with no lock held: it is a call
         // out to another service.
         if let Some(why) = state::unresolved_subnet_refusal(ctx, &region, &input.subnets).await {
@@ -375,9 +392,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.materialize_due_transitions(now);
 
         // The lock was released for that call, so the cluster is resolved AGAIN here:
-        // everything below is decided and written against the cluster as it is now.
+        // everything below is decided and written against the cluster as it is now, and a
+        // delete that landed in between is reported the same way as before.
         let Some(cluster) = guard.clusters.get(&cluster_key) else {
-            return Err(cluster_not_found());
+            return Err(cluster_not_found(&input.cluster_name));
         };
         // "You can only create a node group for your cluster that is equal to
         // the current Kubernetes version for the cluster" — which an EXTERNAL
