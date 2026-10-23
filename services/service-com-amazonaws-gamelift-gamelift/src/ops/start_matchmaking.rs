@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartMatchmaking
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartMatchmaking`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartMatchmaking::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Accepts the matchmaking request and persists the ticket it is tracked by, so this
+//! response and every later read of the ticket (`DescribeMatchmaking`) are served from
+//! the one stored record. The matchmaker the request names must be one that exists, so a
+//! `ConfigurationName` that resolves to no stored configuration is refused with the
+//! modelled `NotFoundException` and no ticket is stored.
+//!
+//! Forming the match itself is FlexMatch evaluating a matchmaker's rule set over the
+//! tickets submitted to it, which this emulator does not do: an accepted ticket is
+//! `QUEUED`, becomes `SEARCHING`, and ends in the modelled `TIMED_OUT` status at the
+//! configuration's `RequestTimeoutSeconds` with the reason it did — never in a `COMPLETED`
+//! status for a match nothing formed. See [`crate::state`]'s ticket progression.
 //!
 //! ## Shape of an operation
 //!
@@ -174,20 +177,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartMatchmaking` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartMatchmakingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartMatchmaking"))
+        use crate::state::{
+            MATCHMAKING_TICKET_STATUS_QUEUED, MAX_MATCHMAKING_TICKETS_PER_ACCOUNT, WORKFLOW_DELAY,
+        };
+
+        let invalid = |message: String| -> Self::Error {
+            StartMatchmakingErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // "To start matchmaking, provide a unique ticket ID, specify a matchmaking
+        // configuration, and include the players to be matched", and a `Player` is
+        // "a player to find matches for[,] identified by a unique player ID" — so a
+        // request with no player to match, a player that carries no id, or one id twice
+        // is refused BEFORE any state is locked and before anything is stored.
+        if input.players.is_empty() {
+            return Err(invalid(
+                "Players must include the players to be matched.".to_string(),
+            ));
+        }
+        let mut player_ids = ::std::collections::HashSet::new();
+        for (index, player) in input.players.iter().enumerate() {
+            let Some(player_id) = player.player_id.as_deref().filter(|id| !id.is_empty()) else {
+                return Err(invalid(format!(
+                    "Players[{index}] does not carry a PlayerId; players are identified by a \
+                     unique player ID."
+                )));
+            };
+            if !player_ids.insert(player_id.to_string()) {
+                return Err(invalid(format!(
+                    "Players names the player {player_id} more than once; players are identified \
+                     by a unique player ID."
+                )));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartMatchmakingErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // "All matchmaking requests must specify a matchmaking configuration", which is
+        // what decides how the players are grouped and how long the request may run — so a
+        // configuration that does not exist is the resource `NotFoundException` describes
+        // ("the requested resource was not found[;] the resource was either not created
+        // yet or deleted"), and no ticket is persisted for it.
+        let Some(configuration_name) =
+            state.resolve_matchmaking_configuration_name(&input.configuration_name)
+        else {
+            return Err(StartMatchmakingErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Specified configuration name does not exist. configurationName={}",
+                        input.configuration_name
+                    )),
+                },
+            )
+            .into());
+        };
+        let Some((configuration_arn, request_timeout_seconds)) = state
+            .matchmaking_configurations
+            .get(&configuration_name)
+            .map(|configuration| {
+                (
+                    configuration.configuration_arn.clone(),
+                    configuration.request_timeout_seconds,
+                )
+            })
+        else {
+            return Err(StartMatchmakingErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Specified configuration name does not exist. configurationName={}",
+                        input.configuration_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "A unique identifier for a matchmaking ticket. If no ticket ID is specified
+        // here, Amazon GameLift Servers will generate one in the form of a UUID."
+        let ticket_id = match input.ticket_id.clone().filter(|id| !id.is_empty()) {
+            Some(ticket_id) => {
+                // The id is what a caller tracks the request by, so a ticket already
+                // holding it is never replaced by this request.
+                if state.matchmaking_tickets.contains_key(&ticket_id) {
+                    return Err(invalid(format!(
+                        "A matchmaking ticket with id {ticket_id} already exists; a ticket id \
+                         identifies one matchmaking request."
+                    )));
+                }
+                ticket_id
+            }
+            None => crate::state::mint_uuid(&mut state.minted_ids, "matchmaking-ticket"),
+        };
+        if state.matchmaking_tickets.len() >= MAX_MATCHMAKING_TICKETS_PER_ACCOUNT {
+            return Err(invalid(format!(
+                "The account already has the maximum of {MAX_MATCHMAKING_TICKETS_PER_ACCOUNT} \
+                 matchmaking tickets."
+            )));
+        }
+
+        let timeout = ::std::time::Duration::from_secs(
+            u64::try_from(request_timeout_seconds).unwrap_or_default(),
+        );
+        let record = crate::state::MatchmakingTicketRecord {
+            ticket_id: ticket_id.clone(),
+            configuration_name,
+            configuration_arn,
+            // "If successful, a matchmaking ticket is returned with status set to QUEUED."
+            status: MATCHMAKING_TICKET_STATUS_QUEUED.to_string(),
+            status_reason: None,
+            status_message: None,
+            start_time: now,
+            end_time: None,
+            players: input.players.clone(),
+            // "SEARCHING -- the matchmaking request is currently being processed": the
+            // ticket is picked up a span after it is accepted, so a caller reading it
+            // straight after this call still sees the QUEUED status.
+            searching_at: Some(now + WORKFLOW_DELAY),
+            // "The maximum duration, in seconds, that a matchmaking ticket can remain in
+            // process before timing out", counted from the instant the request was
+            // received.
+            timeout_at: now + timeout,
+        };
+        state.matchmaking_tickets.insert(ticket_id.clone(), record);
+
+        // Report the STORED ticket, so this response and every later describe of the same
+        // ticket can only agree.
+        let Some(stored) = state.matchmaking_tickets.get(&ticket_id) else {
+            return Err(StartMatchmakingErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the new matchmaking ticket could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(StartMatchmakingOutput {
+            matchmaking_ticket: Some(stored.to_modelled()),
+        })
     }
 }

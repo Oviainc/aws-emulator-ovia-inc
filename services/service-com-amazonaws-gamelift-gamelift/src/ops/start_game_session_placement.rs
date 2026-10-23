@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartGameSessionPlacement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartGameSessionPlacement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartGameSessionPlacement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the placement request to the queue that processes it and persists it, so this
+//! response and every later read of the placement (`DescribeGameSessionPlacement`) are
+//! served from the one stored record. The queue must be one that exists — it is what
+//! decides which destinations the session may be placed on and how long the request may
+//! wait — so a `GameSessionQueueName` that resolves to no stored queue is refused with the
+//! modelled `NotFoundException` and no placement is stored.
+//!
+//! A stored placement is `PENDING` while the queue works on it; [`crate::state`]'s
+//! placement progression is what starts a game session on the first destination that can
+//! host one, fulfils the placement once that session is running, and times the request
+//! out at the queue's `TimeoutInSeconds` when none can.
 //!
 //! ## Shape of an operation
 //!
@@ -220,20 +223,211 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartGameSessionPlacement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartGameSessionPlacementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartGameSessionPlacement"))
+        use crate::state::{
+            MAX_GAME_SESSION_PLACEMENTS_PER_ACCOUNT, MAX_PLAYERS_PER_GAME_SESSION,
+            PLACEMENT_STATUS_PENDING, WORKFLOW_DELAY,
+        };
+
+        let invalid = |message: String| -> Self::Error {
+            StartGameSessionPlacementErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        // Every rule this operation's own doc states is refused BEFORE any state is
+        // locked and before anything is stored. "The request results in a
+        // InvalidRequestException [...] if the request includes both PlayerLatencies and
+        // PriorityConfigurationOverride parameters."
+        let player_latencies = input.player_latencies.clone().unwrap_or_default();
+        if !player_latencies.is_empty() && input.priority_configuration_override.is_some() {
+            return Err(invalid(
+                "PlayerLatencies and PriorityConfigurationOverride cannot both be set: each one \
+                 decides the order the queue searches its locations in."
+                    .to_string(),
+            ));
+        }
+
+        // CreatePlayerSession's doc: "The maximum number of players per game session is
+        // 200. It is not adjustable." The model bounds the member only below.
+        if input.maximum_player_session_count > MAX_PLAYERS_PER_GAME_SESSION {
+            return Err(invalid(format!(
+                "MaximumPlayerSessionCount must be at most {MAX_PLAYERS_PER_GAME_SESSION}; the \
+                 request asked for {}.",
+                input.maximum_player_session_count
+            )));
+        }
+
+        // "You can request new player sessions for a group of players. Include the
+        // DesiredPlayerSessions parameter and include at minimum a unique player ID for
+        // each" — and each of those players takes one of the slots the session is created
+        // with, so more players than slots could never all be placed.
+        let desired_player_sessions = input.desired_player_sessions.clone().unwrap_or_default();
+        let mut player_ids = ::std::collections::HashSet::new();
+        for (index, desired) in desired_player_sessions.iter().enumerate() {
+            let Some(player_id) = desired.player_id.as_deref().filter(|id| !id.is_empty()) else {
+                return Err(invalid(format!(
+                    "DesiredPlayerSessions[{index}] does not carry a PlayerId; each desired \
+                     player session names the player it reserves a slot for."
+                )));
+            };
+            if !player_ids.insert(player_id.to_string()) {
+                return Err(invalid(format!(
+                    "DesiredPlayerSessions names the player {player_id} more than once; a player \
+                     holds one slot in a game session."
+                )));
+            }
+        }
+        let desired_count = i32::try_from(desired_player_sessions.len()).unwrap_or(i32::MAX);
+        if desired_count > input.maximum_player_session_count {
+            return Err(invalid(format!(
+                "DesiredPlayerSessions asks for {desired_count} player sessions; the game session \
+                 is created with {} player slots.",
+                input.maximum_player_session_count
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                StartGameSessionPlacementErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the GameLift emulator state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // The queue is what "looks for the best possible available resource to host the
+        // game session" and what bounds how long the request may wait, so a queue that
+        // does not exist is the resource `NotFoundException` describes and no placement is
+        // persisted for it.
+        let Some(queue_name) = state.resolve_queue_name(&input.game_session_queue_name) else {
+            return Err(StartGameSessionPlacementErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Game session queue {} does not exist.",
+                        input.game_session_queue_name
+                    )),
+                },
+            )
+            .into());
+        };
+        let Some(queue) = state.game_session_queues.get(&queue_name) else {
+            return Err(StartGameSessionPlacementErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Game session queue {} does not exist.",
+                        input.game_session_queue_name
+                    )),
+                },
+            )
+            .into());
+        };
+        let queue_timeout_seconds = queue.timeout_in_seconds;
+        // "The request results in a InvalidRequestException [...] if the request includes
+        // the PriorityConfigurationOverride parameter and specifies a queue that doesn't
+        // prioritize locations." A queue prioritizes locations when its
+        // `PriorityConfiguration` lists the `LOCATION` priority type.
+        if input.priority_configuration_override.is_some() {
+            let prioritizes_locations = queue
+                .priority_configuration
+                .as_ref()
+                .and_then(|priority| priority.priority_order.as_ref())
+                .is_some_and(|order| order.iter().any(|entry| entry == PRIORITY_TYPE_LOCATION));
+            if !prioritizes_locations {
+                return Err(invalid(format!(
+                    "PriorityConfigurationOverride cannot be used with queue {queue_name}: its \
+                     PriorityConfiguration does not prioritize {PRIORITY_TYPE_LOCATION}."
+                )));
+            }
+        }
+
+        // "A unique identifier to assign to the new game session placement", which is
+        // what a caller tracks the request by: a placement already holding the id is
+        // never replaced by this request.
+        if state
+            .game_session_placements
+            .contains_key(&input.placement_id)
+        {
+            return Err(invalid(format!(
+                "A game session placement with id {} already exists; a placement id identifies \
+                 one placement request.",
+                input.placement_id
+            )));
+        }
+        if state.game_session_placements.len() >= MAX_GAME_SESSION_PLACEMENTS_PER_ACCOUNT {
+            return Err(invalid(format!(
+                "The account already has the maximum of \
+                 {MAX_GAME_SESSION_PLACEMENTS_PER_ACCOUNT} game session placements."
+            )));
+        }
+
+        let queue_timeout = ::std::time::Duration::from_secs(
+            u64::try_from(queue_timeout_seconds).unwrap_or_default(),
+        );
+        let record = crate::state::GameSessionPlacementRecord {
+            placement_id: input.placement_id.clone(),
+            queue_name,
+            // "If successful, this operation generates a new game session placement
+            // request and adds it to the game session queue for processing": the request
+            // is pending until a resource has started a session for it.
+            status: PLACEMENT_STATUS_PENDING.to_string(),
+            game_properties: input.game_properties.clone().unwrap_or_default(),
+            maximum_player_session_count: input.maximum_player_session_count,
+            game_session_name: input.game_session_name.clone(),
+            player_latencies,
+            desired_player_sessions,
+            game_session_data: input.game_session_data.clone(),
+            priority_configuration_override: input.priority_configuration_override.clone(),
+            start_time: now,
+            end_time: None,
+            // The queue's first attempt at finding a resource comes a span after the
+            // request is queued, so a caller reading the placement straight after this
+            // call still sees it PENDING with no connection information.
+            attempt_at: now + WORKFLOW_DELAY,
+            // "The maximum time, in seconds, that a new game session placement request
+            // remains in the queue", counted from the instant it was queued.
+            timeout_at: now + queue_timeout,
+            game_session_id: None,
+            game_session_region: None,
+            placed_player_sessions: Vec::new(),
+        };
+        state
+            .game_session_placements
+            .insert(input.placement_id.clone(), record);
+
+        // Report the STORED placement, so this response and every later describe of the
+        // same placement can only agree.
+        let Some(stored) = state.game_session_placements.get(&input.placement_id) else {
+            return Err(
+                StartGameSessionPlacementErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(
+                            "the new game session placement could not be read back".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(StartGameSessionPlacementOutput {
+            game_session_placement: Some(stored.to_modelled(None)),
+        })
     }
 }
+
+/// The `PriorityType` that makes a queue prioritize locations, and so the one a
+/// `PriorityConfigurationOverride` can substitute a list for: that member's doc — "if
+/// you're using a queue that's configured to prioritize location first [...] you can
+/// optionally use the PriorityConfigurationOverride parameter to substitute a different
+/// location priority list". The value comes from the modelled enum (`smithy_query
+/// shape=PriorityType`), which `PRIORITY_TYPE_VALUES` carries.
+const PRIORITY_TYPE_LOCATION: &str = "LOCATION";

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMatchmaking
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMatchmaking`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMatchmaking::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the matchmaking tickets `StartMatchmaking` persisted, in the order the
+//! request named them. A ticket id no stored ticket carries is REFUSED rather than
+//! silently absent from the list, so "this ticket does not exist" never looks like "this
+//! list is empty".
 //!
 //! ## Shape of an operation
 //!
@@ -152,20 +148,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMatchmaking` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMatchmakingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMatchmaking"))
+        let invalid = |message: String| -> Self::Error {
+            DescribeMatchmakingErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // "To request matchmaking tickets, provide a list of up to 10 ticket IDs." The
+        // modelled `MatchmakingIdList` carries no length, so the documented maximum is
+        // refused here — before any state is locked and before a single record is cloned.
+        if input.ticket_ids.len() > crate::state::MAX_TICKET_IDS_PER_REQUEST {
+            return Err(invalid(format!(
+                "TicketIds names {} tickets; up to {} can be requested.",
+                input.ticket_ids.len(),
+                crate::state::MAX_TICKET_IDS_PER_REQUEST
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeMatchmakingErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        // The clock decides a ticket's status — a queued one is picked up, and one whose
+        // request timed out is `TIMED_OUT` — so the tick is what makes this read report
+        // the state the service would be in whether or not anybody polled.
+        state.tick(::std::time::SystemTime::now());
+
+        // "A ticket object is returned for each requested ID that currently exists": the
+        // recorded service refuses an id that names NO ticket rather than omitting it, so
+        // a caller can tell an absent ticket from an empty list. The tickets are reported
+        // in the order the request named them.
+        let mut tickets: Vec<MatchmakingTicket> = Vec::with_capacity(input.ticket_ids.len());
+        for ticket_id in &input.ticket_ids {
+            let Some(ticket) = state.matchmaking_tickets.get(ticket_id) else {
+                return Err(invalid(format!("Matchmaking ticket not found: {ticket_id}")));
+            };
+            tickets.push(ticket.to_modelled());
+        }
+        Ok(DescribeMatchmakingOutput {
+            ticket_list: Some(tickets),
+        })
     }
 }

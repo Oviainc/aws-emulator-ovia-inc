@@ -15,10 +15,16 @@
 mod aliases;
 #[path = "all/fleet_attributes.rs"]
 mod fleet_attributes;
+#[path = "all/game_session_placements.rs"]
+mod game_session_placements;
 #[path = "all/game_session_queues.rs"]
 mod game_session_queues;
 #[path = "all/hosting_loop.rs"]
 mod hosting_loop;
+#[path = "all/locations.rs"]
+mod locations;
+#[path = "all/matchmaking.rs"]
+mod matchmaking;
 #[path = "all/server_process_capacity.rs"]
 mod server_process_capacity;
 #[path = "all/state_roundtrip.rs"]

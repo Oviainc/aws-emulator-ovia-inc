@@ -248,6 +248,13 @@ pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// Source of [`ManagedThing::sequence`] / [`OtaTaskConfiguration::sequence`] values
     /// and of the per-record suffix that makes a generated id unique.
     pub next_sequence: u64,
+    /// The hub configuration a `PutHubConfiguration` has SET in each region, keyed by
+    /// region. A region with no entry has had none set, so it reports the service
+    /// default ([`DEFAULT_HUB_TOKEN_TIMER_EXPIRY_IN_SECONDS`]) and no `UpdatedAt`.
+    /// Keyed by a region the request carries, so it is bounded by
+    /// [`MAX_CONFIGURED_REGIONS`] like this service's other per-region configuration
+    /// store. See [`HubConfiguration`].
+    pub hub_configurations: HashMap<String, HubConfiguration>,
     /// This account's default encryption configuration, keyed by region: the setting is
     /// per account AND per region (`GetDefaultEncryptionConfiguration` reports it "for the
     /// Amazon Web Services account in the default or specified region"), so each region's
@@ -255,6 +262,38 @@ pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// [`DefaultEncryptionConfiguration::default`].
     pub default_encryption: HashMap<String, DefaultEncryptionConfiguration>,
 }
+
+/// One region's hub configuration: the hub token timer expiry an account set there, and
+/// when it was set.
+///
+/// The hub configuration is a SINGLETON per account and region — `PutHubConfiguration`
+/// carries no identifier and `GetHubConfiguration` resolves none — so one record per
+/// region is the whole store, mirroring how every other resource of this service is
+/// scoped to the region its request was signed for.
+///
+/// A record exists only where a caller SET the configuration: the expiry an unconfigured
+/// region reports is [`DEFAULT_HUB_TOKEN_TIMER_EXPIRY_IN_SECONDS`], and its `UpdatedAt`
+/// stays absent because nothing has updated it.
+#[derive(Debug, Clone)]
+pub struct HubConfiguration {
+    /// `HubTokenTimerExpirySettingInSeconds` (modelled `long`, range 1..) exactly as the
+    /// last accepted `PutHubConfiguration` set it.
+    pub hub_token_timer_expiry_setting_in_seconds: i64,
+    /// When that call set it — what `GetHubConfiguration` reports on `UpdatedAt`.
+    pub updated_at: SystemTime,
+}
+
+/// The hub token timer expiry a region reports before any `PutHubConfiguration` sets
+/// one.
+///
+/// A hub configuration always EXISTS: `GetHubConfiguration` recorded against an account
+/// that had never put one still reports `HubTokenTimerExpirySettingInSeconds`, so the
+/// setting has a service default rather than being absent until a caller defines it.
+/// Neither the model nor the AWS documentation publishes that default's value, so this
+/// is a value CHOSEN for the emulator — one day, inside the member's modelled range
+/// (`long`, 1..). Only the VALUE is chosen; that the member is reported is recorded
+/// behaviour.
+pub const DEFAULT_HUB_TOKEN_TIMER_EXPIRY_IN_SECONDS: i64 = 86_400;
 
 /// The most `ManagedThingSummary` items one `ListManagedThings` page carries, and the
 /// page size an absent `MaxResults` gets. A caller reaches the rest of the store
@@ -335,6 +374,53 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
         self.managed_things
             .get_mut(id)
             .filter(|thing| thing.region == region)
+    }
+
+    /// The hub configuration `region`'s endpoint holds, or `None` when no
+    /// `PutHubConfiguration` has set one there.
+    pub fn hub_configuration_in(&self, region: &str) -> Option<&HubConfiguration> {
+        self.hub_configurations.get(region)
+    }
+
+    /// The hub token timer expiry `region` reports: the one its last accepted
+    /// `PutHubConfiguration` set, else the service default
+    /// ([`DEFAULT_HUB_TOKEN_TIMER_EXPIRY_IN_SECONDS`]) — the configuration exists
+    /// whether or not a caller has ever set it.
+    pub fn hub_token_timer_expiry_in(&self, region: &str) -> i64 {
+        self.hub_configuration_in(region).map_or(
+            DEFAULT_HUB_TOKEN_TIMER_EXPIRY_IN_SECONDS,
+            |config| config.hub_token_timer_expiry_setting_in_seconds,
+        )
+    }
+
+    /// Store `seconds` as `region`'s hub token timer expiry, stamped `at`, answering the
+    /// record now held — or `None` when this store cannot take on another region.
+    ///
+    /// A put REPLACES the configuration — its request carries every member of it — so the
+    /// stored expiry is always the last one accepted and `updated_at` is always when that
+    /// call ran. Overwriting a region the store already holds always succeeds; taking on
+    /// a region it does not is refused once the store holds [`MAX_CONFIGURED_REGIONS`] of
+    /// them, which is what bounds this map's cardinality however many distinct regions a
+    /// caller signs for — the same rule, and the same bound, as
+    /// [`Self::set_default_encryption_in`].
+    pub fn put_hub_configuration(
+        &mut self,
+        region: &str,
+        seconds: i64,
+        at: SystemTime,
+    ) -> Option<HubConfiguration> {
+        if !self.hub_configurations.contains_key(region)
+            && self.hub_configurations.len() >= MAX_CONFIGURED_REGIONS
+        {
+            return None;
+        }
+        let record = HubConfiguration {
+            hub_token_timer_expiry_setting_in_seconds: seconds,
+            updated_at: at,
+        };
+        self.hub_configurations
+            .insert(region.to_string(), record.clone());
+        Some(record)
     }
 
     /// The default encryption configuration `region`'s endpoint reports: the one a put

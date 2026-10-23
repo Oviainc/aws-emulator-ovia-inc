@@ -208,16 +208,67 @@ async fn the_project_to_build_batch_path_is_served_from_stored_state() {
         batch["endTime"].is_null(),
         "StartBuildBatch: a running batch build has no endTime, got {batch}"
     );
-    // Resolved from the stored project, not echoed from the request.
+    // Resolved from the stored project, not echoed from the request. A batch reports
+    // the configuration it RUNS WITH, so the members AWS documents a default for are
+    // resolved on the batch even though the project kept them unset: `source`'s
+    // `insecureSsl` is off, the environment pulls with `CODEBUILD` credentials and
+    // runs unprivileged, and the batch's cache and encryption key are the defaults.
     for (member, from_project) in [
-        ("source", "source"),
-        ("environment", "environment"),
         ("serviceRole", "serviceRole"),
         ("buildBatchConfig", "buildBatchConfig"),
     ] {
         assert_eq!(
             batch[member], project[from_project],
             "StartBuildBatch: {member} comes from the project, got {batch}"
+        );
+    }
+    for member in ["type", "buildspec"] {
+        assert_eq!(
+            batch["source"][member], project["source"][member],
+            "StartBuildBatch: source.{member} comes from the project, got {batch}"
+        );
+    }
+    for member in ["type", "image", "computeType"] {
+        assert_eq!(
+            batch["environment"][member], project["environment"][member],
+            "StartBuildBatch: environment.{member} comes from the project, got {batch}"
+        );
+    }
+    // (member path, the effective value a run with nothing configured reports)
+    let defaults: [(&[&str], Value); 5] = [
+        (&["source", "insecureSsl"], json!(false)),
+        (&["environment", "privilegedMode"], json!(false)),
+        (
+            &["environment", "imagePullCredentialsType"],
+            json!("CODEBUILD"),
+        ),
+        (&["cache", "type"], json!("NO_CACHE")),
+        (
+            &["encryptionKey"],
+            json!(format!(
+                "arn:aws:kms:{REGION}:{}:alias/aws/s3",
+                engine::EMULATOR_ACCOUNT_ID
+            )),
+        ),
+    ];
+    for (path, expected) in defaults {
+        let mut reported = &batch;
+        for segment in path {
+            reported = &reported[*segment];
+        }
+        assert_eq!(
+            reported, &expected,
+            "StartBuildBatch: {} must report its documented default {expected}, got {batch}",
+            path.join(".")
+        );
+    }
+    // Collections the batch takes from the project are stated even when the project
+    // names none.
+    for member in ["secondarySources", "secondarySourceVersions"] {
+        assert_eq!(
+            batch[member],
+            json!([]),
+            "StartBuildBatch: {member} must be stated as [], got {batch}"
         );
     }
     assert_eq!(
