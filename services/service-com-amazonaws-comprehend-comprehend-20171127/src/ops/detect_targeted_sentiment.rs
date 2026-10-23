@@ -126,9 +126,12 @@ const MAX_TEXT_BYTES: usize = 5 * 1024;
 /// The `LanguageCode` values this operation analyses.
 ///
 /// The modelled documentation of `DetectTargetedSentimentRequest$LanguageCode` says
-/// "Currently, English is the only supported language", and the sentiment engine's
-/// lexicon is English too, so every other value the `LanguageCode` enum names is
-/// answered with the modelled `UnsupportedLanguageException`.
+/// "Currently, English is the only supported language", so AWS's own set for this
+/// operation is narrower than the `LanguageCode` enum the member targets. A value
+/// outside it is therefore refused the way an input-validation constraint is — HTTP
+/// 400 `ValidationException`, naming the member, the offending value and this set —
+/// and NOT with the modelled `UnsupportedLanguageException`, which answers a
+/// language AWS supports but this emulator's engine cannot read.
 const ANALYSABLE_LANGUAGES: &[&str] = &["en"];
 
 /// `Score` — "model confidence that the entity is relevant", one value per placing
@@ -1202,22 +1205,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Membership of the `LanguageCode` enum is enforced at the boundary; whether
-        // this operation analyses that language is not.
+        // The `LanguageCode` enum the member targets is enforced at the boundary;
+        // this operation's OWN set is narrower than that enum ("Currently, English
+        // is the only supported language"), so the narrowing is enforced here, as
+        // the same kind of refusal the boundary validator answers an out-of-enum
+        // value with: `ValidationException`, in the validator's own enum-constraint
+        // wording, naming the member path, the value that broke it and the set it
+        // had to come from. The modelled `UnsupportedLanguageException` is not this
+        // condition: it reports a language the service cannot process, where this is
+        // a value the operation does not accept at all.
         if !ANALYSABLE_LANGUAGES.contains(&input.language_code.as_str()) {
-            return Err(
-                DetectTargetedSentimentErrorModeled::UnsupportedLanguageException(
-                    UnsupportedLanguageException {
-                        message: Some(format!(
-                            "Targeted sentiment analysis cannot process the language '{}'. \
-                             Supported languages: {}.",
-                            input.language_code,
-                            ANALYSABLE_LANGUAGES.join(", ")
-                        )),
-                    },
-                )
-                .into(),
-            );
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Value '{}' at 'languageCode'failed to satisfy constraint: Member must \
+                 satisfy enum value set: [{}]",
+                input.language_code,
+                ANALYSABLE_LANGUAGES.join(", ")
+            )));
         }
 
         Ok(DetectTargetedSentimentOutput {

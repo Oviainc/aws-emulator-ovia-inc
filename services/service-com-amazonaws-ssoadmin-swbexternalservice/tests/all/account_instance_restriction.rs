@@ -32,9 +32,11 @@ struct SurfaceCall {
     label: String,
     operation: &'static str,
     /// What the operation answers for an `InstanceArn` the account holds no instance
-    /// under: 404 for the operations that resolve the instance themselves, and 501 for
-    /// the three that are still scaffolds — those model the account-instance refusal and
-    /// nothing else, which is exactly why an unknown ARN is not refused as one.
+    /// under: 400 `ResourceNotFoundException` for the operations that resolve the instance
+    /// themselves (every refusal of a request on this awsJson1_1 surface is 400, so the
+    /// error code is what tells it from the restriction), and 501 for the three that are
+    /// still scaffolds — those model the account-instance refusal and nothing else, which
+    /// is exactly why an unknown ARN is not refused as one.
     unknown_instance_status: u16,
     body: Value,
 }
@@ -123,13 +125,13 @@ fn surface_calls(instance_arn: &str, variant: &Variant) -> Vec<SurfaceCall> {
         SurfaceCall {
             label: format!("{}: CreatePermissionSet", variant.label),
             operation: "CreatePermissionSet",
-            unknown_instance_status: 404,
+            unknown_instance_status: 400,
             body: json!({"InstanceArn": instance_arn, "Name": "Withdrawn"}),
         },
         SurfaceCall {
             label: format!("{}: DescribePermissionSet", variant.label),
             operation: "DescribePermissionSet",
-            unknown_instance_status: 404,
+            unknown_instance_status: 400,
             body: json!({
                 "InstanceArn": instance_arn,
                 "PermissionSetArn": permission_set_arn,
@@ -138,13 +140,13 @@ fn surface_calls(instance_arn: &str, variant: &Variant) -> Vec<SurfaceCall> {
         SurfaceCall {
             label: format!("{}: ListPermissionSets", variant.label),
             operation: "ListPermissionSets",
-            unknown_instance_status: 404,
+            unknown_instance_status: 400,
             body: list_permission_sets,
         },
         SurfaceCall {
             label: format!("{}: DeletePermissionSet", variant.label),
             operation: "DeletePermissionSet",
-            unknown_instance_status: 404,
+            unknown_instance_status: 400,
             body: json!({
                 "InstanceArn": instance_arn,
                 "PermissionSetArn": permission_set_arn,
@@ -153,7 +155,7 @@ fn surface_calls(instance_arn: &str, variant: &Variant) -> Vec<SurfaceCall> {
         SurfaceCall {
             label: format!("{}: CreateAccountAssignment", variant.label),
             operation: "CreateAccountAssignment",
-            unknown_instance_status: 404,
+            unknown_instance_status: 400,
             body: assignment.clone(),
         },
         SurfaceCall {
@@ -166,7 +168,7 @@ fn surface_calls(instance_arn: &str, variant: &Variant) -> Vec<SurfaceCall> {
         SurfaceCall {
             label: format!("{}: ListAccountAssignments", variant.label),
             operation: "ListAccountAssignments",
-            unknown_instance_status: 404,
+            unknown_instance_status: 400,
             body: list_account_assignments,
         },
         SurfaceCall {
@@ -253,14 +255,21 @@ async fn the_restriction_precedes_the_existence_checks() {
     let variant = &VARIANTS[0];
 
     // Nothing was ever created on this instance, so every resource these calls name is
-    // absent — and the answer is the 400 above rather than a 404 that would tell a
-    // client "create the permission set and retry".
+    // absent — and the answer is the restriction's `ValidationException` rather than a
+    // not-found that would tell a client "create the permission set and retry".
     for case in surface_calls(&instance_arn, variant) {
         let (status, body) = call(&router, case.operation, &case.body).await;
         assert_eq!(
             status, 400,
             "case {:?}: a missing resource on an account instance is still the \
              restriction, got {status} {body}",
+            case.label
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {:?}: a missing resource on an account instance is still the \
+             restriction, got {body}",
             case.label
         );
     }
@@ -274,7 +283,7 @@ async fn the_restriction_precedes_the_existence_checks() {
             "case {:?}: an unknown InstanceArn expected HTTP {}, got {status} {body}",
             case.label, case.unknown_instance_status
         );
-        if case.unknown_instance_status == 404 {
+        if case.unknown_instance_status == 400 {
             assert_eq!(
                 error_code(&body),
                 "ResourceNotFoundException",

@@ -48,7 +48,7 @@ pub(crate) const AUTHORIZATION_BEHAVIORS: &[&str] = &["PRE_APPROVED"];
 /// One `CreateAcmeEndpoint` case: what it exercises, the request body, and the
 /// `Contact` the stored endpoint must report (the request's, or the modelled default
 /// when the request named none).
-type EndpointCase<'a> = (&'a str, Value, &'a str);
+pub(crate) type EndpointCase<'a> = (&'a str, Value, &'a str);
 
 /// `CreateAcmeEndpoint`, asserted to succeed, returning the ARN it minted.
 pub(crate) async fn create_endpoint(
@@ -170,7 +170,7 @@ pub(crate) fn wait_until(due: SystemTime) {
 }
 
 /// One request body for each row of the table.
-fn endpoint_cases() -> Vec<EndpointCase<'static>> {
+pub(crate) fn endpoint_cases() -> Vec<EndpointCase<'static>> {
     // 50 is `TagList`'s modelled maximum length, so this row sits exactly on the bound.
     let many_tags: Vec<Value> = (0..50)
         .map(|index| json!({ "Key": format!("key-{index}"), "Value": format!("value-{index}") }))
