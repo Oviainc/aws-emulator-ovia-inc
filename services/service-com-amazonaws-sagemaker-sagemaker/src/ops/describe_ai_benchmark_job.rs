@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAIBenchmarkJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAIBenchmarkJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAIBenchmarkJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replays the AI benchmark job `CreateAIBenchmarkJob` stored under this name, and
+//! materialises the move out of `InProgress` the clock already owed
+//! ([`crate::state::AIBenchmarkJob::settle_status`]) — the one write this reporting
+//! operation makes, due at the stored instant whether or not anybody called. This is
+//! the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +161,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAIBenchmarkJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAIBenchmarkJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAIBenchmarkJob"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        let Some(job) = store.ai_benchmark_jobs.get_mut(&input.ai_benchmark_job_name) else {
+            return Err(DescribeAIBenchmarkJobErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Could not find AI benchmark job \"{}\".",
+                    input.ai_benchmark_job_name
+                )),
+            })
+            .into());
+        };
+
+        // The only write a reporting call makes: the move out of `InProgress` the clock
+        // already owed. It was due at the stored instant whether or not anybody described
+        // the job, so a waiter terminates and no caller's read changes the outcome.
+        let settled = job.settle_status(::std::time::SystemTime::now());
+
+        let output = DescribeAIBenchmarkJobOutput {
+            ai_benchmark_job_name: job.name.clone(),
+            ai_benchmark_job_arn: job.arn.clone(),
+            ai_benchmark_job_status: job.status.clone(),
+            failure_reason: job.failure_reason.clone(),
+            benchmark_target: job.benchmark_target.clone(),
+            output_config: AIBenchmarkOutputResult {
+                s3_output_location: job.output_config.s3_output_location.clone(),
+                mlflow_config: job.output_config.mlflow_config.clone(),
+                // The log streams of a run. Nothing benchmarked the target (see
+                // `crate::state::NO_BENCHMARK_RUNTIME_REASON`), so there is no log group
+                // and no stream to name: the member stays ABSENT rather than reporting an
+                // empty list a caller cannot tell from "no logs yet".
+                cloud_watch_logs: None,
+            },
+            ai_workload_config_identifier: job.workload_config_identifier.clone(),
+            role_arn: job.role_arn.clone(),
+            network_config: job.network_config.clone(),
+            creation_time: crate::state::timestamp(job.creation_time),
+            // Nothing ran the benchmark, so there is no instant its run started at.
+            start_time: None,
+            end_time: job.end_time.map(crate::state::timestamp),
+            // `Tags` is optional in the modelled output, so a job created without any
+            // reports the member absent rather than an empty list.
+            tags: Some(job.tags.clone()).filter(|tags| !tags.is_empty()),
+        };
+        let job_arn = job.arn.clone();
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &job_arn, ctx);
+        }
+        Ok(output)
     }
 }

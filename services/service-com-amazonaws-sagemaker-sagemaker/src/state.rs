@@ -4,7 +4,8 @@
 //!
 //! The inference-deployment lifecycle (model -> endpoint config -> endpoint), the
 //! pipeline lifecycle, the model-card governance resources, batch-transform jobs and
-//! the AI benchmarking control plane's workload configurations are kept here, in
+//! the AI benchmarking control plane's workload configurations and benchmark jobs are
+//! kept here, in
 //! `BTreeMap`s keyed by the resource name AWS keys them by, so `ListModels` has one
 //! stable order to sort and paginate over and every `Describe*` replays exactly what
 //! the matching `Create*` stored. The Studio AppImageConfig registry, the Git
@@ -1268,6 +1269,9 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// Keyed by `AIWorkloadConfigName`. See [`AIWorkloadConfig`], at the end of this
     /// module with the rest of the AI-benchmarking workload-configuration slice.
     pub ai_workload_configs: BTreeMap<String, AIWorkloadConfig>,
+    /// Keyed by `AIBenchmarkJobName`. See [`AIBenchmarkJob`], at the end of this module
+    /// with the rest of the AI-benchmarking slice.
+    pub ai_benchmark_jobs: BTreeMap<String, AIBenchmarkJob>,
     /// Keyed by `HubName`. See [`Hub`].
     pub hubs: BTreeMap<String, Hub>,
     /// Every stored hub content VERSION, keyed by [`HubContentKey`].
@@ -2425,6 +2429,116 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// own types rather than in the one above.
     pub fn ai_workload_configs_below_quota(&self) -> bool {
         self.ai_workload_configs.len() < AI_WORKLOAD_CONFIG_QUOTA
+    }
+
+    /// Whether another AI benchmark job fits, i.e. the store is below
+    /// [`AI_BENCHMARK_JOB_QUOTA`].
+    pub fn ai_benchmark_jobs_below_quota(&self) -> bool {
+        self.ai_benchmark_jobs.len() < AI_BENCHMARK_JOB_QUOTA
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The AI benchmark job slice: what `CreateAIBenchmarkJob` writes and
+// `DescribeAIBenchmarkJob` replays, beside the workload-configuration slice the jobs
+// reference.
+// ---------------------------------------------------------------------------
+
+/// The ARN resource kind an AI benchmark job carries, i.e. the `<kind>` in
+/// [`resource_arn`]. Fixed by `AIBenchmarkJobArn`'s modelled pattern
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:ai-benchmark-job/...`), and named
+/// once here so the create and the describe mint and match the same ARN.
+pub const AI_BENCHMARK_JOB_KIND: &str = "ai-benchmark-job";
+
+/// See [`MODEL_QUOTA`]. Bounds the AI benchmark job store the same way, and is what
+/// `CreateAIBenchmarkJob` answers `ResourceLimitExceeded` past.
+pub const AI_BENCHMARK_JOB_QUOTA: usize = 1_000;
+
+/// `AIBenchmarkJobStatus`'s members this emulator moves a benchmark job through
+/// (`smithy_query(query="shape",shape="AIBenchmarkJobStatus")` answers `InProgress`,
+/// `Completed`, `Failed`, `Stopping` and `Stopped`; the `Completed` and stop states are
+/// not reached by creating one). Named once here so no handler compares a bare string
+/// literal.
+pub const AI_BENCHMARK_STATUS_IN_PROGRESS: &str = "InProgress";
+/// See [`AI_BENCHMARK_STATUS_IN_PROGRESS`].
+pub const AI_BENCHMARK_STATUS_FAILED: &str = "Failed";
+
+/// How long after `CreateAIBenchmarkJob` the clock owes the job's move out of
+/// `InProgress` into its terminal status.
+///
+/// A span chosen by this emulator (AWS documents no duration for a benchmark run),
+/// inside the 250–750 ms band the project fixes for a transition the clock owes. It is
+/// never zero, so a caller that describes the job straight after creating it still
+/// observes `InProgress`, and one that waits observes the terminal status, so a waiter
+/// terminates.
+pub const AI_BENCHMARK_JOB_ENDS_AFTER: Duration = Duration::from_millis(400);
+
+/// `FailureReason` of a benchmark job whose run nothing could perform here.
+///
+/// A benchmark job drives real traffic at a live inference endpoint and measures its
+/// latency, throughput and cost. This emulator serves no inference data plane and runs
+/// no benchmark tool, and the engine contract (`vendor/engine/src/lib.rs`) forbids
+/// reporting a status, duration or measurement for work nothing ran — so the run the
+/// caller asked for ends in the modelled `Failed` state with this reason, and no
+/// `StartTime`, `Completed` status or benchmark result is invented. Everything around
+/// the run — accepting the job, resolving its workload configuration, minting its ARN,
+/// replaying it, reporting its terminal status — is real.
+pub const NO_BENCHMARK_RUNTIME_REASON: &str =
+    "This emulator serves no inference data plane and runs no benchmark tool, so the \
+     benchmark job's run was never started";
+
+/// An AI benchmark job created by `CreateAIBenchmarkJob`, as `DescribeAIBenchmarkJob`
+/// replays it.
+///
+/// `ends_at` is the instant the clock owes the move out of `InProgress`; it is stored,
+/// never slept on, and materialised by whichever reporting call first runs at or after
+/// it (see [`AIBenchmarkJob::settle_status`]).
+#[derive(Debug, Clone)]
+pub struct AIBenchmarkJob {
+    pub name: String,
+    pub arn: String,
+    /// The `AIWorkloadConfigIdentifier` the request presented, kept VERBATIM (a bare
+    /// name or the configuration's ARN) so the read replays what the caller sent rather
+    /// than a form it did not use.
+    pub workload_config_identifier: String,
+    pub benchmark_target: crate::ops::types::AIBenchmarkTarget,
+    /// What the request's `OutputConfig` carried. `DescribeAIBenchmarkJob` reports it as
+    /// an `AIBenchmarkOutputResult`, which adds the log streams of a run — and nothing
+    /// ran here, so that member stays absent.
+    pub output_config: crate::ops::types::AIBenchmarkOutputConfig,
+    pub network_config: Option<crate::ops::types::AIBenchmarkNetworkConfig>,
+    pub role_arn: String,
+    pub tags: Vec<Tag>,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub creation_time: SystemTime,
+    pub end_time: Option<SystemTime>,
+    pub ends_at: SystemTime,
+}
+
+impl AIBenchmarkJob {
+    /// Materialise the move out of `InProgress` the clock already owes.
+    ///
+    /// This is the one write a reporting operation may make: the move was due at
+    /// `ends_at` whether or not anybody described the job, so the observer makes no
+    /// difference to the result. `EndTime` takes the instant the move was due, not
+    /// "now", so it is stable across later reads.
+    ///
+    /// The terminal status is [`AI_BENCHMARK_STATUS_FAILED`] with
+    /// [`NO_BENCHMARK_RUNTIME_REASON`]: nothing benchmarked the target, so no
+    /// `Completed` status and no `StartTime` is invented for it.
+    ///
+    /// Answers whether the transition happened on this call, so the caller can record it.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == AI_BENCHMARK_STATUS_IN_PROGRESS && now >= self.ends_at {
+            self.status = AI_BENCHMARK_STATUS_FAILED.to_string();
+            self.failure_reason = Some(NO_BENCHMARK_RUNTIME_REASON.to_string());
+            // The instant the service gave up on the run, which is when the job ended.
+            // No start time is recorded beside it: the run never started.
+            self.end_time = Some(self.ends_at);
+            return true;
+        }
+        false
     }
 }
 
