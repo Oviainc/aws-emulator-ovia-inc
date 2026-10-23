@@ -21,5 +21,7 @@ mod data_plane_precondition;
 mod engagement_lifecycle;
 #[path = "all/rotation_reads.rs"]
 mod rotation_reads;
+#[path = "all/start_engagement.rs"]
+mod start_engagement;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
