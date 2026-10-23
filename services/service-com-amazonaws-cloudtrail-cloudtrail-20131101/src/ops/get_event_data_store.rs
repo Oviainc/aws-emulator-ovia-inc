@@ -207,6 +207,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
+        // This operation REPORTS the store. The only write it makes is to materialise
+        // a change the CLOCK already owed — a provisioning span that has elapsed, or
+        // the seven-day wait a deleted store has served — which was due at this
+        // instant whether or not anybody called.
+        store.settle_event_data_stores(now);
 
         // `EventDataStore` is either a store ARN or the id suffix of one; a value
         // that can be read as neither names no store in any account. The
@@ -235,13 +240,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // The transitions the clock owed this store are applied before it is
-        // reported, so the status this read answers with is the one the store
-        // was already in: an ingestion change that has finished must not read
-        // `STOPPING_INGESTION` for ever, nor a settled federation `ENABLING`.
-        record.settle_federation(now);
-        record.settle_ingestion(now);
-
+        // Every transition the clock owed this store — the provisioning span, an
+        // in-flight ingestion change, a settled federation — was materialised by the
+        // registry-wide pass above, which is this crate's ONE reading of what the clock
+        // owes, so the status reported here is already the one the store is in.
         Ok(report(record))
     }
 }

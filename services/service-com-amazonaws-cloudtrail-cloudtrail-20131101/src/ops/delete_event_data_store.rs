@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEventDataStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEventDataStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEventDataStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves one event data store of the shared registry (`crate::state`) into
+//! `PENDING_DELETION`, from where the clock removes it after the documented
+//! seven-day wait period.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +184,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEventDataStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEventDataStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEventDataStore"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `EventDataStore` is either a store ARN or the id suffix of one; a value that
+        // can be read as neither names no store in any account. The identifier is read
+        // here, rather than through the state's own resolver, so every refusal below
+        // can name the ARN it addressed.
+        let identifier = crate::state::parse_event_data_store_identifier(&input.event_data_store)
+            .map_err(|rejection| {
+                DeleteEventDataStoreErrorModeled::EventDataStoreARNInvalidException(
+                    EventDataStoreARNInvalidException {
+                        message: Some(rejection.message(&region)),
+                    },
+                )
+            })?;
+        let addressed = identifier.arn(&region);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteEventDataStoreErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "DeleteEventDataStore needs the CloudTrail event data store registry, \
+                         which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        // Materialise what the CLOCK already owed before reading: a store whose
+        // seven-day wait has elapsed is gone, and one still provisioning has taken
+        // the status it was created for.
+        store.settle_event_data_stores(now);
+
+        let found = store.addressed_event_data_store_mut(&identifier, &region);
+        let Some(record) = found else {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                DeleteEventDataStoreErrorModeled::EventDataStoreNotFoundException(
+                    EventDataStoreNotFoundException {
+                        message: Some(crate::state::event_data_store_not_found_message(
+                            &addressed,
+                        )),
+                    },
+                ),
+                NOT_FOUND_STATUS,
+            ));
+        };
+
+        // "TerminationProtectionEnabled must be set to False on the event data store
+        // and the FederationStatus must be DISABLED. You cannot delete an event data
+        // store if TerminationProtectionEnabled is True or the FederationStatus is
+        // ENABLED." Both refusals leave the store exactly as it was.
+        if record.termination_protection_enabled {
+            return Err(
+                DeleteEventDataStoreErrorModeled::EventDataStoreTerminationProtectedException(
+                    EventDataStoreTerminationProtectedException {
+                        message: Some(format!(
+                            "The event data store {addressed} cannot be deleted because \
+                             termination protection is enabled for it."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "the FederationStatus must be DISABLED": any other value — including the
+        // transient ENABLING and DISABLING — is not DISABLED, and the clock-owed
+        // transition has already been materialised by `settle_event_data_stores`
+        // above, so this reads the status a caller would see.
+        if record.federation_status != crate::state::FederationState::Disabled {
+            return Err(
+                DeleteEventDataStoreErrorModeled::EventDataStoreFederationEnabledException(
+                    EventDataStoreFederationEnabledException {
+                        message: Some(format!(
+                            "The event data store {addressed} cannot be deleted because Lake \
+                             query federation is enabled. Run DisableFederation on the event \
+                             data store and try again."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Disables the event data store specified by EventDataStore ... the event
+        // data store enters a PENDING_DELETION state, and is automatically deleted
+        // after a wait period of seven days." A store already in PENDING_DELETION is
+        // already in the state this call asks for and keeps the wait period it
+        // started with, so repeating the call changes nothing.
+        if record.status != crate::state::EventDataStoreState::PendingDeletion {
+            record.status = crate::state::EventDataStoreState::PendingDeletion;
+            // A store awaiting deletion is going nowhere else: the status the clock
+            // owed it (provisioning, or an in-flight ingestion transition) is no
+            // longer owed, so neither marker is left to move it off
+            // `PENDING_DELETION` later.
+            record.pending_status = None;
+            record.ingestion_settles_at = None;
+            record.deleted_at = Some(now + crate::state::EVENT_DATA_STORE_DELETION_WAIT);
+            record.updated_at = Some(now);
+        }
+
+        Ok(DeleteEventDataStoreOutput {})
     }
 }
+
+/// The HTTP status this service answers a not-found refusal with.
+///
+/// The model annotates `EventDataStoreNotFoundException` `@httpError(404)`, but
+/// CloudTrail answers 400 for it on the wire: the recorded response for a delete of
+/// an absent store is `HTTP 400` with `__type` `EventDataStoreNotFoundException` and
+/// a `Message` naming the store's ARN. The error CODE is the model's; only the status
+/// is stated here, through [`crate::scaffolded::Scaffolded::modeled_with_status`] —
+/// the same way `get_event_data_store` states it.
+const NOT_FOUND_STATUS: u16 = 400;

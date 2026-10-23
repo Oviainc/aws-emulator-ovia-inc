@@ -242,8 +242,9 @@ async fn an_update_cannot_change_where_a_configuration_lives_or_what_type_it_is(
     let application = create_application(&router, "immutable-members").await;
 
     // Rows span the `Type` values the model's `Type` documentation lists
-    // ("AWS.AppConfig.FeatureFlags", "AWS.Freeform"), a profile with no `Type` at all,
-    // and the location kinds `CreateConfigurationProfile`'s `LocationUri` doc names.
+    // ("AWS.AppConfig.FeatureFlags", "AWS.Freeform"), a profile with no `Type` at all
+    // (created freeform, so that is the value it keeps), and the location kinds
+    // `CreateConfigurationProfile`'s `LocationUri` doc names.
     let cases: Vec<(&str, &str, Option<&str>)> = vec![
         ("hosted feature flags", "hosted", Some("AWS.AppConfig.FeatureFlags")),
         ("hosted freeform", "hosted", Some("AWS.Freeform")),
@@ -295,7 +296,7 @@ async fn an_update_cannot_change_where_a_configuration_lives_or_what_type_it_is(
         );
         assert_eq!(
             updated.string("Type").as_deref(),
-            *profile_type,
+            Some(profile_type.unwrap_or("AWS.Freeform")),
             "case {case:?}: Type must stay as created, got {:?}",
             updated.string("Type")
         );

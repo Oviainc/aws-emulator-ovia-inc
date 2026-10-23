@@ -33,6 +33,9 @@ serde_json = { workspace = true }
 # query CloudTrail Lake cannot run is refused by its syntax rather than by matching text.
 sqlparser = "0.59"
 tracing = { workspace = true }
+# Mints the event data store id that is the suffix of its ARN (a v4 UUID, the form
+# CloudTrail Lake uses).
+uuid = { version = "1", features = ["v4"] }
 # Hex-codes the opaque `ListChannels` pagination token (`src/ops/list_channels.rs`).
 hex = { workspace = true }
 

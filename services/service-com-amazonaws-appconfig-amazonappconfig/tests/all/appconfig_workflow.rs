@@ -474,7 +474,10 @@ async fn environments_and_profiles_round_trip_with_their_optional_members() {
     }
 
     // `Type` and `Validators` are the profile's own optional members; `ValidatorType`
-    // values come from the model's `ValidatorType` enum (JSON_SCHEMA | LAMBDA).
+    // values come from the model's `ValidatorType` enum (JSON_SCHEMA | LAMBDA). A
+    // request that declares no `Type` creates a freeform profile, so the expected
+    // `Type` of such a row is "AWS.Freeform" (see the
+    // `configuration_profile_type` test for that rule over the whole class).
     let profile_cases = [
         ("hosted, freeform", "hosted", Some("AWS.Freeform"), serde_json::Value::Null),
         (
@@ -489,6 +492,7 @@ async fn environments_and_profiles_round_trip_with_their_optional_members() {
             None,
             serde_json::Value::Null,
         ),
+        ("hosted, no type", "hosted", None, serde_json::Value::Null),
         (
             "s3 object with a JSON schema validator",
             "s3://amzn-s3-demo-bucket/my-app/config.json",
@@ -537,7 +541,7 @@ async fn environments_and_profiles_round_trip_with_their_optional_members() {
         );
         assert_eq!(
             created.string("Type").as_deref(),
-            *profile_type,
+            Some(profile_type.unwrap_or("AWS.Freeform")),
             "case {case:?}: expected the stored Type, got {:?}",
             created.string("Type")
         );

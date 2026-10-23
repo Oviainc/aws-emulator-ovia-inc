@@ -335,7 +335,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             location_uri: input.location_uri,
             retrieval_role_arn: input.retrieval_role_arn,
             validators: input.validators.unwrap_or_default(),
-            profile_type: input.r#type,
+            // A profile always has a kind, so a request that declared none creates a
+            // freeform profile: see `state::FREEFORM_PROFILE_TYPE`. Stored, not
+            // substituted when answering, so every later read of this profile and every
+            // rule that branches on its kind sees the same value.
+            profile_type: input
+                .r#type
+                .unwrap_or_else(|| crate::state::FREEFORM_PROFILE_TYPE.to_string()),
             kms_key_identifier: input.kms_key_identifier,
             tags: input.tags.unwrap_or_default(),
             hosted_versions: std::collections::BTreeMap::new(),
@@ -371,7 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             location_uri: Some(stored.location_uri.clone()),
             retrieval_role_arn: stored.retrieval_role_arn.clone(),
             validators: (!stored.validators.is_empty()).then(|| stored.validators.clone()),
-            r#type: stored.profile_type.clone(),
+            r#type: Some(stored.profile_type.clone()),
             kms_key_arn: None,
             kms_key_identifier: stored.kms_key_identifier.clone(),
         })

@@ -229,6 +229,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
+        // Materialise what the CLOCK already owed the registry before any store is
+        // read — a settled federation, an elapsed provisioning or ingestion span, and a
+        // store whose seven-day deletion wait has run out, which is gone. One reading
+        // of what the clock owes, shared by every event-data-store operation.
+        store.settle_event_data_stores(now);
 
         // `EventDataStore` is either a store ARN or the id suffix of one; a value
         // that can be read as neither names no store in any account. The identifier
@@ -257,11 +262,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // A federation transition the clock already owed this store was due
-        // whatever this call does, so it is materialised before the status below is
-        // read: a federation that has finished turning on must not read `ENABLING`
-        // for ever.
-        record.settle_federation(now);
+        // The federation status below is the one the registry-wide settling pass above
+        // left: a federation that has finished turning on does not read `ENABLING` for
+        // ever.
 
         // The role is the one Lake Formation and Glue reach the store's data
         // through — "The federation role must exist in your account" (model doc for

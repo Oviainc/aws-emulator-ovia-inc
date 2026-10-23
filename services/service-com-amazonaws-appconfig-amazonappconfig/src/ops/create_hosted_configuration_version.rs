@@ -264,7 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // helper extension before storing it, and refuses a document the extension
         // rejects. Storing one anyway would leave a version a deployment could serve
         // that AppConfig would have refused at write time.
-        if profile.profile_type.as_deref() == Some(crate::state::FEATURE_FLAGS_PROFILE_TYPE)
+        if profile.profile_type == crate::state::FEATURE_FLAGS_PROFILE_TYPE
             && !crate::state::feature_flags::is_valid_feature_flags_content(&input.content)
         {
             return Err(CreateHostedConfigurationVersionErrorModeled::BadRequestException(

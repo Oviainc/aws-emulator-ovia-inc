@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEventDataStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEventDataStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEventDataStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints one event data store into the shared registry (`crate::state`): the id, the
+//! ARN, the home Region and the timestamps are the service's, everything else is the
+//! request's.
 //!
 //! ## Shape of an operation
 //!
@@ -296,18 +290,247 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEventDataStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEventDataStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEventDataStore"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // "The default value is EXTENDABLE_RETENTION_PRICING."
+        let billing_mode = match input.billing_mode.as_deref() {
+            None => crate::state::EventDataStoreBillingMode::default(),
+            Some(value) => {
+                let Some(mode) = crate::state::EventDataStoreBillingMode::from_wire(value) else {
+                    return Err(CreateEventDataStoreErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(format!(
+                                "BillingMode '{value}' is not valid: the billing mode must be \
+                                 {} or {}",
+                                crate::state::EventDataStoreBillingMode::ExtendableRetentionPricing
+                                    .as_wire(),
+                                crate::state::EventDataStoreBillingMode::FixedRetentionPricing
+                                    .as_wire()
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                mode
+            }
+        };
+        let (default_retention, max_retention) = crate::state::retention_bounds(billing_mode);
+
+        // The retention period a billing mode allows is narrower than the model's
+        // own `@range` (7..3653), which the boundary validator has already applied:
+        // FIXED_RETENTION_PRICING tops out at 2557 days.
+        let retention_period = input.retention_period.unwrap_or(default_retention);
+        if !(crate::state::RETENTION_PERIOD_MIN_DAYS..=max_retention).contains(&retention_period) {
+            return Err(CreateEventDataStoreErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "RetentionPeriod {retention_period} is not valid for BillingMode {}: \
+                         the retention period must be between {} and {max_retention} days",
+                        billing_mode.as_wire(),
+                        crate::state::RETENTION_PERIOD_MIN_DAYS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "It can also occur if there are duplicate tags or too many tags on the
+        // resource" (model doc for `InvalidTagParameterException`): a tag set is a map
+        // on the wire even though the model carries it as a list, and the limit is the
+        // one the model documents for every taggable CloudTrail resource.
+        let tags = input.tags_list.unwrap_or_default();
+        if tags.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
+            return Err(CreateEventDataStoreErrorModeled::InvalidTagParameterException(
+                InvalidTagParameterException {
+                    message: Some(format!(
+                        "TagsList carries {} tags; the limit is {} tags per event data store",
+                        tags.len(),
+                        crate::state::TAGS_PER_RESOURCE_LIMIT
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(duplicate) = crate::state::first_duplicate_tag_key(&tags) {
+            return Err(CreateEventDataStoreErrorModeled::InvalidTagParameterException(
+                InvalidTagParameterException {
+                    message: Some(format!(
+                        "TagsList carries the tag key '{duplicate}' more than once"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The selectors a store may carry: "You can configure up to five advanced event
+        // selectors for each event data store" (model doc for
+        // `CreateEventDataStoreRequest$AdvancedEventSelectors`), and the same per-request
+        // condition-value bound every selector list in this service is held to. The
+        // model states no `@length` on the list, so the boundary validator applies
+        // neither: unchecked, one request would decide how much the registry retains for
+        // the documented seven-day deletion wait.
+        let advanced_event_selectors = input.advanced_event_selectors.unwrap_or_default();
+        if advanced_event_selectors.len()
+            > crate::state::ADVANCED_SELECTORS_PER_EVENT_DATA_STORE_LIMIT
+        {
+            return Err(
+                CreateEventDataStoreErrorModeled::InvalidEventSelectorsException(
+                    InvalidEventSelectorsException {
+                        message: Some(format!(
+                            "AdvancedEventSelectors carries {} selectors; configure up to {} \
+                             advanced event selectors for each event data store",
+                            advanced_event_selectors.len(),
+                            crate::state::ADVANCED_SELECTORS_PER_EVENT_DATA_STORE_LIMIT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The per-selector rules themselves live with `PutEventSelectors`, this crate's
+        // one reading of an advanced event selector, so both callers refuse alike.
+        if let Err(reason) = crate::ops::put_event_selectors::validate_advanced_event_selectors(
+            &advanced_event_selectors,
+        ) {
+            return Err(
+                CreateEventDataStoreErrorModeled::InvalidEventSelectorsException(
+                    InvalidEventSelectorsException {
+                        message: Some(reason),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateEventDataStoreErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "CreateEventDataStore needs the CloudTrail event data store registry, \
+                         which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        store.settle_event_data_stores(now);
+
+        // A store name is unique per Region, so a name already taken IN THIS REGION
+        // is a conflict, never an overwrite.
+        if store.event_data_store_named(&input.name, &region) {
+            return Err(
+                CreateEventDataStoreErrorModeled::EventDataStoreAlreadyExistsException(
+                    EventDataStoreAlreadyExistsException {
+                        message: Some(format!(
+                            "An event data store called {} already exists in {region}",
+                            input.name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The registry is bounded: it holds state for the life of the process and
+        // every request may add to it.
+        if store.event_data_stores.len() >= crate::state::EVENT_DATA_STORE_QUOTA {
+            return Err(
+                CreateEventDataStoreErrorModeled::EventDataStoreMaxLimitExceededException(
+                    EventDataStoreMaxLimitExceededException {
+                        message: Some(format!(
+                            "This emulator's event data store registry already holds its \
+                             maximum of {} stores; delete one before creating another",
+                            crate::state::EVENT_DATA_STORE_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A store is reported in the transient `CREATED` status the real service
+        // reports, and the CLOCK — not another call — moves it to the status it was
+        // created for: ingesting live events unless the request turned that off
+        // ("Specifies whether the event data store should start ingesting live
+        // events. The default is true.").
+        let settled_status = if input.start_ingestion.unwrap_or(true) {
+            crate::state::EventDataStoreState::Enabled
+        } else {
+            crate::state::EventDataStoreState::StoppedIngestion
+        };
+        let id = ::uuid::Uuid::new_v4().to_string();
+        let record = crate::state::EventDataStoreRecord {
+            id: id.clone(),
+            name: input.name,
+            region: region.clone(),
+            status: crate::state::EventDataStoreState::Created,
+            pending_status: Some((
+                now + crate::state::EVENT_DATA_STORE_PROVISIONING,
+                settled_status,
+            )),
+            // Nothing has told this store to start or stop ingesting yet, so the
+            // clock owes no ingestion transition: the Start/Stop pair sets this.
+            ingestion_settles_at: None,
+            // Insights event logging is off until `PutInsightSelectors` turns it
+            // on, and the destination it would log to comes with it.
+            insight_selectors: Vec::new(),
+            insights_destination: None,
+            // The emulator's own account owns what it creates; a cross-account store
+            // is only ever seeded.
+            owner_account_id: None,
+            advanced_event_selectors,
+            // "Specifies whether the event data store includes events from all
+            // Regions, or only from the Region in which the event data store is
+            // created."
+            multi_region_enabled: input.multi_region_enabled.unwrap_or(false),
+            organization_enabled: input.organization_enabled.unwrap_or(false),
+            retention_period: Some(retention_period),
+            termination_protection_enabled: input.termination_protection_enabled.unwrap_or(false),
+            billing_mode,
+            kms_key_id: input.kms_key_id,
+            // Lake query federation is off until `EnableFederation` turns it on, and
+            // the partition keys it would publish come with it.
+            federation_status: crate::state::FederationState::Disabled,
+            federation_settles_at: None,
+            federation_role_arn: None,
+            partition_keys: Vec::new(),
+            // The event configuration a store is created with: whatever
+            // `PutEventConfiguration` defaults to until a caller sets it.
+            max_event_size: crate::state::MaxEventSizeSetting::default(),
+            context_key_selectors: Vec::new(),
+            tags,
+            created_at: Some(now),
+            // Nothing has changed the store yet, so it STORES no update instant; the
+            // response (and every later read) reports the creation time for
+            // `UpdatedTimestamp`, which is what keeps the model's "always either the
+            // same or newer than the time shown in CreatedTimestamp" true.
+            updated_at: None,
+            deleted_at: None,
+        };
+
+        // Report the stored record, so the response and every later read of this
+        // store are the same values.
+        let output = CreateEventDataStoreOutput {
+            event_data_store_arn: Some(record.arn()),
+            name: Some(record.name.clone()),
+            status: Some(record.status.as_wire().to_string()),
+            advanced_event_selectors: (!record.advanced_event_selectors.is_empty())
+                .then(|| record.advanced_event_selectors.clone()),
+            multi_region_enabled: Some(record.multi_region_enabled),
+            organization_enabled: Some(record.organization_enabled),
+            retention_period: record.retention_period,
+            termination_protection_enabled: Some(record.termination_protection_enabled),
+            tags_list: (!record.tags.is_empty()).then(|| record.tags.clone()),
+            created_timestamp: record.created_at.map(::aws_smithy_types::DateTime::from),
+            updated_timestamp: record
+                .updated_at
+                .or(record.created_at)
+                .map(::aws_smithy_types::DateTime::from),
+            kms_key_id: record.kms_key_id.clone(),
+            billing_mode: Some(record.billing_mode.as_wire().to_string()),
+        };
+        store.event_data_stores.insert(id, record);
+        Ok(output)
     }
 }

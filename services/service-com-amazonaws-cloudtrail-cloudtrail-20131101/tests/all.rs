@@ -39,6 +39,8 @@ mod event_configuration;
 mod event_data_store_ingestion;
 #[path = "all/event_data_store_ingestion_start.rs"]
 mod event_data_store_ingestion_start;
+#[path = "all/event_data_store_lifecycle.rs"]
+mod event_data_store_lifecycle;
 #[path = "all/event_data_store_reads.rs"]
 mod event_data_store_reads;
 #[path = "all/event_selectors.rs"]
@@ -59,6 +61,8 @@ mod insights_metric_data;
 mod lake_queries;
 #[path = "all/query_cancellation.rs"]
 mod query_cancellation;
+#[path = "all/range_refusal_wording.rs"]
+mod range_refusal_wording;
 #[path = "all/refusal_fidelity.rs"]
 mod refusal_fidelity;
 #[path = "all/resource_policies.rs"]

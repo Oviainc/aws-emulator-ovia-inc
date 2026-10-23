@@ -126,15 +126,15 @@ fn apply_patch(entry: &mut GetMethodResponseOutput, patch: &Patch) -> Result<(),
         // not" — so the entry is a boolean keyed by a mapping expression, refused here on
         // the same rule `PutMethodResponse` refuses it on.
         "responseParameters" => {
-            let name = bounded_map_key(patch)?;
+            let name = crate::state::bounded_map_key(patch, 1)?;
             if matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace)
                 && !is_method_response_header(&name)
             {
                 return Err(PatchFailure::BadRequest(invalid_response_parameter(&name)));
             }
-            let mut parameters = ordered(entry.response_parameters.take());
+            let mut parameters = crate::state::ordered_map(entry.response_parameters.take());
             patch_bool_map(&mut parameters, patch, name, MAX_COLLECTION_ENTRIES)?;
-            entry.response_parameters = unordered(parameters);
+            entry.response_parameters = crate::state::stored_map(parameters);
             Ok(())
         }
         // "Response models are represented as a key/value map, with a content-type as the
@@ -143,40 +143,20 @@ fn apply_patch(entry: &mut GetMethodResponseOutput, patch: &Patch) -> Result<(),
         // `Model` resource, which no operation of this emulator creates yet, so it is stored
         // as given rather than resolved — as `PutMethodResponse` stores it.
         "responseModels" => {
-            let content_type = bounded_map_key(patch)?;
-            let mut models = ordered(entry.response_models.take());
-            patch_string_map(&mut models, patch, content_type, MAX_COLLECTION_ENTRIES)?;
-            entry.response_models = unordered(models);
+            let content_type = crate::state::bounded_map_key(patch, 1)?;
+            let mut models = crate::state::ordered_map(entry.response_models.take());
+            patch_string_map(
+                &mut models,
+                patch,
+                content_type,
+                MAX_COLLECTION_ENTRIES,
+                MAX_STRING_CHARS,
+            )?;
+            entry.response_models = crate::state::stored_map(models);
             Ok(())
         }
         _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
     }
-}
-
-/// The map key this patch names, refused when it is longer than a stored key may be.
-fn bounded_map_key(patch: &Patch) -> Result<String, PatchFailure> {
-    let key = patch.map_key(1)?;
-    crate::state::bound_chars(&patch.path, &key, MAX_STRING_CHARS)
-        .map_err(PatchFailure::BadRequest)?;
-    Ok(key)
-}
-
-/// A stored map as the shared map-patch helpers take it: the modelled `MethodResponse`
-/// maps are `HashMap`s and absent when empty, while a patch is applied to a `BTreeMap`
-/// that is present-or-empty, so this is the one place the two spellings meet.
-fn ordered<V>(
-    stored: Option<::std::collections::HashMap<String, V>>,
-) -> ::std::collections::BTreeMap<String, V> {
-    stored.unwrap_or_default().into_iter().collect()
-}
-
-/// The inverse of [`ordered`]: a patched map as it is STORED and reported — absent once
-/// its last entry is removed, which is what [`crate::state::non_empty_map`] means by an
-/// empty caller-supplied map.
-fn unordered<V>(
-    patched: ::std::collections::BTreeMap<String, V>,
-) -> Option<::std::collections::HashMap<String, V>> {
-    crate::state::non_empty_map(Some(patched.into_iter().collect()))
 }
 
 /// The modelled failure for a patch this operation cannot apply.

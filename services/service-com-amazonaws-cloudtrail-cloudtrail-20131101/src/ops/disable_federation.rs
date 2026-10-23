@@ -216,6 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
+        // Materialise what the CLOCK already owed the registry before any store is
+        // read — a settled federation, an elapsed provisioning or ingestion span, and a
+        // store whose seven-day deletion wait has run out, which is gone. One reading
+        // of what the clock owes, shared by every event-data-store operation.
+        store.settle_event_data_stores(now);
 
         // `EventDataStore` is "The ARN (or ID suffix of the ARN) of the event data
         // store": a value that can be read as neither names no store in any
@@ -245,11 +250,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // A federation transition the clock already owed this store was due
-        // whatever this call does, so it is materialised before the status below is
-        // read: that is what keeps a wind-down that has finished from reading
+        // The federation status below is the one the registry-wide settling pass above
+        // left, which is what keeps a wind-down that has finished from reading
         // `DISABLING` for ever.
-        record.settle_federation(now);
 
         // A store being torn down carries no configuration left to change — the
         // modelled `InactiveEventDataStoreException` ("The event data store is

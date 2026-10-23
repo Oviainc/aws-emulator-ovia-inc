@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateDistributionWebACL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateDistributionWebACL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateDistributionWebACL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associating a web ACL with a distribution is a CONFIGURATION change to that
+//! distribution: the ARN the request names becomes the distribution's stored `WebACLId`
+//! — "a unique identifier that specifies the WAF web ACL, if any, to associate with this
+//! distribution. To specify a web ACL created using the latest version of WAF, use the
+//! ACL ARN" — so every later read of the distribution answers with it. The change lands
+//! under the same version-token precondition every other distribution mutation obeys,
+//! mints a fresh version token, and sends the distribution back to `InProgress` until the
+//! clock owes it the terminal status, because the new configuration has to reach the edge
+//! locations.
+//!
+//! What the association does NOT do is resolve the web ACL. A web ACL is a WAF resource,
+//! not one this store holds, and the model constrains `WebACLArn` no further than
+//! `string`, so the identifier the request names is what the distribution carries from
+//! then on; the one thing a request can get wrong here without naming anything outside
+//! this service is naming NO web ACL at all, which is the modelled `InvalidArgument`. The
+//! other two modelled errors have no condition here either: `AccessDenied` belongs to the
+//! authorization the emulator does not perform, and `EntityLimitExceeded` reports a quota
+//! on an entity count, while an association creates no entity and CloudFront publishes no
+//! bound on how many distributions one web ACL may be associated with, so nothing this
+//! store holds can be over one.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +90,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,20 +166,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateDistributionWebACL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateDistributionWebACLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateDistributionWebACL"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // The association is a change to ONE stored distribution, so the record has to be
+        // there: `EntityNotFound` is the error this operation models for an entity it
+        // cannot find, and it is decided before anything else is spent on the request.
+        let Some((current_etag, mut config)) = store
+            .distribution(&input.id)
+            .map(|stored| (stored.etag.clone(), stored.config.clone()))
+        else {
+            return Err(AssociateDistributionWebACLErrorModeled::EntityNotFound(
+                crate::state::distribution_not_found(&input.id),
+            )
+            .into());
+        };
+
+        // `If-Match` is OPTIONAL on this operation (the model marks it neither required
+        // nor defaulted), so a request that states no precondition states nothing to
+        // fail; one that states a version is held to it exactly as `UpdateDistribution`
+        // is, and the comparison is against the STORED version, so the association only
+        // lands on the distribution its caller actually read.
+        if let Some(if_match) = input.if_match.as_deref() {
+            match crate::state::check_if_match(&current_etag, Some(if_match)) {
+                IfMatch::Current => {}
+                IfMatch::Invalid => {
+                    return Err(
+                        AssociateDistributionWebACLErrorModeled::InvalidIfMatchVersion(
+                            InvalidIfMatchVersion {
+                                message: Some(
+                                    "The If-Match version is missing or not valid: supply the \
+                                     ETag of the distribution's current version"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                IfMatch::Stale => {
+                    return Err(AssociateDistributionWebACLErrorModeled::PreconditionFailed(
+                        crate::state::precondition_failed(),
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // "The Amazon Resource Name (ARN) of the WAF web ACL to associate" is what this
+        // member carries, and a web ACL is a WAF resource this store cannot resolve — so
+        // the one thing decidable here is whether the request named a web ACL at all. A
+        // blank value names none, which is the modelled `InvalidArgument` rather than an
+        // association of nothing.
+        if input.web_acl_arn.trim().is_empty() {
+            return Err(AssociateDistributionWebACLErrorModeled::InvalidArgument(
+                InvalidArgument {
+                    message: Some(
+                        "WebACLArn must name the WAF web ACL to associate; it cannot be empty"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The association IS the stored configuration's `WebACLId`: one source of truth,
+        // so a later `GetDistribution` reports the web ACL this call associated, and the
+        // mutation goes through the same path `UpdateDistribution` writes a configuration
+        // by — fresh version token, `LastModifiedTime` now, and the propagation the new
+        // configuration is owed.
+        config.web_acl_id = Some(input.web_acl_arn.clone());
+        // The record was read above under this same held lock, so the store still holds
+        // it; the modelled not-found is answered rather than panicking if it ever does
+        // not.
+        let Some(stored) = store.apply_config(&input.id, config, now) else {
+            return Err(AssociateDistributionWebACLErrorModeled::EntityNotFound(
+                crate::state::distribution_not_found(&input.id),
+            )
+            .into());
+        };
+
+        Ok(AssociateDistributionWebACLOutput {
+            id: Some(stored.id.clone()),
+            // Read back out of the record that was just written, so the ARN this call
+            // reports is the one the distribution now runs under.
+            web_acl_arn: stored.config.web_acl_id.clone(),
+            // "The current version of the distribution" — the token the mutation minted.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }

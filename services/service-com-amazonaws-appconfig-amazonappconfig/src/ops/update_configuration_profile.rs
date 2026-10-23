@@ -280,7 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             location_uri: Some(profile.location_uri.clone()),
             retrieval_role_arn: profile.retrieval_role_arn.clone(),
             validators: (!profile.validators.is_empty()).then(|| profile.validators.clone()),
-            r#type: profile.profile_type.clone(),
+            r#type: Some(profile.profile_type.clone()),
             kms_key_arn: None,
             kms_key_identifier: profile.kms_key_identifier.clone(),
         })

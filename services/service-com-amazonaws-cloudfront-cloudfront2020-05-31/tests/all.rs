@@ -47,3 +47,5 @@ mod state_roundtrip;
 mod tag_resource;
 #[path = "all/tenant_distribution_and_method_order.rs"]
 mod tenant_distribution_and_method_order;
+#[path = "all/web_acl_association.rs"]
+mod web_acl_association;

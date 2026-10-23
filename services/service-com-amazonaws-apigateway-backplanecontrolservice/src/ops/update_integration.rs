@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the request's `patchOperations` to the stored `Integration` of the
+//! method the URI names — the record `PutIntegration` wrote — in request order, and reports
+//! the updated integration, so a later `GetIntegration`/`GetMethod` reads back exactly what
+//! the patch set.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The whole list is applied to a COPY of the record, checked against the rules an
+//! `Integration`'s members publish ([`crate::ops::put_integration::validate_integration`],
+//! the same check `PutIntegration` makes) and written back only once every op has
+//! succeeded, so a list carrying one unsupported op leaves the stored integration as it was
+//! rather than half-patched.
+//!
+//! An integration's `type` is fixed when the integration is created: it is not among the
+//! paths this operation accepts, so a request that patches it is refused and changes
+//! nothing — a caller changes the type by `PutIntegration`, which replaces the record.
 //!
 //! ## Shape of an operation
 //!
@@ -156,6 +161,223 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use super::put_integration::{
+    validate_integration, MAX_TEMPLATE_CHARS, MAX_TIMEOUT_IN_MILLIS, MIN_TIMEOUT_IN_MILLIS,
+    PASSTHROUGH_BEHAVIORS,
+};
+use super::put_method::method_key;
+use crate::state::{
+    patch_bool, patch_enum_string, patch_i32, patch_optional_string, patch_required_string,
+    patch_string_map, patch_string_set, Patch, PatchFailure, PatchOpKind, MAX_COLLECTION_ENTRIES,
+    MAX_STRING_CHARS,
+};
+
+/// The `path` values `UpdateIntegration` accepts: one per updateable member of the
+/// `Integration` shape, the `tlsConfig` sub-member included.
+///
+/// `type` is NOT among them: an integration's type decides which of the other members it
+/// takes at all (the `uri` form, whether an integration method is required), so it is
+/// fixed when the record is created and changed only by replacing the record through
+/// `PutIntegration`. `integrationResponses` is not patchable either — an integration
+/// response is its own resource, written by `PutIntegrationResponse`.
+const SUPPORTED_PATHS: &[&str] = &[
+    "/cacheKeyParameters/<parameter>",
+    "/cacheNamespace",
+    "/connectionId",
+    "/connectionType",
+    "/contentHandling",
+    "/credentials",
+    "/httpMethod",
+    "/integrationTarget",
+    "/passthroughBehavior",
+    "/requestParameters/<parameter-name>",
+    "/requestTemplates/<content-type>",
+    "/responseTransferMode",
+    "/timeoutInMillis",
+    "/tlsConfig/insecureSkipVerification",
+    "/uri",
+];
+
+/// The documented range of `timeoutInMillis`: "Custom timeout between 50 and 29,000
+/// milliseconds" (`Integration$timeoutInMillis`), the same range `PutIntegration`
+/// enforces.
+const TIMEOUT_RANGE: ::std::ops::RangeInclusive<i32> =
+    MIN_TIMEOUT_IN_MILLIS..=MAX_TIMEOUT_IN_MILLIS;
+
+/// Apply one patch to a COPY of a stored integration.
+///
+/// Each arm maps a supported path to the member it names and defers the edit itself to the
+/// service's shared patch semantics: `add`/`replace` set a single-valued member and
+/// `remove` clears an optional one, a map path names one entry, and a collection path names
+/// one entry to add or drop. A member the service always reports a value for — the
+/// `cacheNamespace` it defaults to the resource id, the `passthroughBehavior` and the
+/// `timeoutInMillis` it defaults — cannot be removed, only set. Cross-member rules (a
+/// `uri` whose form depends on the type, a `connectionId` that belongs only to a
+/// `VPC_LINK`) are properties of the RESULTING record, so they are checked once, after the
+/// whole list has been applied, by [`validate_integration`].
+fn apply_patch(entry: &mut GetIntegrationOutput, patch: &Patch) -> Result<(), PatchFailure> {
+    match patch.member() {
+        "uri" => {
+            patch_optional_string(&mut entry.uri, patch, MAX_STRING_CHARS)?;
+            // Stored trimmed, the way `PutIntegration` stores it.
+            entry.uri = entry.uri.as_deref().map(|uri| uri.trim().to_string());
+            Ok(())
+        }
+        // The integration's own method, "the integration's HTTP method type": a verb,
+        // stored uppercased because an HTTP verb is case-insensitive on the wire.
+        "httpMethod" => {
+            patch_optional_string(&mut entry.http_method, patch, MAX_STRING_CHARS)?;
+            entry.http_method = entry.http_method.as_deref().map(method_key);
+            Ok(())
+        }
+        "credentials" => patch_optional_string(&mut entry.credentials, patch, MAX_STRING_CHARS),
+        "integrationTarget" => {
+            patch_optional_string(&mut entry.integration_target, patch, MAX_STRING_CHARS)
+        }
+        "connectionId" => patch_optional_string(&mut entry.connection_id, patch, MAX_STRING_CHARS),
+        // A patch `value` is a bare string on the wire, so an enum-typed member's value
+        // set is checked here rather than by the boundary validator. `connectionType` is
+        // one the service always fills in ("The default value is INTERNET"), so like the
+        // other service-filled members it is set from its value set and never cleared.
+        "connectionType" => {
+            if matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace) {
+                patch.require_single_valued()?;
+                let value = patch.require_value()?;
+                if !CONNECTION_TYPE_VALUES.contains(&value) {
+                    return Err(PatchFailure::BadRequest(format!(
+                        "{} takes one of {}, got {value:?}",
+                        patch.path,
+                        CONNECTION_TYPE_VALUES.join(", ")
+                    )));
+                }
+            }
+            let mut connection = entry.connection_type.clone().unwrap_or_default();
+            patch_required_string(&mut connection, patch, MAX_STRING_CHARS)?;
+            entry.connection_type = Some(connection);
+            Ok(())
+        }
+        "contentHandling" => patch_enum_string(
+            &mut entry.content_handling,
+            patch,
+            CONTENT_HANDLING_STRATEGY_VALUES,
+        ),
+        "responseTransferMode" => patch_enum_string(
+            &mut entry.response_transfer_mode,
+            patch,
+            RESPONSE_TRANSFER_MODE_VALUES,
+        ),
+        // "By default, API Gateway uses the resource ID as the cacheNamespace", so a
+        // stored integration always names one: it can be set, not cleared.
+        "cacheNamespace" => {
+            let mut namespace = entry.cache_namespace.clone().unwrap_or_default();
+            patch_required_string(&mut namespace, patch, MAX_STRING_CHARS)?;
+            entry.cache_namespace = Some(namespace);
+            Ok(())
+        }
+        // `passthroughBehavior` is a bare `String` in the model with a documented value
+        // set, and the service fills one in, so it is set from that set and never cleared.
+        "passthroughBehavior" => {
+            if matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace) {
+                patch.require_single_valued()?;
+                let value = patch.require_value()?;
+                if !PASSTHROUGH_BEHAVIORS.contains(&value) {
+                    return Err(PatchFailure::BadRequest(format!(
+                        "Invalid passthroughBehavior specified: {value}; expected one of {}",
+                        PASSTHROUGH_BEHAVIORS.join(", ")
+                    )));
+                }
+            }
+            let mut behavior = entry.passthrough_behavior.clone().unwrap_or_default();
+            patch_required_string(&mut behavior, patch, MAX_STRING_CHARS)?;
+            entry.passthrough_behavior = Some(behavior);
+            Ok(())
+        }
+        "timeoutInMillis" => patch_i32(&mut entry.timeout_in_millis, patch, TIMEOUT_RANGE),
+        // The path names ONE entry of the collection, or the op's own `value` does; that
+        // the entry must also be a request parameter of the owning method is checked with
+        // the rest of the record.
+        "cacheKeyParameters" => {
+            let parameter = patch.collection_entry(1)?;
+            crate::state::bound_chars(&patch.path, &parameter, MAX_STRING_CHARS)
+                .map_err(PatchFailure::BadRequest)?;
+            let mut parameters = entry.cache_key_parameters.take().unwrap_or_default();
+            patch_string_set(&mut parameters, patch, &parameter, MAX_COLLECTION_ENTRIES)?;
+            entry.cache_key_parameters = Some(parameters);
+            Ok(())
+        }
+        // The path names ONE entry of the map: `/requestParameters/<name>`, whose value is
+        // "a method request parameter value or static value" the back end takes.
+        "requestParameters" => {
+            let name = crate::state::bounded_map_key(patch, 1)?;
+            let mut parameters = crate::state::ordered_map(entry.request_parameters.take());
+            patch_string_map(
+                &mut parameters,
+                patch,
+                name,
+                MAX_COLLECTION_ENTRIES,
+                MAX_STRING_CHARS,
+            )?;
+            entry.request_parameters = crate::state::stored_map(parameters);
+            Ok(())
+        }
+        // As `requestParameters`, keyed by "the content type value" with the Velocity
+        // template as its value, so the entry is bounded as a template rather than as a
+        // plain member string — the bound `PutIntegration` applies to the same value.
+        "requestTemplates" => {
+            let content_type = crate::state::bounded_map_key(patch, 1)?;
+            let mut templates = crate::state::ordered_map(entry.request_templates.take());
+            patch_string_map(
+                &mut templates,
+                patch,
+                content_type,
+                MAX_COLLECTION_ENTRIES,
+                MAX_TEMPLATE_CHARS,
+            )?;
+            entry.request_templates = crate::state::stored_map(templates);
+            Ok(())
+        }
+        "tlsConfig" => {
+            let mut config = entry.tls_config.clone().unwrap_or_default();
+            // The structure's own member is addressed the way a top-level member is, with
+            // the `tlsConfig` token dropped.
+            let nested = patch.rebased(1);
+            match nested.member() {
+                "insecureSkipVerification" => {
+                    patch_bool(&mut config.insecure_skip_verification, &nested)?;
+                }
+                _ => return Err(patch.unsupported_path(SUPPORTED_PATHS)),
+            }
+            entry.tls_config = Some(config);
+            Ok(())
+        }
+        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+    }
+}
+
+/// The stored `Integration` as THIS operation's output shape. Both are the model's
+/// `Integration`, so a stored record is rendered the same way by every reader of it.
+fn output_of(stored: GetIntegrationOutput) -> UpdateIntegrationOutput {
+    UpdateIntegrationOutput {
+        r#type: stored.r#type,
+        http_method: stored.http_method,
+        uri: stored.uri,
+        connection_type: stored.connection_type,
+        connection_id: stored.connection_id,
+        credentials: stored.credentials,
+        request_parameters: stored.request_parameters,
+        request_templates: stored.request_templates,
+        passthrough_behavior: stored.passthrough_behavior,
+        content_handling: stored.content_handling,
+        timeout_in_millis: stored.timeout_in_millis,
+        cache_namespace: stored.cache_namespace,
+        cache_key_parameters: stored.cache_key_parameters,
+        integration_responses: stored.integration_responses,
+        tls_config: stored.tls_config,
+        response_transfer_mode: stored.response_transfer_mode,
+        integration_target: stored.integration_target,
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -191,6 +413,46 @@ impl From<UpdateIntegrationErrorModeled> for UpdateIntegrationError {
     fn from(modeled: UpdateIntegrationErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateIntegrationError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateIntegrationErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateIntegrationErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateIntegrationErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
+/// Refuse a patched record that breaks one of the rules an `Integration`'s members
+/// publish; see [`validate_integration`].
+fn bad_request(message: String) -> UpdateIntegrationError {
+    UpdateIntegrationErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse a request naming a record that does not exist, with the message this service
+/// shares for that identifier.
+fn not_found(message: &str) -> UpdateIntegrationError {
+    UpdateIntegrationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
 
 /// The `UpdateIntegration` operation.
@@ -229,18 +491,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIntegration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches =
+            crate::state::parse_patches(input.patch_operations.as_ref()).map_err(patch_failure)?;
+
+        let verb = method_key(&input.http_method);
+        let mut store = state.lock();
+
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
+        let resource = api
+            .resources
+            .get_mut(&input.resource_id)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE))?;
+        let method = resource
+            .methods
+            .get_mut(&verb)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
+        // Patched on a COPY: a list whose later op is refused leaves the stored
+        // integration untouched, rather than keeping the ops before it. A method with no
+        // integration has none to patch: the identifier in the URI names one that does
+        // not exist.
+        let mut updated = method
+            .integration
+            .clone()
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_INTEGRATION))?;
+
+        for patch in &patches {
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+        // The rules an `Integration`'s members publish hold of the record however it came
+        // to be, so the patched record is checked against the same ones `PutIntegration`
+        // checks a created one against, before anything is written.
+        validate_integration(&updated, method).map_err(bad_request)?;
+
+        method.integration = Some(updated.clone());
+
+        // The stored record IS the model's `Integration`, so the update reports it exactly
+        // as `GetIntegration` will read it back.
+        Ok(output_of(updated))
     }
 }

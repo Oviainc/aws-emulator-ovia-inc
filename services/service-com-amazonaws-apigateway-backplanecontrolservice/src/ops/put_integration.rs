@@ -319,10 +319,10 @@ fn bound_input(input: &PutIntegrationInput) -> Result<(), String> {
 /// request set, plus the ones the service fills in, and nothing else.
 ///
 /// `Err` carries the `BadRequestException` message for a request that breaks one of the
-/// rules the `Integration` members publish — the type-dependent `uri` and
-/// `integrationHttpMethod`, the `connectionId` that belongs only to a `VPC_LINK`, the
-/// `passthroughBehavior` value set, the documented `timeoutInMillis` range, and a
-/// `cacheKeyParameters` entry that is not also a request parameter of `method`.
+/// rules the `Integration` members publish. Those rules are properties of the stored
+/// RECORD rather than of this request, so they live in [`validate_integration`], which
+/// `UpdateIntegration` checks a patched record against too: however an integration came
+/// to be, it satisfies the same rules.
 ///
 /// Validation happens here, before anything is written, so a refused request leaves the
 /// method's integration as it was.
@@ -334,16 +334,75 @@ fn integration_of(
     // `type`, `connectionType`, `contentHandling` and `responseTransferMode` are modelled
     // enums, so the boundary validator has already refused anything outside their value
     // sets by the time this runs.
-    let integration_type = input.r#type.as_str();
+    let integration = GetIntegrationOutput {
+        r#type: Some(input.r#type.clone()),
+        // An HTTP verb is case-insensitive on the wire, so the integration's own method
+        // is stored uppercased, the way a method's verb is.
+        http_method: input.integration_http_method.as_deref().map(method_key),
+        uri: input.uri.as_deref().map(|uri| uri.trim().to_string()),
+        connection_type: Some(
+            input
+                .connection_type
+                .clone()
+                .unwrap_or_else(|| DEFAULT_CONNECTION_TYPE.to_string()),
+        ),
+        connection_id: input.connection_id.clone(),
+        credentials: input.credentials.clone(),
+        // The caller-sized maps are reported only when the caller set one; the cache
+        // configuration is materialised by the service — `cacheNamespace` defaults to
+        // the resource id ("By default, API Gateway uses the resource ID as the
+        // cacheNamespace") — so its parameter list is reported as stored, empty included.
+        request_parameters: crate::state::non_empty_map(input.request_parameters.clone()),
+        request_templates: crate::state::non_empty_map(input.request_templates.clone()),
+        passthrough_behavior: Some(
+            input
+                .passthrough_behavior
+                .clone()
+                .unwrap_or_else(|| DEFAULT_PASSTHROUGH_BEHAVIOR.to_string()),
+        ),
+        content_handling: input.content_handling.clone(),
+        timeout_in_millis: input.timeout_in_millis.unwrap_or(DEFAULT_TIMEOUT_IN_MILLIS),
+        cache_namespace: Some(
+            input
+                .cache_namespace
+                .clone()
+                .unwrap_or_else(|| resource_id.to_string()),
+        ),
+        cache_key_parameters: Some(input.cache_key_parameters.clone().unwrap_or_default()),
+        // An integration's responses are `PutIntegrationResponse`'s records, and this
+        // call creates the integration: a freshly created one carries none.
+        integration_responses: None,
+        tls_config: input.tls_config.clone(),
+        response_transfer_mode: input.response_transfer_mode.clone(),
+        integration_target: input.integration_target.clone(),
+    };
+    validate_integration(&integration, method)?;
+    Ok(integration)
+}
+
+/// Refuse a stored `Integration` that breaks one of the rules its own members publish:
+/// the type-dependent `uri` and integration `httpMethod`, the URI forms the two type
+/// families take, the integration method a Lambda integration takes, the `connectionId`
+/// that belongs only to a `VPC_LINK`, the `passthroughBehavior` value set, the documented
+/// `timeoutInMillis` range, and a `cacheKeyParameters` entry that is not also a request
+/// parameter of the `method` the integration hangs off.
+///
+/// Every rule is stated over the RECORD, so the same check serves the operation that
+/// creates an integration and the one that patches it; `method` is the owning method,
+/// which only `cacheKeyParameters` reaches.
+pub fn validate_integration(
+    integration: &GetIntegrationOutput,
+    method: &MethodEntry,
+) -> Result<(), String> {
+    let integration_type = integration.r#type.as_deref().unwrap_or_default();
     let is_mock = integration_type == MOCK_INTEGRATION_TYPE;
 
-    let connection_type = input
+    let connection_type = integration
         .connection_type
-        .clone()
-        .unwrap_or_else(|| DEFAULT_CONNECTION_TYPE.to_string());
+        .as_deref()
+        .unwrap_or(DEFAULT_CONNECTION_TYPE);
     let private = connection_type == VPC_LINK_CONNECTION_TYPE;
-    let connection_id = match (&input.connection_id, private) {
-        (Some(id), true) => Some(id.clone()),
+    match (&integration.connection_id, private) {
         (None, true) => {
             return Err(format!(
                 "connectionId is required when connectionType is {VPC_LINK_CONNECTION_TYPE}"
@@ -355,16 +414,14 @@ fn integration_of(
                  {VPC_LINK_CONNECTION_TYPE}, got connectionType {connection_type}"
             ))
         }
-        (None, false) => None,
-    };
+        _ => {}
+    }
 
-    let integration_method = match &input.integration_http_method {
+    match integration.http_method.as_deref() {
         Some(verb) => {
-            let verb = method_key(verb);
-            if !HTTP_METHODS.contains(&verb.as_str()) {
+            if !HTTP_METHODS.contains(&verb) {
                 return Err(format!(
-                    "Invalid integration HTTP method specified: {}; expected one of {}",
-                    verb,
+                    "Invalid integration HTTP method specified: {verb}; expected one of {}",
                     HTTP_METHODS.join(", ")
                 ));
             }
@@ -376,17 +433,16 @@ fn integration_of(
                      integration method must be {LAMBDA_INTEGRATION_METHOD}, got {verb}"
                 ));
             }
-            Some(verb)
         }
-        None if is_mock => None,
+        None if is_mock => {}
         None => {
             return Err(format!(
                 "integrationHttpMethod is required for an integration of type {integration_type}"
             ))
         }
-    };
+    }
 
-    let uri = match input.uri.as_deref().map(str::trim) {
+    match integration.uri.as_deref().map(str::trim) {
         Some("") => {
             return Err(
                 "uri, when specified, names the integration endpoint and may not be empty"
@@ -414,40 +470,38 @@ fn integration_of(
                      takes a fully formed HTTP(S) URL, got {uri}"
                 ));
             }
-            Some(uri.to_string())
         }
-        None if is_mock => None,
+        None if is_mock => {}
         None => {
             return Err(format!(
                 "uri is required for an integration of type {integration_type}: it names the \
                  integration endpoint"
             ))
         }
-    };
+    }
 
-    let passthrough_behavior = match input.passthrough_behavior.as_deref() {
-        Some(behavior) if !PASSTHROUGH_BEHAVIORS.contains(&behavior) => {
-            return Err(format!(
-                "Invalid passthroughBehavior specified: {behavior}; expected one of {}",
-                PASSTHROUGH_BEHAVIORS.join(", ")
-            ))
-        }
-        Some(behavior) => behavior.to_string(),
-        None => DEFAULT_PASSTHROUGH_BEHAVIOR.to_string(),
-    };
+    let passthrough_behavior = integration
+        .passthrough_behavior
+        .as_deref()
+        .unwrap_or(DEFAULT_PASSTHROUGH_BEHAVIOR);
+    if !PASSTHROUGH_BEHAVIORS.contains(&passthrough_behavior) {
+        return Err(format!(
+            "Invalid passthroughBehavior specified: {passthrough_behavior}; expected one of {}",
+            PASSTHROUGH_BEHAVIORS.join(", ")
+        ));
+    }
 
-    let timeout_in_millis = input.timeout_in_millis.unwrap_or(DEFAULT_TIMEOUT_IN_MILLIS);
-    if !(MIN_TIMEOUT_IN_MILLIS..=MAX_TIMEOUT_IN_MILLIS).contains(&timeout_in_millis) {
+    if !(MIN_TIMEOUT_IN_MILLIS..=MAX_TIMEOUT_IN_MILLIS).contains(&integration.timeout_in_millis) {
         return Err(format!(
             "timeoutInMillis must be between {MIN_TIMEOUT_IN_MILLIS} and \
-             {MAX_TIMEOUT_IN_MILLIS} milliseconds, got {timeout_in_millis}"
+             {MAX_TIMEOUT_IN_MILLIS} milliseconds, got {}",
+            integration.timeout_in_millis
         ));
     }
 
     // `cacheKeyParameters`: "To be valid values for cacheKeyParameters, these parameters
     // must also be specified for Method requestParameters."
-    let cache_key_parameters: Vec<String> = input.cache_key_parameters.clone().unwrap_or_default();
-    for parameter in &cache_key_parameters {
+    for parameter in integration.cache_key_parameters.iter().flatten() {
         if !method.request_parameters.contains_key(parameter) {
             return Err(format!(
                 "Invalid cache key parameter specified: {parameter}; a cache key parameter must \
@@ -457,36 +511,7 @@ fn integration_of(
         }
     }
 
-    Ok(GetIntegrationOutput {
-        r#type: Some(integration_type.to_string()),
-        http_method: integration_method,
-        uri,
-        connection_type: Some(connection_type),
-        connection_id,
-        credentials: input.credentials.clone(),
-        // The caller-sized maps are reported only when the caller set one; the cache
-        // configuration is materialised by the service — `cacheNamespace` defaults to
-        // the resource id ("By default, API Gateway uses the resource ID as the
-        // cacheNamespace") — so its parameter list is reported as stored, empty included.
-        request_parameters: crate::state::non_empty_map(input.request_parameters.clone()),
-        request_templates: crate::state::non_empty_map(input.request_templates.clone()),
-        passthrough_behavior: Some(passthrough_behavior),
-        content_handling: input.content_handling.clone(),
-        timeout_in_millis,
-        cache_namespace: Some(
-            input
-                .cache_namespace
-                .clone()
-                .unwrap_or_else(|| resource_id.to_string()),
-        ),
-        cache_key_parameters: Some(cache_key_parameters),
-        // An integration's responses are `PutIntegrationResponse`'s records, and this
-        // call creates the integration: a freshly created one carries none.
-        integration_responses: None,
-        tls_config: input.tls_config.clone(),
-        response_transfer_mode: input.response_transfer_mode.clone(),
-        integration_target: input.integration_target.clone(),
-    })
+    Ok(())
 }
 
 /// The stored `Integration` as THIS operation's output shape. Both are the model's
