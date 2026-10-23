@@ -58,3 +58,5 @@ mod update_roundtrip;
 // region. The suite itself is an ordinary `tests/all/<name>.rs` file.
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/published_data_plane_urls.rs"]
+mod published_data_plane_urls;

@@ -66,15 +66,21 @@ const CHANNEL_IN_USE: &str = "The channel you tried to delete has origin endpoin
      attached to it";
 
 /// A MediaPackageV2 emulator plus a tiny restJson1 client for it.
-struct Emulator {
+///
+/// `pub(crate)` because it is the ONE client in this crate that can address a PUBLISHED
+/// data-plane hostname with or without a credential (the shared control-plane client,
+/// `channel_lifecycle::Emulator`, signs every request and always addresses the
+/// control-plane host): `published_data_plane_urls` drives the data plane through this one
+/// rather than carrying a second copy of it.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 /// One HTTP answer: status, raw body, and the body parsed as JSON when it is JSON.
-struct Answer {
-    status: u16,
-    body: String,
-    json: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: String,
+    pub(crate) json: Value,
 }
 
 impl Answer {
@@ -95,13 +101,13 @@ impl Answer {
     }
 
     /// A named string member of the body.
-    fn string(&self, member: &str) -> &str {
+    pub(crate) fn string(&self, member: &str) -> &str {
         self.json.get(member).and_then(Value::as_str).unwrap_or("")
     }
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // This suite signs nothing: it exercises handler behaviour, not authentication.
@@ -114,7 +120,7 @@ impl Emulator {
 
     /// Send one control-plane request: the service's own endpoint host plus a SigV4
     /// credential scope naming it.
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Answer {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Answer {
         self.send(
             method,
             path,
@@ -128,7 +134,7 @@ impl Emulator {
 
     /// Send one request, choosing the `Host`, whether it carries a SigV4 credential, and
     /// any extra headers. The data-plane cases need all three.
-    async fn send(
+    pub(crate) async fn send(
         &self,
         method: &str,
         path: &str,
@@ -181,20 +187,26 @@ impl Emulator {
         Answer { status, body, json }
     }
 
-    async fn create_group(&self, name: &str, body: Value) -> Answer {
+    pub(crate) async fn create_group(&self, name: &str, body: Value) -> Answer {
         let mut body = body;
         body["ChannelGroupName"] = json!(name);
         self.call("POST", "/channelGroup", Some(body)).await
     }
 
-    async fn create_channel(&self, group: &str, name: &str, body: Value) -> Answer {
+    pub(crate) async fn create_channel(&self, group: &str, name: &str, body: Value) -> Answer {
         let mut body = body;
         body["ChannelName"] = json!(name);
         self.call("POST", &format!("/channelGroup/{group}/channel"), Some(body))
             .await
     }
 
-    async fn create_endpoint(&self, group: &str, channel: &str, name: &str, body: Value) -> Answer {
+    pub(crate) async fn create_endpoint(
+        &self,
+        group: &str,
+        channel: &str,
+        name: &str,
+        body: Value,
+    ) -> Answer {
         let mut body = body;
         body["OriginEndpointName"] = json!(name);
         self.call(
@@ -548,7 +560,10 @@ async fn not_found_and_conflict_refusals_carry_the_services_fixed_sentences() {
 
 /// A policy granting `action` to everyone — the shape MediaPackage's own endpoint-policy
 /// examples take.
-fn grant_policy(action: &str) -> String {
+///
+/// `pub(crate)` for the same reason as [`Emulator`]: `published_data_plane_urls` grants the
+/// egress actions through this one rather than writing the statement out again.
+pub(crate) fn grant_policy(action: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -1963,7 +1978,9 @@ async fn the_published_data_plane_urls_are_served_and_gated_by_the_endpoint_poli
 }
 
 /// Split a published `https://host/path` URL into its host and its path.
-fn split_url(url: &str) -> (String, String) {
+///
+/// `pub(crate)`: the one splitter this crate's data-plane suites share.
+pub(crate) fn split_url(url: &str) -> (String, String) {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
