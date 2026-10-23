@@ -235,10 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // The federation transition the clock owed this store is applied before it
-        // is reported, so the status this read answers with is the one the store
-        // was already in.
+        // The transitions the clock owed this store are applied before it is
+        // reported, so the status this read answers with is the one the store
+        // was already in: an ingestion change that has finished must not read
+        // `STOPPING_INGESTION` for ever, nor a settled federation `ENABLING`.
         record.settle_federation(now);
+        record.settle_ingestion(now);
 
         Ok(report(record))
     }

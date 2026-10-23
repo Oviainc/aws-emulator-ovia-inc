@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopEventDataStoreIngestion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopEventDataStoreIngestion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopEventDataStoreIngestion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops the ingestion of live events on one CloudTrail Lake event data store.
+//!
+//! The store is addressed the way every event data store operation addresses one —
+//! by its ARN or by the bare id suffix of that ARN, resolved against the Region the
+//! call was made in — and ingestion stops only on a store that is in a state to stop
+//! it: "To stop ingestion, the event data store `Status` must be `ENABLED` and the
+//! `eventCategory` must be `Management`, `Data`, `NetworkActivity`, or
+//! `ConfigurationItem`." Stopping is asynchronous, which is why the model's
+//! `EventDataStoreStatus` enum carries `STOPPING_INGESTION`: the call moves the store
+//! into that transient status and the clock settles it into `STOPPED_INGESTION`
+//! after [`crate::state::INGESTION_SETTLE_AFTER`].
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +180,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopEventDataStoreIngestion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopEventDataStoreIngestionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopEventDataStoreIngestion"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StopEventDataStoreIngestionErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "StopEventDataStoreIngestion needs the CloudTrail event data store \
+                         registry, which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `EventDataStore` is either a store ARN or the id suffix of one; a value
+        // that can be read as neither names no store in any account. The identifier
+        // is read here rather than through
+        // `ComAmazonawsCloudtrailCloudtrail20131101State::event_data_store` so the
+        // refusal below can name the ARN it addressed.
+        let identifier = crate::state::parse_event_data_store_identifier(&input.event_data_store)
+            .map_err(|rejection| {
+            StopEventDataStoreIngestionErrorModeled::EventDataStoreARNInvalidException(
+                EventDataStoreARNInvalidException {
+                    message: Some(rejection.message(&region)),
+                },
+            )
+        })?;
+
+        let Some(record) = store.addressed_event_data_store_mut(&identifier, &region) else {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                StopEventDataStoreIngestionErrorModeled::EventDataStoreNotFoundException(
+                    EventDataStoreNotFoundException {
+                        message: Some(crate::state::event_data_store_not_found_message(
+                            &identifier.arn(&region),
+                        )),
+                    },
+                ),
+                NOT_FOUND_STATUS,
+            ));
+        };
+
+        // An ingestion transition the clock already owed this store was due whatever
+        // this call does, so it is materialised before the status below is read: a
+        // store that has finished stopping must read `STOPPED_INGESTION`, and one
+        // that has finished starting `ENABLED` — which is the status this call needs.
+        record.settle_ingestion(now);
+
+        // Which events a store collects is a property of its configuration, so a
+        // store of a category whose ingestion cannot be paused at all is refused
+        // before its momentary status is considered: the operation does not apply to
+        // such a store in any status.
+        if !record.ingestion_is_controllable() {
+            let collected = record.event_categories();
+            let collected = if collected.is_empty() {
+                "none".to_string()
+            } else {
+                collected.join(", ")
+            };
+            return Err(
+                StopEventDataStoreIngestionErrorModeled::InvalidEventDataStoreCategoryException(
+                    InvalidEventDataStoreCategoryException {
+                        message: Some(format!(
+                            "The event data store {} collects events of category {collected}: \
+                             ingestion can only be stopped on an event data store whose \
+                             eventCategory is one of {}.",
+                            record.arn(),
+                            crate::state::INGESTION_CONTROLLABLE_EVENT_CATEGORIES.join(", "),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "To stop ingestion, the event data store Status must be ENABLED": a store
+        // in any other status — newly created, awaiting deletion, already stopped,
+        // or still moving between the two — is refused with the one error this
+        // operation models for a status that does not support it, and left alone.
+        if record.status != crate::state::EventDataStoreState::Enabled {
+            return Err(
+                StopEventDataStoreIngestionErrorModeled::InvalidEventDataStoreStatusException(
+                    InvalidEventDataStoreStatusException {
+                        message: Some(format!(
+                            "The event data store {} is in status {}: ingestion can only be \
+                             stopped on an event data store whose status is {}.",
+                            record.arn(),
+                            record.status.as_wire(),
+                            crate::state::EventDataStoreState::Enabled.as_wire(),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Stopping is asynchronous: the store enters the transient status the model
+        // carries for it, and the clock owes it the settled one at an instant
+        // strictly after this call — so a caller reading the store straight after
+        // this one still sees `STOPPING_INGESTION`.
+        record.status = crate::state::EventDataStoreState::StoppingIngestion;
+        record.ingestion_settles_at = Some(now + crate::state::INGESTION_SETTLE_AFTER);
+        record.updated_at = Some(now);
+
+        // `StopEventDataStoreIngestionResponse` models no members, so what this call
+        // changed is read back through `GetEventDataStore`.
+        Ok(StopEventDataStoreIngestionOutput {})
     }
 }
+
+/// The HTTP status this service answers a not-found refusal with.
+///
+/// The model annotates `EventDataStoreNotFoundException` `@httpError(404)`, but
+/// CloudTrail answers 400 for it on the wire: the recorded response for this very
+/// operation is `HTTP 400` with `__type` `EventDataStoreNotFoundException` and a
+/// `Message` naming the store's ARN. The error CODE is the model's; only the status
+/// is stated here, through [`crate::scaffolded::Scaffolded::modeled_with_status`] —
+/// the same way `get_event_data_store` states it.
+const NOT_FOUND_STATUS: u16 = 400;
