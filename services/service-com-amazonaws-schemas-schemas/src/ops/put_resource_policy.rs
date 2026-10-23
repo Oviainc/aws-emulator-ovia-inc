@@ -212,7 +212,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(error) => {
                 return Err(PutResourcePolicyErrorModeled::BadRequestException(
                     crate::state::policy_not_json(&format!(
-                        "the value sent is not well-formed JSON ({error})"
+                        "the value sent is not valid JSON: {}",
+                        crate::state::json_parse_detail(&policy, &error)
                     )),
                 )
                 .into());
@@ -222,10 +223,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the store keeps and every later read reports: the document's JSON
         // content, re-encoded, rather than the text one caller's renderer produced.
         // See `crate::state::canonical_json`.
-        let document = crate::state::canonical_json(&policy).map_err(|error| {
+        let document = crate::state::canonical_json(&policy).map_err(|detail| {
             PutResourcePolicyError::from(PutResourcePolicyErrorModeled::BadRequestException(
                 crate::state::policy_not_json(&format!(
-                    "the value sent is not well-formed JSON ({error})"
+                    "the value sent is not valid JSON: {detail}"
                 )),
             ))
         })?;
@@ -254,11 +255,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `RevisionId` is a precondition on the write: it holds only while the stored
         // policy is still at that revision. A registry with no policy is at no
-        // revision, so no revision a caller can name matches it.
+        // revision, so no revision a caller can name matches it. The refusal's own
+        // sentence is the service's constant (`crate::state::stale_policy_revision`):
+        // it reports neither the revision sent nor the one stored.
         if let Some(requested) = revision_id.as_deref() {
             if current_revision.as_deref() != Some(requested) {
                 return Err(PutResourcePolicyErrorModeled::PreconditionFailedException(
-                    crate::state::stale_policy_revision(requested),
+                    crate::state::stale_policy_revision(),
                 )
                 .into());
             }
