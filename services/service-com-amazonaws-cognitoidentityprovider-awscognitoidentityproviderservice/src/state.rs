@@ -76,6 +76,19 @@ pub const DEFAULT_EXPLICIT_AUTH_FLOWS: [&str; 3] = [
 pub const ADMIN_PASSWORD_AUTH_FLOWS: [&str; 2] =
     ["ALLOW_ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"];
 
+/// The `ExplicitAuthFlows` values that enable `AuthFlow=USER_PASSWORD_AUTH`:
+/// "`ALLOW_USER_PASSWORD_AUTH`: Enable user password-based authentication", beside
+/// the legacy `USER_PASSWORD_AUTH` the same member documents
+/// (`CreateUserPoolClient.ExplicitAuthFlows` in this service's model).
+pub const USER_PASSWORD_AUTH_FLOWS: [&str; 2] =
+    ["ALLOW_USER_PASSWORD_AUTH", "USER_PASSWORD_AUTH"];
+
+/// The `ExplicitAuthFlows` value that enables `AuthFlow=REFRESH_TOKEN_AUTH` and its
+/// `REFRESH_TOKEN` alias: "`ALLOW_REFRESH_TOKEN_AUTH`: Enable authflow to refresh
+/// tokens" (`CreateUserPoolClient.ExplicitAuthFlows` in this service's model), which
+/// is also one of the three a client that sets no `ExplicitAuthFlows` gets.
+pub const REFRESH_TOKEN_AUTH_FLOWS: [&str; 1] = ["ALLOW_REFRESH_TOKEN_AUTH"];
+
 /// `UserPoolTierType` defaults to `ESSENTIALS` (`CreateUserPool.UserPoolTier`).
 const DEFAULT_USER_POOL_TIER: &str = "ESSENTIALS";
 
@@ -122,7 +135,7 @@ pub const MAX_GROUPS_PER_POOL: usize = 1_000;
 const MAX_AUTH_SESSIONS: usize = 10_000;
 
 /// The most unexpired issued tokens this emulator holds; the oldest are evicted
-/// past it. Three are recorded per sign-in.
+/// past it. Three are recorded per sign-in, two per refresh.
 const MAX_ISSUED_TOKENS: usize = 30_000;
 
 /// Per-service state. A handler reaches it through [`service_state`].
@@ -146,6 +159,20 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// The stored pool, mutably.
     pub fn pool_mut(&mut self, user_pool_id: &str) -> Option<&mut UserPool> {
         self.user_pools.get_mut(user_pool_id)
+    }
+
+    /// The stored pool that holds the app client `client_id`, or `None` when no pool
+    /// does.
+    ///
+    /// The unauthenticated half of this API — `InitiateAuth`, `SignUp`,
+    /// `ForgotPassword`, `RespondToAuthChallenge` — identifies its user pool by
+    /// `ClientId` ALONE and models no `UserPoolId` member, so the stored app client is
+    /// what names the pool. An id is minted per client and lives in exactly one pool,
+    /// so at most one pool can answer.
+    pub fn pool_of_client(&self, client_id: &str) -> Option<&UserPool> {
+        self.user_pools
+            .values()
+            .find(|pool| pool.clients.contains_key(client_id))
     }
 
     /// Store a challenge session and return its token.
@@ -189,6 +216,39 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         client_id: &str,
         username: &str,
         now: SystemTime,
+    ) -> Option<AuthenticationResultType> {
+        self.mint_tokens(user_pool_id, client_id, username, now, true)
+    }
+
+    /// Issue the access / id token pair for a sign-in that REUSES the refresh token the
+    /// caller presented, record both, and return the modelled result.
+    ///
+    /// `InitiateAuth`'s `AuthFlow`: "REFRESH_TOKEN_AUTH and REFRESH_TOKEN — Receive new
+    /// ID and access tokens when you pass a `REFRESH_TOKEN` parameter with a valid
+    /// refresh token as the value" (this service's model). The refresh token in force
+    /// stays the one the caller already holds, so none is minted and the result carries
+    /// no `RefreshToken` member. Otherwise identical to [`issue_tokens`], whose claim
+    /// building it shares.
+    pub fn refresh_tokens(
+        &mut self,
+        user_pool_id: &str,
+        client_id: &str,
+        username: &str,
+        now: SystemTime,
+    ) -> Option<AuthenticationResultType> {
+        self.mint_tokens(user_pool_id, client_id, username, now, false)
+    }
+
+    /// The one token-minting path behind [`issue_tokens`] and [`refresh_tokens`]:
+    /// `with_refresh_token` decides whether a refresh token is minted beside the access
+    /// and id tokens, so the two entry points cannot disagree about a claim.
+    fn mint_tokens(
+        &mut self,
+        user_pool_id: &str,
+        client_id: &str,
+        username: &str,
+        now: SystemTime,
+        with_refresh_token: bool,
     ) -> Option<AuthenticationResultType> {
         let TokenInputs {
             issuer,
@@ -267,35 +327,42 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             }
         }
 
-        let refresh_claims = serde_json::json!({
-            "sub": sub,
-            "iss": issuer,
-            "client_id": client_id,
-            "username": stored_username,
-            "token_use": "refresh",
-            "iat": issued_at,
-            "exp": issued_at + refresh_ttl.as_secs() as i64,
-            "jti": new_uuid(),
-            "origin_jti": origin_jti,
-        });
-
         let access_token = unsecured_jws(&access_claims);
         let id_token = unsecured_jws(&id_claims);
-        let refresh_token = unsecured_jws(&refresh_claims);
+        // A refresh sign-in reuses the token the caller presented, so no refresh claims
+        // are built on that path at all.
+        let refresh_token = with_refresh_token.then(|| {
+            let refresh_claims = serde_json::json!({
+                "sub": sub,
+                "iss": issuer,
+                "client_id": client_id,
+                "username": stored_username,
+                "token_use": "refresh",
+                "iat": issued_at,
+                "exp": issued_at + refresh_ttl.as_secs() as i64,
+                "jti": new_uuid(),
+                "origin_jti": origin_jti,
+            });
+            unsecured_jws(&refresh_claims)
+        });
 
+        let minted = 2 + usize::from(with_refresh_token);
         self.issued_tokens
             .retain(|_, record| record.expires_at > now);
         evict_oldest_until(
             &mut self.issued_tokens,
-            MAX_ISSUED_TOKENS.saturating_sub(3),
+            MAX_ISSUED_TOKENS.saturating_sub(minted),
             |record| record.expires_at,
         );
 
         for (token, kind, ttl) in [
-            (&access_token, TokenKind::Access, access_ttl),
-            (&id_token, TokenKind::Id, id_ttl),
-            (&refresh_token, TokenKind::Refresh, refresh_ttl),
-        ] {
+            (Some(&access_token), TokenKind::Access, access_ttl),
+            (Some(&id_token), TokenKind::Id, id_ttl),
+            (refresh_token.as_ref(), TokenKind::Refresh, refresh_ttl),
+        ]
+        .into_iter()
+        .filter_map(|(token, kind, ttl)| token.map(|token| (token, kind, ttl)))
+        {
             self.issued_tokens.insert(
                 token.clone(),
                 TokenRecord {
@@ -315,7 +382,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             // `ExpiresIn` is the access token's lifetime, in seconds.
             expires_in: i32::try_from(access_ttl.as_secs()).unwrap_or(i32::MAX),
             token_type: Some("Bearer".to_string()),
-            refresh_token: Some(refresh_token),
+            refresh_token,
             id_token: Some(id_token),
             new_device_metadata: None,
         })
@@ -628,9 +695,25 @@ pub struct UserPoolClient {
 impl UserPoolClient {
     /// Whether `AuthFlow=ADMIN_USER_PASSWORD_AUTH` is enabled for this client.
     pub fn allows_admin_password_auth(&self) -> bool {
+        self.allows_any_of(&ADMIN_PASSWORD_AUTH_FLOWS)
+    }
+
+    /// Whether `AuthFlow=USER_PASSWORD_AUTH` is enabled for this client.
+    pub fn allows_user_password_auth(&self) -> bool {
+        self.allows_any_of(&USER_PASSWORD_AUTH_FLOWS)
+    }
+
+    /// Whether `AuthFlow=REFRESH_TOKEN_AUTH` / `REFRESH_TOKEN` is enabled for this
+    /// client.
+    pub fn allows_refresh_token_auth(&self) -> bool {
+        self.allows_any_of(&REFRESH_TOKEN_AUTH_FLOWS)
+    }
+
+    /// Whether this client's stored `ExplicitAuthFlows` carry any of `flows`.
+    fn allows_any_of(&self, flows: &[&str]) -> bool {
         self.explicit_auth_flows
             .iter()
-            .any(|flow| ADMIN_PASSWORD_AUTH_FLOWS.contains(&flow.as_str()))
+            .any(|flow| flows.contains(&flow.as_str()))
     }
 
     /// Whether this client suppresses "no such user": `PreventUserExistenceErrors
