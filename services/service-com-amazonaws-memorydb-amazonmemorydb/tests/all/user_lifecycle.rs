@@ -586,36 +586,37 @@ async fn the_listing_pages_and_filters_over_every_user() {
         );
     }
 
-    // A filter narrows the listing by the property it names.
+    // A filter narrows the listing by the property it names, under MemoryDB's own
+    // hyphenated, lower-case filter names.
     let filter_cases: Vec<(&str, Value, Vec<&str>)> = vec![
         (
             "by user name",
-            json!([{ "Name": "UserName", "Values": ["user-a", "user-b"] }]),
+            json!([{ "Name": "user-name", "Values": ["user-a", "user-b"] }]),
             vec!["user-a", "user-b"],
         ),
         (
             "by acl name",
-            json!([{ "Name": "ACLName", "Values": ["paged-acl"] }]),
+            json!([{ "Name": "acl-name", "Values": ["paged-acl"] }]),
             vec!["user-a", "user-c"],
         ),
         (
-            // `DescribeUsers` filters on `UserName` and `ACLName`; a name outside that
+            // `DescribeUsers` filters on `user-name` and `acl-name`; a name outside that
             // set is refused below rather than treated as a property of `User`.
             "by acl name, nothing belongs to it",
-            json!([{ "Name": "ACLName", "Values": ["no-such-acl"] }]),
+            json!([{ "Name": "acl-name", "Values": ["no-such-acl"] }]),
             vec![],
         ),
         (
             "two filters, both must hold",
             json!([
-                { "Name": "ACLName", "Values": ["paged-acl"] },
-                { "Name": "UserName", "Values": ["user-c"] },
+                { "Name": "acl-name", "Values": ["paged-acl"] },
+                { "Name": "user-name", "Values": ["user-c"] },
             ]),
             vec!["user-c"],
         ),
         (
             "a filter nothing matches",
-            json!([{ "Name": "UserName", "Values": ["absent"] }]),
+            json!([{ "Name": "user-name", "Values": ["absent"] }]),
             vec![],
         ),
     ];
@@ -643,11 +644,11 @@ async fn the_listing_pages_and_filters_over_every_user() {
         (
             "unknown filter",
             json!([{ "Name": "NoSuchProperty", "Values": ["x"] }]),
-            "InvalidParameterCombinationException",
+            "InvalidParameterValueException",
         ),
         (
             "filter with no values",
-            json!([{ "Name": "UserName", "Values": [] }]),
+            json!([{ "Name": "user-name", "Values": [] }]),
             "InvalidParameterValueException",
         ),
     ] {

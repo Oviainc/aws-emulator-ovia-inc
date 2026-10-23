@@ -54,3 +54,5 @@ mod state_roundtrip;
 // list is next touched for another reason.
 #[path = "all/config_custom_rule_policy.rs"]
 mod config_custom_rule_policy;
+#[path = "all/compliance_details_by_config_rule.rs"]
+mod compliance_details_by_config_rule;

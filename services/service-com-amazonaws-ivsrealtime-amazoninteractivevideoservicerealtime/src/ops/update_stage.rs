@@ -172,7 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.name = Some(name);
         }
         if let Some(configuration) = input.auto_participant_recording_configuration {
-            record.auto_participant_recording_configuration = Some(configuration);
+            // Through the same seam `CreateStage` uses, so an updated stage reports the
+            // configuration's documented defaults exactly as a created one does.
+            record.auto_participant_recording_configuration =
+                crate::state::effective_recording_configuration(Some(configuration));
         }
 
         Ok(UpdateStageOutput {

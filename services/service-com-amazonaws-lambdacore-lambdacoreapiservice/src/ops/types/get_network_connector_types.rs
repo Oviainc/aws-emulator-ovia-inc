@@ -17,7 +17,17 @@ pub struct GetNetworkConnectorInput {
     pub identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.lambdacore#GetNetworkConnectorResponse")]
+/// `GetNetworkConnectorResponse`. Its schema and codec come from
+/// [`lambdacore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `LastModified` targets `CoreTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="operation",
+/// operation="GetNetworkConnector")` reports `"timestampFormat": "date-time"` on it) — a
+/// trait the derive does not put on a member schema, so the member would go onto the
+/// restJson1 wire as a bare epoch NUMBER. See `types/date_time_wire.rs` for the whole
+/// story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct GetNetworkConnectorOutput {
     pub arn: String,
@@ -37,4 +47,70 @@ pub struct GetNetworkConnectorOutput {
     pub last_update_status_reason_code: Option<String>,
     pub last_modified: Option<::aws_smithy_types::DateTime>,
 }
+
+lambdacore_schema_and_codec!(
+    GetNetworkConnectorOutput,
+    GET_NETWORK_CONNECTOR_OUTPUT_SCHEMA,
+    "com.amazonaws.lambdacore#GetNetworkConnectorResponse",
+    "com.amazonaws.lambdacore",
+    "GetNetworkConnectorResponse",
+    (M_ARN, arn, "Arn", 0, req, string),
+    (M_NAME, name, "Name", 1, req, string),
+    (M_ID, id, "Id", 2, req, string),
+    (M_VERSION_ARN, version_arn, "VersionArn", 3, opt, string),
+    (M_VERSION, version, "Version", 4, opt, long),
+    (
+        M_LATEST_VERSION_ARN,
+        latest_version_arn,
+        "LatestVersionArn",
+        5,
+        opt,
+        string
+    ),
+    (M_LATEST_VERSION, latest_version, "LatestVersion", 6, opt, long),
+    (
+        M_CONFIGURATION,
+        configuration,
+        "Configuration",
+        7,
+        opt,
+        union_of(NetworkConnectorConfiguration)
+    ),
+    (M_OPERATOR_ROLE, operator_role, "OperatorRole", 8, opt, string),
+    (M_STATE, state, "State", 9, opt, string),
+    (M_STATE_REASON, state_reason, "StateReason", 10, opt, string),
+    (
+        M_STATE_REASON_CODE,
+        state_reason_code,
+        "StateReasonCode",
+        11,
+        opt,
+        string
+    ),
+    (
+        M_LAST_UPDATE_STATUS,
+        last_update_status,
+        "LastUpdateStatus",
+        12,
+        opt,
+        string
+    ),
+    (
+        M_LAST_UPDATE_STATUS_REASON,
+        last_update_status_reason,
+        "LastUpdateStatusReason",
+        13,
+        opt,
+        string
+    ),
+    (
+        M_LAST_UPDATE_STATUS_REASON_CODE,
+        last_update_status_reason_code,
+        "LastUpdateStatusReasonCode",
+        14,
+        opt,
+        string
+    ),
+    (M_LAST_MODIFIED, last_modified, "LastModified", 15, opt, date_time),
+);
 

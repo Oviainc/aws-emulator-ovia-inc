@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIngestionDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIngestionDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIngestionDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an ingestion destination UNDER an ingestion and PERSISTS it there: the
+//! response is built from the stored record (see
+//! [`crate::state::IngestionDestinationRecord::to_ingestion_destination`]), so
+//! `GetIngestionDestination` and `UpdateIngestionDestination` work from the same bytes
+//! this call wrote. A destination this emulator accepted is usable straight away, so it
+//! is stored in the terminal `Active` state and the clock owes no transition.
 //!
 //! ## Shape of an operation
 //!
@@ -91,9 +88,15 @@
 //!   parameters and try again.
 //! * `InternalServerException` (HTTP 500) — The request processing has failed because of an
 //!   unknown error, exception, or failure with an internal server.
+//! * `ResourceNotFoundException` (HTTP 404) — The specified resource does not exist. Widened
+//!   in through `extra_errors`: the model's own `errors` list for this operation omits it,
+//!   while `appBundleIdentifier` can name a bundle that does not exist, and every sibling
+//!   operation taking that member models it.
 //! * `ServiceQuotaExceededException` (HTTP 402) — The request exceeds a service quota.
 //! * `ThrottlingException` (HTTP 429) — The request rate exceeds the limit.
-//! * `ValidationException` (HTTP 400) — The request has invalid or missing parameters.
+//! * `ValidationException` (HTTP 400) — The request has invalid or missing parameters, which
+//!   is also how AppFabric refuses a write naming an `ingestionIdentifier` that does not
+//!   exist (the reporting path answers HTTP 404 for the same identifier).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -109,12 +112,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-appfabric-fabricfronten
 // here — hence the `CreateIngestionDestinationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.appfabric#CreateIngestionDestination")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.appfabric#CreateIngestionDestination",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum CreateIngestionDestinationErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
@@ -171,18 +178,192 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIngestionDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIngestionDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIngestionDestination"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateIngestionDestinationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the AppFabric emulator could not reach its state store"
+                            .to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every member of `processingConfiguration` and `destinationConfiguration`
+        // is closed by the model (the `Schema` / `Format` enums, and the bucket
+        // name, prefix and stream name length bounds), so the boundary validator
+        // has already refused a malformed configuration before this handler runs.
+
+        let region = crate::state::request_region(ctx);
+
+        let mut store = state.lock();
+        let Some(bundle_key) = store.bundle_key(&input.app_bundle_identifier) else {
+            return Err(
+                CreateIngestionDestinationErrorModeled::ResourceNotFoundException(
+                    crate::state::app_bundle_not_found(&input.app_bundle_identifier),
+                )
+                .into(),
+            );
+        };
+        // AppFabric checks the ingestion a destination nests under as INPUT
+        // validation on its write path: an ingestion that does not exist is
+        // HTTP 400 `ValidationException`, not the HTTP 404 the reporting path
+        // answers for the same identifier.
+        let Some(ingestion_arn) = store
+            .app_bundles
+            .get(&bundle_key)
+            .and_then(|bundle| bundle.resolve_ingestion(&input.ingestion_identifier))
+            .map(|ingestion| ingestion.arn.clone())
+        else {
+            return Err(CreateIngestionDestinationErrorModeled::ValidationException(
+                crate::state::ingestion_does_not_exist(),
+            )
+            .into());
+        };
+
+        // The PARENT and both configurations are this request's parameters, so
+        // they belong in the fingerprint: the same token under a different
+        // ingestion, or with a different configuration, is a different request
+        // rather than a retry of this one.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                ("ingestionArn", ingestion_arn.as_str()),
+                (
+                    "processingConfiguration",
+                    &crate::state::render_processing_configuration(&input.processing_configuration),
+                ),
+                (
+                    "destinationConfiguration",
+                    &crate::state::render_destination_configuration(
+                        &input.destination_configuration,
+                    ),
+                ),
+            ],
+            input.tags.as_deref(),
+        );
+
+        // @idempotencyToken: the same token replays the destination the first call
+        // created; the same token with different parameters is the conflict AWS
+        // documents as IdempotentParameterMismatch.
+        if let Some(token) = input.client_token.as_deref() {
+            let key = crate::state::client_token_key(Self::NAME, token);
+            if let Some(spent) = store.client_tokens.get(&key).cloned() {
+                if spent.fingerprint != fingerprint {
+                    return Err(CreateIngestionDestinationErrorModeled::ConflictException(
+                        crate::state::idempotent_parameter_mismatch(token, "IngestionDestination"),
+                    )
+                    .into());
+                }
+                let replayed = store
+                    .app_bundles
+                    .get(&bundle_key)
+                    .and_then(|bundle| bundle.resolve_ingestion(&input.ingestion_identifier))
+                    .and_then(|ingestion| ingestion.resolve_destination(&spent.arn))
+                    .map(crate::state::IngestionDestinationRecord::to_ingestion_destination);
+                if let Some(ingestion_destination) = replayed {
+                    return Ok(CreateIngestionDestinationOutput {
+                        ingestion_destination,
+                    });
+                }
+                // The replayed destination was deleted since; the token is spent on
+                // nothing, so this call creates a new one under a new token.
+                store.client_tokens.remove(&key);
+            }
+        }
+
+        let sequence = store.next_sequence();
+        let created_at = ::std::time::SystemTime::now();
+        let id = crate::state::new_uuid();
+        let Some(ingestion) = store
+            .app_bundles
+            .get_mut(&bundle_key)
+            .and_then(|bundle| bundle.resolve_ingestion_mut(&input.ingestion_identifier))
+        else {
+            return Err(CreateIngestionDestinationErrorModeled::ValidationException(
+                crate::state::ingestion_does_not_exist(),
+            )
+            .into());
+        };
+        // A RESOURCE GUARD on the store, answered with the quota error this
+        // operation models. Checked AFTER the idempotent replay above, so a retry
+        // of a destination that already exists is never refused by it.
+        if ingestion.destinations.len() >= crate::state::MAX_DESTINATIONS_PER_INGESTION {
+            return Err(
+                CreateIngestionDestinationErrorModeled::ServiceQuotaExceededException(
+                    crate::state::quota_exceeded(
+                        &ingestion_arn,
+                        "IngestionDestination",
+                        "IngestionDestinationsPerIngestion",
+                        crate::state::MAX_DESTINATIONS_PER_INGESTION,
+                    ),
+                )
+                .into(),
+            );
+        }
+        // A destination's ARN nests under the ingestion that owns it, which nests
+        // under its app bundle — AppFabric's own resource chain.
+        let arn = crate::state::appfabric_arn(
+            &region,
+            &format!(
+                "appbundle/{bundle_key}/ingestion/{}/ingestiondestination/{id}",
+                ingestion.id
+            ),
+        );
+        let record = crate::state::IngestionDestinationRecord {
+            id: id.clone(),
+            arn: arn.clone(),
+            ingestion_arn: ingestion_arn.clone(),
+            processing_configuration: input.processing_configuration,
+            destination_configuration: input.destination_configuration,
+            // IngestionDestinationStatus = Active | Failed. A destination this
+            // emulator accepted is usable straight away, so it is stored in the
+            // terminal `Active` state and carries no status reason.
+            status: "Active".to_string(),
+            status_reason: None,
+            created_at,
+            updated_at: created_at,
+            tags: input.tags.unwrap_or_default(),
+            sequence,
+        };
+        ingestion.destinations.insert(id.clone(), record);
+        // Read the response back out of the store, so what the caller sees is
+        // exactly what a later Get or List will see.
+        let stored = ingestion
+            .destinations
+            .get(&id)
+            .map(crate::state::IngestionDestinationRecord::to_ingestion_destination);
+
+        if let Some(token) = input.client_token.as_deref() {
+            store.remember_client_token(
+                crate::state::client_token_key(Self::NAME, token),
+                arn,
+                fingerprint,
+            );
+        }
+
+        let Some(ingestion_destination) = stored else {
+            return Err(
+                CreateIngestionDestinationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the created ingestion destination could not be read back"
+                            .to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        crate::state::audit_resource_change(
+            ctx.parts(),
+            Self::NAME,
+            "IngestionDestination",
+            &id,
+            "created",
+        );
+        Ok(CreateIngestionDestinationOutput {
+            ingestion_destination,
+        })
     }
 }

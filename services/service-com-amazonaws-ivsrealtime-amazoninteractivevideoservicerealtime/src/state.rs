@@ -14,7 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    AutoParticipantRecordingConfiguration, InternalServerException, ParticipantToken,
+    AutoParticipantRecordingConfiguration, InternalServerException,
+    ParticipantRecordingHlsConfiguration, ParticipantThumbnailConfiguration, ParticipantToken,
     ResourceNotFoundException, ServiceQuotaExceededException, Stage, StageEndpoints, StageSummary,
     ValidationException,
 };
@@ -42,6 +43,213 @@ pub fn default_token_capabilities() -> Vec<String> {
         .map(|capability| (*capability).to_string())
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// The modelled defaults of a stage's individual-participant-recording
+// configuration
+//
+// `AutoParticipantRecordingConfiguration` is reported for every stage, so each member
+// the caller left out is reported with the default the model documents for it. Every
+// constant below cites the member doc it comes from; none is this emulator's choice.
+// ---------------------------------------------------------------------------
+
+/// `storageConfigurationArn` of a stage with no storage configuration attached.
+///
+/// Documented on `AutoParticipantRecordingConfiguration$storageConfigurationArn`:
+/// "Default: `\"\"` (empty string, no storage configuration is specified)."
+pub const NO_STORAGE_CONFIGURATION_ARN: &str = "";
+
+/// Media types recorded when the configuration names none.
+///
+/// Documented on `AutoParticipantRecordingConfiguration$mediaTypes`: "Types of media to
+/// be recorded. Default: `AUDIO_VIDEO`."
+pub const DEFAULT_RECORDING_MEDIA_TYPE: &str = "AUDIO_VIDEO";
+
+/// Window in which a publisher's reconnect is merged into one recording, when the
+/// configuration does not size it.
+///
+/// Documented on `AutoParticipantRecordingConfiguration$recordingReconnectWindowSeconds`:
+/// "The default value is 0, which disables merging."
+pub const DEFAULT_RECORDING_RECONNECT_WINDOW_SECONDS: i32 = 0;
+
+/// Whether replica participants are recorded, when the configuration does not say.
+///
+/// Documented on `AutoParticipantRecordingConfiguration$recordParticipantReplicas`:
+/// "Optional field to disable replica participant recording. … Default: `true`."
+pub const DEFAULT_RECORD_PARTICIPANT_REPLICAS: bool = true;
+
+/// Thumbnail-generation interval, when the thumbnail configuration does not set one.
+///
+/// Documented on `ParticipantThumbnailConfiguration$targetIntervalSeconds`: "The targeted
+/// thumbnail-generation interval in seconds. … Default: 60."
+pub const DEFAULT_THUMBNAIL_INTERVAL_SECONDS: i32 = 60;
+
+/// Thumbnail storage format, when the thumbnail configuration names none.
+///
+/// Documented on `ParticipantThumbnailConfiguration$storage`: "Indicates the format in
+/// which thumbnails are recorded. … Default: `SEQUENTIAL`."
+pub const DEFAULT_THUMBNAIL_STORAGE: &str = "SEQUENTIAL";
+
+/// Thumbnail recording mode, when the thumbnail configuration names none.
+///
+/// Documented on `ParticipantThumbnailConfiguration$recordingMode`: "Thumbnail recording
+/// mode. Default: `DISABLED`."
+pub const DEFAULT_THUMBNAIL_RECORDING_MODE: &str = "DISABLED";
+
+/// Target duration of a recorded HLS segment, when the HLS configuration does not set one.
+///
+/// Documented on `ParticipantRecordingHlsConfiguration$targetSegmentDurationSeconds`:
+/// "Defines the target duration for recorded segments generated when recording a stage
+/// participant. … Default: 6."
+pub const DEFAULT_HLS_TARGET_SEGMENT_DURATION_SECONDS: i32 = 6;
+
+/// [`DEFAULT_RECORDING_MEDIA_TYPE`] as the modelled `ParticipantRecordingMediaTypeList`.
+pub fn default_recording_media_types() -> Vec<String> {
+    vec![DEFAULT_RECORDING_MEDIA_TYPE.to_string()]
+}
+
+/// [`DEFAULT_THUMBNAIL_STORAGE`] as the modelled `ThumbnailStorageTypeList`.
+pub fn default_thumbnail_storage() -> Vec<String> {
+    vec![DEFAULT_THUMBNAIL_STORAGE.to_string()]
+}
+
+/// The thumbnail configuration a stage reports, with each member the caller left out
+/// filled in from the model's documented default for it.
+pub fn effective_thumbnail_configuration(
+    requested: Option<ParticipantThumbnailConfiguration>,
+) -> ParticipantThumbnailConfiguration {
+    let requested = requested.unwrap_or_default();
+    ParticipantThumbnailConfiguration {
+        target_interval_seconds: Some(
+            requested
+                .target_interval_seconds
+                .unwrap_or(DEFAULT_THUMBNAIL_INTERVAL_SECONDS),
+        ),
+        storage: Some(requested.storage.unwrap_or_else(default_thumbnail_storage)),
+        recording_mode: Some(
+            requested
+                .recording_mode
+                .unwrap_or_else(|| DEFAULT_THUMBNAIL_RECORDING_MODE.to_string()),
+        ),
+    }
+}
+
+/// The HLS configuration a stage reports, with the one member the caller left out filled
+/// in from the model's documented default for it.
+pub fn effective_hls_configuration(
+    requested: Option<ParticipantRecordingHlsConfiguration>,
+) -> ParticipantRecordingHlsConfiguration {
+    ParticipantRecordingHlsConfiguration {
+        target_segment_duration_seconds: Some(
+            requested
+                .and_then(|configuration| configuration.target_segment_duration_seconds)
+                .unwrap_or(DEFAULT_HLS_TARGET_SEGMENT_DURATION_SECONDS),
+        ),
+    }
+}
+
+/// The recording configuration attached to a stage whose request supplied none, or
+/// supplied one with no storage configuration: every member at the default the model
+/// documents for it.
+pub fn default_recording_configuration() -> AutoParticipantRecordingConfiguration {
+    AutoParticipantRecordingConfiguration {
+        storage_configuration_arn: NO_STORAGE_CONFIGURATION_ARN.to_string(),
+        media_types: Some(default_recording_media_types()),
+        thumbnail_configuration: Some(effective_thumbnail_configuration(None)),
+        recording_reconnect_window_seconds: DEFAULT_RECORDING_RECONNECT_WINDOW_SECONDS,
+        hls_configuration: Some(effective_hls_configuration(None)),
+        record_participant_replicas: DEFAULT_RECORD_PARTICIPANT_REPLICAS,
+    }
+}
+
+/// The recording configuration a stage holds, given what its create or update request
+/// supplied: the ONE place the configuration's documented defaults are applied, so
+/// `CreateStage` and `UpdateStage` attach the same configuration for the same request.
+///
+/// A request that supplied no configuration, and one that supplied a configuration with
+/// an empty `storageConfigurationArn`, both get [`default_recording_configuration`]: the
+/// model documents that reset on the member itself — "To disable individual participant
+/// recording, set this to `\"\"`; other fields in this object will get reset to their
+/// defaults when sending `\"\"`."
+///
+/// Otherwise each member the caller left out is filled in from its documented default.
+/// Two members cannot be "left out" at this seam: `recordingReconnectWindowSeconds` and
+/// `recordParticipantReplicas` carry Smithy `@default` traits, so the framework has
+/// already materialised the MODEL's default for them by the time a handler sees the
+/// request and an absent member is indistinguishable from one the caller sent — their
+/// values are reported as they arrived, which is also what honours an explicit `false`
+/// on `recordParticipantReplicas` ("Optional field to disable replica participant
+/// recording").
+pub fn effective_recording_configuration(
+    requested: Option<AutoParticipantRecordingConfiguration>,
+) -> AutoParticipantRecordingConfiguration {
+    let requested = requested.unwrap_or_default();
+    if requested.storage_configuration_arn.is_empty() {
+        return default_recording_configuration();
+    }
+    AutoParticipantRecordingConfiguration {
+        storage_configuration_arn: requested.storage_configuration_arn,
+        media_types: Some(
+            requested
+                .media_types
+                .unwrap_or_else(default_recording_media_types),
+        ),
+        thumbnail_configuration: Some(effective_thumbnail_configuration(
+            requested.thumbnail_configuration,
+        )),
+        recording_reconnect_window_seconds: requested.recording_reconnect_window_seconds,
+        hls_configuration: Some(effective_hls_configuration(requested.hls_configuration)),
+        record_participant_replicas: requested.record_participant_replicas,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A stage's data-plane endpoints
+//
+// The model's `StageEndpoints` doc tells a caller to cache these values "at stage
+// creation", so every stage carries all four from the moment it exists. The HOSTS are
+// this emulator's, built from the stage's own id the way the sibling `ivs` emulator
+// builds a channel's ingest endpoint and playback URL: derived from persisted state,
+// identical on every read of one stage and distinct between stages. The scheme, port and
+// path of each are the forms AWS was recorded reporting, which is what a client parsing
+// an endpoint depends on.
+// ---------------------------------------------------------------------------
+
+/// The `events` endpoint of every stage: one global host, carrying no per-stage part,
+/// as AWS was recorded reporting it.
+pub const STAGE_EVENTS_ENDPOINT: &str = "wss://global.events.live-video.net";
+
+/// Host suffix of a stage's WHIP endpoint.
+const WHIP_HOST_SUFFIX: &str = "global-bm.whip.live-video.net";
+
+/// Host suffix of a stage's RTMP and RTMPS endpoints — the same contribution host the
+/// sibling `ivs` emulator names in a channel's ingest endpoint.
+const CONTRIBUTE_HOST_SUFFIX: &str = "global-contribute.live-video.net";
+
+/// The four endpoints of the stage `stage_arn` names.
+///
+/// Keyed off the ARN's own resource id, so the endpoints of a stage are a function of
+/// the stage and nothing else.
+pub fn stage_endpoints(stage_arn: &str) -> StageEndpoints {
+    let stage_id = stage_arn.rsplit('/').next().unwrap_or(stage_arn);
+    StageEndpoints {
+        events: Some(STAGE_EVENTS_ENDPOINT.to_string()),
+        whip: Some(format!("https://{stage_id}.{WHIP_HOST_SUFFIX}")),
+        rtmp: Some(format!("rtmp://{stage_id}.{CONTRIBUTE_HOST_SUFFIX}/app/")),
+        rtmps: Some(format!(
+            "rtmps://{stage_id}.{CONTRIBUTE_HOST_SUFFIX}:443/app/"
+        )),
+    }
+}
+
+/// What `activeSessionId` reports for a stage no session is active in.
+///
+/// Recorded behaviour: AWS reports the member as the empty string rather than leaving it
+/// out, so a caller that reads the field off a stage always finds it and compares it
+/// against a session id. (The model's `StageSessionId` `@length 16..16` describes an
+/// actual session id; the empty value is the "no session" reading, and output is not
+/// constraint-checked.)
+pub const NO_ACTIVE_SESSION_ID: &str = "";
 
 /// Page size `ListStages` uses when the request omits `maxResults`.
 ///
@@ -101,14 +309,17 @@ pub struct StageRecord {
     pub arn: String,
     pub name: Option<String>,
     /// `None` until a session is active in the stage; no operation in this slice
-    /// starts one.
+    /// starts one. Reported as [`NO_ACTIVE_SESSION_ID`] while it is `None`.
     pub active_session_id: Option<String>,
     pub tags: HashMap<String, String>,
-    pub auto_participant_recording_configuration: Option<AutoParticipantRecordingConfiguration>,
-    /// Summary of the stage's data-plane endpoints. Left `None`: this emulator serves
-    /// no events/WHIP/RTMP endpoint for a stage, and reporting a host nothing listens
-    /// on would be a fabricated value.
-    pub endpoints: Option<StageEndpoints>,
+    /// The stage's individual-participant-recording configuration. Not optional: every
+    /// stage has one, with the modelled defaults where the creating request supplied
+    /// none ([`effective_recording_configuration`]).
+    pub auto_participant_recording_configuration: AutoParticipantRecordingConfiguration,
+    /// The stage's data-plane endpoints, assigned at creation ([`stage_endpoints`]).
+    /// Not optional: the model's `StageEndpoints` doc tells a caller to cache them "at
+    /// stage creation", so a stage without them is not a stage a client can use.
+    pub endpoints: StageEndpoints,
     /// When the stage was created. No member of the modelled `Stage` /
     /// `StageSummary` reports it and pagination orders by [`Self::sequence`], so
     /// nothing reads it yet; it is recorded because the stage-session and
@@ -126,14 +337,15 @@ impl StageRecord {
         Stage {
             arn: self.arn.clone(),
             name: self.name.clone(),
-            active_session_id: self.active_session_id.clone(),
+            // Always reported, the empty value included: see [`NO_ACTIVE_SESSION_ID`].
+            active_session_id: Some(self.active_session_id.clone().unwrap_or_default()),
             // Always reported, empty map included: `tags` is how a caller reads the
             // tags back, and an absent member is not the same answer as "none".
             tags: Some(self.tags.clone()),
-            auto_participant_recording_configuration: self
-                .auto_participant_recording_configuration
-                .clone(),
-            endpoints: self.endpoints.clone(),
+            auto_participant_recording_configuration: Some(
+                self.auto_participant_recording_configuration.clone(),
+            ),
+            endpoints: Some(self.endpoints.clone()),
         }
     }
 
@@ -142,7 +354,9 @@ impl StageRecord {
         StageSummary {
             arn: self.arn.clone(),
             name: self.name.clone(),
-            active_session_id: self.active_session_id.clone(),
+            // The same member of the same stage as [`Self::to_stage`] reports, so a
+            // summary and a read answer alike.
+            active_session_id: Some(self.active_session_id.clone().unwrap_or_default()),
             tags: Some(self.tags.clone()),
         }
     }
@@ -170,7 +384,11 @@ impl ParticipantTokenRecord {
             user_id: self.user_id.clone(),
             attributes: (!self.attributes.is_empty()).then(|| self.attributes.clone()),
             duration: Some(self.duration_minutes),
-            capabilities: Some(self.capabilities.clone()),
+            // Reported only when the token grants something, the same way `attributes`
+            // is: `capabilities` is `@length 0..2`, so a caller may legally ask for an
+            // empty set, and a token that grants no capability carries no capabilities
+            // member rather than an empty list.
+            capabilities: (!self.capabilities.is_empty()).then(|| self.capabilities.clone()),
             expiration_time: Some(::aws_smithy_types::DateTime::from(self.expiration_time)),
         }
     }

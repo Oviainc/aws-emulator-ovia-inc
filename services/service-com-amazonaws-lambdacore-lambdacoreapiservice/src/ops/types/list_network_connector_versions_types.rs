@@ -27,7 +27,15 @@ pub struct ListNetworkConnectorVersionsOutput {
     pub next_marker: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.lambdacore#NetworkConnectorVersionSummary")]
+/// `NetworkConnectorVersionSummary`, the projection `ListNetworkConnectorVersions`
+/// returns. Its schema and codec come from [`lambdacore_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `LastModified` targets `CoreTimestamp`,
+/// which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape",shape="NetworkConnectorVersionSummary")`) — see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkConnectorVersionSummary {
     pub arn: String,
@@ -40,4 +48,28 @@ pub struct NetworkConnectorVersionSummary {
     pub state_reason_code: Option<String>,
     pub last_modified: Option<::aws_smithy_types::DateTime>,
 }
+
+lambdacore_schema_and_codec!(
+    NetworkConnectorVersionSummary,
+    NETWORK_CONNECTOR_VERSION_SUMMARY_SCHEMA,
+    "com.amazonaws.lambdacore#NetworkConnectorVersionSummary",
+    "com.amazonaws.lambdacore",
+    "NetworkConnectorVersionSummary",
+    (M_ARN, arn, "Arn", 0, req, string),
+    (M_VERSION_ARN, version_arn, "VersionArn", 1, req, string),
+    (M_NAME, name, "Name", 2, req, string),
+    (M_ID, id, "Id", 3, req, string),
+    (M_VERSION, version, "Version", 4, req, long),
+    (M_STATE, state, "State", 5, req, string),
+    (M_STATE_REASON, state_reason, "StateReason", 6, opt, string),
+    (
+        M_STATE_REASON_CODE,
+        state_reason_code,
+        "StateReasonCode",
+        7,
+        opt,
+        string
+    ),
+    (M_LAST_MODIFIED, last_modified, "LastModified", 8, opt, date_time),
+);
 

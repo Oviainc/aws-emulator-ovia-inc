@@ -196,9 +196,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let parameter_group_name = crate::state::fold_name(&input.parameter_group_name);
         let mut state = state.lock();
-        // Besides this create's own insert, the only write: the status transitions the
-        // clock already owed the stored clusters and ACLs at this instant.
+        // Besides this create's own insert, the only writes: the status transitions the
+        // clock already owed the stored clusters and ACLs at this instant, and the
+        // resources the account ALREADY HAD before any call — among them the
+        // `default.<family>` parameter groups MemoryDB owns — materialised on first
+        // touch, so a create can collide with one instead of replacing it.
         state.settle(std::time::Instant::now());
+        state.ensure_builtins(&region);
 
         if state.parameter_groups.contains_key(&parameter_group_name) {
             return Err(

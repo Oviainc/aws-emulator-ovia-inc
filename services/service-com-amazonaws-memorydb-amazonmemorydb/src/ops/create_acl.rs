@@ -250,6 +250,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::acl_status::CREATING.to_string(),
             settles_at: Some(now + crate::state::SETTLE_AFTER),
             user_names,
+            // The members a create names are the ACL's INITIAL membership, not a change
+            // being applied to an existing one, so a fresh ACL has nothing pending:
+            // `ACL$PendingChanges` reports the updates in flight on an ACL.
+            pending_user_names_to_add: Vec::new(),
+            pending_user_names_to_remove: Vec::new(),
             arn: arn.clone(),
         };
 

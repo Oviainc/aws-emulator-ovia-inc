@@ -267,6 +267,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ResourceNotFoundException" — so the record is forgotten by the
             // clock, which is what removes it and all of its versions.
             connector.state = crate::state::STATE_DELETING.to_string();
+            // The state this call just set is explained by the event that set
+            // it, which `StateReason` reports alongside `State`.
+            connector.state_reason =
+                Some(crate::state::STATE_REASON_DELETION_REQUESTED.to_string());
             connector.last_modified = now;
             connector.pending = Some(crate::state::PendingTransition {
                 due: now + crate::state::LIFECYCLE_TRANSITION,

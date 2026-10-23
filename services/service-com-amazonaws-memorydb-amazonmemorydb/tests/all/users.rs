@@ -16,8 +16,8 @@
 //! * `UserName` narrows the listing to that one user, and a name state does not hold
 //!   is the modelled `UserNotFoundFault`;
 //! * a `Filters` entry selects the users whose named property carries one of its
-//!   values, filters combine conjunctively, and a filter naming a property a user does
-//!   not have is the modelled `InvalidParameterCombinationException`;
+//!   values, filters combine conjunctively, and a filter whose `Name` is not one of the
+//!   service's filterable properties is the modelled `InvalidParameterValueException`;
 //! * the listing pages over its whole set in name order for any `MaxResults`;
 //! * a describe is a REPORT: two identical calls answer identically.
 //!
@@ -401,36 +401,37 @@ async fn filters_select_the_users_whose_named_property_matches() {
         )
         .await;
 
-    // One row per filter shape: the request, and the names it must select. The values
-    // are deliberately written in mixed case, which a filter folds like any other
-    // reference to a resource name.
+    // One row per filter shape: the request, and the names it must select. The filter
+    // names are MemoryDB's own hyphenated, lower-case spellings of the properties, and
+    // the values are deliberately written in mixed case, which a filter folds like any
+    // other reference to a resource name.
     let cases: &[(&str, Value, &[&str])] = &[
         (
-            "one UserName value",
-            json!({ "Filters": [{ "Name": "UserName", "Values": ["App"] }] }),
+            "one user-name value",
+            json!({ "Filters": [{ "Name": "user-name", "Values": ["App"] }] }),
             &["app"],
         ),
         (
-            "several UserName values",
-            json!({ "Filters": [{ "Name": "UserName", "Values": ["App", "a", "nobody"] }] }),
+            "several user-name values",
+            json!({ "Filters": [{ "Name": "user-name", "Values": ["App", "a", "nobody"] }] }),
             &["a", "app"],
         ),
         (
-            "an ACLName value",
-            json!({ "Filters": [{ "Name": "ACLName", "Values": ["Reader-ACL"] }] }),
+            "an acl-name value",
+            json!({ "Filters": [{ "Name": "acl-name", "Values": ["Reader-ACL"] }] }),
             &["a", "data-reader-1"],
         ),
         (
-            "an ACLName nothing belongs to",
-            json!({ "Filters": [{ "Name": "ACLName", "Values": ["empty-acl"] }] }),
+            "an acl-name nothing belongs to",
+            json!({ "Filters": [{ "Name": "acl-name", "Values": ["empty-acl"] }] }),
             &[],
         ),
         (
             "two filters are conjunctive",
             json!({
                 "Filters": [
-                    { "Name": "ACLName", "Values": ["reader-acl"] },
-                    { "Name": "UserName", "Values": ["data-reader-1", "App"] },
+                    { "Name": "acl-name", "Values": ["reader-acl"] },
+                    { "Name": "user-name", "Values": ["data-reader-1", "App"] },
                 ],
             }),
             &["data-reader-1"],
@@ -439,7 +440,7 @@ async fn filters_select_the_users_whose_named_property_matches() {
             "UserName beside a filter it satisfies",
             json!({
                 "UserName": "a",
-                "Filters": [{ "Name": "ACLName", "Values": ["reader-acl"] }],
+                "Filters": [{ "Name": "acl-name", "Values": ["reader-acl"] }],
             }),
             &["a"],
         ),
@@ -447,7 +448,7 @@ async fn filters_select_the_users_whose_named_property_matches() {
             "UserName beside a filter it fails",
             json!({
                 "UserName": "App",
-                "Filters": [{ "Name": "ACLName", "Values": ["reader-acl"] }],
+                "Filters": [{ "Name": "acl-name", "Values": ["reader-acl"] }],
             }),
             &[],
         ),
@@ -527,9 +528,80 @@ async fn users_page_over_the_whole_set_for_any_page_size() {
     }
 }
 
+/// The filter NAME vocabulary: `Filters` is keyed by MemoryDB's own hyphenated,
+/// lower-case spelling of the property being filtered, and any other spelling of it —
+/// including the model doc's `UserName` example, the ACL property's `ACLName` form, an
+/// underscored or upper-cased variant, and one carrying stray whitespace — names no
+/// filterable property and is refused with the modelled `InvalidParameterValueException`.
+#[tokio::test]
+async fn only_the_services_own_filter_names_are_accepted() {
+    let harness = harness();
+    for row in &seeded_users() {
+        harness.seed_user(row);
+    }
+    harness
+        .ok(
+            "CreateACL",
+            &json!({ "ACLName": "vocabulary-acl", "UserNames": ["a"] }),
+            "setup",
+        )
+        .await;
+
+    // (filter name, the value it is given, whether the service accepts the NAME). The
+    // accepted rows are the whole vocabulary; the refused ones differ from them along
+    // letter case, the separator, whitespace and the property named.
+    let cases: &[(&str, &str, bool)] = &[
+        ("user-name", "a", true),
+        ("acl-name", "vocabulary-acl", true),
+        // The model's doc example spelling is prose, not the wire vocabulary.
+        ("UserName", "a", false),
+        ("ACLName", "vocabulary-acl", false),
+        ("username", "a", false),
+        ("User-Name", "a", false),
+        ("USER-NAME", "a", false),
+        ("user_name", "a", false),
+        ("acl_name", "vocabulary-acl", false),
+        ("user-name ", "a", false),
+        // A property `User` does not expose at all.
+        ("access-string", "on ~* +@all", false),
+        ("engine", "valkey", false),
+        ("name", "a", false),
+    ];
+    for (name, value, accepted) in cases {
+        let case = format!("Filters=[{{Name:{name:?}}}]");
+        let request = json!({ "Filters": [{ "Name": name, "Values": [value] }] });
+        let (status, body) = harness.call("DescribeUsers", &request).await;
+        if *accepted {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the filter name to be accepted, got {status} \
+                 with {body}"
+            );
+            assert_eq!(
+                body["Users"].as_array().map(Vec::len),
+                Some(1),
+                "case {case:?}: expected the filter to select the one matching user, got \
+                 {body}"
+            );
+            assert_eq!(
+                body["Users"][0]["Name"],
+                json!("a"),
+                "case {case:?}: expected the filter to select user \"a\", got {body}"
+            );
+        } else {
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "InvalidParameterValueException"),
+                "case {case:?}: expected 400 InvalidParameterValueException, got {status} \
+                 with {body}"
+            );
+        }
+    }
+}
+
 /// The refusals, one rule per row: a `UserName` state does not hold is the modelled
-/// not-found fault, a filter on a property a user does not have is the modelled
-/// invalid-combination fault, and a page size or token that names nothing is a 400.
+/// not-found fault, a filter whose `Name` is not a filterable property is the modelled
+/// invalid-value error, and a page size or token that names nothing is a 400.
 #[tokio::test]
 async fn refusals_come_from_state_and_from_the_filterable_properties() {
     let harness = harness();
@@ -546,32 +618,43 @@ async fn refusals_come_from_state_and_from_the_filterable_properties() {
             404,
             "UserNotFoundFault",
         ),
-        // A property `User` does not expose cannot be filtered on.
+        // A name that is not one of the service's filterable properties — including the
+        // model doc's own `UserName` spelling, which is not the wire vocabulary.
         (
             json!({ "Filters": [{ "Name": "Engine", "Values": ["valkey"] }] }),
             400,
-            "InvalidParameterCombinationException",
+            "InvalidParameterValueException",
         ),
         (
             json!({ "Filters": [{ "Name": "AccessString", "Values": ["on ~* +@all"] }] }),
             400,
-            "InvalidParameterCombinationException",
+            "InvalidParameterValueException",
+        ),
+        (
+            json!({ "Filters": [{ "Name": "UserName", "Values": ["a"] }] }),
+            400,
+            "InvalidParameterValueException",
+        ),
+        (
+            json!({ "Filters": [{ "Name": "ACLName", "Values": ["reader-acl"] }] }),
+            400,
+            "InvalidParameterValueException",
         ),
         (
             json!({ "Filters": [{ "Name": "username", "Values": ["a"] }] }),
             400,
-            "InvalidParameterCombinationException",
+            "InvalidParameterValueException",
         ),
         // One good filter does not excuse a bad one.
         (
             json!({
                 "Filters": [
-                    { "Name": "UserName", "Values": ["a"] },
+                    { "Name": "user-name", "Values": ["a"] },
                     { "Name": "Nope", "Values": ["a"] },
                 ],
             }),
             400,
-            "InvalidParameterCombinationException",
+            "InvalidParameterValueException",
         ),
         // The page size and token rules the other listings in this slice follow.
         (

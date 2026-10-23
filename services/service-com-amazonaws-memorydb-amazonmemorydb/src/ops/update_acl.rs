@@ -4,9 +4,11 @@
 //! IMPLEMENTED: moves the stored ACL's `UserNames` by `UserNamesToAdd` /
 //! `UserNamesToRemove` and answers with the stored record, so `DescribeACLs` reports
 //! exactly what was persisted — including the `MinimumEngineVersion` the new membership
-//! requires, which is DERIVED and so follows every change made here. The ACLs an
-//! account already had are refused: a built-in ACL is not the caller's to change. The
-//! change is also recorded as an `acl` event, which `DescribeEvents` reports.
+//! requires, which is DERIVED and so follows every change made here, and the
+//! `PendingChanges` the accepted change is still applying, which the clock clears when
+//! the ACL settles back to `active`. The ACLs an account already had are refused: a
+//! built-in ACL is not the caller's to change. The change is also recorded as an `acl`
+//! event, which `DescribeEvents` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -325,6 +327,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so a caller polling straight away still sees the transient status.
         acl.status = crate::state::acl_status::MODIFYING.to_string();
         acl.settles_at = Some(now + crate::state::SETTLE_AFTER);
+        // The change itself, recorded as PENDING while it settles: `ACL$PendingChanges`
+        // is "A list of updates being applied to the ACL", so the members this call
+        // asked to add and remove are what a client polling the ACL reads until the
+        // clock settles it back to `active` (where `settle` clears them). Only the
+        // members actually named are recorded, so a one-sided change leaves the other
+        // side absent.
+        acl.pending_user_names_to_add = to_add.iter().cloned().collect();
+        acl.pending_user_names_to_remove = to_remove.iter().cloned().collect();
 
         // Both derived lists are computed the way `DescribeACLs` computes them, so the
         // answer to this call and the next read cannot disagree.

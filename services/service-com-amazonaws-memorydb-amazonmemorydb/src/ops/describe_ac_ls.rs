@@ -2,7 +2,8 @@
 
 //! @op DescribeACLs
 //! IMPLEMENTED: reads the ACLs [`crate::state`] holds, deriving each one's `Clusters`
-//! from the clusters currently referencing it, and pages them with
+//! from the clusters currently referencing it and reporting the `PendingChanges` of a
+//! membership change that is still settling, and pages them with
 //! `MaxResults`/`NextToken`.
 //!
 //! ## Shape of an operation

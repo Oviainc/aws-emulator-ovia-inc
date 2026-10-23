@@ -15,9 +15,10 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    AppBundle, AppBundleSummary, ConflictException, DestinationConfiguration, Ingestion,
-    IngestionSummary, ProcessingConfiguration, ResourceNotFoundException,
-    ServiceQuotaExceededException, Tag, ValidationException, ValidationExceptionField,
+    AppBundle, AppBundleSummary, ConflictException, Destination, DestinationConfiguration,
+    Ingestion, IngestionDestination, IngestionSummary, ProcessingConfiguration,
+    ResourceNotFoundException, ServiceQuotaExceededException, Tag, ValidationException,
+    ValidationExceptionField,
 };
 
 /// The ARN namespace (and sigv4 signing name) this service's ARNs carry, from
@@ -43,6 +44,9 @@ pub const MAX_APP_BUNDLES: usize = 1_000;
 
 /// The same guard for the ingestions one app bundle may hold.
 pub const MAX_INGESTIONS_PER_APP_BUNDLE: usize = 1_000;
+
+/// The same guard for the ingestion destinations one ingestion may hold.
+pub const MAX_DESTINATIONS_PER_INGESTION: usize = 1_000;
 
 /// The number of tags ONE resource may hold.
 ///
@@ -98,6 +102,14 @@ impl AppBundleRecord {
         }
     }
 
+    /// The ingestion `identifier` names within this bundle, for mutation.
+    pub fn resolve_ingestion_mut(&mut self, identifier: &str) -> Option<&mut IngestionRecord> {
+        match ingestion_key(self, identifier) {
+            Some(key) => self.ingestions.get_mut(&key),
+            None => None,
+        }
+    }
+
     /// This bundle's ingestions in creation order.
     pub fn ingestions_in_order(&self) -> Vec<&IngestionRecord> {
         let mut ingestions: Vec<&IngestionRecord> = self.ingestions.values().collect();
@@ -120,8 +132,9 @@ pub struct IngestionRecord {
     pub updated_at: SystemTime,
     pub tags: Vec<Tag>,
     pub sequence: u64,
-    /// Reserved for a later slice: the ingestion-destination operations are
-    /// still scaffolded, and they persist their records here.
+    /// This ingestion's destinations, keyed by bare UUID:
+    /// `CreateIngestionDestination` writes them and
+    /// `UpdateIngestionDestination` rewrites their configuration in place.
     pub destinations: HashMap<String, IngestionDestinationRecord>,
 }
 
@@ -149,10 +162,39 @@ impl IngestionRecord {
             state: self.state.clone(),
         }
     }
+
+    /// The ingestion destination `identifier` names within this ingestion, by ARN
+    /// or bare UUID.
+    pub fn resolve_destination(&self, identifier: &str) -> Option<&IngestionDestinationRecord> {
+        match destination_key(self, identifier) {
+            Some(key) => self.destinations.get(&key),
+            None => None,
+        }
+    }
+
+    /// The ingestion destination `identifier` names within this ingestion, for
+    /// mutation.
+    pub fn resolve_destination_mut(
+        &mut self,
+        identifier: &str,
+    ) -> Option<&mut IngestionDestinationRecord> {
+        match destination_key(self, identifier) {
+            Some(key) => self.destinations.get_mut(&key),
+            None => None,
+        }
+    }
+
+    /// This ingestion's destinations in creation order.
+    pub fn destinations_in_order(&self) -> Vec<&IngestionDestinationRecord> {
+        let mut destinations: Vec<&IngestionDestinationRecord> =
+            self.destinations.values().collect();
+        destinations.sort_by_key(|destination| destination.sequence);
+        destinations
+    }
 }
 
-/// An ingestion destination. Reserved for a later slice, which implements the
-/// `*IngestionDestination` operations against this record.
+/// An ingestion destination, as `CreateIngestionDestination` stored it and
+/// `UpdateIngestionDestination` last wrote it.
 #[derive(Debug, Clone)]
 pub struct IngestionDestinationRecord {
     pub id: String,
@@ -166,6 +208,22 @@ pub struct IngestionDestinationRecord {
     pub updated_at: SystemTime,
     pub tags: Vec<Tag>,
     pub sequence: u64,
+}
+
+impl IngestionDestinationRecord {
+    /// The modelled `IngestionDestination` for this record.
+    pub fn to_ingestion_destination(&self) -> IngestionDestination {
+        IngestionDestination {
+            arn: self.arn.clone(),
+            ingestion_arn: self.ingestion_arn.clone(),
+            processing_configuration: self.processing_configuration.clone(),
+            destination_configuration: self.destination_configuration.clone(),
+            status: Some(self.status.clone()),
+            status_reason: self.status_reason.clone(),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+        }
+    }
 }
 
 /// What one spent idempotency token created, so replaying the token replays the
@@ -439,6 +497,24 @@ pub fn ingestion_key(bundle: &AppBundleRecord, identifier: &str) -> Option<Strin
     }
 }
 
+/// The store key of the ingestion destination `identifier` names inside
+/// `ingestion`, by ARN or bare UUID — the same two forms every other
+/// `Identifier` in this service accepts.
+pub fn destination_key(ingestion: &IngestionRecord, identifier: &str) -> Option<String> {
+    if is_arn(identifier) {
+        ingestion
+            .destinations
+            .values()
+            .find(|destination| destination.arn == identifier)
+            .map(|destination| destination.id.clone())
+    } else {
+        ingestion
+            .destinations
+            .contains_key(identifier)
+            .then(|| identifier.to_string())
+    }
+}
+
 /// Whether an `Identifier` is in its ARN form rather than its bare-UUID form.
 /// The model's pattern allows exactly these two (`^arn:.+$` or a UUID).
 fn is_arn(identifier: &str) -> bool {
@@ -575,6 +651,46 @@ fn push_component(rendered: &mut String, value: &str) {
     rendered.push_str(value);
 }
 
+/// A canonical rendering of a `ProcessingConfiguration`, so it can go into a
+/// [`request_fingerprint`] as one component: the union member that was set, then
+/// that member's own values.
+///
+/// Every component is length-prefixed for the same reason the fingerprint's are:
+/// no two different configurations may render alike.
+pub fn render_processing_configuration(configuration: &ProcessingConfiguration) -> String {
+    let mut rendered = String::new();
+    match configuration {
+        ProcessingConfiguration::auditLog(audit_log) => {
+            push_component(&mut rendered, "auditLog");
+            push_component(&mut rendered, &audit_log.schema);
+            push_component(&mut rendered, &audit_log.format);
+        }
+    }
+    rendered
+}
+
+/// The same canonical rendering for a `DestinationConfiguration`.
+pub fn render_destination_configuration(configuration: &DestinationConfiguration) -> String {
+    let mut rendered = String::new();
+    match configuration {
+        DestinationConfiguration::auditLog(audit_log) => {
+            push_component(&mut rendered, "auditLog");
+            match &audit_log.destination {
+                Destination::s3Bucket(bucket) => {
+                    push_component(&mut rendered, "s3Bucket");
+                    push_component(&mut rendered, &bucket.bucket_name);
+                    push_component(&mut rendered, bucket.prefix.as_deref().unwrap_or_default());
+                }
+                Destination::firehoseStream(stream) => {
+                    push_component(&mut rendered, "firehoseStream");
+                    push_component(&mut rendered, &stream.stream_name);
+                }
+            }
+        }
+    }
+    rendered
+}
+
 /// One page of a listing, and the token that asks for the page after it.
 #[derive(Debug)]
 pub struct Page<T> {
@@ -692,6 +808,40 @@ pub fn ingestion_not_found(identifier: &str) -> ResourceNotFoundException {
         resource_id: identifier.to_string(),
         resource_type: "Ingestion".to_string(),
     }
+}
+
+/// A modelled `ResourceNotFoundException` for an ingestion destination the store
+/// does not hold — the REPORTING path's refusal (`GetIngestionDestination`,
+/// `ListIngestionDestinations`), which AppFabric answers with HTTP 404.
+pub fn ingestion_destination_not_found(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: "The specified ingestion destination does not exist".to_string(),
+        resource_id: identifier.to_string(),
+        resource_type: "IngestionDestination".to_string(),
+    }
+}
+
+/// A modelled `ValidationException` refusing a MUTATION of an ingestion
+/// destination because the ingestion it is nested under does not exist.
+///
+/// AppFabric checks the ingestion-destination chain on its mutation path as
+/// INPUT validation rather than as a lookup: a `*IngestionDestination` write
+/// naming an ingestion that does not exist is answered HTTP 400
+/// `ValidationException`, while the reporting path answers HTTP 404
+/// (see [`ingestion_not_found`]).
+pub fn ingestion_does_not_exist() -> ValidationException {
+    field_validation_failed(
+        "ingestionIdentifier",
+        "The specified ingestion does not exist",
+    )
+}
+
+/// The same refusal for the ingestion destination the mutation names.
+pub fn ingestion_destination_does_not_exist() -> ValidationException {
+    field_validation_failed(
+        "ingestionDestinationIdentifier",
+        "The specified ingestion destination does not exist",
+    )
 }
 
 /// A modelled `ResourceNotFoundException` for a tagging call whose `resourceArn`

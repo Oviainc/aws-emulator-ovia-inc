@@ -13,7 +13,11 @@
 //!   target is addressed only through its gateway;
 //! * the memory (`/memories/`): one [`MemoryRecord`] per `memoryId`, holding the
 //!   configuration the caller supplied and the strategies minted for it, so
-//!   `GetMemory` and any later memory read answer from one store.
+//!   `GetMemory` and any later memory read answer from one store;
+//! * the harness (`/harnesses/`): one [`HarnessRecord`] per `harnessId`, holding
+//!   the whole agent-loop configuration `CreateHarness` persisted, so
+//!   `GetHarness` reports exactly that and `DeleteHarness` reports what it
+//!   removed.
 //!
 //! Helpers the handlers share (the region a request was signed for, the
 //! canonical ARNs, id minting, the clock-owed status transition, the response
@@ -29,11 +33,15 @@ use crate::ops::types::{
     CertificateConfiguration, CreateGatewayOutput, CreateGatewayTargetOutput,
     CredentialProviderConfiguration, FilesystemConfiguration, GatewayInterceptorConfiguration,
     GatewayPolicyEngineConfiguration, GatewayProtocolConfiguration, GetGatewayOutput,
-    GetGatewayTargetOutput, IndexedKey, LifecycleConfiguration, McpTargetConfiguration, Memory,
-    MemoryStrategy, MetadataConfiguration, NamespaceKeyEntry, NetworkConfiguration, PrivateEndpoint,
-    ProtocolConfiguration, RequestHeaderConfiguration, RuntimeMetadataConfiguration,
-    StreamDeliveryResources, TargetConfiguration, ValidationException, ValidationExceptionField,
-    WorkloadIdentityDetails,
+    GetGatewayTargetOutput, Harness, HarnessAgentCoreRuntimeEnvironment,
+    HarnessAgentCoreRuntimeEnvironmentRequest, HarnessEnvironmentArtifact,
+    HarnessEnvironmentProvider, HarnessEnvironmentProviderRequest, HarnessHook,
+    HarnessMemoryConfiguration, HarnessModelConfiguration, HarnessSkill, HarnessSystemContentBlock,
+    HarnessTool, HarnessTruncationConfiguration, IndexedKey, LifecycleConfiguration,
+    McpTargetConfiguration, Memory, MemoryStrategy, MetadataConfiguration, NamespaceKeyEntry,
+    NetworkConfiguration, PrivateEndpoint, ProtocolConfiguration, RequestHeaderConfiguration,
+    RuntimeMetadataConfiguration, StreamDeliveryResources, TargetConfiguration,
+    ValidationException, ValidationExceptionField, WorkloadIdentityDetails,
 };
 
 /// The ARN namespace (and sigv4 signing name) this service stamps on its
@@ -506,6 +514,176 @@ impl GatewayTargetRecord {
     }
 }
 
+/// How many harnesses this emulator will hold.
+///
+/// `CreateHarness` models `ServiceQuotaExceededException` (HTTP 402) for
+/// exceeding the real service's per-account quota. This number is NOT a fidelity
+/// claim about that quota: it is the emulator's own ceiling, set generously so no
+/// realistic workflow meets it, so that a caller looping on create cannot grow
+/// this process's memory without bound.
+pub const MAX_HARNESSES: usize = 1_000;
+
+/// How long a freshly created harness stays `CREATING` before the clock owes it
+/// `READY`.
+///
+/// AWS documents no duration for this transition, so the span is chosen: short
+/// enough to keep a client script quick, long enough that a caller acting
+/// straight after the call still observes the transient status.
+pub const HARNESS_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+/// The version a created harness carries. `HarnessVersion` is
+/// `^([1-9][0-9]{0,4})$`, so versions start at 1; only `UpdateHarness` publishes
+/// another one, and it is not implemented, so a stored harness is at version 1.
+pub const FIRST_HARNESS_VERSION: u32 = 1;
+
+/// `HarnessTruncationStrategy` for "do not truncate". The enum's full value list
+/// is `sliding_window | summarization | none`
+/// (`smithy_query shape=HarnessTruncationStrategy`), and `Harness.truncation` is
+/// `@required` on every response while `CreateHarness`'s is optional, so a
+/// harness created without one reports the strategy that truncates nothing.
+pub const HARNESS_TRUNCATION_NONE: &str = "none";
+
+/// `NetworkMode` for a runtime reachable over the public internet. The enum's
+/// full value list is `PUBLIC | VPC` (`smithy_query shape=NetworkMode`), and
+/// `VPC` cannot be defaulted into: `VpcConfig` makes `securityGroups` and
+/// `subnets` `@required`, so only the caller can ask for it.
+pub const NETWORK_MODE_PUBLIC: &str = "PUBLIC";
+
+/// The member `CreateHarness` refuses a request for when it carries none, and
+/// why.
+///
+/// `Harness.model` is `@required` on every response while
+/// `CreateHarnessRequest.model` is optional, and AWS documents no default model
+/// for a harness. Rather than invent a model id no AWS rule produces, the
+/// operation answers its own modelled `ValidationException` naming the member —
+/// the request cannot be served faithfully. If AWS's default ever becomes known,
+/// this becomes that default instead.
+pub const HARNESS_MODEL_MEMBER: &str = "model";
+pub const HARNESS_MODEL_REQUIRED: &str =
+    "must be specified: a harness reports the model it runs with, and this service has no \
+     default model to run one with";
+
+/// One harness: everything the caller configured, plus what the service minted
+/// for it and the status the clock drives.
+///
+/// `CreateHarness`, `GetHarness` and `DeleteHarness` all report the SAME
+/// `Harness` structure, so it is rendered from this one record
+/// ([`Self::harness`]) rather than in any handler: a member the create reports
+/// and the read does not would be a difference no stored state justifies.
+#[derive(Debug, Clone)]
+pub struct HarnessRecord {
+    pub harness_id: String,
+    pub harness_arn: String,
+    pub harness_name: String,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// The version this harness reports, as a number; rendered by
+    /// [`Self::version_string`].
+    pub version: u32,
+    /// The status until [`settles_at`](Self::settles_at) passes.
+    pub transient_status: String,
+    /// The status from [`settles_at`](Self::settles_at) onwards.
+    pub settled_status: String,
+    /// The instant the transient status is owed its transition. Stored, never
+    /// slept on: a read materialises the transition the clock already made due.
+    pub settles_at: SystemTime,
+    pub execution_role_arn: String,
+    pub model: HarnessModelConfiguration,
+    pub system_prompt: Vec<HarnessSystemContentBlock>,
+    pub tools: Vec<HarnessTool>,
+    pub skills: Vec<HarnessSkill>,
+    pub allowed_tools: Vec<String>,
+    pub truncation: HarnessTruncationConfiguration,
+    /// The AgentCore Runtime environment this harness runs in: the identity the
+    /// service minted for it, with the lifecycle, network and filesystem
+    /// configuration the request asked for (or the documented defaults).
+    pub environment: HarnessAgentCoreRuntimeEnvironment,
+    pub environment_artifact: Option<HarnessEnvironmentArtifact>,
+    pub environment_variables: BTreeMap<String, String>,
+    pub authorizer_configuration: Option<AuthorizerConfiguration>,
+    pub memory: Option<HarnessMemoryConfiguration>,
+    pub hooks: Vec<HarnessHook>,
+    pub max_iterations: Option<i32>,
+    pub max_tokens: Option<i32>,
+    pub timeout_seconds: Option<i32>,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl HarnessRecord {
+    /// The status this harness reports at `now`: the transient one until the
+    /// transition the clock owes comes due, the settled one afterwards.
+    pub fn status_at(&self, now: SystemTime) -> &str {
+        if now < self.settles_at {
+            &self.transient_status
+        } else {
+            &self.settled_status
+        }
+    }
+
+    /// The version number as the wire renders it (`HarnessVersion`, pattern
+    /// `^([1-9][0-9]{0,4})$`).
+    pub fn version_string(&self) -> String {
+        self.version.to_string()
+    }
+
+    /// Whether a `harnessVersion` query value names the version this harness
+    /// holds. `None` asks for the latest, which it always holds; an unparseable
+    /// or unknown version names no stored version, which the caller answers with
+    /// `ResourceNotFoundException`.
+    pub fn holds_version(&self, requested: Option<&str>) -> bool {
+        match requested {
+            None => true,
+            Some(raw) => raw.parse::<u32>().is_ok_and(|version| version == self.version),
+        }
+    }
+
+    /// This harness as every harness operation reports it, at `now`.
+    pub fn harness(&self, now: SystemTime) -> Harness {
+        self.harness_with_status(self.status_at(now).to_string())
+    }
+
+    /// This harness reported with `status` instead of the one the clock resolves
+    /// — the delete path, which reports the harness it just removed as
+    /// `DELETING`.
+    pub fn harness_with_status(&self, status: String) -> Harness {
+        Harness {
+            harness_id: self.harness_id.clone(),
+            harness_name: self.harness_name.clone(),
+            arn: self.harness_arn.clone(),
+            status,
+            harness_version: Some(self.version_string()),
+            execution_role_arn: self.execution_role_arn.clone(),
+            created_at: timestamp(self.created_at),
+            updated_at: timestamp(self.updated_at),
+            model: self.model.clone(),
+            system_prompt: self.system_prompt.clone(),
+            tools: self.tools.clone(),
+            skills: self.skills.clone(),
+            allowed_tools: self.allowed_tools.clone(),
+            truncation: self.truncation.clone(),
+            environment: HarnessEnvironmentProvider::agentCoreRuntimeEnvironment(
+                self.environment.clone(),
+            ),
+            environment_artifact: self.environment_artifact.clone(),
+            environment_variables: (!self.environment_variables.is_empty()).then(|| {
+                self.environment_variables
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+            authorizer_configuration: self.authorizer_configuration.clone(),
+            memory: self.memory.clone(),
+            hooks: (!self.hooks.is_empty()).then(|| self.hooks.clone()),
+            max_iterations: self.max_iterations,
+            max_tokens: self.max_tokens,
+            timeout_seconds: self.timeout_seconds,
+            // Reported only for a harness in a failed status; one this emulator
+            // drives reaches READY, which has no failure.
+            failure_reason: None,
+        }
+    }
+}
+
 /// One AgentCore Memory resource: everything the caller configured, the
 /// strategies minted for it, and the status the clock drives.
 ///
@@ -593,6 +771,62 @@ impl MemoryRecord {
     }
 }
 
+/// The AgentCore Runtime environment a harness runs in, for a harness whose id
+/// is `harness_id` in `region`.
+///
+/// The runtime a harness runs on is managed BY the harness: the caller never
+/// named it, so its identity is minted 1:1 with the harness (same id, same name,
+/// the runtime ARN form `AgentRuntimeArn` publishes) and is reported so a caller
+/// can tell two harnesses' environments apart. The lifecycle configuration falls
+/// back to the defaults the model documents
+/// ([`effective_lifecycle_configuration`]) and the network configuration to
+/// [`NETWORK_MODE_PUBLIC`], the only mode that needs no caller-supplied VPC.
+pub fn harness_runtime_environment(
+    region: &str,
+    harness_id: &str,
+    harness_name: &str,
+    requested: Option<HarnessEnvironmentProviderRequest>,
+) -> HarnessAgentCoreRuntimeEnvironment {
+    let requested = requested.map(|provider| match provider {
+        HarnessEnvironmentProviderRequest::agentCoreRuntimeEnvironment(environment) => environment,
+    });
+    let requested = requested.unwrap_or(HarnessAgentCoreRuntimeEnvironmentRequest {
+        lifecycle_configuration: None,
+        network_configuration: None,
+        filesystem_configurations: None,
+    });
+    HarnessAgentCoreRuntimeEnvironment {
+        agent_runtime_arn: runtime_arn(region, harness_id),
+        agent_runtime_name: harness_name.to_string(),
+        agent_runtime_id: harness_id.to_string(),
+        lifecycle_configuration: effective_lifecycle_configuration(
+            requested.lifecycle_configuration,
+        ),
+        network_configuration: requested.network_configuration.unwrap_or(NetworkConfiguration {
+            network_mode: NETWORK_MODE_PUBLIC.to_string(),
+            network_mode_config: None,
+        }),
+        filesystem_configurations: requested.filesystem_configurations,
+    }
+}
+
+/// `arn:aws:bedrock-agentcore:{region}:{account}:harness/{harnessId}` —
+/// `HarnessArn`'s pattern.
+pub fn harness_arn(region: &str, harness_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("harness/{harness_id}"))
+}
+
+/// The truncation configuration to store for a request: the caller's, or the
+/// strategy that truncates nothing when the caller named none.
+pub fn effective_truncation_configuration(
+    requested: Option<HarnessTruncationConfiguration>,
+) -> HarnessTruncationConfiguration {
+    requested.unwrap_or_else(|| HarnessTruncationConfiguration {
+        strategy: HARNESS_TRUNCATION_NONE.to_string(),
+        config: None,
+    })
+}
+
 /// Per-service state for com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol. A handler reaches it through [`service_state`].
 ///
 /// Every map here is caller-driven growth, so every one is bounded:
@@ -600,8 +834,9 @@ impl MemoryRecord {
 /// [`MAX_VERSIONS_PER_RUNTIME`] caps the versions one runtime accumulates,
 /// [`MAX_GATEWAYS`] caps the gateways (and with them their 1:1 name index),
 /// [`MAX_TARGETS_PER_GATEWAY`] the targets one gateway holds, [`MAX_MEMORIES`]
-/// the memories (and with them their 1:1 name index) and
-/// [`MAX_STRATEGIES_PER_MEMORY`] the strategies one memory holds, and the
+/// the memories (and with them their 1:1 name index),
+/// [`MAX_STRATEGIES_PER_MEMORY`] the strategies one memory holds and
+/// [`MAX_HARNESSES`] the harnesses (and with them their 1:1 name index), and the
 /// idempotency records are capped at [`MAX_REMEMBERED_CLIENT_TOKENS`] with
 /// oldest-first eviction plus removal when the resource they name is deleted.
 #[derive(Debug, Default)]
@@ -628,6 +863,14 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// `ConflictException` ("The name must be unique within your account").
     /// One entry per stored memory.
     pub memory_names: BTreeMap<String, String>,
+    /// Every harness, keyed by `harnessId` — the identifier every harness route
+    /// addresses it by. The key order is the deterministic list order a harness
+    /// listing pages over.
+    pub harnesses: BTreeMap<String, HarnessRecord>,
+    /// `harnessName` -> `harnessId`, so a duplicate name at create time is a
+    /// `ConflictException` rather than a second harness later reads cannot tell
+    /// apart. One entry per stored harness.
+    pub harness_names: BTreeMap<String, String>,
     /// `<operation>/<clientToken>` -> the (runtime, version) that token first
     /// produced, so a replayed Create/Update answers with its first result
     /// instead of minting a second runtime or a second version. The key carries
@@ -658,6 +901,15 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// The keys of [`Self::memory_idempotency`] in the order they were first
     /// recorded, so the oldest record is the one evicted at the ceiling.
     memory_idempotency_order: VecDeque<String>,
+    /// `<operation>/<clientToken>` -> the harness that token first produced, so a
+    /// replayed `CreateHarness` answers with its first result instead of minting
+    /// a second harness. Separate from the maps above because the record is
+    /// validated against a different store; the key carries the operation for
+    /// the same reason as there.
+    harness_idempotency: BTreeMap<String, String>,
+    /// The keys of [`Self::harness_idempotency`] in the order they were first
+    /// recorded, so the oldest record is the one evicted at the ceiling.
+    harness_idempotency_order: VecDeque<String>,
     /// Bumped on every mint, so two runtimes created in the same instant with
     /// the same name still get distinct ids.
     mint_counter: u64,
@@ -815,6 +1067,23 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
             .retain(|token| live.contains_key(token));
     }
 
+    /// Mint a `harnessId` for `name` that no stored harness holds: the name + `-`
+    /// + 10 alphanumerics, per `HarnessId`'s pattern
+    /// `^[a-zA-Z][a-zA-Z0-9_]{0,39}-[a-zA-Z0-9]{10}$`.
+    ///
+    /// `HarnessName` is `^[a-zA-Z][a-zA-Z0-9_]{0,39}$`, which is exactly the
+    /// stem that pattern admits, so the name needs no reshaping — unlike a
+    /// gateway id, whose pattern is narrower than its name's.
+    pub fn mint_harness_id(&mut self, name: &str, at: SystemTime) -> String {
+        loop {
+            self.mint_counter = self.mint_counter.wrapping_add(1);
+            let candidate = format!("{name}-{}", suffix_for(name, self.mint_counter, at));
+            if !self.harnesses.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
     /// Mint a `memoryId` for `name` that no stored memory holds: `name` + `-` +
     /// 10 alphanumerics, per `MemoryId`'s pattern
     /// `^[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$` (min length 12, which
@@ -851,6 +1120,21 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
         }
     }
 
+    /// The harness a previous request to `operation` carrying this `clientToken`
+    /// produced, if the record is still held and that harness still exists.
+    pub fn replayed_harness_result(
+        &self,
+        operation: &str,
+        client_token: Option<&str>,
+    ) -> Option<String> {
+        let harness_id = self
+            .harness_idempotency
+            .get(&token_key(operation, client_token?))?;
+        self.harnesses
+            .contains_key(harness_id)
+            .then(|| harness_id.clone())
+    }
+
     /// The memory a previous request to `operation` carrying this `clientToken`
     /// produced, if the record is still held and the memory still exists.
     pub fn replayed_memory_result(
@@ -862,6 +1146,36 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
         self.memories
             .contains_key(memory_id)
             .then(|| memory_id.clone())
+    }
+
+    /// Record what a `clientToken` produced for `operation`, evicting the oldest
+    /// record once [`MAX_REMEMBERED_CLIENT_TOKENS`] are held. An evicted token is
+    /// indistinguishable from one whose idempotency window has passed: the next
+    /// request carrying it is served as a fresh one.
+    pub fn remember_harness_client_token(
+        &mut self,
+        operation: &str,
+        client_token: Option<String>,
+        harness_id: &str,
+    ) {
+        let Some(token) = client_token else {
+            return;
+        };
+        remember_token(
+            &mut self.harness_idempotency,
+            &mut self.harness_idempotency_order,
+            token_key(operation, &token),
+            harness_id.to_string(),
+        );
+    }
+
+    /// Drop the idempotency records naming a harness that no longer exists, for
+    /// the same reason [`Self::forget_client_tokens_for`] does.
+    pub fn forget_harness_client_tokens_for(&mut self, harness_id: &str) {
+        self.harness_idempotency.retain(|_, id| id != harness_id);
+        let live = &self.harness_idempotency;
+        self.harness_idempotency_order
+            .retain(|token| live.contains_key(token));
     }
 
     /// Record what a `clientToken` produced for `operation`, evicting the oldest

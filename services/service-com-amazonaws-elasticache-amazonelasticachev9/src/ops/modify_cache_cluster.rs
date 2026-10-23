@@ -576,9 +576,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cluster.auth_token_enabled = !deleting;
             cluster.auth_token_last_modified = Some(now);
         }
+        // An empty `LogDeliveryConfigurations` list asks for no change, so it
+        // is no asynchronous work either.
+        let log_delivery_requested = input
+            .log_delivery_configurations
+            .as_deref()
+            .is_some_and(|requests| !requests.is_empty());
         if let Some(requests) = input.log_delivery_configurations {
             crate::state::apply_log_delivery(&mut cluster.log_delivery_configurations, requests);
         }
+
+        // Whether this request changes a member the modelled
+        // `PendingModifiedValues` CARRIES — `NumCacheNodes` /
+        // `CacheNodeIdsToRemove`, `CacheNodeType`, `EngineVersion`,
+        // `AuthTokenStatus` and `LogDeliveryConfigurations` (the shape also
+        // carries the in-transit encryption members, which only
+        // `ModifyReplicationGroup`, a scaffolded 501, can set). Those are the
+        // changes ElastiCache works through asynchronously, so an immediate one
+        // leaves the cluster transient; a request confined to the members that
+        // shape does NOT carry is a settings change applied synchronously.
+        // `CacheNodeIdsToRemove` is not tested on its own: it is only honoured
+        // beside a `NumCacheNodes` that removes nodes (refused above
+        // otherwise), so that member already covers it. Read before the
+        // members are moved into the record below.
+        let applies_async_change = input.num_cache_nodes.is_some()
+            || input.cache_node_type.is_some()
+            || input.engine_version.is_some()
+            || input.auth_token.is_some()
+            || input.auth_token_update_strategy.is_some()
+            || log_delivery_requested;
 
         let deferred = !input.apply_immediately.unwrap_or(false);
         // `PendingModifiedValues` is the only place the model reports a
@@ -637,9 +663,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &new_zones,
                 );
             }
-            // The cluster is `modifying` until the clock owes it `available`
-            // again.
-            cluster.begin_transition(crate::state::STATUS_MODIFYING, now);
+            // A change the modelled `PendingModifiedValues` carries is work
+            // ElastiCache does asynchronously, so the cluster is `modifying`
+            // until the clock owes it `available` again. A change confined to
+            // the members that shape cannot hold is applied synchronously and
+            // leaves the cluster settled — the applied value and a usable
+            // cluster state become visible together, so a caller that confirms
+            // the modify by reading the field back is not then refused by the
+            // next state-gated call on the cluster. A `ScaleConfig` moves
+            // nothing either: it has no applied home and stays pending.
+            if applies_async_change {
+                cluster.begin_transition(crate::state::STATUS_MODIFYING, now);
+            }
         }
 
         let cache_cluster = cluster.to_modeled(true);

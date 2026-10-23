@@ -4,7 +4,9 @@
 //! IMPLEMENTED: answers from [`crate::state`] — the engine default parameters of the
 //! FAMILY the named group was created with, each carrying the value an
 //! `UpdateParameterGroup` persisted for this group when one changed it, in name order
-//! and paged by `MaxResults`/`NextToken`.
+//! and paged by `MaxResults`/`NextToken`. The `default.<family>` groups MemoryDB owns in
+//! every account are part of that state, so a caller can read any family's baseline
+//! without creating a group.
 //!
 //! ## Shape of an operation
 //!
@@ -151,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in a mounted emulator (the router hands every service the
@@ -175,10 +177,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A parameter-group name is a case-insensitive identifier, so the name this
         // request asks about is folded exactly as the store is keyed.
         let parameter_group_name = crate::state::fold_name(&input.parameter_group_name);
+        let region = crate::state::request_region(ctx);
         let mut state = state.lock();
-        // The only write a describe makes: the status transitions the clock already
-        // owed the stored clusters and ACLs at this instant.
+        // The writes a describe makes, neither of them asked for by this caller: the
+        // status transitions the clock already owed the stored clusters and ACLs at this
+        // instant, and the resources the account ALREADY HAD before any call — among
+        // them the `default.<family>` parameter group MemoryDB owns for every family —
+        // which this store materialises on first touch because the engine hands every
+        // service an empty one.
         state.settle(std::time::Instant::now());
+        state.ensure_builtins(&region);
 
         let Some(group) = state.parameter_groups.get(&parameter_group_name) else {
             return Err(DescribeParametersErrorModeled::ParameterGroupNotFoundFault(

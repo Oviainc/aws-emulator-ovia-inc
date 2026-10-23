@@ -74,8 +74,9 @@
 //!   is not valid.
 //! * `InvalidParameterValueException` (HTTP 400) — The specified parameter value is not
 //!   valid. Widened in through `extra_errors` (see below): the service answers an
-//!   out-of-window `MaxResults` or a `NextToken` naming no position with it, and the
-//!   model's `errors` list for this operation omits it.
+//!   out-of-window `MaxResults`, a `NextToken` naming no position and a `Filters` entry
+//!   whose `Name` is not a filterable property with it, and the model's `errors` list
+//!   for this operation omits it.
 //! * `UserNotFoundFault` (HTTP 404) — The specified user does not exist.
 
 #[allow(unused_imports)]
@@ -83,19 +84,25 @@ use super::types::*;
 
 use crate::state::StoredUser;
 
-/// The user property a `Filters` entry may name to match a user's own name.
+/// The filter name that matches a user's own name (`User$Name`).
 ///
-/// `Filter$Name` is "The property being filtered. For example, UserName.", so the
-/// filterable properties are the ones `User` exposes; this slice exposes a user's name
-/// (`User$Name`) and the ACLs it belongs to (`User$ACLNames`, [`FILTER_ACL_NAME`]).
-const FILTER_USER_NAME: &str = "UserName";
+/// `Filter$Name` is "The property being filtered. For example, UserName." — prose, with
+/// no enumerated values and only a `\S` pattern on `FilterName`, so the model does not
+/// publish the vocabulary. MemoryDB keys its filters by the HYPHENATED, LOWER-CASE
+/// spelling of the property (`user-name`, `acl-name`), which is the wire vocabulary a
+/// recorded `DescribeUsers` is accepted with; the doc's `UserName` is not one of them.
+const FILTER_USER_NAME: &str = "user-name";
 
-/// The user property a `Filters` entry may name to match one of the ACLs the user
-/// belongs to (`User$ACLNames`).
-const FILTER_ACL_NAME: &str = "ACLName";
+/// The filter name that matches one of the ACLs the user belongs to (`User$ACLNames`),
+/// in the same hyphenated lower-case spelling as [`FILTER_USER_NAME`].
+const FILTER_ACL_NAME: &str = "acl-name";
 
 /// Whether `user` satisfies EVERY filter: one filter matches when the property it
 /// names carries one of that filter's values, and the filters combine conjunctively.
+///
+/// A filter name is matched EXACTLY: it is the service's own spelling of the property,
+/// so any other spelling names no filterable property and is refused before the listing
+/// is built.
 ///
 /// `acl_names` is the user's derived `ACLNames`, so a filter on ACL membership sees
 /// exactly what the response reports.
@@ -219,20 +226,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .find(|filter| !matches!(filter.name.as_str(), FILTER_USER_NAME | FILTER_ACL_NAME))
         {
-            // A filter on a property a user does not have cannot select anything, so
-            // it is reported rather than silently matching nothing.
-            return Err(
-                DescribeUsersErrorModeled::InvalidParameterCombinationException(
-                    InvalidParameterCombinationException {
-                        message: Some(format!(
-                            "Unknown filter name {}. Valid filter names are \
-                             {FILTER_ACL_NAME} and {FILTER_USER_NAME}.",
-                            unknown.name
-                        )),
-                    },
-                )
-                .into(),
-            );
+            // A filter naming no filterable property cannot select anything, so the
+            // VALUE of `Filter$Name` is refused — one member's value is outside what the
+            // service accepts, which is this service's invalid-value error rather than
+            // its invalid-combination one (nothing about how the members COMBINE is
+            // wrong).
+            return Err(DescribeUsersErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!("Invalid filter name {}.", unknown.name)),
+                },
+            )
+            .into());
         }
 
         let region = crate::state::request_region(ctx);

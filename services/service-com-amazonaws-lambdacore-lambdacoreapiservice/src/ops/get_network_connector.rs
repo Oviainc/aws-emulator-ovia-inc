@@ -249,11 +249,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             configuration: Some(version.configuration.clone()),
             operator_role: version.operator_role.clone(),
             state: Some(connector.state.clone()),
-            // Both state reasons are "populated when the state is FAILED or
-            // DELETE_FAILED", which no connector this emulator provisions
-            // reaches, and both last-update reasons explain a failed update,
-            // which it never produces either — so each is whatever the record
-            // holds, which is nothing.
+            // `StateReason` is the human-readable explanation of the `State`
+            // this answer reports, so it is the reason the record holds for
+            // it — set by whichever call or clock-due transition set that
+            // state. `StateReasonCode` and the two last-update reasons each
+            // name a FAILURE (`InvalidSubnet`, `InternalError`, …), which this
+            // emulator never produces, so each is whatever the record holds,
+            // which is nothing.
             state_reason: connector.state_reason.clone(),
             state_reason_code: connector.state_reason_code.clone(),
             last_update_status: connector.last_update_status.clone(),

@@ -26,7 +26,15 @@ pub struct ListNetworkConnectorsOutput {
     pub next_marker: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.lambdacore#NetworkConnectorSummary")]
+/// `NetworkConnectorSummary`, the projection `ListNetworkConnectors` returns. Its schema
+/// and codec come from [`lambdacore_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `LastModified` targets `CoreTimestamp`,
+/// which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape",shape="NetworkConnectorSummary")`) — see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkConnectorSummary {
     pub arn: String,
@@ -38,4 +46,27 @@ pub struct NetworkConnectorSummary {
     pub latest_version_arn: Option<String>,
     pub latest_version: Option<i64>,
 }
+
+lambdacore_schema_and_codec!(
+    NetworkConnectorSummary,
+    NETWORK_CONNECTOR_SUMMARY_SCHEMA,
+    "com.amazonaws.lambdacore#NetworkConnectorSummary",
+    "com.amazonaws.lambdacore",
+    "NetworkConnectorSummary",
+    (M_ARN, arn, "Arn", 0, req, string),
+    (M_NAME, name, "Name", 1, req, string),
+    (M_ID, id, "Id", 2, req, string),
+    (M_TYPE, r#type, "Type", 3, req, string),
+    (M_STATE, state, "State", 4, opt, string),
+    (M_LAST_MODIFIED, last_modified, "LastModified", 5, opt, date_time),
+    (
+        M_LATEST_VERSION_ARN,
+        latest_version_arn,
+        "LatestVersionArn",
+        6,
+        opt,
+        string
+    ),
+    (M_LATEST_VERSION, latest_version, "LatestVersion", 7, opt, long),
+);
 
