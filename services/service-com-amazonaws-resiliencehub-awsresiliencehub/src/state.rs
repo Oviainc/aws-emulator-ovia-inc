@@ -30,6 +30,17 @@ pub const MAX_APPS: usize = 200;
 /// past it.
 pub const MAX_RESILIENCY_POLICIES: usize = 200;
 
+/// The most PUBLISHED app versions this emulator stores for ONE application.
+///
+/// A MEMORY BOUND, not an AWS quota: `PublishAppVersion` is reachable by any
+/// caller and freezes a COPY of the draft's contents per call, so without a
+/// ceiling a publish loop grows the process until the host is out of memory.
+/// `PublishAppVersion` models no `ServiceQuotaExceededException`, so past the
+/// ceiling it answers its own modelled `ValidationException` (HTTP 400) — the
+/// channel its model offers for a request this service will not carry out —
+/// naming the ceiling.
+pub const MAX_PUBLISHED_APP_VERSIONS_PER_APP: usize = 200;
+
 /// The most Application Components this emulator stores in ONE app version.
 ///
 /// A MEMORY BOUND, not an AWS quota, for the same reason as [`MAX_APPS`]:
@@ -72,6 +83,31 @@ pub struct AppVersionContents {
     /// built on it) needs one stable order across calls. At most
     /// [`MAX_APP_COMPONENTS_PER_APP_VERSION`] entries.
     pub app_components: BTreeMap<String, AppComponent>,
+    /// The `versionName` the `PublishAppVersion` call that minted this version
+    /// carried, when it named one — the modelled `AppVersionSummary$versionName`.
+    /// Always `None` for the draft, which nobody names.
+    pub version_name: Option<String>,
+    /// The modelled `AppVersionSummary$identifier` of this version: the publish
+    /// sequence number a published version was minted with. `None` for the draft,
+    /// which is not a published version and so has no identifier.
+    pub identifier: Option<i64>,
+    /// When this version was published — the modelled
+    /// `AppVersionSummary$creationTime`. `None` for the draft, which comes into
+    /// being with the application and whose creation time is the application's own
+    /// `creationTime`.
+    pub creation_time: Option<::aws_smithy_types::DateTime>,
+}
+
+impl AppVersionContents {
+    /// Whether this app version holds nothing — the question
+    /// `PublishAppVersion` asks of a draft before freezing it.
+    ///
+    /// Every member a draft writer persists is counted here, so adding one (a
+    /// resource, an app template body) means adding it to this test rather than
+    /// to each caller of it.
+    pub fn is_empty(&self) -> bool {
+        self.app_components.is_empty()
+    }
 }
 
 /// Per-service state for com-amazonaws-resiliencehub-awsresiliencehub. A handler reaches it through [`service_state`].
@@ -84,6 +120,7 @@ pub struct AppVersionContents {
 /// [`MAX_APPS`], `app_name_index` by `apps` (one entry per stored app),
 /// `policies` by [`MAX_RESILIENCY_POLICIES`], `app_versions` by `apps` (an entry
 /// exists only for a stored application, and `DeleteApp` drops it) times
+/// [`MAX_PUBLISHED_APP_VERSIONS_PER_APP`] plus the draft, times
 /// [`MAX_APP_COMPONENTS_PER_APP_VERSION`] per version, and the idempotency store
 /// by [`MAX_IDEMPOTENCY_TOKENS`].
 #[derive(Debug, Default)]
@@ -155,6 +192,55 @@ impl ComAmazonawsResiliencehubAwsresiliencehubState {
             .or_default()
             .entry(DRAFT_APP_VERSION.to_string())
             .or_default()
+    }
+
+    /// How many PUBLISHED versions `app_arn` has: every stored version except the
+    /// draft, which is not published.
+    pub fn published_app_version_count(&self, app_arn: &str) -> usize {
+        self.app_versions
+            .get(app_arn)
+            .map(|versions| {
+                versions
+                    .keys()
+                    .filter(|version| version.as_str() != DRAFT_APP_VERSION)
+                    .count()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The publish sequence number the next published version of `app_arn` takes:
+    /// one past the highest it already has, so the first publish is 1 and the
+    /// numbers never repeat for one application.
+    ///
+    /// Derived from the stored versions rather than from a counter, so the number
+    /// a version was minted with is the number a reader finds it under.
+    pub fn next_published_app_version(&self, app_arn: &str) -> i64 {
+        let highest = self
+            .app_versions
+            .get(app_arn)
+            .and_then(|versions| {
+                versions
+                    .values()
+                    .filter_map(|contents| contents.identifier)
+                    .max()
+            })
+            .unwrap_or(0);
+        highest.saturating_add(1)
+    }
+
+    /// Store `contents` as version `app_version` of `app_arn`. The caller has
+    /// already established that `app_arn` names a stored application and that
+    /// `app_version` is not in use.
+    pub fn insert_app_version(
+        &mut self,
+        app_arn: &str,
+        app_version: &str,
+        contents: AppVersionContents,
+    ) {
+        self.app_versions
+            .entry(app_arn.to_string())
+            .or_default()
+            .insert(app_version.to_string(), contents);
     }
 
     /// Forget every app version of `app_arn`, so deleting an application releases
