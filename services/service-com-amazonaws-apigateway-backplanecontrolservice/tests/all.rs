@@ -15,6 +15,8 @@
 mod api_key_collection_members;
 #[path = "all/api_key_lifecycle.rs"]
 mod api_key_lifecycle;
+#[path = "all/authorizer_lifecycle.rs"]
+mod authorizer_lifecycle;
 #[path = "all/delete_lifecycle.rs"]
 mod delete_lifecycle;
 #[path = "all/delete_method_response.rs"]

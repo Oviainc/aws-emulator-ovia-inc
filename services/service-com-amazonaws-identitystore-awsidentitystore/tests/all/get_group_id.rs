@@ -17,17 +17,15 @@
 //! the JSON type of the attribute value. The `engineering` case from the issue is one
 //! row.
 //!
-//! The wire harness (`emulator`, `ok`, `refused`, …) is the sibling suite's, shared
+//! The wire harness (`emulator`, `ok`, `refused`, …) is [`crate::harness`]'s, shared
 //! rather than copied: every call still goes through the production
 //! [`MultiServiceRouter`] front door and nothing reaches into the state struct.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_identitystore_awsidentitystore as identitystore;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::identity_store_lifecycle::{
-    assert_resource_arn, assert_uuid, emulator, ok, refused, string, OTHER_STORE, STORE,
-};
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::identity_store_lifecycle::{assert_resource_arn, assert_uuid};
 
 /// The bounds of the modelled `GroupDisplayName` length
 /// (`smithy_query(query="shape",shape="GroupDisplayName")`: length 1..1024).
@@ -105,9 +103,10 @@ async fn create_group(
     )
 }
 
-/// The `n`-th identity store id of a run: the modelled `IdentityStoreId` pattern's
-/// `d-[0-9a-f]{10}` form.
-fn store_id(n: usize) -> String {
+/// A well-formed `IdentityStoreId` naming no identity store, built from `n` so a row
+/// can have one of its own: the modelled `IdentityStoreId` pattern's `d-[0-9a-f]{10}`
+/// form.
+fn unknown_store_id(n: usize) -> String {
     format!("d-{n:010x}")
 }
 
@@ -226,15 +225,7 @@ async fn the_unique_attribute_path_names_the_attribute_case_insensitively() {
 async fn a_display_name_resolves_only_within_the_store_that_holds_it() {
     let router = emulator();
     let case = "per-store scope";
-    // The same display name in two stores is two groups; each store resolves its own.
     let (here, _) = create_group(&router, STORE, "engineering", case).await;
-    let (there, _) = create_group(&router, OTHER_STORE, "engineering", case).await;
-    assert_ne!(
-        here, there,
-        "case {case:?}: expected one group per store, got {here} in both"
-    );
-    // A name only the other store holds, so a miss is observable in each direction.
-    create_group(&router, OTHER_STORE, "security", case).await;
 
     // Rows differ along the FORM of the identity-store identifier: the modelled
     // `IdentityStoreId` pattern admits the bare id and the store's ARN, and both name
@@ -260,25 +251,11 @@ async fn a_display_name_resolves_only_within_the_store_that_holds_it() {
             "case {form:?}: expected the store id, got {resolved}"
         );
     }
-    let resolved = get_group_id(
-        &router,
-        OTHER_STORE,
-        by_display_name("engineering"),
-        "other store",
-    )
-    .await;
-    assert_eq!(
-        string(&resolved, "GroupId", "other store"),
-        there,
-        "case \"other store\": expected the group of store {OTHER_STORE}, got {resolved}"
-    );
 
-    // Rows that name no group: a name nothing was created under, a name only the other
-    // store holds, a store nothing was ever created in, and a name longer than the
-    // modelled `GroupDisplayName` bound (1024) so no stored group can carry it.
+    // Rows that name no group: a name nothing was created under, and a name longer than
+    // the modelled `GroupDisplayName` bound (1024) so no stored group can carry it.
     let misses: Vec<(&str, String)> = vec![
         ("unused name", "nobody".to_string()),
-        ("name held by the other store", "security".to_string()),
         ("longer than any stored name", "g".repeat(DISPLAY_NAME_MAX_LEN + 1)),
     ];
     for (case, display_name) in &misses {
@@ -298,15 +275,29 @@ async fn a_display_name_resolves_only_within_the_store_that_holds_it() {
              got {refusal}"
         );
     }
-    get_group_id_refused(
-        &router,
-        &store_id(0xff),
-        by_display_name("engineering"),
-        404,
-        "ResourceNotFoundException",
-        "store nothing was created in",
-    )
-    .await;
+
+    // And a lookup addressed to an identity store that does not exist is refused for
+    // the STORE's sake: the store is the missing resource, not the group.
+    for (case, identifier) in [
+        ("an unknown store id", MISSING_STORE.to_string()),
+        ("another unknown store id", unknown_store_id(0xff)),
+    ] {
+        let refusal = get_group_id_refused(
+            &router,
+            &identifier,
+            by_display_name("engineering"),
+            404,
+            "ResourceNotFoundException",
+            case,
+        )
+        .await;
+        assert_eq!(
+            refusal["ResourceType"],
+            json!("IDENTITY_STORE"),
+            "case {case:?}: expected the identity store to be the missing resource, \
+             got {refusal}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -462,39 +453,32 @@ async fn resolving_a_group_id_changes_nothing_a_later_caller_sees() {
          got {after} after {before}"
     );
 
-    // And a resolution never brings an identity store into being: were it a write, the
-    // misses below would consume the whole per-emulator store capacity and the creates
-    // after them would be refused.
+    // And a resolution never writes: the group's record is untouched above, and a miss
+    // in a store that does not exist stays a miss — were the read a write, it would
+    // bring that store into being and a later create in it would then be served.
     let reader = emulator();
-    let probed = identitystore::state::MAX_IDENTITY_STORES + 4;
-    for index in 0..probed {
-        let case = format!("miss in unused store {index}");
+    for index in 0..4 {
+        let case = format!("miss in a store that does not exist {index}");
         get_group_id_refused(
             &reader,
-            &store_id(index),
+            &unknown_store_id(index),
             by_display_name("engineering"),
             404,
             "ResourceNotFoundException",
             &case,
         )
         .await;
+        refused(
+            &reader,
+            "CreateGroup",
+            json!({
+                "IdentityStoreId": unknown_store_id(index),
+                "DisplayName": "engineering",
+            }),
+            404,
+            "ResourceNotFoundException",
+            &case,
+        )
+        .await;
     }
-    for index in 0..identitystore::state::MAX_IDENTITY_STORES {
-        let case = format!("create in store {index}");
-        create_group(&reader, &store_id(index), "engineering", &case).await;
-    }
-    // The capacity is now genuinely full — of the stores the CREATES made, not of any
-    // the reads touched.
-    refused(
-        &reader,
-        "CreateGroup",
-        json!({
-            "IdentityStoreId": store_id(identitystore::state::MAX_IDENTITY_STORES),
-            "DisplayName": "engineering",
-        }),
-        402,
-        "ServiceQuotaExceededException",
-        "store capacity",
-    )
-    .await;
 }

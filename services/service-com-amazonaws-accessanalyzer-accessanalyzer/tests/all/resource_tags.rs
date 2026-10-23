@@ -407,6 +407,10 @@ struct ArnCase {
 /// An ARN that is not an ARN is refused as invalid, and a well-formed ARN no resource
 /// has is refused as not found — on each of the three tagging operations, with the
 /// tagged resource left untouched.
+///
+/// The not-found CODE is the tagging path's own `NotFoundException`, not the
+/// `ResourceNotFoundException` the analyzer-name-addressed operations answer with; the
+/// suite that owns that rule is `tests/all/fixed_refusal_texts.rs`.
 #[tokio::test]
 async fn a_tagging_call_on_an_unknown_or_malformed_arn_is_refused() {
     let emulator = Emulator::new();
@@ -429,20 +433,20 @@ async fn a_tagging_call_on_an_unknown_or_malformed_arn_is_refused() {
             case: "a well-formed analyzer ARN naming no analyzer",
             resource_arn: expected_arn("no_such_analyzer"),
             status: 404,
-            code: "ResourceNotFoundException",
+            code: "NotFoundException",
         },
         ArnCase {
             case: "an analyzer ARN in another account",
             resource_arn: "arn:aws:access-analyzer:us-east-1:111122223333:analyzer/bystander"
                 .to_string(),
             status: 404,
-            code: "ResourceNotFoundException",
+            code: "NotFoundException",
         },
         ArnCase {
             case: "another service's resource ARN",
             resource_arn: "arn:aws:s3:::some-bucket".to_string(),
             status: 404,
-            code: "ResourceNotFoundException",
+            code: "NotFoundException",
         },
     ];
 

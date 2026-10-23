@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Closes the client's MQTT connection and, when the caller asks for it, discards the
+//! session state behind it — both written to the stored session
+//! (`crate::state::MqttSession`), so every later reader of that session sees the
+//! disconnect.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A client id the broker holds no OPEN connection for has nothing to close — whether it
+//! has never connected or its session is already disconnected — so it is a 404
+//! `ResourceNotFoundException`, the condition this family answers with "verify that the
+//! client is connected and try again".
+//!
+//! `cleanSession=true` deletes the session state (its subscriptions and queued
+//! messages); `cleanSession=false` preserves it, which is what makes the session
+//! persistent. Either way the connection RECORD stays for as long as the service reports
+//! a disconnected client's information
+//! (`crate::state::DISCONNECT_INFORMATION_RETENTION_MILLIS`), which is what lets
+//! `GetConnection` report `connected: false` with the disconnect reason afterwards.
+//!
+//! `preventWillMessage` controls whether the client's Last Will and Testament is
+//! published on disconnect. A session this emulator holds carries no LWT — an MQTT
+//! CONNECT is what sets one, and this emulator serves no MQTT transport — so there is
+//! never a will message to publish or to suppress, and neither value publishes anything.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +190,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConnection"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteConnectionErrorModeled::InternalFailureException(InternalFailureException::new(
+                "An unexpected error has occurred.",
+            ))
+        })?;
+
+        let now_millis = crate::state::now_millis();
+        let mut guard = state.lock();
+        // There has to be an open connection to close: a client id the broker holds no
+        // session for, and one whose session is already disconnected, both have none.
+        let session = guard
+            .session(&input.client_id, now_millis)
+            .filter(|session| session.connected)
+            .ok_or_else(|| {
+                DeleteConnectionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException::new(crate::state::CLIENT_NOT_FOUND),
+                )
+            })?;
+
+        // The connection closes, and the record says the SERVICE closed it — this call is
+        // not the client hanging up.
+        session.disconnect(crate::state::SERVER_INITIATED_DISCONNECT, now_millis);
+        // The session state goes when the caller asks for it, and for a client that
+        // connected with a clean session there is no persistent state to preserve, so
+        // the parameter is ignored for one.
+        if input.clean_session || session.clean_session {
+            session.subscriptions.clear();
+            session.queued_messages.clear();
+        }
+
+        Ok(DeleteConnectionOutput)
     }
 }

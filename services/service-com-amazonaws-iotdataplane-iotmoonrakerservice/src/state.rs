@@ -2,17 +2,22 @@
 
 //! Engine state for the com-amazonaws-iotdataplane-iotmoonrakerservice service.
 //!
-//! Two stores, and every handler computes its whole response from them:
+//! Three stores, and every handler computes its whole response from them:
 //!
-//! * `shadows` — the Device Shadow documents, keyed by `(thingName, shadowName)` with
-//!   the empty shadow name standing for the unnamed ("classic") shadow. The stored
-//!   document is the merge of every `UpdateThingShadow` that has been applied to it;
-//!   `state.delta` is NOT stored, it is derived from `desired` vs `reported` whenever
-//!   a document is rendered.
+//! * `shadows` — one [`ShadowSlot`] per `(thingName, shadowName)`, with the empty
+//!   shadow name standing for the unnamed ("classic") shadow. The slot holds the
+//!   shadow's VERSION COUNTER and the stored document, which is the merge of every
+//!   `UpdateThingShadow` that has been applied to it; `state.delta` is NOT stored, it is
+//!   derived from `desired` vs `reported` whenever a document is rendered. The counter
+//!   is the slot's, not the document's, so it survives the document's deletion.
 //! * `retained_messages` — the MQTT retained message of each topic, as the last
 //!   `Publish` with `retain=true` left it.
+//! * `connections` — the MQTT session the broker holds per client id, which is what the
+//!   connection operations (`GetConnection`, `ListSubscriptions`, `SendDirectMessage`,
+//!   `DeleteConnection`) report on; a client id with no session is their shared
+//!   not-found condition.
 //!
-//! Both are `BTreeMap`s so a list operation walks them in a stable key order and an
+//! All three are `BTreeMap`s so a list operation walks them in a stable key order and an
 //! offset-style `nextToken` keeps meaning across calls.
 //!
 //! Beside the two stores, this module holds the service's RESPONSE TEXT: the fixed
@@ -21,7 +26,7 @@
 //! same condition and a message composed per handler drifts into describing the
 //! emulator's internals instead of the service's contract.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -154,6 +159,44 @@ pub fn too_many_topic_parts(max_parts: usize) -> String {
     format!("Topic can't contain more than {max_parts} parts")
 }
 
+/// How many BYTES one topic name may carry, measured on the UTF-8 topic. The IoT Core
+/// message-broker quota "Topic size" is 256 bytes, and it is independent of
+/// [`MAX_TOPIC_PARTS`]: a topic of legal depth is still refused once its name is longer
+/// than this.
+pub const MAX_TOPIC_BYTES: usize = 256;
+
+/// The service's fixed rejection for a topic name longer than the broker allows.
+pub fn too_many_topic_bytes(max_bytes: usize) -> String {
+    format!("Topic can't contain more than {max_bytes} bytes")
+}
+
+/// Why the broker will not publish to `topic`, or `None` when the name is one it will.
+///
+/// The rule is the MQTT topic-NAME rule, which holds wherever a topic names the
+/// destination of one message rather than a subscription's filter: a name carrying a
+/// wildcard is a FILTER and not a name, a name may not carry more levels than
+/// [`MAX_TOPIC_PARTS`], and a name may not be longer than [`MAX_TOPIC_BYTES`]. Each
+/// condition has its own message naming its own limit, so a caller is told which ceiling
+/// it crossed; the limits are independent, so a name of legal depth is still weighed
+/// against the byte ceiling.
+pub fn topic_name_refusal(topic: &str) -> Option<String> {
+    // MQTT forbids the single-level (`+`) and multi-level (`#`) wildcards in a publish
+    // topic: a topic carrying one is a topic FILTER, which only a subscription may be.
+    if topic.contains('+') || topic.contains('#') {
+        return Some(INVALID_TOPIC_FILTER.to_string());
+    }
+    // A topic name is a path of levels separated by `/`, and the broker bounds how many
+    // levels one carries.
+    if topic.split('/').count() > MAX_TOPIC_PARTS {
+        return Some(too_many_topic_parts(MAX_TOPIC_PARTS));
+    }
+    // …and, independently, how long the whole name is.
+    if topic.len() > MAX_TOPIC_BYTES {
+        return Some(too_many_topic_bytes(MAX_TOPIC_BYTES));
+    }
+    None
+}
+
 /// The service's fixed answer when a topic holds no retained message.
 pub const RETAINED_MESSAGE_NOT_FOUND: &str = "Retained message not found";
 
@@ -205,22 +248,46 @@ pub const MAX_SHADOW_DOCUMENT_BYTES: usize = 8 * 1024;
 /// stored record — and therefore a `GetThingShadow` response — bounded outright.
 pub const MAX_STORED_SHADOW_BYTES: usize = 64 * 1024;
 
-/// How many shadow documents this emulator stores, across every thing and shadow
-/// name. Emulator-chosen, for the same reason as [`MAX_RETAINED_TOPICS`]: both the
-/// thing name and the shadow name come straight from the request, so without a cap a
-/// caller could name a new shadow per request forever. An update of a shadow that is
-/// already stored is never refused by this cap, and `DeleteThingShadow` frees a slot.
+/// How many shadow SLOTS this emulator keeps, across every thing and shadow name.
+/// Emulator-chosen, for the same reason as [`MAX_RETAINED_TOPICS`]: both the thing name
+/// and the shadow name come straight from the request, so without a cap a caller could
+/// name a new shadow per request forever. An update of a shadow name that already has a
+/// slot is never refused by this cap — including one whose document was deleted, since
+/// the slot (and with it the version counter) outlives the document, so `DeleteThingShadow`
+/// does NOT free a slot.
 pub const MAX_SHADOWS: usize = 1024;
 
-/// The largest `Publish` payload this service accepts, in bytes. The AWS IoT Core
-/// message-broker quota "Maximum size of a message payload" is 128 KB.
+/// The largest message payload this service accepts, in bytes. The AWS IoT Core
+/// message-broker quota "Maximum size of a message payload" is 128 KB, measured
+/// inclusively: a payload of exactly this many bytes is accepted and one byte more is
+/// refused with `RequestEntityTooLargeException` (413) — the entity is too large for the
+/// service, which is what tells a publisher to split or shrink the message, as against a
+/// malformed request. It bounds every message the broker takes: a `Publish` and a
+/// `SendDirectMessage` alike.
 pub const MAX_PUBLISH_PAYLOAD_BYTES: usize = 128 * 1024;
+
+/// The service's rejection of a message payload over [`MAX_PUBLISH_PAYLOAD_BYTES`],
+/// built from the request: the size the request carried and the limit it crossed.
+pub fn payload_too_large(size: usize, max_allowed: usize) -> String {
+    format!("the payload is {size} bytes; the maximum message payload size is {max_allowed} bytes")
+}
 
 /// How many topics may hold a retained message at once. Emulator-chosen: the real
 /// service's quota is far larger than an in-memory emulator should be asked to hold,
 /// and a bound is what keeps `Publish` from growing the store without limit. Clearing
 /// a retained message (an empty retained payload) always frees a slot.
 pub const MAX_RETAINED_TOPICS: usize = 1024;
+
+/// The page size `ListSubscriptions` uses when the caller names no `maxResults`.
+///
+/// Source: `ListSubscriptionsRequest$maxResults`'s own documentation — "By default, this
+/// is set to 20" (`smithy_query(query="operation", operation="ListSubscriptions")` gives
+/// its modelled `range {min: 1, max: 200}`, which bounds what a caller may ask for).
+pub const DEFAULT_SUBSCRIPTION_PAGE_SIZE: usize = 20;
+
+/// The largest page `ListSubscriptions` answers with: the top of `maxResults`' modelled
+/// range, so a caller cannot ask for more than the model allows.
+pub const MAX_SUBSCRIPTION_PAGE_SIZE: usize = 200;
 
 /// The page size `ListNamedShadowsForThing` uses when the caller gives no `pageSize`,
 /// so one unparameterised request cannot return a page that grows with the number of
@@ -249,16 +316,44 @@ pub struct ShadowSection {
 /// A stored shadow document. A section is `None` while the shadow has never carried
 /// it — that is what makes `state.desired` absent from the rendered document rather
 /// than present and empty.
+///
+/// The document carries no version of its own: the version is the SLOT's
+/// ([`ShadowSlot::version`]), because the counter outlives the document, and
+/// [`Shadow::document`] is handed the version the slot stands at.
 #[derive(Debug, Clone, Default)]
 pub struct Shadow {
     pub desired: Option<ShadowSection>,
     pub reported: Option<ShadowSection>,
-    /// The document version, 1 after the first update and incremented by every
-    /// accepted update.
-    pub version: i64,
     /// When the document was last accepted, in epoch SECONDS — the unit shadow
     /// documents use for `timestamp` and for every metadata leaf.
     pub timestamp_secs: i64,
+}
+
+/// One shadow slot: everything the service keeps for a `(thingName, shadowName)`.
+///
+/// The slot exists from the first update of that shadow name and is never dropped: the
+/// VERSION COUNTER lives here, so it survives `DeleteThingShadow`, which takes the
+/// document away and consumes a version of its own. That is what makes the counter
+/// monotone per shadow name — a device holding a version from before a delete is still
+/// refused with `ConflictException` afterwards, and a recreated document resumes above
+/// the deleted one instead of starting again at 1.
+#[derive(Debug, Clone, Default)]
+pub struct ShadowSlot {
+    /// The highest version this shadow name has consumed: 0 before anything has, 1
+    /// after the first accepted update, and one more for every accepted update and
+    /// every delete.
+    pub version: i64,
+    /// The stored document, or `None` once it has been deleted.
+    pub document: Option<Shadow>,
+}
+
+impl ShadowSlot {
+    /// Consume the next version of this shadow name and answer it. The ONE place the
+    /// counter moves, so no caller can move it by a different step.
+    pub fn consume_version(&mut self) -> i64 {
+        self.version += 1;
+        self.version
+    }
 }
 
 impl Shadow {
@@ -322,8 +417,9 @@ impl Shadow {
     }
 
     /// The shadow document as a client reads it: `state` (with `delta` derived now),
-    /// `metadata`, `version` and `timestamp`.
-    pub fn document(&self) -> Value {
+    /// `metadata`, `version` and `timestamp`. `version` is the slot's counter, which
+    /// the caller passes in.
+    pub fn document(&self, version: i64) -> Value {
         let mut state = Map::new();
         let mut metadata = Map::new();
         if let Some(desired) = &self.desired {
@@ -346,7 +442,7 @@ impl Shadow {
         let mut document = Map::new();
         document.insert("state".to_string(), Value::Object(state));
         document.insert("metadata".to_string(), Value::Object(metadata));
-        document.insert("version".to_string(), Value::from(self.version));
+        document.insert("version".to_string(), Value::from(version));
         document.insert("timestamp".to_string(), Value::from(self.timestamp_secs));
         Value::Object(document)
     }
@@ -497,30 +593,206 @@ pub struct RetainedMessage {
     pub user_properties: Option<Vec<u8>>,
 }
 
+/// The service's fixed answer when the addressed MQTT client has no session the broker
+/// holds — the one condition every connection operation shares. The requirement is the
+/// 404 and the `ResourceNotFoundException` identity; this is the service's constant
+/// wording for it, which carries no request data.
+pub const CLIENT_NOT_FOUND: &str =
+    "The client ID is not found. Verify that the client is connected and try again";
+
+/// The service's answer when a `SendDirectMessage` asked for delivery confirmation.
+///
+/// `confirmation=true` means the service delivers at QoS 1 and answers only once the
+/// RECEIVING CLIENT has sent a PUBACK; this emulator serves no MQTT transport, so no
+/// client process can ever send one, and the modelled 504 is the honest answer rather
+/// than a 200 that claims a confirmation nothing produced.
+pub const NO_DELIVERY_CONFIRMATION: &str =
+    "this emulator holds the client's session but serves no MQTT connection it could \
+     acknowledge the delivery over, so no delivery confirmation can be received";
+
+/// The lifecycle disconnect reason a disconnect the SERVICE performed carries — which is
+/// what `DeleteConnection` is, as against a client closing its own connection
+/// (`CLIENT_INITIATED_DISCONNECT`). One of the reasons AWS IoT Core's lifecycle-event
+/// `disconnectReason` takes.
+pub const SERVER_INITIATED_DISCONNECT: &str = "SERVER_INITIATED_DISCONNECT";
+
+/// How long a disconnected client's connection information is still reported, in
+/// MILLISECONDS.
+///
+/// Source: `GetConnectionResponse$disconnectedSince`'s own documentation — "This
+/// information is available for 30 minutes after the client disconnects"
+/// (`smithy_query(query="doc", shape="GetConnectionResponse", member="disconnectedSince")`).
+/// Past it the session record is no longer something the service reports, so the
+/// connection operations answer [`CLIENT_NOT_FOUND`] and the record is released.
+pub const DISCONNECT_INFORMATION_RETENTION_MILLIS: i64 = 30 * 60 * 1000;
+
+/// How many messages one session queues for a client that is offline. The IoT Core
+/// message-broker quota "Maximum number of queued messages per persistent session" is
+/// 100, and a 101st delivery pushes the oldest out, as a broker's bounded queue does.
+pub const MAX_QUEUED_SESSION_MESSAGES: usize = 100;
+
+/// One message `SendDirectMessage` delivered to a client, kept verbatim: the message a
+/// session queues for a client that is offline is exactly the bytes and MQTT5 properties
+/// that were sent.
+#[derive(Debug, Clone)]
+pub struct DirectMessage {
+    pub topic: String,
+    pub payload: Vec<u8>,
+    /// The QoS the delivery used: 1 when the sender asked for confirmation, else 0 —
+    /// what `SendDirectMessageRequest$confirmation` documents.
+    pub qos: i32,
+    pub content_type: Option<String>,
+    pub response_topic: Option<String>,
+    pub user_properties: Option<String>,
+    pub payload_format_indicator: Option<String>,
+    pub correlation_data: Option<String>,
+    /// When the message was delivered, in epoch MILLISECONDS.
+    pub delivered_at_millis: i64,
+}
+
+/// One MQTT client session the broker is holding: what the connection operations report
+/// on, and what `DeleteConnection` disconnects or discards.
+///
+/// A session is opened by an MQTT CONNECT, which is a transport this emulator does not
+/// serve, so nothing in the HTTP data plane puts a session in the table: a client id that
+/// has never connected has no session, which is why every connection operation answers
+/// it with [`CLIENT_NOT_FOUND`] — the 404 AWS answers for one. Every field is a fact
+/// about the session, so each operation's response is computed from the record and never
+/// from the request that asked for it.
+#[derive(Debug, Clone, Default)]
+pub struct MqttSession {
+    /// The client id the session was opened under, which `GetConnection` reports back.
+    pub client_id: String,
+    /// Whether the client's network connection is open. A session outlives it when the
+    /// client asked for a persistent session.
+    pub connected: bool,
+    /// Whether the client connected with a clean session.
+    pub clean_session: bool,
+    /// The thing associated with the client's principal, when there is one.
+    pub thing_name: Option<String>,
+    /// The keep-alive interval the client asked for, in SECONDS.
+    pub keep_alive_seconds: i32,
+    /// The session expiry interval the client configured, in SECONDS.
+    pub session_expiry_seconds: i64,
+    /// When the client connected, in epoch MILLISECONDS — the unit
+    /// `GetConnectionResponse$connectedSince` documents.
+    pub connected_since_millis: i64,
+    /// When the client disconnected, in epoch MILLISECONDS, or 0 while it is connected.
+    pub disconnected_since_millis: i64,
+    /// Why the client last disconnected, when it is disconnected.
+    pub disconnect_reason: Option<String>,
+    /// The socket information, which `GetConnection` reports only to a request that
+    /// asked for it (`includeSocketInformation`).
+    pub source_ip: Option<String>,
+    pub source_port: i32,
+    pub target_ip: Option<String>,
+    pub target_port: i32,
+    /// The VPC endpoint the client connected through, for a client that connected
+    /// through one.
+    pub vpc_endpoint_id: Option<String>,
+    /// The topic filters this session subscribes to, each with its QoS, in stable
+    /// filter order — the order `ListSubscriptions` pages over.
+    pub subscriptions: BTreeMap<String, i32>,
+    /// What `SendDirectMessage` delivered to this session while the client was offline,
+    /// oldest first and bounded by [`MAX_QUEUED_SESSION_MESSAGES`]. A message to a
+    /// CONNECTED client is handed to the connection and queues nothing, exactly as a
+    /// publish to a live subscriber leaves no trace.
+    pub queued_messages: VecDeque<DirectMessage>,
+}
+
+impl MqttSession {
+    /// Whether the service still reports this session at `now_millis`: always while the
+    /// client is connected, and for [`DISCONNECT_INFORMATION_RETENTION_MILLIS`] after it
+    /// disconnected.
+    pub fn is_reported_at(&self, now_millis: i64) -> bool {
+        self.connected
+            || now_millis.saturating_sub(self.disconnected_since_millis)
+                < DISCONNECT_INFORMATION_RETENTION_MILLIS
+    }
+
+    /// Close this session's network connection at `at_millis`, recording why. The
+    /// session state (its subscriptions and queued messages) is kept: that is what makes
+    /// it a persistent session.
+    pub fn disconnect(&mut self, reason: &str, at_millis: i64) {
+        self.connected = false;
+        self.disconnected_since_millis = at_millis;
+        self.disconnect_reason = Some(reason.to_string());
+    }
+
+    /// Queue `message` for this offline session, dropping the oldest once the queue is
+    /// at [`MAX_QUEUED_SESSION_MESSAGES`].
+    pub fn queue(&mut self, message: DirectMessage) {
+        self.queued_messages.push_back(message);
+        while self.queued_messages.len() > MAX_QUEUED_SESSION_MESSAGES {
+            self.queued_messages.pop_front();
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-iotdataplane-iotmoonrakerservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotdataplaneIotmoonrakerserviceState {
-    /// Shadow documents keyed by `(thingName, shadowName)`; [`CLASSIC_SHADOW`] is the
+    /// Shadow slots keyed by `(thingName, shadowName)`; [`CLASSIC_SHADOW`] is the
     /// unnamed shadow's key.
-    pub shadows: BTreeMap<(String, String), Shadow>,
+    pub shadows: BTreeMap<(String, String), ShadowSlot>,
     /// Retained messages keyed by topic.
     pub retained_messages: BTreeMap<String, RetainedMessage>,
+    /// The MQTT session the broker holds per client id — see [`MqttSession`].
+    pub connections: BTreeMap<String, MqttSession>,
 }
 
 impl ComAmazonawsIotdataplaneIotmoonrakerserviceState {
-    /// Whether `thing_name` has any shadow at all — named or classic.
+    /// Whether `thing_name` has any shadow DOCUMENT at all — named or classic. A slot
+    /// whose document was deleted is not a shadow: it is only the counter that outlived
+    /// one.
     pub fn has_any_shadow(&self, thing_name: &str) -> bool {
-        self.shadows.keys().any(|(thing, _)| thing == thing_name)
+        self.shadows
+            .iter()
+            .any(|((thing, _), slot)| thing == thing_name && slot.document.is_some())
     }
 
-    /// The NAMED shadows of `thing_name`, in stable key order. The classic shadow is
-    /// not a named shadow, so it is never listed.
+    /// The NAMED shadows of `thing_name` that hold a document, in stable key order. The
+    /// classic shadow is not a named shadow, so it is never listed.
     pub fn named_shadows_for_thing(&self, thing_name: &str) -> Vec<String> {
         self.shadows
-            .keys()
-            .filter(|(thing, name)| thing == thing_name && name != CLASSIC_SHADOW)
-            .map(|(_, name)| name.clone())
+            .iter()
+            .filter(|((thing, name), slot)| {
+                thing == thing_name && name != CLASSIC_SHADOW && slot.document.is_some()
+            })
+            .map(|((_, name), _)| name.clone())
             .collect()
+    }
+
+    /// The document stored under `key` and the version its slot stands at, or `None`
+    /// when no document is stored there — whether the shadow never existed or its
+    /// document was deleted.
+    pub fn stored_shadow(&self, key: &(String, String)) -> Option<(&Shadow, i64)> {
+        let slot = self.shadows.get(key)?;
+        slot.document.as_ref().map(|document| (document, slot.version))
+    }
+
+    /// The version `key` stands at: the last version it consumed, which is what a
+    /// conditional update must state and 0 for a shadow name nothing has written yet.
+    /// A delete consumes one too, so this does not fall back after a delete.
+    pub fn shadow_version(&self, key: &(String, String)) -> i64 {
+        self.shadows.get(key).map_or(0, |slot| slot.version)
+    }
+
+    /// Release every session whose record the service no longer reports — see
+    /// [`MqttSession::is_reported_at`]. A release the CLOCK already made due: it was owed
+    /// at this instant whether or not anybody called, so a reporting operation may
+    /// materialise it before it answers.
+    pub fn release_retired_sessions(&mut self, now_millis: i64) {
+        self.connections
+            .retain(|_, session| session.is_reported_at(now_millis));
+    }
+
+    /// The session the broker holds for `client_id`, after the sessions the clock has
+    /// already retired are released. `None` is the condition every connection operation
+    /// answers with [`CLIENT_NOT_FOUND`].
+    pub fn session(&mut self, client_id: &str, now_millis: i64) -> Option<&mut MqttSession> {
+        self.release_retired_sessions(now_millis);
+        self.connections.get_mut(client_id)
     }
 }
 
