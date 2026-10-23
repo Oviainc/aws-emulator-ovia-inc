@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEventDataStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEventDataStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEventDataStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one CloudTrail Lake event data store, addressed either by its ARN or by
+//! the id suffix of that ARN. It is a pure read: every member of the answer comes
+//! from the stored record, and nothing in the registry changes.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +187,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEventDataStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEventDataStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEventDataStore"))
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetEventDataStoreErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "GetEventDataStore needs the CloudTrail event data store registry, \
+                         which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        // `EventDataStore` is either a store ARN or the id suffix of one; a value
+        // that can be read as neither names no store in any account. The
+        // identifier is read here rather than through
+        // `ComAmazonawsCloudtrailCloudtrail20131101State::event_data_store` so the
+        // refusal below can name the ARN it addressed.
+        let identifier = crate::state::parse_event_data_store_identifier(&input.event_data_store)
+            .map_err(|rejection| {
+                GetEventDataStoreErrorModeled::EventDataStoreARNInvalidException(
+                    EventDataStoreARNInvalidException {
+                        message: Some(rejection.message()),
+                    },
+                )
+            })?;
+
+        let Some(record) = store.addressed_event_data_store(&identifier, &region) else {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                GetEventDataStoreErrorModeled::EventDataStoreNotFoundException(
+                    EventDataStoreNotFoundException {
+                        message: Some(crate::state::event_data_store_not_found_message(
+                            &identifier.arn(&region),
+                        )),
+                    },
+                ),
+                NOT_FOUND_STATUS,
+            ));
+        };
+
+        Ok(report(record))
+    }
+}
+
+/// The HTTP status this service answers a not-found refusal with.
+///
+/// The model annotates `EventDataStoreNotFoundException` `@httpError(404)`, but
+/// CloudTrail answers 400 for it on the wire: the recorded response for this very
+/// operation is `HTTP 400` with `__type` `EventDataStoreNotFoundException` and a
+/// `Message` naming the store's ARN. The error CODE is the model's; only the
+/// status is stated here, through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`] — the same way
+/// `describe_query` states it.
+const NOT_FOUND_STATUS: u16 = 400;
+
+/// Project a stored event data store onto this operation's response.
+///
+/// A member is reported only when the store carries it, so a configuration the
+/// store does not hold stays absent on the wire rather than becoming an empty list
+/// or an invented value.
+fn report(record: &crate::state::EventDataStoreRecord) -> GetEventDataStoreOutput {
+    GetEventDataStoreOutput {
+        event_data_store_arn: Some(record.arn()),
+        name: Some(record.name.clone()),
+        status: Some(record.status.as_wire().to_string()),
+        advanced_event_selectors: (!record.advanced_event_selectors.is_empty())
+            .then(|| record.advanced_event_selectors.clone()),
+        multi_region_enabled: Some(record.multi_region_enabled),
+        organization_enabled: Some(record.organization_enabled),
+        retention_period: record.retention_period,
+        termination_protection_enabled: Some(record.termination_protection_enabled),
+        created_timestamp: record.created_at.map(::aws_smithy_types::DateTime::from),
+        // A store nothing has changed since it was created reports its creation
+        // time, which is what keeps "UpdatedTimestamp is always either the same or
+        // newer than CreatedTimestamp" true.
+        updated_timestamp: record
+            .updated_at
+            .or(record.created_at)
+            .map(::aws_smithy_types::DateTime::from),
+        kms_key_id: record.kms_key_id.clone(),
+        billing_mode: Some(record.billing_mode.as_wire().to_string()),
+        federation_status: Some(record.federation_status.as_wire().to_string()),
+        federation_role_arn: record.federation_role_arn.clone(),
+        partition_keys: (!record.partition_keys.is_empty())
+            .then(|| record.partition_keys.clone()),
     }
 }

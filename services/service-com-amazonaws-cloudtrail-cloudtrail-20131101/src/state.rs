@@ -22,7 +22,10 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{RefreshSchedule, RequestWidget, Tag, Trail, TrailInfo, Widget};
+use crate::ops::types::{
+    AdvancedEventSelector, PartitionKey, RefreshSchedule, RequestWidget, Tag, Trail, TrailInfo,
+    Widget,
+};
 
 /// The Region a request is served in when it carries no SigV4 credential scope to
 /// read one from. It matches the Region the emulator writes into the AWS shared
@@ -382,6 +385,14 @@ pub type TrailKey = (String, String);
 /// store the caller asked for is exactly what could not be found.
 pub const EVENT_DATA_STORE_NOT_FOUND_MESSAGE: &str = "The event data store was not found.";
 
+/// The refusal text for `EventDataStoreNotFoundException` on a call that names ONE
+/// store, as the recorded response of the real service words it: it names the ARN
+/// the request addressed, which for a bare id is the one that id completes to in
+/// the caller's Region.
+pub fn event_data_store_not_found_message(arn: &str) -> String {
+    format!("The event data store {arn} was not found.")
+}
+
 /// The refusal text for `QueryIdNotFoundException`: it names the member the
 /// request supplied and its value, the way the service words it — "The QueryId
 /// value <id> does not exist or is not in the same region."
@@ -431,10 +442,61 @@ impl EventDataStoreState {
     }
 }
 
+/// The billing mode of an event data store: one variant per value of the model's
+/// `BillingMode` enum.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum EventDataStoreBillingMode {
+    /// The model doc for `CreateEventDataStoreRequest$BillingMode`: "The default
+    /// value is EXTENDABLE_RETENTION_PRICING."
+    #[default]
+    ExtendableRetentionPricing,
+    FixedRetentionPricing,
+}
+
+impl EventDataStoreBillingMode {
+    /// The value this billing mode carries on the wire.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::ExtendableRetentionPricing => "EXTENDABLE_RETENTION_PRICING",
+            Self::FixedRetentionPricing => "FIXED_RETENTION_PRICING",
+        }
+    }
+}
+
+/// The Lake query federation state of an event data store: one variant per value
+/// of the model's `FederationStatus` enum.
+///
+/// `Disabled` is the default because a store federates only once
+/// `EnableFederation` is called for it: "The status is ENABLED if Lake query
+/// federation is enabled, or DISABLED if Lake query federation is disabled"
+/// (model doc for `GetEventDataStoreResponse$FederationStatus`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum FederationState {
+    Enabling,
+    Enabled,
+    Disabling,
+    #[default]
+    Disabled,
+}
+
+impl FederationState {
+    /// The value this federation state carries on the wire.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Enabling => "ENABLING",
+            Self::Enabled => "ENABLED",
+            Self::Disabling => "DISABLING",
+            Self::Disabled => "DISABLED",
+        }
+    }
+}
+
 /// One persisted CloudTrail Lake event data store.
 ///
 /// The ARN is not stored: it is a function of the Region and the id
-/// ([`event_data_store_arn`]), so deriving it keeps one source of truth.
+/// ([`event_data_store_arn`]), so deriving it keeps one source of truth. Every
+/// other member a read reports IS stored, so a read computes its whole answer from
+/// this record rather than from the request that asked for it.
 #[derive(Debug, Default, Clone)]
 pub struct EventDataStoreRecord {
     /// The ARN's resource suffix — the identifier every operation accepts in
@@ -449,6 +511,29 @@ pub struct EventDataStoreRecord {
     /// `EventDataStoreOwnerAccountId`.
     pub owner_account_id: Option<String>,
     pub created_at: Option<SystemTime>,
+    /// When the store was last changed. "UpdatedTimestamp is always either the
+    /// same or newer than the time shown in CreatedTimestamp" (model doc for
+    /// `GetEventDataStoreResponse$UpdatedTimestamp`), and `None` for a store
+    /// nothing has changed since it was created.
+    pub updated_at: Option<SystemTime>,
+    /// The selectors that choose which events the store collects.
+    pub advanced_event_selectors: Vec<AdvancedEventSelector>,
+    pub multi_region_enabled: bool,
+    pub organization_enabled: bool,
+    /// In days; the model bounds `RetentionPeriod` to 7..=3653. `None` for a store
+    /// whose retention nothing has stated.
+    pub retention_period: Option<i32>,
+    pub termination_protection_enabled: bool,
+    pub kms_key_id: Option<String>,
+    pub billing_mode: EventDataStoreBillingMode,
+    pub federation_status: FederationState,
+    /// The role Lake query federation accesses the store's resources through; set
+    /// only while federation is on.
+    pub federation_role_arn: Option<String>,
+    /// The keys CloudTrail Lake partitions the store's event data by. The model
+    /// bounds `PartitionKeyList` to 0..=2 entries.
+    pub partition_keys: Vec<PartitionKey>,
+    pub tags: Vec<Tag>,
 }
 
 impl EventDataStoreRecord {
@@ -459,6 +544,11 @@ impl EventDataStoreRecord {
             Some(account_id) => account_id,
             None => ::engine::emulator_account_id(),
         }
+    }
+
+    /// This store's ARN, derived from the Region it lives in and its id.
+    pub fn arn(&self) -> String {
+        event_data_store_arn(&self.region, &self.id)
     }
 }
 
@@ -586,6 +676,20 @@ pub struct EventDataStoreIdentifier {
     /// The Region the ARN pins the store to; `None` for a bare id, which names a
     /// store in the caller's own Region.
     pub region: Option<String>,
+}
+
+impl EventDataStoreIdentifier {
+    /// The Region this identifier addresses a store in: the ARN's own Region, or
+    /// the Region the call was made in for a bare id.
+    pub fn addressed_region<'a>(&'a self, request_region: &'a str) -> &'a str {
+        self.region.as_deref().unwrap_or(request_region)
+    }
+
+    /// The whole ARN this identifier addresses — the ARN as given, or the one a
+    /// bare id completes to in the caller's Region.
+    pub fn arn(&self, request_region: &str) -> String {
+        event_data_store_arn(self.addressed_region(request_region), &self.id)
+    }
 }
 
 /// The ARN of the event data store `id` in `region`.
@@ -783,11 +887,22 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
         request_region: &str,
     ) -> Result<Option<&EventDataStoreRecord>, EventDataStoreRejection> {
         let parsed = parse_event_data_store_identifier(identifier)?;
-        let addressed = parsed.region.as_deref().unwrap_or(request_region);
-        Ok(self
-            .event_data_stores
-            .get(&parsed.id)
-            .filter(|record| record.region == addressed))
+        Ok(self.addressed_event_data_store(&parsed, request_region))
+    }
+
+    /// The event data store an already-read identifier addresses, if the registry
+    /// holds it — the lookup half of [`Self::event_data_store`], for a caller that
+    /// has read the identifier itself (to word a refusal with the ARN it
+    /// addresses, say).
+    pub fn addressed_event_data_store(
+        &self,
+        identifier: &EventDataStoreIdentifier,
+        request_region: &str,
+    ) -> Option<&EventDataStoreRecord> {
+        let addressed = identifier.addressed_region(request_region);
+        self.event_data_stores
+            .get(&identifier.id)
+            .filter(|record| record.region == addressed)
     }
 
     /// The query `query_id` names, as a call made in `request_region` and naming
