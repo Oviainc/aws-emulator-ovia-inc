@@ -76,9 +76,16 @@ const ETHEREUM_MAINNET_ACCOUNTS: &[&str] = &[
 
 /// Published accounts of the Bitcoin mainnet; see [`ETHEREUM_MAINNET_ACCOUNTS`]. Each is
 /// a base58 address of that chain.
+///
+/// The selection rule, so the catalog is a fixed set and not something one reading
+/// extends: the chain's LANDMARK addresses — the ones its own history published — in the
+/// order the chain published them.
 const BITCOIN_MAINNET_ACCOUNTS: &[&str] = &[
-    // An early published address, cited as the recipient of the first Bitcoin payment
-    // between two parties (block 170).
+    // The coinbase address of the genesis block (2009-01-03): the first address of
+    // Bitcoin.
+    "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+    // The recipient of the first Bitcoin payment between two parties (block 170,
+    // 2009-01-12).
     "1Q2TWHE3GMdB6BZKafqwxXtWAWgFt5Jvm3",
     // A widely-published large holder.
     "1FeexV6bAHb8ybZjqQMjJrcCrHGW9sb6uF",

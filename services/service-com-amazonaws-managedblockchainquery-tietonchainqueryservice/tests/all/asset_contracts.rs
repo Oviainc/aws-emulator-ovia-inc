@@ -237,8 +237,9 @@ async fn get_asset_contract_resolves_every_spelling_of_one_address() {
                  got {reply:?}"
             );
             assert_eq!(
-                reply["contractIdentifier"], body["contractIdentifier"],
-                "case {case}: the response identifies the contract the request named, \
+                reply["contractIdentifier"], stored["contractIdentifier"],
+                "case {case}: the response identifies the contract in the one spelling \
+                 the service reports an address in, whichever spelling reached it, \
                  got {reply:?}"
             );
         }

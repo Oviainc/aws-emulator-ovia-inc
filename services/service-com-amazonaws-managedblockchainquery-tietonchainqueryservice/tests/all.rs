@@ -23,5 +23,7 @@ mod derived_chain_history;
 mod derived_chain_reads;
 #[path = "all/error_contract.rs"]
 mod error_contract;
+#[path = "all/response_fidelity.rs"]
+mod response_fidelity;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -46,6 +46,7 @@
 //! `ResourceNotFoundException` or the modelled empty page: this emulator indexes no
 //! chain, so it reports only what it holds.
 
+pub mod address;
 pub mod derived;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -55,9 +56,9 @@ use sha2::{Digest, Sha256};
 pub mod chain;
 
 use crate::ops::types::{
-    BlockchainInstant, ContractMetadata, InternalServerException, OwnerIdentifier, TokenBalance,
-    TokenIdentifier, Transaction, TransactionEvent, TransactionOutputItem, ValidationException,
-    ValidationExceptionField, QUERY_NETWORK_VALUES,
+    BlockchainInstant, ContractIdentifier, ContractMetadata, InternalServerException,
+    OwnerIdentifier, TokenBalance, TokenIdentifier, Transaction, TransactionEvent,
+    TransactionOutputItem, ValidationException, ValidationExceptionField, QUERY_NETWORK_VALUES,
 };
 
 // ---------------------------------------------------------------------------
@@ -197,6 +198,10 @@ impl StoredTransaction {
     }
 
     /// Project the stored transaction onto the modelled `Transaction`.
+    ///
+    /// Every `ChainAddress`-typed member is rendered in the spelling the ledger keys an
+    /// address by ([`derived::normalize_address`]), the same form every other response
+    /// of this service reports an address in.
     pub fn transaction(&self) -> Transaction {
         Transaction {
             network: self.network.clone(),
@@ -206,9 +211,12 @@ impl StoredTransaction {
             transaction_timestamp: instant_secs(self.transaction_timestamp),
             transaction_index: self.transaction_index,
             number_of_transactions: self.number_of_transactions,
-            to: self.to.clone(),
-            from: self.from.clone(),
-            contract_address: self.contract_address.clone(),
+            to: derived::normalize_address(&self.to),
+            from: self.from.as_deref().map(derived::normalize_address),
+            contract_address: self
+                .contract_address
+                .as_deref()
+                .map(derived::normalize_address),
             gas_used: self.gas_used.map(|amount| amount.to_string()),
             cumulative_gas_used: self.cumulative_gas_used.map(|amount| amount.to_string()),
             effective_gas_price: self.effective_gas_price.map(|amount| amount.to_string()),
@@ -238,7 +246,8 @@ impl StoredTransaction {
     ///
     /// `network`, `transactionHash`, `transactionId`, `blockchainInstant` and
     /// `confirmationStatus` are properties of the TRANSACTION, so they come from it
-    /// rather than being stored a second time on each event.
+    /// rather than being stored a second time on each event; the `ChainAddress`-typed
+    /// members are rendered the way [`StoredTransaction::transaction`] renders them.
     pub fn events(&self) -> Vec<TransactionEvent> {
         self.events
             .iter()
@@ -246,10 +255,13 @@ impl StoredTransaction {
                 network: self.network.clone(),
                 transaction_hash: self.transaction_hash.clone(),
                 event_type: event.event_type.clone(),
-                from: event.from.clone(),
-                to: event.to.clone(),
+                from: event.from.as_deref().map(derived::normalize_address),
+                to: event.to.as_deref().map(derived::normalize_address),
                 value: event.value.map(|amount| amount.to_string()),
-                contract_address: event.contract_address.clone(),
+                contract_address: event
+                    .contract_address
+                    .as_deref()
+                    .map(derived::normalize_address),
                 token_id: event.token_id.clone(),
                 transaction_id: self.transaction_id.clone(),
                 vout_index: event.vout_index,
@@ -358,6 +370,20 @@ pub struct HoldingKey {
 }
 
 impl HoldingKey {
+    /// The holding a `(tokenIdentifier, ownerIdentifier)` pair names, as the LEDGER
+    /// spells it ([`HoldingKey::normalized`]).
+    ///
+    /// The ONE place a request's pair becomes a key, so a read and the error item that
+    /// reports a failed read name the same holding in the same spelling.
+    pub fn from_identifiers(token: &TokenIdentifier, owner: &OwnerIdentifier) -> HoldingKey {
+        HoldingKey {
+            contract_address: token.contract_address.clone(),
+            token_id: token.token_id.clone(),
+            owner_address: owner.address.clone(),
+        }
+        .normalized()
+    }
+
     /// Whether a `TokenFilter`/`TokenIdentifier` naming `contract_address` and
     /// `token_id` selects this holding: a member the filter does not name matches
     /// anything, and one it does name must match exactly.
@@ -506,6 +532,28 @@ pub struct StoredContract {
     pub metadata: Option<ContractMetadata>,
 }
 
+impl StoredContract {
+    /// Project the stored contract onto the modelled `ContractIdentifier`: the network
+    /// its ledger holds and the address it is stored at, both as the LEDGER spells them
+    /// ([`derived::normalize_address`]).
+    ///
+    /// A response identifies the contract it answered ABOUT, which is the stored one —
+    /// not the characters a request used to reach it, since the two spellings of one EVM
+    /// address name one contract.
+    pub fn identifier(&self) -> ContractIdentifier {
+        ContractIdentifier {
+            network: self.network.clone(),
+            contract_address: derived::normalize_address(&self.contract_address),
+        }
+    }
+
+    /// The contract's `deployerAddress`, as the LEDGER spells it; see
+    /// [`StoredContract::identifier`].
+    pub fn deployer_address(&self) -> String {
+        derived::normalize_address(&self.deployer_address)
+    }
+}
+
 /// One network's ledger.
 #[derive(Debug, Default)]
 pub struct NetworkLedger {
@@ -540,8 +588,25 @@ impl NetworkLedger {
     /// Store `transaction` and index it by hash, id and participating address.
     ///
     /// The only way a transaction enters a ledger, so the indexes cannot drift from the
-    /// `transactions` map.
-    pub fn insert_transaction(&mut self, transaction: StoredTransaction) {
+    /// `transactions` map — and the one place an address is brought into the form the
+    /// ledger holds it in ([`derived::normalize_address`]), so a stored record and a
+    /// lookup key can never be two spellings of one account.
+    pub fn insert_transaction(&mut self, mut transaction: StoredTransaction) {
+        transaction.to = derived::normalize_address(&transaction.to);
+        transaction.from = transaction.from.as_deref().map(derived::normalize_address);
+        transaction.contract_address = transaction
+            .contract_address
+            .as_deref()
+            .map(derived::normalize_address);
+        for event in &mut transaction.events {
+            event.from = event.from.as_deref().map(derived::normalize_address);
+            event.to = event.to.as_deref().map(derived::normalize_address);
+            event.contract_address = event
+                .contract_address
+                .as_deref()
+                .map(derived::normalize_address);
+        }
+
         let key = transaction.key();
         self.by_hash
             .insert(normalize_hash(&transaction.transaction_hash), key.clone());
@@ -671,12 +736,7 @@ impl ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState {
 
         // The key as the LEDGER spells it, so the two spellings of one Ethereum account
         // or token contract read one balance (see [`derived::normalize_address`]).
-        let key = HoldingKey {
-            contract_address: token.contract_address.clone(),
-            token_id: token.token_id.clone(),
-            owner_address: owner.address.clone(),
-        }
-        .normalized();
+        let key = HoldingKey::from_identifiers(token, owner);
         let at = instant_to_secs(at_instant);
 
         let holding = self
@@ -701,8 +761,10 @@ impl ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState {
 ///
 /// Carries the modelled exception the failure IS, so the single-item read answers with
 /// it directly and the batch read renders the same case as an error item: the
-/// `errorType` is the modelled `ErrorType` for that case, the `errorCode` the name of
-/// the exception's shape, and the `errorMessage` the exception's own message.
+/// `errorType` is the modelled `ErrorType` for that case, the `errorMessage` the
+/// exception's own message, and the `errorCode` the HTTP status the exception is raised
+/// with — which the batch handler takes from the generated error channel rather than
+/// from here, so there is one source for the status of a failed read.
 #[derive(Debug)]
 pub enum BalanceFailure {
     /// The `tokenIdentifier` names a network but no token.
@@ -712,15 +774,6 @@ pub enum BalanceFailure {
 }
 
 impl BalanceFailure {
-    /// The wire code of the modelled exception this failure is: the name of its shape,
-    /// which is the code that exception reports when it is raised as a call's error.
-    pub fn error_code(&self) -> &'static str {
-        match self {
-            Self::Unidentified(_) => "ValidationException",
-            Self::NotFound(_) => "ResourceNotFoundException",
-        }
-    }
-
     /// The modelled `ErrorType` of this failure.
     pub fn error_type(&self) -> &'static str {
         match self {
@@ -1103,8 +1156,10 @@ fn ethereum_address(network: &str, label: &str) -> String {
     format!("0x{}", &digest_hex(&format!("{network}/address/{label}"))[..40])
 }
 
-/// A deterministic Bitcoin-shaped address for `label` on `network`: a `1` prefix plus
-/// 32 base58 characters, matching `ChainAddress`'s `^[-A-Za-z0-9]{13,74}$`.
+/// A deterministic Bitcoin address for `label` on `network`: a `1` prefix plus 32 base58
+/// characters, which is a string of the shape the chain's base58 encoding fixes
+/// ([`address::is_bitcoin_address`]) and not merely one `ChainAddress`'s
+/// `^[-A-Za-z0-9]{13,74}$` lets through.
 ///
 /// Base58 (and not hex or base64) because a Bitcoin address is base58: the alphabet
 /// excludes `0`, `O`, `I` and `l`, so a fixture address cannot be misread.
@@ -1112,7 +1167,7 @@ fn bitcoin_address(network: &str, label: &str) -> String {
     const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     let digest = Sha256::digest(format!("{network}/address/{label}").as_bytes());
     let mut address = String::from("1");
-    for byte in digest.iter() {
+    for byte in digest.iter().take(32) {
         address.push(BASE58[*byte as usize % BASE58.len()] as char);
     }
     address
