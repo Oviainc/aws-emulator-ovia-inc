@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/ad_configuration.rs"]
 mod ad_configuration;
+#[path = "all/ad_configuration_list.rs"]
+mod ad_configuration_list;
 #[path = "all/batch_get_channel.rs"]
 mod batch_get_channel;
 #[path = "all/batch_get_stream_key.rs"]
