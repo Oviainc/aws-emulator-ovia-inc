@@ -9,8 +9,13 @@
 //! `ResourceNotFoundException` (404) — an empty list would claim the
 //! recommendation exists and has no resources.
 //!
-//! `language` is accepted and does not change the text: the store holds one copy
-//! of each resource's metadata.
+//! `language` selects the localized text of a response — and
+//! `RecommendationResourceSummary` carries none: every member of it is an
+//! identifier, an ARN, a Region code, an enum, a timestamp or the resource's own
+//! metadata VALUES (`smithy_query(query="shape",shape="RecommendationResourceSummary")`),
+//! none of which is prose this service writes. So this operation reports the
+//! same resources whatever `language` asks for, and that is the faithful answer
+//! rather than an accept-and-drop: there is nothing in its output to localize.
 //!
 //! ## Shape of an operation
 //!
