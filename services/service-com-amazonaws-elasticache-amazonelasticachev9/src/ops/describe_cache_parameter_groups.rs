@@ -192,8 +192,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // A group AWS provides exists in every Region, so its ARN names the
-        // Region this request was signed for.
+        // A group AWS provides exists in every Region, and a custom group is
+        // created in one, so the ARN a read reports names the Region this
+        // request was signed for.
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
 
