@@ -299,10 +299,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "Either FleetId or AliasId is required to name the target fleet.".to_string(),
                 ))
             }
-            // An alias is a separate slice that still answers 501, so no alias can have
-            // been created: no stored alias resolves to a fleet.
-            (None, Some(alias_id)) => {
-                return Err(not_found(format!("The alias {alias_id} was not found.")))
+            // "In most situations, you can use an alias ID in place of a fleet ID": an
+            // alias names the fleet its routing strategy points at, so the request is
+            // served on that fleet. A terminal alias "does not resolve to a fleet but
+            // instead can be used to display a message to the user", so it answers the
+            // modelled `TerminalRoutingStrategyException` carrying that message.
+            (None, Some(alias_reference)) => {
+                let Some(alias) = state.resolve_alias(alias_reference) else {
+                    return Err(not_found(format!(
+                        "The alias {alias_reference} was not found."
+                    )));
+                };
+                match alias.routing() {
+                    crate::state::AliasRouting::Fleet(fleet_id) => fleet_id.to_string(),
+                    crate::state::AliasRouting::Terminal(message) => {
+                        return Err(
+                            CreateGameSessionErrorModeled::TerminalRoutingStrategyException(
+                                TerminalRoutingStrategyException {
+                                    message: message.map(str::to_string),
+                                },
+                            )
+                            .into(),
+                        )
+                    }
+                }
             }
             (Some(fleet_id), None) => fleet_id.clone(),
         };
