@@ -108,11 +108,14 @@ pub const MAX_BATCH_DOCUMENTS: usize = 25;
 
 /// The largest single document in the batch, in UTF-8 bytes.
 ///
-/// From the same member documentation: "The maximum size of each document is 5 KB."
-/// A document past it is refused with the `TextSizeLimitExceededException` this
-/// operation declares ("The size of the input text exceeds the limit. Use a smaller
-/// document.").
-pub const MAX_DOCUMENT_BYTES: usize = 5 * 1024;
+/// The same per-document real-time quota a single-document inference call
+/// enforces, [`crate::state::REALTIME_TEXT_QUOTA_BYTES`] — one document's quota
+/// cannot depend on whether it was submitted alone or in a batch. The member
+/// documentation rounds it to "5 KB"; the enforced quota is a count of BYTES, so it
+/// is that constant and not a multiple of 1024. A document past it is refused with
+/// the `TextSizeLimitExceededException` this operation declares ("The size of the
+/// input text exceeds the limit. Use a smaller document.").
+pub const MAX_DOCUMENT_BYTES: usize = crate::state::REALTIME_TEXT_QUOTA_BYTES;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
