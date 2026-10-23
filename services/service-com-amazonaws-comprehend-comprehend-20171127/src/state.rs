@@ -56,6 +56,15 @@
 //! [`DocumentClassifier::document_classifier_properties`] projects it into the
 //! modelled `DocumentClassifierProperties` shape that `ListDocumentClassifiers` and
 //! `DescribeDocumentClassifier` report.
+//!
+//! ## Service-wide rules that are not state
+//!
+//! [`REALTIME_TEXT_QUOTA_BYTES`], [`DOMINANT_LANGUAGE_TEXT_QUOTA_BYTES`] and
+//! [`text_size_refusal`] are the ONE per-document size quota table and the ONE
+//! size-report refusal the real-time (synchronous) inference operations share, so no
+//! two of them can disagree about the quota or about what a refusal tells the
+//! caller. [`request_region`], [`epoch_parts`] and [`datetime_parts`] are the other
+//! service-wide helpers that live here rather than in one operation's file.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1070,8 +1079,9 @@ impl ComAmazonawsComprehendComprehend20171127State {
     /// the store — but only while it still points at that record, because a later
     /// creation may have taken the same token over.
     ///
-    /// The ONE place that invariant is written, for both ways a record leaves:
-    /// a completed deletion and an eviction at the bound.
+    /// The ONE place that invariant is written, for every way a record leaves:
+    /// a completed deletion, an eviction at the bound, and a creation that
+    /// displaces an earlier record under the same ARN.
     fn forget_classifier_token(&mut self, arn: &str, record: Option<DocumentClassifier>) {
         if let Some(token) = record.and_then(|classifier| classifier.client_request_token) {
             if self
@@ -1150,13 +1160,21 @@ impl ComAmazonawsComprehendComprehend20171127State {
     ///
     /// The ONE insertion path for [`Self::document_classifiers`], so the bound
     /// cannot be bypassed by a handler.
+    ///
+    /// A record is keyed by its ARN, so a creation can DISPLACE an earlier record
+    /// with the same name and version. That is the third way a record leaves the
+    /// store, beside a completed deletion and an eviction, and it reclaims the
+    /// displaced record's index entry the same way: without it, a caller repeating
+    /// one creation under fresh tokens would leave one unreachable entry per request
+    /// behind and the index could outgrow the records it points at.
     pub fn insert_document_classifier(&mut self, classifier: DocumentClassifier) {
-        if let Some(token) = classifier.client_request_token.clone() {
-            self.classifier_idempotency_tokens
-                .insert(token, classifier.classifier_arn.clone());
+        let arn = classifier.classifier_arn.clone();
+        let token = classifier.client_request_token.clone();
+        let displaced = self.document_classifiers.insert(arn.clone(), classifier);
+        self.forget_classifier_token(&arn, displaced);
+        if let Some(token) = token {
+            self.classifier_idempotency_tokens.insert(token, arn);
         }
-        self.document_classifiers
-            .insert(classifier.classifier_arn.clone(), classifier);
         while self.document_classifiers.len() > MAX_DOCUMENT_CLASSIFIER_RECORDS {
             let oldest = self
                 .document_classifiers
@@ -1190,6 +1208,42 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The per-document quota a real-time (synchronous) inference operation accepts, in
+/// UTF-8 bytes, for every one of them EXCEPT `DetectDominantLanguage`.
+///
+/// Comprehend's model states no byte maximum — `CustomerInputString` carries only
+/// `@length min 1`, and the member prose rounds the quota to "5 KB" — so the
+/// enforced value is the published real-time quota, which is a count of BYTES and
+/// not a power-of-two multiple of 1024: a 5001-byte document is refused with
+/// `TextSizeLimitExceededException`, a 5000-byte one is accepted.
+pub const REALTIME_TEXT_QUOTA_BYTES: usize = 5_000;
+
+/// The per-document quota of `DetectDominantLanguage`, in UTF-8 bytes.
+///
+/// Language identification reads a whole document rather than a sentence, so this
+/// operation alone carries the larger published quota (the member prose rounds it
+/// to "100 KB"): a 100001-byte document is refused, a 100000-byte one is accepted.
+pub const DOMINANT_LANGUAGE_TEXT_QUOTA_BYTES: usize = 100_000;
+
+/// The refusal message for a document past `quota_bytes`: `Some(message)` when
+/// `text` exceeds the quota, `None` when it fits.
+///
+/// ONE size check and ONE message for every real-time inference operation, because
+/// the message is built from the REQUEST — it reports the quota that applies and
+/// the submitted document's UTF-8 byte length, which is the pair an adaptive client
+/// re-chunks against — and only the quota differs between operations. Callers pair
+/// it with their own modelled `TextSizeLimitExceededException`, whose HTTP status
+/// (400) and error code the model fixes.
+pub fn text_size_refusal(text: &str, quota_bytes: usize) -> Option<String> {
+    let actual_bytes = text.len();
+    (actual_bytes > quota_bytes).then(|| {
+        format!(
+            "Input text size exceeds limit. Max length of request text allowed is \
+             {quota_bytes} bytes while in this request the text size is {actual_bytes} bytes"
+        )
+    })
 }
 
 /// The region an unsigned request is answered in; emulators default to `us-east-1`

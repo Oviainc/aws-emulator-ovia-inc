@@ -3,8 +3,8 @@
 //! @op BatchDetectDominantLanguage
 //!
 //! IMPLEMENTED. Each document in `TextList` is identified by the same in-process
-//! `whatlang` engine `DetectDominantLanguage` uses — through that operation's
-//! `detect_languages`, so a batch answer and a single-document answer for the same
+//! `lingua` engine `DetectDominantLanguage` uses — through that operation's
+//! `identify_languages`, so a batch answer and a single-document answer for the same
 //! text are the same answer — and is reported at its own zero-based input position.
 //!
 //! ## Shape of an operation
@@ -80,7 +80,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use super::detect_dominant_language::detect_languages;
+use super::detect_dominant_language::identify_languages;
 
 /// The most documents one call may carry.
 ///
@@ -93,14 +93,19 @@ const MAX_BATCH_DOCUMENTS: usize = 25;
 
 /// The largest single document in the batch, in UTF-8 bytes.
 ///
-/// From the same member documentation: "The maximum size of each document is 5 KB."
-/// The ceiling is PER DOCUMENT, so an oversized document is reported as that
+/// The same per-document real-time quota a single-document inference call
+/// enforces, [`crate::state::REALTIME_TEXT_QUOTA_BYTES`] — one document's quota
+/// cannot depend on whether it was submitted alone or in a batch. The member
+/// documentation rounds it to "5 KB"; the enforced quota is a count of BYTES, so it
+/// is that constant and not a multiple of 1024.
+///
+/// The quota is PER DOCUMENT, so an oversized document is reported as that
 /// document's `BatchItemError` rather than failing the whole call: the modelled
 /// `ErrorList` holds "one object for each document that contained an error", and its
 /// companion sentence — "If all of the documents contain an error, the ResultList is
 /// empty" — only describes a reachable response if a document's own failure leaves
 /// the call itself successful.
-const MAX_DOCUMENT_BYTES: usize = 5 * 1024;
+const MAX_DOCUMENT_BYTES: usize = crate::state::REALTIME_TEXT_QUOTA_BYTES;
 
 /// The `BatchItemError$ErrorCode` a document past [`MAX_DOCUMENT_BYTES`] carries: the
 /// screaming-snake-case spelling of the operation's own
@@ -204,26 +209,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both lists are built in input order, so each is "sorted in ascending order
         // by the Index field" and every entry's `Index` is its document's own
         // zero-based position — the only mapping a caller has back to its input.
+        //
+        // Each document is identified through the same `identify_languages` seam the
+        // single-document operation uses, so the engine runs off the async worker and
+        // the `.await` between documents is a yield point: a 25-document batch cannot
+        // hold a runtime worker for the whole call.
         let mut result_list = Vec::new();
         let mut error_list = Vec::new();
-        for (position, text) in input.text_list.iter().enumerate() {
+        for (position, text) in input.text_list.into_iter().enumerate() {
             let index = i32::try_from(position).ok();
-            if text.len() > MAX_DOCUMENT_BYTES {
+            // The ONE size check and the ONE size-report sentence every real-time
+            // inference operation shares; here it is the document's own
+            // `BatchItemError`, whose `Index` already says which document it is.
+            if let Some(message) = crate::state::text_size_refusal(&text, MAX_DOCUMENT_BYTES) {
                 error_list.push(BatchItemError {
                     index,
                     error_code: Some(TEXT_SIZE_LIMIT_ERROR_CODE.to_string()),
-                    error_message: Some(format!(
-                        "Document at index {position} is {} bytes, which exceeds the \
-                         {MAX_DOCUMENT_BYTES} byte limit for one document. Use a smaller \
-                         document.",
-                        text.len()
-                    )),
+                    error_message: Some(message),
                 });
                 continue;
             }
+            let languages = identify_languages(text).await.map_err(|message| {
+                BatchDetectDominantLanguageErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(message),
+                    },
+                )
+            })?;
             result_list.push(BatchDetectDominantLanguageItemResult {
                 index,
-                languages: Some(detect_languages(text)),
+                languages: Some(languages),
             });
         }
 

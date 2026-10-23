@@ -25,6 +25,8 @@ mod dominant_language_jobs;
 mod key_phrases_jobs;
 #[path = "all/pii_entities_jobs.rs"]
 mod pii_entities_jobs;
+#[path = "all/realtime_text_quotas.rs"]
+mod realtime_text_quotas;
 #[path = "all/request_validation.rs"]
 mod request_validation;
 #[path = "all/sentiment_jobs.rs"]
