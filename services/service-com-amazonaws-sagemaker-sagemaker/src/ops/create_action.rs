@@ -151,7 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let region = crate::state::request_region(ctx);
-        let arn = crate::state::resource_arn(&region, "action", &input.action_name);
+        let arn = crate::state::resource_arn(&region, crate::state::ACTION_KIND, &input.action_name);
 
         let mut store = state.lock();
         // The store is bounded, so a caller varying `ActionName` cannot grow it without

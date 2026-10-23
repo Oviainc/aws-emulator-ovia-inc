@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: records the lineage edge `SourceArn` -> `DestinationArn` in
+//! `crate::state`, after refusing an ARN that names no lineage entity this service holds
+//! with the modelled `ResourceNotFound`, and an edge from an entity to itself with a
+//! `ValidationException`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The SCAFFOLDED marker line this file used to carry is gone, because the stub census
+//! (the grep over those lines) must not count this operation as unwritten any more.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +158,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddAssociation"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `AssociationType` selects exactly one member of the modelled
+        // `AssociationEdgeType` enum, which the boundary validator does not enforce, so
+        // anything else is refused here rather than stored as an edge type the model does
+        // not have. The accepted set is the generated `ASSOCIATION_EDGE_TYPE_VALUES`
+        // slice, so the refusal stays in step with the model rather than with a
+        // transcription of it.
+        if let Some(association_type) = input.association_type.as_deref() {
+            if !ASSOCIATION_EDGE_TYPE_VALUES.contains(&association_type) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "AssociationType must be one of {}; got \"{association_type}\".",
+                    ASSOCIATION_EDGE_TYPE_VALUES.join(", ")
+                )));
+            }
+        }
+
+        // An association is an EDGE between two lineage entities: every modelled edge
+        // type ("the source contributed to the destination", "the source generated the
+        // destination", ...) relates two DIFFERENT entities. An entity pointing at itself
+        // is a request-level defect rather than a missing resource, and this operation
+        // models no error for it, so it answers the 400 `ValidationException` the
+        // framework's refusal channel gives. It is settled BEFORE either end is resolved,
+        // so the answer does not turn on whether the entity named twice happens to exist.
+        if input.source_arn == input.destination_arn {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "The source and the destination of an association must be different \
+                 entities; both were \"{}\".",
+                input.source_arn
+            )));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // An association is an edge between STORED entities, so both ends must exist: an
+        // ARN nothing created gets the not-found failure this operation models, never a
+        // 200 recording an edge to nothing. The source is resolved first, so a request
+        // naming two unknown ARNs reports the first end it could not resolve.
+        for (member, arn) in [
+            ("SourceArn", &input.source_arn),
+            ("DestinationArn", &input.destination_arn),
+        ] {
+            if !store.lineage_entity_exists(&region, arn) {
+                return Err(AddAssociationErrorModeled::ResourceNotFound(ResourceNotFound {
+                    message: Some(format!("Could not find {member} \"{arn}\".")),
+                })
+                .into());
+            }
+        }
+
+        let key = (input.source_arn.clone(), input.destination_arn.clone());
+        match store.associations.get_mut(&key) {
+            // The PAIR is an association's identity, so adding one that is already there
+            // records the edge type the latest call asked for rather than filing a second
+            // edge between the same two entities. The first add's instant is kept: that is
+            // when this edge came into being.
+            Some(existing) => existing.association_type = input.association_type.clone(),
+            None => {
+                // The store is bounded, so a caller cannot grow it without end; an add
+                // past the bound answers the limit failure this operation models. Checked
+                // only for a NEW edge, since replacing an existing one adds no entry.
+                if !store.associations_below_quota() {
+                    return Err(AddAssociationErrorModeled::ResourceLimitExceeded(
+                        ResourceLimitExceeded {
+                            message: Some(format!(
+                                "The account-level service limit for lineage associations \
+                                 is {}, with current utilization of {} and a request delta \
+                                 of 1.",
+                                crate::state::ASSOCIATION_QUOTA,
+                                store.associations.len()
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                store.associations.insert(
+                    key,
+                    crate::state::Association {
+                        source_arn: input.source_arn.clone(),
+                        destination_arn: input.destination_arn.clone(),
+                        association_type: input.association_type.clone(),
+                        creation_time: now,
+                    },
+                );
+            }
+        }
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &input.destination_arn, ctx);
+        Ok(AddAssociationOutput {
+            source_arn: Some(input.source_arn),
+            destination_arn: Some(input.destination_arn),
+        })
     }
 }
