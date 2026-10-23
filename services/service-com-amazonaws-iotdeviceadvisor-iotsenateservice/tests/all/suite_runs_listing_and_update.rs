@@ -627,8 +627,8 @@ fn update_rows() -> Vec<(String, Value, Value)> {
 }
 
 /// An update records a NEW configuration version, and every later read observes it: the
-/// new version is the latest, the earlier version stays readable at its own label, and the
-/// identity of the definition does not move.
+/// new version is the latest, the earlier version stays readable at its own label (serving
+/// the one live configuration), and the identity of the definition does not move.
 #[tokio::test]
 async fn an_update_records_a_new_version_a_following_read_observes() {
     let emulator = Emulator::new();
@@ -642,7 +642,10 @@ async fn an_update_records_a_new_version_a_following_read_observes() {
         );
         let id = created.string("suiteDefinitionId");
         let arn = created.string("suiteDefinitionArn");
-        let created_at = created.member("createdAt").clone();
+        let created_at = created
+            .member("createdAt")
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a createdAt timestamp"));
 
         let updated = emulator
             .call(
@@ -679,10 +682,16 @@ async fn an_update_records_a_new_version_a_following_read_observes() {
             "case {case:?}: the name must come from the configuration just stored, got {}",
             updated.body
         );
-        assert_eq!(
-            updated.member("createdAt"),
-            &created_at,
-            "case {case:?}: createdAt is the creation instant and never moves"
+        // For the one live record both timestamps are last-write stamps: an update moves
+        // createdAt past the one the create reported.
+        let updated_created_at = updated
+            .member("createdAt")
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a createdAt timestamp"));
+        assert!(
+            updated_created_at > created_at,
+            "case {case:?}: an update must advance createdAt past {created_at}, got \
+             {updated_created_at}"
         );
         assert!(
             updated.member("lastUpdatedAt").is_number(),
@@ -710,7 +719,8 @@ async fn an_update_records_a_new_version_a_following_read_observes() {
             "case {case:?}: an unqualified read answers the configuration just stored"
         );
 
-        // The version the create minted is still readable, with ITS configuration.
+        // The version the create minted is still readable — and answers the one LIVE
+        // configuration, not the content it was created with.
         let old = emulator
             .call(
                 "GET",
@@ -721,9 +731,9 @@ async fn an_update_records_a_new_version_a_following_read_observes() {
             .await;
         assert_eq!(
             old.member("suiteDefinitionConfiguration"),
-            &initial,
-            "case {case:?}: version v1 must still answer the configuration it was created \
-             with, got {}",
+            &replacement,
+            "case {case:?}: version v1 must answer the CURRENT configuration (a definition \
+             keeps one live configuration), got {}",
             old.body
         );
 

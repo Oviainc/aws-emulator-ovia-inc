@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetScalingPlanResourceForecastData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetScalingPlanResourceForecastData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetScalingPlanResourceForecastData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation answers
+//!
+//! The forecast for ONE scalable resource over ONE time window, in two steps:
+//!
+//! 1. the request's own members are refused first — the forecast window (the documented
+//!    seven-day span and 56-day history limits), the resource coordinates (forecasts are
+//!    issued for an Auto Scaling group's desired capacity and nothing else) and the
+//!    `ForecastDataType` enum — so a bad window is refused whether or not the named plan
+//!    exists;
+//! 2. the clock-owed plan transitions are settled and the data points are reported.
+//!
+//! Step 2 reports no data point, and that is the faithful answer rather than a shortcut:
+//! a data point of this forecast is a value "calculated using historical data points
+//! from a specified CloudWatch load metric" (this operation's own documentation, below).
+//! This emulator ingests no CloudWatch metric data at all, so no load metric has a
+//! history in it and there is nothing for any resource's predicted value to be
+//! calculated FROM — which is why the stored plan cannot change this answer and is not
+//! consulted for it. `Datapoints` is a required member whose list may legitimately be
+//! empty — which is also what AWS answers for a plan whose forecast has not been
+//! computed yet — whereas predicted values invented here would report a computation that
+//! never ran.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +184,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetScalingPlanResourceForecastData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetScalingPlanResourceForecastDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal)?;
+        let now = ::std::time::SystemTime::now();
+
+        // The request's own members are refused BEFORE any lookup: none of these
+        // refusals depends on what this service holds, so a request AWS would not
+        // accept is refused here whether or not the named plan exists.
+        crate::state::one_of(
+            "ForecastDataType",
+            &input.forecast_data_type,
+            FORECAST_DATA_TYPE_VALUES,
+        )
+        .map_err(validation)?;
+        validate_forecast_window(input.start_time, input.end_time, now).map_err(validation)?;
+        validate_forecast_resource(&input).map_err(validation)?;
+
+        let mut state = state.lock();
+        // Clock-owed work first, so this read reports the state the clock already made
+        // due (a plan whose creation or deletion came due) rather than a stale one.
+        state.settle_due(now);
+
+        // The forecast carries no data point, and that is the whole of this answer.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetScalingPlanResourceForecastData"))
+        // A data point here is a "predicted value … calculated using historical data
+        // points from a specified CloudWatch load metric" (this operation's own
+        // documentation). This emulator ingests no CloudWatch metric data, so no load
+        // metric — including the one a scaling instruction of a stored plan names —
+        // has a history in it for a predicted value to be calculated FROM. There is
+        // therefore nothing for the stored plan to contribute: the forecast over the
+        // requested window is empty for a resource this service covers and for one it
+        // does not alike, so the plan is deliberately NOT looked up to decide it.
+        // `Datapoints` is a required member whose list may legitimately be empty —
+        // which is also what AWS answers while a plan's forecast has not been computed
+        // yet — and this operation models NO not-found error
+        // (`smithy_query(query="operation",operation="GetScalingPlanResourceForecastData")`
+        // binds only `InternalServiceException` and `ValidationException`), so a plan
+        // this service does not hold is reported the same way, exactly as
+        // `DescribeScalingPlanResources` reports a miss as an empty page. Synthesising
+        // values here would report a computation that never ran.
+        let datapoints: Vec<Datapoint> = Vec::new();
+
+        Ok(GetScalingPlanResourceForecastDataOutput { datapoints })
     }
+}
+
+/// The only `ServiceNamespace` this operation forecasts for.
+///
+/// `GetScalingPlanResourceForecastDataRequest$ServiceNamespace`: "The namespace of the
+/// AWS service. The only valid value is autoscaling."
+pub const FORECAST_SERVICE_NAMESPACE: &str = "autoscaling";
+
+/// The only `ScalableDimension` this operation forecasts for.
+///
+/// `GetScalingPlanResourceForecastDataRequest$ScalableDimension`: "The scalable
+/// dimension for the resource. The only valid value is
+/// autoscaling:autoScalingGroup:DesiredCapacity."
+pub const FORECAST_SCALABLE_DIMENSION: &str = "autoscaling:autoScalingGroup:DesiredCapacity";
+
+/// The widest forecast window a caller may ask for, in days.
+///
+/// `GetScalingPlanResourceForecastDataRequest$EndTime`: "The maximum time duration
+/// between the start and end time is seven days."
+pub const MAX_FORECAST_WINDOW_DAYS: i64 = 7;
+
+/// How far back a forecast window may start, in days.
+///
+/// `GetScalingPlanResourceForecastDataRequest$StartTime`: "The date and time can be at
+/// most 56 days before the current date and time." The operation's own documentation
+/// states the same limit from the other side: "Data points are available for up to 56
+/// days."
+pub const MAX_FORECAST_HISTORY_DAYS: i64 = 56;
+
+/// Seconds in a day, for turning the two documented day counts into a span.
+const SECONDS_PER_DAY: i64 = 86_400;
+
+/// A modelled `TimestampType` as whole nanoseconds since the epoch, so two instants
+/// compare at the full precision the wire carries.
+fn epoch_nanos(at: ::aws_smithy_types::DateTime) -> i128 {
+    i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos())
+}
+
+/// `days` as a span in nanoseconds.
+fn days_in_nanos(days: i64) -> i128 {
+    i128::from(days) * i128::from(SECONDS_PER_DAY) * 1_000_000_000
+}
+
+/// The forecast window a caller asked for, refused where it is not one AWS issues
+/// forecast data over.
+///
+/// `StartTime` is "the inclusive start time" and `EndTime` "the exclusive end time" of a
+/// time range, so an end at or before the start spans no time at all; the two day counts
+/// are the documented limits on the range's width and on how far back it may reach.
+/// `Err` carries the refusal message naming the member and the constraint it broke.
+fn validate_forecast_window(
+    start_time: ::aws_smithy_types::DateTime,
+    end_time: ::aws_smithy_types::DateTime,
+    now: ::std::time::SystemTime,
+) -> Result<(), String> {
+    let start = epoch_nanos(start_time);
+    let end = epoch_nanos(end_time);
+    if end <= start {
+        return Err(
+            "EndTime must be later than StartTime: StartTime is the inclusive start and \
+             EndTime the exclusive end of the forecast window"
+                .to_string(),
+        );
+    }
+    if end - start > days_in_nanos(MAX_FORECAST_WINDOW_DAYS) {
+        return Err(format!(
+            "The maximum time duration between the start and end time is \
+             {MAX_FORECAST_WINDOW_DAYS} days"
+        ));
+    }
+    if epoch_nanos(::aws_smithy_types::DateTime::from(now)) - start
+        > days_in_nanos(MAX_FORECAST_HISTORY_DAYS)
+    {
+        return Err(format!(
+            "StartTime can be at most {MAX_FORECAST_HISTORY_DAYS} days before the current \
+             date and time"
+        ));
+    }
+    Ok(())
+}
+
+/// The scalable resource a caller asked a forecast for.
+///
+/// Capacity forecasts are issued for one kind of scalable resource — an Auto Scaling
+/// group's desired capacity, the only value either enum member documents — and the
+/// resource id has to identify a resource of that kind, which is the same rule a scaling
+/// instruction's own `ResourceId` satisfies (`crate::state::validate_resource_id`). A
+/// triple that describes no such resource is refused with the sentence this service uses
+/// for every such triple.
+fn validate_forecast_resource(
+    input: &GetScalingPlanResourceForecastDataInput,
+) -> Result<(), String> {
+    if input.service_namespace != FORECAST_SERVICE_NAMESPACE
+        || input.scalable_dimension != FORECAST_SCALABLE_DIMENSION
+    {
+        return Err(crate::state::UNSUPPORTED_RESOURCE.to_string());
+    }
+    crate::state::validate_resource_id(&input.resource_id, &input.scalable_dimension)
+}
+
+/// This operation's own modelled `ValidationException` (HTTP 400), naming what the
+/// caller has to change.
+fn validation(message: impl Into<String>) -> GetScalingPlanResourceForecastDataError {
+    GetScalingPlanResourceForecastDataErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The service's state is unreachable: a server fault, never a client error.
+fn internal() -> GetScalingPlanResourceForecastDataError {
+    GetScalingPlanResourceForecastDataErrorModeled::InternalServiceException(
+        InternalServiceException {
+            message: Some("the scaling-plan store is unavailable".to_string()),
+        },
+    )
+    .into()
 }

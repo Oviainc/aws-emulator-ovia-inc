@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds tags to an SWF domain: the tags the request carries are merged into the stored
+//! domain's own tag list under one lock — a key the domain already carries takes the
+//! new value, a key it does not is appended — so `ListTagsForResource` reads back
+//! exactly what this call wrote. An ARN that resolves to no stored domain is the
+//! modelled `UnknownResourceFault`, and a merge that would leave the domain above the
+//! documented maximum of 50 tags is the modelled `TooManyTagsFault`, storing nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +70,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::collections::BTreeMap;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -161,20 +161,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The caller-chosen batch is bounded BEFORE any work proportional to it, and
+        // before the store lock is taken: "Amazon SWF supports a maximum of 50 tags per
+        // resource", so a request carrying more than that many tags can only ever exceed
+        // the maximum, whatever the domain already holds. Refusing it here is what keeps
+        // the merge below O(number of tags) and the critical section short.
+        if input.tags.len() > crate::state::MAX_TAGS_PER_DOMAIN {
+            return Err(TagResourceErrorModeled::TooManyTagsFault(TooManyTagsFault {
+                message: Some(format!(
+                    "The request carries {} tags, above the maximum of {} per resource",
+                    input.tags.len(),
+                    crate::state::MAX_TAGS_PER_DOMAIN
+                )),
+            })
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // The model declares no server fault for this operation, and
+            // `OperationNotPermittedFault` is this service's common error: the request
+            // cannot be served, and saying so with a modelled code beats a 501, which
+            // would claim the operation is unwritten.
+            TagResourceErrorModeled::OperationNotPermittedFault(OperationNotPermittedFault {
+                message: Some("the SWF domain store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut guard = state.lock();
+        // The resource is addressed by its WHOLE ARN, the same way
+        // `ListTagsForResource` resolves one: that is what scopes the lookup to the
+        // domain's region and account, so one region's ARN never tags a same-named
+        // domain registered in another.
+        let named = crate::state::domain_name_from_arn(&input.resource_arn).map(str::to_string);
+        let stored = named.and_then(|name| guard.domains.get_mut(&name));
+        let Some(domain) = stored.filter(|domain| domain.arn == input.resource_arn) else {
+            return Err(TagResourceErrorModeled::UnknownResourceFault(
+                UnknownResourceFault {
+                    message: Some(unknown_resource_message(&input.resource_arn)),
+                },
+            )
+            .into());
+        };
+
+        // "Add a tag to a Amazon SWF domain": a tag is identified by its key, so a key
+        // the domain already carries takes the value this request names rather than
+        // appearing twice, and a key it does not carry is added. The merge is keyed by
+        // tag key — one map lookup per request tag, never a scan of the stored list — and
+        // is computed first and stored only if it holds, so a refused request leaves the
+        // domain's tags exactly as they were.
+        let mut positions: BTreeMap<&str, usize> = domain
+            .tags
+            .iter()
+            .enumerate()
+            .map(|(position, stored)| (stored.key.as_str(), position))
+            .collect();
+        let mut merged = domain.tags.clone();
+        for tag in &input.tags {
+            match positions.get(tag.key.as_str()) {
+                Some(&position) => merged[position].value = tag.value.clone(),
+                None => {
+                    merged.push(tag.clone());
+                    // The borrow of `domain.tags` ends with `positions`, so the key is
+                    // taken from the request's own tag, which outlives this loop.
+                    positions.insert(tag.key.as_str(), merged.len() - 1);
+                }
+            }
+        }
+        // The merged TOTAL is the authoritative bound: a request within the batch limit
+        // can still carry the domain past the documented maximum, which the modelled
+        // `TooManyTagsFault` ("You've exceeded the number of tags allowed for a domain")
+        // is what refuses.
+        if merged.len() > crate::state::MAX_TAGS_PER_DOMAIN {
+            return Err(TagResourceErrorModeled::TooManyTagsFault(TooManyTagsFault {
+                message: Some(format!(
+                    "The domain would carry {} tags, above the maximum of {} per resource",
+                    merged.len(),
+                    crate::state::MAX_TAGS_PER_DOMAIN
+                )),
+            })
+            .into());
+        }
+        domain.tags = merged;
+
+        Ok(TagResourceOutput)
+    }
+}
+
+/// The `UnknownResourceFault` message for an ARN that names no stored domain.
+///
+/// Built from the request, in the same form the sibling tag read answers with: a
+/// well-formed SWF domain ARN names the domain the caller asked about, and a string that
+/// is not one names no domain at all, so the message reports what was asked for.
+fn unknown_resource_message(resource_arn: &str) -> String {
+    match crate::state::domain_name_from_arn(resource_arn) {
+        Some(name) => format!("Unknown domain: {name}"),
+        None => format!("Unknown resource: {resource_arn}"),
     }
 }

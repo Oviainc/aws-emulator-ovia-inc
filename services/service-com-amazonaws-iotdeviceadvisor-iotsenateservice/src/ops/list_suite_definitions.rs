@@ -183,14 +183,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some((_, definition)) = remaining.next() else {
                 break;
             };
-            let config = definition.configuration(None);
+            let config = &definition.configuration;
             page.push(SuiteDefinitionInformation {
                 suite_definition_id: Some(definition.id.clone()),
-                suite_definition_name: config.map(|c| c.suite_definition_name.clone()),
-                default_devices: config.and_then(|c| c.devices.clone()),
-                intended_for_qualification: config.and_then(|c| c.intended_for_qualification),
-                is_long_duration_test: config.and_then(|c| c.is_long_duration_test),
-                protocol: config.and_then(|c| c.protocol.clone()),
+                suite_definition_name: Some(config.suite_definition_name.clone()),
+                default_devices: config.devices.clone(),
+                intended_for_qualification: config.intended_for_qualification,
+                is_long_duration_test: config.is_long_duration_test,
+                protocol: config.protocol.clone(),
                 created_at: Some(definition.created_at.into()),
             });
         }

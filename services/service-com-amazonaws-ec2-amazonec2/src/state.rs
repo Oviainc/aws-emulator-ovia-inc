@@ -99,6 +99,17 @@
 //! Keyed by `VolumeId` in a [`BTreeMap`], the same stable order the VPC and subnet stores
 //! are kept in, so a pagination token can name the id the next page starts at.
 //!
+//! ## BYOIP address ranges
+//!
+//! [`ComAmazonawsEc2Amazonec2State::byoip_cidrs`] holds the address ranges the account has
+//! brought to AWS as [`ByoipCidrRecord`]s: the modelled [`ByoipCidr`] every operation that
+//! reports one answers with, plus the release the clock owes a range a
+//! `DeprovisionByoipCidr` has started ([`ByoipCidrRecord::released_at`], on the same monotonic
+//! clock and the same [`TRANSITION_DELAY`] as a `pending` VPC's `available` move). Keyed by
+//! the range itself in its canonical form ([`canonical_byoip_cidr`]), because the range IS
+//! the name the API takes — every BYOIP operation is addressed by `Cidr`, not by a minted id
+//! — which also gives the describe path one stable order.
+//!
 //! ## Elastic IP addresses
 //!
 //! [`ComAmazonawsEc2Amazonec2State::addresses`] holds the account's Elastic IP addresses
@@ -242,7 +253,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     Address, ApplicationStatus, ApplicationStatusDetail, AvailabilityZone,
-    AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates, CapacityBlock,
+    AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates, ByoipCidr,
+    CapacityBlock,
     CreateVolumeOutput, DescribeFastLaunchImagesSuccessItem, DisableFastLaunchOutput,
     EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
     Instance, InstanceApplicationStatus,
@@ -946,6 +958,10 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateVolume` `ClientToken` and the volume id it minted, so a repeat of the
     /// same request answers with that volume instead of creating a second one.
     pub volume_client_tokens: HashMap<String, String>,
+    /// Every BYOIP address range the account holds, by the range itself in canonical form
+    /// — see the module docs. Ordered by that key, which is the order a describe of them
+    /// reports and pages over.
+    pub byoip_cidrs: BTreeMap<String, ByoipCidrRecord>,
     /// Every customer-owned IP (CoIP) address pool the account holds, by `PoolId`, as the
     /// modelled `CoipPool` shape itself — so every member a writer sets round-trips through
     /// `DescribeCoipPools` without a field-by-field copy. Ordered by id in a [`BTreeMap`],
@@ -1050,6 +1066,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             id_counter: 0,
             volumes: BTreeMap::new(),
             volume_client_tokens: HashMap::new(),
+            byoip_cidrs: BTreeMap::new(),
             coip_pools: BTreeMap::new(),
             capacity_blocks: BTreeMap::new(),
             application_status: BTreeMap::new(),
@@ -2005,11 +2022,13 @@ impl ComAmazonawsEc2Amazonec2State {
     /// A reporting operation may call this: each move was already owed at this
     /// instant whether or not anybody asked, so materialising it changes nothing
     /// a later caller would otherwise have seen. It covers every resource kind that
-    /// has one — an instance's next state, a `pending` VPC becoming `available`
-    /// with its IPv6 association moving `associating` -> `associated`, a `pending`
-    /// subnet becoming `available`, a `pending` transit gateway with the route tables that
-    /// come up with it, and a Windows fast launch configuration reaching `enabled` or
-    /// finishing the cleanup a disable started.
+    /// has one — an instance's next state, a `pending` VPC becoming `available` with
+    /// its IPv6 association moving `associating` -> `associated`, a `pending` subnet
+    /// becoming `available`, a `pending` transit gateway with the route tables that come up
+    /// with it, a Windows fast launch configuration reaching `enabled` or finishing the
+    /// cleanup a disable started, and a `pending-deprovision` BYOIP range reaching the end
+    /// of its release — leaving the account, or landing in `failed-deprovision` when
+    /// addresses are still allocated from it.
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         for instance in self.instances.values_mut() {
@@ -2056,6 +2075,44 @@ impl ComAmazonawsEc2Amazonec2State {
             // The transition is applied once; nothing is owed on this subnet any more.
             false
         });
+        // The end of a release `DeprovisionByoipCidr` started: at its due instant the
+        // range either stops being one of the account's ranges or lands in
+        // `failed-deprovision`, whether or not anybody called again.
+        //
+        // Which of the two is decided HERE, at the due instant, from the addresses the
+        // account holds out of the range THEN: "Ensure that all EIPs from the range have
+        // been deallocated and try again" (`ByoipCidrState`'s `failed-deprovision`) is a
+        // question about the end of the release, so a caller that gives an address back
+        // while the range is `pending-deprovision` still gets its release.
+        let due: Vec<String> = self
+            .byoip_cidrs
+            .iter()
+            .filter(|(_, record)| {
+                record
+                    .released_at
+                    .is_some_and(|released_at| now >= released_at)
+            })
+            .map(|(cidr, _)| cidr.clone())
+            .collect();
+        for cidr in due {
+            let held = self.addresses_in_byoip_cidr(&cidr);
+            if held.is_empty() {
+                // The release succeeded: the range is not one of the account's any more.
+                self.byoip_cidrs.remove(&cidr);
+                continue;
+            }
+            // "failed-deprovision: The request to deprovision the address range was
+            // unsuccessful" (`ByoipCidrState`) — the range stays the account's, carrying
+            // why in its `StatusMessage` ("Otherwise, contains an error message",
+            // `ByoipCidr$StatusMessage`), and can be released again once the caller has
+            // cleared what held it.
+            let reason = byoip_cidr_release_failure(&held);
+            if let Some(record) = self.byoip_cidrs.get_mut(&cidr) {
+                record.released_at = None;
+                record.byoip_cidr.state = Some(BYOIP_CIDR_STATE_FAILED_DEPROVISION.to_string());
+                record.byoip_cidr.status_message = Some(reason);
+            }
+        }
         let transit_gateways = &mut self.transit_gateways;
         let route_tables = &mut self.transit_gateway_route_tables;
         self.transit_gateway_available_at
@@ -5062,6 +5119,216 @@ impl ComAmazonawsEc2Amazonec2State {
         Some(vpc)
     }
 }
+
+// ---------------------------------------------------------------------------
+// BYOIP address ranges
+// ---------------------------------------------------------------------------
+
+/// `ByoipCidrState` of a range AWS has finished provisioning and will advertise on
+/// request.
+pub const BYOIP_CIDR_STATE_PROVISIONED: &str = "provisioned";
+
+/// `ByoipCidrState` of a provisioned range the account asked AWS not to advertise
+/// ("PubliclyAdvertisable ... Default: true", `ProvisionByoipCidrRequest`).
+pub const BYOIP_CIDR_STATE_PROVISIONED_NOT_PUBLICLY_ADVERTISABLE: &str =
+    "provisioned-not-publicly-advertisable";
+
+/// `ByoipCidrState` of a range whose provisioning did not complete.
+pub const BYOIP_CIDR_STATE_FAILED_PROVISION: &str = "failed-provision";
+
+/// `ByoipCidrState` of a range whose release did not complete.
+pub const BYOIP_CIDR_STATE_FAILED_DEPROVISION: &str = "failed-deprovision";
+
+/// `ByoipCidrState` of a range whose release is under way.
+pub const BYOIP_CIDR_STATE_PENDING_DEPROVISION: &str = "pending-deprovision";
+
+/// `ByoipCidrState` of a range AWS is advertising to the internet.
+pub const BYOIP_CIDR_STATE_ADVERTISED: &str = "advertised";
+
+/// The `ByoipCidrState`s an address range can be RELEASED from.
+///
+/// "Before you can release an address range, you must stop advertising it and you must not
+/// have any IP addresses allocated from its address range" (`DeprovisionByoipCidr`) — so a
+/// range AWS is advertising, or one part way through a move the clock has not finished
+/// (`pending-advertising`, `pending-withdrawal`, `pending-provision`,
+/// `pending-deprovision`), is not releasable: the caller has to wait for or undo that
+/// first. What is left are the states where the range is the account's and sitting still:
+/// it finished provisioning (`provisioned`, or
+/// `provisioned-not-publicly-advertisable` when the account asked for it not to be
+/// advertised), or a provision or an earlier release of it failed and the range is the
+/// caller's to clear (`failed-provision`, `failed-deprovision`). Every word here is one of
+/// `ByoipCidrState`'s own values (`BYOIP_CIDR_STATE_VALUES` in `ops::types`).
+pub const RELEASABLE_BYOIP_CIDR_STATES: &[&str] = &[
+    BYOIP_CIDR_STATE_PROVISIONED,
+    BYOIP_CIDR_STATE_PROVISIONED_NOT_PUBLICLY_ADVERTISABLE,
+    BYOIP_CIDR_STATE_FAILED_PROVISION,
+    BYOIP_CIDR_STATE_FAILED_DEPROVISION,
+];
+
+/// Can an address range in `state` be released? See [`RELEASABLE_BYOIP_CIDR_STATES`].
+pub fn byoip_cidr_state_is_releasable(state: &str) -> bool {
+    RELEASABLE_BYOIP_CIDR_STATES.contains(&state)
+}
+
+/// One BYOIP address range the account holds: the modelled [`ByoipCidr`] every operation
+/// that reports one answers with, plus the release the clock owes it, if any.
+///
+/// The state word lives on the modelled shape rather than beside it, so a range reports
+/// one state however it is read; only the release, which no member of [`ByoipCidr`]
+/// carries, is stored next to it.
+#[derive(Debug, Clone)]
+pub struct ByoipCidrRecord {
+    /// The range as the model shapes it.
+    pub byoip_cidr: ByoipCidr,
+    /// When the release of a `pending-deprovision` range ends, for a range a
+    /// `DeprovisionByoipCidr` has started; `None` for a range nobody is releasing.
+    ///
+    /// Monotonic ([`Instant`]), like [`VolumeRecord::available_at`] and
+    /// [`ComAmazonawsEc2Amazonec2State::vpc_available_at`], because it is only ever
+    /// compared against the clock and never reported, so a wall-clock adjustment cannot
+    /// resurrect a released range. WHAT the release ends as is NOT stored: it is decided at
+    /// the due instant, in
+    /// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`], from the addresses
+    /// the account holds out of the range then.
+    pub released_at: Option<Instant>,
+}
+
+impl ByoipCidrRecord {
+    /// A range sitting in `state`, with nothing owed to it by the clock.
+    pub fn in_state(cidr: &str, state: &str) -> Self {
+        Self {
+            byoip_cidr: ByoipCidr {
+                cidr: Some(cidr.to_string()),
+                state: Some(state.to_string()),
+                ..ByoipCidr::default()
+            },
+            released_at: None,
+        }
+    }
+
+    /// The range's current `ByoipCidrState`.
+    pub fn state(&self) -> &str {
+        self.byoip_cidr.state.as_deref().unwrap_or_default()
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Store `record` as the account's range for the `Cidr` it carries, replacing whatever
+    /// range that CIDR named before.
+    ///
+    /// The key is the range in the CANONICAL form the store documents
+    /// ([`canonical_byoip_cidr`]), taken here rather than trusted from the caller, so a
+    /// writer that stores `192.0.2.5/24` cannot create a range no lookup can name. A record
+    /// carrying no `Cidr`, or one that is not an address range at all, names no range the
+    /// API can address — every BYOIP operation is addressed by `Cidr` — so there is no key
+    /// to file it under and it is not stored.
+    pub fn insert_byoip_cidr(&mut self, record: ByoipCidrRecord) {
+        let Some(cidr) = record
+            .byoip_cidr
+            .cidr
+            .as_deref()
+            .and_then(|cidr| canonical_byoip_cidr(cidr).ok())
+        else {
+            return;
+        };
+        self.byoip_cidrs.insert(cidr, record);
+    }
+
+    /// Start releasing the range `cidr`: move it to `pending-deprovision` and record when
+    /// the release ends, answering the range as the caller is told about it.
+    ///
+    /// The release is NOT applied here. "Releases the specified address range"
+    /// (`DeprovisionByoipCidr`) is work AWS reports as under way — the range comes back in
+    /// a non-terminal state — so it ends [`TRANSITION_DELAY`] later, through
+    /// [`Self::materialize_due_transitions`], which is also where WHAT it ends as is
+    /// decided; a caller that asks again immediately still sees the `pending-deprovision`
+    /// range.
+    pub fn begin_byoip_cidr_release(&mut self, cidr: &str) -> Option<ByoipCidr> {
+        let record = self.byoip_cidrs.get_mut(cidr)?;
+        record.byoip_cidr.state = Some(BYOIP_CIDR_STATE_PENDING_DEPROVISION.to_string());
+        record.byoip_cidr.status_message = None;
+        record.released_at = Some(Instant::now() + TRANSITION_DELAY);
+        Some(record.byoip_cidr.clone())
+    }
+
+    /// The allocation ids of the account's Elastic IP addresses that come out of the
+    /// address range `cidr`, in id order.
+    ///
+    /// "You must not have any IP addresses allocated from its address range"
+    /// (`DeprovisionByoipCidr`) is a question about the addresses the account HOLDS, so it
+    /// is answered from the address store rather than from a counter on the range.
+    ///
+    /// An Elastic IP address is IPv4 ([`Address::public_ip`] is a dotted quad), so an IPv6
+    /// range holds none: [`ipv4_cidr_block_contains`] reads no bounds for an IPv6 `cidr`
+    /// and answers `false`, which is why the IPv6 case needs no arm of its own here.
+    pub fn addresses_in_byoip_cidr(&self, cidr: &str) -> Vec<String> {
+        debug_assert!(
+            cidr.contains('/'),
+            "addresses_in_byoip_cidr takes an address range, got {cidr:?}"
+        );
+        self.addresses
+            .iter()
+            .filter(|(_, address)| {
+                address.public_ip.as_deref().is_some_and(|public_ip| {
+                    ipv4_cidr_block_contains(cidr, &format!("{public_ip}/32"))
+                })
+            })
+            .map(|(allocation_id, _)| allocation_id.clone())
+            .collect()
+    }
+}
+
+/// The `StatusMessage` a release that failed because addresses are still allocated out of
+/// the range carries: "Ensure that all EIPs from the range have been deallocated and try
+/// again" (`ByoipCidrState`'s `failed-deprovision`), naming the allocations that held it so
+/// the caller can clear them from this text alone.
+///
+/// Built from the store, never from a recording, and the ONE wording of that outcome.
+pub fn byoip_cidr_release_failure(held: &[String]) -> String {
+    format!(
+        "Deprovisioning failed: {count} Elastic IP address(es) are still allocated from this \
+         address range ({allocations}). Deallocate them and try again.",
+        count = held.len(),
+        allocations = held.join(", "),
+    )
+}
+
+/// `value` as an address range in the canonical form this store keys its BYOIP ranges by:
+/// an IPv4 or an IPv6 CIDR block with its host bits cleared.
+///
+/// BYOIP covers both families — "We recommend that you stop advertising the BYOIP CIDR from
+/// other locations before you advertise it through Amazon" and the IPv6 notes on
+/// `ProvisionByoipCidr` — so a range is whichever of the two it parses as, read by the same
+/// canonicalisers the VPC and subnet paths use. Deliberately NO prefix-length rule: the
+/// sizes AWS accepts for a range brought from a caller's own allocation are documented
+/// nowhere the model carries, and a bound invented here would refuse ranges AWS accepts
+/// (the same reason [`canonical_ipv6_cidr`] states none).
+pub fn canonical_byoip_cidr(value: &str) -> Result<String, CidrProblem> {
+    canonical_ipv4_cidr(value).or_else(|_| canonical_ipv6_cidr(value))
+}
+
+/// EC2's error code for an address range the request named that the account has not
+/// brought to AWS, so there is no range to act on.
+pub const INVALID_CIDR_NOT_FOUND: &str = "InvalidCidr.NotFound";
+
+/// Refuse an address range this account has not provisioned: HTTP 400
+/// `InvalidCidr.NotFound`.
+///
+/// The message names the range the request asked about, in EC2's own "the value you sent,
+/// in parentheses" form, so the caller can tell which of several ranges was not found from
+/// the text alone.
+pub fn invalid_cidr_not_found<E>(cidr: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CIDR_NOT_FOUND,
+        400,
+        format!("The CIDR ({cidr}) does not exist."),
+    )
+}
+
+// The error code and refusal for a resource whose current state does not admit the request
+// — "The resource is not in the correct state for the request" (EC2 API error codes) — are
+// `INCORRECT_STATE` / `incorrect_state`, declared with the fast launch codes below;
+// `DeprovisionByoipCidr`'s state refusal uses that one rather than a second copy.
 
 // ---------------------------------------------------------------------------
 // Capacity Blocks
