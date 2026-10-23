@@ -614,7 +614,9 @@ use crate::ops::types::{
     PlacementGroup,
     PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry, ProductCode,
-    Region, RequestLaunchTemplateData, RouteServer, RunInstancesOutput, SecondaryNetwork,
+    Region, RequestLaunchTemplateData, RouteServer, RouteServerBfdStatus,
+    RouteServerBgpOptions, RouteServerBgpStatus, RouteServerEndpoint, RouteServerPeer,
+    RunInstancesOutput, SecondaryNetwork,
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
     SpotPlacementScore, StateReason,
@@ -1514,6 +1516,20 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs. Ordered by endpoint id, which is the order
     /// `DescribeVpcEndpointConnections` reports and pages over.
     pub vpc_endpoint_connections: BTreeMap<String, VpcEndpointConnection>,
+    /// Every route server endpoint the account holds, by `RouteServerEndpointId`, as the
+    /// modelled [`RouteServerEndpoint`] shape itself, keyed and ordered like
+    /// [`Self::route_servers`].
+    pub route_server_endpoints: BTreeMap<String, RouteServerEndpoint>,
+    /// When each route server endpoint's `pending` -> `available` transition falls due.
+    pub route_server_endpoint_available_at: BTreeMap<String, Instant>,
+    /// A `CreateRouteServerEndpoint` `ClientToken` and the `RouteServerEndpointId` that
+    /// request minted.
+    pub route_server_endpoint_client_tokens: HashMap<String, String>,
+    /// Every route server peer the account holds, by `RouteServerPeerId`, as the modelled
+    /// [`RouteServerPeer`] shape itself, keyed and ordered like [`Self::route_servers`].
+    pub route_server_peers: BTreeMap<String, RouteServerPeer>,
+    /// When each route server peer's `pending` -> `available` transition falls due.
+    pub route_server_peer_available_at: BTreeMap<String, Instant>,
     /// The account's Allowed AMIs setting in each Region a caller has configured it in, by
     /// Region name — see the module docs. A Region with no entry has the setting an account
     /// that never enabled the feature has ([`AllowedImagesSettings::default`]), so a read
@@ -1724,6 +1740,11 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
+            route_server_endpoints: BTreeMap::new(),
+            route_server_endpoint_available_at: BTreeMap::new(),
+            route_server_endpoint_client_tokens: HashMap::new(),
+            route_server_peers: BTreeMap::new(),
+            route_server_peer_available_at: BTreeMap::new(),
             allowed_images_settings: BTreeMap::new(),
             fpga_images: BTreeMap::new(),
             fpga_image_client_tokens: HashMap::new(),
@@ -2715,8 +2736,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// has one — an instance's next state, a `pending` VPC becoming `available` with
     /// its IPv6 association moving `associating` -> `associated`, a `pending` subnet
     /// becoming `available`, a `pending` transit gateway with the route tables that come up
-    /// with it, a VPC BPA exclusion reaching `create-complete`, a Windows fast launch
-    /// configuration reaching `enabled` or finishing the cleanup a disable started, a
+    /// with it, a `pending` route server endpoint or route server peer becoming
+    /// `available` (a route server's own two states are derived on read by
+    /// [`RouteServerRecord::view_at`] instead), a VPC BPA exclusion reaching
+    /// `create-complete`, a Windows fast
+    /// launch configuration reaching `enabled` or finishing the cleanup a disable started, a
     /// `pending-withdrawal` BYOIP range reaching the end of its withdrawal, and a
     /// `pending-deprovision` BYOIP range reaching the end of its release — leaving the
     /// account, or landing in `failed-deprovision` when addresses are still allocated from
@@ -2867,6 +2891,37 @@ impl ComAmazonawsEc2Amazonec2State {
                     }
                 }
                 // The transition is applied once; nothing is owed on this gateway any more.
+                false
+            });
+        // A route server, its endpoints and its peers come up the same way: each is
+        // answered in the non-terminal `pending` state its create hands back, so the clock
+        // owes it `available` one TRANSITION_DELAY later whether or not anybody calls
+        // again. A route server whose create asked for route persistence is `enabling` it
+        // over exactly that span, so it reaches `enabled` on the same instant.
+        let route_server_endpoints = &mut self.route_server_endpoints;
+        self.route_server_endpoint_available_at
+            .retain(|route_server_endpoint_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(endpoint) = route_server_endpoints.get_mut(route_server_endpoint_id) {
+                    if endpoint.state.as_deref() == Some(ROUTE_SERVER_ENDPOINT_STATE_PENDING) {
+                        endpoint.state = Some(ROUTE_SERVER_ENDPOINT_STATE_AVAILABLE.to_string());
+                    }
+                }
+                false
+            });
+        let route_server_peers = &mut self.route_server_peers;
+        self.route_server_peer_available_at
+            .retain(|route_server_peer_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(peer) = route_server_peers.get_mut(route_server_peer_id) {
+                    if peer.state.as_deref() == Some(ROUTE_SERVER_PEER_STATE_PENDING) {
+                        peer.state = Some(ROUTE_SERVER_PEER_STATE_AVAILABLE.to_string());
+                    }
+                }
                 false
             });
         self.fast_launch_images.retain(|_image_id, record| {
@@ -14375,6 +14430,312 @@ impl ComAmazonawsEc2Amazonec2State {
         self.snapshot_block_public_access = state;
         self.snapshot_block_public_access
     }
+}
+
+// ---------------------------------------------------------------------------
+// Route server ENDPOINTS and their BGP peers
+// ---------------------------------------------------------------------------
+//
+// The route servers these hang off are the "Route servers" section above
+// ([`RouteServerRecord`]); an endpoint and a peer are stored as the modelled shapes
+// themselves, with the one non-terminal state each has moved by the clock sweep.
+
+/// A route server endpoint still coming up: `RouteServerEndpointState`'s `pending`.
+pub const ROUTE_SERVER_ENDPOINT_STATE_PENDING: &str = "pending";
+
+/// A route server endpoint that is usable: `RouteServerEndpointState`'s `available`.
+pub const ROUTE_SERVER_ENDPOINT_STATE_AVAILABLE: &str = "available";
+
+/// A route server peer still coming up: `RouteServerPeerState`'s `pending`.
+pub const ROUTE_SERVER_PEER_STATE_PENDING: &str = "pending";
+
+/// A route server peer whose session is configured: `RouteServerPeerState`'s `available`.
+pub const ROUTE_SERVER_PEER_STATE_AVAILABLE: &str = "available";
+
+/// The liveness detection protocol a peer gets when the request names none: "Defaults to
+/// `bgp-keepalive`" (`RouteServerBgpOptionsRequest$PeerLivenessDetection`).
+pub const PEER_LIVENESS_BGP_KEEPALIVE: &str = "bgp-keepalive";
+
+/// The other member of `RouteServerPeerLivenessMode`: "`bfd`: An additional Bidirectional
+/// Forwarding Detection (BFD) protocol" (same member).
+pub const PEER_LIVENESS_BFD: &str = "bfd";
+
+/// A BGP or BFD session that is not established: the `down` member of
+/// `RouteServerBgpState` and of `RouteServerBfdState`.
+///
+/// This is the only status either session can have in this emulator: a session comes up
+/// only when a real BGP speaker on the peer address answers, and nothing here speaks BGP,
+/// so reporting `up` would be reporting work nobody did.
+pub const ROUTE_SERVER_SESSION_DOWN: &str = "down";
+
+/// The `ResourceType` a `CreateRouteServerEndpoint` tag specification may name.
+pub const RESOURCE_TYPE_ROUTE_SERVER_ENDPOINT: &str = "route-server-endpoint";
+
+/// The `ResourceType` a `CreateRouteServerPeer` tag specification may name.
+pub const RESOURCE_TYPE_ROUTE_SERVER_PEER: &str = "route-server-peer";
+
+/// The largest number of route server endpoints this in-memory store holds, and the same
+/// ceiling for their peers.
+///
+/// A capacity bound in the same style as [`MAX_TRANSIT_GATEWAYS`] and
+/// [`MAX_STORED_ROUTE_SERVERS`], not an AWS quota: each record lives in this process's
+/// memory, so the number a caller can create has to be finite. It is well above the
+/// published per-Region route server quota, so a test that creates more than a real
+/// account's default quota is not refused for a reason this emulator cannot have.
+pub const MAX_ROUTE_SERVER_RECORDS: usize = 1_000;
+
+/// EC2's error code for a request naming a route server endpoint id this account holds no
+/// endpoint for — the code the service answers `CreateRouteServerPeer` with when its
+/// `RouteServerEndpointId` resolves to nothing.
+pub const INVALID_ROUTE_SERVER_ENDPOINT_ID_NOT_FOUND: &str =
+    "InvalidRouteServerEndpointId.NotFound";
+
+/// EC2's error code for a request naming a route server peer id this account holds no peer
+/// for.
+pub const INVALID_ROUTE_SERVER_PEER_ID_NOT_FOUND: &str = "InvalidRouteServerPeerId.NotFound";
+
+/// Everything [`ComAmazonawsEc2Amazonec2State::insert_route_server_endpoint`] needs that it
+/// does not derive itself.
+#[derive(Debug, Clone)]
+pub struct RouteServerEndpointSpec {
+    /// "The ID of the route server for which to create an endpoint"
+    /// (`CreateRouteServerEndpointRequest$RouteServerId`), already resolved against the
+    /// store.
+    pub route_server_id: String,
+    /// "The ID of the subnet to place the route server endpoint into" (same request).
+    pub subnet_id: String,
+    /// The VPC of that subnet, read off the stored subnet rather than taken from the
+    /// request: "The ID of the VPC containing the endpoint"
+    /// (`RouteServerEndpoint$VpcId`).
+    pub vpc_id: Option<String>,
+    /// The address of the endpoint's elastic network interface, taken from the subnet's
+    /// own CIDR block by [`ComAmazonawsEc2Amazonec2State::mint_route_server_eni_address`].
+    pub eni_address: Option<String>,
+    /// The tags of a `route-server-endpoint` tag specification.
+    pub tags: Vec<Tag>,
+}
+
+/// Everything [`ComAmazonawsEc2Amazonec2State::insert_route_server_peer`] needs that it
+/// does not derive itself. Every fact about the ENDPOINT the peer belongs to is read off
+/// the stored endpoint by the insert, so a peer can never name a different route server,
+/// VPC or subnet than its endpoint does.
+#[derive(Debug, Clone)]
+pub struct RouteServerPeerSpec {
+    /// "The IPv4 address of the peer device" (`CreateRouteServerPeerRequest$PeerAddress`).
+    pub peer_address: String,
+    /// "The Border Gateway Protocol (BGP) Autonomous System Number (ASN) for the
+    /// appliance" (`RouteServerBgpOptionsRequest$PeerAsn`).
+    pub peer_asn: i64,
+    /// The resolved liveness detection protocol. A `&'static str` so only a member of the
+    /// modelled `RouteServerPeerLivenessMode` catalog can be stored.
+    pub peer_liveness_detection: &'static str,
+    /// The tags of a `route-server-peer` tag specification.
+    pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes one stored route server endpoint holds: its tags. The ids, the
+/// ENI address and the state are this module's own.
+pub fn route_server_endpoint_payload_bytes(endpoint: &RouteServerEndpoint) -> usize {
+    tag_list_bytes(endpoint.tags.as_deref().unwrap_or_default())
+}
+
+/// The caller-chosen bytes one stored route server peer holds: its tags and the peer
+/// address the request named.
+pub fn route_server_peer_payload_bytes(peer: &RouteServerPeer) -> usize {
+    tag_list_bytes(peer.tags.as_deref().unwrap_or_default())
+        .saturating_add(peer.peer_address.as_deref().map_or(0, str::len))
+}
+
+/// The liveness detection protocol a peer the request asked for `requested` with gets.
+///
+/// "Defaults to `bgp-keepalive`" (`RouteServerBgpOptionsRequest$PeerLivenessDetection`),
+/// and a word no member of `RouteServerPeerLivenessMode` has is refused rather than stored.
+pub fn route_server_peer_liveness<E>(
+    requested: Option<&str>,
+) -> Result<&'static str, Scaffolded<E>> {
+    match requested {
+        None | Some(PEER_LIVENESS_BGP_KEEPALIVE) => Ok(PEER_LIVENESS_BGP_KEEPALIVE),
+        Some(PEER_LIVENESS_BFD) => Ok(PEER_LIVENESS_BFD),
+        Some(value) => Err(invalid_parameter_value(format!(
+            "Value ({value}) for parameter bgpOptions.peerLivenessDetection is invalid. \
+             Valid values are {PEER_LIVENESS_BFD} and {PEER_LIVENESS_BGP_KEEPALIVE}."
+        ))),
+    }
+}
+
+/// The ASN `asn` if the published range admits it, or the refusal EC2 answers for one it
+/// does not.
+///
+/// "Valid values are from 1 to 4294967295" is published identically for the Amazon side of
+/// the session ([`AMAZON_SIDE_ASN_RANGE`], `CreateRouteServerRequest$AmazonSideAsn`) and for
+/// the appliance's side (`RouteServerBgpOptionsRequest$PeerAsn`), so the peer's side is held
+/// to that same one pair of published bounds and `member` only names which one the message
+/// is about.
+pub fn require_route_server_asn<E>(asn: i64, member: &str) -> Result<i64, Scaffolded<E>> {
+    let (min, max) = AMAZON_SIDE_ASN_RANGE;
+    if (min..=max).contains(&asn) {
+        return Ok(asn);
+    }
+    Err(invalid_parameter_value(format!(
+        "Value ({asn}) for parameter {member} is invalid. Valid values are from {min} to {max}."
+    )))
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another route server endpoint fits inside the store's ceiling
+    /// ([`MAX_ROUTE_SERVER_RECORDS`]).
+    ///
+    /// The same contract as [`Self::has_transit_gateway_capacity`]: a create asks first and
+    /// refuses with [`route_server_limit_exceeded`] when it answers `false`. The endpoint
+    /// and the peer store are asked about separately, so a full store of one kind cannot
+    /// refuse a create of another.
+    pub fn has_route_server_endpoint_capacity(&self) -> bool {
+        self.route_server_endpoints.len() < MAX_ROUTE_SERVER_RECORDS
+    }
+
+    /// Whether another route server peer fits inside that same ceiling.
+    pub fn has_route_server_peer_capacity(&self) -> bool {
+        self.route_server_peers.len() < MAX_ROUTE_SERVER_RECORDS
+    }
+
+    /// Insert a route server endpoint in `pending` and answer the
+    /// `RouteServerEndpointId` it was given.
+    ///
+    /// The endpoint's elastic network interface is the service's, not the caller's, so its
+    /// id is minted here beside the endpoint's own.
+    pub fn insert_route_server_endpoint(&mut self, spec: RouteServerEndpointSpec) -> String {
+        let route_server_endpoint_id = self.next_id("rse");
+        let eni_id = self.next_id("eni");
+        let endpoint = RouteServerEndpoint {
+            route_server_id: Some(spec.route_server_id),
+            route_server_endpoint_id: Some(route_server_endpoint_id.clone()),
+            vpc_id: spec.vpc_id,
+            subnet_id: Some(spec.subnet_id),
+            eni_id: Some(eni_id),
+            eni_address: spec.eni_address,
+            state: Some(ROUTE_SERVER_ENDPOINT_STATE_PENDING.to_string()),
+            // "The reason for any failure in endpoint creation or operation"
+            // (`RouteServerEndpoint$FailureReason`): this endpoint is coming up, so there
+            // is no failure to report.
+            failure_reason: None,
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(route_server_endpoint_payload_bytes(&endpoint));
+        self.route_server_endpoints
+            .insert(route_server_endpoint_id.clone(), endpoint);
+        self.route_server_endpoint_available_at.insert(
+            route_server_endpoint_id.clone(),
+            Instant::now() + TRANSITION_DELAY,
+        );
+        route_server_endpoint_id
+    }
+
+    /// Insert a route server peer of the endpoint `route_server_endpoint_id` in `pending`
+    /// and answer the `RouteServerPeerId` it was given, or `None` when no endpoint of that
+    /// id is stored.
+    ///
+    /// The peer's route server, VPC, subnet and endpoint network interface are read off the
+    /// STORED endpoint, so they cannot disagree with it whatever the request said.
+    pub fn insert_route_server_peer(
+        &mut self,
+        route_server_endpoint_id: &str,
+        spec: RouteServerPeerSpec,
+    ) -> Option<String> {
+        let endpoint = self
+            .route_server_endpoints
+            .get(route_server_endpoint_id)?
+            .clone();
+        let route_server_peer_id = self.next_id("rsp");
+        let peer = RouteServerPeer {
+            route_server_peer_id: Some(route_server_peer_id.clone()),
+            route_server_endpoint_id: endpoint.route_server_endpoint_id.clone(),
+            route_server_id: endpoint.route_server_id.clone(),
+            vpc_id: endpoint.vpc_id.clone(),
+            subnet_id: endpoint.subnet_id.clone(),
+            state: Some(ROUTE_SERVER_PEER_STATE_PENDING.to_string()),
+            // Nothing has failed: "The reason for any failure in peer creation or
+            // operation" (`RouteServerPeer$FailureReason`).
+            failure_reason: None,
+            endpoint_eni_id: endpoint.eni_id.clone(),
+            endpoint_eni_address: endpoint.eni_address.clone(),
+            peer_address: Some(spec.peer_address),
+            bgp_options: Some(RouteServerBgpOptions {
+                peer_asn: Some(spec.peer_asn),
+                peer_liveness_detection: Some(spec.peer_liveness_detection.to_string()),
+            }),
+            // The session with the appliance is not established — nothing in this emulator
+            // speaks BGP to the peer address — so it is reported as
+            // [`ROUTE_SERVER_SESSION_DOWN`] rather than as a session nobody opened.
+            bgp_status: Some(RouteServerBgpStatus {
+                status: Some(ROUTE_SERVER_SESSION_DOWN.to_string()),
+            }),
+            // BFD is a session only a peer that asked for that liveness mode has, so a
+            // `bgp-keepalive` peer carries no BFD status at all.
+            bfd_status: (spec.peer_liveness_detection == PEER_LIVENESS_BFD).then(|| {
+                RouteServerBfdStatus {
+                    status: Some(ROUTE_SERVER_SESSION_DOWN.to_string()),
+                }
+            }),
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(route_server_peer_payload_bytes(&peer));
+        self.route_server_peers
+            .insert(route_server_peer_id.clone(), peer);
+        self.route_server_peer_available_at.insert(
+            route_server_peer_id.clone(),
+            Instant::now() + TRANSITION_DELAY,
+        );
+        Some(route_server_peer_id)
+    }
+
+    /// The address the next route server endpoint in the subnet `cidr_block` gets for its
+    /// elastic network interface, or `None` when the block holds no free address.
+    ///
+    /// The lowest assignable address of the block that nothing in the account already holds
+    /// — not another route server endpoint, and not an instance's primary private address
+    /// ([`Self::private_ip_in_use`], the one record of the addresses this emulator has
+    /// handed out), so one subnet cannot give the same address to two interfaces. AWS
+    /// "reserves the first four IPv4 addresses and the last IPv4 address in each subnet
+    /// CIDR block" (the [`SUBNET_RESERVED_ADDRESSES`] this crate already counts against a
+    /// subnet's available addresses), and the address is the service's choice, never the
+    /// caller's.
+    pub fn mint_route_server_eni_address(&self, cidr_block: &str) -> Option<String> {
+        let (first, last) = ipv4_cidr_bounds(cidr_block)?;
+        let held: BTreeSet<&str> = self
+            .route_server_endpoints
+            .values()
+            .filter_map(|endpoint| endpoint.eni_address.as_deref())
+            .collect();
+        // The first four addresses of the block and its last are reserved, so the
+        // assignable window starts four above the base and stops one below the broadcast
+        // address.
+        let lowest = first.checked_add(SUBNET_RESERVED_ADDRESSES - 1)?;
+        (lowest..last)
+            .map(|address| ::std::net::Ipv4Addr::from(address).to_string())
+            .find(|candidate| {
+                !held.contains(candidate.as_str()) && !self.private_ip_in_use(candidate)
+            })
+    }
+}
+
+/// Refuse a request that named a route server endpoint id no endpoint of the account has:
+/// HTTP 400 `InvalidRouteServerEndpointId.NotFound`.
+pub fn invalid_route_server_endpoint_id_not_found<E>(endpoint_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ROUTE_SERVER_ENDPOINT_ID_NOT_FOUND,
+        400,
+        format!("The route server endpoint ID '{endpoint_id}' does not exist"),
+    )
+}
+
+/// Refuse a request that named a route server peer id no peer of the account has: HTTP 400
+/// `InvalidRouteServerPeerId.NotFound`.
+pub fn invalid_route_server_peer_id_not_found<E>(peer_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ROUTE_SERVER_PEER_ID_NOT_FOUND,
+        400,
+        format!("The route server peer ID '{peer_id}' does not exist"),
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -409,7 +409,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             config_sync_state: crate::state::SYNC_IN_SYNC.to_string(),
             sync_states,
             update_token: crate::state::new_uuid(),
-            created_at: now,
+            provisioning_since: now,
             flow_operations: ::std::collections::HashMap::new(),
         };
 

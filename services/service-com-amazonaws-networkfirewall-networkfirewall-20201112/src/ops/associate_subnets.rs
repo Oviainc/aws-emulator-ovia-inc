@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateSubnets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateSubnets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateSubnets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: adds the requested subnets to the stored `FirewallRecord`'s
+//! `SubnetMappings`, giving each newly named subnet its own Availability Zone and a
+//! firewall endpoint that starts out `CREATING`, and re-mints the firewall's
+//! `UpdateToken` when the mapping set changed — so a following `DescribeFirewall`
+//! reports the union. A stale `UpdateToken` is refused with `InvalidTokenException`,
+//! and a firewall carrying `SubnetChangeProtection` with `InvalidOperationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +190,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateSubnets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateSubnetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateSubnets"))
+        // Each firewall endpoint sits in its own Availability Zone, named in the
+        // region the request is signed for, exactly as `CreateFirewall` names the
+        // zones of the subnets a firewall starts with.
+        let region = crate::state::request_region(ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AssociateSubnetsErrorModeled::InternalServerError(InternalServerError {
+                    message: Some("the firewall store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        let key = state
+            .resolve_firewall(
+                input.firewall_name.as_deref(),
+                input.firewall_arn.as_deref(),
+            )
+            .map_err(associate_lookup_error)?;
+        let Some(record) = state.firewalls.get_mut(&key) else {
+            return Err(AssociateSubnetsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // The `PROVISIONING` -> `READY` move the clock owed at `ready_at()` is
+        // materialised here too, so the endpoints this call does not touch carry
+        // the status a reader would see rather than a stale one.
+        record.settle(now);
+
+        // `UpdateToken` is the resource's optimistic lock: when the caller sends
+        // one it must be the token the firewall currently carries, so a caller
+        // that read the firewall before someone else changed it is refused rather
+        // than overwriting that change.
+        if let Some(token) = &input.update_token {
+            if token != &record.update_token {
+                return Err(AssociateSubnetsErrorModeled::InvalidTokenException(
+                    InvalidTokenException {
+                        message: Some(crate::state::INVALID_TOKEN_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let attached = record
+            .associate_subnets(&region, &input.subnet_mappings, now)
+            .map_err(associate_breach_error)?;
+        // The token "marks the state of the firewall resource at the time of the
+        // request", so it is re-minted exactly when this call moved that state: a
+        // request naming only subnets the firewall already carries associated
+        // nothing, and leaves the resource — its token included — as it was.
+        if !attached.is_empty() {
+            record.update_token = crate::state::new_uuid();
+        }
+
+        Ok(AssociateSubnetsOutput {
+            firewall_arn: Some(record.firewall_arn.clone()),
+            firewall_name: Some(record.firewall_name.clone()),
+            subnet_mappings: Some(record.subnet_mappings.clone()),
+            update_token: Some(record.update_token.clone()),
+        })
     }
+}
+
+crate::state::impl_resolve_error!(
+    associate_lookup_error -> AssociateSubnetsError, AssociateSubnetsErrorModeled,
+    plural = "firewalls",
+    name_member = "FirewallName", arn_member = "FirewallArn"
+);
+
+/// Map a refused subnet association onto this operation's modelled errors: a
+/// firewall protected against subnet changes cannot take the change at all
+/// (`InvalidOperationException` — "the operation failed because it's not
+/// valid"), while a request that names no subnet, names one twice, or would need
+/// more Availability Zones than a firewall spans is a bad request
+/// (`InvalidRequestException`).
+fn associate_breach_error(breach: crate::state::SubnetAssociationBreach) -> AssociateSubnetsError {
+    use crate::state::SubnetAssociationBreach as Breach;
+    match breach {
+        Breach::Protected => AssociateSubnetsErrorModeled::InvalidOperationException(
+            InvalidOperationException {
+                message: Some(crate::state::SUBNET_CHANGE_PROTECTED_MESSAGE.to_string()),
+            },
+        ),
+        Breach::NoSubnets => {
+            AssociateSubnetsErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(crate::state::NO_SUBNETS_MESSAGE.to_string()),
+            })
+        }
+        Breach::RepeatedSubnet(subnet_id) => {
+            AssociateSubnetsErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(crate::state::parameter_message(
+                    "Subnet is specified more than once",
+                    &subnet_id,
+                )),
+            })
+        }
+        Breach::ZoneCapacity => {
+            AssociateSubnetsErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(crate::state::too_many_zones_message()),
+            })
+        }
+    }
+    .into()
 }

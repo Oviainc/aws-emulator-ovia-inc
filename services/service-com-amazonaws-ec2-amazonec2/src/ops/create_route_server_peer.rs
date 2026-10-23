@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRouteServerPeer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRouteServerPeer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates a BGP peer of a stored route server endpoint from the request's
+//! peer address, BGP options and tags, stores it as the modelled [`RouteServerPeer`] shape
+//! — taking the route server, VPC, subnet and endpoint network interface it reports off
+//! that stored endpoint — and answers it in `pending` with the instant the clock owes it
+//! `available` recorded beside it (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::route_server_peer_available_at`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRouteServerPeer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +145,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRouteServerPeer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRouteServerPeerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRouteServerPeer"))
+        use crate::state;
+
+        // `ctx` carries request metadata only; every fact this peer reports comes from the
+        // request or from the endpoint in the store the engine on `self` holds.
+        let _ = ctx;
+
+        // "The tags to apply to the route server peer during creation"
+        // (`TagSpecifications`), refusing a specification that names any resource type but
+        // the one this action creates.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_ROUTE_SERVER_PEER,
+            Self::NAME,
+        )?;
+
+        let payload_bytes =
+            state::tag_list_bytes(&tags).saturating_add(input.peer_address.len());
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+
+        // "The ID of the route server endpoint for which to create a peer"
+        // (`RouteServerEndpointId`) is resolved FIRST, before the BGP options the request
+        // carries are read: a peer belongs to one endpoint, so an id that names no
+        // endpoint of the account leaves nothing for those options to be options OF, and
+        // the service answers `InvalidRouteServerEndpointId.NotFound` whatever else the
+        // request said.
+        if !store
+            .route_server_endpoints
+            .contains_key(&input.route_server_endpoint_id)
+        {
+            return Err(state::invalid_route_server_endpoint_id_not_found(
+                &input.route_server_endpoint_id,
+            ));
+        }
+
+        // "The IPv4 address of the peer device" (`PeerAddress`): the model targets a plain
+        // `String`, so the form the member documents is enforced here.
+        if !state::is_ipv4_address(&input.peer_address) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({address}) for parameter peerAddress is invalid. \
+                 It must be an IPv4 address.",
+                address = input.peer_address,
+            )));
+        }
+
+        // "The Border Gateway Protocol (BGP) Autonomous System Number (ASN) for the
+        // appliance. Valid values are from 1 to 4294967295" (`BgpOptions$PeerAsn`), held
+        // to the same published range as the Amazon side of the session.
+        let peer_asn =
+            state::require_route_server_asn(input.bgp_options.peer_asn, "bgpOptions.peerAsn")?;
+        // "The requested liveness detection protocol for the BGP peer … Defaults to
+        // `bgp-keepalive`" (`BgpOptions$PeerLivenessDetection`).
+        let peer_liveness_detection = state::route_server_peer_liveness(
+            input.bgp_options.peer_liveness_detection.as_deref(),
+        )?;
+
+        if !store.has_route_server_peer_capacity() {
+            return Err(state::route_server_limit_exceeded(format!(
+                "This emulator holds {max} route server peers, which is as many as it \
+                 stores",
+                max = state::MAX_ROUTE_SERVER_RECORDS,
+            )));
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::route_server_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation"
+        // (`DryRun`). Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The record itself: the id, the `pending` state, the clock-owed `available` move
+        // and every id it inherits from its endpoint come from the store, never from the
+        // request.
+        let Some(route_server_peer_id) = store.insert_route_server_peer(
+            &input.route_server_endpoint_id,
+            state::RouteServerPeerSpec {
+                peer_address: input.peer_address.clone(),
+                peer_asn,
+                peer_liveness_detection,
+                tags,
+            },
+        ) else {
+            return Err(state::internal_error(format!(
+                "the route server endpoint '{endpoint_id}' could not be read back",
+                endpoint_id = input.route_server_endpoint_id,
+            )));
+        };
+
+        // The answer is the record as it was stored, so `CreateRouteServerPeer` and
+        // `DescribeRouteServerPeers` cannot drift apart.
+        let Some(peer) = store.route_server_peers.get(&route_server_peer_id).cloned() else {
+            return Err(state::internal_error(format!(
+                "the route server peer '{route_server_peer_id}' could not be read back"
+            )));
+        };
+        Ok(CreateRouteServerPeerOutput {
+            route_server_peer: Some(peer),
+        })
     }
 }

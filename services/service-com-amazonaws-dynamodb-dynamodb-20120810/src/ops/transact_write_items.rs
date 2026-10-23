@@ -342,7 +342,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut planned: Vec<Planned> = Vec::with_capacity(actions.len());
         let mut keyed: std::collections::BTreeSet<(String, crate::state::ItemKey)> =
             std::collections::BTreeSet::new();
-        for action in &actions {
+        let elements = actions.len();
+        for (at, action) in actions.iter().enumerate() {
+            // A refusal the ITEM this element writes carries — a key attribute of a
+            // type the table does not declare for it — is decided when the transaction
+            // keys that item, so it cancels the transaction; see
+            // [`cancelled_by_element`].
+            let keying = |error| cancelled_by_element(at, elements, error);
             let name = crate::state::resolve_table_name(action.table_name()).map_err(lift)?;
             let substitutions = crate::state::Substitutions::new(
                 action.expression_attribute_names(),
@@ -384,7 +390,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     deny(table, action, now)?;
                     table.check_index_key_limits(&item).map_err(lift)?;
                     Prepared {
-                        key: table.key_of_item(&item).map_err(lift)?,
+                        key: table.key_of_item(&item).map_err(keying)?,
                         addressed: item.clone(),
                         write: PlannedWrite::Put(item),
                     }
@@ -910,4 +916,65 @@ fn lift(error: crate::state::RequestError) -> TransactWriteItemsError {
             crate::scaffolded::Scaffolded::validation(message)
         }
     }
+}
+
+/// The clause every refusal of a parameter value in this service opens with, which the
+/// documented `ValidationError` cancellation reason also states ("Message: One or more
+/// parameter values were invalid").
+const INVALID_PARAMETER_CLAUSE: &str = "One or more parameter values were invalid";
+
+/// Report a refusal the transaction decided for ONE element — the item it writes
+/// carrying a key attribute of a type the table does not declare — as the cancellation
+/// it is.
+///
+/// "All of which must either succeed or fail": an element the transaction itself
+/// refuses when it keys that element's item cancels the whole request, so the answer is
+/// the `TransactionCanceledException` whose `CancellationReasons` name that element with
+/// `ValidationError` and every other element with `None`, since nothing was wrong with
+/// those ("Cancellation reason codes and possible error messages"). A refusal about the
+/// REQUEST rather than about an item it writes — a `Key` member that does not name this
+/// table's key attributes, an item addressed twice, an entry naming no operation, a
+/// table that is not there — is still answered directly, which is what [`lift`] does
+/// with it.
+fn cancelled_by_element(
+    at: usize,
+    elements: usize,
+    error: crate::state::RequestError,
+) -> TransactWriteItemsError {
+    let crate::state::RequestError::Validation(message) = error else {
+        return lift(error);
+    };
+    // "ValidationError - Code: ValidationError, Message: One or more parameter values
+    // were invalid" ("Cancellation reason codes and possible error messages"): the
+    // reason's message states the documented clause, and keeps the detail of what the
+    // request got wrong behind it, the way every other validation refusal of a
+    // parameter value in this service words it.
+    let detail = if message.starts_with(INVALID_PARAMETER_CLAUSE) {
+        message
+    } else {
+        format!("{INVALID_PARAMETER_CLAUSE}: {message}")
+    };
+    let codes: Vec<&str> = (0..elements)
+        .map(|element| {
+            if element == at {
+                crate::state::CANCELLATION_CODE_VALIDATION_ERROR
+            } else {
+                crate::state::CANCELLATION_CODE_NONE
+            }
+        })
+        .collect();
+    let cancellation_reasons: Vec<CancellationReason> = codes
+        .iter()
+        .enumerate()
+        .map(|(element, code)| CancellationReason {
+            code: Some((*code).to_string()),
+            message: (element == at).then(|| detail.clone()),
+            item: None,
+        })
+        .collect();
+    TransactWriteItemsErrorModeled::TransactionCanceledException(TransactionCanceledException {
+        message: Some(crate::state::transaction_cancelled_message(&codes)),
+        cancellation_reasons: Some(cancellation_reasons),
+    })
+    .into()
 }
