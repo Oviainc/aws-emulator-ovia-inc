@@ -340,6 +340,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // for.
             crate::state::validate_template_body(body)
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            // A change set is a plan over a template CloudFormation can deploy: a body
+            // declaring a resource type it does not recognise is refused before the change
+            // set is created (`crate::state::resource_types`).
+            crate::state::validate_resource_types(body)
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

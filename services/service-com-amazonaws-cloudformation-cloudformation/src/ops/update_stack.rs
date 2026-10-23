@@ -380,6 +380,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `@length` for.
                 crate::state::validate_template_body(body)
                     .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                // A submitted template is only one CloudFormation can deploy: a body
+                // declaring a resource type it does not recognise is refused before the
+                // update starts, so the stack keeps the template it has
+                // (`crate::state::resource_types`).
+                crate::state::validate_resource_types(body)
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
                 body.clone()
             }
             // `UsePreviousTemplate`: "Reuse the existing template that is associated with

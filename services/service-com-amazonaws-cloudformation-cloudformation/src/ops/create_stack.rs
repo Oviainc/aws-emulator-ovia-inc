@@ -34,6 +34,10 @@
 //! neither JSON nor YAML is stored (and declares no resources and no outputs) rather than
 //! refused with a template-format `ValidationError`.
 //!
+//! A template whose `Resources` section declares a resource type CloudFormation does not
+//! recognise IS refused, with HTTP 400 `ValidationError` naming those types, before the
+//! stack is created: see [`crate::state::resource_types`] for the recognised set.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -321,6 +325,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The documented `TemplateBody` maximum, which the model carries no `@length` for:
         // a stored body is caller-sized otherwise.
         crate::state::validate_template_body(&template_body)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // "Creates a stack as specified in the template" — only a template CloudFormation
+        // can deploy: a body declaring a resource type it does not recognise is refused
+        // HERE, before the stack is created, so a template real AWS refuses outright is not
+        // driven to CREATE_COMPLETE against resources nobody created. See
+        // `crate::state::resource_types` for the recognised set.
+        crate::state::validate_resource_types(&template_body)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // `Parameter$UsePreviousValue` is a stack-UPDATE instruction ("During a stack
         // update, use the existing parameter value that the stack is using for a given

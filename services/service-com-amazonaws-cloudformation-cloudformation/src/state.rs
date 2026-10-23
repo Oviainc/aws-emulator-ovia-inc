@@ -91,6 +91,10 @@ pub mod template;
 /// the create and delete calls that make its resources exist.
 mod provisioner;
 
+/// Which resource TYPES a template may declare at all: the catalogue CloudFormation
+/// publishes, and the refusal a template declaring anything else is held to.
+pub mod resource_types;
+
 /// The extension registry: the registered and activated extensions this account and
 /// Region holds, and the versions of each.
 pub mod registry;
@@ -186,6 +190,20 @@ pub fn validate_template_body(template_body: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// `Err(message)` for a template body declaring a resource type CloudFormation does not
+/// recognise — the rule every operation that SUBMITS a template is held to, before
+/// anything is created ([`resource_types`] is where the recognised set lives).
+///
+/// `Ok(())` for a body this service's reader will not read at all: a body that is neither
+/// JSON nor YAML, or one past a documented per-template quota, declares no resource to
+/// hold to the catalogue and is answered by the template-format rules instead.
+pub fn validate_resource_types(template_body: &str) -> Result<(), String> {
+    match template::parse(template_body) {
+        Some(template) => resource_types::refuse_unrecognized(&template),
+        None => Ok(()),
+    }
 }
 
 /// `StackStatus` values this service puts a stack into (all from the model's
