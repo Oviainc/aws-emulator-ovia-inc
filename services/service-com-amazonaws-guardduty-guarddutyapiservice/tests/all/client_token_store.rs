@@ -14,6 +14,15 @@
 //!    caller just recorded still replays.
 //! 3. A delete drops the mappings naming the detector it removed, so a replayed
 //!    create never answers with an id the store no longer holds.
+//! 4. The Malware Protection plan index is the SAME store under a different
+//!    resource: its key is request-chosen too, so it carries the same ceiling and
+//!    the same oldest-first eviction, its reader resolves the plan (a mapping whose
+//!    plan is gone answers with nothing rather than an id the store no longer
+//!    holds), and a plan delete drops the mappings naming it. Only the bound and
+//!    the replay are exercised over the wire here: `DeleteMalwareProtectionPlan` is
+//!    still a scaffolded 501 with its own issue, so the delete hook
+//!    (`forget_malware_protection_plan_client_tokens_for`) has no caller to drive
+//!    it from yet.
 
 use std::sync::Arc;
 
@@ -22,6 +31,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     ComAmazonawsGuarddutyGuarddutyapiserviceState as GuardDutyState, MAX_CLIENT_TOKENS,
+    MAX_MALWARE_PROTECTION_PLANS_PER_ACCOUNT_PER_REGION,
 };
 
 use super::detector_lifecycle::{call_in, error_code, router_over};
@@ -29,6 +39,15 @@ use super::detector_lifecycle::{call_in, error_code, router_over};
 /// How many `(region, token)` mappings the store holds right now.
 fn stored_mappings(engine: &engine::InMemoryEngine) -> usize {
     engine.state::<GuardDutyState>().lock().client_tokens.len()
+}
+
+/// How many `(region, token)` mappings the Malware Protection plan index holds.
+fn stored_plan_mappings(engine: &engine::InMemoryEngine) -> usize {
+    engine
+        .state::<GuardDutyState>()
+        .lock()
+        .malware_protection_plan_client_tokens
+        .len()
 }
 
 async fn create_in(router: &MultiServiceRouter, region: &str, body: Value) -> (u16, Value) {
@@ -253,5 +272,106 @@ async fn the_idempotency_store_stays_bounded_without_losing_a_detector() {
     assert_eq!(
         status, 200,
         "eviction must not touch the detector, got {status} {read:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rule 4: the Malware Protection plan index is bounded the same way.
+// ---------------------------------------------------------------------------
+
+/// An IAM role ARN of the form `CreateMalwareProtectionPlan`'s `Role` takes.
+const PLAN_ROLE: &str = "arn:aws:iam::000000000000:role/GuardDutyMalwareProtectionRole";
+
+async fn create_plan_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    bucket: &str,
+    token: &str,
+) -> (u16, Value) {
+    call_in(
+        router,
+        region,
+        "POST",
+        "/malware-protection-plan",
+        Some(json!({
+            "role": PLAN_ROLE,
+            "protectedResource": {"s3Bucket": {"bucketName": bucket}},
+            "clientToken": token,
+        })),
+    )
+    .await
+}
+
+/// Drive more distinct tokens into the plan index than it retains.
+///
+/// Plans are one per protected bucket and capped per Region, so the creates are
+/// spread across Regions and buckets: that is how one caller records more mappings
+/// than the ceiling while every one of them still names a live plan — the case a
+/// bound has to survive.
+#[tokio::test]
+async fn the_plan_idempotency_store_stays_bounded_without_losing_a_plan() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = router_over(Arc::clone(&engine));
+
+    let overshoot = 8;
+    let mut minted: Vec<(String, String, String)> = Vec::new();
+    for index in 0..MAX_CLIENT_TOKENS + overshoot {
+        let region = format!("zz-plan-{}", index / MAX_MALWARE_PROTECTION_PLANS_PER_ACCOUNT_PER_REGION);
+        let bucket = format!("bucket-{index}");
+        let token = format!("plan-token-{index}");
+        let (status, created) = create_plan_in(&router, &region, &bucket, &token).await;
+        assert_eq!(
+            status, 200,
+            "plan create {index} in {region} got {status} {created:?}"
+        );
+        let id = created["malwareProtectionPlanId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("plan create {index}: no id in {created:?}"))
+            .to_string();
+        minted.push((region, token, id));
+
+        assert!(
+            stored_plan_mappings(&engine) <= MAX_CLIENT_TOKENS,
+            "after {} plan create(s) the index held {} mapping(s), past the bound of \
+             {MAX_CLIENT_TOKENS}",
+            index + 1,
+            stored_plan_mappings(&engine)
+        );
+    }
+
+    // Every plan a create minted is still there: the bound evicts mappings, not
+    // resources. Sampled across the run rather than walked, so the assertion costs
+    // a handful of calls on a store this size.
+    let step = (minted.len() / 8).max(1);
+    for n in (0..minted.len()).step_by(step) {
+        let (region, _, id) = &minted[n];
+        let (status, read) = call_in(
+            &router,
+            region,
+            "GET",
+            &format!("/malware-protection-plan/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "plan {n} in {region} must still be readable, got {status} {read:?}"
+        );
+    }
+
+    // The most recently recorded mapping still replays to its own plan.
+    let (region, token, id) = minted
+        .last()
+        .cloned()
+        .expect("the loop recorded at least one mapping");
+    let (status, replayed) = create_plan_in(&router, &region, "a-different-bucket", &token).await;
+    assert_eq!(
+        status, 200,
+        "the newest plan mapping must still replay, got {status} {replayed:?}"
+    );
+    assert_eq!(
+        replayed["malwareProtectionPlanId"].as_str().unwrap_or_default(),
+        id,
+        "the newest plan mapping must replay to its own plan, got {replayed:?}"
     );
 }

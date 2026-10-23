@@ -29,6 +29,8 @@ mod findings_feedback;
 mod investigation_lifecycle;
 #[path = "all/ip_set_lifecycle.rs"]
 mod ip_set_lifecycle;
+#[path = "all/ip_set_update_and_delete.rs"]
+mod ip_set_update_and_delete;
 #[path = "all/malware_protection_plan.rs"]
 mod malware_protection_plan;
 #[path = "all/malware_scan_settings.rs"]

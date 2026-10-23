@@ -22,6 +22,17 @@ use std::collections::{BTreeMap, HashMap};
 #[derive(Debug, Default)]
 pub struct ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// Every persisted detector, keyed by its minted `DetectorId`.
+    ///
+    /// BOUNDED by [`MAX_DETECTOR_REGIONS`]: the store holds at most one detector
+    /// per Region ("you can have only one detector per account per Region"), and
+    /// the Region comes from the request's credential scope, so the number of
+    /// PARTITIONS needs its own ceiling — see
+    /// [`Self::detector_regions_exhausted`], which `CreateDetector` refuses past.
+    /// Everything a detector owns is bounded in turn
+    /// ([`MAX_MEMBERS_PER_DETECTOR`], [`MAX_FILTERS_PER_ACCOUNT_PER_REGION`],
+    /// [`IP_SETS_PER_DETECTOR`] plus [`DELETED_IP_SETS_RETAINED`],
+    /// [`THREAT_INTEL_SETS_PER_DETECTOR`]), so the whole map is finite whatever a
+    /// caller sends.
     pub detectors: HashMap<String, Detector>,
     /// `ClientToken` -> the detector a `CreateDetector` minted under it, so a
     /// replayed create returns that detector instead of refusing or minting a second
@@ -64,11 +75,18 @@ pub struct ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// `UpdateMalwareProtectionPlan` is the operation that changes a plan — and a
     /// replay that did mutate would make a retried create a hidden update.
     ///
-    /// It needs no eviction policy of its own to stay bounded: an entry is written
-    /// ONLY for a plan that was minted, and a plan can only be minted while
-    /// [`MAX_MALWARE_PROTECTION_PLANS_TOTAL`] is not reached, so this map holds at
-    /// most that many mappings.
-    pub malware_protection_plan_client_tokens: HashMap<(String, String), String>,
+    /// It is BOUNDED by [`MAX_CLIENT_TOKENS`], the ceiling the detector index
+    /// carries and for the same reason: the key is request-chosen, so an entry per
+    /// create-then-delete cycle would otherwise accumulate for ever (the plan quota
+    /// a delete frees bounds the PLANS, not the mappings that named them). Write it
+    /// through [`Self::record_malware_protection_plan_client_token`], which drops
+    /// the mappings whose plan is gone and then the oldest, read it through
+    /// [`Self::malware_protection_plan_for_client_token`], which resolves the plan
+    /// so a stale mapping yields nothing, and drop a deleted plan's mappings with
+    /// [`Self::forget_malware_protection_plan_client_tokens_for`]; never insert
+    /// into it directly.
+    pub malware_protection_plan_client_tokens:
+        HashMap<(String, String), MalwareProtectionPlanTokenRecord>,
     /// Last instant handed out by [`Self::tick_millis`], so two mutations in the
     /// same millisecond still get strictly increasing timestamps.
     last_millis: i64,
@@ -190,6 +208,78 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     pub fn forget_client_tokens_for(&mut self, detector_id: &str) {
         self.client_tokens
             .retain(|_, record| record.detector_id != detector_id);
+    }
+
+    /// The Malware Protection plan `region`'s endpoint minted under `token`, if a
+    /// create recorded one and that plan is still held.
+    ///
+    /// Resolved THROUGH [`Self::malware_protection_plan_in`] for the same reason
+    /// [`Self::detector_for_client_token`] resolves through [`Self::detector_in`]:
+    /// a mapping whose plan was deleted resolves to nothing, so a replayed create
+    /// never answers with an id the store no longer holds.
+    pub fn malware_protection_plan_for_client_token(
+        &self,
+        region: &str,
+        token: &str,
+    ) -> Option<&MalwareProtectionPlan> {
+        let record = self
+            .malware_protection_plan_client_tokens
+            .get(&(region.to_string(), token.to_string()))?;
+        self.malware_protection_plan_in(region, &record.plan_id)
+    }
+
+    /// Record that `token` minted `plan_id` for `region`, keeping the plan
+    /// idempotency index bounded by [`MAX_CLIENT_TOKENS`] — the detector index's
+    /// ceiling, for the same reason: the key is request-chosen.
+    ///
+    /// Two kinds of mapping are dropped to make room, in this order: one whose plan
+    /// the store no longer holds (it can never resolve again), then the OLDEST
+    /// remaining mapping — the token a caller is least likely to replay. Evicting a
+    /// mapping costs a replay its idempotency, never a resource a caller can still
+    /// read: the plan itself stays exactly where it was.
+    pub fn record_malware_protection_plan_client_token(
+        &mut self,
+        region: &str,
+        token: &str,
+        plan_id: &str,
+        now: i64,
+    ) {
+        // Taken out of `self` so the retain below can consult the plan store.
+        let mut tokens = std::mem::take(&mut self.malware_protection_plan_client_tokens);
+        tokens.retain(|(token_region, _), record| {
+            self.malware_protection_plan_in(token_region, &record.plan_id)
+                .is_some()
+        });
+        while tokens.len() >= MAX_CLIENT_TOKENS {
+            let oldest = tokens
+                .iter()
+                .min_by(|(left_key, left), (right_key, right)| {
+                    left.recorded_at_millis
+                        .cmp(&right.recorded_at_millis)
+                        // The instants are strictly increasing, so this only orders
+                        // mappings a coarser clock could tie.
+                        .then_with(|| left_key.cmp(right_key))
+                })
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else { break };
+            tokens.remove(&oldest);
+        }
+        tokens.insert(
+            (region.to_string(), token.to_string()),
+            MalwareProtectionPlanTokenRecord {
+                plan_id: plan_id.to_string(),
+                recorded_at_millis: now,
+            },
+        );
+        self.malware_protection_plan_client_tokens = tokens;
+    }
+
+    /// Drop every plan idempotency mapping naming `plan_id`, so a replayed create
+    /// stops resolving to a plan a delete removed — the hook a plan delete calls, as
+    /// `DeleteDetector` calls [`Self::forget_client_tokens_for`].
+    pub fn forget_malware_protection_plan_client_tokens_for(&mut self, plan_id: &str) {
+        self.malware_protection_plan_client_tokens
+            .retain(|_, record| record.plan_id != plan_id);
     }
 
     /// Mint an `InvestigationId`: the 32 hexadecimal characters [`Self::mint_id`]
@@ -318,7 +408,10 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     }
 }
 
-/// The most `(region, ClientToken)` -> detector mappings the store retains.
+/// The most `(region, ClientToken)` -> detector mappings the store retains. The
+/// plan idempotency index
+/// ([`ComAmazonawsGuarddutyGuarddutyapiserviceState::malware_protection_plan_client_tokens`])
+/// is bounded by the same number, for the same reason.
 ///
 /// A STORE GUARD, not a modelled quota: AWS publishes no limit on how many
 /// idempotency tokens an account may use, and nothing a caller can read reports this
@@ -337,6 +430,20 @@ pub const MAX_CLIENT_TOKENS: usize = 1_024;
 pub struct ClientTokenRecord {
     /// The `DetectorId` the create minted.
     pub detector_id: String,
+    /// When the mapping was recorded, in epoch milliseconds from
+    /// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::tick_millis`].
+    pub recorded_at_millis: i64,
+}
+
+/// [`ClientTokenRecord`] for the Malware Protection plan index: the plan a
+/// `ClientToken` minted, and when the create that minted it was recorded.
+///
+/// A separate record rather than a reused one because the two indexes resolve
+/// different resource types, and a token must never hand back the other store's id.
+#[derive(Debug, Clone)]
+pub struct MalwareProtectionPlanTokenRecord {
+    /// The `MalwareProtectionPlanId` the create minted.
+    pub plan_id: String,
     /// When the mapping was recorded, in epoch milliseconds from
     /// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::tick_millis`].
     pub recorded_at_millis: i64,
@@ -1428,10 +1535,84 @@ impl Detector {
 
     /// The IPSet a create already minted for `token`, if any — the seam that makes
     /// `CreateIPSet` idempotent under a replayed `ClientToken`.
+    ///
+    /// An IPSet a delete has already accepted ([`IpSetRecord::is_deleting`])
+    /// resolves to nothing, so a replayed create never answers with a list the
+    /// service is no longer keeping — the same rule
+    /// [`Self::detector_for_client_token`]'s mapping follows for a deleted detector.
     pub fn ip_set_for_token(&self, token: &str) -> Option<&IpSetRecord> {
         self.ip_sets
             .values()
-            .find(|ip_set| ip_set.client_token.as_deref() == Some(token))
+            .find(|ip_set| ip_set.client_token.as_deref() == Some(token) && !ip_set.is_deleting())
+    }
+
+    /// How many of this detector's IPSets are LIVE — held and not being deleted.
+    ///
+    /// This is the count [`IP_SETS_PER_DETECTOR`] bounds: a list whose delete has
+    /// been accepted is only reported, never used, so it no longer occupies one of
+    /// the detector's slots.
+    pub fn live_ip_set_count(&self) -> usize {
+        self.ip_sets
+            .values()
+            .filter(|ip_set| !ip_set.is_deleting())
+            .count()
+    }
+
+    /// Accept the deletion of the IPSet `ip_set_id` names.
+    ///
+    /// `None` when this detector holds no such IPSet at all; `Some(true)` when this
+    /// call is the one that accepted the deletion, and `Some(false)` when a delete
+    /// had already been accepted for it — the caller needs that distinction because
+    /// only the first delete changes the set of LIVE sub-resources the detector
+    /// holds, and so only the first moves the detector's own `UpdatedAt`.
+    ///
+    /// The list moves to [`IP_SET_DELETE_PENDING`] and the clock owes it
+    /// [`IP_SET_DELETED`], which is what `GetIPSet` reports afterwards; a list
+    /// already being deleted is left exactly where it is, so a repeated delete is a
+    /// true no-op.
+    ///
+    /// Keeping a deleted record is what lets a read report [`IP_SET_DELETED`], so
+    /// this is also where that retention is BOUNDED: at most
+    /// [`DELETED_IP_SETS_RETAINED`] deleted records survive per detector, and a
+    /// delete past that drops the one deleted longest ago — the same
+    /// oldest-first eviction [`ComAmazonawsGuarddutyGuarddutyapiserviceState::record_client_token`]
+    /// uses, for the same reason: without it a caller could create and delete
+    /// without limit and make the service retain every record.
+    pub fn delete_ip_set(&mut self, ip_set_id: &str, now: i64) -> Option<bool> {
+        let accepted = self.ip_sets.get_mut(ip_set_id)?.begin_delete(now);
+        if accepted {
+            self.evict_deleted_ip_sets(ip_set_id);
+        }
+        Some(accepted)
+    }
+
+    /// Drop deleted IPSets, oldest first, until at most [`DELETED_IP_SETS_RETAINED`]
+    /// remain. `keep` is never evicted: it is the record the call that triggered this
+    /// just deleted, and a caller reads that one back.
+    fn evict_deleted_ip_sets(&mut self, keep: &str) {
+        let surplus = self
+            .ip_sets
+            .values()
+            .filter(|ip_set| ip_set.is_deleting())
+            .count()
+            .saturating_sub(DELETED_IP_SETS_RETAINED);
+        if surplus == 0 {
+            return;
+        }
+        // The oldest deletions first: `updated_at_millis` on a deleted record is the
+        // instant its delete was accepted, and `tick_millis` makes those instants
+        // strictly increasing, so the ordering is total and the id only breaks a tie
+        // that cannot arise.
+        let mut deleted: Vec<(i64, String)> = self
+            .ip_sets
+            .values()
+            .filter(|ip_set| ip_set.is_deleting() && ip_set.id != keep)
+            .map(|ip_set| (ip_set.updated_at_millis, ip_set.id.clone()))
+            .collect();
+        deleted.sort_unstable();
+        for (_, id) in deleted.into_iter().take(surplus) {
+            self.ip_sets.remove(&id);
+        }
     }
 }
 
@@ -1454,15 +1635,36 @@ pub const IP_SET_DEACTIVATING: &str = "DEACTIVATING";
 /// `IpSetStatus`: the list is stored but GuardDuty is not using it.
 pub const IP_SET_INACTIVE: &str = "INACTIVE";
 
+/// `IpSetStatus`: a delete has been accepted and the list is on its way out of
+/// use. See [`IP_SET_ACTIVATING`] for the enum.
+pub const IP_SET_DELETE_PENDING: &str = "DELETE_PENDING";
+
+/// `IpSetStatus`: the list has been deleted. Terminal — nothing moves a deleted
+/// IPSet to any other status.
+pub const IP_SET_DELETED: &str = "DELETED";
+
 /// How long an IPSet stays in a transitional [`IP_SET_ACTIVATING`] /
-/// [`IP_SET_DEACTIVATING`] status before the CLOCK owes it the settled status.
+/// [`IP_SET_DEACTIVATING`] / [`IP_SET_DELETE_PENDING`] status before the CLOCK
+/// owes it the settled status.
 ///
-/// GuardDuty documents no duration for activating a trusted IP list, so this
-/// emulator CHOOSES one. It is deliberately non-zero: a caller that reads the
-/// IPSet back immediately after creating it still observes the transient status.
+/// GuardDuty documents no duration for activating or deleting a trusted IP list,
+/// so this emulator CHOOSES one. It is deliberately non-zero: a caller that reads
+/// the IPSet back immediately after creating or deleting it still observes the
+/// transient status.
 pub const IP_SET_TRANSITION_MILLIS: i64 = 500;
 
-/// How many IPSets one detector may hold.
+/// How many DELETED IPSets one detector retains so a read can still report
+/// [`IP_SET_DELETED`].
+///
+/// A deleted record is kept because `GetIPSet`'s `Status` is `@required` and the
+/// enum carries `DELETE_PENDING` and `DELETED`
+/// (`smithy_query(operation="GetIPSet")`), so the status after a delete is
+/// observable rather than a 400. The retention is bounded for the same reason
+/// [`IP_SETS_PER_DETECTOR`] bounds the live ones: a caller creating and deleting
+/// in a loop must not be able to make the service retain records without limit.
+pub const DELETED_IP_SETS_RETAINED: usize = IP_SETS_PER_DETECTOR;
+
+/// How many LIVE IPSets one detector may hold ([`Detector::live_ip_set_count`]).
 ///
 /// `ListIPSets` reports a detector's IPSets in a single page: `IpSetIds` is
 /// `len 0..50` and `MaxResults` is `range 1..50`
@@ -1569,6 +1771,34 @@ impl IpSetRecord {
         record
     }
 
+    /// Has a delete already been accepted for this IPSet — is it
+    /// [`IP_SET_DELETE_PENDING`] or [`IP_SET_DELETED`]?
+    ///
+    /// Such a record is no longer a live trusted IP list: it is still REPORTED, so
+    /// a read can answer with the status the delete put it in, but it occupies none
+    /// of the detector's [`IP_SETS_PER_DETECTOR`] slots and no update may move it.
+    pub fn is_deleting(&self) -> bool {
+        self.status == IP_SET_DELETE_PENDING || self.status == IP_SET_DELETED
+    }
+
+    /// Accept this IPSet's deletion: [`IP_SET_DELETE_PENDING`] now, with the clock
+    /// owing [`IP_SET_DELETED`] at [`IP_SET_TRANSITION_MILLIS`]. Reports whether
+    /// this call is the one that accepted it.
+    ///
+    /// A record already being deleted is left exactly where it is — neither the
+    /// status nor the instant the clock owes it moves — so a repeated delete
+    /// neither restarts the transition nor walks a `DELETED` record backwards, and
+    /// it answers `false` so a caller writes nothing else either.
+    pub fn begin_delete(&mut self, now: i64) -> bool {
+        if self.is_deleting() {
+            return false;
+        }
+        self.status = IP_SET_DELETE_PENDING.to_string();
+        self.status_due_millis = Some(now.saturating_add(IP_SET_TRANSITION_MILLIS));
+        self.updated_at_millis = now;
+        true
+    }
+
     /// Start the transition the caller's `Activate` asks for, from whatever status
     /// this IPSet currently has.
     ///
@@ -1604,6 +1834,7 @@ impl IpSetRecord {
         self.status = match self.status.as_str() {
             IP_SET_ACTIVATING => IP_SET_ACTIVE.to_string(),
             IP_SET_DEACTIVATING => IP_SET_INACTIVE.to_string(),
+            IP_SET_DELETE_PENDING => IP_SET_DELETED.to_string(),
             // Nothing else is transitional, so nothing else is owed a move.
             other => other.to_string(),
         };

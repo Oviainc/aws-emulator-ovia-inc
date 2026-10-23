@@ -59,8 +59,10 @@ const INVALID_INPUT: &str = "InvalidInputException";
 /// mints) that no create ever minted.
 const ABSENT_IP_SET_ID: &str = "0123456789abcdef0123456789abcdef";
 
-/// Long enough for the clock to owe the settled status, plus slack.
-fn past_the_transition() -> std::time::Duration {
+/// Long enough for the clock to owe the settled status, plus slack. Shared with the
+/// `ip_set_update_and_delete` suite: the IPSet transitions it drives are owed at the
+/// same `IP_SET_TRANSITION_MILLIS`, so both suites must wait the same span.
+pub(crate) fn past_the_transition() -> std::time::Duration {
     std::time::Duration::from_millis(IP_SET_TRANSITION_MILLIS as u64 + 250)
 }
 

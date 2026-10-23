@@ -187,10 +187,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|ip_set| ip_set.id.clone());
             // Nothing is minted past the per-detector maximum: this is the branch
             // that BOUNDS `Detector::ip_sets`, so the store a caller can make this
-            // service retain is at most `IP_SETS_PER_DETECTOR` records per
-            // detector, released with the detector by `DeleteDetector`. Checked
-            // after the idempotency lookup, because a replay mints nothing.
-            if replayed.is_none() && detector.ip_sets.len() >= crate::state::IP_SETS_PER_DETECTOR {
+            // service retain is at most `IP_SETS_PER_DETECTOR` LIVE records per
+            // detector, released with the detector by `DeleteDetector`. A list
+            // whose delete has been accepted is no longer live and occupies no
+            // slot, which is why the count is `live_ip_set_count` and not the map's
+            // length. Checked after the idempotency lookup, because a replay mints
+            // nothing.
+            if replayed.is_none()
+                && detector.live_ip_set_count() >= crate::state::IP_SETS_PER_DETECTOR
+            {
                 return Err(crate::scaffolded::Scaffolded::invalid_input(
                     crate::state::ip_set_limit_message(),
                 ));

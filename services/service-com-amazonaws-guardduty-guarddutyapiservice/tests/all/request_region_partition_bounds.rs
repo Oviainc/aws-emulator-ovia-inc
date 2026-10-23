@@ -15,10 +15,10 @@
 //! > refused by that bound and stays governed by its own per-Region rule.
 //!
 //! Together the two bounds make each store finite whatever a caller sends: the plan
-//! map with its plan idempotency index (which gets an entry only for a plan that was
-//! minted), and the detector map with everything a detector owns — its members,
-//! filters, IPSets and findings — plus the detector idempotency index, which is
-//! bounded with eviction by `MAX_CLIENT_TOKENS` (`tests/all/client_token_store.rs`).
+//! map with its plan idempotency index (which is bounded with eviction by
+//! `MAX_CLIENT_TOKENS` in its own right — `tests/all/client_token_store.rs`), and the
+//! detector map with everything a detector owns — its members, filters, IPSets and
+//! findings — plus the detector idempotency index, bounded the same way.
 //!
 //! Every request goes over the wire through `MultiServiceRouter::dispatch`.
 
@@ -193,6 +193,14 @@ async fn a_detector_create_past_the_region_bound_is_refused() {
         refused["detectorId"],
         Value::Null,
         "a refused create must mint no detector, got {refused:?}"
+    );
+
+    // And it is not served afterwards either: the refused Region holds nothing.
+    let (_, listed) = call_in(&router, one_too_many, "GET", "/detector", None).await;
+    assert_eq!(
+        listed["detectorIds"],
+        json!([]),
+        "the refused Region must hold no detector, got {listed:?}"
     );
 
     // The refusal evicted nothing: every Region the store already held still lists

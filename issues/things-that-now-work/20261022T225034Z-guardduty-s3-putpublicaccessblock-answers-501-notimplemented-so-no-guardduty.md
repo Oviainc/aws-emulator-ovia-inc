@@ -10,6 +10,25 @@ Issue-Commit: ead37dd00922f5e8ae35cfd4d29cc6e26f23d78c
 
 > _Note: this issue was identified against the code base at commit `ead37dd00922f5e8ae35cfd4d29cc6e26f23d78c`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+The cause this issue names — `s3:PutPublicAccessBlock` answering 501 — is gone:
+`services/service-com-amazonaws-s3-amazons3/src/ops/put_public_access_block.rs` stores the
+`PublicAccessBlockConfiguration` on the bucket and answers the modelled 200, and
+`services/service-com-amazonaws-s3-amazons3/tests/all/bucket_public_access_block.rs` pins
+that round trip. Of the downstream surface this issue listed as blocked behind it, the
+IPSet lifecycle is now reachable end to end: `UpdateIPSet` and `DeleteIPSet` are
+implemented (`GetIPSet` reports `DELETE_PENDING` and then `DELETED`), covered by
+`services/service-com-amazonaws-guardduty-guarddutyapiservice/tests/all/ip_set_update_and_delete.rs`,
+so `guardduty.ipset-lifecycle-active-then-deleted` no longer dies on a 501.
+
+STILL BLOCKED, each behind its own filed issue rather than behind this one:
+`guardduty.threatintelset-lifecycle` and `guardduty.threatentityset-lifecycle` need
+`CreateThreatIntelSet` / `CreateThreatEntitySet` (and their Get/Update/Delete siblings),
+which are still scaffolded 501s — see `guardduty-createthreatintelset-stub` and
+`guardduty-createthreatentityset-stub`. `ListIPSets` is likewise still a stub
+(`guardduty-listipsets-stub`).
+
 ## Operation
 PutPublicAccessBlock
 
