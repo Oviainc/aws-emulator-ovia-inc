@@ -63,11 +63,12 @@ pub const BUILD_SETTLE_MILLIS: i64 = 750;
 /// still observes `QUEUED`. The due instant is stored, never slept on.
 pub const SANDBOX_SETTLE_MILLIS: i64 = 500;
 
-/// How long a `StartBuild` or `StartBuildBatch` idempotency token stays in
-/// force. AWS documents the same lifetime on both members — on
-/// `StartBuildInput$idempotencyToken`: "The token is included in the StartBuild
-/// request and is valid for 5 minutes.", and on
-/// `StartBuildBatchInput$idempotencyToken`: "The token is included in the
+/// How long an idempotency token stays in force. AWS documents the same lifetime
+/// on every build operation that takes one: `StartBuildInput$idempotencyToken` —
+/// "The token is included in the StartBuild request and is valid for 5 minutes",
+/// `RetryBuildInput$idempotencyToken` — "The token is included in the RetryBuild
+/// request and is valid for five minutes" — and
+/// `StartBuildBatchInput$idempotencyToken` — "The token is included in the
 /// StartBuildBatch request and is valid for five minutes."
 pub const IDEMPOTENCY_TOKEN_TTL_MILLIS: i64 = 5 * 60 * 1000;
 
@@ -188,7 +189,7 @@ pub const MAX_BUILDS: usize = 10_000;
 /// pruning `build_batches_by_project` and the per-project counters with it.
 pub const MAX_BUILD_BATCHES: usize = 10_000;
 
-/// `StartBuild` idempotency entries retained at once.
+/// Idempotency entries retained at once, across every operation that takes a token.
 ///
 /// Every insert first drops the entries whose documented 5-minute lifetime has
 /// elapsed, since those can never be matched again; this ceiling is the backstop
@@ -431,6 +432,14 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     pub next_sandbox_numbers: BTreeMap<String, i64>,
     /// `StartSandbox` idempotency tokens, keyed by (project name, token).
     pub start_sandbox_tokens: BTreeMap<(String, String), StartSandboxToken>,
+    /// `RetryBuild` idempotency tokens, keyed by (project name, token).
+    ///
+    /// Kept apart from `start_build_tokens` for the reason
+    /// `start_build_batch_tokens` is: the two operations issue their tokens
+    /// independently, so the same token value may be in force for a build and
+    /// for a retry of a build of one project, and neither may resolve the
+    /// other's build.
+    pub retry_build_tokens: BTreeMap<(String, String), StartBuildToken>,
 }
 
 /// A persisted build project: the modelled [`Project`] plus the instants its
@@ -565,8 +574,8 @@ pub struct StartSandboxToken {
     pub issued_millis: i64,
 }
 
-/// What one in-force `StartBuild` or `StartBuildBatch` idempotency token
-/// resolved to.
+/// What one in-force `StartBuild`, `RetryBuild` or `StartBuildBatch` idempotency
+/// token resolved to.
 #[derive(Debug, Clone)]
 pub struct StartBuildToken {
     /// The build — or, for a `StartBuildBatch` token, the batch build — the
@@ -579,6 +588,29 @@ pub struct StartBuildToken {
     /// Epoch millis the token was issued at; it expires
     /// [`IDEMPOTENCY_TOKEN_TTL_MILLIS`] later.
     pub issued_millis: i64,
+}
+
+/// The same token, in force, carrying a DIFFERENT request than the one it was
+/// issued for — the parameter mismatch AWS documents on every
+/// `idempotencyToken` member. Each operation answers it with its own modelled
+/// `InvalidInputException`, so this carries no message of its own.
+#[derive(Debug, Clone, Copy)]
+pub struct IdempotencyMismatch;
+
+/// Which operation's idempotency store a lookup reads.
+///
+/// Each operation keeps its own store (the crate's convention, as
+/// `start_build_batch_tokens` and `start_sandbox_tokens` do), so a token is only
+/// ever resolved against the operation that issued it;
+/// [`ComAmazonawsCodebuildCodebuild20161006State::resolve_idempotency_token`]
+/// takes this so the documented five-minute / parameter-mismatch rule is written
+/// once for the operations that mint a [`Build`].
+#[derive(Debug, Clone, Copy)]
+pub enum BuildTokenStore {
+    /// `StartBuild`'s store (`start_build_tokens`).
+    StartBuild,
+    /// `RetryBuild`'s store (`retry_build_tokens`).
+    RetryBuild,
 }
 
 impl ComAmazonawsCodebuildCodebuild20161006State {
@@ -764,6 +796,92 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
             IDEMPOTENCY_TOKEN_TTL_MILLIS,
             MAX_IDEMPOTENCY_TOKENS,
         );
+    }
+
+    /// What an idempotency token already in force resolves to.
+    ///
+    /// AWS documents the token as valid for five minutes: a repeat of the SAME
+    /// request inside that window resolves to the build the first one started
+    /// (`Ok(Some(build))`), and the same token with a changed request is a
+    /// parameter mismatch ([`IdempotencyMismatch`]), which AWS documents as a
+    /// refusal rather than a second build. `Ok(None)` means this request has to
+    /// start one — the token is absent, expired, or the build it named is no
+    /// longer retained.
+    ///
+    /// `store` is the operation's own token store, so the rule is written once
+    /// for the operations that mint a [`Build`] and still resolves a token only
+    /// against the operation that issued it.
+    ///
+    /// Reads the build through [`Self::settled_build`], so a replay reports the
+    /// build as of now rather than as of the first call.
+    pub fn resolve_idempotency_token(
+        &mut self,
+        store: BuildTokenStore,
+        key: Option<&(String, String)>,
+        fingerprint: &str,
+        now_millis: i64,
+    ) -> Result<Option<Build>, IdempotencyMismatch> {
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let tokens = match store {
+            BuildTokenStore::StartBuild => &self.start_build_tokens,
+            BuildTokenStore::RetryBuild => &self.retry_build_tokens,
+        };
+        let in_force = tokens
+            .get(key)
+            .filter(|issued| now_millis - issued.issued_millis < IDEMPOTENCY_TOKEN_TTL_MILLIS)
+            .cloned();
+        let Some(issued) = in_force else {
+            return Ok(None);
+        };
+        if issued.request_fingerprint != fingerprint {
+            return Err(IdempotencyMismatch);
+        }
+        Ok(self
+            .settled_build(&issued.build_id, now_millis)
+            .map(|stored| stored.build.clone()))
+    }
+
+    /// Record the build an in-force `RetryBuild` idempotency token resolves to,
+    /// under [`Self::record_start_build_token`]'s rule and in that operation's
+    /// own store.
+    pub fn record_retry_build_token(
+        &mut self,
+        key: (String, String),
+        token: StartBuildToken,
+        now_millis: i64,
+    ) {
+        record_token(
+            &mut self.retry_build_tokens,
+            key,
+            token,
+            now_millis,
+            IDEMPOTENCY_TOKEN_TTL_MILLIS,
+            MAX_IDEMPOTENCY_TOKENS,
+        );
+    }
+
+    /// Link `retried_id`'s record forward to the build a retry of it started.
+    ///
+    /// AWS documents `AutoRetryConfig$nextAutoRetry` as "The build ARN of the
+    /// auto-retried build triggered by the current build", so the record of the
+    /// build that was retried is what carries it. A build that is no longer
+    /// retained (evicted by [`MAX_BUILDS`]) is simply not linked.
+    ///
+    /// The member is singular, so a build retried more than once reports its
+    /// LATEST retry here: each call replaces the link, and the chain is still
+    /// walkable from the other end, where every retry keeps its own
+    /// `previousAutoRetry`.
+    pub fn link_next_auto_retry(&mut self, retried_id: &str, retry_arn: String) {
+        let Some(stored) = self.builds.get_mut(retried_id) else {
+            return;
+        };
+        let held = stored.build.auto_retry_config.take().unwrap_or_default();
+        stored.build.auto_retry_config = Some(crate::ops::types::AutoRetryConfig {
+            next_auto_retry: Some(retry_arn),
+            ..held
+        });
     }
 
     /// Record the batch build an in-force `StartBuildBatch` idempotency token

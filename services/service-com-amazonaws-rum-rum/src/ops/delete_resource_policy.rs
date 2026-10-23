@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
+//!
 //! Removes the one resource-based policy an app monitor carries, clearing the
 //! [`crate::state::ResourcePolicyRecord`] `PutResourcePolicy` wrote, optionally
-//! conditional on that policy's current revision id.
+//! conditional on that policy's current revision id. Removing it revokes every grant it
+//! made: the authorization evaluation reads the policy in force on each call
+//! ([`crate::state::authorization`]), so a principal that was allowed only by this policy
+//! is refused from the next call on.
 //!
 //! ## Shape of an operation
 //!
@@ -152,8 +156,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The policy to remove is named entirely by the request's own members.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteResourcePolicyErrorModeled::InternalServerException(
                 InternalServerException {
@@ -164,7 +166,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The monitor and the policy in force, under a SHORT read lock: the decision
+        // below reads the IAM and STS stores and needs no lock of this service's.
+        let (resource_arn, held_policy) = {
+            let store = state.lock();
+            let Some(record) = store.app_monitors.get(&input.name) else {
+                return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.name),
+                )
+                .into());
+            };
+            (record.arn.clone(), record.resource_policy_document())
+        };
+        // The policy being removed is part of the decision that removes it: a principal
+        // the policy itself allows `rum:DeleteResourcePolicy` may delete it.
+        if let Err(denial) = crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::DELETE_RESOURCE_POLICY,
+            &resource_arn,
+            held_policy.as_deref(),
+            &[],
+        ) {
+            return Err(DeleteResourcePolicyErrorModeled::AccessDeniedException(
+                crate::state::access_denied(&denial),
+            )
+            .into());
+        }
+
         let mut store = state.lock();
+        // The monitor is resolved again under the write lock: the decision above held no
+        // lock, so a concurrent `DeleteAppMonitor` may have removed it — with its policy
+        // — in between.
         let Some(record) = store.app_monitors.get_mut(&input.name) else {
             return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
                 crate::state::app_monitor_not_found(&input.name),

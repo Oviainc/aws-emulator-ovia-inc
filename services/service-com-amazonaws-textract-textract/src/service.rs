@@ -97,16 +97,38 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound). Amazon Textract
+        // answers those with `InvalidParameterException` — the error it documents as
+        // "An input parameter violated a constraint. … Validate your parameter before
+        // calling the API operation again" — and EVERY operation of this service
+        // declares it, so a client that catches Textract's modelled exception catches
+        // the boundary's refusal too. The framework's default code,
+        // `ValidationException`, is modelled on this service's adapter operations only,
+        // and a client branching on it would miss the refusal elsewhere. Both the code
+        // and the message are replaced; the message is the boundary's own, which names
+        // the member and the constraint it failed.
+        match refusal {
+            Refusal::Invalid(violations) => {
+                let message = violations
+                    .iter()
+                    .map(smithy_server_runtime::Violation::message)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                Some(Refused {
+                    code: "InvalidParameterException".to_string(),
+                    message: if message.is_empty() {
+                        "An input parameter violated a constraint. Validate your parameter \
+                         before calling the API operation again."
+                            .to_string()
+                    } else {
+                        message
+                    },
+                })
+            }
+            // Authentication is not an input-parameter problem; the framework's own
+            // wording for it stands.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

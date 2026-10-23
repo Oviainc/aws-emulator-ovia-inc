@@ -189,18 +189,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Possible values are: 1, 3, 5, 7, 14, …, 3653" — `Days` is a plain integer in
         // the model, so the boundary validator does not hold `retentionInDays` to that
-        // catalogue and this handler is what refuses a value outside it.
+        // catalogue and this handler is what refuses a value outside it. The refusal
+        // lists the catalogue the model states, so a caller reads a legal retention out
+        // of it.
         if !crate::state::RETENTION_IN_DAYS_VALUES.contains(&input.retention_in_days) {
             return Err(PutRetentionPolicyErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "retentionInDays value {} is not one of {}",
-                        input.retention_in_days,
-                        crate::state::RETENTION_IN_DAYS_VALUES
-                            .iter()
-                            .map(i32::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                    message: Some(crate::state::invalid_value_message(
+                        "retention",
+                        crate::state::RETENTION_IN_DAYS_VALUES,
                     )),
                 },
             )
@@ -212,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = store.log_groups.get_mut(&input.log_group_name) else {
             return Err(PutRetentionPolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some("The specified log group does not exist.".to_string()),
+                    message: Some(crate::state::resource_not_found_message("log group")),
                 },
             )
             .into());

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeComplianceByConfigRule
+//!
 //! Reports whether each Config rule in [`crate::state`] is compliant: the rule's
 //! `ComplianceType` rolled up from the evaluation results recorded against it, plus
 //! the number of resources contributing a `NON_COMPLIANT` result, filtered by the

@@ -25,6 +25,19 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex codec for that id's bytes and for the opaque ListAppMonitors NextToken.
 hex = { workspace = true }
+# `iam_authorization`: the shared evaluation of IAM policy documents against
+# (action, resource, principal), which every RUM operation's authorization check runs.
+service-common = { path = "../common" }
+# The IAM store holds the identity-based policies of the principal a request speaks
+# for, and the STS store resolves which principal that is: RUM reads both services'
+# OWN state accessors rather than keeping a second copy of either fact.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The CloudWatch Logs client that provisions the vended log group RUM reports as
+# `DataStorage.CwLog.CwLogGroup` when log delivery is enabled, over the in-process
+# callback into this same emulator (no network client feature is enabled: the
+# transport is the emulator's own).
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -33,6 +46,9 @@ emulator-core-build-support = { workspace = true }
 # `time` for the one test that must cross a whole-second boundary, since
 # `ISOTimestampString` has one-second resolution.
 tokio = { workspace = true, features = ["time"] }
+# The authorization tests mount the CloudWatch Logs service beside RUM, because
+# enabling `CwLogEnabled` provisions the vended log group by calling it.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 
 [lints]
 workspace = true

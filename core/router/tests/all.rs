@@ -118,3 +118,5 @@ mod pi_data_source_ownership;
 mod lex_signing_name_routing;
 #[path = "all/lex_models_v2_runtime_v2_cross_service.rs"]
 mod lex_models_v2_runtime_v2_cross_service;
+#[path = "all/wisdom_signing_name_routing.rs"]
+mod wisdom_signing_name_routing;
