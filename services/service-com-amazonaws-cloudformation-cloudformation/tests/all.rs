@@ -17,10 +17,18 @@ mod agentcore_stack_outputs;
 mod callback_signature;
 #[path = "all/change_set_lifecycle.rs"]
 mod change_set_lifecycle;
+// An EMPTY, moved-out suite: its rows now live in `all/nested_resource_outputs.rs` and
+// `all/provisioned_resources.rs`. Declared because the layout check refuses an undeclared
+// file under `tests/all/`, and this fixer's tool set can write a file but not remove one;
+// the next change to touch this directory should delete both lines and the file.
+#[path = "all/ecs_elbv2_stack_outputs.rs"]
+mod ecs_elbv2_stack_outputs;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/extension_registry.rs"]
 mod extension_registry;
+#[path = "all/nested_resource_outputs.rs"]
+mod nested_resource_outputs;
 #[path = "all/provisioned_resources.rs"]
 mod provisioned_resources;
 #[path = "all/resolved_properties.rs"]

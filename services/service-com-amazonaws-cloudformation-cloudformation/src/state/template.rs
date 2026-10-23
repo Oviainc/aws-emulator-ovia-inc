@@ -1107,48 +1107,139 @@ pub struct StackScope<'a> {
 /// function produces. The attributes each resource answers are filled in in a second
 /// pass, once every resource's identity is known, so an attribute that is the resource's
 /// own declared property resolves even where that property refers to another resource of
-/// the same template (`VpcId: !Ref Vpc`).
+/// the same template (`VpcId: !Ref Vpc`). A type whose own IDENTIFIER is a function of
+/// another resource's is resolved the same way, by
+/// [`resolve_dependent_identities`].
 pub fn provision(
     template: &Template,
     scope: &Scope<'_>,
     budget: &mut Budget,
 ) -> Vec<StoredResource> {
     let mut names: Vec<(&DeclaredResource, String)> = Vec::new();
-    let mut provisioned: Vec<StoredResource> = Vec::new();
     for declared in &template.resources {
         if !is_created(declared, scope, budget) {
             continue;
         }
-        let name = physical_name(declared, scope, budget);
-        let (physical_resource_id, attributes) = return_values(declared, &name, scope, budget);
-        provisioned.push(StoredResource {
-            logical_id: declared.logical_id.clone(),
-            resource_type: declared.resource_type.clone(),
-            physical_resource_id,
-            attributes,
-            metadata: declared_metadata(declared),
-            // Filled by [`resolve_properties`], once every resource's identity is
-            // known; `materialised` by
-            // [`super::provisioning`](crate::state::provisioning), once the owning
-            // service has created the resource.
-            properties: Value::Null,
-            materialised: false,
-        });
-        names.push((declared, name));
+        names.push((declared, physical_name(declared, scope, budget)));
     }
 
-    let by_logical_id: BTreeMap<String, StoredResource> = provisioned
+    let mut identities: BTreeMap<String, StoredResource> = BTreeMap::new();
+    for (declared, name) in &names {
+        let (physical_resource_id, attributes) = return_values(declared, name, scope, budget);
+        identities.insert(
+            declared.logical_id.clone(),
+            StoredResource {
+                logical_id: declared.logical_id.clone(),
+                resource_type: declared.resource_type.clone(),
+                physical_resource_id,
+                attributes,
+                metadata: declared_metadata(declared),
+                // Filled by [`resolve_properties`], once every resource's identity is
+                // known; `materialised` by
+                // [`super::provisioning`](crate::state::provisioning), once the owning
+                // service has created the resource.
+                properties: Value::Null,
+                materialised: false,
+            },
+        );
+    }
+    // The few types whose own identifier is built from ANOTHER resource's had nothing to
+    // resolve against above, so they are recomputed once the rest are known.
+    resolve_dependent_identities(&names, &mut identities, scope, budget);
+
+    let mut provisioned: Vec<StoredResource> = names
         .iter()
-        .map(|resource| (resource.logical_id.clone(), resource.clone()))
+        .filter_map(|(declared, _)| identities.get(&declared.logical_id).cloned())
         .collect();
     let resolved = Scope {
-        resources: &by_logical_id,
+        resources: &identities,
         ..*scope
     };
-    for (resource, (declared, name)) in provisioned.iter_mut().zip(names) {
-        attach_attributes(resource, declared, &name, &resolved, budget);
+    for (resource, (declared, name)) in provisioned.iter_mut().zip(&names) {
+        attach_attributes(resource, declared, name, &resolved, budget);
     }
     provisioned
+}
+
+/// How many rounds [`resolve_dependent_identities`] recomputes a dependent identity in.
+///
+/// Chosen as one past the longest chain of identifier dependencies the catalogued types
+/// form — an ELBv2 listener rule's ARN is built from its listener's, which is built from
+/// its load balancer's — so the last round is the one that finds nothing left to change.
+const MAX_IDENTITY_ROUNDS: usize = 4;
+
+/// Whether a resource type's published identifier is a function of ANOTHER resource of the
+/// template, so it can only be computed once that resource's identity is known.
+///
+/// Three of the catalogued types are: an Amazon ECS service's ARN carries the CLUSTER that
+/// hosts it (`service/<cluster>/<name>`), and an ELBv2 listener's and listener rule's ARNs
+/// nest inside the ARN of the load balancer and the listener their declaration names. Every
+/// other type's return values are functions of its own name and its own declared
+/// properties, so one pass computes them.
+fn identity_depends_on_another_resource(resource_type: &str) -> bool {
+    matches!(
+        resource_type,
+        ECS_SERVICE | ELB_LISTENER | ELB_LISTENER_RULE
+    )
+}
+
+/// Recompute the identity of each resource whose identifier is built from another
+/// resource's, until a round changes nothing.
+///
+/// CloudFormation creates a stack's resources in the order their `Ref`s and `Fn::GetAtt`s
+/// imply, so a resource whose identifier embeds another's is created after it and embeds
+/// the real one. [`provision`]'s first pass has no resource to resolve against — the
+/// identities are what it is producing — so a dependent resource is computed again here,
+/// against the identities already known, and that is repeated until it settles: a listener
+/// resolves once its load balancer's ARN is known, and the rule inside it the round after.
+/// Only the [`identity_depends_on_another_resource`] types are recomputed, so the work is
+/// bounded by how many of THOSE a template declares rather than by its resource count, and
+/// a dependency the rounds do not settle (a cycle, which no deployable template has) keeps
+/// the identity the last round computed.
+fn resolve_dependent_identities(
+    names: &[(&DeclaredResource, String)],
+    identities: &mut BTreeMap<String, StoredResource>,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) {
+    let dependent: Vec<&(&DeclaredResource, String)> = names
+        .iter()
+        .filter(|(declared, _)| identity_depends_on_another_resource(&declared.resource_type))
+        .collect();
+    if dependent.is_empty() {
+        return;
+    }
+    for _round in 0..MAX_IDENTITY_ROUNDS {
+        let mut recomputed: Vec<(String, String, BTreeMap<String, String>)> =
+            Vec::with_capacity(dependent.len());
+        {
+            let known = Scope {
+                resources: &*identities,
+                ..*scope
+            };
+            for (declared, name) in &dependent {
+                let (physical_resource_id, attributes) =
+                    return_values(declared, name, &known, budget);
+                recomputed.push((declared.logical_id.clone(), physical_resource_id, attributes));
+            }
+        }
+        let mut changed = false;
+        for (logical_id, physical_resource_id, attributes) in recomputed {
+            let Some(resource) = identities.get_mut(&logical_id) else {
+                continue;
+            };
+            if resource.physical_resource_id != physical_resource_id
+                || resource.attributes != attributes
+            {
+                resource.physical_resource_id = physical_resource_id;
+                resource.attributes = attributes;
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+    }
 }
 
 /// The content of the `Metadata` resource attribute a declaration carries, as JSON.
@@ -1637,7 +1728,10 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     ECR_PUBLIC_REPOSITORY,
     ECR_REPOSITORY,
     ECS_CLUSTER,
+    ECS_SERVICE,
     ECS_TASK_DEFINITION,
+    ELB_LISTENER,
+    ELB_LISTENER_RULE,
     ELB_LOAD_BALANCER,
     ELB_TARGET_GROUP,
     "AWS::IAM::Role",
@@ -2007,6 +2101,83 @@ fn return_values(
             attributes.insert("GroupId".to_string(), group_id.clone());
             (group_id, attributes)
         }
+        // "Ref returns the Amazon Resource Name (ARN)"; Fn::GetAtt: Name. A service ARN
+        // carries the CLUSTER that hosts it (`service/<cluster>/<name>`), which the
+        // declaration names by short name or by cluster ARN and which defaults to the
+        // `default` cluster — so the cluster is resolved once the resource the declaration
+        // names has an identity ([`resolve_dependent_identities`]). The `Arn`/`ServiceArn`
+        // the convention adds is that same ARN, since it is the service's physical id.
+        ECS_SERVICE => {
+            let cluster = properties
+                .get("Cluster")
+                .and_then(|value| text(value, scope, 0, budget))
+                .map(|reference| ecs_cluster_name(&reference))
+                .unwrap_or_else(|| ECS_DEFAULT_CLUSTER.to_string());
+            attributes.insert("Name".to_string(), name.to_string());
+            (
+                ::emulator_server::emulator_arn(
+                    "ecs",
+                    region,
+                    &format!("service/{cluster}/{name}"),
+                ),
+                attributes,
+            )
+        }
+        // "Ref returns the ARN of the listener"; Fn::GetAtt: ListenerArn. A listener's ARN
+        // nests inside the ARN of the load balancer its declaration names
+        // (`listener/<type>/<lb>/<lb id>/<listener id>`), so it is resolved once that load
+        // balancer's identity is known ([`resolve_dependent_identities`]); a declaration
+        // naming none leaves the listener with CloudFormation's own generated identity
+        // rather than an ARN built on a value that is not one.
+        ELB_LISTENER => {
+            let listener_arn = properties
+                .get("LoadBalancerArn")
+                .and_then(|value| text(value, scope, 0, budget))
+                .and_then(|parent| {
+                    nested_elb_arn(
+                        &parent,
+                        ELB_LOAD_BALANCER_SEGMENT,
+                        ELB_LISTENER_SEGMENT,
+                        &service_assigned_label(ELB_LISTENER_ID_SALT, name, ELB_ID_HEX_DIGITS),
+                    )
+                });
+            match listener_arn {
+                Some(arn) => {
+                    attributes.insert("ListenerArn".to_string(), arn.clone());
+                    (arn, attributes)
+                }
+                None => (name.to_string(), attributes),
+            }
+        }
+        // "Ref returns the rule ARN"; Fn::GetAtt: IsDefault, RuleArn. A rule's ARN nests
+        // inside its listener's the same way. `IsDefault` is false for a rule a template
+        // declares: a listener's default rule is created WITH the listener (it is that
+        // listener's `DefaultActions`), never as a resource of its own.
+        ELB_LISTENER_RULE => {
+            let rule_arn = properties
+                .get("ListenerArn")
+                .and_then(|value| text(value, scope, 0, budget))
+                .and_then(|parent| {
+                    nested_elb_arn(
+                        &parent,
+                        ELB_LISTENER_SEGMENT,
+                        ELB_LISTENER_RULE_SEGMENT,
+                        &service_assigned_label(
+                            ELB_LISTENER_RULE_ID_SALT,
+                            name,
+                            ELB_ID_HEX_DIGITS,
+                        ),
+                    )
+                });
+            attributes.insert("IsDefault".to_string(), false.to_string());
+            match rule_arn {
+                Some(arn) => {
+                    attributes.insert("RuleArn".to_string(), arn.clone());
+                    (arn, attributes)
+                }
+                None => (name.to_string(), attributes),
+            }
+        }
         // The Amazon Bedrock AgentCore types. Source for each one's identifiers: the
         // AgentCore control-plane model, whose `arnReference` traits name these very
         // resource types — `MemoryArn` references `AWS::BedrockAgentCore::Memory`,
@@ -2348,6 +2519,68 @@ const SECRET_ARN_SUFFIX_CHARACTERS: usize = 6;
 /// How many hexadecimal characters an Amazon EC2 resource id carries after its prefix: the
 /// current (long) id form is 17 (`sg-0123456789abcdef0`).
 const EC2_ID_HEX_DIGITS: usize = 17;
+
+/// The `AWS::ECS::Service` resource type: a service running on an ECS cluster.
+const ECS_SERVICE: &str = "AWS::ECS::Service";
+
+/// An Elastic Load Balancing v2 listener's and listener rule's resource types. Each one's
+/// published identifier NESTS inside its parent's ARN, which is what [`nested_elb_arn`]
+/// builds and why [`identity_depends_on_another_resource`] names them.
+const ELB_LISTENER: &str = "AWS::ElasticLoadBalancingV2::Listener";
+const ELB_LISTENER_RULE: &str = "AWS::ElasticLoadBalancingV2::ListenerRule";
+
+/// The salts a listener's and a rule's assigned ids are derived under, beside the load
+/// balancer's and the target group's (see [`service_assigned_label`]).
+const ELB_LISTENER_ID_SALT: &str = "elasticloadbalancing/listener-id";
+const ELB_LISTENER_RULE_ID_SALT: &str = "elasticloadbalancing/listener-rule-id";
+
+/// The ARN resource segment of each Elastic Load Balancing v2 resource kind, which is what
+/// a nested ARN replaces: a listener's is `listener/app/<lb>/<lb id>/<listener id>` and a
+/// rule's `listener-rule/app/<lb>/<lb id>/<listener id>/<rule id>`.
+const ELB_LOAD_BALANCER_SEGMENT: &str = "loadbalancer";
+const ELB_LISTENER_SEGMENT: &str = "listener";
+const ELB_LISTENER_RULE_SEGMENT: &str = "listener-rule";
+
+/// The cluster an ECS service belongs to when its declaration names none. Every ECS
+/// `cluster` member documents it: "If you do not specify a cluster, the default cluster is
+/// assumed", and that cluster is named `default`.
+const ECS_DEFAULT_CLUSTER: &str = "default";
+
+/// The ARN of a resource Elastic Load Balancing nests inside another: `parent`'s ARN with
+/// `segment` in place of `parent_segment` and `id` appended, which is the form a
+/// listener's ARN takes inside its load balancer's and a rule's inside its listener's.
+///
+/// `None` where `parent` is not an Elastic Load Balancing ARN of the expected kind — the
+/// declaration names no parent, or names one this emulator could not resolve — so the
+/// nested resource keeps the identity CloudFormation's naming rules gave it rather than
+/// one built on a value that is not an ARN.
+fn nested_elb_arn(
+    parent: &str,
+    parent_segment: &str,
+    segment: &str,
+    id: &str,
+) -> Option<String> {
+    let marker = format!(":{parent_segment}/");
+    if !parent.starts_with(&format!("arn:{PARTITION}:elasticloadbalancing:"))
+        || !parent.contains(&marker)
+    {
+        return None;
+    }
+    Some(format!(
+        "{}/{id}",
+        parent.replacen(&marker, &format!(":{segment}/"), 1)
+    ))
+}
+
+/// The cluster NAME an ECS resource's `Cluster` property names: every such member takes
+/// "the short name or full Amazon Resource Name (ARN) of the cluster", and a cluster ARN's
+/// resource portion is `cluster/<name>`.
+fn ecs_cluster_name(reference: &str) -> String {
+    match reference.rsplit_once(":cluster/") {
+        Some((_, name)) => name.to_string(),
+        None => reference.to_string(),
+    }
+}
 
 /// A service-assigned identifier of the canonical UUID form, derived from `name` under
 /// `domain`.
@@ -3129,11 +3362,23 @@ mod tests {
         // values are functions of the resource's own properties: a declaration carrying
         // only the type is what a template that sets no property spells. A DB type's
         // `Endpoint.Port` is one of those — it needs a declared engine — so each DB row
-        // declares the engine a template would.
+        // declares the engine a template would, and the two NESTED Elastic Load Balancing
+        // types (a listener and a rule, whose ARNs are built from their parent's) the
+        // parent ARN a template would.
         let declared_as = |resource_type: &str| DeclaredResource {
             logical_id: "ARes".to_string(),
             resource_type: resource_type.to_string(),
-            properties: ::serde_json::json!({"Engine": "aurora-mysql"}),
+            properties: ::serde_json::json!({
+                "Engine": "aurora-mysql",
+                "LoadBalancerArn": format!(
+                    "arn:{PARTITION}:elasticloadbalancing:us-east-1:000000000000:\
+                     loadbalancer/app/a-name/0123456789abcdef"
+                ),
+                "ListenerArn": format!(
+                    "arn:{PARTITION}:elasticloadbalancing:us-east-1:000000000000:\
+                     listener/app/a-name/0123456789abcdef/fedcba9876543210"
+                ),
+            }),
             condition: None,
             declaration: Value::Null,
         };
