@@ -83,6 +83,9 @@ impl Emulator {
             },
             // Already past, so the record needs no clock-owed transition.
             available_at: std::time::Instant::now(),
+            // A seeded record was taken of no cluster this store holds, so it
+            // carries no source configuration for a restore to rebuild from.
+            source: None,
         });
     }
 

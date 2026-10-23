@@ -23,5 +23,7 @@ mod cluster_versions;
 mod modify_cluster_parameter_group;
 #[path = "all/orderable_cluster_options.rs"]
 mod orderable_cluster_options;
+#[path = "all/snapshot_restore.rs"]
+mod snapshot_restore;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
