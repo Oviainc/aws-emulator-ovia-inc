@@ -18,7 +18,7 @@ use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 /// The canonical account id every ARN a generated emulator mints carries
 /// (`engine::emulator_account_id`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The values the model's `ExecutionState` enum declares, from
 /// `smithy_query(query="shape", shape="ExecutionState", model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`.
@@ -37,7 +37,7 @@ const EXECUTION_STATES: &[&str] = &[
 ];
 
 /// A router carrying this one service on a fresh shared engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // This suite exercises operation behaviour, not request signing.
@@ -49,7 +49,11 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Call one operation and return its HTTP status and parsed body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -77,7 +81,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// The wire error code of an error response: the `__type` member's shape name.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -88,7 +92,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// One workflow with `step_names` manual-approval steps.
-fn workflow(action: &str, step_names: &[&str]) -> Value {
+pub(crate) fn workflow(action: &str, step_names: &[&str]) -> Value {
     let steps: Vec<Value> = step_names
         .iter()
         .map(|name| {
@@ -114,7 +118,7 @@ fn workflow(action: &str, step_names: &[&str]) -> Value {
 }
 
 /// The workflow set most cases use: one per traffic-shifting action.
-fn default_workflows() -> Value {
+pub(crate) fn default_workflows() -> Value {
     json!([
         workflow("activate", &["scale-up", "shift-traffic"]),
         workflow("deactivate", &["shift-traffic", "scale-down"]),
@@ -157,7 +161,12 @@ fn unrunnable_workflow(action: &str, step_names: &[&str]) -> Value {
 }
 
 /// A `CreatePlan` request carrying only the required members plus `workflows`.
-fn create_request(name: &str, regions: [&str; 2], approach: &str, workflows: Value) -> Value {
+pub(crate) fn create_request(
+    name: &str,
+    regions: [&str; 2],
+    approach: &str,
+    workflows: Value,
+) -> Value {
     json!({
         "name": name,
         "regions": regions,
@@ -168,7 +177,11 @@ fn create_request(name: &str, regions: [&str; 2], approach: &str, workflows: Val
 }
 
 /// Create a plan and return its ARN.
-async fn create_plan(router: &MultiServiceRouter, name: &str, regions: [&str; 2]) -> String {
+pub(crate) async fn create_plan(
+    router: &MultiServiceRouter,
+    name: &str,
+    regions: [&str; 2],
+) -> String {
     let request = create_request(name, regions, "activePassive", default_workflows());
     let (status, created) = call(router, "CreatePlan", &request).await;
     assert_eq!(
