@@ -167,7 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: format!("Resource {} not found.", input.resource_arn),
-                        resource_id: Some(input.resource_arn.clone()),
+                        // The ARN parsed but names no kind this store holds, so there is
+                        // no resolved resource to report an id or a kind for.
+                        resource_id: None,
                         resource_type: None,
                     },
                 )
@@ -175,11 +177,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // `resourceId` is the ID of the resource the ARN RESOLVED to — its name, or a
+        // package group's pattern — never the ARN itself: a client feeds that value back
+        // into a name-scoped call or matches it against a name. The message is the one the
+        // resource's own kind is refused with everywhere else in this service, so a caller
+        // that addressed a domain by ARN reads the same sentence as one that named it.
         let not_found = || {
             ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Resource {} not found.", input.resource_arn),
-                    resource_id: Some(input.resource_arn.clone()),
+                    message: crate::state::tagged_resource_not_found_message(&reference),
+                    resource_id: Some(crate::state::reported_resource_id(&reference)),
                     resource_type: crate::state::reported_resource_type(&reference),
                 },
             )

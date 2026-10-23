@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
+#[path = "all/invoke_path_routing.rs"]
+mod invoke_path_routing;
 #[path = "all/probe.rs"]
 mod probe;
 #[path = "all/state_roundtrip.rs"]

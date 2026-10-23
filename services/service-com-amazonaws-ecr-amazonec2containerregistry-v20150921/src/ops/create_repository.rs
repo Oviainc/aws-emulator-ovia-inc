@@ -312,6 +312,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy_text: None,
             images: ::std::collections::BTreeMap::new(),
             tag_index: ::std::collections::BTreeMap::new(),
+            // A new repository holds no blobs: a layer is in a repository once an
+            // upload against it is completed.
+            layer_blobs: ::std::collections::BTreeMap::new(),
             // A new repository carries no lifecycle policy, and no preview of one.
             lifecycle_policy: None,
             lifecycle_preview: None,
