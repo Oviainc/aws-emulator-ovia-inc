@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateChannel`'s real behaviour. Implement it here — this is
+//! Updates a CloudTrail Lake channel in this service's channel registry — this is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +169,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateChannel"))
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateChannelErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "UpdateChannel needs the CloudTrail channel registry, which this \
+                         engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `Channel` is documented as "The ARN or ID (the ARN suffix) of the channel",
+        // so both forms name the same channel; an `arn:`-prefixed value that is not a
+        // channel ARN cannot name one, so it is refused as a malformed ARN rather than
+        // reported absent. The reading is the registry's own
+        // (`crate::state::channels`), so every channel operation resolves an
+        // identifier the same way.
+        let address = store
+            .addressed_channel(&input.channel, &region)
+            .ok_or_else(|| {
+                UpdateChannelError::from(UpdateChannelErrorModeled::ChannelARNInvalidException(
+                    ChannelARNInvalidException {
+                        message: Some(crate::state::channels::channel_arn_invalid_message(
+                            &input.channel,
+                        )),
+                    },
+                ))
+            })?;
+
+        // A channel is a Regional resource of one account, so only the channel the
+        // identifier addresses is updatable here; an identifier naming another account
+        // addresses no record in this registry.
+        let key = match address {
+            crate::state::channels::ChannelAddress::Key(key) => key,
+            crate::state::channels::ChannelAddress::AnotherAccount => {
+                return Err(channel_not_found(&input.channel, &region))
+            }
+        };
+        let Some((channel_id, channel_region)) = store
+            .channels
+            .get(&key)
+            .map(|record| (record.channel_id.clone(), record.home_region.clone()))
+        else {
+            return Err(channel_not_found(&input.channel, &region));
+        };
+
+        // A destination the request supplies REPLACES the stored list, so it is
+        // checked the way `CreateChannel` checks the list it was given — against the
+        // event data stores of the Region the channel lives in, since that is the lake
+        // this channel logs into.
+        for destination in input.destinations.iter().flatten() {
+            store
+                .resolve_channel_destination(destination, &channel_region)
+                .map_err(destination_error)?;
+        }
+
+        // A name already taken by ANOTHER channel in the channel's OWN Region is a
+        // conflict; re-setting a channel's own name is not, which is what makes the
+        // operation `@idempotent`. The Region is the channel's, not the caller's,
+        // because a channel ARN addresses a channel from anywhere.
+        if let Some(name) = input.name.as_deref() {
+            if let Some(existing) = store
+                .channel_named(&channel_region, name)
+                .filter(|existing| existing.channel_id != channel_id)
+            {
+                return Err(UpdateChannelErrorModeled::ChannelAlreadyExistsException(
+                    ChannelAlreadyExistsException {
+                        message: Some(format!(
+                            "Channel {name} already exists in {channel_region}; it is the \
+                             channel {}",
+                            existing.channel_arn
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Only what the request carries changes: an absent member leaves the stored
+        // value alone, and `Source` is not updatable at all ("You cannot change this
+        // name after you create the channel").
+        let Some(channel) = store.channels.get_mut(&key) else {
+            return Err(channel_not_found(&input.channel, &region));
+        };
+        if let Some(name) = input.name {
+            channel.name = name;
+        }
+        if let Some(destinations) = input.destinations {
+            channel.destinations = destinations;
+        }
+
+        // Report the stored record, so the response and every later read of this
+        // channel are the same values.
+        Ok(UpdateChannelOutput {
+            channel_arn: Some(channel.channel_arn.clone()),
+            name: Some(channel.name.clone()),
+            source: Some(channel.source.clone()),
+            destinations: Some(channel.destinations.clone()),
+        })
     }
+}
+
+/// Refuse the request because the identifier named no stored channel.
+///
+/// The wording and the status are the registry's shared ones, so this operation,
+/// `GetChannel` and `DeleteChannel` cannot drift; the identifier is completed through
+/// [`crate::state::channels::addressed_channel_arn`] first, because a refusal names the
+/// channel ARN the identifier ADDRESSED — the recorded refusal of a BARE channel id
+/// answers with the ARN that id names in the calling Region, not with the id as typed.
+fn channel_not_found(identifier: &str, request_region: &str) -> UpdateChannelError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        UpdateChannelErrorModeled::ChannelNotFoundException(ChannelNotFoundException {
+            message: Some(crate::state::channels::channel_not_found_message(
+                &crate::state::channels::addressed_channel_arn(identifier, request_region),
+            )),
+        }),
+        crate::state::channels::CHANNEL_NOT_FOUND_HTTP_STATUS,
+    )
+}
+
+/// The modelled failure a refused destination answers with. Each
+/// [`crate::state::channels::DestinationRejection`] variant names one, the same way
+/// `create_channel.rs` lifts them, so both operations refuse the same destination the
+/// same way.
+fn destination_error(
+    rejection: crate::state::channels::DestinationRejection,
+) -> UpdateChannelError {
+    use crate::state::channels::DestinationRejection;
+
+    let modeled = match rejection {
+        DestinationRejection::ArnInvalid(message) => {
+            UpdateChannelErrorModeled::EventDataStoreARNInvalidException(
+                EventDataStoreARNInvalidException {
+                    message: Some(message),
+                },
+            )
+        }
+        DestinationRejection::NotFound(message) => {
+            // The one refusal whose status is not its shape's `@httpError`: the shape
+            // carries 404 and the service answers 400. See
+            // `state::channels::EVENT_DATA_STORE_NOT_FOUND_HTTP_STATUS`.
+            return crate::scaffolded::Scaffolded::modeled_with_status(
+                UpdateChannelErrorModeled::EventDataStoreNotFoundException(
+                    EventDataStoreNotFoundException {
+                        message: Some(message),
+                    },
+                ),
+                crate::state::channels::EVENT_DATA_STORE_NOT_FOUND_HTTP_STATUS,
+            );
+        }
+        DestinationRejection::Inactive(message) => {
+            UpdateChannelErrorModeled::InactiveEventDataStoreException(
+                InactiveEventDataStoreException {
+                    message: Some(message),
+                },
+            )
+        }
+        DestinationRejection::InvalidParameter(message) => {
+            UpdateChannelErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+        }
+    };
+    modeled.into()
 }

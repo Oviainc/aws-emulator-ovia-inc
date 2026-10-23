@@ -47,6 +47,10 @@ mod boot_serve;
 mod cloudformation_provisions_stack_resources;
 #[path = "all/cloudfront_key_value_store_handshake.rs"]
 mod cloudfront_key_value_store_handshake;
+// In the SORTED block, not appended at the end, for the reason stated above: the end of
+// this file is where every concurrent suite lands.
+#[path = "all/cloudtrail_channel_routing.rs"]
+mod cloudtrail_channel_routing;
 #[path = "all/connect_signing_name_routing.rs"]
 mod connect_signing_name_routing;
 #[path = "all/dynamodb_streams_routing.rs"]

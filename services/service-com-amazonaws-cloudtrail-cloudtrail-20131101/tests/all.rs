@@ -19,6 +19,8 @@ mod channel_error_envelope;
 mod channel_lifecycle;
 #[path = "all/channel_listing.rs"]
 mod channel_listing;
+#[path = "all/channel_updates.rs"]
+mod channel_updates;
 #[path = "all/dashboard_enumeration.rs"]
 mod dashboard_enumeration;
 #[path = "all/dashboard_lifecycle.rs"]
@@ -82,7 +84,9 @@ mod trail_refusals;
 #[path = "all/trail_update.rs"]
 mod trail_update;
 // Declared only because the build's layout check requires every file under `tests/all/`
-// to be declared: this one is an empty leftover (see its own doc comment), and the suite
-// it used to hold now lives in `all/channel_error_envelope.rs`.
+// to be declared: these two are empty leftovers (see their own doc comments), kept
+// because the fixers' tool cannot delete a file.
+#[path = "all/wire.rs"]
+mod wire;
 #[path = "all/zz_diagnostic.rs"]
 mod zz_diagnostic;

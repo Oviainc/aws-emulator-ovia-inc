@@ -133,10 +133,17 @@ impl From<DeleteChannelErrorModeled> for DeleteChannelError {
 const CHANNEL_NOT_FOUND_STATUS: u16 = 400;
 
 /// Refuse the request because the identifier named no stored channel.
-fn channel_not_found(identifier: &str) -> DeleteChannelError {
+///
+/// The message names the channel ARN the identifier addressed, which is what the
+/// recorded refusals carry: a bare channel id is completed into the ARN it names in
+/// the Region the call was made in (see
+/// `crate::state::channels::addressed_channel_arn`).
+fn channel_not_found(identifier: &str, request_region: &str) -> DeleteChannelError {
     crate::scaffolded::Scaffolded::modeled_with_status(
         DeleteChannelErrorModeled::ChannelNotFoundException(ChannelNotFoundException {
-            message: Some(crate::state::channels::channel_not_found_message(identifier)),
+            message: Some(crate::state::channels::channel_not_found_message(
+                &crate::state::channels::addressed_channel_arn(identifier, request_region),
+            )),
         }),
         CHANNEL_NOT_FOUND_STATUS,
     )
@@ -216,6 +223,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if released {
             return Ok(DeleteChannelOutput {});
         }
-        Err(channel_not_found(&input.channel))
+        Err(channel_not_found(&input.channel, &region))
     }
 }

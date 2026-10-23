@@ -26,10 +26,9 @@
 //!   `ChannelARNInvalidException` ("thrown when the specified value of ChannelARN is not
 //!   valid"), and a refused request deletes nothing.
 //!
-//! `GetChannel` is still a scaffold stub (its own issue,
-//! `20261022T230533Z-cloudtrail-getchannel-stub.md`), so a delete is read back through
-//! the registry these cases seed — the same store the handler writes — and through the
-//! second delete's refusal, which is the same fact over the wire.
+//! A delete is read back through the registry these cases seed — the same store the
+//! handler writes — and through the second delete's refusal, which is the same fact over
+//! the wire.
 
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -163,6 +162,16 @@ fn channel_id(seed: &str) -> String {
     format!("{seed}-30fe-4581-8bd3-351632c2be72")
 }
 
+/// The channel ARN a refusal names for the channel `id` in `region`, written out from
+/// the format the model doc publishes
+/// (`arn:aws:cloudtrail:us-east-2:123456789012:channel/01234567890`) and the emulator's
+/// canonical account, rather than taken from the code that builds the refusal: an
+/// expectation computed by the production helper could not catch that helper addressing
+/// the wrong ARN.
+fn expected_channel_arn(region: &str, id: &str) -> String {
+    format!("arn:aws:cloudtrail:{region}:000000000000:channel/{id}")
+}
+
 /// RULE: `DeleteChannel` releases exactly the channel its identifier addresses — by
 /// channel ARN or by bare id, out of the Region the ARN pins or the Region the call was
 /// made in — and leaves every other channel in the registry.
@@ -235,7 +244,13 @@ async fn deleting_a_channel_releases_exactly_that_channel() {
             case,
             CHANNEL_NOT_FOUND_STATUS,
             "ChannelNotFoundException",
-            &format!("The channel {identifier} was not found."),
+            // A refusal names the channel ARN the identifier addressed, so a bare id
+            // is answered with the ARN it completes to in the calling Region. The ARN
+            // is spelled out here, not taken from the code that builds the refusal.
+            &format!(
+                "The channel {} was not found.",
+                expected_channel_arn(region, id)
+            ),
         );
     }
 
@@ -266,49 +281,63 @@ async fn an_identifier_naming_no_channel_is_not_found() {
     let before = emulator.channel_keys();
 
     let absent = channel_id("ffffffff");
-    let rows: Vec<(&str, String)> = vec![
-        ("a bare id no channel carries", absent.clone()),
+    // (case, identifier, the channel ARN the refusal must name — spelled out here
+    //  rather than taken from the code that builds it)
+    let rows: Vec<(&str, String, String)> = vec![
+        (
+            "a bare id no channel carries",
+            absent.clone(),
+            expected_channel_arn(HOME_REGION, &absent),
+        ),
         (
             "an ARN in the calling Region for an absent channel",
             channels::channel_arn(HOME_REGION, &absent),
+            expected_channel_arn(HOME_REGION, &absent),
         ),
         (
             "the ARN of a channel that lives in another Region",
             channels::channel_arn(OTHER_REGION, &present),
+            expected_channel_arn(OTHER_REGION, &present),
         ),
         (
             "an ARN naming another account",
+            format!("arn:aws:cloudtrail:{HOME_REGION}:111122223333:channel/{present}"),
             format!("arn:aws:cloudtrail:{HOME_REGION}:111122223333:channel/{present}"),
         ),
         (
             "the stored id in upper-case hex, which is a different id",
             present.to_uppercase(),
+            expected_channel_arn(HOME_REGION, &present.to_uppercase()),
         ),
         (
             "a bare identifier that is not a minted id at all",
             "my-channel".to_string(),
+            expected_channel_arn(HOME_REGION, "my-channel"),
         ),
         (
             "a bare identifier one UUID group short",
             "39032a83-30fe-4581-351632c2be72".to_string(),
+            expected_channel_arn(HOME_REGION, "39032a83-30fe-4581-351632c2be72"),
         ),
         (
             "a bare identifier with a non-hex digit",
             "39032a8z-30fe-4581-8bd3-351632c2be72".to_string(),
+            expected_channel_arn(HOME_REGION, "39032a8z-30fe-4581-8bd3-351632c2be72"),
         ),
         (
             "an ARN whose channel id is not a minted one",
             format!("arn:aws:cloudtrail:{HOME_REGION}:000000000000:channel/not-a-minted-id"),
+            expected_channel_arn(HOME_REGION, "not-a-minted-id"),
         ),
     ];
 
-    for (case, identifier) in &rows {
+    for (case, identifier, subject) in &rows {
         let reply = emulator.delete_channel(identifier).await;
         reply.expect_error_message(
             case,
             CHANNEL_NOT_FOUND_STATUS,
             "ChannelNotFoundException",
-            &format!("The channel {identifier} was not found."),
+            &format!("The channel {subject} was not found."),
         );
         assert_eq!(
             emulator.channel_keys(),

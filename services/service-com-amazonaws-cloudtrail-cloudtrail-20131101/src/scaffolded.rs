@@ -190,12 +190,12 @@ pub enum Scaffolded<E> {
     ///
     /// The error code and the body are the model's own; only the HTTP status is
     /// the handler's. CloudTrail declares `@httpError(404)` on
-    /// `EventDataStoreNotFoundException`, `QueryIdNotFoundException` and
-    /// `ImportNotFoundException` and then answers 400 for all three on the wire,
-    /// which no modeled annotation can express. Reach for this ONLY with recorded
-    /// evidence of the status the service answers with, and cite it where you
-    /// construct it: a status chosen without evidence silently contradicts the
-    /// model.
+    /// `EventDataStoreNotFoundException`, `QueryIdNotFoundException`,
+    /// `ImportNotFoundException` and `ChannelNotFoundException` and then answers 400
+    /// for all four on the wire, which no modeled annotation can express. Reach for
+    /// this ONLY with recorded evidence of the status the service answers with, and
+    /// cite it where you construct it: a status chosen without evidence silently
+    /// contradicts the model.
     ModeledWithStatus { error: E, status: u16 },
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.

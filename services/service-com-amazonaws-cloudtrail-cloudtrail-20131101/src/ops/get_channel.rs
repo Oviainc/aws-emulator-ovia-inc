@@ -123,14 +123,17 @@ impl From<GetChannelErrorModeled> for GetChannelError {
 
 /// Refuse the request because the identifier named no stored channel.
 ///
-/// The status is the registry's shared one
-/// ([`crate::state::channels::CHANNEL_NOT_FOUND_HTTP_STATUS`]) so this operation and
-/// `DeleteChannel` cannot drift; only the lift into this operation's error channel is
-/// local.
-fn channel_not_found(identifier: &str) -> GetChannelError {
+/// The wording and the status are the registry's shared ones, so this operation,
+/// `UpdateChannel` and `DeleteChannel` cannot drift; the identifier is completed
+/// through [`crate::state::channels::addressed_channel_arn`] first, because a refusal
+/// names the channel ARN the identifier ADDRESSED — a BARE channel id is answered with
+/// the ARN that id names in the calling Region, not with the id as typed.
+fn channel_not_found(identifier: &str, request_region: &str) -> GetChannelError {
     crate::scaffolded::Scaffolded::modeled_with_status(
         GetChannelErrorModeled::ChannelNotFoundException(ChannelNotFoundException {
-            message: Some(crate::state::channels::channel_not_found_message(identifier)),
+            message: Some(crate::state::channels::channel_not_found_message(
+                &crate::state::channels::addressed_channel_arn(identifier, request_region),
+            )),
         }),
         crate::state::channels::CHANNEL_NOT_FOUND_HTTP_STATUS,
     )
@@ -208,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::channels::ChannelAddress::Key(key) => store.channels.get(&key),
             crate::state::channels::ChannelAddress::AnotherAccount => None,
         };
-        let channel = channel.ok_or_else(|| channel_not_found(&input.channel))?;
+        let channel = channel.ok_or_else(|| channel_not_found(&input.channel, &region))?;
 
         Ok(GetChannelOutput {
             channel_arn: Some(channel.channel_arn.clone()),
@@ -219,7 +222,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `ApplyToAllRegions` is false for every channel this emulator holds,
             // and no operation it serves configures a channel's advanced event
             // selectors (`CreateChannel` models no selector member and
-            // `UpdateChannel` is still a stub), so there are none to report.
+            // `UpdateChannel` changes only the name and the destinations), so there
+            // are none to report.
             source_config: Some(SourceConfig {
                 apply_to_all_regions: Some(false),
                 advanced_event_selectors: Some(Vec::new()),

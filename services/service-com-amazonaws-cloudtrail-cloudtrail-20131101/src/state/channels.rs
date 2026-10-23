@@ -391,8 +391,28 @@ pub fn channel_arn_invalid_message(identifier: &str) -> String {
 /// The `ChannelNotFoundException` text for a well-formed identifier that names no
 /// stored channel. Built from the request, like [`channel_arn_invalid_message`], and the
 /// same sentence `super::TaggableArn::not_found_message` answers a tagging call with.
-pub fn channel_not_found_message(identifier: &str) -> String {
-    format!("The channel {identifier} was not found.")
+///
+/// `subject` is the channel ARN the identifier ADDRESSED, which is what the recorded
+/// refusals name: a call that passes a bare channel id is answered
+/// "The channel `arn:aws:cloudtrail:<region>:<account>:channel/<id>` was not found.",
+/// not with the id as typed — so a caller-supplied identifier is completed through
+/// [`addressed_channel_arn`] first. (`super::event_data_store_not_found_message` names
+/// the addressed ARN for the same reason.)
+pub fn channel_not_found_message(subject: &str) -> String {
+    format!("The channel {subject} was not found.")
+}
+
+/// The channel ARN a caller-supplied identifier addresses: the ARN as given, or — for
+/// a bare channel id — the ARN that id names in `request_region`, in this account.
+///
+/// An identifier that is no channel identifier at all is named as given: it addresses
+/// nothing, and it is refused by its form ([`channel_arn_invalid_message`]) rather than
+/// as an absent channel.
+pub fn addressed_channel_arn(identifier: &str, request_region: &str) -> String {
+    match parse_channel_identifier(identifier) {
+        Some(ChannelIdentifier::Id(id)) => channel_arn(request_region, &id),
+        Some(ChannelIdentifier::Arn { .. }) | None => identifier.to_string(),
+    }
 }
 
 impl ComAmazonawsCloudtrailCloudtrail20131101State {
@@ -505,3 +525,4 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
         Ok(store)
     }
 }
+
