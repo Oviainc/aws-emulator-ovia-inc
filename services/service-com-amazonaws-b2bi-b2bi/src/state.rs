@@ -67,6 +67,12 @@ pub const MAX_PROFILES_PER_ACCOUNT: usize = 5;
 /// the clock owes: `inactive` is a resting state, not a transient one.
 pub const TRANSFORMER_STATUS_INACTIVE: &str = "inactive";
 
+/// The other value of the modelled `TransformerStatus` enum (`active` | `inactive`,
+/// `smithy_query(query="shape",shape="TransformerStatus")`): the state a transformer has
+/// to be in to be used by a capability, and the state its configuration rests immutable
+/// in (see `UpdateTransformer`).
+pub const TRANSFORMER_STATUS_ACTIVE: &str = "active";
+
 /// How many hex digits follow the resource-type prefix in a generated id.
 ///
 /// 17, matching the `profileId` / `capabilityId` / `partnershipId` / `tradingPartnerId`
