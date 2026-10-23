@@ -20,6 +20,7 @@
 use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
 use crate::cluster_lifecycle::{all_text, Answer, Emulator};
+use crate::static_catalog::listed_zones;
 
 /// Every node type the catalog offers.
 ///
@@ -263,12 +264,22 @@ async fn every_filter_selects_from_the_catalog() {
 async fn the_availability_zones_are_the_zones_of_the_signed_region() {
     let emulator = Emulator::new();
 
-    // A Region's zones are `<region><suffix>`; the emulator presents three, the
-    // smallest count AWS publishes for a Region. Written out here rather than
-    // taken from the production helper, so a wrong suffix set fails this suite.
-    const ZONE_SUFFIXES: [&str; 3] = ["a", "b", "c"];
+    // A Region's zones are `<region>` plus consecutive letters from `a`, as many
+    // as that Region publishes — four for Oregon, three for a Region AWS
+    // publishes the smallest count for. Written out here rather than taken from
+    // the production helper, so a wrong zone list fails this suite; the whole
+    // per-Region table and the platforms each zone advertises are pinned in the
+    // `static_catalog` suite.
+    const REGION_ZONES: [(&str, &[&str]); 3] = [
+        ("us-west-2", &["us-west-2a", "us-west-2b", "us-west-2c", "us-west-2d"]),
+        ("eu-central-1", &["eu-central-1a", "eu-central-1b", "eu-central-1c"]),
+        (
+            "ap-southeast-1",
+            &["ap-southeast-1a", "ap-southeast-1b", "ap-southeast-1c"],
+        ),
+    ];
 
-    for region in ["us-west-2", "eu-central-1", "ap-southeast-1"] {
+    for (region, zones) in REGION_ZONES {
         let answer = emulator
             .call_in_region(
                 region,
@@ -287,20 +298,28 @@ async fn the_availability_zones_are_the_zones_of_the_signed_region() {
             CLUSTER_TYPES.len(),
             "case zones in {region}: expected one option per cluster type, got {options:?}"
         );
-        let expected: Vec<String> = ZONE_SUFFIXES
-            .iter()
-            .map(|suffix| format!("{region}{suffix}"))
-            .collect();
+        let expected: Vec<String> = zones.iter().map(|zone| zone.to_string()).collect();
         assert_eq!(
             state::region_availability_zones(region),
             expected,
             "case zones in {region}: the handler's zone helper must report {expected:?}"
         );
-        // Each option carries the Region's whole zone list, in order.
+        // Each option carries the Region's whole zone list, in order, and every
+        // zone carries the platforms a cluster in it can run on.
         let repeated: Vec<String> = std::iter::repeat_n(expected.clone(), options.len())
             .flatten()
             .collect();
-        let served = all_text(&answer.body, "Name");
+        let served: Vec<String> = listed_zones(&answer.body)
+            .into_iter()
+            .map(|(name, platforms)| {
+                assert_eq!(
+                    platforms,
+                    vec!["VPC".to_string()],
+                    "case zone {name}: expected the VPC platform, got {platforms:?}"
+                );
+                name
+            })
+            .collect();
         assert_eq!(
             served, repeated,
             "case zones in {region}: expected each of the {} option(s) to carry {expected:?}, got {served:?}",

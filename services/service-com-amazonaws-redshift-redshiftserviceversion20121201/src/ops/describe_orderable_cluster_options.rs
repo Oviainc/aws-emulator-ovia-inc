@@ -180,16 +180,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "such as the EC2 Availability Zones (AZ) in the specific Amazon Web
         // Services Region that you can specify": the zones an option offers are
-        // the zones of the Region this request was signed for.
-        let zones: Vec<AvailabilityZone> = st::region_availability_zones(&st::request_region(ctx))
-            .into_iter()
-            .map(|name| AvailabilityZone {
-                name: Some(name),
-                // Redshift publishes no platform list for an orderable option's
-                // zones, and the member is optional.
-                supported_platforms: None,
-            })
-            .collect();
+        // the zones of the Region this request was signed for, as many as that
+        // Region publishes, each carrying the platforms a cluster in it can run
+        // on (`AvailabilityZone` is `{Name, SupportedPlatforms}`).
+        let zones: Vec<AvailabilityZone> =
+            st::region_availability_zone_records(&st::request_region(ctx));
 
         // A pure read of the seeded engine-version catalog: no transition is ever
         // owed on it, so this operation settles nothing and writes nothing.

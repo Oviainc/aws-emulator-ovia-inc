@@ -29,3 +29,5 @@ mod orderable_cluster_options;
 mod snapshot_restore;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/static_catalog.rs"]
+mod static_catalog;

@@ -16,7 +16,10 @@
 //! the derived endpoint address / namespace ARN, and the clock-owed
 //! `creating` -> `available` transitions (see [`PROVISIONING_SPAN`]).
 
-use crate::ops::types::{Cluster, ClusterParameterGroup, ClusterVersion, Parameter, Snapshot};
+use crate::ops::types::{
+    AvailabilityZone, Cluster, ClusterParameterGroup, ClusterVersion, Parameter, Snapshot,
+    SupportedPlatform,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -100,23 +103,46 @@ pub fn default_parameter_group(cluster_version: &str) -> String {
     format!("default.{}", parameter_group_family(cluster_version))
 }
 
+/// Every engine version this service offers, paired with the engine BUILD that
+/// version currently runs.
+///
+/// Source for the version list: `smithy_query(query="doc",
+/// shape="CreateClusterMessage", member="ClusterVersion")` — "Only version 1.0
+/// is currently available. Example: 1.0". Source for the build: Amazon Redshift
+/// reports the engine build of a version as that version's
+/// `ClusterVersion$Description` (`smithy_query(query="shape",
+/// shape="ClusterVersion")` — "The description of the cluster version"), and the
+/// build Amazon Redshift publishes for engine version 1.0 is `1.0.49795`. A
+/// build is catalog data — the same for every account and stable across reads —
+/// not a per-run value.
+pub const PUBLISHED_ENGINE_BUILDS: [(&str, &str); 1] = [(DEFAULT_CLUSTER_VERSION, "1.0.49795")];
+
+/// `ClusterVersion$Description` for an engine build: the Amazon Redshift engine
+/// (ParAccel Analytic DataBase) build string, `PADB <build>`.
+///
+/// The member identifies WHICH ENGINE BUILD a version corresponds to, so it
+/// carries the build rather than restating the version number the caller already
+/// has in `ClusterVersion$ClusterVersion`.
+pub fn engine_build_description(build: &str) -> String {
+    format!("PADB {build}")
+}
+
 /// The Amazon Redshift engine versions this service offers, in the order
 /// `DescribeClusterVersions` reports them.
 ///
-/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
-/// member="ClusterVersion")` — "Only version 1.0 is currently available. Example:
-/// 1.0" — so the published catalog holds exactly that one engine version, with the
-/// family [`parameter_group_family`] gives it. Seeded into
+/// Built from [`PUBLISHED_ENGINE_BUILDS`], so each entry carries the family
+/// [`parameter_group_family`] gives its version and the build description
+/// [`engine_build_description`] gives its build. Seeded into
 /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::cluster_versions`]
 /// when the store is created, so the catalog a read reports and the
 /// [`DEFAULT_CLUSTER_VERSION`] a `CreateCluster` applies cannot disagree.
 pub fn published_cluster_versions() -> Vec<ClusterVersion> {
-    [DEFAULT_CLUSTER_VERSION]
+    PUBLISHED_ENGINE_BUILDS
         .into_iter()
-        .map(|version| ClusterVersion {
+        .map(|(version, build)| ClusterVersion {
             cluster_version: Some(version.to_string()),
             cluster_parameter_group_family: Some(parameter_group_family(version)),
-            description: Some(format!("Cluster version {version}")),
+            description: Some(engine_build_description(build)),
         })
         .collect()
 }
@@ -1169,19 +1195,92 @@ pub fn master_password_secret_arn(cluster_identifier: &str, region: &str) -> Str
 
 /// The Availability Zones of one Region, in name order.
 ///
-/// A Region's zones are `<region><suffix>`; the emulator presents three, which
-/// is the smallest count AWS publishes for a Region, so every zone name it hands
-/// out has the shape a caller parses. Derived from the Region alone, so the same
-/// Region always reports the same zones.
+/// A Region's zones are `<region>` followed by consecutive letters from `a`, as
+/// many as that Region publishes ([`region_zone_count`]). Derived from the
+/// Region alone, so the same Region always reports the same zones.
 pub fn region_availability_zones(region: &str) -> Vec<String> {
-    ZONE_SUFFIXES
-        .iter()
-        .map(|suffix| format!("{region}{suffix}"))
+    (0..region_zone_count(region))
+        .map(|index| format!("{region}{}", ZONE_LETTERS[index]))
         .collect()
 }
 
-/// The suffixes [`region_availability_zones`] appends to a Region name.
-const ZONE_SUFFIXES: [char; 3] = ['a', 'b', 'c'];
+/// The letters a zone name may end in, in order; a Region uses the first
+/// [`region_zone_count`] of them.
+const ZONE_LETTERS: [char; 6] = ['a', 'b', 'c', 'd', 'e', 'f'];
+
+/// How many Availability Zones AWS publishes for one Region.
+///
+/// Source: the AWS global-infrastructure reference "Regions, Availability Zones,
+/// and Local Zones" (also `aws ec2 describe-availability-zones` per Region): the
+/// count differs BY REGION, so a caller choosing a zone from a Region's list
+/// gets that Region's zones and not a fixed three. [`REGION_ZONE_COUNTS`] names
+/// every Region that publishes more than [`DEFAULT_ZONE_COUNT`]; any other
+/// Region publishes that default, which is the smallest count AWS publishes for
+/// a Region.
+pub fn region_zone_count(region: &str) -> usize {
+    REGION_ZONE_COUNTS
+        .iter()
+        .find(|(named, _)| *named == region)
+        .map_or(DEFAULT_ZONE_COUNT, |(_, count)| *count)
+}
+
+/// The number of Availability Zones a Region publishes unless
+/// [`REGION_ZONE_COUNTS`] names it.
+pub const DEFAULT_ZONE_COUNT: usize = 3;
+
+/// Every Region that publishes more Availability Zones than
+/// [`DEFAULT_ZONE_COUNT`], with the number it publishes.
+///
+/// Source: as [`region_zone_count`] — the AWS Regions and Availability Zones
+/// reference. Kept to the Regions whose count differs from the default, so a
+/// Region added to AWS later still reports a well-formed zone list.
+pub const REGION_ZONE_COUNTS: [(&str, usize); 4] = [
+    ("us-east-1", 6),
+    ("us-west-2", 4),
+    ("ap-northeast-1", 4),
+    ("ap-northeast-2", 4),
+];
+
+/// The only platform a cluster can be launched on today.
+///
+/// Source: `smithy_query(query="shape", shape="SupportedPlatform")` — "A list of
+/// supported platforms for orderable clusters". EC2-Classic is retired, so every
+/// zone a cluster is orderable in supports exactly the VPC platform.
+pub const PLATFORM_VPC: &str = "VPC";
+
+/// The platforms a cluster placed in an Availability Zone can run on.
+pub fn zone_supported_platforms() -> Vec<SupportedPlatform> {
+    [PLATFORM_VPC]
+        .into_iter()
+        .map(|name| SupportedPlatform {
+            name: Some(name.to_string()),
+        })
+        .collect()
+}
+
+/// One Availability Zone as this service reports it: its name AND the platforms
+/// a cluster in it can run on.
+///
+/// `AvailabilityZone` is `{Name, SupportedPlatforms}`
+/// (`smithy_query(query="shape", shape="AvailabilityZone")`), and a client
+/// branching on platform support reads the second member — so every
+/// `AvailabilityZone` this service emits is built here rather than from the name
+/// alone.
+pub fn availability_zone(name: &str) -> AvailabilityZone {
+    AvailabilityZone {
+        name: Some(name.to_string()),
+        supported_platforms: Some(zone_supported_platforms()),
+    }
+}
+
+/// The Availability Zones of one Region as modelled records, in name order:
+/// [`region_availability_zones`] through [`availability_zone`].
+pub fn region_availability_zone_records(region: &str) -> Vec<AvailabilityZone> {
+    region_availability_zones(region)
+        .iter()
+        .map(|name| availability_zone(name))
+        .collect()
+}
 
 /// The Availability Zone Redshift picks when the request names none.
 ///
