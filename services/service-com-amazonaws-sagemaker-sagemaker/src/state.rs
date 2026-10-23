@@ -61,7 +61,8 @@ use crate::ops::types::{
     DataProcessing, DriftCheckBaselines, ExperimentConfig, ExplainerConfig, GitConfig, IamIdentity,
     InferenceExecutionConfig, InferenceSpecification, JupyterLabAppImageConfig,
     KernelGatewayImageConfig, ManagedConfiguration, MetadataProperties, MetricsConfig,
-    ModelCardSecurityConfig, ModelClientConfig, ModelDeployConfig, ModelLifeCycle, ModelMetrics,
+    ModelCardExportOutputConfig, ModelCardSecurityConfig, ModelClientConfig, ModelDeployConfig,
+    ModelLifeCycle, ModelMetrics,
     ModelPackageModelCard, ModelPackageSecurityConfig, ModelPackageStatusDetails,
     ModelPackageStatusItem, ModelPackageValidationSpecification, NetworkConfig,
     ParallelismConfiguration, Parameter, ProcessingInput, ProcessingOutputConfig,
@@ -153,6 +154,10 @@ pub const MODEL_CARD_QUOTA: usize = 1_000;
 /// `UpdateModelCard` answers `ResourceLimitExceeded` past: every content update appends
 /// a version, so without a bound one card could grow the store without end.
 pub const MODEL_CARD_VERSION_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`]. Bounds the model-card export-job store, and is what
+/// `CreateModelCardExportJob` answers `ResourceLimitExceeded` past: an export job is
+/// terminal and has no delete, so this is the most one emulator run can start.
+pub const MODEL_CARD_EXPORT_JOB_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const PROCESSING_JOB_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`]. Bounds the lineage-group store as a whole, across Regions: a
@@ -1554,6 +1559,12 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// Keyed by `ModelCardName`. See [`ModelCard`], at the end of this module with the
     /// rest of the model-card slice.
     pub model_cards: BTreeMap<String, ModelCard>,
+    /// Model card export jobs, keyed by [`model_card_export_job_key`] — the card the job
+    /// exports plus the job's own name, which is exactly what the job's ARN names, so the
+    /// export jobs of one card sit together in one stable order. See
+    /// [`ModelCardExportJob`], at the end of this module with the rest of the model-card
+    /// slice.
+    pub model_card_export_jobs: BTreeMap<String, ModelCardExportJob>,
     /// Keyed by `AIWorkloadConfigName`. See [`AIWorkloadConfig`], at the end of this
     /// module with the rest of the AI-benchmarking workload-configuration slice.
     pub ai_workload_configs: BTreeMap<String, AIWorkloadConfig>,
@@ -1804,6 +1815,12 @@ impl ComAmazonawsSagemakerSagemakerState {
     pub fn model_cards_below_quota(&self) -> bool {
         self.model_cards.len() < MODEL_CARD_QUOTA
     }
+
+    /// Whether another model card export job fits, i.e. the store is below
+    /// [`MODEL_CARD_EXPORT_JOB_QUOTA`].
+    pub fn model_card_export_jobs_below_quota(&self) -> bool {
+        self.model_card_export_jobs.len() < MODEL_CARD_EXPORT_JOB_QUOTA
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -1884,6 +1901,25 @@ pub fn record_state_change(
 /// service mints, for the resource kinds it owns.
 pub fn resource_arn(region: &str, kind: &str, name: &str) -> String {
     ::emulator_server::emulator_arn(ARN_SERVICE, region, &format!("{kind}/{name}"))
+}
+
+/// The RESOURCE portion of `arn` when `arn` is one [`resource_arn`] mints in `region` for
+/// this account, or `None` when it names anything else.
+///
+/// The read side of [`resource_arn`], and the one place the fixed segments are checked:
+/// a resolver that takes an identifier in ARN form (an `…NameOrArn` member, or an
+/// ARN-typed member naming a resource) must refuse an ARN of another partition, service,
+/// Region or account rather than addressing whatever local record shares its trailing
+/// path. The six fields themselves are read by `service_common::arn`, the ONE ARN parse
+/// this workspace has, so no service splits an ARN of its own again; only the `aws`
+/// partition is accepted, because that is the one every ARN this emulator mints carries
+/// and a partition is a closed world — an `aws-cn` ARN names no resource in `aws`.
+fn arn_resource<'v>(arn: &'v str, region: &str) -> Option<&'v str> {
+    let parsed = ::service_common::arn::parse_of(arn, ARN_SERVICE)?;
+    (parsed.partition == "aws"
+        && parsed.region == region
+        && parsed.account == ::emulator_server::EMULATOR_ACCOUNT_ID)
+        .then_some(parsed.resource)
 }
 
 /// How SageMaker's lineage and pipeline readers state a resource the account does not
@@ -2360,6 +2396,17 @@ pub fn mint_opaque_resource_id() -> String {
 /// `^(arn:…:hub\/)?<name>$`), and the store is keyed by the name — so an ARN is
 /// reduced to the resource portion after its final `/`. A value that is not an ARN is
 /// already a name and is returned unchanged.
+///
+/// KNOWN ASYMMETRY, recorded here rather than fixed in one operation: this reduction does
+/// NOT check the ARN's partition, Region or account, so an ARN naming another Region or
+/// account still resolves the locally stored resource of the same name, and an ARN this
+/// service mints for it carries the REQUEST's Region rather than the one the caller
+/// supplied. The resolvers for ARN-typed members are strict instead (they go through
+/// `arn_resource`, which is what [`entity_name_from_name_or_arn`] and
+/// [`model_card_export_job_key_from_arn`] check with). Tightening this one changes every
+/// `ArnOrName` reader in the service at once — `DescribeModelCard`, `UpdateModelCard`,
+/// `CreateModelCardExportJob`, the hub readers — so it belongs to a change that covers
+/// them together, with their refusal wording, rather than to any single operation.
 pub fn name_from_arn_or_name(value: &str) -> &str {
     match value.strip_prefix("arn:") {
         Some(_) => value.split('/').next_back().unwrap_or(value),
@@ -2796,8 +2843,10 @@ impl ComAmazonawsSagemakerSagemakerState {
 
 // ---------------------------------------------------------------------------
 // Model cards. `CreateModelCard` stores one here and `DescribeModelCard` replays it;
-// the store itself is `ComAmazonawsSagemakerSagemakerState::model_cards` above. Kept
-// together at the end of the file so a model-card change touches one span of it.
+// the store itself is `ComAmazonawsSagemakerSagemakerState::model_cards` above, and the
+// export jobs `CreateModelCardExportJob` starts against a card sit beside it in
+// `model_card_export_jobs`. Kept together at the end of the file so a model-card change
+// touches one span of it.
 // ---------------------------------------------------------------------------
 
 /// The version number a model card's FIRST version carries. `DescribeModelCard`'s
@@ -2893,6 +2942,116 @@ impl ModelCard {
 /// here: this is the one structural claim the model's documentation makes.
 pub fn is_model_card_content(content: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(content).is_ok_and(|parsed| parsed.is_object())
+}
+
+/// `ModelCardExportJobStatus`'s members this emulator moves an export job through (the
+/// modelled enum carries exactly `InProgress`, `Completed` and `Failed`). Named once
+/// here so no handler compares a bare string literal.
+pub const MODEL_CARD_EXPORT_STATUS_IN_PROGRESS: &str = "InProgress";
+/// See [`MODEL_CARD_EXPORT_STATUS_IN_PROGRESS`].
+pub const MODEL_CARD_EXPORT_STATUS_FAILED: &str = "Failed";
+
+/// How long after `CreateModelCardExportJob` the clock owes the job's terminal status.
+///
+/// Same contract as [`TRANSFORM_JOB_SETTLES_AFTER`]: a caller that describes the job
+/// straight after creating it still observes `InProgress`, one that waits observes the
+/// terminal status, so a waiter terminates. Real SageMaker takes as long as rendering
+/// and uploading the document takes; the span is compressed, never zero, and the due
+/// instant is stored rather than slept on.
+pub const MODEL_CARD_EXPORT_JOB_SETTLES_AFTER: Duration = Duration::from_millis(300);
+
+/// Why a model card export job this emulator accepted ends in the modelled `Failed`
+/// status.
+///
+/// The job renders the card's version as the model card PDF document SageMaker
+/// publishes and writes it to the request's `OutputConfig$S3OutputPath`. That renderer
+/// is AWS's own and this emulator does not have it, and the engine contract
+/// (`vendor/engine/src/lib.rs`) forbids reporting a status or an artifact for work
+/// nothing performed — so reporting `Completed` with `ExportArtifacts` naming an object
+/// nothing wrote would claim an export that never happened. The job therefore ends in
+/// the status the model carries for an export that produced no document, with this
+/// reason saying why, and no `ExportArtifacts` beside it. Everything around the render —
+/// resolving the card and its version, accepting the job, minting its ARN, replaying it,
+/// reporting its terminal status — is real.
+pub const MODEL_CARD_EXPORT_NOT_RUN_FAILURE: &str =
+    "This emulator renders no model card PDF, so the model card was not exported and no \
+     artifact was written to the job's S3OutputPath.";
+
+/// The store key one model card export job is held under: the card it exports and the
+/// job's own name.
+///
+/// A job's ARN is `<card ARN>/export-job/<job name>`, so the job's name is unique within
+/// the card rather than within the account — two cards may each have an export job of
+/// the same name, and they are two jobs.
+pub fn model_card_export_job_key(card_name: &str, job_name: &str) -> String {
+    format!("{card_name}/{job_name}")
+}
+
+/// The store key the export-job ARN `arn` addresses, or `None` when the value does not
+/// name an export job of a model card of this service, in this account and in `region`.
+///
+/// `DescribeModelCardExportJob` resolves a job by ARN alone, and the store is keyed by
+/// the card and job names the ARN carries — so the ARN is parsed and its fixed segments
+/// checked the way [`entity_name_from_name_or_arn`] checks an entity's, before the
+/// resource portion `model-card/<card>/export-job/<job>` is reduced to that key. An ARN
+/// naming another partition, service, Region, account or resource shape names no job
+/// here, and a name segment carrying a further `/` is refused rather than folded into the
+/// key, so two different ARNs can never address one record.
+pub fn model_card_export_job_key_from_arn(arn: &str, region: &str) -> Option<String> {
+    let (card_name, job_name) = arn_resource(arn, region)?
+        .strip_prefix("model-card/")?
+        .split_once("/export-job/")?;
+    (!card_name.is_empty()
+        && !card_name.contains('/')
+        && !job_name.is_empty()
+        && !job_name.contains('/'))
+        .then(|| model_card_export_job_key(card_name, job_name))
+}
+
+/// A model card export job created by `CreateModelCardExportJob`, as
+/// `DescribeModelCardExportJob` replays it.
+///
+/// `card_version` is the version the create RESOLVED (the requested one, or the card's
+/// latest when the request named none), so a later read reports the version that was
+/// exported rather than whichever is latest by then. `ends_at` is the instant the clock
+/// owes the move out of `InProgress`; it is stored, never slept on, and materialised by
+/// whichever reporting call first runs at or after it ([`ModelCardExportJob::settle_status`]).
+#[derive(Debug, Clone)]
+pub struct ModelCardExportJob {
+    pub name: String,
+    pub arn: String,
+    pub card_name: String,
+    pub card_version: i32,
+    pub status: String,
+    pub output_config: ModelCardExportOutputConfig,
+    pub failure_reason: Option<String>,
+    pub created_at: SystemTime,
+    pub last_modified_at: SystemTime,
+    pub ends_at: SystemTime,
+}
+
+impl ModelCardExportJob {
+    /// Materialise the move out of `InProgress` the clock already owes.
+    ///
+    /// The one write a reporting operation may make: the move was due at `ends_at`
+    /// whether or not anybody described the job, so the observer makes no difference to
+    /// the result, and `LastModifiedAt` takes the instant the move was due rather than
+    /// "now", so the value is stable across later reads.
+    ///
+    /// The terminal status is [`MODEL_CARD_EXPORT_STATUS_FAILED`] with
+    /// [`MODEL_CARD_EXPORT_NOT_RUN_FAILURE`]; see that constant for why an export this
+    /// emulator accepted cannot end `Completed`.
+    ///
+    /// Answers whether the transition happened on this call, so the caller can record it.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == MODEL_CARD_EXPORT_STATUS_IN_PROGRESS && now >= self.ends_at {
+            self.status = MODEL_CARD_EXPORT_STATUS_FAILED.to_string();
+            self.failure_reason = Some(MODEL_CARD_EXPORT_NOT_RUN_FAILURE.to_string());
+            self.last_modified_at = self.ends_at;
+            return true;
+        }
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3714,21 +3873,10 @@ pub fn entity_name_from_name_or_arn<'v>(
     if !value.starts_with("arn:") {
         return Some(value);
     }
-    let fields: Vec<&str> = value.splitn(6, ':').collect();
-    let [prefix, partition, service, arn_region, account, resource] = fields[..] else {
-        return None;
-    };
-    // Only the `aws` partition: that is the one every ARN this emulator mints carries,
-    // and a partition is a closed world — an `aws-cn` ARN names no entity in `aws`.
-    if prefix != "arn"
-        || partition != "aws"
-        || service != ARN_SERVICE
-        || arn_region != region
-        || account != ::emulator_server::EMULATOR_ACCOUNT_ID
-    {
-        return None;
-    }
-    let name = resource.strip_prefix(kind)?.strip_prefix('/')?;
+    // The fixed segments are checked once, by `arn_resource`.
+    let name = arn_resource(value, region)?
+        .strip_prefix(kind)?
+        .strip_prefix('/')?;
     (!name.is_empty() && !name.contains('/')).then_some(name)
 }
 
