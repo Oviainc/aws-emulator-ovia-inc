@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCacheParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCacheParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCacheParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation answers from this service's state. The SCAFFOLDED
+//! marker line is gone, which is what records it as no longer a stub
+//! (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`); the paragraphs below
+//! are the scaffold's notes on how an operation of this service is wired.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +162,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCacheParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCacheParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCacheParameterGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `CacheParameterGroupName`: "This value is stored as a lowercase
+        // string", so that is the identity a cluster's
+        // `CacheParameterGroupName` and a later describe resolve against.
+        let name = input.cache_parameter_group_name.to_ascii_lowercase();
+        // The member carries no modelled `@length`, so an empty name reaches
+        // this handler; a group has to be named to be addressable later.
+        if name.is_empty() {
+            return Err(
+                CreateCacheParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(
+                            "Invalid value for CacheParameterGroupName: the name of a cache \
+                             parameter group may not be empty."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The family is the one the group "can be used with", and only the
+        // families this service publishes exist; see
+        // `crate::state::PARAMETER_GROUP_FAMILIES`.
+        let family = input.cache_parameter_group_family;
+        if !crate::state::PARAMETER_GROUP_FAMILIES.contains(&family.as_str()) {
+            return Err(
+                CreateCacheParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {family} for CacheParameterGroupFamily: must be one of \
+                             {}.",
+                            crate::state::PARAMETER_GROUP_FAMILIES.join(" | ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let tags = match crate::state::tag_pairs(input.tags) {
+            Ok(tags) => tags,
+            Err(crate::state::TagRefusal::TooMany(count)) => {
+                return Err(
+                    CreateCacheParameterGroupErrorModeled::TagQuotaPerResourceExceeded(
+                        TagQuotaPerResourceExceeded {
+                            message: Some(format!(
+                                "{count} tags were supplied; the maximum number of tags permitted \
+                                 on a resource is {}.",
+                                crate::state::MAX_TAGS_PER_RESOURCE
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Err(crate::state::TagRefusal::MissingKey) => {
+                return Err(
+                    CreateCacheParameterGroupErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(
+                                "Invalid value for Tags: a tag's Key may not be null.".to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        // One store lock spans the existence check and the insert, so of two
+        // concurrent creates of the same name exactly one can be the one that
+        // finds the name free.
+        let mut store = state.lock();
+
+        // A name already taken — by a custom group or by a family default, which
+        // the store comes up holding — is the modelled already-exists fault. The
+        // lookup is the one every handler resolving a `CacheParameterGroupName`
+        // goes through.
+        if store.parameter_group(&name).is_some() {
+            return Err(
+                CreateCacheParameterGroupErrorModeled::CacheParameterGroupAlreadyExistsFault(
+                    CacheParameterGroupAlreadyExistsFault {
+                        message: Some(format!("Cache parameter group {name} already exists.")),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The `default.` namespace belongs to the family defaults the service
+        // provides, so a custom group cannot take a name in it and pass itself
+        // off as one.
+        if name.starts_with(crate::state::DEFAULT_PARAMETER_GROUP_PREFIX) {
+            return Err(
+                CreateCacheParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {name} for CacheParameterGroupName: names beginning \
+                             with {} are reserved for the cache parameter group families' default \
+                             groups.",
+                            crate::state::DEFAULT_PARAMETER_GROUP_PREFIX
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The store is bounded; see `crate::state::PARAMETER_GROUP_QUOTA`.
+        if store.custom_parameter_group_count() >= crate::state::PARAMETER_GROUP_QUOTA {
+            return Err(
+                CreateCacheParameterGroupErrorModeled::CacheParameterGroupQuotaExceededFault(
+                    CacheParameterGroupQuotaExceededFault {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} cache parameter groups.",
+                            crate::state::PARAMETER_GROUP_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::CacheParameterGroupRecord {
+            name: name.clone(),
+            family,
+            description: input.description,
+            tags,
+        };
+        store.cache_parameter_groups.insert(name.clone(), record);
+
+        // Read back out of the store, so the response is the persisted group
+        // rather than the request echoed. The lookup cannot miss — the insert
+        // above just stored it — and the ARN names the Region the request was
+        // signed for; see `CacheParameterGroupRecord::to_modeled`.
+        Ok(CreateCacheParameterGroupOutput {
+            cache_parameter_group: store
+                .parameter_group(&name)
+                .map(|group| group.to_modeled(&region)),
+        })
     }
 }
