@@ -278,7 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The graph is not usable when the call returns; the clock owes the move to
             // AVAILABLE a fixed span later (see `crate::state::PROVISIONING_SPAN`).
             status: crate::state::GraphStatus::Creating,
-            settles_at: Some(now + crate::state::PROVISIONING_SPAN),
+            pending: Some(crate::state::PendingTransition::owed(
+                crate::state::GraphStatus::Available,
+                now,
+            )),
             status_reason: None,
             create_time: ::std::time::SystemTime::now(),
             provisioned_memory: input.provisioned_memory,
