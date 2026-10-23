@@ -186,56 +186,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Resolve the execution's variables against the declaration: every declared
-        // variable takes the request's override if it has one, else its declared
-        // default. Two cases cannot be resolved at all, and each is refused with the
-        // modelled `ValidationException` naming the variable rather than quietly
-        // leaving a variable out of the execution:
-        //
-        // * an override naming a variable the declaration does not carry — there is
-        //   nothing for it to override;
-        // * a declared variable with neither a `defaultValue` nor an override — the
-        //   execution would have no value for a variable its pipeline declares.
-        let declared = pipeline.declaration.variables.clone().unwrap_or_default();
-        let overrides = input.variables.unwrap_or_default();
-        if let Some(unknown) = overrides
-            .iter()
-            .find(|variable| !declared.iter().any(|d| d.name == variable.name))
-        {
-            return Err(StartPipelineExecutionErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "variables: pipeline {} declares no variable named {}",
-                        input.name, unknown.name
-                    )),
-                },
+        // Resolve the execution's variables against the declaration — the same rule
+        // whichever call starts an execution, so it lives in
+        // `crate::state::resolve_execution_variables`. A variable that cannot be
+        // resolved is refused with the modelled `ValidationException` naming it.
+        let variables = crate::state::resolve_execution_variables(
+            &pipeline.declaration,
+            &input.variables.unwrap_or_default(),
+        )
+        .map_err(|message| {
+            StartPipelineExecutionError::from(
+                StartPipelineExecutionErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                }),
             )
-            .into());
-        }
-        let mut variables: Vec<ResolvedPipelineVariable> = Vec::with_capacity(declared.len());
-        for declaration in &declared {
-            let Some(resolved) = overrides
-                .iter()
-                .find(|variable| variable.name == declaration.name)
-                .map(|variable| variable.value.clone())
-                .or_else(|| declaration.default_value.clone())
-            else {
-                return Err(StartPipelineExecutionErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "variables: pipeline {} declares variable {} with no defaultValue, \
-                             so a value must be given for it",
-                            input.name, declaration.name
-                        )),
-                    },
-                )
-                .into());
-            };
-            variables.push(ResolvedPipelineVariable {
-                name: Some(declaration.name.clone()),
-                resolved_value: Some(resolved),
-            });
-        }
+        })?;
 
         let now = ::std::time::SystemTime::now();
         let record = crate::state::PipelineExecutionRecord {

@@ -6,8 +6,11 @@
 //! — by name or by ARN — and is stored NORMALISED to that environment's ARN, so a queue
 //! created by name reports the ARN the way AWS Batch does; an entry that resolves to
 //! nothing is a `ClientException`, and so is re-creating a queue that already exists. A
-//! `serviceEnvironmentOrder` entry can resolve to nothing here, because
-//! `CreateServiceEnvironment` is not implemented yet. The queue is returned in the
+//! `serviceEnvironmentOrder` entry resolves the same way, against the service
+//! environments `CreateServiceEnvironment` stored, and a queue can carry a
+//! compute-environment order OR a service-environment order, never both. A
+//! `jobStateTimeLimitActions` entry keeps the documented `maxTimeSeconds` bounds
+//! ([`crate::state::validate_job_state_time_limit_actions`]). The queue is returned in the
 //! non-terminal `CREATING` status, which the clock moves to `VALID`.
 //!
 //! This is the ONLY file to touch for this operation.
@@ -227,30 +230,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut compute_environment_order = Vec::with_capacity(requested_order.len());
-        for entry in &requested_order {
-            let Some(environment) = state.compute_environment(&entry.compute_environment) else {
-                return Err(CreateJobQueueErrorModeled::ClientException(
-                    batch::client_exception(format!(
-                        "Compute environment {} does not exist",
-                        entry.compute_environment
-                    )),
-                )
-                .into());
-            };
-            compute_environment_order.push(ComputeEnvironmentOrder {
-                order: entry.order,
-                compute_environment: environment.arn.clone(),
-            });
-        }
-        if let Some(entry) = requested_services.first() {
+        let compute_environment_order = state
+            .resolve_compute_environment_order(&requested_order)
+            .map_err(|detail| {
+                CreateJobQueueError::from(CreateJobQueueErrorModeled::ClientException(
+                    batch::client_exception(detail),
+                ))
+            })?;
+        let service_environment_order = state
+            .resolve_service_environment_order(&requested_services)
+            .map_err(|detail| {
+                CreateJobQueueError::from(CreateJobQueueErrorModeled::ClientException(
+                    batch::client_exception(detail),
+                ))
+            })?;
+        // `serviceEnvironmentOrder`'s own doc: "A job queue can't have both a
+        // serviceEnvironmentOrder and a computeEnvironmentOrder field."
+        if !compute_environment_order.is_empty() && !service_environment_order.is_empty() {
             return Err(CreateJobQueueErrorModeled::ClientException(batch::client_exception(
-                format!(
-                    "Service environment {} does not exist",
-                    entry.service_environment
-                ),
+                "A job queue can't have both a computeEnvironmentOrder and a serviceEnvironmentOrder",
             ))
             .into());
+        }
+
+        if let Some(actions) = input.job_state_time_limit_actions.as_deref() {
+            batch::validate_job_state_time_limit_actions(actions).map_err(|detail| {
+                CreateJobQueueError::from(CreateJobQueueErrorModeled::ClientException(
+                    batch::client_exception(detail),
+                ))
+            })?;
         }
 
         let name = input.job_queue_name.clone();
@@ -267,7 +275,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             priority: input.priority,
             scheduling_policy_arn: input.scheduling_policy_arn,
             compute_environment_order,
-            service_environment_order: None,
+            service_environment_order: (!service_environment_order.is_empty())
+                .then_some(service_environment_order),
             job_queue_type: input.job_queue_type,
             tags: input.tags,
             job_state_time_limit_actions: input.job_state_time_limit_actions,

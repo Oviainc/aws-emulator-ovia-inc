@@ -146,17 +146,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            DeleteStageErrorModeled::InternalServerException(crate::state::state_unavailable())
+            crate::state::store_unavailable(DeleteStageErrorModeled::InternalServerException)
         })?;
         let mut store = state.lock();
         if store.stages.remove(&input.arn).is_none() {
-            return Err(DeleteStageErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    exception_message: Some(format!("stage {} does not exist", input.arn)),
-                    ..Default::default()
-                },
-            )
-            .into());
+            return Err(crate::state::resource_not_found(
+                DeleteStageErrorModeled::ResourceNotFoundException,
+                &input.arn,
+            ));
         }
         // The tokens were issued against this stage, so they go with it.
         store.participant_tokens.remove(&input.arn);

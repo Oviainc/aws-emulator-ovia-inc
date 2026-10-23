@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateJobQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateJobQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies a partial update to a job queue [`crate::state`] already holds, and persists
+//! it: every member the request carries is written and every member it omits is left
+//! exactly as it was, so the stored queue is the only record either this operation or
+//! `DescribeJobQueues` answers from.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateJobQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules it enforces, each from the model's own docs:
+//!
+//! * the queue is addressed the way `jobQueue` documents — "the name or the Amazon
+//!   Resource Name (ARN) of the job queue" — and a reference the service holds no queue
+//!   for is a `ClientException` (HTTP 400);
+//! * a `computeEnvironmentOrder` entry must name a compute environment this emulator
+//!   holds (by name or by ARN) and is stored NORMALISED to that environment's ARN, the
+//!   way `CreateJobQueue` stores it; a `serviceEnvironmentOrder` entry resolves the same
+//!   way against the service environments `CreateServiceEnvironment` stored, and the
+//!   queue the update leaves behind carries a compute-environment order OR a
+//!   service-environment order, never both ("A job queue can't have both a
+//!   serviceEnvironmentOrder and a computeEnvironmentOrder field");
+//! * the fair-share scheduling policy "can be replaced but not removed", and a queue
+//!   created without one "can't have a fair-share scheduling policy added";
+//! * `jobStateTimeLimitActions` entries keep the documented `maxTimeSeconds` bounds
+//!   ([`crate::state::validate_job_state_time_limit_actions`]);
+//! * a refused update writes NOTHING: every check runs before the first field is set.
+//!
+//! An accepted update leaves the queue in the non-terminal `UPDATING` status, which the
+//! clock moves to `VALID` after [`crate::state::JOB_PHASE_MILLIS`] — the same span a
+//! create's `CREATING` takes.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +193,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateJobQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateJobQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateJobQueue"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                UpdateJobQueueErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        // `jobQueue` is "the name or the Amazon Resource Name (ARN) of the job queue".
+        let Some(name) = state.job_queue_name(&input.job_queue) else {
+            return Err(UpdateJobQueueErrorModeled::ClientException(batch::client_exception(
+                format!("Job queue {} does not exist", input.job_queue),
+            ))
+            .into());
+        };
+
+        // Everything is validated against the STORED queue before anything is written, so
+        // a refused update leaves the queue exactly as it was.
+        let stored = state
+            .job_queues
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| {
+                UpdateJobQueueError::from(UpdateJobQueueErrorModeled::ServerException(
+                    batch::unreachable_state(),
+                ))
+            })?;
+
+        // A `computeEnvironmentOrder` the request carries REPLACES the stored order, so
+        // each entry must resolve to a compute environment this emulator holds, and is
+        // stored as that environment's ARN (what `CreateJobQueue` stores and
+        // `DescribeJobQueues` reports).
+        let compute_environment_order = match input.compute_environment_order.as_deref() {
+            None => None,
+            Some([]) => {
+                return Err(UpdateJobQueueErrorModeled::ClientException(
+                    batch::client_exception(
+                        "computeEnvironmentOrder must name at least one compute environment",
+                    ),
+                )
+                .into())
+            }
+            Some(entries) => Some(
+                state
+                    .resolve_compute_environment_order(entries)
+                    .map_err(|detail| {
+                        UpdateJobQueueError::from(UpdateJobQueueErrorModeled::ClientException(
+                            batch::client_exception(detail),
+                        ))
+                    })?,
+            ),
+        };
+
+        // A `serviceEnvironmentOrder` the request carries likewise REPLACES the stored
+        // one, resolved against the service environments `CreateServiceEnvironment`
+        // stored and normalised to each environment's ARN.
+        let service_environment_order = match input.service_environment_order.as_deref() {
+            None => None,
+            Some([]) => {
+                return Err(UpdateJobQueueErrorModeled::ClientException(
+                    batch::client_exception(
+                        "serviceEnvironmentOrder must name at least one service environment",
+                    ),
+                )
+                .into())
+            }
+            Some(entries) => Some(
+                state
+                    .resolve_service_environment_order(entries)
+                    .map_err(|detail| {
+                        UpdateJobQueueError::from(UpdateJobQueueErrorModeled::ClientException(
+                            batch::client_exception(detail),
+                        ))
+                    })?,
+            ),
+        };
+
+        // `serviceEnvironmentOrder`'s own doc: "A job queue can't have both a
+        // serviceEnvironmentOrder and a computeEnvironmentOrder field." Checked on the
+        // queue the update WOULD leave behind, so neither order can be added beside the
+        // other.
+        let effective_compute = compute_environment_order
+            .as_deref()
+            .unwrap_or(&stored.compute_environment_order);
+        let effective_service = service_environment_order
+            .as_deref()
+            .or(stored.service_environment_order.as_deref())
+            .unwrap_or_default();
+        if !effective_compute.is_empty() && !effective_service.is_empty() {
+            return Err(UpdateJobQueueErrorModeled::ClientException(batch::client_exception(
+                "A job queue can't have both a computeEnvironmentOrder and a serviceEnvironmentOrder",
+            ))
+            .into());
+        }
+
+        // `schedulingPolicyArn`: "Once a job queue is created, the fair-share scheduling
+        // policy can be replaced but not removed", and a queue created without one "can't
+        // have a fair-share scheduling policy added".
+        let scheduling_policy_arn = match input.scheduling_policy_arn.as_deref() {
+            None => None,
+            Some("") => {
+                return Err(UpdateJobQueueErrorModeled::ClientException(
+                    batch::client_exception(
+                        "A job queue's fair-share scheduling policy can be replaced but not removed",
+                    ),
+                )
+                .into())
+            }
+            Some(requested) => {
+                if stored.scheduling_policy_arn.is_none() {
+                    return Err(UpdateJobQueueErrorModeled::ClientException(
+                        batch::client_exception(
+                            "A job queue without a fair-share scheduling policy can't have one added",
+                        ),
+                    )
+                    .into());
+                }
+                Some(requested.to_string())
+            }
+        };
+
+        if let Some(actions) = input.job_state_time_limit_actions.as_deref() {
+            batch::validate_job_state_time_limit_actions(actions).map_err(|detail| {
+                UpdateJobQueueError::from(UpdateJobQueueErrorModeled::ClientException(
+                    batch::client_exception(detail),
+                ))
+            })?;
+        }
+
+        let Some(queue) = state.job_queues.get_mut(&name) else {
+            return Err(
+                UpdateJobQueueErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        if let Some(requested) = input.state {
+            queue.state = requested;
+        }
+        if let Some(priority) = input.priority {
+            queue.priority = priority;
+        }
+        if let Some(arn) = scheduling_policy_arn {
+            queue.scheduling_policy_arn = Some(arn);
+        }
+        if let Some(order) = compute_environment_order {
+            queue.compute_environment_order = order;
+        }
+        if let Some(order) = service_environment_order {
+            queue.service_environment_order = Some(order);
+        }
+        if let Some(actions) = input.job_state_time_limit_actions {
+            queue.job_state_time_limit_actions = Some(actions);
+        }
+        // The queue is left in the transient status an update puts it in; the clock owes
+        // the move back to `VALID`, so a caller reading straight after this call still
+        // observes `UPDATING`.
+        queue.status = batch::STATUS_UPDATING.to_string();
+        queue.status_reason = None;
+        queue.status_due_at = Some(now + batch::JOB_PHASE_MILLIS);
+
+        Ok(UpdateJobQueueOutput {
+            job_queue_name: Some(queue.name.clone()),
+            job_queue_arn: Some(queue.arn.clone()),
+        })
     }
 }

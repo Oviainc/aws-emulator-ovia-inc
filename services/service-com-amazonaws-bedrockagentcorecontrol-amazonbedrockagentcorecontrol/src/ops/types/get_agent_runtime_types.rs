@@ -18,7 +18,15 @@ pub struct GetAgentRuntimeInput {
     pub agent_runtime_version: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#GetAgentRuntimeResponse")]
+/// `GetAgentRuntimeResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `lastUpdatedAt` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="operation",
+/// operation="GetAgentRuntime")`), and the derive does not put that trait on a member
+/// schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetAgentRuntimeOutput {
     pub agent_runtime_arn: String,
@@ -44,4 +52,146 @@ pub struct GetAgentRuntimeOutput {
     pub capacity_provider_configuration: Option<CapacityProviderConfiguration>,
     pub platform_version: Option<String>,
 }
+
+agentcore_schema_and_codec!(
+    GetAgentRuntimeOutput,
+    GET_AGENT_RUNTIME_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#GetAgentRuntimeResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "GetAgentRuntimeResponse",
+    (
+        M_AGENT_RUNTIME_ARN,
+        agent_runtime_arn,
+        "agentRuntimeArn",
+        0,
+        req,
+        string
+    ),
+    (
+        M_AGENT_RUNTIME_NAME,
+        agent_runtime_name,
+        "agentRuntimeName",
+        1,
+        req,
+        string
+    ),
+    (
+        M_AGENT_RUNTIME_ID,
+        agent_runtime_id,
+        "agentRuntimeId",
+        2,
+        req,
+        string
+    ),
+    (
+        M_AGENT_RUNTIME_VERSION,
+        agent_runtime_version,
+        "agentRuntimeVersion",
+        3,
+        req,
+        string
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 4, req, date_time),
+    (
+        M_LAST_UPDATED_AT,
+        last_updated_at,
+        "lastUpdatedAt",
+        5,
+        req,
+        date_time
+    ),
+    (M_ROLE_ARN, role_arn, "roleArn", 6, req, string),
+    (
+        M_NETWORK_CONFIGURATION,
+        network_configuration,
+        "networkConfiguration",
+        7,
+        opt,
+        struct_of(NetworkConfiguration)
+    ),
+    (M_STATUS, status, "status", 8, req, string),
+    (
+        M_LIFECYCLE_CONFIGURATION,
+        lifecycle_configuration,
+        "lifecycleConfiguration",
+        9,
+        req,
+        struct_of(LifecycleConfiguration)
+    ),
+    (M_FAILURE_REASON, failure_reason, "failureReason", 10, opt, string),
+    (M_DESCRIPTION, description, "description", 11, opt, string),
+    (
+        M_WORKLOAD_IDENTITY_DETAILS,
+        workload_identity_details,
+        "workloadIdentityDetails",
+        12,
+        opt,
+        struct_of(WorkloadIdentityDetails)
+    ),
+    (
+        M_AGENT_RUNTIME_ARTIFACT,
+        agent_runtime_artifact,
+        "agentRuntimeArtifact",
+        13,
+        opt,
+        union_of(AgentRuntimeArtifact)
+    ),
+    (
+        M_PROTOCOL_CONFIGURATION,
+        protocol_configuration,
+        "protocolConfiguration",
+        14,
+        opt,
+        struct_of(ProtocolConfiguration)
+    ),
+    (
+        M_ENVIRONMENT_VARIABLES,
+        environment_variables,
+        "environmentVariables",
+        15,
+        opt,
+        map_of_string
+    ),
+    (
+        M_AUTHORIZER_CONFIGURATION,
+        authorizer_configuration,
+        "authorizerConfiguration",
+        16,
+        opt,
+        union_of(AuthorizerConfiguration)
+    ),
+    (
+        M_REQUEST_HEADER_CONFIGURATION,
+        request_header_configuration,
+        "requestHeaderConfiguration",
+        17,
+        opt,
+        union_of(RequestHeaderConfiguration)
+    ),
+    (
+        M_METADATA_CONFIGURATION,
+        metadata_configuration,
+        "metadataConfiguration",
+        18,
+        opt,
+        struct_of(RuntimeMetadataConfiguration)
+    ),
+    (
+        M_FILESYSTEM_CONFIGURATIONS,
+        filesystem_configurations,
+        "filesystemConfigurations",
+        19,
+        opt,
+        list_of_union(FilesystemConfiguration)
+    ),
+    (
+        M_CAPACITY_PROVIDER_CONFIGURATION,
+        capacity_provider_configuration,
+        "capacityProviderConfiguration",
+        20,
+        opt,
+        struct_of(CapacityProviderConfiguration)
+    ),
+    (M_PLATFORM_VERSION, platform_version, "platformVersion", 21, opt, string),
+);
 

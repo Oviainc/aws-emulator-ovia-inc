@@ -17,6 +17,8 @@ mod client_rejections;
 mod detector_data_sources_projection;
 #[path = "all/detector_lifecycle.rs"]
 mod detector_lifecycle;
+#[path = "all/findings_archive_state.rs"]
+mod findings_archive_state;
 #[path = "all/findings_feedback.rs"]
 mod findings_feedback;
 #[path = "all/investigation_lifecycle.rs"]

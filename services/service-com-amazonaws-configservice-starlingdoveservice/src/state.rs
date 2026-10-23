@@ -17,10 +17,10 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AccountAggregationSource, AggregationAuthorization, AggregatorFilters, Compliance,
     ComplianceContributorCount, ComplianceSummary, ConfigExportDeliveryInfo, ConfigRule,
-    ConfigSnapshotDeliveryProperties, ConfigStreamDeliveryInfo, ConfigurationAggregator,
-    ConfigurationRecorder,
-    ConfigurationRecorderStatus, ConfigurationRecorderSummary, DeliveryChannel,
-    DeliveryChannelStatus, EvaluationModeConfiguration, ExclusionByResourceTypes,
+    ConfigRuleEvaluationStatus, ConfigSnapshotDeliveryProperties, ConfigStreamDeliveryInfo,
+    ConfigurationAggregator, ConfigurationRecorder, ConfigurationRecorderStatus,
+    ConfigurationRecorderSummary, DeliveryChannel, DeliveryChannelStatus,
+    EvaluationModeConfiguration, ExclusionByResourceTypes,
     ExecutionControls, OrganizationAggregationSource, PendingAggregationRequest, RecordingGroup,
     RecordingMode, RecordingStrategy, RemediationConfiguration, RemediationParameterValue,
     ResourceIdentifier, RetentionConfiguration, Scope, Source, Tag,
@@ -132,6 +132,14 @@ pub const COMPLIANCE_RESOURCE_CAP: i32 = 100;
 /// `Owner` value for a Custom Policy rule (`com.amazonaws.configservice#Owner`).
 pub const OWNER_CUSTOM_POLICY: &str = "CUSTOM_POLICY";
 
+/// `Owner` value for a Custom Lambda rule, whose evaluation Config performs by
+/// invoking the caller's Lambda function (`com.amazonaws.configservice#Owner`).
+/// `DescribeConfigRuleEvaluationStatus` reports no status for a rule of this owner
+/// (`ConfigRuleEvaluationStatus`: "Status information for your Config Managed rules
+/// and Config Custom Policy rules. … This operation does not return status
+/// information about Config Custom Lambda rules.").
+pub const OWNER_CUSTOM_LAMBDA: &str = "CUSTOM_LAMBDA";
+
 /// `DeliveryStatus` values (`com.amazonaws.configservice#DeliveryStatus`, whose
 /// members are `Success`, `Failure` and `Not_Applicable`).
 pub const DELIVERY_STATUS_SUCCESS: &str = "Success";
@@ -226,6 +234,27 @@ pub const AGGREGATION_AUTHORIZATIONS_QUOTA: usize = 5_000;
 /// it matches the `ConfigRuleNames` length maximum (0..25) the same operation
 /// declares.
 pub const DESCRIBE_CONFIG_RULES_PAGE_SIZE: usize = 25;
+
+/// How many rule evaluation statuses one `DescribeConfigRuleEvaluationStatus` page
+/// carries when the request does not ask for a number of its own.
+///
+/// `RuleLimit`'s modelled default is 0 — "no stated limit" rather than "no results" —
+/// so the page size for such a request is this emulator's: it matches the
+/// `ConfigRuleNames` length maximum (0..25) the same operation declares.
+pub const DESCRIBE_CONFIG_RULE_EVALUATION_STATUS_PAGE_SIZE: usize = 25;
+
+/// How long after a Config rule is created or updated the evaluation Config owes that
+/// rule completes.
+///
+/// Config evaluates a rule as soon as it is written, with no call from the caller
+/// (`StartConfigRulesEvaluation`: "You don't need to call the
+/// StartConfigRulesEvaluation API to run an evaluation for a new rule. When you create
+/// a rule, Config evaluates your resources against the rule automatically."). The
+/// model documents no duration for that evaluation, so the span is CHOSEN: it sits
+/// inside the 250–750 ms window this project uses for a transition the clock owes,
+/// which keeps the not-yet-evaluated rule observable to a caller that reads the
+/// evaluation status straight after writing the rule.
+pub const RULE_EVALUATION_SETTLE_AFTER: Duration = Duration::from_millis(500);
 
 /// The `Parameters` key naming the role Config assumes to run a remediation
 /// (`PutRemediationConfigurations`: "for automatic remediation configuration, the
@@ -626,6 +655,82 @@ impl DeliveryChannelEntry {
     }
 }
 
+/// The invocation-and-evaluation history of one Config rule, as
+/// `DescribeConfigRuleEvaluationStatus` reports it.
+///
+/// An evaluation pass visits the recorded configuration state of the resources in the
+/// rule's scope and records one evaluation result per resource it placed
+/// (`StartConfigRulesEvaluation`: it "re-runs an evaluation against the last known
+/// state of your resources"). This emulator holds no recorded configuration items yet
+/// — `PutResourceConfig` is still scaffolded — so a pass visits nothing, runs no rule
+/// logic at all and records no evaluation result, which is why a rule's compliance
+/// stays `INSUFFICIENT_DATA` ([`ConfigRuleEntry::compliance`]) while its pass
+/// completes successfully.
+#[derive(Debug, Clone, Default)]
+pub struct RuleEvaluationEntry {
+    /// When set, the instant Config invoked the evaluation pass this rule is owed.
+    /// Recorded when the pass starts, so the instant the rule reports never depends
+    /// on the span the pass takes.
+    pub invoked_at: Option<SystemTime>,
+    /// When set, the instant at which the evaluation pass this rule is owed
+    /// completes. Materialised by [`Self::settle`].
+    pub completes_at: Option<SystemTime>,
+    /// Whether a pass has ever completed for this rule
+    /// (`ConfigRuleEvaluationStatus$FirstEvaluationStarted`: "Config has evaluated
+    /// your Amazon Web Services resources against the rule at least once").
+    pub first_evaluation_started: bool,
+    /// When Config last invoked the rule, i.e. when the last completed pass started.
+    pub last_successful_invocation_at: Option<SystemTime>,
+    /// When the last completed pass finished evaluating the resources in scope.
+    pub last_successful_evaluation_at: Option<SystemTime>,
+}
+
+impl RuleEvaluationEntry {
+    /// The evaluation history of a rule Config has just invoked an evaluation pass
+    /// for, which is every rule a write creates.
+    pub fn invoked_at(at: SystemTime) -> Self {
+        let mut evaluation = Self::default();
+        evaluation.invoke(at);
+        evaluation
+    }
+
+    /// Record that Config owes this rule an evaluation pass, invoked at `at`.
+    pub fn invoke(&mut self, at: SystemTime) {
+        self.invoked_at = Some(at);
+        self.completes_at = Some(at + RULE_EVALUATION_SETTLE_AFTER);
+    }
+
+    /// Whether the pass this rule is owed has still not completed as of `now`.
+    ///
+    /// Reading the pending pass is what tells a caller the rule's reported instants
+    /// are the previous pass's, not this one's.
+    pub fn in_progress(&self, now: SystemTime) -> bool {
+        self.completes_at.is_some_and(|due| now < due)
+    }
+
+    /// Materialise the completion the clock has already made due.
+    ///
+    /// This is the ONLY write a reporting operation performs on a rule: the pass was
+    /// owed at `completes_at` whether or not anybody read the rule's evaluation
+    /// status. A pass that is still running ([`Self::in_progress`]) is left alone, so
+    /// the rule keeps reporting the previous pass's instants until this one is due.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.in_progress(now) {
+            return;
+        }
+        if let Some(due) = self.completes_at {
+            self.first_evaluation_started = true;
+            // The invocation instant is the one recorded when the pass started; a
+            // pass always has one, so an absent `invoked_at` can only mean the
+            // completion instant itself.
+            self.last_successful_invocation_at = Some(self.invoked_at.unwrap_or(due));
+            self.last_successful_evaluation_at = Some(due);
+            self.invoked_at = None;
+            self.completes_at = None;
+        }
+    }
+}
+
 /// One persisted Config rule.
 #[derive(Debug, Clone)]
 pub struct ConfigRuleEntry {
@@ -655,6 +760,9 @@ pub struct ConfigRuleEntry {
     /// therefore carries no results and rolls up to `INSUFFICIENT_DATA` until an
     /// evaluation writer lands.
     pub resource_compliance: BTreeMap<String, String>,
+    /// When Config invoked this rule and when those invocations finished evaluating
+    /// the resources in scope, as `DescribeConfigRuleEvaluationStatus` reports it.
+    pub evaluation: RuleEvaluationEntry,
 }
 
 impl ConfigRuleEntry {
@@ -683,6 +791,55 @@ impl ConfigRuleEntry {
             created_by: None,
             evaluation_modes: Some(self.evaluation_modes.clone()),
             rule_evaluation_visibility: self.rule_evaluation_visibility.clone(),
+        }
+    }
+
+    /// Whether `DescribeConfigRuleEvaluationStatus` reports a status for this rule.
+    ///
+    /// Config reports one for its managed rules and for Custom Policy rules only
+    /// (`ConfigRuleEvaluationStatus`: "Status information for your Config Managed
+    /// rules and Config Custom Policy rules. … This operation does not return status
+    /// information about Config Custom Lambda rules.").
+    pub fn reports_evaluation_status(&self) -> bool {
+        self.source.owner != OWNER_CUSTOM_LAMBDA
+    }
+
+    /// The modelled `ConfigRuleEvaluationStatus` as a READ reports it.
+    ///
+    /// `FirstActivatedTime` is when this rule was written, which is when Config
+    /// activated it. The failure members (`LastFailedInvocationTime`,
+    /// `LastFailedEvaluationTime`, `LastErrorCode`, `LastErrorMessage`) are reported
+    /// ABSENT because no evaluation pass of this emulator fails: there is no rule
+    /// logic to fail and no resource to fail on. The debug-log members
+    /// (`LastDebugLogDeliveryStatus`, `LastDebugLogDeliveryStatusReason`,
+    /// `LastDebugLogDeliveryTime`) are absent for the same reason — nothing has
+    /// attempted to deliver a Custom Policy debug log, which is the delivery path
+    /// `DeliverConfigSnapshot` owns and which is still scaffolded. `LastDeactivatedTime`
+    /// is absent because no operation of this service turns a rule off: `DeleteConfigRule`
+    /// removes it outright.
+    pub fn to_evaluation_status_shape(&self) -> ConfigRuleEvaluationStatus {
+        ConfigRuleEvaluationStatus {
+            config_rule_name: Some(self.name.clone()),
+            config_rule_arn: Some(self.arn.clone()),
+            config_rule_id: Some(self.id.clone()),
+            first_activated_time: Some(timestamp(self.created_at)),
+            last_deactivated_time: None,
+            first_evaluation_started: self.evaluation.first_evaluation_started,
+            last_successful_invocation_time: self
+                .evaluation
+                .last_successful_invocation_at
+                .map(timestamp),
+            last_successful_evaluation_time: self
+                .evaluation
+                .last_successful_evaluation_at
+                .map(timestamp),
+            last_failed_invocation_time: None,
+            last_failed_evaluation_time: None,
+            last_error_code: None,
+            last_error_message: None,
+            last_debug_log_delivery_status: None,
+            last_debug_log_delivery_status_reason: None,
+            last_debug_log_delivery_time: None,
         }
     }
 
@@ -1508,8 +1665,10 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
 }
 
-/// Encode the key a `DescribeConfigRules` page should resume at as an opaque
-/// `NextToken`, with the base64 codec the framework already carries.
+/// Encode the key the next page of a paged read should resume at as an opaque
+/// `NextToken`, with the base64 codec the framework already carries. Every paged read
+/// of this service pages over its store's own key ordering, so one codec serves them
+/// all.
 pub fn encode_page_token(resume_at: &str) -> String {
     ::aws_smithy_types::base64::encode(resume_at)
 }
@@ -1661,6 +1820,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            evaluation: RuleEvaluationEntry::default(),
         }
     }
 
@@ -1770,6 +1930,80 @@ mod tests {
             assert!(
                 summary.compliance_summary_timestamp.is_some(),
                 "case {case:?}: expected a ComplianceSummaryTimestamp"
+            );
+        }
+    }
+
+    #[test]
+    fn an_evaluation_pass_completes_only_once_the_clock_has_made_it_due() {
+        // Rows differ along how far past the invocation the clock has moved: before
+        // the pass is due, exactly when it is due, and well past it.
+        let invoked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let cases: [(&str, Duration, bool); 4] = [
+            ("at the invocation itself", Duration::ZERO, false),
+            (
+                "one millisecond before the pass is due",
+                RULE_EVALUATION_SETTLE_AFTER - Duration::from_millis(1),
+                false,
+            ),
+            ("exactly when it is due", RULE_EVALUATION_SETTLE_AFTER, true),
+            ("a minute past it", Duration::from_secs(60), true),
+        ];
+
+        assert!(
+            RULE_EVALUATION_SETTLE_AFTER >= Duration::from_millis(250)
+                && RULE_EVALUATION_SETTLE_AFTER <= Duration::from_millis(750),
+            "the span the clock owes an evaluation must stay inside 250-750 ms, got \
+             {RULE_EVALUATION_SETTLE_AFTER:?}"
+        );
+
+        for (case, elapsed, completed) in cases {
+            let mut evaluation = RuleEvaluationEntry::default();
+            evaluation.invoke(invoked_at);
+            let now = invoked_at + elapsed;
+            assert_eq!(
+                evaluation.in_progress(now),
+                !completed,
+                "case {case:?}: expected in_progress {}, got {}",
+                !completed,
+                evaluation.in_progress(now)
+            );
+
+            evaluation.settle(now);
+            assert_eq!(
+                evaluation.first_evaluation_started, completed,
+                "case {case:?}: expected FirstEvaluationStarted {completed}, got {}",
+                evaluation.first_evaluation_started
+            );
+            let expected_invocation = completed.then_some(invoked_at);
+            assert_eq!(
+                evaluation.last_successful_invocation_at, expected_invocation,
+                "case {case:?}: expected the last successful invocation at \
+                 {expected_invocation:?}, got {:?}",
+                evaluation.last_successful_invocation_at
+            );
+            let expected_evaluation = completed.then_some(invoked_at + RULE_EVALUATION_SETTLE_AFTER);
+            assert_eq!(
+                evaluation.last_successful_evaluation_at, expected_evaluation,
+                "case {case:?}: expected the last successful evaluation at \
+                 {expected_evaluation:?}, got {:?}",
+                evaluation.last_successful_evaluation_at
+            );
+
+            // Settling again at the same instant changes nothing: the completion is
+            // materialised once.
+            let before = (
+                evaluation.last_successful_invocation_at,
+                evaluation.last_successful_evaluation_at,
+            );
+            evaluation.settle(now);
+            assert_eq!(
+                (
+                    evaluation.last_successful_invocation_at,
+                    evaluation.last_successful_evaluation_at
+                ),
+                before,
+                "case {case:?}: a second settle must not move the recorded instants"
             );
         }
     }

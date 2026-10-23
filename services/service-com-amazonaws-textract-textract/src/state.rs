@@ -53,8 +53,8 @@ use crate::ops::types::{
     AdapterOverview, Block, BoundingBox, Document, DocumentLocation, DocumentMetadata,
     ExpenseCurrency, ExpenseDetection, ExpenseDocument, ExpenseField, ExpenseType, Geometry,
     InvalidParameterException, LineItemFields, LineItemGroup, NotificationChannel, OutputConfig,
-    Point, Relationship, ResourceNotFoundException, Warning, AUTO_UPDATE_VALUES,
-    FEATURE_TYPE_VALUES,
+    Point, QueriesConfig, Query, Relationship, ResourceNotFoundException, Warning,
+    AUTO_UPDATE_VALUES, FEATURE_TYPE_VALUES,
 };
 
 /// The value Textract reports as `DetectDocumentTextModelVersion`.
@@ -92,6 +92,42 @@ pub const MAX_DOCUMENT_PAGES: usize = 3000;
 /// it is refused with `DocumentTooLargeException` BEFORE any block is built, so the work
 /// a single request can cause is bounded by this constant.
 pub const MAX_BLOCKS_PER_DOCUMENT: usize = 50_000;
+
+/// The share of a query's terms that must appear in a field's label for that field to be
+/// the query's answer.
+///
+/// NOT an AWS constant: it is this emulator's retrieval threshold. Below it the document
+/// holds no answer to the query, which is reported as a `QUERY` block with no `ANSWER`
+/// relationship rather than as a guess.
+pub const MIN_QUERY_MATCH: f32 = 0.5;
+
+/// How many queries one SYNCHRONOUS `AnalyzeDocument` request may ask.
+///
+/// AWS's Textract quotas publish 15 queries per synchronous request, and a request asking
+/// more is refused with `InvalidParameterException`. That ceiling also bounds the work a
+/// request can cause here: answering a query costs one pass over the document's fields,
+/// so an uncapped `QueriesConfig.Queries` would let one request choose both factors of
+/// that product.
+pub const MAX_QUERIES_PER_REQUEST: usize = 15;
+
+/// How many queries one ASYNCHRONOUS `StartDocumentAnalysis` request may ask.
+///
+/// AWS's Textract quotas publish a higher per-request figure for the asynchronous
+/// analysis than for the synchronous one (30 against 15), so the asynchronous path carries
+/// its own ceiling rather than refusing input the real service accepts.
+pub const MAX_QUERIES_PER_ASYNC_REQUEST: usize = 30;
+
+/// How many `Query.Pages` entries one query may name. NOT an AWS limit; it bounds the
+/// page filter a single caller-supplied query can make this service evaluate.
+pub const MAX_PAGES_PER_QUERY: usize = 100;
+
+/// Terms a label or a question is matched on.
+///
+/// NOT an AWS limit: it is what bounds retrieval. A label is split on every
+/// non-alphanumeric character, so without this a single line of punctuation-separated
+/// fragments would carry a term list as long as the document. Past it, a label or a
+/// question is matched on its first terms, which is where what it is about is said.
+pub const MAX_RETRIEVAL_TERMS: usize = 32;
 
 /// How many documents this service keeps. NOT an AWS limit: an emulator-side bound so a
 /// caller cannot grow the heap without end. The least recently registered is evicted.
@@ -836,9 +872,13 @@ pub enum FeatureError {
 
 /// Read a `FeatureTypes` list.
 ///
-/// `FORMS` and `TABLES` are derived; the other modelled values (`QUERIES`,
-/// `SIGNATURES`, `LAYOUT`) are reported as [`FeatureError::NotDerived`] so the caller
-/// answers 501 rather than a 200 that silently omits the blocks they asked for.
+/// `FORMS`, `TABLES` and `QUERIES` are derived; the other modelled values (`SIGNATURES`,
+/// `LAYOUT`) are reported as [`FeatureError::NotDerived`] so the caller answers 501 rather
+/// than a 200 that silently omits the blocks they asked for.
+///
+/// `QUERIES` needs no flag of its own: the `QUERY` and `QUERY_RESULT` blocks come from the
+/// queries themselves, which [`queries_of`] reads off the request, so there is no second
+/// representation of "QUERIES was asked for" to drift from it.
 pub fn parse_features(values: &[String]) -> Result<FeatureSet, FeatureError> {
     if values.is_empty() {
         return Err(FeatureError::Empty);
@@ -848,6 +888,7 @@ pub fn parse_features(values: &[String]) -> Result<FeatureSet, FeatureError> {
         match value.as_str() {
             "FORMS" => features.forms = true,
             "TABLES" => features.tables = true,
+            QUERIES_FEATURE => {}
             // `FEATURE_TYPE_VALUES` is the FeatureType enum from the Smithy model.
             other if FEATURE_TYPE_VALUES.contains(&other) => {
                 return Err(FeatureError::NotDerived(other.to_string()))
@@ -856,6 +897,157 @@ pub fn parse_features(values: &[String]) -> Result<FeatureSet, FeatureError> {
         }
     }
     Ok(features)
+}
+
+/// The `FeatureType` that asks for the queries `QueriesConfig` supplies.
+pub const QUERIES_FEATURE: &str = "QUERIES";
+
+/// The queries an analysis must answer, or why the request cannot be served.
+///
+/// AWS pairs the `QUERIES` feature with the `QueriesConfig` member: `QueriesConfig` is
+/// what the queries are supplied in and `QUERIES` is what asks for them, so one without
+/// the other violates the input constraint `InvalidParameterException` describes. The
+/// message names the member that was supplied and the one that was not, so it is derived
+/// from the request rather than recorded.
+///
+/// Read straight off the requested `FeatureTypes`, so the pairing is checked whatever else
+/// that list holds — including a modelled feature this emulator derives no blocks for,
+/// whose 501 must not stand in front of a bad request.
+///
+/// Each query's `Query.Pages` is parsed ONCE here, so no caller-supplied page entry is
+/// re-parsed while the document is searched, and both caller-controlled counts are bounded
+/// (`max_queries`, which the caller passes as the quota for ITS path, and
+/// [`MAX_PAGES_PER_QUERY`]): the work a query answer costs is `queries x fields`, and
+/// neither factor may be chosen without limit.
+pub fn queries_of(
+    feature_types: &[String],
+    config: Option<&QueriesConfig>,
+    max_queries: usize,
+) -> Result<Vec<PreparedQuery>, String> {
+    let queries_requested = feature_types.iter().any(|value| value == QUERIES_FEATURE);
+    match (queries_requested, config) {
+        (true, Some(config)) => {
+            if config.queries.len() > max_queries {
+                return Err(format!(
+                    "QueriesConfig.Queries holds {} queries; at most {max_queries} queries \
+                     can be asked of one document",
+                    config.queries.len()
+                ));
+            }
+            config.queries.iter().map(PreparedQuery::new).collect()
+        }
+        (false, None) => Ok(Vec::new()),
+        (false, Some(_)) => Err(
+            "QueriesConfig was supplied, but FeatureTypes does not contain QUERIES: \
+             QueriesConfig must be used with the QUERIES FeatureType"
+                .to_string(),
+        ),
+        (true, None) => Err(
+            "FeatureTypes contains QUERIES, but no QueriesConfig was supplied: the QUERIES \
+             FeatureType must be used with QueriesConfig"
+                .to_string(),
+        ),
+    }
+}
+
+/// Whether a derived block list plus the blocks `queries` would add exceeds
+/// [`MAX_BLOCKS_PER_DOCUMENT`].
+///
+/// A `QUERY` block, and the `QUERY_RESULT` that may answer it, are blocks the response
+/// carries, so they count against the same ceiling the document's own blocks are checked
+/// against. The caller answers `true` with `DocumentTooLargeException`.
+pub fn exceeds_block_ceiling(pages: &[String], queries: usize) -> bool {
+    estimated_block_count(pages).saturating_add(queries.saturating_mul(2))
+        > MAX_BLOCKS_PER_DOCUMENT
+}
+
+/// A query as it was asked, with its page filter parsed once.
+#[derive(Debug, Clone)]
+pub struct PreparedQuery {
+    /// The query the caller asked, as a `QUERY` block reports it.
+    pub query: Query,
+    /// The pages it asks about.
+    pages: PageFilter,
+}
+
+/// The pages a query asks about, read out of `Query.Pages` once.
+#[derive(Debug, Clone)]
+enum PageFilter {
+    /// `Pages` absent: page 1, which is what AWS documents as its default.
+    FirstPage,
+    /// `*`: every page of the document.
+    EveryPage,
+    /// The pages and intervals the caller named; `None` is the open end of `N-*`.
+    Intervals(Vec<(u32, Option<u32>)>),
+}
+
+impl PreparedQuery {
+    /// Read one query, or say why its `Pages` is not one of the forms AWS documents.
+    ///
+    /// AWS, on `Query$Pages`: the only characters allowed are `0 1 2 3 4 5 6 7 8 9 - *`,
+    /// with no whitespace; `*` must be the only element when used; intervals such as `1-3`
+    /// and `4-*` are allowed; a page must be greater than 0.
+    fn new(query: &Query) -> Result<Self, String> {
+        let pages = match query.pages.as_deref() {
+            None => PageFilter::FirstPage,
+            Some(entries) if entries.len() == 1 && entries[0] == "*" => PageFilter::EveryPage,
+            Some(entries) => {
+                if entries.len() > MAX_PAGES_PER_QUERY {
+                    return Err(format!(
+                        "Query.Pages holds {} entries; at most {MAX_PAGES_PER_QUERY} can be \
+                         named for one query",
+                        entries.len()
+                    ));
+                }
+                let mut intervals = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    if entry == "*" {
+                        return Err(format!(
+                            "Query.Pages {entries:?} uses *, which must be the only element \
+                             of the list"
+                        ));
+                    }
+                    let interval = parse_page_interval(entry).ok_or_else(|| {
+                        format!("Query.Pages entry {entry:?} is not a page or a page interval")
+                    })?;
+                    intervals.push(interval);
+                }
+                PageFilter::Intervals(intervals)
+            }
+        };
+        Ok(Self {
+            query: query.clone(),
+            pages,
+        })
+    }
+
+    /// Whether this query asks about `page_number`.
+    fn covers(&self, page_number: i32) -> bool {
+        let Ok(page_number) = u32::try_from(page_number) else {
+            return false;
+        };
+        match &self.pages {
+            PageFilter::FirstPage => page_number == 1,
+            PageFilter::EveryPage => true,
+            PageFilter::Intervals(intervals) => intervals.iter().any(|(first, last)| {
+                page_number >= *first && last.is_none_or(|last| page_number <= last)
+            }),
+        }
+    }
+}
+
+/// `(first, last)` of a `Query.Pages` entry, `last` absent for an open interval.
+/// `None` when the entry is not a page or an interval at all.
+fn parse_page_interval(entry: &str) -> Option<(u32, Option<u32>)> {
+    let page = |value: &str| value.parse::<u32>().ok().filter(|page| *page > 0);
+    match entry.split_once('-') {
+        None => page(entry).map(|only| (only, Some(only))),
+        Some((first, "*")) => page(first).map(|first| (first, None)),
+        Some((first, last)) => {
+            let (first, last) = (page(first)?, page(last)?);
+            (first <= last).then_some((first, Some(last)))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1631,6 +1823,153 @@ fn table_blocks(
         out.extend(cell_blocks);
     }
     (out, ids)
+}
+
+// ---------------------------------------------------------------------------
+// Queries
+// ---------------------------------------------------------------------------
+
+/// A labelled field read out of a document: its label, the value it carries, and where on
+/// the page that value sits.
+#[derive(Debug, Clone)]
+pub struct Field {
+    /// The page the field was read from, as `Block$Page` numbers pages.
+    pub page_number: i32,
+    /// The label, as written in the document.
+    pub label: String,
+    /// The value the label carries, as written in the document.
+    pub value: String,
+    /// Where the value sits on the page, for the answer's `Geometry`.
+    pub value_box: BoundingBox,
+    /// The label's retrieval terms, computed ONCE when the field is read and held as a
+    /// set, so matching a query against every field of a document costs a lookup per term
+    /// rather than a scan.
+    label_terms: BTreeSet<String>,
+}
+
+/// Every labelled field of a document, in reading order.
+///
+/// Read through [`labelled_split`], the ONE reader of a labelled line, so a query is
+/// answered from exactly the fields `FORMS` analysis and `AnalyzeExpense` report.
+pub fn fields(key: &str, content: &DocumentContent) -> Vec<Field> {
+    let mut out = Vec::new();
+    for (page_index, page_text) in content.pages.iter().enumerate() {
+        let page_number = i32::try_from(page_index + 1).unwrap_or(i32::MAX);
+        for line in layout_page(key, page_index, page_text, content.confidence) {
+            let Some((colon, _, value_words)) = labelled_split(&line) else {
+                continue;
+            };
+            let label = char_span(&line.text, 0, colon).trim().to_string();
+            let value_box = union(&word_boxes(&line, &value_words));
+            out.push(Field {
+                page_number,
+                label_terms: terms(&label).into_iter().collect(),
+                label,
+                value: char_span(&line.text, colon + 1, line.text.chars().count())
+                    .trim()
+                    .to_string(),
+                value_box,
+            });
+        }
+    }
+    out
+}
+
+/// Words a question is phrased with rather than asks about, so they say nothing about
+/// which field answers it. NOT an AWS list: it is this emulator's retrieval stop list.
+const QUERY_STOPWORDS: &[&str] = &[
+    "the", "what", "which", "who", "whom", "whose", "when", "where", "was", "were", "is", "are",
+    "does", "do", "did", "of", "for", "in", "on", "at", "to", "this", "that", "from", "and", "me",
+    "my", "your", "please", "tell", "show", "give", "document", "there", "any", "has", "have",
+];
+
+/// The terms a query or a label is about: its alphanumeric words, lowercased, without the
+/// stop list and without one-character fragments (an apostrophe's tail, say), at most
+/// [`MAX_RETRIEVAL_TERMS`] of them.
+fn terms(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|term| term.chars().count() > 1 && !QUERY_STOPWORDS.contains(&term.as_str()))
+        .take(MAX_RETRIEVAL_TERMS)
+        .collect()
+}
+
+/// The field that answers `query`, and the share of the query's terms its label carries.
+///
+/// Term-overlap retrieval over the document's own labelled fields: no answer is reported
+/// unless a field's label really carries at least [`MIN_QUERY_MATCH`] of the query's
+/// terms, and the answer is that field's value as it was read out of the document.
+///
+/// Bounded on every factor: one pass over the fields per query (both counts capped, by the
+/// caller's query quota and, through [`MAX_BLOCKS_PER_DOCUMENT`], by the document's line
+/// count), at most [`MAX_RETRIEVAL_TERMS`] set lookups per field, and no allocation — the
+/// query's terms and each field's are already computed.
+fn answer_for<'a>(
+    query: &PreparedQuery,
+    wanted: &[String],
+    fields: &'a [Field],
+) -> Option<(&'a Field, f32)> {
+    if wanted.is_empty() {
+        return None;
+    }
+    let mut best: Option<(&Field, f32)> = None;
+    for field in fields
+        .iter()
+        .filter(|field| query.covers(field.page_number))
+    {
+        let matched = wanted
+            .iter()
+            .filter(|term| field.label_terms.contains(term.as_str()))
+            .count();
+        let score = matched as f32 / wanted.len() as f32;
+        if score >= MIN_QUERY_MATCH && best.is_none_or(|(_, previous)| score > previous) {
+            best = Some((field, score));
+        }
+    }
+    best
+}
+
+/// The `QUERY` block of each requested query, plus a `QUERY_RESULT` for every query this
+/// document answers.
+///
+/// A `QUERY` block carries the query as asked (`Query.Text` and `Query.Alias` are the
+/// caller's, which is what AWS reports them as) and relates to its answer with an `ANSWER`
+/// relationship. A query the document holds no answer to gets a `QUERY` block with no
+/// `ANSWER`: nothing is invented to answer it.
+pub fn query_blocks(key: &str, content: &DocumentContent, queries: &[PreparedQuery]) -> Vec<Block> {
+    if queries.is_empty() {
+        return Vec::new();
+    }
+    let fields = fields(key, content);
+    let mut out = Vec::new();
+    for (index, query) in queries.iter().enumerate() {
+        // The first page of the document the query asks about: a query that names no page
+        // asks about page 1, as `Query$Pages` documents.
+        let page = (1..=content.page_count())
+            .find(|page| query.covers(*page))
+            .unwrap_or(1);
+        let mut block = new_block("QUERY", block_id(key, "QUERY", &[index]), page);
+        // A QUERY is a question asked of the page, not a region of it, so it carries no
+        // Geometry.
+        block.query = Some(query.query.clone());
+        let wanted = terms(&query.query.text);
+        match answer_for(query, &wanted, &fields) {
+            Some((field, score)) => {
+                let result_id = block_id(key, "QUERY_RESULT", &[index]);
+                block.relationships = Some(vec![relationship("ANSWER", vec![result_id.clone()])]);
+                let mut result = new_block("QUERY_RESULT", result_id, field.page_number);
+                result.text = Some(field.value.clone());
+                // Confidence in the answer is the confidence of the text it was read
+                // from, scaled by how much of the query that field's label accounts for.
+                result.confidence = Some((score * content.confidence).clamp(0.0, 100.0));
+                result.geometry = Some(geometry(field.value_box.clone()));
+                out.push(block);
+                out.push(result);
+            }
+            None => out.push(block),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

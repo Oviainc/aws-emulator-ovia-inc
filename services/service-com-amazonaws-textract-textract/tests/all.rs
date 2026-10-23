@@ -21,6 +21,8 @@ mod adapters;
 mod document_extraction;
 #[path = "all/expense_analysis.rs"]
 mod expense_analysis;
+#[path = "all/queries_and_input_refusals.rs"]
+mod queries_and_input_refusals;
 #[path = "all/raster_documents.rs"]
 mod raster_documents;
 #[path = "all/resource_tags.rs"]

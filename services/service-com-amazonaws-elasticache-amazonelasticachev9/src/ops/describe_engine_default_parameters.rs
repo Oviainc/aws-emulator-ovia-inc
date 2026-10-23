@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEngineDefaultParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEngineDefaultParameters`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: this operation answers from this service's state. The SCAFFOLDED
+//! marker line is gone, which is what records it as no longer a stub
+//! (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`); the paragraphs below
+//! are the scaffold's notes on how an operation of this service is wired. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEngineDefaultParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +109,38 @@ impl From<DescribeEngineDefaultParametersErrorModeled> for DescribeEngineDefault
     }
 }
 
+/// The pagination key a `Marker` of THIS operation carries: the family the page
+/// belongs to and the record it starts at.
+///
+/// A marker is only meaningful inside one family's catalog, so the family it was
+/// minted for travels in the token and is checked when it comes back: a token
+/// from another family (or from another paginated describe of this service)
+/// names a different family or no family at all, and is refused rather than
+/// silently resolving to an offset into the wrong catalog.
+fn marker_key(family: &str, page_key: &str) -> String {
+    format!("{family}|{page_key}")
+}
+
+/// The record key `marker` resumes at, or `None` when it is not a token this
+/// operation minted for `family`.
+fn marker_start(marker: &str, family: &str) -> Option<String> {
+    let decoded = crate::state::decode_marker(marker)?;
+    let (minted_for, page_key) = decoded.split_once('|')?;
+    (minted_for == family).then(|| page_key.to_string())
+}
+
+/// `message` as this operation's modelled `InvalidParameterValueException`
+/// ("The value for a parameter is invalid", HTTP 400) — the only refusal this
+/// handler has, so every place that reaches it words it the same way.
+fn invalid_parameter_value(message: String) -> DescribeEngineDefaultParametersError {
+    DescribeEngineDefaultParametersErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
 /// The `DescribeEngineDefaultParameters` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -147,20 +175,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEngineDefaultParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEngineDefaultParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEngineDefaultParameters"))
+        // "Returns the default engine and system parameter information for the
+        // specified cache engine": a pure read of the catalog the engine
+        // publishes. Nothing in it has a lifecycle the clock drives — a family's
+        // defaults are the same before and after anything is created — so this
+        // handler writes nothing at all.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `MaxRecords` carries no modelled `@range` and a `Marker` carries no
+        // modelled format, so this operation's documented "Default: 100.
+        // Constraints: minimum 20; maximum 100" window and a token this service
+        // did not mint for this family are refused here, through the same
+        // helpers every paginated describe in this service shares.
+        // `InvalidParameterValueException` is what this operation models for a
+        // value a parameter may not take.
+        let page_size = match crate::state::page_size(input.max_records) {
+            Ok(size) => size,
+            Err(message) => return Err(invalid_parameter_value(message)),
+        };
+
+        let store = state.lock();
+        // The family selects the catalog, and a name no published family carries
+        // has no defaults to report: that is a value this member may not take,
+        // not an empty answer.
+        let family = input.cache_parameter_group_family;
+        let Some(parameters) = store.engine_defaults(&family) else {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value {family} for CacheParameterGroupFamily."
+            )));
+        };
+
+        // The marker is checked AGAINST the family: a token this operation did
+        // not mint for this family resumes nothing.
+        let resume_from = match input.marker.as_deref() {
+            Some(marker) => match marker_start(marker, &family) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(invalid_parameter_value(format!(
+                        "Invalid value {marker} for Marker."
+                    )))
+                }
+            },
+            None => None,
+        };
+
+        // `EngineDefaults` carries two parameter lists and ONE `Marker`, so a
+        // page is a window over both: the stored key order runs the plain
+        // parameters first and the node-type-specific ones after (see
+        // `state::ParameterRecord::page_key`), and each record of the page lands
+        // in the list its own kind belongs to.
+        let mut page_plain: Vec<Parameter> = Vec::new();
+        let mut page_node_type_specific: Vec<CacheNodeTypeSpecificParameter> = Vec::new();
+        let mut marker = None;
+        // A `Marker` carries the inclusive start key of its page, so the page is
+        // a RANGE of the stored order rather than a scan of all of it.
+        let start = match resume_from.as_deref() {
+            Some(key) => ::std::ops::Bound::Included(key),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        for (key, parameter) in parameters.range::<str, _>((start, ::std::ops::Bound::Unbounded)) {
+            if page_plain.len() + page_node_type_specific.len() == page_size {
+                // More records exist than `MaxRecords`, so the response carries
+                // the marker the next call resumes from.
+                marker = Some(crate::state::encode_marker(&marker_key(&family, key)));
+                break;
+            }
+            if parameter.is_node_type_specific() {
+                page_node_type_specific.push(parameter.to_node_type_specific());
+            } else {
+                page_plain.push(parameter.to_modeled());
+            }
+        }
+
+        Ok(DescribeEngineDefaultParametersOutput {
+            engine_defaults: Some(EngineDefaults {
+                cache_parameter_group_family: Some(family),
+                marker,
+                parameters: Some(page_plain),
+                cache_node_type_specific_parameters: Some(page_node_type_specific),
+            }),
+        })
     }
 }
+

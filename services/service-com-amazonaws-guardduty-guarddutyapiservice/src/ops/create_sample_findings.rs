@@ -194,9 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // GuardDuty AGGREGATES repeated occurrences of the same finding type on
             // the same resource into one finding rather than creating another: the
-            // existing finding keeps its id and ARN, and its occurrence count and
-            // `UpdatedAt` move. A sample finding has no distinct resource, so the
-            // finding type alone identifies it.
+            // existing finding keeps its id and ARN, and its occurrence count,
+            // `UpdatedAt` and `EventLastSeen` move — a repeat generation IS another
+            // observation of the activity. A sample finding has no distinct
+            // resource, so the finding type alone identifies it.
             if let Some(existing) = state
                 .detector_in_mut(&region, &input.detector_id)
                 .and_then(|detector| {
@@ -208,6 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 existing.count = existing.count.saturating_add(1);
                 existing.updated_at_millis = now;
+                existing.event_last_seen_millis = now;
                 continue;
             }
 
@@ -237,6 +239,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 count: 1,
                 created_at_millis: now,
                 updated_at_millis: now,
+                // The generated finding is observed exactly once, now.
+                event_last_seen_millis: now,
                 archived: false,
                 sample: true,
                 // No feedback has been submitted about a finding GuardDuty has only

@@ -15,6 +15,8 @@
 mod harness;
 #[path = "all/monitor_update.rs"]
 mod monitor_update;
+#[path = "all/query_lifecycle.rs"]
+mod query_lifecycle;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/scope_monitor_lifecycle.rs"]

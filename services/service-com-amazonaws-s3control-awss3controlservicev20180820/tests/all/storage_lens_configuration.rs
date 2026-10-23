@@ -27,6 +27,11 @@
 //! it per the Smithy model, runs the handler and serializes the restXml
 //! response. The router, the request builder and the XML escaping are the
 //! access point suite's, reused rather than copied.
+//!
+//! The document readers and writers below (`leaves_of`, `document_xml`,
+//! `tags_xml` and friends) are `pub(crate)` because the Storage Lens GROUP
+//! suite compares whole documents the same way rather than writing a second
+//! XML walker.
 
 use crate::access_point_lifecycle::{
     call_in_region, xml_escape, xml_unescape, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION,
@@ -47,7 +52,7 @@ const OTHER_REGION: &str = "eu-central-1";
 pub(crate) type Leaf = (String, String);
 
 /// One leaf, spelled for a table row.
-fn leaf(path: &str, value: &str) -> Leaf {
+pub(crate) fn leaf(path: &str, value: &str) -> Leaf {
     (path.to_string(), value.to_string())
 }
 
@@ -171,14 +176,14 @@ pub(crate) fn leaves_of(body: &str) -> Vec<Leaf> {
 
 /// The leaves of `body`, sorted, so two documents compare as documents rather
 /// than as a member order no part of the contract fixes.
-fn sorted_leaves(body: &str) -> Vec<Leaf> {
+pub(crate) fn sorted_leaves(body: &str) -> Vec<Leaf> {
     let mut leaves = leaves_of(body);
     leaves.sort();
     leaves
 }
 
 /// `leaves` sorted, for comparison against [`sorted_leaves`].
-fn sorted(leaves: &[Leaf]) -> Vec<Leaf> {
+pub(crate) fn sorted(leaves: &[Leaf]) -> Vec<Leaf> {
     let mut sorted = leaves.to_vec();
     sorted.sort();
     sorted
@@ -189,7 +194,7 @@ fn sorted(leaves: &[Leaf]) -> Vec<Leaf> {
 /// Successive leaves sharing a parent path go into the same parent element, so
 /// two leaves at `Include/Buckets/Arn` are two `<Arn>` elements in one
 /// `<Buckets>`.
-fn document_xml(leaves: &[Leaf]) -> String {
+pub(crate) fn document_xml(leaves: &[Leaf]) -> String {
     let mut xml = String::new();
     let mut open: Vec<&str> = Vec::new();
     for (path, value) in leaves {
@@ -223,7 +228,7 @@ fn document_xml(leaves: &[Leaf]) -> String {
 
 /// The `<Tags>` element a request carries, or nothing at all when the request
 /// names no tag set.
-fn tags_xml(tags: Option<&[(String, String)]>) -> String {
+pub(crate) fn tags_xml(tags: Option<&[(String, String)]>) -> String {
     let Some(tags) = tags else {
         return String::new();
     };

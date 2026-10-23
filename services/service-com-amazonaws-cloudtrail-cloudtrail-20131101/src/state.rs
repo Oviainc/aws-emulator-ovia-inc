@@ -23,8 +23,8 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AdvancedEventSelector, PartitionKey, RefreshSchedule, RequestWidget, Tag, Trail, TrailInfo,
-    Widget,
+    AdvancedEventSelector, ImportSource, ImportStatistics, PartitionKey, RefreshSchedule,
+    RequestWidget, Tag, Trail, TrailInfo, Widget,
 };
 
 /// The Region a request is served in when it carries no SigV4 credential scope to
@@ -357,6 +357,91 @@ pub fn iso8601(at: SystemTime) -> Option<String> {
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .ok()
 }
+
+/// The `ImportStatus` values the model's enum declares
+/// (`smithy_query(query="shape",shape="ImportStatus")`): `INITIALIZING | IN_PROGRESS |
+/// FAILED | STOPPED | COMPLETED`.
+pub const IMPORT_STATUS_INITIALIZING: &str = "INITIALIZING";
+/// See [`IMPORT_STATUS_INITIALIZING`].
+pub const IMPORT_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`IMPORT_STATUS_INITIALIZING`].
+pub const IMPORT_STATUS_STOPPED: &str = "STOPPED";
+/// See [`IMPORT_STATUS_INITIALIZING`].
+pub const IMPORT_STATUS_COMPLETED: &str = "COMPLETED";
+/// See [`IMPORT_STATUS_INITIALIZING`].
+pub const IMPORT_STATUS_FAILED: &str = "FAILED";
+
+/// The statuses an import can still leave. The other three — `COMPLETED`, `FAILED`
+/// and `STOPPED` — are where an import ends, so nothing moves them.
+pub const RUNNING_IMPORT_STATUSES: [&str; 2] =
+    [IMPORT_STATUS_INITIALIZING, IMPORT_STATUS_IN_PROGRESS];
+
+/// The HTTP status this service answers `ImportNotFoundException` with.
+///
+/// The model annotates the shape `@httpError(404)`
+/// (`smithy_query(query="shape",shape="ImportNotFoundException")`), but `@httpError`
+/// is an HTTP-BINDING trait and the recorded CloudTrail responses to an import
+/// operation addressing an unknown import id carry HTTP **400** with
+/// `__type: ImportNotFoundException` — the status a client's retry classifier sees is
+/// the service's, not the model's. A handler answers it through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`], which keeps the modelled
+/// shape's body and changes only the status line.
+pub const IMPORT_NOT_FOUND_HTTP_STATUS: u16 = 400;
+
+/// The refusal text for an import id that names no import.
+///
+/// Built from the request so a caller can tell WHICH id was not found, in the wording
+/// the recorded CloudTrail responses use ("The import job <id> was not found.").
+pub fn import_not_found_message(import_id: &str) -> String {
+    format!("The import job {import_id} was not found.")
+}
+
+/// One persisted import job: the request `StartImport` was given, the status the job
+/// is in, and the two instants the service stamps on it.
+///
+/// `statistics` is `None` while nothing has been imported: this emulator reads no S3
+/// bucket, so an import reports no counts rather than counts nothing produced.
+#[derive(Debug, Clone)]
+pub struct ImportRecord {
+    pub import_id: String,
+    /// The destination event data store ARNs (`ImportDestinations`, length 1..1).
+    pub destinations: Vec<String>,
+    pub import_source: Option<ImportSource>,
+    pub start_event_time: Option<SystemTime>,
+    pub end_event_time: Option<SystemTime>,
+    /// One of the [`IMPORT_STATUS_INITIALIZING`] family.
+    pub status: String,
+    pub created_timestamp: SystemTime,
+    pub updated_timestamp: SystemTime,
+    pub statistics: Option<ImportStatistics>,
+}
+
+impl ImportRecord {
+    /// Whether this import is still running, so a stop has something to stop.
+    pub fn is_running(&self) -> bool {
+        RUNNING_IMPORT_STATUSES.contains(&self.status.as_str())
+    }
+
+    /// Stop this import.
+    ///
+    /// A running import moves to `STOPPED` and its `UpdatedTimestamp` becomes `at`.
+    /// An import that already reached a terminal status is left exactly as it is —
+    /// there is nothing left to stop — so a repeated stop reports the same record.
+    pub fn stop(&mut self, at: SystemTime) {
+        if self.is_running() {
+            self.status = IMPORT_STATUS_STOPPED.to_string();
+            self.updated_timestamp = at;
+        }
+    }
+}
+
+/// The import registry key: an import id and the Region the import was created in.
+///
+/// CloudTrail is a regional service — an import belongs to the Region its destination
+/// event data store lives in — so an import is reachable only from that Region, the
+/// same way [`TrailKey`] scopes a trail name. The id comes FIRST so the `BTreeMap`
+/// iterates id-ordered, which is the order `ListImports` pages through.
+pub type ImportKey = (String, String);
 
 /// The first tag key that appears more than once in `tags`, if any.
 ///
@@ -767,6 +852,14 @@ fn event_data_store_arn_rejection(value: &str) -> String {
 pub struct ComAmazonawsCloudtrailCloudtrail20131101State {
     /// Every trail in the account, keyed by [`TrailKey`].
     pub trails: BTreeMap<TrailKey, TrailRecord>,
+    /// Every import job in the account, keyed by [`ImportKey`]. `StartImport` adds a
+    /// record; `StopImport` moves a running one to `STOPPED`.
+    ///
+    /// Unbounded here on purpose: `StartImport` is the only operation that adds a
+    /// record and it is still a scaffold stub, so the bound belongs with it — on the
+    /// terms [`TRAIL_QUOTA`] and [`DASHBOARD_QUOTA`] state, a whole-registry cap
+    /// refused with that operation's own modelled error.
+    pub imports: BTreeMap<ImportKey, ImportRecord>,
     /// Every CloudTrail Lake event data store, keyed by its id (the resource
     /// suffix of its ARN), which is unique across Regions.
     pub event_data_stores: BTreeMap<String, EventDataStoreRecord>,
@@ -855,6 +948,22 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
                 None => TrailForMutation::Absent,
             }),
         }
+    }
+
+    /// The import `import_id` names in `region`, for an operation that only reports
+    /// it.
+    pub fn import(&self, import_id: &str, region: &str) -> Option<&ImportRecord> {
+        self.imports
+            .get(&(import_id.to_string(), region.to_string()))
+    }
+
+    /// The import `import_id` names in `region`, for an operation that CHANGES it.
+    ///
+    /// `None` is a well-formed id naming no import the caller's Region holds, which
+    /// every import operation answers with `ImportNotFoundException`.
+    pub fn import_mut(&mut self, import_id: &str, region: &str) -> Option<&mut ImportRecord> {
+        self.imports
+            .get_mut(&(import_id.to_string(), region.to_string()))
     }
 
     /// Whether this Region holds any event data store at all — what a request

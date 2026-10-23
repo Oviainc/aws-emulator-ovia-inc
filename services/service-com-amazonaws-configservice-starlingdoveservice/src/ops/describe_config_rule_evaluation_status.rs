@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConfigRuleEvaluationStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConfigRuleEvaluationStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConfigRuleEvaluationStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports, for each Config rule in [`crate::state`] whose status Config publishes,
+//! when the rule was activated and when Config last invoked it and last finished
+//! evaluating the resources in its scope — materialising, as it reports, the
+//! evaluation pass the clock has already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +81,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The smallest `Limit` this operation accepts
+/// (`com.amazonaws.configservice#RuleLimit`, range 0..50, default 0).
+const RULE_LIMIT_MIN: i32 = 0;
+/// The largest `Limit` this operation accepts; see [`RULE_LIMIT_MIN`].
+const RULE_LIMIT_MAX: i32 = 50;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -156,18 +157,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConfigRuleEvaluationStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConfigRuleEvaluationStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConfigRuleEvaluationStatus"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let names = input.config_rule_names.unwrap_or_default();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A requested name that names no rule is a failure, not an empty page.
+        for name in &names {
+            if !store.config_rules.contains_key(name) {
+                return Err(
+                    DescribeConfigRuleEvaluationStatusErrorModeled::NoSuchConfigRuleException(
+                        NoSuchConfigRuleException {
+                            message: Some(crate::state::no_such_config_rule_message(name)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        DescribeConfigRuleEvaluationStatusErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified NextToken is not valid; use the NextToken a \
+                                     previous DescribeConfigRuleEvaluationStatus response \
+                                     returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // `Limit` is how many statuses the caller asked for; its modelled default of 0
+        // states no number, so a request that leaves it there gets this emulator's
+        // page size. A value outside the modelled `RuleLimit` range is a bad parameter
+        // value, refused with the operation's own modelled error rather than served a
+        // page the caller did not ask for — and never asserted on, so no request can
+        // unwind this read.
+        if !(RULE_LIMIT_MIN..=RULE_LIMIT_MAX).contains(&input.limit) {
+            return Err(
+                DescribeConfigRuleEvaluationStatusErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Limit {} is not valid: it has to be between {RULE_LIMIT_MIN} and \
+                             {RULE_LIMIT_MAX}",
+                            input.limit,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let requested_limit = usize::try_from(input.limit).unwrap_or(0);
+        let page_size = if requested_limit == 0 {
+            crate::state::DESCRIBE_CONFIG_RULE_EVALUATION_STATUS_PAGE_SIZE
+        } else {
+            requested_limit
+        };
+
+        // Materialise every evaluation pass the clock has already made due. Each one
+        // completed at its own instant whether or not anybody asked for the status, so
+        // reporting it does not change what a later caller sees.
+        for rule in store.config_rules.values_mut() {
+            rule.evaluation.settle(now);
+        }
+
+        // Page over the store's own name ordering, resuming at the name the token
+        // holds, so a token survives rules inserted or deleted between pages.
+        let mut page = Vec::new();
+        let mut next_token = None;
+        let from = resume_at.unwrap_or_default();
+        for (name, rule) in store.config_rules.range::<String, _>(from..) {
+            if !names.is_empty() && !names.iter().any(|requested| requested == name) {
+                continue;
+            }
+            // Config publishes no status for a Custom Lambda rule. Naming one is not a
+            // failure — the rule exists — it simply has no status to report.
+            if !rule.reports_evaluation_status() {
+                continue;
+            }
+            if page.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(name));
+                break;
+            }
+            page.push(rule.to_evaluation_status_shape());
+        }
+
+        Ok(DescribeConfigRuleEvaluationStatusOutput {
+            config_rules_evaluation_status: Some(page),
+            next_token,
+        })
     }
 }

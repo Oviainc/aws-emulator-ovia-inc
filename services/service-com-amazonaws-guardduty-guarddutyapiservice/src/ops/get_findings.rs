@@ -213,7 +213,11 @@ fn finding(record: &crate::state::FindingRecord) -> Finding {
             count: Some(record.count),
             detector_id: Some(record.detector_id.clone()),
             event_first_seen: Some(crate::state::iso8601(record.created_at_millis)),
-            event_last_seen: Some(crate::state::iso8601(record.updated_at_millis)),
+            // The ACTIVITY's clock, not the record's: a change to the finding's own
+            // metadata (its archive state, its feedback) is not an observation of
+            // the activity, so `EventLastSeen` comes from the record's
+            // `event_last_seen_millis` rather than from its `UpdatedAt`.
+            event_last_seen: Some(crate::state::iso8601(record.event_last_seen_millis)),
             resource_role: Some(record.resource_role.clone()),
             service_name: Some(GUARDDUTY_SERVICE_NAME.to_string()),
             // "Feedback that was submitted about the finding"

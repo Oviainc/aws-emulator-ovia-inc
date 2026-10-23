@@ -237,14 +237,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         };
 
+        // Cross-member input validation comes FIRST, before every feature dispatch and
+        // before the 501 below: an inconsistent FeatureTypes / QueriesConfig pair is a bad
+        // request whatever else the request asks for, so it is never hidden behind "not
+        // implemented here".
+        let queries = match crate::state::queries_of(
+            &input.feature_types,
+            input.queries_config.as_ref(),
+            // The ASYNCHRONOUS quota, which AWS publishes higher than the synchronous one.
+            crate::state::MAX_QUERIES_PER_ASYNC_REQUEST,
+        ) {
+            Ok(queries) => queries,
+            Err(message) => return Err(invalid(message)),
+        };
+
         if input.adapters_config.is_some() {
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "StartDocumentAnalysis with AdaptersConfig",
-            ));
-        }
-        if input.queries_config.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "StartDocumentAnalysis with QueriesConfig",
             ));
         }
 
@@ -321,7 +330,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // FAILED state carrying the reason, not a hollow success.
         let (outcome, status_message, content, blocks) = match read {
             Ok(content) => {
-                let blocks = crate::state::blocks(&key, &content, features);
+                // The queries this job must answer are derived once, with the document's
+                // own blocks, so the job's later `GetDocumentAnalysis` reads report the
+                // same QUERY and QUERY_RESULT blocks the document holds answers for.
+                if crate::state::exceeds_block_ceiling(&content.pages, queries.len()) {
+                    return Err(
+                        StartDocumentAnalysisErrorModeled::DocumentTooLargeException(
+                            DocumentTooLargeException {
+                                message: Some(format!(
+                                    "the document and the {} queries asked of it would expand \
+                                     into more than the {} blocks this emulator derives for \
+                                     one document",
+                                    queries.len(),
+                                    crate::state::MAX_BLOCKS_PER_DOCUMENT
+                                )),
+                                code: None,
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                let mut blocks = crate::state::blocks(&key, &content, features);
+                blocks.extend(crate::state::query_blocks(&key, &content, &queries));
                 (
                     crate::state::JobOutcome::Succeeded,
                     None,

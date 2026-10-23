@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplicationProviders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplicationProviders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the application-provider catalog this service holds in
+//! `crate::state` ([`crate::state::BUILT_IN_APPLICATION_PROVIDERS`]) — the SAME catalog
+//! `DescribeApplicationProvider` reports one entry of, projected through the same
+//! `to_shape`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplicationProviders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read: application providers are AWS-owned (the modelled
+//! `ApplicationProviderArn` pins the owner segment to the literal `aws`) and this
+//! service models no operation that creates, updates or deletes one, so the catalog is
+//! fixed and this handler writes nothing. Paged by `MaxResults` with a `NextToken` that
+//! resumes from the ARN the previous page ended on, and absent on the last page.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +162,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplicationProviders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationProvidersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplicationProviders"))
+        let _ = (ctx, &self.engine);
+
+        // A `NextToken` this service did not issue for THIS enumeration is a bad
+        // request, not an empty page: answering an empty page would silently end a
+        // caller's enumeration early.
+        let after = crate::state::cursor_after(
+            crate::state::CURSOR_APPLICATION_PROVIDERS,
+            input.next_token.as_deref(),
+        )
+        .map_err(|message| {
+            ListApplicationProvidersErrorModeled::ValidationException(ValidationException {
+                message: Some(message.to_string()),
+                reason: None,
+            })
+        })?;
+
+        // The catalog `DescribeApplicationProvider` answers from, projected through the
+        // SAME `to_shape`, so a listed entry and a described one agree member for
+        // member. Keyed by `ApplicationProviderArn` and sorted by it, so the order is
+        // stable across calls and the next page resumes from the key this one ends on
+        // whatever order the catalog is written in.
+        let mut ordered: Vec<(String, ApplicationProvider)> =
+            crate::state::BUILT_IN_APPLICATION_PROVIDERS
+                .iter()
+                .map(|provider| (provider.arn(), provider.to_shape()))
+                .collect();
+        ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let (application_providers, next_token) = crate::state::page(
+            crate::state::CURSOR_APPLICATION_PROVIDERS,
+            ordered,
+            after.as_deref(),
+            input.max_results,
+        );
+        Ok(ListApplicationProvidersOutput {
+            application_providers: Some(application_providers),
+            next_token,
+        })
     }
 }

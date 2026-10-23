@@ -5,7 +5,18 @@
 //! The calling account joins a persisted collaboration. Every collaboration-derived
 //! member of the returned `Membership` is copied FROM the stored collaboration, never
 //! from the request, and the membership is indexed by (collaboration, account) so a
-//! second join is a `ConflictException`.
+//! second join is refused.
+//!
+//! The two refusals this handler classifies:
+//!
+//! * a `collaborationIdentifier` the caller has no authorization to — never created,
+//!   deleted, or one this account is not part of — is `AccessDeniedException` (403),
+//!   the one answer `crate::state::CleanRoomsState::collaboration_grant` gives all
+//!   three cases;
+//! * an account that already holds a membership in that collaboration is
+//!   `ValidationException` (400): the identifier it sent names a collaboration this
+//!   account is already a member of, so the request's value is what fails, and the
+//!   refusal is terminal rather than the retryable resource conflict a 409 announces.
 //!
 //! An optional member whose value the SERVICE decides is materialized at creation, so a
 //! later read reports the setting in force rather than an absent member: the documented
@@ -200,50 +211,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        let Some(record) = store.collaborations.get(&collaboration_id).cloned() else {
-            return Err(CreateMembershipErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("collaboration {collaboration_id} not found"),
-                    resource_id: collaboration_id,
-                    resource_type: st::RESOURCE_TYPE_COLLABORATION.to_string(),
-                },
-            )
-            .into());
-        };
-
-        // A membership's `memberAbilities` come from the collaboration's member
-        // specification for the joining account; an account the collaboration never
-        // named has nothing to join.
-        let Some(grant) = record.grant_for(&caller) else {
+        // One gate for the collaboration identifier: an id no collaboration is stored
+        // under and an id the caller is not part of are the same refusal, because the
+        // caller's authorization to a collaboration lives in the collaboration and
+        // disappears with it. The grant is what the membership's `memberAbilities` and
+        // payment defaults come from.
+        let Some((record, grant)) = store
+            .collaboration_grant(&collaboration_id, &caller)
+            .map(|(record, grant)| (record.clone(), grant))
+        else {
             return Err(CreateMembershipErrorModeled::AccessDeniedException(
                 AccessDeniedException {
-                    message: Some(format!(
-                        "account {caller} is not a member of collaboration {}",
-                        record.id
+                    message: Some(st::collaboration_access_denied_message(
+                        &collaboration_id,
+                        &caller,
                     )),
-                    reason: None,
+                    reason: Some(st::ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS.to_string()),
                 },
             )
             .into());
         };
 
-        if let Some(existing) = store.membership_of(&record.id, &caller) {
-            return Err(CreateMembershipErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "account {caller} already has membership {} in collaboration {}",
-                    existing.id, record.id
-                )),
-                resource_id: Some(existing.id.clone()),
-                resource_type: Some(st::RESOURCE_TYPE_MEMBERSHIP.to_string()),
-                reason: Some(st::CONFLICT_REASON_ALREADY_EXISTS.to_string()),
-            })
+        // One account holds at most one membership per collaboration, so a repeat join
+        // is refused on the value the request carried.
+        if store.membership_of(&record.id, &caller).is_some() {
+            return Err(CreateMembershipErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(st::duplicate_membership_message(&caller, &record.id)),
+                    reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "collaborationIdentifier".to_string(),
+                        message: "must name a collaboration this account is not already a member of"
+                            .to_string(),
+                    }]),
+                },
+            )
             .into());
         }
 
-        // Last, AFTER the resource-identity checks, so an unknown collaboration still
-        // answers 404 and a repeat join still answers 409 even at the cap: the store
-        // grows by one membership per call and lives for the life of the process, so
-        // past the cap the service answers the quota error it models rather than
+        // Last, AFTER the resource-identity checks, so an unauthorized collaboration
+        // still answers 403 and a repeat join still answers 400 even at the cap: the
+        // store grows by one membership per call and lives for the life of the process,
+        // so past the cap the service answers the quota error it models rather than
         // accepting another entry. See `st::MAX_MEMBERSHIPS` — the cap and these quota
         // identifiers are the emulator's own, not values AWS publishes.
         if store.memberships.len() >= st::MAX_MEMBERSHIPS {

@@ -177,6 +177,110 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the body this service puts a failure in.
+///
+/// Every error shape in the IVS RealTime model names its detail member
+/// `exceptionMessage` and carries no `@jsonName` (`smithy_query(query="shape",
+/// shape="ValidationException,ResourceNotFoundException")`), so serializing one of those
+/// shapes renders `{"exceptionMessage": …}` — a key no SDK error parser reads. An SDK
+/// takes the error message from the body's `message` / `Message` key and reports nothing
+/// when neither is there, and the recorded IVS RealTime responses arrive with a populated
+/// message, so the body AWS really sends carries `message`. This member is that key.
+///
+/// It is a BODY rendering only: the error code and the HTTP status still come from the
+/// modelled error shape the operation declares — see [`Scaffolded::stated`].
+static STATED_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#StatedError$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message")
+.with_json_name("message");
+
+/// Schema for the one-member body [`STATED_MESSAGE`] describes.
+///
+/// In the `smithy.framework` namespace for the same reason as [`NOT_IMPLEMENTED_SCHEMA`]:
+/// it is not a shape in any model, so it must not collide with a modelled one. Nothing
+/// about the error's identity travels here — the wire code comes from
+/// [`OperationError::shape_name`] on the modelled error and the status from
+/// [`OperationError::http_status`].
+pub static STATED_ERROR_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#StatedError",
+        "smithy.framework",
+        "StatedError",
+    ),
+    ShapeType::Structure,
+    &[&STATED_MESSAGE],
+);
+
+/// Just the body [`STATED_MESSAGE`] describes, for a failure this service states OUTSIDE
+/// the modelled-error channel.
+///
+/// The one case is the constraint refusal `crate::service`'s per-operation wrapper answers
+/// before any handler runs: it has a sentence to state and no modelled error VALUE to
+/// carry it, since the refusal belongs to the request rather than to an operation's error
+/// enum. The wire code and status travel beside it, as the arguments of
+/// `ServerHttpProtocol::serialize_error`.
+#[derive(Debug, Clone)]
+pub struct StatedBody {
+    /// The text the body's `message` key carries.
+    pub message: String,
+}
+
+impl StatedBody {
+    /// A body stating `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl SerializableStruct for StatedBody {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&STATED_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
+/// A modelled failure plus the text this service states it with.
+///
+/// `modeled` is the operation's own modelled error — the one `#[operation_error]` accepts
+/// only because the model declares it for this operation — and it alone decides the wire
+/// error code and the HTTP status. `message` is what the body's `message` key carries.
+#[derive(Debug, Clone)]
+pub struct Stated<E> {
+    /// The modelled error this failure is, which names the code and the status.
+    pub modeled: E,
+    /// The text the body states, built by `crate::state`'s message rules.
+    pub message: String,
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for Stated<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.modeled, self.message)
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for Stated<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.modeled.source()
+    }
+}
+
+impl<E> SerializableStruct for Stated<E> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&STATED_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -184,7 +288,15 @@ pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
+    ///
+    /// Its BODY is the modelled shape's own members, which for this service means the
+    /// `exceptionMessage` key no SDK error parser reads — so an implemented handler
+    /// states a modelled failure through [`Scaffolded::stated`] instead, keeping this
+    /// variant for the generated `From` impl each operation carries.
     Modeled(E),
+    /// A modeled error the operation declares, with the body AWS sends for it: the
+    /// `message` key. See [`Stated`] and [`Scaffolded::stated`].
+    Stated(Stated<E>),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -202,6 +314,20 @@ impl<E> Scaffolded<E> {
     /// The scaffold signal for `operation`.
     pub fn not_implemented(operation: &str) -> Self {
         Self::NotImplemented(NotImplemented::new(operation))
+    }
+
+    /// State `modeled` the way this service states it on the wire: the modelled shape's
+    /// own error code and HTTP status, with `message` under the body key AWS sends
+    /// (`message`, not the model's `exceptionMessage`; see [`STATED_MESSAGE`]).
+    ///
+    /// This is how an implemented handler returns a modelled failure. `modeled` is the
+    /// operation's own error enum, so the compiler still refuses a failure this operation
+    /// does not model, and the text comes from the message rules in `crate::state`.
+    pub fn stated(modeled: E, message: impl Into<String>) -> Self {
+        Self::Stated(Stated {
+            modeled,
+            message: message.into(),
+        })
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
@@ -228,6 +354,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::Stated(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +367,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::Stated(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +382,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            // The stated body: the `message` key, not the modelled shape's members.
+            Self::Stated(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +392,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::Stated(_) => &STATED_ERROR_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +405,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            // The code stays MODEL-derived: it is the modelled shape the operation
+            // declares, read off the same enum `Modeled` carries.
+            Self::Stated(e) => e.modeled.shape_name(),
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +420,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            // The status stays MODEL-derived (`@httpError` on the modelled shape).
+            Self::Stated(e) => e.modeled.http_status(),
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,6 +433,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
+            Self::Stated(e) => e.modeled.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }

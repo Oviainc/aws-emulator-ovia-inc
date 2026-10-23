@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
+//!
 //! Removes the tag keys the request names from the resource its `ResourceArn`
 //! identifies, in [`crate::state`]: a key the resource does not carry is nothing to
 //! remove, and every key the request does not name is left alone. The inverse of

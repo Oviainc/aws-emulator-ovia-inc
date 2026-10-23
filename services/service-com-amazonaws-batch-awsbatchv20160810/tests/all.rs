@@ -23,6 +23,8 @@ mod job_definition_deregistration;
 mod job_definition_registry;
 #[path = "all/job_lifecycle.rs"]
 mod job_lifecycle;
+#[path = "all/job_queue_updates.rs"]
+mod job_queue_updates;
 #[path = "all/service_environment.rs"]
 mod service_environment;
 #[path = "all/service_job_termination.rs"]

@@ -320,12 +320,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            if let Some(build) = resolve_idempotency_token(
-                &mut guard,
-                token_key.as_ref(),
-                &fingerprint,
-                now,
-            )? {
+            if let Some(build) = guard
+                .resolve_idempotency_token(
+                    crate::state::BuildTokenStore::StartBuild,
+                    token_key.as_ref(),
+                    &fingerprint,
+                    now,
+                )
+                .map_err(|_| parameter_mismatch())?
+            {
                 return Ok(StartBuildOutput { build: Some(build) });
             }
             project
@@ -445,8 +448,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A concurrent request carrying the same token may have won the race; it is
         // the same request, so it resolves to the build that one started.
-        if let Some(build) =
-            resolve_idempotency_token(&mut guard, token_key.as_ref(), &fingerprint, now)?
+        if let Some(build) = guard
+            .resolve_idempotency_token(
+                crate::state::BuildTokenStore::StartBuild,
+                token_key.as_ref(),
+                &fingerprint,
+                now,
+            )
+            .map_err(|_| parameter_mismatch())?
         {
             return Ok(StartBuildOutput { build: Some(build) });
         }
@@ -483,47 +492,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// What an idempotency token already in force resolves to.
-///
-/// AWS documents the token as "valid for 5 minutes": a repeat of the SAME request
-/// inside that window resolves to the build the first one started (`Ok(Some(build))`),
-/// and the same token with a changed request is a parameter mismatch, which AWS
-/// documents as a refusal rather than a second build. `Ok(None)` means this request
-/// has to start one.
-fn resolve_idempotency_token(
-    state: &mut crate::state::ComAmazonawsCodebuildCodebuild20161006State,
-    token_key: Option<&(String, String)>,
-    fingerprint: &str,
-    now: i64,
-) -> Result<Option<Build>, StartBuildError> {
-    let Some(key) = token_key else {
-        return Ok(None);
-    };
-    let in_force = state
-        .start_build_tokens
-        .get(key)
-        .filter(|issued| {
-            now - issued.issued_millis < crate::state::IDEMPOTENCY_TOKEN_TTL_MILLIS
-        })
-        .cloned();
-    let Some(issued) = in_force else {
-        return Ok(None);
-    };
-    if issued.request_fingerprint != fingerprint {
-        return Err(StartBuildErrorModeled::InvalidInputException(
-            InvalidInputException {
-                message: Some(
-                    "Parameter mismatch: idempotencyToken was already used for a StartBuild \
-                     request with different parameters"
-                        .to_string(),
-                ),
-            },
-        )
-        .into());
-    }
-    Ok(state
-        .settled_build(&issued.build_id, now)
-        .map(|stored| stored.build.clone()))
+/// The same idempotency token carrying a changed request, which AWS documents as a
+/// refusal rather than a second build: "If you repeat the StartBuild request with the
+/// same token, but change a parameter, CodeBuild returns a parameter mismatch error."
+fn parameter_mismatch() -> StartBuildError {
+    StartBuildErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(
+            "Parameter mismatch: idempotencyToken was already used for a StartBuild \
+             request with different parameters"
+                .to_string(),
+        ),
+    })
+    .into()
 }
 
 /// The project's source with this request's source `*Override` members applied.

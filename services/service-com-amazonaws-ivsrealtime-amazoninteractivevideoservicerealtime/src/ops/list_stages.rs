@@ -149,7 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure read over the stored stages; nothing is written.
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            ListStagesErrorModeled::InternalServerException(crate::state::state_unavailable())
+            crate::state::store_unavailable(ListStagesErrorModeled::InternalServerException)
         })?;
 
         // A `nextToken` this service did not issue names no position, so it is
@@ -157,12 +157,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
-                ListStagesErrorModeled::ValidationException(ValidationException {
-                    exception_message: Some(
-                        "nextToken is not a pagination token issued by ListStages".to_string(),
+                crate::state::validation_failed(
+                    ListStagesErrorModeled::ValidationException,
+                    // The construction `crate::state::violation_clause` states a member
+                    // refusal with: the operation, the member and the requirement.
+                    format!(
+                        "{}.nextToken is required to be a pagination token issued by {}",
+                        Self::NAME,
+                        Self::NAME,
                     ),
-                    ..Default::default()
-                })
+                )
             })?),
         };
         let page_size = input

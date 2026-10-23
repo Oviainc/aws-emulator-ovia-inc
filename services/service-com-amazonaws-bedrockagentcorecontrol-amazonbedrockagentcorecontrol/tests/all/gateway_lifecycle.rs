@@ -236,8 +236,8 @@ async fn a_gateway_is_created_and_read_back_for_every_authorizer_type() {
         );
         assert_eq!(
             text(&created, "gatewayUrl"),
-            format!("https://{id}.gateway.bedrock-agentcore.{REGION}.amazonaws.com/mcp"),
-            "case {case:?}: expected the documented MCP gateway URL, got {}",
+            format!("https://{id}.gateway.bedrock-agentcore.{REGION}.amazonaws.com"),
+            "case {case:?}: expected the assigned gateway host, with no path, got {}",
             text(&created, "gatewayUrl")
         );
         assert_eq!(

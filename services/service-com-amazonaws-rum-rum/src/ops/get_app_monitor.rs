@@ -137,8 +137,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // `@readonly`: this reports the stored monitor and writes nothing, so what a
-        // later caller sees is unchanged by the read.
-        let _ = ctx;
+        // later caller sees is unchanged by the read. `ctx` carries the credential the
+        // authorization decision below is made for.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetAppMonitorErrorModeled::InternalServerException(
                 InternalServerException {
@@ -148,6 +148,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The monitor and its resource policy, under a SHORT read lock: the decision
+        // below reads the IAM and STS stores and needs no lock of this service's.
+        let (resource_arn, resource_policy) = {
+            let store = state.lock();
+            let Some(record) = store.app_monitors.get(&input.name) else {
+                return Err(GetAppMonitorErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.name),
+                )
+                .into());
+            };
+            (record.arn.clone(), record.resource_policy_document())
+        };
+        // May this caller read THIS app monitor? Evaluated per call, like every other
+        // operation's.
+        if let Err(denial) = crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::GET_APP_MONITOR,
+            &resource_arn,
+            resource_policy.as_deref(),
+            &[],
+        ) {
+            return Err(GetAppMonitorErrorModeled::AccessDeniedException(
+                crate::state::access_denied(&denial),
+            )
+            .into());
+        }
 
         let store = state.lock();
         let Some(record) = store.app_monitors.get(&input.name) else {

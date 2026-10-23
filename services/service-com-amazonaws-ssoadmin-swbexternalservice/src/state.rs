@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AccountAssignment, AccountAssignmentOperationStatus, DisplayData,
+    AccountAssignment, AccountAssignmentOperationStatus, ApplicationProvider, DisplayData,
     EncryptionConfigurationDetails, InstanceMetadata, PermissionSet, RegionMetadata, Tag,
     TrustedTokenIssuerConfiguration,
 };
@@ -713,7 +713,8 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
 /// provider belongs to AWS and no operation of this service creates or deletes one.
 /// They are therefore a FIXED catalog ([`BUILT_IN_APPLICATION_PROVIDERS`]) rather than a
 /// store: `DescribeApplicationProvider` reports an entry of it and refuses every other
-/// ARN, and `ListApplicationProviders` (still scaffolded) enumerates the same entries.
+/// ARN, and `ListApplicationProviders` enumerates the same entries, through
+/// [`BuiltInApplicationProvider::to_shape`], so the two agree member for member.
 #[derive(Debug, Clone, Copy)]
 pub struct BuiltInApplicationProvider {
     /// The last segment of the provider's ARN, e.g. `custom`.
@@ -738,6 +739,33 @@ impl BuiltInApplicationProvider {
             display_name: Some(self.display_name.to_string()),
             icon_url: None,
             description: None,
+        }
+    }
+
+    /// This provider's ARN in the `aws` partition.
+    ///
+    /// `arn:aws:sso::aws:applicationProvider/<id>` — the provider ARN carries no region
+    /// and the literal `aws` where a resource of the caller's would carry an account, so
+    /// it is not built through `engine::emulator_arn`. The same provider exists in every
+    /// partition the pattern admits (which is why
+    /// [`built_in_application_provider`] matches on the id alone); an ENUMERATION has to
+    /// report one ARN per entry, and it reports it in the partition the emulator serves.
+    pub fn arn(&self) -> String {
+        format!("arn:aws:sso::aws:applicationProvider/{}", self.id)
+    }
+
+    /// This provider as the modeled `ApplicationProvider` shape — the member-for-member
+    /// projection `ListApplicationProviders` reports, holding exactly what
+    /// `DescribeApplicationProvider` reports for the same entry.
+    ///
+    /// `ResourceServerConfig` is absent: nothing holds a resource server for these
+    /// providers, and an invented scope map would be a value no AWS rule produces.
+    pub fn to_shape(&self) -> ApplicationProvider {
+        ApplicationProvider {
+            application_provider_arn: self.arn(),
+            federation_protocol: Some(self.federation_protocol.to_string()),
+            display_data: Some(self.display_data()),
+            resource_server_config: None,
         }
     }
 }
@@ -988,6 +1016,10 @@ fn mint_digest() -> String {
 /// Cursor scope of `ListInstances`' pagination token. The enumeration takes no
 /// filter, so its scope is the operation alone.
 pub const CURSOR_INSTANCES: &str = "instances";
+
+/// Cursor scope of `ListApplicationProviders`' pagination token. The enumeration walks
+/// the whole AWS-owned catalog and takes no filter, so its scope is the operation alone.
+pub const CURSOR_APPLICATION_PROVIDERS: &str = "applicationProviders";
 
 /// Cursor scope of a `ListPermissionSets` enumeration: the operation and the instance
 /// whose permission sets it walks.

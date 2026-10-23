@@ -267,6 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         // A rule records configuration changes the recorder captures, so there has to
@@ -311,6 +312,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             existing.input_parameters = requested.input_parameters.clone();
             existing.maximum_execution_frequency = requested.maximum_execution_frequency.clone();
             existing.evaluation_modes = evaluation_modes;
+            // Writing a rule is what makes Config evaluate it: "When you create a
+            // rule, Config evaluates your resources against the rule automatically"
+            // (`StartConfigRulesEvaluation`), and an update re-evaluates against the
+            // new definition. The pass completes a span later, which is what
+            // `DescribeConfigRuleEvaluationStatus` reports.
+            existing.evaluation.invoke(now);
         } else {
             let sequence = store.next_rule_seq;
             // A u64 counter cannot be exhausted by API calls, so it never reissues an
@@ -338,9 +345,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     rule_evaluation_visibility: Some(
                         crate::state::RULE_EVALUATION_VISIBILITY_EXTERNAL.to_string(),
                     ),
-                    created_at: ::std::time::SystemTime::now(),
+                    created_at: now,
                     tags: crate::state::tag_set(input.tags.as_deref().unwrap_or_default()),
                     resource_compliance: ::std::collections::BTreeMap::new(),
+                    // Config evaluates a rule as soon as it is created, with no call
+                    // from the caller; the pass completes a span later.
+                    evaluation: crate::state::RuleEvaluationEntry::invoked_at(now),
                 },
             );
         }

@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutActionRevision
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutActionRevision`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutActionRevision::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the revision an action currently carries — the source revision a caller
+//! reports for one action of one stage of one pipeline — in the store every other
+//! handler of this crate reads, and answers from what was already stored there:
+//!
+//! * `newRevision` is true exactly when the reported `revisionId` is not the one the
+//!   action already carried, so reporting the same revision again is answered with
+//!   false;
+//! * a revision that IS new starts a pipeline execution, recorded with the
+//!   `PutActionRevision` trigger type the model declares for it and carrying the
+//!   reported revision as the action's `sourceRevisions` entry, and that execution's
+//!   id is reported as the pipeline's current workflow state;
+//! * a revision that is not new starts nothing, and the pipeline's current execution
+//!   (the most recently started one still retained) is reported instead.
+//!
+//! What this call records is what `GetPipelineState` reports as that action's
+//! `ActionState$currentRevision`, so the two answer from one stored revision.
+//!
+//! The execution stays `InProgress` for the same reason `StartPipelineExecution`'s
+//! does: moving it on would mean running the stages' actions, which the
+//! action-execution plane (`PollForJobs`, `PutJobSuccessResult`) does, and those
+//! operations are still 501.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +169,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutActionRevision` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutActionRevisionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutActionRevision"))
+        let _ = ctx;
+        let state = crate::state::require_state(&*self.engine)?;
+        let mut state = state.lock();
+
+        // The revision is reported against one action of one stage of one pipeline, so
+        // each of the three names is resolved against the stored declaration and each
+        // has its own modelled refusal.
+        let Some(pipeline) = state.pipelines.get(&input.pipeline_name) else {
+            return Err(PutActionRevisionErrorModeled::PipelineNotFoundException(
+                PipelineNotFoundException {
+                    message: Some(format!("pipeline {} does not exist", input.pipeline_name)),
+                },
+            )
+            .into());
+        };
+        let Some(stage) = pipeline
+            .declaration
+            .stages
+            .iter()
+            .find(|stage| stage.name == input.stage_name)
+        else {
+            return Err(PutActionRevisionErrorModeled::StageNotFoundException(
+                StageNotFoundException {
+                    message: Some(format!(
+                        "pipeline {} has no stage named {}",
+                        input.pipeline_name, input.stage_name
+                    )),
+                },
+            )
+            .into());
+        };
+        if !stage
+            .actions
+            .iter()
+            .any(|action| action.name == input.action_name)
+        {
+            return Err(PutActionRevisionErrorModeled::ActionNotFoundException(
+                ActionNotFoundException {
+                    message: Some(format!(
+                        "stage {} of pipeline {} has no action named {}",
+                        input.stage_name, input.pipeline_name, input.action_name
+                    )),
+                },
+            )
+            .into());
+        }
+        let declaration = pipeline.declaration.clone();
+        let pipeline_version = pipeline.version;
+
+        let revision = input.action_revision;
+        let action = (
+            input.pipeline_name.clone(),
+            input.stage_name.clone(),
+            input.action_name.clone(),
+        );
+        // `newRevision` "indicates whether the artifact revision was previously used
+        // in an execution of the specified pipeline": the revision is new unless the
+        // action already carries this `revisionId`.
+        let new_revision = state
+            .action_revisions
+            .get(&action)
+            .is_none_or(|stored| stored.revision_id != revision.revision_id);
+
+        if !new_revision {
+            // Nothing to run: the action already carries this revision, so no
+            // execution is started and the pipeline's current workflow state is the
+            // execution it was already on. The report is still recorded, so the
+            // `revisionChangeId` and `created` the action carries are the ones last
+            // reported for it.
+            let current = state.current_execution_id(&input.pipeline_name).cloned();
+            state.action_revisions.insert(action, revision);
+            return Ok(PutActionRevisionOutput {
+                new_revision: false,
+                pipeline_execution_id: current,
+            });
+        }
+
+        // A new revision starts an execution, so everything that refuses a start
+        // refuses this call too — and nothing is recorded when it does.
+        let variables =
+            crate::state::resolve_execution_variables(&declaration, &[]).map_err(|message| {
+                PutActionRevisionError::from(PutActionRevisionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                ))
+            })?;
+        let execution_mode = crate::state::resolved_execution_mode(&declaration);
+        let limit = crate::state::max_concurrent_executions(&execution_mode);
+        let running = state.concurrent_execution_count(&input.pipeline_name);
+        if running >= limit {
+            return Err(
+                PutActionRevisionErrorModeled::ConcurrentPipelineExecutionsLimitExceededException(
+                    ConcurrentPipelineExecutionsLimitExceededException {
+                        message: Some(format!(
+                            "pipeline {} already has {running} execution(s) that have not \
+                             completed, the limit for a pipeline in {execution_mode} execution \
+                             mode",
+                            input.pipeline_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::PipelineExecutionRecord {
+            // Minted against the store, so the id this call reports is the one the
+            // execution is filed under and no other execution can carry it.
+            pipeline_execution_id: state.new_execution_id(),
+            pipeline_name: input.pipeline_name.clone(),
+            pipeline_version,
+            status: crate::state::STATUS_IN_PROGRESS.to_string(),
+            status_summary: None,
+            start_time: now,
+            last_update_time: now,
+            trigger: ExecutionTrigger {
+                trigger_type: Some(crate::state::TRIGGER_TYPE_PUT_ACTION_REVISION.to_string()),
+                // `ExecutionTrigger$triggerDetail` carries the ARN of the user who ran
+                // the command; this emulator does not resolve a caller identity, so
+                // the member is absent rather than invented.
+                trigger_detail: None,
+            },
+            execution_mode,
+            execution_type: crate::state::EXECUTION_TYPE_STANDARD.to_string(),
+            variables,
+            // The execution runs the revision that started it, against the action it
+            // was reported for.
+            source_revisions: vec![SourceRevision {
+                action_name: input.action_name.clone(),
+                revision_id: Some(revision.revision_id.clone()),
+                revision_summary: None,
+                revision_url: None,
+            }],
+        };
+
+        state.action_revisions.insert(action, revision);
+        // No `clientRequestToken` names an execution a revision report started: the
+        // request carries none, and the revision itself is what makes the call
+        // idempotent (reporting it again is answered with `newRevision` false).
+        let execution_id = state.record_execution(record, None);
+
+        Ok(PutActionRevisionOutput {
+            new_revision: true,
+            pipeline_execution_id: Some(execution_id),
+        })
     }
 }

@@ -2,6 +2,14 @@
 
 //! @op UpdateAppMonitor
 //!
+//! Applies the members the request names to the stored app monitor, after two decisions
+//! this operation makes BEFORE it writes anything: whether the calling principal is
+//! allowed `rum:UpdateAppMonitor` on that monitor ([`crate::state::authorization`]), and
+//! — for a request that turns CloudWatch Logs delivery ON — whether it holds the
+//! `logs:PutResourcePolicy` permission RUM needs to install the delivery policy on its
+//! behalf, in which case the vended log group is also created so the `CwLogGroup`
+//! `GetAppMonitor` advertises resolves ([`crate::state::cw_log_delivery`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -163,9 +171,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing in this operation depends on request metadata: the monitor it changes
-        // is named by the path, and its ARN was derived once at create time.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateAppMonitorErrorModeled::InternalServerException(
                 InternalServerException {
@@ -199,6 +204,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 UpdateAppMonitorErrorModeled::ValidationException(ValidationException { message })
                     .into(),
             );
+        }
+
+        // The region the log group's ARN is taken in; `ctx` is the only place it is
+        // readable from.
+        let region = crate::state::request_region(ctx.parts());
+        // The monitor and the resource policy the decision reads, under a SHORT read
+        // lock: everything between here and the write below — the authorization
+        // decisions and provisioning the log group — holds no lock of this service's.
+        let (resource_arn, resource_policy) = {
+            let store = state.lock();
+            let Some(record) = store.app_monitors.get(&input.name) else {
+                return Err(UpdateAppMonitorErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.name),
+                )
+                .into());
+            };
+            (record.arn.clone(), record.resource_policy_document())
+        };
+
+        // May this caller change THIS app monitor at all? Evaluated per call against the
+        // identity-based policies the caller holds and the monitor's resource policy.
+        if let Err(denial) = crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::UPDATE_APP_MONITOR,
+            &resource_arn,
+            resource_policy.as_deref(),
+            &[],
+        ) {
+            return Err(UpdateAppMonitorErrorModeled::AccessDeniedException(
+                crate::state::access_denied(&denial),
+            )
+            .into());
+        }
+
+        // Turning CloudWatch Logs delivery ON is a managed side effect with a
+        // cross-service precondition: RUM installs a resource policy on the vended log
+        // group on the caller's behalf, so the caller must hold `logs:PutResourcePolicy`
+        // — and the group has to exist afterwards, because `GetAppMonitor` advertises its
+        // name. Both are done BEFORE the record is touched, so a refused request leaves
+        // `CwLogEnabled` exactly as it was. See `crate::state::cw_log_delivery`.
+        if input.cw_log_enabled == Some(true) {
+            if crate::state::cw_log_delivery::caller_may_enable_delivery(
+                &*self.engine,
+                ctx,
+                &region,
+                &input.name,
+            )
+            .is_err()
+            {
+                // The wording AWS answers this refusal with, built from the request's
+                // `Name` member.
+                return Err(UpdateAppMonitorErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: format!("Error updating the application {}", input.name),
+                    },
+                )
+                .into());
+            }
+            if let Err(detail) = crate::state::cw_log_delivery::provision_log_group(
+                ctx,
+                &region,
+                &input.name,
+            )
+            .await
+            {
+                return Err(UpdateAppMonitorErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!(
+                            "could not provision the app monitor's CloudWatch Logs log \
+                             group: {detail}"
+                        ),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into());
+            }
         }
 
         let modified = crate::state::current_iso_timestamp();

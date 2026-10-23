@@ -23,3 +23,5 @@ mod public_access_block;
 mod state_roundtrip;
 #[path = "all/storage_lens_configuration.rs"]
 mod storage_lens_configuration;
+#[path = "all/storage_lens_group.rs"]
+mod storage_lens_group;

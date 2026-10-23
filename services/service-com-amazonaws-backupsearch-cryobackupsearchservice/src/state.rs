@@ -342,8 +342,12 @@ pub struct ComAmazonawsBackupsearchCryobackupsearchserviceState {
 
 impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// Materialise every status transition the clock has already made due. Call this
-    /// FIRST in every handler, including a read: it only applies a change that was
-    /// owed at `now` whether or not anyone called.
+    /// FIRST in every handler that reports or moves a search job's STATUS, including a
+    /// read: it only applies a change that was owed at `now` whether or not anyone
+    /// called. The tagging operations (`TagResource`, `UntagResource`,
+    /// `ListTagsForResource`) are exempt — they reach a job's tag set by ARN, which no
+    /// owed status transition touches, so settling could not change what they read or
+    /// write.
     pub fn settle(&mut self, now: SystemTime) {
         for job in self.search_jobs.values_mut() {
             job.settle(now);
