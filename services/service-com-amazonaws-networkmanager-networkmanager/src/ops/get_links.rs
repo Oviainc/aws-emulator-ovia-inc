@@ -187,15 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not found whatever the query string carries.
         if !store.global_networks.contains_key(&input.global_network_id) {
             return Err(GetLinksErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "global network {} does not exist",
-                        input.global_network_id
-                    ),
-                    resource_id: input.global_network_id.clone(),
-                    resource_type: crate::state::GLOBAL_NETWORK_KIND.to_string(),
-                    context: None,
-                },
+                crate::state::resource_not_found(
+                    crate::state::GLOBAL_NETWORK_KIND,
+                    &input.global_network_id,
+                ),
             )
             .into());
         }

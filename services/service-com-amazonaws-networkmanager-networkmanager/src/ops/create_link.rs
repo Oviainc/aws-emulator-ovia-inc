@@ -196,15 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // level is a 404 rather than a link with a dangling back-reference.
         if !store.global_networks.contains_key(&input.global_network_id) {
             return Err(CreateLinkErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "global network {} does not exist",
-                        input.global_network_id
-                    ),
-                    resource_id: input.global_network_id.clone(),
-                    resource_type: crate::state::GLOBAL_NETWORK_KIND.to_string(),
-                    context: None,
-                },
+                crate::state::resource_not_found(
+                    crate::state::GLOBAL_NETWORK_KIND,
+                    &input.global_network_id,
+                ),
             )
             .into());
         }
@@ -216,15 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|site| site.global_network_id == input.global_network_id);
         if !site_belongs {
             return Err(CreateLinkErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "site {} does not exist in global network {}",
-                        input.site_id, input.global_network_id
-                    ),
-                    resource_id: input.site_id.clone(),
-                    resource_type: crate::state::SITE_KIND.to_string(),
-                    context: None,
-                },
+                crate::state::resource_not_found(crate::state::SITE_KIND, &input.site_id),
             )
             .into());
         }

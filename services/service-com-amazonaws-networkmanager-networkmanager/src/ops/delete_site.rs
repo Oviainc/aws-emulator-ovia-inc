@@ -138,15 +138,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !store.global_networks.contains_key(&input.global_network_id) {
             return Err(DeleteSiteErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "global network {} does not exist",
-                        input.global_network_id
-                    ),
-                    resource_id: input.global_network_id.clone(),
-                    resource_type: crate::state::GLOBAL_NETWORK_KIND.to_string(),
-                    context: None,
-                },
+                crate::state::resource_not_found(
+                    crate::state::GLOBAL_NETWORK_KIND,
+                    &input.global_network_id,
+                ),
             )
             .into());
         }
@@ -159,15 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|record| record.global_network_id == input.global_network_id);
         if !belongs {
             return Err(DeleteSiteErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "site {} does not exist in global network {}",
-                        input.site_id, input.global_network_id
-                    ),
-                    resource_id: input.site_id.clone(),
-                    resource_type: crate::state::SITE_KIND.to_string(),
-                    context: None,
-                },
+                crate::state::resource_not_found(crate::state::SITE_KIND, &input.site_id),
             )
             .into());
         }
