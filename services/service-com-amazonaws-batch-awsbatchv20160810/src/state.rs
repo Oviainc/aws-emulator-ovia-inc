@@ -37,11 +37,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    ClientException, ComputeEnvironmentOrder, ComputeResource, ConsumableResourceProperties,
-    ContainerDetail, ContainerOverrides, ContainerProperties, EcsProperties, EcsSettings,
-    EksConfiguration, JobDefinition, JobDependency, JobStateTimeLimitAction, JobTimeout,
-    KeyValuePair, NodeProperties, ResourceRequirement, RetryStrategy, ServerException,
-    ServiceEnvironmentOrder,
+    CapacityLimit, ClientException, ComputeEnvironmentOrder, ComputeResource,
+    ConsumableResourceProperties, ContainerDetail, ContainerOverrides, ContainerProperties,
+    EcsProperties, EcsSettings, EksConfiguration, JobDefinition, JobDependency,
+    JobStateTimeLimitAction, JobTimeout, KeyValuePair, NodeProperties, ResourceRequirement,
+    RetryStrategy, ServerException, ServiceEnvironmentOrder,
 };
 
 /// This service's ARN namespace and sigv4 signing name (`OPERATIONS.md`).
@@ -76,6 +76,12 @@ pub mod limits {
 
     /// AWS Batch service quota "Job queues per Region": 50 (adjustable).
     pub const MAX_JOB_QUEUES: usize = 50;
+
+    /// Service environments kept at once. An EMULATOR bound (AWS publishes no quota for
+    /// this resource): `CreateServiceEnvironment` fills the store and anyone can repeat
+    /// it, so a create past this answers the modelled `ClientException`. Sized like the
+    /// other per-Region, name-keyed Batch resources above.
+    pub const MAX_SERVICE_ENVIRONMENTS: usize = 50;
 
     /// Dependencies one submit may name. AWS Batch documents it on `SubmitJob$dependsOn`:
     /// "A job can depend upon a maximum of 20 jobs."
@@ -149,6 +155,12 @@ pub const PLATFORM_CAPABILITY_MANAGED_INSTANCES: &str = "MANAGED_INSTANCES";
 /// hyphens (-), and underscores (_)." The model types the member as a plain `String`, so
 /// the framework cannot refuse a bad one.
 pub const MAX_JOB_DEFINITION_NAME_LEN: usize = 128;
+
+/// The longest `serviceEnvironmentName` the service accepts, from the member's doc: "The
+/// name for the service environment. It can be up to 128 characters long and can contain
+/// letters, numbers, hyphens (-), and underscores (_)." The model types the member as a
+/// plain `String`, so the framework cannot refuse a bad one.
+pub const MAX_SERVICE_ENVIRONMENT_NAME_LEN: usize = 128;
 
 /// The lowest `schedulingPriority` the service accepts, from the member's doc: "The
 /// minimum supported value is 0 and the maximum supported value is 9999."
@@ -275,6 +287,15 @@ pub fn job_arn(region: &str, job_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("job/{job_id}"))
 }
 
+/// `arn:aws:batch:<region>:<account>:service-environment/<name>`.
+pub fn service_environment_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("service-environment/{name}"),
+    )
+}
+
 /// The resource part of an ARN (everything after the account field), or `None`
 /// when `value` is not an ARN at all.
 fn arn_resource(value: &str) -> Option<&str> {
@@ -285,9 +306,9 @@ fn arn_resource(value: &str) -> Option<&str> {
 }
 
 /// The resource id an ARN of this `kind` names (`compute-environment`,
-/// `job-queue`, `job-definition`, `job`), or `None` when `value` is not an ARN of
-/// that kind. A plain name is passed through by the callers below, which is how
-/// every "name or ARN" member resolves both ways.
+/// `job-queue`, `job-definition`, `job`, `service-environment`), or `None` when `value`
+/// is not an ARN of that kind. A plain name is passed through by the callers below,
+/// which is how every "name or ARN" member resolves both ways.
 fn arn_resource_id<'a>(value: &'a str, kind: &str) -> Option<&'a str> {
     arn_resource(value)?.strip_prefix(kind)?.strip_prefix('/')
 }
@@ -311,6 +332,28 @@ pub struct ComputeEnvironment {
     pub eks_configuration: Option<EksConfiguration>,
     pub ecs_settings: Option<EcsSettings>,
     pub context: Option<String>,
+    pub tags: Option<HashMap<String, String>>,
+}
+
+/// A service environment, exactly as `CreateServiceEnvironment` stored it.
+///
+/// The name is the environment's identity and the ARN is minted once beside it, so every
+/// later operation reports the same one. AWS Batch returns a fresh service environment in
+/// the non-terminal `CREATING` status, so the move to `VALID` is owed by the clock
+/// ([`ServiceEnvironment::status_due_at`]).
+#[derive(Debug, Clone)]
+pub struct ServiceEnvironment {
+    pub name: String,
+    pub arn: String,
+    /// `ServiceEnvironmentType` (the model's only value today is `SAGEMAKER_TRAINING`).
+    pub environment_type: String,
+    /// `ServiceEnvironmentState`: `ENABLED` unless the create asked for `DISABLED`.
+    pub state: String,
+    /// `ServiceEnvironmentStatus`.
+    pub status: String,
+    /// Set while the `CREATING` -> `VALID` move is still owed by the clock.
+    pub status_due_at: Option<i64>,
+    pub capacity_limits: Vec<CapacityLimit>,
     pub tags: Option<HashMap<String, String>>,
 }
 
@@ -445,16 +488,33 @@ pub fn client_exception_message(detail: &str) -> String {
     format!("Error executing request, Exception : {detail}, RequestId: {ABSENT_REQUEST_ID}")
 }
 
-/// Whether `value` is a `jobDefinitionName` the service accepts: up to
-/// [`MAX_JOB_DEFINITION_NAME_LEN`] letters, numbers, hyphens and underscores
-/// (the member's own doc). The model types it as a plain `String`, so the
-/// framework admits anything and this rule is applied in the handler.
-pub fn is_valid_job_definition_name(value: &str) -> bool {
+/// Whether `value` is a name AWS Batch accepts for a resource it keys by name: a
+/// non-empty string of at most `max_len` letters, numbers, hyphens and underscores.
+///
+/// Every Batch resource whose name member documents that charset shares this rule
+/// (`jobDefinitionName`, `serviceEnvironmentName`, …), and the model types each of them
+/// as a plain `String`, so the framework admits anything and the rule is applied in the
+/// handler.
+pub fn is_valid_resource_name(value: &str, max_len: usize) -> bool {
     !value.is_empty()
-        && value.chars().count() <= MAX_JOB_DEFINITION_NAME_LEN
+        && value.chars().count() <= max_len
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Whether `value` is a `jobDefinitionName` the service accepts: up to
+/// [`MAX_JOB_DEFINITION_NAME_LEN`] letters, numbers, hyphens and underscores
+/// (the member's own doc). See [`is_valid_resource_name`].
+pub fn is_valid_job_definition_name(value: &str) -> bool {
+    is_valid_resource_name(value, MAX_JOB_DEFINITION_NAME_LEN)
+}
+
+/// Whether `value` is a `serviceEnvironmentName` the service accepts: up to
+/// [`MAX_SERVICE_ENVIRONMENT_NAME_LEN`] letters, numbers, hyphens and underscores
+/// (the member's own doc). See [`is_valid_resource_name`].
+pub fn is_valid_service_environment_name(value: &str) -> bool {
+    is_valid_resource_name(value, MAX_SERVICE_ENVIRONMENT_NAME_LEN)
 }
 
 /// Encode a `DescribeJobDefinitions` cursor: the `(name, revision)` key of the
@@ -530,6 +590,10 @@ pub struct ComAmazonawsBatchAwsbatchv20160810State {
     pub job_queues: HashMap<String, JobQueue>,
     /// Job queue ARN -> name.
     pub job_queues_by_arn: HashMap<String, String>,
+    /// Service environments by name. Bounded by [`limits::MAX_SERVICE_ENVIRONMENTS`].
+    pub service_environments: HashMap<String, ServiceEnvironment>,
+    /// Service environment ARN -> name, so `name or ARN` members resolve both ways.
+    pub service_environments_by_arn: HashMap<String, String>,
     /// Registered job-definition revisions, keyed by `(jobDefinitionName, revision)` —
     /// the describe and pagination order. Bounded by [`MAX_JOB_DEFINITIONS`].
     pub job_definitions: BTreeMap<(String, i32), JobDefinition>,
@@ -592,6 +656,26 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         }
         let id = arn_resource_id(name_or_arn, "job-queue")?;
         self.job_queues.contains_key(id).then(|| id.to_string())
+    }
+
+    /// The service environment `name_or_arn` names, resolved by name or by ARN.
+    pub fn service_environment(&self, name_or_arn: &str) -> Option<&ServiceEnvironment> {
+        let name = self.service_environment_name(name_or_arn)?;
+        self.service_environments.get(&name)
+    }
+
+    /// The NAME of the service environment `name_or_arn` names.
+    pub fn service_environment_name(&self, name_or_arn: &str) -> Option<String> {
+        if let Some(name) = self.service_environments_by_arn.get(name_or_arn) {
+            return Some(name.clone());
+        }
+        if self.service_environments.contains_key(name_or_arn) {
+            return Some(name_or_arn.to_string());
+        }
+        let id = arn_resource_id(name_or_arn, "service-environment")?;
+        self.service_environments
+            .contains_key(id)
+            .then(|| id.to_string())
     }
 
     /// The revision `RegisterJobDefinition` gives the next registration of `name`: one
@@ -671,8 +755,9 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// `now` whether or not anybody called, so a later caller sees exactly what
     /// this caller saw.
     ///
-    /// The work one call does is bounded. The compute environment and job queue stores
-    /// are capped by [`limits::MAX_COMPUTE_ENVIRONMENTS`] and [`limits::MAX_JOB_QUEUES`],
+    /// The work one call does is bounded. The compute environment, job queue and service
+    /// environment stores are capped by [`limits::MAX_COMPUTE_ENVIRONMENTS`],
+    /// [`limits::MAX_JOB_QUEUES`] and [`limits::MAX_SERVICE_ENVIRONMENTS`],
     /// and the jobs are reached through the due index rather than by scanning: a call
     /// materialises the transitions that have actually fallen due — each of which happens
     /// once in a job's life — plus the jobs waiting on a job that just finished.
@@ -687,6 +772,12 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             if queue.status_due_at.is_some_and(|due| due <= now) {
                 queue.status = STATUS_VALID.to_string();
                 queue.status_due_at = None;
+            }
+        }
+        for environment in self.service_environments.values_mut() {
+            if environment.status_due_at.is_some_and(|due| due <= now) {
+                environment.status = STATUS_VALID.to_string();
+                environment.status_due_at = None;
             }
         }
         self.advance_jobs(now);

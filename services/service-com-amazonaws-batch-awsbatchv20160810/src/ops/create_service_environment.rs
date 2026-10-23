@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateServiceEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateServiceEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a service environment and persists it in [`crate::state`]. The name is the
+//! environment's identity: re-creating one that already exists is a `ClientException`,
+//! never an overwrite. The ARN is minted once, from the region the request was signed
+//! for, and stored with the record, so every later operation reports the same one. The
+//! environment is returned in the non-terminal `CREATING` status, which the clock moves
+//! to `VALID`, and `state` defaults to `ENABLED` (the member's own doc).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateServiceEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +154,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateServiceEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateServiceEnvironment"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(CreateServiceEnvironmentErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        let region = batch::request_region(ctx);
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        // `serviceEnvironmentName` is a plain `String` in the model, so the framework
+        // admits anything: the charset and length the member documents are applied here.
+        if !batch::is_valid_service_environment_name(&input.service_environment_name) {
+            return Err(CreateServiceEnvironmentErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "serviceEnvironmentName must be 1 to {} letters, numbers, hyphens (-) or underscores (_)",
+                    batch::MAX_SERVICE_ENVIRONMENT_NAME_LEN
+                )),
+            )
+            .into());
+        }
+        if state
+            .service_environments
+            .contains_key(&input.service_environment_name)
+        {
+            return Err(CreateServiceEnvironmentErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "Object already exists: service environment {}",
+                    input.service_environment_name
+                )),
+            )
+            .into());
+        }
+        if state.service_environments.len() >= batch::limits::MAX_SERVICE_ENVIRONMENTS {
+            return Err(CreateServiceEnvironmentErrorModeled::ClientException(
+                batch::client_exception(batch::quota_message(
+                    "service environments",
+                    batch::limits::MAX_SERVICE_ENVIRONMENTS,
+                )),
+            )
+            .into());
+        }
+
+        let name = input.service_environment_name.clone();
+        let arn = batch::service_environment_arn(&region, &name);
+        let environment = batch::ServiceEnvironment {
+            name: name.clone(),
+            arn: arn.clone(),
+            environment_type: input.service_environment_type,
+            // "The default value is ENABLED" (`CreateServiceEnvironment$state`).
+            state: input
+                .state
+                .unwrap_or_else(|| batch::STATE_ENABLED.to_string()),
+            status: batch::STATUS_CREATING.to_string(),
+            status_due_at: Some(now + batch::JOB_PHASE_MILLIS),
+            capacity_limits: input.capacity_limits,
+            tags: input.tags,
+        };
+        state
+            .service_environments_by_arn
+            .insert(arn.clone(), name.clone());
+        state.service_environments.insert(name.clone(), environment);
+
+        Ok(CreateServiceEnvironmentOutput {
+            service_environment_name: name,
+            service_environment_arn: arn,
+        })
     }
 }
