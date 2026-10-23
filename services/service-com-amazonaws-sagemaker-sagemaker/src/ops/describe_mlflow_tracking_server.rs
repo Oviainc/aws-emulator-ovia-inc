@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMlflowTrackingServer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMlflowTrackingServer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMlflowTrackingServer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reconstructs the tracking server from `crate::state`, materialising the
+//! `Creating` -> `Created` transition the clock already owes, and refuses an unknown
+//! name with the modelled `ResourceNotFound`. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +174,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMlflowTrackingServer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMlflowTrackingServerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMlflowTrackingServer"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        let Some(server) = store.mlflow_tracking_servers.get_mut(&input.tracking_server_name)
+        else {
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                crate::state::TRACKING_SERVER_KIND,
+                &input.tracking_server_name,
+            );
+            return Err(DescribeMlflowTrackingServerErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(format!("Could not find mlflow tracking server \"{arn}\".")),
+                },
+            )
+            .into());
+        };
+
+        // The only write a reporting call makes: the transition the clock already owed.
+        // It was due at the stored instant whether or not anybody described the server,
+        // so a waiter terminates and no caller's read changes the outcome.
+        let settled = server.settle_status(::std::time::SystemTime::now());
+
+        let output = DescribeMlflowTrackingServerOutput {
+            tracking_server_arn: Some(server.arn.clone()),
+            tracking_server_name: Some(server.name.clone()),
+            artifact_store_uri: Some(server.artifact_store_uri.clone()),
+            tracking_server_size: Some(server.size.clone()),
+            mlflow_version: server.mlflow_version.clone(),
+            role_arn: Some(server.role_arn.clone()),
+            tracking_server_status: Some(server.status.clone()),
+            // Weekly maintenance has not run on an emulated server, so there is no
+            // maintenance attempt whose status to report.
+            tracking_server_maintenance_status: None,
+            is_active: Some(server.is_active().to_string()),
+            // The MLflow UI is a server this emulator does not run, so there is no
+            // address to hand out: a synthesised host would be one nothing answers on.
+            tracking_server_url: None,
+            weekly_maintenance_window_start: server.weekly_maintenance_window_start.clone(),
+            automatic_model_registration: Some(server.automatic_model_registration),
+            creation_time: Some(crate::state::timestamp(server.creation_time)),
+            // `UserContext` describes the Studio user profile behind the call; this
+            // request was signed by an IAM principal with no profile, so there is no
+            // user context to report for either the create or the last modification.
+            created_by: None,
+            last_modified_time: Some(crate::state::timestamp(server.last_modified_time)),
+            last_modified_by: None,
+            s3_bucket_owner_account_id: Some(server.s3_bucket_owner_account_id.clone()),
+            s3_bucket_owner_verification: Some(server.s3_bucket_owner_verification),
+        };
+        let arn = server.arn.clone();
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &arn, ctx);
+        }
+        Ok(output)
     }
 }

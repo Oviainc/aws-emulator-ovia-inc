@@ -65,6 +65,9 @@ mod multiplex_deletion;
 #[path = "all/multiplex_lifecycle.rs"]
 mod multiplex_lifecycle;
 
+#[path = "all/multiplex_program_listing.rs"]
+mod multiplex_program_listing;
+
 #[path = "all/multiplex_program_update.rs"]
 mod multiplex_program_update;
 

@@ -145,6 +145,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
+        // An application the clock has already finished deleting is gone, so the
+        // name is free: the removal was due whether or not anybody called, and
+        // settling it here is what keeps this check from reporting a name as
+        // taken by a record that no longer exists.
+        store.materialize_due_application_removals();
+
         // "The name of the application. Must be unique within your account." —
         // a name already in the store is refused, never overwritten.
         if store.applications.contains_key(&input.application_name) {
@@ -196,13 +202,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             date_created: created,
             date_updated: created,
-            resource_lifecycle_config: input.resource_lifecycle_config,
+            // An application always carries a resource lifecycle configuration:
+            // what the request asked for, with every setting it left out filled
+            // in from the service's own version-lifecycle defaults.
+            resource_lifecycle_config: crate::state::resource_lifecycle_config_with_defaults(
+                input.resource_lifecycle_config.as_ref(),
+            ),
             // A configuration template is a separate resource, created by
             // `CreateConfigurationTemplate` (still scaffolded). This list is
             // reported from what the store holds, so it starts empty rather than
             // naming a template nothing holds.
             configuration_templates: Vec::new(),
             tags: input.tags.unwrap_or_default(),
+            pending_deletion: None,
         };
         // "Creates an application that has … no application versions."
         let description = application.to_description(Vec::new());
@@ -211,11 +223,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .applications
             .insert(application.name.clone(), application);
 
-        // The activity this call performed, recorded for `DescribeEvents`.
-        store.record_event(
+        // The activity this call performed, recorded for `DescribeEvents`: the
+        // operation starting, the application it created, and the operation
+        // completing, all under this request's id.
+        store.record_completed_activity(
             &crate::state::new_request_id(),
-            crate::state::SEVERITY_INFO,
-            "createApplication completed successfully.",
+            "createApplication",
+            Some(crate::state::resource_created_event(
+                crate::state::RESOURCE_APPLICATION,
+                &application_name,
+            )),
             crate::state::EventSubject {
                 application_name: Some(application_name),
                 ..Default::default()

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMultiplexPrograms
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMultiplexPrograms`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMultiplexPrograms::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "List the programs that currently exist for a specific multiplex" — a
+//! REPORTING operation: it reads the programs the named multiplex holds out of
+//! this service's state ([`crate::state::ComAmazonawsMedialiveMedialiveState::multiplex_program_summaries`])
+//! and writes nothing of its own. The only write it runs is
+//! [`crate::state::ComAmazonawsMedialiveMedialiveState::settle`], which
+//! materialises the lifecycle transitions the clock had already made due before
+//! this call.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +152,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMultiplexPrograms` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMultiplexProgramsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMultiplexPrograms"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing and
+        // is a bad request. It is clamped to a finite ceiling, and an absent one
+        // uses that ceiling, so no single request can ask the service to project
+        // an unbounded number of programs in one response. The page size is
+        // judged before the multiplex is resolved, so a request the real service
+        // refuses is refused whatever multiplex it names.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(ListMultiplexProgramsErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "maxResults must be at least 1, got {max_results}"
+                        )),
+                    },
+                )
+                .into());
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises transitions the clock had already
+        // made due, which were owed whether or not this list ran.
+        state.settle(::std::time::SystemTime::now());
+
+        // `NextToken` is the `ProgramName` the next page starts at, and a
+        // multiplex holds its programs in name order, so resuming is a range scan
+        // from that name. A token naming a program deleted since the previous
+        // page simply resumes at the next surviving name instead of failing.
+        let first = match input.next_token.as_deref() {
+            Some(token) => ::std::ops::Bound::Included(token),
+            None => ::std::ops::Bound::Unbounded,
+        };
+
+        // No such multiplex is the 404 this operation models; a multiplex that
+        // exists and holds no program is an EMPTY page, not a refusal. A deleted
+        // multiplex keeps its record, so it goes on reporting the programs it
+        // held, exactly as `DescribeMultiplexProgram` does.
+        let Some((multiplex_programs, next_token)) =
+            state.multiplex_program_summaries(&input.multiplex_id, first, page_size)
+        else {
+            return Err(ListMultiplexProgramsErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::not_found_message(
+                        "Multiplex",
+                        &input.multiplex_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListMultiplexProgramsOutput {
+            multiplex_programs: Some(multiplex_programs),
+            next_token,
+        })
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no multiplex store to read. A modelled server error, never a
+/// fresh engine (which would answer from an empty store nobody ever wrote to).
+fn unavailable() -> ListMultiplexProgramsError {
+    ListMultiplexProgramsErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }

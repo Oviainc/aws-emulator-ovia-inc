@@ -142,6 +142,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
+        // An application the clock has already finished deleting is gone, so an
+        // update never applies to a record that no longer exists.
+        store.materialize_due_application_removals();
 
         let application = store
             .applications
@@ -161,13 +164,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // ONE refusal for both, including the ABSENT case, because that is what the
         // recorded rejection of this operation carries: its message is the
-        // member-and-constraint sentence, on a request this emulator's own
-        // presence-only check used to answer "the ServiceRole property is required
-        // the first time …" — a sentence it could only reach when no usable value
-        // arrived at all. The status (400) and the code (`InvalidParameterValue`)
-        // are unchanged either way.
+        // member-and-constraint sentence, on a request a presence-only check used
+        // to answer "the ServiceRole property is required the first time …" — a
+        // sentence it could only reach when no usable value arrived at all. The
+        // status (400) and the code (`InvalidParameterValue`) are unchanged either
+        // way.
+        //
+        // The stored configuration is never absent (the service applies its own
+        // version-lifecycle policy to every application), so what the check reads
+        // from it is the role it does or does not carry.
         if crate::state::service_role_unusable(
-            application.resource_lifecycle_config.as_ref(),
+            Some(&application.resource_lifecycle_config),
             &input.resource_lifecycle_config,
         ) {
             return Err(
@@ -182,15 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The service role persists with the application, so a request that
         // changes only the version lifecycle settings keeps the role already
-        // stored rather than clearing it.
-        let mut stored = input.resource_lifecycle_config.clone();
+        // stored rather than clearing it. Every setting the request leaves out
+        // is the service default, exactly as on the create path, so the stored
+        // configuration is always complete.
+        let mut stored = crate::state::resource_lifecycle_config_with_defaults(Some(
+            &input.resource_lifecycle_config,
+        ));
         if stored.service_role.is_none() {
-            stored.service_role = application
-                .resource_lifecycle_config
-                .as_ref()
-                .and_then(|config| config.service_role.clone());
+            stored.service_role = application.resource_lifecycle_config.service_role.clone();
         }
-        application.resource_lifecycle_config = Some(stored.clone());
+        application.resource_lifecycle_config = stored.clone();
         application.date_updated = crate::state::now();
 
         Ok(UpdateApplicationResourceLifecycleOutput {

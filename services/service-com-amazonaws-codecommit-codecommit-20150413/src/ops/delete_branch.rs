@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBranch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBranch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBranch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one branch — a named reference — from a repository's stored reference map
+//! and reports the reference it removed (its name and the commit it pointed at). The
+//! repository's default branch is the one reference this operation cannot remove, and
+//! the model declares no "branch does not exist" error for it, so deleting a name the
+//! repository does not hold succeeds with no `deletedBranch` in the response.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +164,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBranch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBranchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBranch"))
+        let _ = ctx;
+        // Both members are `@required` and carry the model's own constraints, so an
+        // ABSENT name is already refused at the boundary as
+        // `RepositoryNameRequiredException` / `BranchNameRequiredException`, and a name
+        // outside those constraints — `RepositoryName`'s length 1..100 and pattern,
+        // `BranchName`'s length 1..256, so including an empty string — as
+        // `InvalidRepositoryNameException` / `InvalidBranchNameException` (see
+        // `crate::service::refusal_for`). What reaches here is a name whose SHAPE the
+        // model does not express: a branch name is a git reference name, and a string
+        // that cannot be one names no reference in any repository — the same check
+        // `CreateBranch` applies to the name it is asked to create.
+        if !crate::state::is_valid_branch_name(&input.branch_name) {
+            return Err(DeleteBranchErrorModeled::InvalidBranchNameException(
+                InvalidBranchNameException {
+                    message: Some(format!(
+                        "the reference name {} is not valid",
+                        input.branch_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        let repository = store
+            .repositories
+            .get_mut(&input.repository_name)
+            .ok_or_else(|| {
+                DeleteBranchErrorModeled::RepositoryDoesNotExistException(
+                    RepositoryDoesNotExistException {
+                        message: Some(crate::state::repository_does_not_exist_message(
+                            &input.repository_name,
+                        )),
+                    },
+                )
+            })?;
+
+        // "Deletes a branch from a repository, unless that branch is the default branch
+        // for the repository": the repository's default branch is refused, and the
+        // refusal is decided BEFORE the reference is touched, so nothing is persisted.
+        if repository.default_branch.as_deref() == Some(input.branch_name.as_str()) {
+            return Err(
+                DeleteBranchErrorModeled::DefaultBranchCannotBeDeletedException(
+                    DefaultBranchCannotBeDeletedException {
+                        message: Some(
+                            "The specified branch is the default branch for the repository, \
+                             and cannot be deleted. To delete this branch, you must first set \
+                             another branch as the default branch."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The reference is dropped from the repository's reference map, and the branch
+        // it held is what the response reports: `deletedBranch` is "Information about
+        // the branch deleted by the operation, including the branch name and the commit
+        // ID that was the tip of the branch". The commits are NOT deleted — only the
+        // reference to them — so a commit this branch led to stays readable by id.
+        let Some(deleted) = repository.branches.remove(&input.branch_name) else {
+            // This operation models no "branch does not exist" error and
+            // `deletedBranch` is optional, so a name the repository does not hold
+            // leaves the repository exactly as it was — `lastModifiedDate` included —
+            // and reports no deleted branch. That is what makes deleting the same
+            // branch twice, and deleting a name that never existed, the same
+            // successful no-op.
+            return Ok(DeleteBranchOutput {
+                deleted_branch: None,
+            });
+        };
+
+        // Removing a reference modifies the repository, and `lastModifiedDate` is "the
+        // date and time the repository was last modified"
+        // (`smithy_query(query="doc",shape="RepositoryMetadata",member="lastModifiedDate")`),
+        // so it moves here exactly as it does for the reference `CreateBranch` adds.
+        repository.last_modified_date = std::time::SystemTime::now();
+        // The deleted reference was pinning its tip against the store's own retention
+        // bound; with it gone, the history only that reference kept alive is released.
+        repository.prune_history();
+
+        Ok(DeleteBranchOutput {
+            deleted_branch: Some(BranchInfo {
+                branch_name: Some(deleted.name),
+                commit_id: Some(deleted.commit_id),
+            }),
+        })
     }
 }

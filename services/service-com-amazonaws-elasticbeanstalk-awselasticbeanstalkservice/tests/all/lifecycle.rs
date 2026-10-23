@@ -302,11 +302,11 @@ fn form_encoded(value: &str) -> String {
     encoded
 }
 
-/// `e-` followed by exactly 8 lowercase alphanumerics, the form the real service
-/// issues an `EnvironmentId` in.
-fn is_environment_id(id: &str) -> bool {
+/// `e-` followed by exactly 13 lowercase alphanumerics, the form the real
+/// service issues an `EnvironmentId` in.
+pub(crate) fn is_environment_id(id: &str) -> bool {
     id.strip_prefix("e-").is_some_and(|body| {
-        body.len() == 8
+        body.len() == eb::state::ENVIRONMENT_ID_BODY_LENGTH
             && body
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
@@ -409,8 +409,8 @@ async fn the_application_and_environment_lifecycle_runs_end_to_end() {
     );
     assert_eq!(
         version.expect("ApplicationVersion/Status", case),
-        "Unprocessed",
-        "case {case:?}: a version nothing processed must be Unprocessed, got {}",
+        "UNPROCESSED",
+        "case {case:?}: a version nothing processed must be UNPROCESSED, got {}",
         version.body
     );
     assert_eq!(
@@ -467,7 +467,7 @@ async fn the_application_and_environment_lifecycle_runs_end_to_end() {
     let environment_id = environment.expect("EnvironmentId", case).to_string();
     assert!(
         is_environment_id(&environment_id),
-        "case {case:?}: expected an e-<8 lowercase alnum> EnvironmentId, got {environment_id:?}"
+        "case {case:?}: expected an e-<13 lowercase alnum> EnvironmentId, got {environment_id:?}"
     );
     let cname = environment.expect("CNAME", case).to_string();
     assert_eq!(
@@ -564,7 +564,9 @@ async fn the_application_and_environment_lifecycle_runs_end_to_end() {
         with_deleted.body
     );
 
-    // 7. DeleteApplication removes the application and its versions.
+    // 7. DeleteApplication starts the application's deletion. The delete is
+    // asynchronous, so the application is still described until the clock has
+    // made its removal due.
     let deleted = emulator
         .call(
             "DeleteApplication",
@@ -579,6 +581,15 @@ async fn the_application_and_environment_lifecycle_runs_end_to_end() {
         "case {case:?}: expected 200 from DeleteApplication, got {} and body {}",
         deleted.status, deleted.body
     );
+    let deleting = emulator.call("DescribeApplications", &[]).await;
+    assert_eq!(
+        deleting.values_at("Applications/member/ApplicationName"),
+        vec!["my-app"],
+        "case {case:?}: an application whose deletion is still running must still be \
+         described, got {}",
+        deleting.body
+    );
+    std::thread::sleep(PAST_DUE);
     let gone = emulator.call("DescribeApplications", &[]).await;
     assert!(
         gone.values_at("Applications/member/ApplicationName").is_empty(),

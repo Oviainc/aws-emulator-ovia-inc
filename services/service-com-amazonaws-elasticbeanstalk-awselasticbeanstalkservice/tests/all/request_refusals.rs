@@ -337,7 +337,9 @@ async fn deleting_an_application_that_does_not_exist_is_a_no_op() {
     }
 
     // The positive control: an application that DOES exist is deleted, and
-    // deleting it again is the same no-op.
+    // deleting it again is the same no-op. The delete is ASYNCHRONOUS — the
+    // application is still described while it runs — so the removal is asserted
+    // once the clock has made it due.
     let case = "created then deleted twice";
     assert_eq!(
         emulator
@@ -357,6 +359,7 @@ async fn deleting_an_application_that_does_not_exist_is_a_no_op() {
             deleted.status, deleted.body
         );
     }
+    std::thread::sleep(PAST_DUE);
     let applications = emulator.call("DescribeApplications", &[]).await;
     assert!(
         applications

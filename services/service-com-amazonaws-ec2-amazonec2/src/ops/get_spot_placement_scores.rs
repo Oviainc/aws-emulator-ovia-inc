@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSpotPlacementScores
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSpotPlacementScores`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSpotPlacementScores::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +165,201 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSpotPlacementScores` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSpotPlacementScoresErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // This operation "calculates the Spot placement score for a Region or
+        // Availability Zone based on the specified target capacity and compute
+        // requirements": it reports a calculation over the request and this service's
+        // Region and zone catalogs and persists NOTHING, so — like
+        // `DescribeAvailabilityZones` and `DescribeInstanceTypeOfferings` beside it — it
+        // never reaches the engine on `self`.
+        let _ = &self.engine;
+
+        // "The token returned from a previous paginated request" — anything else is
+        // refused rather than read as a cursor, and it is refused before any member that
+        // selects what to score is looked at, so whether a bogus token is caught never
+        // depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(crate::state::invalid_pagination_token)?,
+            ),
+        };
+
+        // `TargetCapacity` is the one required member, and the request walk refuses a
+        // request that omits it before this handler runs (as it refuses anything outside
+        // the member's 1..2000000000 range). The member is not an `Option`, so this guard
+        // is what keeps a capacity below that range — the only value left that names no
+        // capacity to score — from being scored as if it were one.
+        let capacity = u64::try_from(input.target_capacity)
+            .ok()
+            .filter(|capacity| *capacity > 0);
+        let Some(capacity) = capacity else {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "Invalid value '{}' for TargetCapacity",
+                input.target_capacity
+            )));
+        };
+
+        // "The unit for the target capacity" is one of the modelled
+        // `TargetCapacityUnitType` values; a value outside the enum names no unit, so it
+        // is refused rather than read as the default. The unit does not change the score
+        // (see `crate::state::placement_score`), but it is still the caller's parameter
+        // and so is still checked.
+        if let Some(unit_type) = input.target_capacity_unit_type.as_deref() {
+            if !TARGET_CAPACITY_UNIT_TYPE_VALUES.contains(&unit_type) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "Invalid value '{unit_type}' for TargetCapacityUnitType"
+                )));
+            }
+        }
+
+        // "If you specify InstanceRequirementsWithMetadata, you can't specify
+        // InstanceTypes" — and the converse on `InstanceTypes` — so naming both is a
+        // parameter combination EC2 does not accept. The wording is EC2's own constant
+        // refusal for the combination, which names both ways of stating the compute
+        // requirements and what to do about it.
+        if input.instance_requirements_with_metadata.is_some() && input.instance_types.is_some() {
+            return Err(crate::state::invalid_parameter_combination(
+                "You can specify either InstanceTypes or InstanceRequirements, but not both. \
+                 Remove either InstanceTypes or InstanceRequirements, and try again.",
+            ));
+        }
+
+        // "The instance types": each one has to be an instance type this emulator
+        // offers (`crate::state::offered_instance_types`, the modelled `InstanceType`
+        // enum), because an unknown one names nothing that could fulfil the capacity.
+        // Only DISTINCT types diversify a request: "variations of a single instance
+        // type" — and a repeat of one — leave EC2 the same choice as naming it once.
+        let requested_types = input.instance_types.as_deref().unwrap_or_default();
+        for instance_type in requested_types {
+            if !crate::state::offered_instance_types().contains(&instance_type.as_str()) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "Invalid value '{instance_type}' for InstanceType"
+                )));
+            }
+        }
+        let distinct_types: std::collections::BTreeSet<&str> =
+            requested_types.iter().map(String::as_str).collect();
+
+        // EC2 is a regional service reached through a regional endpoint, so the Region
+        // the caller signed for is the one it is most likely asking about: it is scored
+        // ahead of the rest of the catalog, and so survives the top-ten cap below. A
+        // credential scope is caller-controlled text, so one that is not shaped like a
+        // Region code is not scored as a Region at all.
+        let signed_region = crate::state::request_region(ctx.parts());
+
+        let regions: Vec<String> = match input.region_names.as_deref() {
+            // "The Regions used to narrow down the list of Regions to be scored": a
+            // request that narrows nothing is scored over the catalog
+            // ([`crate::state::commercial_regions`]) — the caller's own Region first, then
+            // the rest in Region-code order, capped at [`crate::state::MAX_SCORED_REGIONS`]
+            // by "the top 10 Regions or Availability Zones". Every Region scores the same
+            // here — the emulator holds no per-Region capacity data, just as it holds no
+            // per-Region instance type subset — so which ten is a tie-break, not a
+            // ranking, and the caller's own Region is the one it cannot be answered
+            // without.
+            None | Some([]) => {
+                let mut candidates: Vec<String> = Vec::new();
+                if crate::state::region_name_is_well_formed(&signed_region) {
+                    candidates.push(signed_region.clone());
+                }
+                candidates.extend(
+                    crate::state::commercial_regions()
+                        .into_iter()
+                        .map(str::to_string)
+                        .filter(|region| *region != signed_region),
+                );
+                candidates.truncate(crate::state::MAX_SCORED_REGIONS);
+                candidates
+            }
+            // A named list needs no cap of its own: the model bounds `RegionNames` at ten
+            // names (`len 0..10`), so the request walk has already refused a longer one
+            // rather than this handler silently dropping names from it. Each name has to
+            // name a Region this emulator can score — the catalog, plus the Region the
+            // call was signed for, which is scoreable whichever partition it belongs to —
+            // the way `InstanceTypes` has to name a type the catalog offers; and a Region
+            // named twice is scored once, because a duplicate narrows to the same Region.
+            Some(names) => {
+                let catalog = crate::state::commercial_regions();
+                for name in names {
+                    let scoreable =
+                        name == &signed_region || catalog.contains(&name.as_str());
+                    if !scoreable {
+                        return Err(crate::state::invalid_parameter_value(format!(
+                            "Invalid region: [{name}]"
+                        )));
+                    }
+                }
+                crate::state::deduplicate_ids(names)
+            }
+        };
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation." Every caller of
+        // this emulator holds them, so the calculation below does not run at all.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSpotPlacementScores"))
+        // It is answered AFTER every parameter check, because what it answers is "Request
+        // would have succeeded, but DryRun flag is set.": a request EC2 would refuse
+        // anyway is refused on its own terms, the way the other handlers of this crate
+        // order the two.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        // "Specify true so that the response returns a list of scored Availability
+        // Zones. Otherwise, the response returns a list of scored Regions."
+        //
+        // `IncludeLocalZones` ("the response returns scores that include Local Zones")
+        // selects nothing extra here: every zone this emulator has is an
+        // `availability-zone` (`crate::state::availability_zones_in_region`), so there is
+        // no Local Zone to include or to ignore, and "Local Zone capacity counts toward
+        // its parent Region" either way.
+        let single_availability_zone = input.single_availability_zone.unwrap_or(false);
+        let scored = crate::state::spot_placement_scores(
+            &regions,
+            capacity,
+            distinct_types.len(),
+            single_availability_zone,
+        );
+
+        // `MaxResults` bounds one page of that set and the cursor names the location the
+        // next page starts at, so a token always advances in the order
+        // `spot_placement_scores` reports in. The model's `range 10..1000` on
+        // `MaxResults` is already enforced, so the only value that cannot convert is one
+        // the boundary validator would have rejected.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => scored.partition_point(|record| {
+                crate::state::placement_score_page_cursor(record).as_str() < cursor
+            }),
+        };
+        let page = scored.get(from..).unwrap_or_default();
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        // "This value is null when there are no more items to return"
+        // (`GetSpotPlacementScoresResult$NextToken`): a token only when a scored location
+        // follows this page.
+        let next_token = page.get(limit).map(|record| {
+            crate::state::encode_page_token(&crate::state::placement_score_page_cursor(record))
+        });
+
+        Ok(GetSpotPlacementScoresOutput {
+            spot_placement_scores: Some(
+                page.iter()
+                    .take(limit)
+                    .map(crate::state::SpotPlacementScoreRecord::to_spot_placement_score)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
+
+/// The page size a request that names no `MaxResults` gets: the largest the model
+/// publishes for this operation (`SpotPlacementScoresMaxResults`, `range 10..1000`),
+/// which is also the most EC2 returns in one page.
+const DEFAULT_MAX_RESULTS: usize = 1000;
