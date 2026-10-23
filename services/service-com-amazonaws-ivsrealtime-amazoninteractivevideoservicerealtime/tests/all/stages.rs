@@ -924,15 +924,22 @@ async fn update_stage_changes_only_the_members_supplied() {
         "mediaTypes": ["AUDIO_ONLY"],
         "recordingReconnectWindowSeconds": 15,
     });
-    // What a read reports back: `AutoParticipantRecordingConfiguration`'s
-    // `recordParticipantReplicas` carries `@default: false`, so the stored
-    // configuration always names it.
+    // What a read reports back: the members the request supplied, plus every member it
+    // left out at the default the model documents for it.
+    // `recordParticipantReplicas` carries `@default: false`, so the framework has
+    // already materialised `false` by the time the handler sees the request.
     let stored_recording = json!({
         "storageConfigurationArn":
             "arn:aws:ivs:us-east-1:000000000000:storage-configuration/abcd1234",
         "mediaTypes": ["AUDIO_ONLY"],
         "recordingReconnectWindowSeconds": 15,
         "recordParticipantReplicas": false,
+        "thumbnailConfiguration": {
+            "targetIntervalSeconds": 60,
+            "storage": ["SEQUENTIAL"],
+            "recordingMode": "DISABLED",
+        },
+        "hlsConfiguration": { "targetSegmentDurationSeconds": 6 },
     });
 
     // Rows differ in WHICH members the update supplies.
@@ -941,7 +948,7 @@ async fn update_stage_changes_only_the_members_supplied() {
             "name only",
             json!({ "name": "renamed" }),
             json!("renamed"),
-            Value::Null,
+            default_recording_configuration(),
         ),
         (
             "recording configuration only",
@@ -955,7 +962,12 @@ async fn update_stage_changes_only_the_members_supplied() {
             json!("both"),
             stored_recording.clone(),
         ),
-        ("no member at all", json!({}), json!("original"), Value::Null),
+        (
+            "no member at all",
+            json!({}),
+            json!("original"),
+            default_recording_configuration(),
+        ),
     ];
 
     for (case, update, expected_name, expected_recording) in cases {
@@ -1200,6 +1212,591 @@ async fn the_stores_are_bounded_and_report_the_modeled_quota_error() {
         status, 200,
         "a fresh stage after the bound was reached: expected 200, got {status} {response}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The Stage and ParticipantToken projections
+// ---------------------------------------------------------------------------
+
+/// A storage-configuration ARN inside `AutoParticipantRecordingStorageConfigurationArn`'s
+/// pattern, so a row that attaches storage is accepted.
+const STORAGE_CONFIGURATION_ARN: &str =
+    "arn:aws:ivs:us-east-1:000000000000:storage-configuration/abcd1234";
+
+/// Every member of `AutoParticipantRecordingConfiguration` at the default the model
+/// documents for it: what a stage reports when its request configured no storage.
+///
+/// Sources — `smithy_query(query="shape",
+/// shape="AutoParticipantRecordingConfiguration,ParticipantThumbnailConfiguration,
+/// ParticipantRecordingHlsConfiguration")`: `storageConfigurationArn` "Default: `""`
+/// (empty string, no storage configuration is specified)", `mediaTypes` "Default:
+/// AUDIO_VIDEO", `recordingReconnectWindowSeconds` "The default value is 0",
+/// `recordParticipantReplicas` "Default: true", `thumbnailConfiguration`
+/// `targetIntervalSeconds` "Default: 60" / `storage` "Default: SEQUENTIAL" /
+/// `recordingMode` "Default: DISABLED", and `hlsConfiguration`
+/// `targetSegmentDurationSeconds` "Default: 6".
+fn default_recording_configuration() -> Value {
+    json!({
+        "storageConfigurationArn": "",
+        "mediaTypes": ["AUDIO_VIDEO"],
+        "recordingReconnectWindowSeconds": 0,
+        "recordParticipantReplicas": true,
+        "thumbnailConfiguration": {
+            "targetIntervalSeconds": 60,
+            "storage": ["SEQUENTIAL"],
+            "recordingMode": "DISABLED",
+        },
+        "hlsConfiguration": { "targetSegmentDurationSeconds": 6 },
+    })
+}
+
+/// All four `StageEndpoints` members are present on `stage`, and each is well-formed for
+/// its protocol: the scheme, the per-stage host and the path are what a client parses out
+/// of an endpoint. The HOSTS themselves are environment-specific and are not asserted.
+fn assert_stage_endpoints(case: &str, stage: &Value) {
+    let arn = stage["arn"].as_str().unwrap_or_default();
+    let stage_id = arn.rsplit('/').next().unwrap_or_default();
+    assert!(
+        !stage_id.is_empty(),
+        "case {case:?}: expected the stage arn to carry a resource id, got {arn:?}"
+    );
+    let endpoints = &stage["endpoints"];
+
+    // The events endpoint is one global host carrying no per-stage part.
+    let events = endpoints["events"].as_str();
+    assert!(
+        events.is_some_and(|value| value.starts_with("wss://")),
+        "case {case:?}: expected a wss:// events endpoint, got {events:?}"
+    );
+
+    // Rows: the member, its scheme, and the path a client publishes to.
+    for (member, scheme, path) in [
+        ("whip", "https://", ""),
+        ("rtmp", "rtmp://", "/app/"),
+        ("rtmps", "rtmps://", "/app/"),
+    ] {
+        let actual = endpoints[member].as_str();
+        assert!(
+            actual.is_some_and(|value| value.starts_with(scheme)
+                && value.ends_with(path)
+                && value.contains(stage_id)),
+            "case {case:?}: expected {member} to start with {scheme:?}, end with {path:?} \
+             and name the stage id {stage_id:?}, got {actual:?}"
+        );
+    }
+}
+
+/// Every stage reports its four data-plane endpoints, a recording configuration with the
+/// modelled defaults for whatever the request left out, and an `activeSessionId` — and
+/// `CreateStage` and `GetStage` report one identical stage.
+#[tokio::test]
+async fn every_stage_projection_carries_endpoints_a_recording_configuration_and_a_session_id() {
+    let emulator = Emulator::new();
+
+    // Rows differ in which members the creating request supplies, and in whether it
+    // configures storage for individual-participant recording.
+    let configured = json!({
+        "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+        "mediaTypes": ["AUDIO_ONLY"],
+        "recordingReconnectWindowSeconds": 30,
+    });
+    let cases: Vec<(&str, Value, Value)> = vec![
+        ("no members at all", json!({}), default_recording_configuration()),
+        (
+            "a name",
+            json!({ "name": "endpoints-demo" }),
+            default_recording_configuration(),
+        ),
+        (
+            "a name and tags",
+            json!({ "name": "tagged", "tags": { "team": "video" } }),
+            default_recording_configuration(),
+        ),
+        (
+            "participant tokens as well",
+            json!({ "participantTokenConfigurations": [{ "userId": "alice" }] }),
+            default_recording_configuration(),
+        ),
+        (
+            // Documented on `storageConfigurationArn`: "other fields in this object will
+            // get reset to their defaults when sending `\"\"`".
+            "a recording configuration with no storage configured",
+            json!({
+                "autoParticipantRecordingConfiguration": {
+                    "storageConfigurationArn": "",
+                    "mediaTypes": ["NONE"],
+                    "recordingReconnectWindowSeconds": 120,
+                },
+            }),
+            default_recording_configuration(),
+        ),
+        (
+            "a recording configuration with storage configured",
+            json!({ "autoParticipantRecordingConfiguration": configured }),
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "mediaTypes": ["AUDIO_ONLY"],
+                "recordingReconnectWindowSeconds": 30,
+                "recordParticipantReplicas": false,
+                "thumbnailConfiguration": {
+                    "targetIntervalSeconds": 60,
+                    "storage": ["SEQUENTIAL"],
+                    "recordingMode": "DISABLED",
+                },
+                "hlsConfiguration": { "targetSegmentDurationSeconds": 6 },
+            }),
+        ),
+    ];
+
+    for (case, request, expected_recording) in cases {
+        let (status, created) = emulator.call("CreateStage", &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} {created}"
+        );
+        let created_stage = created["stage"].clone();
+        assert_stage_endpoints(case, &created_stage);
+        assert_eq!(
+            created_stage["activeSessionId"],
+            json!(""),
+            "case {case:?}: expected an empty activeSessionId on a stage with no \
+             session, got {created_stage}"
+        );
+        assert_eq!(
+            created_stage["autoParticipantRecordingConfiguration"], expected_recording,
+            "case {case:?}: expected recording configuration {expected_recording}, got \
+             {created_stage}"
+        );
+
+        // The create response is what the model tells a caller to cache, so a read must
+        // report exactly it.
+        let arn = created_stage["arn"].as_str().unwrap_or_default().to_string();
+        let (status, read) = emulator.call("GetStage", &json!({ "arn": arn })).await;
+        assert_eq!(status, 200, "case {case:?}: GetStage got {status} {read}");
+        assert_eq!(
+            read["stage"], created_stage,
+            "case {case:?}: expected GetStage to report the created stage, got {read}"
+        );
+
+        // The summary of the same stage answers alike on the member it shares.
+        let (status, listed) = emulator.call("ListStages", &json!({})).await;
+        assert_eq!(status, 200, "case {case:?}: ListStages got {status} {listed}");
+        let sessions: Vec<&Value> = listed["stages"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter(|summary| summary["arn"] == json!(arn))
+                    .map(|summary| &summary["activeSessionId"])
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            sessions,
+            vec![&json!("")],
+            "case {case:?}: expected the summary to report an empty activeSessionId, \
+             got {listed}"
+        );
+    }
+}
+
+/// A stage's endpoints are assigned to that stage: identical on every read of it, and
+/// distinct between stages.
+#[tokio::test]
+async fn stage_endpoints_are_assigned_per_stage_and_do_not_change() {
+    let emulator = Emulator::new();
+    let mut whip_endpoints: BTreeSet<String> = BTreeSet::new();
+    let stages = 4;
+
+    for index in 0..stages {
+        let name = format!("stage-{index}");
+        let arn = emulator.create_stage(&json!({ "name": name })).await;
+        let (status, first) = emulator
+            .call("GetStage", &json!({ "arn": arn.clone() }))
+            .await;
+        assert_eq!(status, 200, "stage {name}: GetStage got {status} {first}");
+        let (status, second) = emulator
+            .call("GetStage", &json!({ "arn": arn.clone() }))
+            .await;
+        assert_eq!(status, 200, "stage {name}: GetStage got {status} {second}");
+        assert_eq!(
+            first["stage"]["endpoints"], second["stage"]["endpoints"],
+            "stage {name}: expected two reads to report the same endpoints, got \
+             {first} then {second}"
+        );
+        assert_stage_endpoints(&name, &first["stage"]);
+        whip_endpoints.insert(
+            first["stage"]["endpoints"]["whip"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+
+    assert_eq!(
+        whip_endpoints.len(),
+        stages,
+        "expected one distinct WHIP endpoint per stage, got {whip_endpoints:?}"
+    );
+}
+
+/// Each member a supplied recording configuration leaves out is reported at the default
+/// the model documents for it, by `CreateStage` and `UpdateStage` alike.
+#[tokio::test]
+async fn the_recording_configuration_fills_in_the_modeled_default_for_every_member_left_out() {
+    let emulator = Emulator::new();
+
+    // Rows differ in which members the configuration supplies and in the values it
+    // supplies for them: every `ParticipantRecordingMediaType` the model lists
+    // (AUDIO_VIDEO, AUDIO_ONLY, NONE), both `ThumbnailRecordingMode`s (INTERVAL,
+    // DISABLED), both `ThumbnailStorageType`s (SEQUENTIAL, LATEST), and each published
+    // bound of the three numeric members — `targetIntervalSeconds` @range 1..86400,
+    // `targetSegmentDurationSeconds` @range 2..10, `recordingReconnectWindowSeconds`
+    // @range 0..300. From `smithy_query(query="shape",
+    // shape="AutoParticipantRecordingConfiguration,ParticipantThumbnailConfiguration,
+    // ParticipantRecordingHlsConfiguration,ParticipantRecordingMediaType,
+    // ThumbnailRecordingMode,ThumbnailStorageType")`.
+    let cases: Vec<(&str, Value, Value)> = vec![
+        (
+            "storage configuration only",
+            json!({ "storageConfigurationArn": STORAGE_CONFIGURATION_ARN }),
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "mediaTypes": ["AUDIO_VIDEO"],
+                "recordingReconnectWindowSeconds": 0,
+                "recordParticipantReplicas": false,
+                "thumbnailConfiguration": {
+                    "targetIntervalSeconds": 60,
+                    "storage": ["SEQUENTIAL"],
+                    "recordingMode": "DISABLED",
+                },
+                "hlsConfiguration": { "targetSegmentDurationSeconds": 6 },
+            }),
+        ),
+        (
+            "audio only",
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "mediaTypes": ["AUDIO_ONLY"],
+            }),
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "mediaTypes": ["AUDIO_ONLY"],
+                "recordingReconnectWindowSeconds": 0,
+                "recordParticipantReplicas": false,
+                "thumbnailConfiguration": {
+                    "targetIntervalSeconds": 60,
+                    "storage": ["SEQUENTIAL"],
+                    "recordingMode": "DISABLED",
+                },
+                "hlsConfiguration": { "targetSegmentDurationSeconds": 6 },
+            }),
+        ),
+        (
+            "no media recorded, thumbnails at the minimum interval",
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "mediaTypes": ["NONE"],
+                "thumbnailConfiguration": {
+                    "recordingMode": "INTERVAL",
+                    "targetIntervalSeconds": 1,
+                },
+            }),
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "mediaTypes": ["NONE"],
+                "recordingReconnectWindowSeconds": 0,
+                "recordParticipantReplicas": false,
+                "thumbnailConfiguration": {
+                    "targetIntervalSeconds": 1,
+                    "storage": ["SEQUENTIAL"],
+                    "recordingMode": "INTERVAL",
+                },
+                "hlsConfiguration": { "targetSegmentDurationSeconds": 6 },
+            }),
+        ),
+        (
+            "thumbnails at the maximum interval, in both storage formats",
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "thumbnailConfiguration": {
+                    "targetIntervalSeconds": 86_400,
+                    "storage": ["SEQUENTIAL", "LATEST"],
+                },
+            }),
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "mediaTypes": ["AUDIO_VIDEO"],
+                "recordingReconnectWindowSeconds": 0,
+                "recordParticipantReplicas": false,
+                "thumbnailConfiguration": {
+                    "targetIntervalSeconds": 86_400,
+                    "storage": ["SEQUENTIAL", "LATEST"],
+                    "recordingMode": "DISABLED",
+                },
+                "hlsConfiguration": { "targetSegmentDurationSeconds": 6 },
+            }),
+        ),
+        (
+            "HLS segments at the minimum duration, reconnect window at its minimum",
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "recordingReconnectWindowSeconds": 0,
+                "hlsConfiguration": { "targetSegmentDurationSeconds": 2 },
+            }),
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "mediaTypes": ["AUDIO_VIDEO"],
+                "recordingReconnectWindowSeconds": 0,
+                "recordParticipantReplicas": false,
+                "thumbnailConfiguration": {
+                    "targetIntervalSeconds": 60,
+                    "storage": ["SEQUENTIAL"],
+                    "recordingMode": "DISABLED",
+                },
+                "hlsConfiguration": { "targetSegmentDurationSeconds": 2 },
+            }),
+        ),
+        (
+            "every member supplied, at the maximum of each bound",
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "mediaTypes": ["AUDIO_VIDEO"],
+                "recordingReconnectWindowSeconds": 300,
+                "recordParticipantReplicas": true,
+                "thumbnailConfiguration": {
+                    "targetIntervalSeconds": 86_400,
+                    "storage": ["LATEST"],
+                    "recordingMode": "INTERVAL",
+                },
+                "hlsConfiguration": { "targetSegmentDurationSeconds": 10 },
+            }),
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "mediaTypes": ["AUDIO_VIDEO"],
+                "recordingReconnectWindowSeconds": 300,
+                "recordParticipantReplicas": true,
+                "thumbnailConfiguration": {
+                    "targetIntervalSeconds": 86_400,
+                    "storage": ["LATEST"],
+                    "recordingMode": "INTERVAL",
+                },
+                "hlsConfiguration": { "targetSegmentDurationSeconds": 10 },
+            }),
+        ),
+        (
+            // The documented reset: sending `""` returns every other member to default.
+            "no storage configured, with other members supplied",
+            json!({
+                "storageConfigurationArn": "",
+                "mediaTypes": ["AUDIO_ONLY"],
+                "recordingReconnectWindowSeconds": 300,
+                "thumbnailConfiguration": { "recordingMode": "INTERVAL" },
+                "hlsConfiguration": { "targetSegmentDurationSeconds": 10 },
+            }),
+            default_recording_configuration(),
+        ),
+    ];
+
+    for (case, configuration, expected) in cases {
+        let (status, created) = emulator
+            .call(
+                "CreateStage",
+                &json!({ "autoParticipantRecordingConfiguration": configuration }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateStage got {status} {created}"
+        );
+        assert_eq!(
+            created["stage"]["autoParticipantRecordingConfiguration"], expected,
+            "case {case:?}: expected CreateStage to report {expected}, got {created}"
+        );
+        let arn = created["stage"]["arn"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (status, read) = emulator.call("GetStage", &json!({ "arn": arn })).await;
+        assert_eq!(status, 200, "case {case:?}: GetStage got {status} {read}");
+        assert_eq!(
+            read["stage"], created["stage"],
+            "case {case:?}: expected GetStage to report the created stage, got {read}"
+        );
+
+        // The same configuration attached by an update reports the same members.
+        let other = emulator.create_stage(&json!({})).await;
+        let (status, updated) = emulator
+            .call(
+                "UpdateStage",
+                &json!({
+                    "arn": other,
+                    "autoParticipantRecordingConfiguration": configuration,
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: UpdateStage got {status} {updated}"
+        );
+        assert_eq!(
+            updated["stage"]["autoParticipantRecordingConfiguration"], expected,
+            "case {case:?}: expected UpdateStage to report {expected}, got {updated}"
+        );
+    }
+
+    // And one past each published bound is refused, so the bounds above are real    // bounds and not values this projection happens to accept.
+    let refused: Vec<(&str, Value)> = vec![
+        (
+            "a thumbnail interval one below the minimum",
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "thumbnailConfiguration": { "targetIntervalSeconds": 0 },
+            }),
+        ),
+        (
+            "a thumbnail interval one above the maximum",
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "thumbnailConfiguration": { "targetIntervalSeconds": 86_401 },
+            }),
+        ),
+        (
+            "an HLS segment duration one below the minimum",
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "hlsConfiguration": { "targetSegmentDurationSeconds": 1 },
+            }),
+        ),
+        (
+            "an HLS segment duration one above the maximum",
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "hlsConfiguration": { "targetSegmentDurationSeconds": 11 },
+            }),
+        ),
+        (
+            "a reconnect window one below the minimum",
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "recordingReconnectWindowSeconds": -1,
+            }),
+        ),
+        (
+            "a reconnect window one above the maximum",
+            json!({
+                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "recordingReconnectWindowSeconds": 301,
+            }),
+        ),
+    ];
+
+    for (case, configuration) in refused {
+        let (status, response) = emulator
+            .call(
+                "CreateStage",
+                &json!({ "autoParticipantRecordingConfiguration": configuration }),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "ValidationException",
+            "case {case:?}: got {response}"
+        );
+    }
+}
+
+/// A participant token reports `capabilities` only when it grants some: an explicitly
+/// empty list is honoured rather than replaced by the documented default, and the token
+/// then carries no `capabilities` member — the same way `attributes` is carried only when
+/// the token holds attributes. Asserted on both operations that issue a token.
+#[tokio::test]
+async fn a_participant_token_reports_a_collection_member_only_when_it_holds_entries() {
+    let emulator = Emulator::new();
+    let stage = emulator.create_stage(&json!({ "name": "tokens" })).await;
+
+    // Rows differ in the capabilities the request asks for: absent (the documented
+    // `PUBLISH,SUBSCRIBE` default), explicitly empty (`@length 0..2` makes it legal), and
+    // each non-empty subset of the two `ParticipantTokenCapability` values the model
+    // lists, in both orders.
+    let capability_cases: Vec<(&str, Value, Value)> = vec![
+        ("absent", Value::Null, json!(["PUBLISH", "SUBSCRIBE"])),
+        ("explicitly empty", json!([]), Value::Null),
+        ("publish only", json!(["PUBLISH"]), json!(["PUBLISH"])),
+        ("subscribe only", json!(["SUBSCRIBE"]), json!(["SUBSCRIBE"])),
+        (
+            "both, in the order asked for",
+            json!(["SUBSCRIBE", "PUBLISH"]),
+            json!(["SUBSCRIBE", "PUBLISH"]),
+        ),
+    ];
+
+    for (case, requested, expected) in capability_cases {
+        let mut request = json!({ "stageArn": stage });
+        if !requested.is_null() {
+            request["capabilities"] = requested.clone();
+        }
+        let (status, response) = emulator.call("CreateParticipantToken", &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateParticipantToken got {status} {response}"
+        );
+        assert_eq!(
+            response["participantToken"]["capabilities"], expected,
+            "case {case:?}: expected capabilities {expected}, got {response}"
+        );
+
+        let mut configuration = json!({ "userId": "alice" });
+        if !requested.is_null() {
+            configuration["capabilities"] = requested.clone();
+        }
+        let (status, created) = emulator
+            .call(
+                "CreateStage",
+                &json!({ "participantTokenConfigurations": [configuration] }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateStage got {status} {created}"
+        );
+        assert_eq!(
+            created["participantTokens"][0]["capabilities"], expected,
+            "case {case:?}: expected CreateStage to report capabilities {expected}, got \
+             {created}"
+        );
+    }
+
+    // The same rule on `attributes`, the member this projection follows.
+    let attribute_cases: Vec<(&str, Value, Value)> = vec![
+        ("absent", Value::Null, Value::Null),
+        ("explicitly empty", json!({}), Value::Null),
+        (
+            "one entry",
+            json!({ "room": "main" }),
+            json!({ "room": "main" }),
+        ),
+    ];
+
+    for (case, requested, expected) in attribute_cases {
+        let mut request = json!({ "stageArn": stage });
+        if !requested.is_null() {
+            request["attributes"] = requested;
+        }
+        let (status, response) = emulator.call("CreateParticipantToken", &request).await;
+        assert_eq!(
+            status, 200,
+            "attributes case {case:?}: got {status} {response}"
+        );
+        assert_eq!(
+            response["participantToken"]["attributes"], expected,
+            "attributes case {case:?}: expected {expected}, got {response}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
