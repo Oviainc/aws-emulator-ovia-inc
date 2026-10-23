@@ -41,6 +41,8 @@ mod pending_activity_task_count;
 mod request_cancel_workflow_execution;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_resource_value_fidelity.rs"]
+mod tag_resource_value_fidelity;
 #[path = "all/unknown_resource_messages.rs"]
 mod unknown_resource_messages;
 #[path = "all/workflow_execution_lifecycle.rs"]
