@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAdapterVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAdapterVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAdapterVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the versions of this service's stored adapters that fall inside the
+//! filtration criteria the request names, one page at a time. A pure READ: it writes
+//! nothing, so repeating it answers identically.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,20 +163,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAdapterVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAdapterVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAdapterVersions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAdapterVersionsErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("Textract state is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+
+        // `AdapterId` is optional: naming one scopes the listing to that adapter, and
+        // naming none lists the versions of every adapter this service holds. An
+        // `AdapterId` that names no adapter is not an empty listing — it is the missing
+        // resource this operation models `ResourceNotFoundException` for.
+        let Some(versions) = store.adapter_versions(input.adapter_id.as_deref()) else {
+            return Err(ListAdapterVersionsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::ADAPTER_NOT_FOUND_MESSAGE.to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        // The creation-time window the request named, applied BEFORE the page is cut, so
+        // a page holds up to `MaxResults` MATCHING versions rather than whatever
+        // survives filtering a page.
+        let matching: Vec<AdapterVersionOverview> = versions
+            .iter()
+            .filter(|version| {
+                crate::state::within_creation_window(
+                    version.created_at,
+                    input.after_creation_time.as_ref(),
+                    input.before_creation_time.as_ref(),
+                )
+            })
+            .map(|version| version.overview(now))
+            .collect();
+
+        // The cursor is bound to the QUERY, not just to the operation: a token issued
+        // for one adapter or one creation-time window names an offset into THAT result
+        // set, so replaying it against another query is refused rather than answered
+        // with an unrelated page.
+        let scope = crate::state::adapter_version_page_scope(
+            input.adapter_id.as_deref(),
+            input.after_creation_time.as_ref(),
+            input.before_creation_time.as_ref(),
+        );
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_page_token(&scope, token) {
+                Some(offset) => offset,
+                None => {
+                    return Err(
+                        ListAdapterVersionsErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                message: Some(
+                                    "NextToken was not issued for this listing".to_string(),
+                                ),
+                                code: None,
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+        };
+
+        // Defensive only: `MaxResults`'s modelled `1..` range is refused at the
+        // boundary before this handler runs, so `page_of` answering `None` means the
+        // page size was unusable — reported as the modelled client error, never a 501.
+        let Some((page, next_token)) =
+            crate::state::page_of(&scope, &matching, input.max_results, offset)
+        else {
+            return Err(
+                ListAdapterVersionsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "MaxResults must be at least 1, got {:?}",
+                            input.max_results
+                        )),
+                        code: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(ListAdapterVersionsOutput {
+            // Present even when empty: an adapter with no versions yet has an empty
+            // version list, which is not the same answer as reporting no list at all.
+            adapter_versions: Some(page),
+            next_token,
+        })
     }
 }

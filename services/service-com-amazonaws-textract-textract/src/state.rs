@@ -44,16 +44,17 @@
 
 pub mod ocr;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AdapterOverview, Block, BoundingBox, Document, DocumentLocation, DocumentMetadata,
-    ExpenseCurrency, ExpenseDetection, ExpenseDocument, ExpenseField, ExpenseType, Geometry,
-    InvalidParameterException, LineItemFields, LineItemGroup, NotificationChannel, OutputConfig,
-    Point, QueriesConfig, Query, Relationship, ResourceNotFoundException, Warning,
+    AdapterOverview, AdapterVersionOverview, Block, BoundingBox, Document, DocumentLocation,
+    DocumentMetadata, ExpenseCurrency, ExpenseDetection, ExpenseDocument, ExpenseField,
+    ExpenseType, Geometry, InvalidParameterException, LineItemFields, LineItemGroup,
+    NotificationChannel, OutputConfig, Point, QueriesConfig, Query, Relationship,
+    ResourceNotFoundException, Warning,
     AUTO_UPDATE_VALUES, FEATURE_TYPE_VALUES,
 };
 
@@ -167,6 +168,14 @@ const ADAPTER_ID_LEN: usize = 32;
 /// carries nothing from the request: the id the caller sent is already in its own request.
 /// This is the sentence Amazon Textract itself answers for an unknown `AdapterId`.
 pub const ADAPTER_NOT_FOUND_MESSAGE: &str = "Adapter Id not found.";
+
+/// The `AdapterVersionStatus` a version reports while its creation is still owed by the
+/// clock.
+///
+/// From the modelled `AdapterVersionStatus` enum
+/// (`ADAPTER_VERSION_STATUS_VALUES`): a version AWS has accepted but not finished
+/// training reports `CREATION_IN_PROGRESS` until it settles.
+pub const ADAPTER_VERSION_STATUS_CREATION_IN_PROGRESS: &str = "CREATION_IN_PROGRESS";
 
 /// The service segment every Amazon Textract ARN carries, as `engine::emulator_arn`'s
 /// first argument.
@@ -379,6 +388,36 @@ impl ComAmazonawsTextractTextractState {
         Some(removed)
     }
 
+    /// Every stored adapter version in scope for a listing, oldest first.
+    ///
+    /// `adapter_id` scopes the listing to ONE adapter — `None` lists the versions of
+    /// every adapter this service holds. `None` is ALSO the answer when `adapter_id`
+    /// names an adapter that does not exist, which is how a listing of an unknown
+    /// adapter reaches the modelled `ResourceNotFoundException` instead of reporting an
+    /// empty list.
+    ///
+    /// The order is `(CreationTime, AdapterVersion, AdapterId)` ascending: AWS documents
+    /// no order for an adapter-version listing, and a listing must be ordered by
+    /// SOMETHING total and stable or an offset cursor could skip or repeat a version
+    /// between pages.
+    pub fn adapter_versions(&self, adapter_id: Option<&str>) -> Option<Vec<&AdapterVersionRecord>> {
+        let mut versions: Vec<&AdapterVersionRecord> = match adapter_id {
+            Some(adapter_id) => self.adapters.get(adapter_id)?.versions.values().collect(),
+            None => self
+                .adapters
+                .values()
+                .flat_map(|adapter| adapter.versions.values())
+                .collect(),
+        };
+        versions.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.adapter_version.cmp(&right.adapter_version))
+                .then_with(|| left.adapter_id.cmp(&right.adapter_id))
+        });
+        Some(versions)
+    }
+
     /// The tags of the resource a tagging `ResourceARN` names, if this service holds it.
     ///
     /// The ONE place a parsed ARN becomes the tag map it addresses, so `TagResource`,
@@ -468,6 +507,13 @@ pub struct AdapterRecord {
     /// create REQUESTS, so an adapter that was updated since must still answer a replay
     /// of its own create token with itself rather than with a parameter mismatch.
     pub created_with: AdapterConfiguration,
+    /// Every version of THIS adapter, keyed by its `AdapterVersion`.
+    ///
+    /// A version is a child of its adapter — AWS, on `DeleteAdapter`: "Deletes an Amazon
+    /// Textract adapter. Takes an AdapterId and deletes the adapter permanently, along
+    /// with all adapter versions" — so it lives inside the adapter's record and goes
+    /// away with it. A `BTreeMap` so a listing's order comes out the same on every read.
+    pub versions: BTreeMap<String, AdapterVersionRecord>,
 }
 
 impl AdapterRecord {
@@ -491,6 +537,9 @@ impl AdapterRecord {
             created_at,
             client_request_token,
             created_with: configuration,
+            // A newly created adapter has no versions: `CreateAdapterVersion` is what
+            // adds one, so a create-then-list answers an empty version list.
+            versions: BTreeMap::new(),
         }
     }
 
@@ -528,6 +577,69 @@ impl AdapterRecord {
         self.created_with == other.created_with
             && self.tags == other.tags
             && feature_type_set(&self.feature_types) == feature_type_set(&other.feature_types)
+    }
+}
+
+/// One version of an adapter, as `ListAdapterVersions` and `GetAdapterVersion` report it.
+///
+/// The reported `Status` is NOT stored: it is derived from [`Self::settles_at`] the way
+/// [`Job`] derives a job's status, so a reporting call never has to write state to move a
+/// version along. The operation that CREATES a version picks that due instant.
+#[derive(Debug, Clone)]
+pub struct AdapterVersionRecord {
+    /// The adapter this version belongs to. Carried on the record so a listing across
+    /// every adapter can report which adapter each version came from.
+    pub adapter_id: String,
+    /// This version's own identifier, unique within its adapter.
+    pub adapter_version: String,
+    /// When the version was created, reported as `CreationTime`.
+    pub created_at: SystemTime,
+    /// The feature types the version operates on — its adapter's, at creation.
+    pub feature_types: Vec<String>,
+    /// The instant the `CREATION_IN_PROGRESS` -> [`Self::settled_status`] transition
+    /// became due. Before it, every read reports `CREATION_IN_PROGRESS`.
+    pub settles_at: SystemTime,
+    /// The `AdapterVersionStatus` the version settles into, one of the modelled
+    /// `ADAPTER_VERSION_STATUS_VALUES`.
+    pub settled_status: String,
+    /// The `StatusMessage` that explains [`Self::settled_status`], if there is one. Not
+    /// reported before the version settles: it describes the settled status.
+    pub settled_status_message: Option<String>,
+}
+
+impl AdapterVersionRecord {
+    /// The version's `Status` at `now`.
+    pub fn status(&self, now: SystemTime) -> &str {
+        if now >= self.settles_at {
+            self.settled_status.as_str()
+        } else {
+            ADAPTER_VERSION_STATUS_CREATION_IN_PROGRESS
+        }
+    }
+
+    /// The version's `StatusMessage` at `now`: the settled status's message, once the
+    /// version has settled into it.
+    pub fn status_message(&self, now: SystemTime) -> Option<String> {
+        if now >= self.settles_at {
+            self.settled_status_message.clone()
+        } else {
+            None
+        }
+    }
+
+    /// This version as the modelled `AdapterVersionOverview`, as of `now`.
+    ///
+    /// ONE projection, so every operation that reports a version summary reports the
+    /// same members from the same stored record.
+    pub fn overview(&self, now: SystemTime) -> AdapterVersionOverview {
+        AdapterVersionOverview {
+            adapter_id: Some(self.adapter_id.clone()),
+            adapter_version: Some(self.adapter_version.clone()),
+            creation_time: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            feature_types: Some(self.feature_types.clone()),
+            status: Some(self.status(now).to_string()),
+            status_message: self.status_message(now),
+        }
     }
 }
 
@@ -2401,7 +2513,8 @@ pub fn expense_documents(key: &str, content: &DocumentContent) -> Vec<ExpenseDoc
 // Pagination
 // ---------------------------------------------------------------------------
 
-/// An opaque cursor into ONE listing: a job's block list, or a filtered adapter listing.
+/// An opaque cursor into ONE listing: a job's block list, or a filtered resource
+/// listing.
 ///
 /// Stateless and self-verifying on purpose: a paginated read is a reporting call, so it
 /// must not write state to hand out a cursor. The token binds its offset to `scope` — the
@@ -2463,7 +2576,7 @@ pub fn page_of_blocks(
 }
 
 // ---------------------------------------------------------------------------
-// Adapter listing
+// Resource listings
 // ---------------------------------------------------------------------------
 
 /// A wire `CreationTime` bound as whole nanoseconds since the Unix epoch.
@@ -2480,8 +2593,33 @@ fn system_time_nanos(value: SystemTime) -> i128 {
     }
 }
 
-/// The cursor scope a listing's pages are bound to: the filtration criteria the listing
-/// was computed under.
+/// Whether something created at `created_at` falls inside the creation-time window the
+/// request named.
+///
+/// The ONE window rule every listing of this service filters by, so they cannot drift
+/// apart. AWS, on `ListAdaptersRequest$AfterCreationTime` and
+/// `ListAdapterVersionsRequest$AfterCreationTime`: each "[s]pecifies the lower bound for
+/// the ... operation", and the `$BeforeCreationTime` of each specifies the upper bound —
+/// so a resource is listed exactly when its stored `CreationTime` lies within the bounds
+/// the request gave, each bound inclusive, an absent one unbounded on that side, and a
+/// request naming neither filtering nothing out.
+pub fn within_creation_window(
+    created_at: SystemTime,
+    after_creation_time: Option<&::aws_smithy_types::DateTime>,
+    before_creation_time: Option<&::aws_smithy_types::DateTime>,
+) -> bool {
+    let created = system_time_nanos(created_at);
+    after_creation_time.is_none_or(|bound| created >= datetime_nanos(bound))
+        && before_creation_time.is_none_or(|bound| created <= datetime_nanos(bound))
+}
+
+/// One creation-time bound as a cursor scope names it; `-` for an absent bound.
+fn bound_key(value: Option<&::aws_smithy_types::DateTime>) -> String {
+    value.map_or_else(|| "-".to_string(), |value| datetime_nanos(value).to_string())
+}
+
+/// The cursor scope a `ListAdapters` listing's pages are bound to: the filtration
+/// criteria the listing was computed under.
 ///
 /// A `NextToken` is an offset into ONE list, so a cursor cut under one creation-time
 /// window names nothing in another: changing the window invalidates the cursor instead of
@@ -2490,26 +2628,47 @@ pub fn adapter_page_scope(
     after_creation_time: Option<&::aws_smithy_types::DateTime>,
     before_creation_time: Option<&::aws_smithy_types::DateTime>,
 ) -> String {
-    fn bound(value: Option<&::aws_smithy_types::DateTime>) -> String {
-        value.map_or_else(|| "-".to_string(), |value| datetime_nanos(value).to_string())
-    }
     format!(
         "ListAdapters|{}|{}",
-        bound(after_creation_time),
-        bound(before_creation_time)
+        bound_key(after_creation_time),
+        bound_key(before_creation_time)
+    )
+}
+
+/// The cursor scope a `ListAdapterVersions` listing's pages are bound to: which adapter
+/// the listing was scoped to, and the creation-time window it was computed under.
+///
+/// Same rule as [`adapter_page_scope`], with the adapter in the scope because an
+/// `AdapterId` selects WHICH versions are listed: a cursor cut for one adapter names
+/// nothing in another adapter's listing. `MaxResults` is deliberately absent from the
+/// scope — a caller may change the page size between pages.
+pub fn adapter_version_page_scope(
+    adapter_id: Option<&str>,
+    after_creation_time: Option<&::aws_smithy_types::DateTime>,
+    before_creation_time: Option<&::aws_smithy_types::DateTime>,
+) -> String {
+    // The adapter is length-prefixed rather than interpolated bare: an `AdapterId` is
+    // caller-controlled, so a scope that just concatenated it could be forged by an id
+    // carrying the separator.
+    let adapter = adapter_id.map_or_else(
+        || "-".to_string(),
+        |adapter_id| format!("{}:{adapter_id}", adapter_id.len()),
+    );
+    format!(
+        "ListAdapterVersions|{adapter}|{}|{}",
+        bound_key(after_creation_time),
+        bound_key(before_creation_time)
     )
 }
 
 /// Every stored adapter the filtration criteria admit, as `ListAdapters` reports it, in
 /// the ONE total order the listing's pages are cut from.
 ///
-/// AWS, on `ListAdaptersRequest$AfterCreationTime`/`$BeforeCreationTime`: they specify
-/// the "lower bound" and the "upper bound" for the operation, so an adapter is listed
-/// exactly when its stored `CreationTime` lies within the bounds the request gave (each
-/// bound inclusive, and an absent one unbounded on that side). AWS documents no order for
-/// the listing and an offset cursor is only coherent over a stable one, so adapters are
-/// reported oldest first, with the `AdapterId` breaking ties between adapters created in
-/// the same instant.
+/// An adapter is listed exactly when its stored `CreationTime` lies inside the window the
+/// request named — see [`within_creation_window`]. AWS documents no order for the listing
+/// and an offset cursor is only coherent over a stable one, so adapters are reported
+/// oldest first, with the `AdapterId` breaking ties between adapters created in the same
+/// instant.
 ///
 /// Derived from the stored adapter records alone — the same records `GetAdapter` reports —
 /// so the listing can never disagree with a read of one adapter.
@@ -2518,15 +2677,11 @@ pub fn listed_adapters(
     after_creation_time: Option<&::aws_smithy_types::DateTime>,
     before_creation_time: Option<&::aws_smithy_types::DateTime>,
 ) -> Vec<AdapterOverview> {
-    let after = after_creation_time.map(datetime_nanos);
-    let before = before_creation_time.map(datetime_nanos);
     let mut selected: Vec<&AdapterRecord> = store
         .adapters
         .values()
         .filter(|adapter| {
-            let created = system_time_nanos(adapter.created_at);
-            after.is_none_or(|bound| created >= bound)
-                && before.is_none_or(|bound| created <= bound)
+            within_creation_window(adapter.created_at, after_creation_time, before_creation_time)
         })
         .collect();
     selected.sort_by(|left, right| {

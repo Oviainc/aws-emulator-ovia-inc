@@ -15,6 +15,8 @@
 mod adapter_listing;
 #[path = "all/adapter_mutations.rs"]
 mod adapter_mutations;
+#[path = "all/adapter_versions.rs"]
+mod adapter_versions;
 #[path = "all/adapters.rs"]
 mod adapters;
 #[path = "all/document_extraction.rs"]
