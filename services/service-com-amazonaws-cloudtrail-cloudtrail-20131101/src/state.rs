@@ -459,10 +459,12 @@ pub fn parse_trail_identifier(value: &str) -> Result<TrailIdentifier, Identifier
 
 /// Read `arn:<partition>:cloudtrail:<region>:<account>:trail/<name>`.
 fn parse_trail_arn(value: &str) -> Result<TrailIdentifier, IdentifierRejection> {
+    // The refusal names the ARN the caller supplied, which is the one thing the
+    // caller has to change — the way the service words it: "The ARN <arn> is
+    // invalid."
     let reject = || {
         Err(IdentifierRejection::InvalidArn(format!(
-            "'{value}' is not a valid trail ARN: the format of a trail ARN is \
-             arn:aws:cloudtrail:<region>:<account-id>:trail/<trail-name>"
+            "The ARN {value} is invalid."
         )))
     };
 
@@ -488,6 +490,27 @@ fn parse_trail_arn(value: &str) -> Result<TrailIdentifier, IdentifierRejection> 
         region: (*region).to_string(),
         name: name.to_string(),
     })
+}
+
+/// The HTTP status every trail not-found refusal answers with.
+///
+/// The model annotates `TrailNotFoundException` `@httpError(404)`, but CloudTrail
+/// answers 400 for it on the wire: the recorded responses of `GetTrail`,
+/// `GetTrailStatus`, `DeleteTrail`, `StartLogging` and `StopLogging` on a trail that
+/// was never created are HTTP 400 with `__type` `TrailNotFoundException`. The error
+/// CODE and the body stay the model's; only the status is stated here, through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`]. It is the same deviation
+/// `EventDataStoreNotFoundException` and `QueryIdNotFoundException` already carry in
+/// `ops::describe_query`.
+pub const TRAIL_NOT_FOUND_STATUS: u16 = 400;
+
+/// The refusal text that names the trail by its ARN — what `GetTrailStatus`,
+/// `DeleteTrail`, `StartLogging`, `StopLogging` and `UpdateTrail` answer with, each
+/// of which addresses exactly one Region's trail, so a caller who passed a bare name
+/// is told which Region's trail was looked for. `GetTrail`'s recorded refusal carries
+/// the identifier as the request sent it instead ([`unknown_trail_message`]).
+pub fn trail_not_found_arn_message(region: &str, name: &str) -> String {
+    unknown_trail_message(&trail_arn(region, name))
 }
 
 /// Render an instant the way the modelled string timestamp members carry it
@@ -1210,8 +1233,10 @@ pub enum TrailForMutation<'a> {
     AddressedInAnotherRegion { name: String, addressed: String },
     /// A trail of this name exists, but it is homed in another Region.
     HomedInAnotherRegion { name: String, home_region: String },
-    /// No trail of this name in any Region.
-    Absent,
+    /// No trail of this name in any Region. Carries the name the identifier
+    /// resolved to, which the not-found refusal names as that trail's ARN (see
+    /// [`trail_not_found_arn_message`]).
+    Absent { name: String },
 }
 
 impl ComAmazonawsCloudtrailCloudtrail20131101State {
@@ -1273,7 +1298,7 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
             Some(record) => Ok(TrailForMutation::Found(record)),
             None => Ok(match elsewhere.into_iter().next() {
                 Some(home_region) => TrailForMutation::HomedInAnotherRegion { name, home_region },
-                None => TrailForMutation::Absent,
+                None => TrailForMutation::Absent { name },
             }),
         }
     }

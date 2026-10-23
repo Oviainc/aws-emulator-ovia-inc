@@ -10,12 +10,13 @@
 //!    names becomes the suffix of the addresses ACM used for that domain, so a later
 //!    `DescribeCertificate` reports it and the five mailboxes at it — and reports every
 //!    other domain's validation exactly as it was.
-//! 2. `ValidationDomain` must be `Domain` or a superdomain of it, and `Domain` must be
-//!    a name the certificate covers; either is
-//!    `InvalidDomainValidationOptionsException` (HTTP 400) and leaves the stored
-//!    validations untouched.
+//! 2. `ValidationDomain` must be `Domain` or a superdomain of it
+//!    (`InvalidDomainValidationOptionsException`, HTTP 400), and `Domain` must be a
+//!    name the certificate holds a validation for (`ResourceNotFoundException`, HTTP
+//!    400); either refusal leaves the stored validations untouched.
 //! 3. There is mail to resend only while the certificate is still
-//!    `PENDING_VALIDATION`, that domain is awaiting proof BY EMAIL, and the documented
+//!    `PENDING_VALIDATION`, that domain is awaiting proof BY EMAIL, ACM has already
+//!    dispatched the initial validation mail the request owes, and the documented
 //!    72-hour window since the mail was last sent has not elapsed; otherwise
 //!    `InvalidStateException` (HTTP 400).
 //!
@@ -37,8 +38,8 @@ use service_com_amazonaws_acm_certificatemanager::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::certificate_lifecycle::{
-    call, describe, error_code, error_message, hold_pending_validations, request_certificate,
-    router_with_engine, ACCOUNT, REGION,
+    call, describe, dispatch_validation_mail_now, error_code, error_message,
+    hold_pending_validations, request_certificate, router_with_engine, ACCOUNT, REGION,
 };
 use crate::certificate_validation_state_machine::{make_validation_due_now, PRIVATE_CA_ARN};
 
@@ -63,8 +64,9 @@ const VALIDATION_LOCAL_PARTS: &[&str] = &[
 type ResendCase<'a> = (&'a str, Value, &'a str, &'a str, &'a str);
 
 /// One refused-resend row: what it exercises, the `Domain`, the `ValidationDomain`,
-/// and the value the refusal must name (the one the rule rejected).
-type RefusalCase<'a> = (&'a str, &'a str, &'a str, &'a str);
+/// the error code the refusal must carry, and the value it must name (the one the rule
+/// rejected).
+type RefusalCase<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
 
 /// The mailboxes the rule requires at `mail_suffix`, lower-cased and sorted.
 fn expected_mailboxes(mail_suffix: &str) -> Vec<String> {
@@ -120,8 +122,9 @@ fn validations_other_than(detail: &Value, domain: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Request a certificate and hold it in `PENDING_VALIDATION` for the rest of the row,
-/// so the state the resend rules are about is the one under test.
+/// Request a certificate, hold it in `PENDING_VALIDATION` for the rest of the row and
+/// let the initial validation mail ACM owes it go out, so the state the resend rules
+/// are about is the one under test.
 async fn pending_certificate(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
@@ -129,6 +132,7 @@ async fn pending_certificate(
 ) -> String {
     let arn = request_certificate(router, body).await;
     hold_pending_validations(engine);
+    dispatch_validation_mail_now(engine);
     arn
 }
 
@@ -348,10 +352,11 @@ async fn repeated_resends_record_the_latest_validation_domain() {
     }
 }
 
-/// RULE: `ValidationDomain` must be `Domain` or a superdomain of it, and `Domain` must
-/// be a name the certificate covers; anything else is
-/// `InvalidDomainValidationOptionsException` (HTTP 400) and the stored validations are
-/// left exactly as they were.
+/// RULE: `ValidationDomain` must be `Domain` or a superdomain of it, which is
+/// `InvalidDomainValidationOptionsException` (HTTP 400) when it is not, and `Domain`
+/// must be a name the certificate holds a validation for, which is
+/// `ResourceNotFoundException` (HTTP 400) when it does not; either way the stored
+/// validations are left exactly as they were.
 #[tokio::test]
 async fn an_incorrect_domain_pair_is_refused() {
     // The certificate every row resends against: a deep name plus a wildcard and a
@@ -368,71 +373,81 @@ async fn an_incorrect_domain_pair_is_refused() {
     // another TLD's parent, a wildcard suffix), and a Domain the certificate does not
     // cover (a sibling, a superdomain of a covered name, a subdomain of one, an
     // unrelated name) — each with a ValidationDomain the first half accepts, so the
-    // refusal can only come from the coverage check.
+    // refusal can only come from the lookup of the certificate's own validation.
     let cases: &[RefusalCase<'_>] = &[
         (
             "a suffix off the label boundary",
             "probe.sub.example.com",
             "ample.com",
+            "InvalidDomainValidationOptionsException",
             "ample.com",
         ),
         (
             "a sibling of the domain",
             "probe.sub.example.com",
             "other.sub.example.com",
+            "InvalidDomainValidationOptionsException",
             "other.sub.example.com",
         ),
         (
             "a subdomain of the domain, the wrong direction",
             "probe.sub.example.com",
             "deep.probe.sub.example.com",
+            "InvalidDomainValidationOptionsException",
             "deep.probe.sub.example.com",
         ),
         (
             "an unrelated registrable domain",
             "probe.sub.example.com",
             "totally-unrelated.org",
+            "InvalidDomainValidationOptionsException",
             "totally-unrelated.org",
         ),
         (
             "another TLD's parent",
             "probe.sub.example.com",
             "example.org",
+            "InvalidDomainValidationOptionsException",
             "example.org",
         ),
         (
             "a wildcard validation domain of a plain name",
             "probe.sub.example.com",
             "*.example.com",
+            "InvalidDomainValidationOptionsException",
             "*.example.com",
         ),
         (
             "a domain the certificate does not cover",
             "absent.example.com",
             "example.com",
+            "ResourceNotFoundException",
             "absent.example.com",
         ),
         (
             "a superdomain of a covered name is not itself covered",
             "sub.example.com",
             "example.com",
+            "ResourceNotFoundException",
             "sub.example.com",
         ),
         (
             "a subdomain of a covered name is not itself covered",
             "deep.probe.sub.example.com",
             "example.com",
+            "ResourceNotFoundException",
             "deep.probe.sub.example.com",
         ),
         (
             "a name covered only by the certificate's wildcard",
             "host.wild.example.com",
             "wild.example.com",
+            "ResourceNotFoundException",
             "host.wild.example.com",
         ),
     ];
 
-    for (case, domain, validation_domain, named) in cases {
+    for (case, domain, validation_domain, expected_code, named) in cases {
         let (router, engine) = router_with_engine();
         let arn = pending_certificate(&router, &engine, &request).await;
         let before = describe(&router, &arn).await;
@@ -440,8 +455,8 @@ async fn an_incorrect_domain_pair_is_refused() {
         let (status, response) = resend(&router, &arn, domain, validation_domain).await;
         assert_eq!(
             (status, error_code(&response).as_str()),
-            (400, "InvalidDomainValidationOptionsException"),
-            "case {case:?}: expected 400 InvalidDomainValidationOptionsException for \
+            (400, *expected_code),
+            "case {case:?}: expected 400 {expected_code} for \
              Domain={domain} ValidationDomain={validation_domain}, got {status} {response}"
         );
         // The refusal names the value it rejected, so a caller can tell which half of
@@ -570,6 +585,10 @@ async fn the_resend_window_closes_72_hours_after_the_last_mail() {
             &json!({ "DomainName": "window.example.com", "ValidationMethod": "EMAIL" }),
         )
         .await;
+        // The dispatch the clock owed is materialised through a real request before
+        // this row dates it: the window is measured from the mail that actually went
+        // out.
+        let _ = describe(&router, &arn).await;
         backdate_validation_email(&engine, &arn, *age);
 
         let (status, response) = resend(&router, &arn, "window.example.com", "example.com").await;
@@ -609,6 +628,95 @@ async fn the_resend_window_closes_72_hours_after_the_last_mail() {
                  domain as it was, got {validation}"
             );
         }
+    }
+}
+
+/// RULE: ACM dispatches a certificate's FIRST domain-validation mail itself, a bounded
+/// span after it accepts the request; until that mail has gone out there is no message
+/// to RE-send, so the call is `InvalidStateException` (HTTP 400) — and the identical
+/// call succeeds once the dispatch the clock owed has happened.
+#[tokio::test]
+async fn a_resend_before_the_initial_mail_went_out_is_refused() {
+    // Rows differ along what the rule generalises over: which covered name the resend
+    // names (the DomainName, a subject alternative name, a wildcard) and which suffix
+    // it asks for (the name itself, a superdomain).
+    let cases: &[(&str, Value, &str, &str)] = &[
+        (
+            "the certificate's own domain, through itself",
+            json!({ "DomainName": "gate.example.com", "ValidationMethod": "EMAIL" }),
+            "gate.example.com",
+            "gate.example.com",
+        ),
+        (
+            "a subject alternative name, through its registrable domain",
+            json!({
+                "DomainName": "gate.deep.example.net",
+                "SubjectAlternativeNames": ["san.deep.example.net"],
+                "ValidationMethod": "EMAIL",
+            }),
+            "san.deep.example.net",
+            "example.net",
+        ),
+        (
+            "a wildcard name, through the domain it covers",
+            json!({
+                "DomainName": "gate.example.org",
+                "SubjectAlternativeNames": ["*.wild.example.org"],
+                "ValidationMethod": "EMAIL",
+            }),
+            "*.wild.example.org",
+            "wild.example.org",
+        ),
+        (
+            // No method named: ACM validates by email, so the same gate applies.
+            "a certificate that named no validation method",
+            json!({ "DomainName": "gate.example.io" }),
+            "gate.example.io",
+            "example.io",
+        ),
+    ];
+
+    for (case, body, domain, validation_domain) in cases {
+        let (router, engine) = router_with_engine();
+        let arn = request_certificate(&router, body).await;
+        // Both transitions the clock owes this request are held out, so the row
+        // observes the state before the initial mail went out whatever the wall clock
+        // does, and then releases only the mail.
+        hold_pending_validations(&engine);
+
+        let (status, response) = resend(&router, &arn, domain, validation_domain).await;
+        assert_eq!(
+            (status, error_code(&response).as_str()),
+            (400, "InvalidStateException"),
+            "case {case:?}: expected 400 InvalidStateException before the initial mail \
+             went out, got {status} {response}"
+        );
+        // Nothing has been mailed, so the stored validation names no address.
+        let detail = describe(&router, &arn).await;
+        let validation = validation_for(case, &detail, domain);
+        let mailboxes = reported_mailboxes(case, &validation);
+        assert!(
+            mailboxes.is_empty(),
+            "case {case:?}: no mailbox can be reported before the initial mail went \
+             out, got {mailboxes:?}"
+        );
+
+        // The dispatch the clock owed then falls due, and the identical call succeeds.
+        dispatch_validation_mail_now(&engine);
+        let (status, response) = resend(&router, &arn, domain, validation_domain).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the same resend must succeed once the initial mail has gone \
+             out, got {status} {response}"
+        );
+        let detail = describe(&router, &arn).await;
+        let validation = validation_for(case, &detail, domain);
+        let mailboxes = reported_mailboxes(case, &validation);
+        assert_eq!(
+            mailboxes,
+            expected_mailboxes(validation_domain),
+            "case {case:?}: expected the five mailboxes at {validation_domain}, got {mailboxes:?}"
+        );
     }
 }
 
@@ -653,10 +761,11 @@ async fn a_resend_touches_only_the_certificate_it_names() {
         "case the other certificate: its validation must be untouched, got {other}"
     );
     let mailboxes = reported_mailboxes("the other certificate", &other);
-    assert!(
-        mailboxes.is_empty(),
-        "case the other certificate: its mailbox list must be untouched — nothing has \
-         mailed it, so it names no address — got {mailboxes:?}"
+    assert_eq!(
+        mailboxes,
+        expected_mailboxes("shared.sub.example.com"),
+        "case the other certificate: its mailbox list must still be the one its own \
+         initial dispatch wrote, got {mailboxes:?}"
     );
 
     // And an ARN with no record behind it is a lookup failure, not a resend: the

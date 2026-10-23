@@ -11,20 +11,28 @@
 //! [`crate::state::HARVEST_OUTCOME`] for the span and the terminal status, and
 //! `settle_harvest_jobs` on the state struct for where it is materialised.
 //!
-//! ## What this handler deliberately does NOT decide about the harvest window
+//! ## What this handler decides about the harvest window and the destination role
 //!
-//! `StartTime` and `EndTime` are modelled as plain `__string` with no `@pattern`, no
-//! `@timestampFormat` and no relation between them
-//! (`smithy_query(query="operation",operation="CreateHarvestJob",…)`), so this handler
-//! length-bounds them and stores them as sent. Whether MediaPackage refuses an
-//! unparseable instant, an inverted window (`EndTime` before `StartTime`) or a window
-//! outside the endpoint's startover period — and with which of its modelled 422 reasons —
-//! is a NEGATIVE-class rule about accepted input, which this service tracks in its own
-//! issue (`mediapackage-control-plane-negative-class-rejections-missing-…`) for every
-//! operation at once rather than per handler: one handler guessing a rejection the others
-//! do not apply is the drift that issue exists to remove. Nothing downstream here depends
-//! on the window being ordered — no harvest runs (see `HARVEST_OUTCOME`) — so storing it
-//! verbatim reports exactly what the caller submitted.
+//! A submission is accepted only when it can be carried out, and both checks happen
+//! before the store is touched, so a refused submission persists nothing:
+//!
+//! * the WINDOW is an interval of media, so `EndTime` must name an instant LATER than
+//!   `StartTime`. The two are modelled as plain `__string` with no `@pattern`, no
+//!   `@timestampFormat` and no relation between them
+//!   (`smithy_query(query="operation",operation="CreateHarvestJob",…)`), so this handler
+//!   reads them as ISO-8601 instants itself — text that is not an instant is refused as
+//!   that member's own failure — and stores them as SENT, because the bounds the caller
+//!   gets back are the caller's own text;
+//! * the DESTINATION ROLE is the identity MediaPackage writes the harvested content as,
+//!   so the role's trust policy has to grant `mediapackage.amazonaws.com`
+//!   `sts:AssumeRole`. The role is resolved against the account's IAM records in the same
+//!   engine and read through the one shared trust-policy evaluator
+//!   ([`crate::state::harvest_role_refusal`]).
+//!
+//! Both answer the modelled `UnprocessableEntityException` (422) keyed by the member the
+//! caller has to fix. A window outside the endpoint's startover period is NOT refused
+//! here: nothing published states that bound for this service in a form this emulator can
+//! apply, so guessing it would refuse submissions AWS accepts.
 //!
 //! ## Shape of an operation
 //!
@@ -191,12 +199,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let mut state = state.lock();
-        // The clock, not this call, moves a submitted job's status: materialise first
-        // what was already due, so the duplicate-id rule below and the response are
-        // decided against the jobs as the clock has left them.
-        let now = std::time::SystemTime::now();
-        state.settle_harvest_jobs(now);
 
         // Bound what the caller may make this record cost, before anything is stored: the
         // store copies these strings verbatim, so one request must not decide how much
@@ -213,6 +215,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ] {
             crate::state::bound_chars(member, value, crate::state::MAX_STRING_CHARS)?;
         }
+
+        // The window is an interval of media, so its end has to be LATER than its start:
+        // an inverted or empty window names no content to harvest. `StartTime` and
+        // `EndTime` are modelled as `__string`, so this handler is what reads them as
+        // instants — text that is not an instant at all is refused as that member's own
+        // failure, which is a different answer from "your window is inverted". Decided
+        // before the store is touched, so a refused submission persists nothing.
+        let start = crate::state::parse_instant(&input.start_time)
+            .ok_or_else(|| crate::state::instant_invalid("startTime"))?;
+        let end = crate::state::parse_instant(&input.end_time)
+            .ok_or_else(|| crate::state::instant_invalid("endTime"))?;
+        if end <= start {
+            return Err(crate::state::harvest_window_invalid().into());
+        }
+
+        // MediaPackage writes the harvested content to the caller's bucket AS the role the
+        // destination names, so a submission it could never carry out is refused here
+        // instead of producing a job id for a harvest that cannot happen. The IAM store is
+        // a different store in the same engine, and no IAM handler reads this one; its
+        // guard is taken and released BEFORE this service's, so no two orders of the same
+        // two locks exist.
+        let iam = crate::state::iam_state(&*self.engine).ok_or_else(|| {
+            CreateHarvestJobErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the IAM store is unavailable".into()),
+                },
+            )
+        })?;
+        let role_refusal =
+            crate::state::harvest_role_refusal(&input.s3_destination.role_arn, &iam.lock());
+        if let Some(refusal) = role_refusal {
+            return Err(refusal.into());
+        }
+
+        let mut state = state.lock();
+        // The clock, not this call, moves a submitted job's status: materialise first
+        // what was already due, so the duplicate-id rule below and the response are
+        // decided against the jobs as the clock has left them.
+        let now = std::time::SystemTime::now();
+        state.settle_harvest_jobs(now);
 
         // A HarvestJob harvests ONE origin endpoint: an `OriginEndpointId` naming no
         // stored endpoint has nothing to harvest, so the job is not created. This is a

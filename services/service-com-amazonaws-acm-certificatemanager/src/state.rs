@@ -21,7 +21,9 @@
 //!
 //! A requested certificate does not stay `PENDING_VALIDATION`: ACM resolves its
 //! validation on its own, so the record carries the outcome the clock owes it and the
-//! instant it falls due ([`PendingValidation`]). Nothing sleeps for that instant —
+//! instant it falls due ([`PendingValidation`]), and — for a certificate it validates
+//! by EMAIL — the instant the initial validation mail it owes falls due
+//! ([`Certificate::pending_validation_email`]). Nothing sleeps for those instants —
 //! [`ComAmazonawsAcmCertificatemanagerState::materialize_due`] applies whatever was
 //! already due, and every handler calls it before reading or writing the store.
 
@@ -110,7 +112,22 @@ pub const FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED: &str =
 /// requesting still observes `PENDING_VALIDATION`, and it is never slept on: the due
 /// instant is stored on the record and materialised by whichever call next touches
 /// the store (see [`ComAmazonawsAcmCertificatemanagerState::materialize_due`]).
-pub const VALIDATION_SETTLE_DELAY: Duration = Duration::from_millis(500);
+///
+/// It sits ABOVE [`VALIDATION_EMAIL_DISPATCH_DELAY`] because the two owed transitions
+/// happen in that order at AWS: ACM dispatches a request's validation mail first and
+/// only then reaches an outcome for the request, so the compressed spans keep the same
+/// order and each stays inside the observable band.
+pub const VALIDATION_SETTLE_DELAY: Duration = Duration::from_millis(750);
+
+/// How long after `RequestCertificate` the initial domain-validation EMAIL falls due.
+///
+/// A CHOSEN span, not a documented one: AWS dispatches the mail itself, shortly after
+/// the request is accepted and well before the request reaches an outcome. It is never
+/// zero, so a caller that resends straight after requesting still observes the state
+/// where no mail has gone out yet, and it is never slept on: the due instant is stored
+/// on the record ([`Certificate::pending_validation_email`]) and materialised by
+/// whichever call next touches the store.
+pub const VALIDATION_EMAIL_DISPATCH_DELAY: Duration = Duration::from_millis(250);
 
 /// How long after the domain-validation email was last sent ACM will send it again.
 ///
@@ -333,11 +350,13 @@ pub struct DomainValidationRecord {
     /// so a certificate migrated away from `EMAIL` and back mails the domain the
     /// request named rather than the covered name itself.
     pub requested_validation_domain: Option<String>,
-    /// The mailboxes ACM has sent a domain-validation email to: one entry per message
-    /// sent, for a name ACM validates BY EMAIL. Nothing sends mail at request time, so
-    /// the list stays empty until `ResendValidationEmail` writes to it; a name
-    /// validated by DNS or HTTP has no mailbox list at all, which is what
-    /// [`domain_validation`] reports from the record's own method.
+    /// The mailboxes ACM has sent a domain-validation email to: the five role-account
+    /// addresses at [`Self::validation_domain`], for a name ACM validates BY EMAIL.
+    /// Empty until the mail has actually gone out — the initial dispatch the clock owes
+    /// a request ([`Certificate::pending_validation_email`]), or a
+    /// `ResendValidationEmail` — and empty for a name validated by DNS or HTTP, where a
+    /// mailbox list does not apply at all; [`domain_validation`] reports the difference
+    /// from the record's own method.
     pub validation_emails: Vec<String>,
     /// The CNAME to publish, for DNS validation.
     pub resource_record: Option<ResourceRecord>,
@@ -444,11 +463,21 @@ pub struct Certificate {
     /// that have been previously exported").
     pub exported: bool,
     /// When ACM last sent this certificate's domain-validation email: the instant the
-    /// certificate was requested for a request that asked for email validation, moved
-    /// forward by each `ResendValidationEmail`. `None` for a certificate ACM sends no
-    /// validation mail for at all. It is what the documented
+    /// initial dispatch fell due, moved forward by each `ResendValidationEmail`. `None`
+    /// while no mail has gone out yet — a certificate ACM validates by DNS or HTTP, and
+    /// one whose initial dispatch is still owed. It is what the documented
     /// [`RESEND_VALIDATION_WINDOW`] is measured from.
     pub validation_email_sent_at: Option<SystemTime>,
+    /// When the INITIAL domain-validation email ACM owes this request falls due, for a
+    /// certificate it validates by EMAIL. `None` once the mail has gone out, for a
+    /// certificate ACM sends no validation mail for at all, and once the request has
+    /// settled with the mail still owed — a request ACM has finished processing gets no
+    /// validation mail afterwards.
+    ///
+    /// Stored, never slept on, exactly as [`Self::pending_validation`] is: the instant
+    /// is fixed by the call that accepted the request, so the mail is owed at that
+    /// instant whether or not anybody calls again.
+    pub pending_validation_email: Option<SystemTime>,
     /// When the certificate was revoked, which "exists only when the certificate
     /// status is REVOKED" (`CertificateDetail$RevokedAt` doc).
     pub revoked_at: Option<SystemTime>,
@@ -465,13 +494,29 @@ pub struct Certificate {
 }
 
 impl Certificate {
-    /// Apply the validation outcome the clock already owes this certificate at `now`.
+    /// Apply everything the clock already owes this certificate at `now`: the initial
+    /// domain-validation email, then the validation outcome.
     ///
     /// A certificate ACM reports as `PENDING_VALIDATION` is waiting on work ACM does
-    /// on its own; the instant that work completes was fixed when the certificate was
-    /// requested, so applying it here materialises a change the clock already made
-    /// rather than a side effect of whoever happened to call.
+    /// on its own; the instant each piece of that work completes was fixed when the
+    /// certificate was requested, so applying it here materialises a change the clock
+    /// already made rather than a side effect of whoever happened to call.
+    ///
+    /// The two are applied in DUE ORDER, so the record passes through the same states
+    /// it would have if somebody had called in between.
     pub fn materialize_due(&mut self, now: SystemTime) {
+        if let Some(due) = self.pending_validation_email {
+            // The outcome is applied first when it falls due first: a request ACM has
+            // finished processing sends no validation mail afterwards.
+            let outcome_first = self
+                .pending_validation
+                .as_ref()
+                .is_some_and(|pending| pending.due_at < due);
+            if now >= due && !outcome_first {
+                self.pending_validation_email = None;
+                self.dispatch_validation_email(due);
+            }
+        }
         let Some(pending) = self
             .pending_validation
             .clone()
@@ -480,12 +525,40 @@ impl Certificate {
             return;
         };
         self.pending_validation = None;
+        // The request has reached an outcome, so no validation mail is owed for it any
+        // more.
+        self.pending_validation_email = None;
         match pending.outcome {
             ValidationOutcome::Issued => self.issue(pending.due_at),
             ValidationOutcome::Failed => {
                 self.fail(FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED);
             }
         }
+    }
+
+    /// Record the domain-validation email ACM sent at `at` for every name this
+    /// certificate validates BY EMAIL.
+    ///
+    /// "ACM sends email to the the following five addresses: admin@<suffix>
+    /// administrator@<suffix> hostmaster@<suffix> postmaster@<suffix>
+    /// webmaster@<suffix>" (`ResendValidationEmailRequest$ValidationDomain` doc), at
+    /// each name's own validation domain — the suffix the record already carries. A
+    /// name validated by DNS or HTTP gets no mail, so its mailbox list is left as it is.
+    ///
+    /// `at` is the instant the mail went out, which is what the documented
+    /// [`RESEND_VALIDATION_WINDOW`] is measured from — not the instant somebody
+    /// happened to read the record.
+    pub fn dispatch_validation_email(&mut self, at: SystemTime) {
+        for validation in &mut self.domain_validations {
+            if validation.validation_method != VALIDATION_METHOD_EMAIL {
+                continue;
+            }
+            let Some(mail_suffix) = validation.validation_domain.clone() else {
+                continue;
+            };
+            validation.validation_emails = validation_mailboxes(&mail_suffix);
+        }
+        self.validation_email_sent_at = Some(at);
     }
 
     /// Whether export was allowed for this certificate when it was created: "You can
@@ -549,15 +622,16 @@ impl Certificate {
     /// proven, and nothing was issued, so the issuance members stay absent.
     ///
     /// `ValidationEmails` is "a list of email addresses that ACM used to send domain
-    /// validation emails" (`DomainValidation$ValidationEmails` doc). A request that
-    /// ends with ownership still unproven sent none, so the list is dropped with the
-    /// validation it belonged to.
+    /// validation emails" (`DomainValidation$ValidationEmails` doc) — a record of mail
+    /// ACM HAS sent, which a request ending unproven does not retract, so each list is
+    /// left exactly as the dispatches that wrote it left it. A request that failed
+    /// before its mail went out never had one: the owed dispatch is dropped by
+    /// [`Self::materialize_due`], so that list is still empty.
     fn fail(&mut self, reason: &str) {
         self.status = STATUS_FAILED.to_string();
         self.failure_reason = Some(reason.to_string());
         for validation in &mut self.domain_validations {
             validation.validation_status = DOMAIN_STATUS_FAILED.to_string();
-            validation.validation_emails.clear();
         }
     }
 }
@@ -1001,8 +1075,9 @@ pub fn validation_target(domain_name: &str) -> &str {
 /// (`ResendValidationEmailRequest$ValidationDomain` doc).
 ///
 /// A certificate's `ValidationEmails` lists the addresses ACM HAS written to, so these
-/// are rendered onto a record by the call that sends the mail
-/// (`ResendValidationEmail`), never by the describe that reports it.
+/// are rendered onto a record when mail goes out — the initial dispatch the clock owes
+/// a request ([`Certificate::dispatch_validation_email`]) or a
+/// `ResendValidationEmail` — never by the describe that reports it.
 pub const VALIDATION_EMAIL_LOCAL_PARTS: &[&str] = &[
     "admin",
     "administrator",
@@ -1091,7 +1166,8 @@ pub fn domain_validation_record(
         ),
         requested_validation_domain: validation_domain.map(str::to_string),
         // Minting a validation sends no mail: the mailbox list names the messages ACM
-        // HAS sent, which is what `ResendValidationEmail` records.
+        // HAS sent, which is what [`Certificate::dispatch_validation_email`] and
+        // `ResendValidationEmail` record.
         validation_emails: Vec::new(),
         resource_record: None,
         http_redirect: None,

@@ -59,7 +59,11 @@ fn tags_path(arn: &str) -> String {
 
 /// `TagKeys` is an `@httpQuery` list, so each key travels as one `tagKeys=` parameter
 /// with its reserved characters percent-encoded.
-fn urlencode(value: &str) -> String {
+///
+/// The same escaping an `application/x-www-form-urlencoded` body needs, so this is the
+/// one copy in this test target: `tests/all/harvest_job_rejections.rs` drives IAM's
+/// awsQuery wire through it too.
+pub(crate) fn urlencode(value: &str) -> String {
     value
         .bytes()
         .map(|byte| match byte {

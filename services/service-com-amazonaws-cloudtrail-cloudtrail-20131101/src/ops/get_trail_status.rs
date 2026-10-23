@@ -209,8 +209,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        let record = store
-            .resolve(&input.name, &region)
+        // `Name` is a bare name (the caller's Region) or a trail ARN (the ARN's
+        // Region); either way exactly one Region's trail is addressed, and the
+        // not-found refusal names that trail's ARN.
+        let key = store
+            .addressed_key(&input.name, &region)
             .map_err(|rejection| match rejection {
                 crate::state::IdentifierRejection::InvalidArn(message) => {
                     GetTrailStatusErrorModeled::CloudTrailARNInvalidException(
@@ -226,12 +229,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         },
                     )
                 }
-            })?
-            .ok_or_else(|| {
-                GetTrailStatusErrorModeled::TrailNotFoundException(TrailNotFoundException {
-                    message: Some(crate::state::unknown_trail_message(&input.name)),
-                })
             })?;
+        let (name, addressed) = (&key.0, &key.1);
+        let record = store.trails.get(&key).ok_or_else(|| {
+            // The model says 404 for this error; CloudTrail answers 400. See
+            // `crate::state::TRAIL_NOT_FOUND_STATUS`.
+            crate::scaffolded::Scaffolded::modeled_with_status(
+                GetTrailStatusErrorModeled::TrailNotFoundException(TrailNotFoundException {
+                    message: Some(crate::state::trail_not_found_arn_message(addressed, name)),
+                }),
+                crate::state::TRAIL_NOT_FOUND_STATUS,
+            )
+        })?;
 
         Ok(GetTrailStatusOutput {
             is_logging: Some(record.status.is_logging),
