@@ -11,7 +11,12 @@
 //!   account, so a caller that is not it earns `AccessDeniedException` (403) before any
 //!   state is written. The store records the management account (none, until something
 //!   records one — this emulator runs no Organizations control plane), so the gate reads
-//!   state rather than deciding per request; see [`crate::state`].
+//!   state rather than deciding per request; see [`crate::state`]. That decision takes
+//!   no value from the request, so it is not made here FIRST: the service serves this
+//!   operation behind the gate in [`crate::service`], which runs ahead of the
+//!   framework's deserialize-and-validate boundary — a body that breaks a modelled
+//!   constraint earns the same 403 as a conforming one. The check below is the same
+//!   rule, kept so no path can write to the store for a caller the gate refuses.
 //! * `ClientToken` (`@idempotencyToken`) replay returns the team the first call minted —
 //!   same `Arn`, same `VersionId`, no second team.
 //! * A `Name` a live team already holds earns `ConflictException` (409).
@@ -212,6 +217,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account (see `state::ComAmazonawsMpaAwsfluffycoreserviceState::
         // organization_management_account_id`), which makes every caller a standalone
         // account and this the answer to every call until one is recorded.
+        //
+        // A refused caller does not reach here: the decision needs nothing from the
+        // request, so `crate::service` makes it ahead of the framework's constraint
+        // boundary. This is the same rule at the store's own door, so the store cannot
+        // be written for an unauthorized caller even if a request reached this handler
+        // without passing that gate.
         if !state.is_management_account(crate::state::caller_account_id()) {
             return Err(CreateApprovalTeamErrorModeled::AccessDeniedException(
                 crate::state::not_management_account(),

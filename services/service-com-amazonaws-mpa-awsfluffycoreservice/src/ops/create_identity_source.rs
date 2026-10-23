@@ -22,12 +22,12 @@
 //! one — this emulator runs no Organizations control plane), so the gate reads state
 //! rather than deciding per request. Recorded AWS behaviour refuses
 //! `CreateIdentitySource` from an account outside the organization's management account
-//! with exactly this error. AWS decides it BEFORE it validates the request body, which
-//! this framework cannot yet do — modelled constraints are refused ahead of every
-//! handler — so a request that is BOTH unauthorized and malformed is still answered
-//! with `ValidationException` (400) here; that ordering is the subject of its own open
-//! issue (`mpa-createapprovalteam-returns-400-validationexception-instead-of-the`),
-//! which owns the seam both creates would share.
+//! with exactly this error, and decides it BEFORE it validates the request body. That
+//! ordering is now what this emulator does too: the decision takes no value from the
+//! request, so it is made in the gate [`crate::service`] puts in front of every
+//! management-account-only operation, ahead of the framework's constraint boundary — a
+//! request that is BOTH unauthorized and malformed is answered with the 403. The check
+//! below is that same rule at the store's own door.
 //!
 //! The cross-account ARN gate does not apply: this request names no resource ARN.
 //!
@@ -204,6 +204,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `state::ComAmazonawsMpaAwsfluffycoreserviceState::
         // organization_management_account_id`), which makes every caller a standalone
         // account and this the answer to every call until one is recorded.
+        //
+        // A refused caller does not reach here: the decision needs nothing from the
+        // request, so `crate::service` makes it ahead of the framework's constraint
+        // boundary for every operation this service gates on the management account.
+        // This is the same rule at the store's own door, so the store cannot be written
+        // for an unauthorized caller even if a request reached this handler without
+        // passing that gate.
         if !state.is_management_account(crate::state::caller_account_id()) {
             return Err(CreateIdentitySourceErrorModeled::AccessDeniedException(
                 crate::state::not_management_account(),

@@ -19,6 +19,8 @@ mod authorization_gate;
 mod identity_sources;
 #[path = "all/inactive_team_version_deletion.rs"]
 mod inactive_team_version_deletion;
+#[path = "all/management_account_gate_order.rs"]
+mod management_account_gate_order;
 #[path = "all/policy_catalog.rs"]
 mod policy_catalog;
 #[path = "all/policy_version_detail.rs"]
