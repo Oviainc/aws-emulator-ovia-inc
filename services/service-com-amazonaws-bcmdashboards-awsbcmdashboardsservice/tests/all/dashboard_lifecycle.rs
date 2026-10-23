@@ -86,7 +86,7 @@ pub(crate) const PRESENTED_AKID: &str = "AKIDEXAMPLE";
 pub(crate) const REQUEST_SOURCE: &str = "bcm-dashboards.us-east-1.amazonaws.com";
 
 /// The wire error code (`__type`) of an error body.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")

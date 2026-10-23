@@ -55,8 +55,8 @@ pub struct Dashboard {
     pub widgets: Vec<Widget>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
-    /// The tags supplied at create time, persisted so the tagging operations have
-    /// state to read once they are implemented.
+    /// The tags supplied at create time, read back by `ListTagsForResource` (and
+    /// state for the other tagging operations once they are implemented).
     pub resource_tags: Vec<ResourceTag>,
 }
 
@@ -107,8 +107,8 @@ pub struct ScheduledReportRecord {
     pub updated_at: SystemTime,
     pub last_execution_at: Option<SystemTime>,
     pub health_status: Option<HealthStatus>,
-    /// The tags supplied at create time, persisted so the tagging operations have
-    /// state to read once they are implemented.
+    /// The tags supplied at create time, read back by `ListTagsForResource` (and
+    /// state for the other tagging operations once they are implemented).
     pub resource_tags: Vec<ResourceTag>,
 }
 
@@ -171,6 +171,24 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
         self.next_dashboard_seq = self.next_dashboard_seq.wrapping_add(1);
         let resource_id = format!("{:032x}", self.next_dashboard_seq);
         ::engine::emulator_arn("bcm-dashboards", "", &format!("dashboard/{resource_id}"))
+    }
+
+    /// The tags persisted on the resource `resource_arn` names, in the order they
+    /// were stored, or `None` when this service holds no resource under that ARN.
+    ///
+    /// The ARN is the only key a tagging operation resolves a resource by, so every
+    /// one of them resolves it here rather than reaching into the resource maps
+    /// itself. `ResourceArn`'s pattern admits both resource types this service
+    /// stores — `dashboard/...` and `scheduled-report/...` — so both are looked up
+    /// here; an ARN neither map holds resolves to `None` and the caller answers its
+    /// modelled `ResourceNotFoundException`.
+    pub fn resource_tags(&self, resource_arn: &str) -> Option<&[ResourceTag]> {
+        if let Some(dashboard) = self.dashboards.get(resource_arn) {
+            return Some(dashboard.resource_tags.as_slice());
+        }
+        self.scheduled_reports
+            .get(resource_arn)
+            .map(|report| report.resource_tags.as_slice())
     }
 
     /// Mint a fresh widget id: 32 lowercase hex characters, as `WidgetId`'s
