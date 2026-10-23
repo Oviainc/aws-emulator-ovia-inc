@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransitGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransitGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates a transit gateway from the request's description, options and
+//! tags, stores it as the modelled [`TransitGateway`] shape with the default transit
+//! gateway route table a create owes it, and answers it in `pending` with the instant the
+//! clock owes it `available` recorded beside it (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::transit_gateway_available_at`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransitGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +146,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransitGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransitGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransitGateway"))
+        use crate::state;
+        use std::time::SystemTime;
+
+        // "The transit gateway options" (`Options`), each member the request left out at
+        // the default its own documentation publishes, and a value outside a published
+        // range or enum refused rather than defaulted. Resolved before anything is read
+        // or written, so a bad option is refused whatever the store holds.
+        let options = state::transit_gateway_options(input.options.as_ref())?;
+
+        // "The tags to apply to the transit gateway" (`TagSpecifications`) — "you must
+        // specify the resource type to tag, otherwise the request will fail"
+        // (`TagSpecification`), and the only type this action tags is the gateway it
+        // creates. The tag payload's own bounds (the count per resource, each key and
+        // value's length, no key twice, nothing in the reserved namespace) are applied by
+        // the one shared reader every create holds its tags to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_TRANSIT_GATEWAY,
+            Self::NAME,
+        )?;
+
+        let spec = state::TransitGatewaySpec {
+            description: input.description.clone(),
+            region: state::request_region(ctx.parts()),
+            created_at: SystemTime::now(),
+            options,
+            tags,
+        };
+        // The bytes this gateway would add to the store, charged against the crate's one
+        // byte budget below so the store is bounded in bytes and not only in records.
+        let payload_bytes = state::tag_list_bytes(&spec.tags)
+            .saturating_add(spec.description.as_deref().map_or(0, str::len))
+            .saturating_add(
+                spec.options
+                    .transit_gateway_cidr_blocks
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(String::len)
+                    .sum(),
+            );
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_transit_gateway_capacity() {
+            return Err(state::transit_gateway_limit_exceeded());
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The record itself, built the one way this crate builds a transit gateway — the
+        // id, the ARN, the owning account, the `pending` state, the clock-owed `available`
+        // move and the default route table all come from the store, never from the request.
+        let transit_gateway_id = store.insert_transit_gateway(spec);
+
+        // The answer is the record as it was stored, so `CreateTransitGateway` and
+        // `DescribeTransitGateways` cannot drift apart.
+        let Some(transit_gateway) = store.transit_gateways.get(&transit_gateway_id).cloned() else {
+            return Err(state::internal_error(
+                "the transit gateway just created could not be read back",
+            ));
+        };
+        Ok(CreateTransitGatewayOutput {
+            transit_gateway: Some(transit_gateway),
+        })
     }
 }
