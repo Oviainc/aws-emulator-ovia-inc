@@ -5,6 +5,12 @@
 //! Updates a registration's product configuration settings in [`crate::state`], so
 //! `ListIdentityProviders` and every later read report the updated settings.
 //!
+//! `Product` is checked before any of that: it is modelled as a plain `String`, so the
+//! boundary validator cannot enforce the values its documentation lists, and whether a
+//! product name is one this service serves does not depend on what is registered — a
+//! request naming a product outside [`crate::state::PRODUCTS`] is refused naming the
+//! value, exactly as every other operation with a `Product` member refuses it.
+//!
 //! The identity provider is RESOLVED BEFORE the `UpdateSettings` payload is looked at:
 //! a reference that resolves to no registration is refused with the modelled
 //! `ValidationException` and [`crate::state::IDENTITY_PROVIDER_NOT_VALID`], whatever the
@@ -149,6 +155,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = std::time::SystemTime::now();
+
+        // Whether a product name is one this service serves does not depend on what is
+        // registered, so it is checked before the store is read at all — the same check,
+        // in the same place, as every other operation that takes a `Product` on the wire.
+        if let Some(product) = input.product.as_deref() {
+            crate::state::validate_product(product).map_err(into_error)?;
+        }
+
         let mut state = state.lock();
         state.materialise_due(now);
 
@@ -215,6 +229,12 @@ fn into_error(error: crate::state::StateError) -> UpdateIdentityProviderSettings
         crate::state::StateError::NotFound(message)
         | crate::state::StateError::Conflict(message)
         | crate::state::StateError::Validation(message) => message,
+        // The identity provider the request addressed is not a registration of this
+        // account: an invalid parameter, which is the one client error this operation
+        // models anyway.
+        crate::state::StateError::ProviderNotRegistered => {
+            crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()
+        }
     };
     validation(&message)
 }

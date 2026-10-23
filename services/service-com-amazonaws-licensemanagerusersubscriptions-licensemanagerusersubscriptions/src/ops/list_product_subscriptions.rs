@@ -151,8 +151,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let filters = input.filters.clone().unwrap_or_default();
         // A malformed filter is refused whatever the store holds, so this runs before any
-        // record is looked at.
+        // record is looked at — and so does the product name, which is a fact about the
+        // request rather than about what is registered.
         crate::state::validate_filters(&filters, FILTERABLE_ATTRIBUTES).map_err(into_error)?;
+        if let Some(product) = input.product.as_deref() {
+            crate::state::validate_product(product).map_err(into_error)?;
+        }
         let mut state = state.lock();
         // The only write a read may make: the transition the clock already owed.
         state.materialise_due(std::time::SystemTime::now());
@@ -184,17 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
         if provider_arns.is_empty() {
-            return Err(ListProductSubscriptionsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(match input.product.as_deref() {
-                        Some(product) => format!(
-                            "the identity provider is not registered for product {product}"
-                        ),
-                        None => "the identity provider is not registered".to_string(),
-                    }),
-                },
-            )
-            .into());
+            // The identifier names no registration of this account: an invalid parameter,
+            // reported exactly as `DeregisterIdentityProvider` reports it. Listing a
+            // provider's subscriptions is a call about the REGISTRATION, so it says so
+            // rather than failing closed the way the user-plane calls do.
+            return Err(into_error(crate::state::StateError::ProviderNotRegistered));
         }
 
         let mut matching = Vec::new();
@@ -265,6 +263,14 @@ fn into_error(error: crate::state::StateError) -> ListProductSubscriptionsError 
         crate::state::StateError::Validation(message) => {
             ListProductSubscriptionsErrorModeled::ValidationException(ValidationException {
                 message: Some(message),
+            })
+            .into()
+        }
+        // The identifier is not one of this account's identity providers: an invalid
+        // parameter, answered with the same code and status as every other invalid one.
+        crate::state::StateError::ProviderNotRegistered => {
+            ListProductSubscriptionsErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()),
             })
             .into()
         }

@@ -9,7 +9,10 @@
 //! `ResourceArn` is RESOLVED against state first, exactly as the other two tagging
 //! operations resolve it: it is the same resolution of the same member, so an ARN that
 //! names no resource this service holds gets the same non-modelled `BadRequestException`
-//! ([`crate::scaffolded::Scaffolded::invalid_input_resource_arn`]).
+//! ([`crate::scaffolded::Scaffolded::invalid_input_resource_arn`]). A value that is not
+//! shaped like an ARN at all never reaches here: the member's `@pattern` refuses it at the
+//! boundary, which `crate::service`'s `override_refusal` states with the same code and the
+//! bad-syntax sentence.
 //!
 //! A key the resource already carries is overwritten rather than refused, which is what
 //! the operation's `@idempotent` trait asks for — and the MERGED tag set is bounded by
@@ -158,6 +161,15 @@ fn into_error(error: crate::state::StateError) -> TagResourceError {
         | crate::state::StateError::Validation(message) => {
             TagResourceErrorModeled::ValidationException(ValidationException {
                 message: Some(message),
+            })
+            .into()
+        }
+        // Tagging addresses a resource by ARN, never an identity provider by reference, so
+        // the merge cannot report this; it is worded the way the identity-provider-plane
+        // operations word it.
+        crate::state::StateError::ProviderNotRegistered => {
+            TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()),
             })
             .into()
         }

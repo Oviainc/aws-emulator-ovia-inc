@@ -217,5 +217,14 @@ fn into_error(error: crate::state::StateError) -> ListIdentityProvidersError {
             })
             .into()
         }
+        // This operation addresses no single registration — it lists them — so the lookup
+        // cannot report this; it is worded the same way the other identity-provider-plane
+        // operations word it.
+        crate::state::StateError::ProviderNotRegistered => {
+            ListIdentityProvidersErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()),
+            })
+            .into()
+        }
     }
 }

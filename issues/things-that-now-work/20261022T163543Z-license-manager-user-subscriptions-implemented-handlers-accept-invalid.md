@@ -92,3 +92,33 @@ Cause 7 — StopProductSubscription() with no members: code 'ValidationException
 7. Same call with Product='NOT_A_REAL_PRODUCT_XYZ' -> HTTP 200; AWS: ValidationException "Invalid product NOT_A_REAL_PRODUCT_XYZ".
 8. StopProductSubscription() with no members -> ValidationException with the wrong sentence.
 9. Or replay the check ids in trace_ids.
+
+## Resolution
+
+All seven causes are fixed in the license-manager-user-subscriptions crate, each by a
+stated rule rather than by the recorded instance: the documented `Product` value set
+(every operation with a `Product` member), a `DirectoryId` resolved against the account's
+directory fleet in the service's own state, a per-plane answer for an identity provider
+that is
+addressed but not registered (an invalid parameter to the registration plane, a fail-closed
+`UnauthorizedException` to the product-subscription plane), `BadRequestException` for a
+`ResourceArn` this service cannot use (from the boundary refusal as well as the handler),
+one builder for the "<members> must be provided" sentence, and the AssociateUser
+authorization gate hoisted ahead of modelled-constraint enforcement. `tests/all/refusals.rs`
+drives each rule over the wire across a table of inputs.
+
+### Known limitations, tracked for a later change
+
+The account's directories are held in this service's own state behind a seed seam
+(`state::seed_account_directories`), exactly as the account's EC2 fleet is
+(`state::seed_account_instances`): a registration resolves its `DirectoryId` against that
+fleet. Point both seams at the owning services' stores once there is a shared one to read
+— reading another service crate's state struct directly would couple the two crates.
+
+A provider the request marks `IsSharedActiveDirectory`, or whose `DirectoryId` takes the
+`sd-` form the member's `@pattern` admits beside `d-`, names a directory SHARED into this
+account. `ds:DescribeSharedDirectories` is what reports those and is still a scaffolded 501
+in the Directory Service emulator, so there is nothing to resolve such an id against: those
+registrations are accepted without resolution, and a shared id naming no directory
+therefore still mints a provider. Resolve them — and tighten this carve-out — once
+Directory Service records shared directories.

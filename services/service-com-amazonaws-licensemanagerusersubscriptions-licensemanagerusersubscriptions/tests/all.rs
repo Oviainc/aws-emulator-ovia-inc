@@ -17,6 +17,8 @@ mod identity_provider_subscriptions;
 mod license_server_endpoints;
 #[path = "all/list_instances.rs"]
 mod list_instances;
+#[path = "all/refusals.rs"]
+mod refusals;
 #[path = "all/resource_resolution_refusals.rs"]
 mod resource_resolution_refusals;
 #[path = "all/state_roundtrip.rs"]

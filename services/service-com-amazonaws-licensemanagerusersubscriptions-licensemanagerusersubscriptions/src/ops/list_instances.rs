@@ -209,5 +209,14 @@ fn into_error(error: crate::state::StateError) -> ListInstancesError {
             })
             .into()
         }
+        // This operation addresses no identity provider — it lists the instances — so the
+        // lookup cannot report this; it is worded the same way the other
+        // identity-provider-plane operations word it.
+        crate::state::StateError::ProviderNotRegistered => {
+            ListInstancesErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()),
+            })
+            .into()
+        }
     }
 }

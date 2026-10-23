@@ -49,13 +49,13 @@ use service_com_amazonaws_licensemanagerusersubscriptions_licensemanagerusersubs
 };
 
 use super::identity_provider_subscriptions::{
-    arn_prefix, as_str, call, harness, list_providers, provider_union, register, send, Harness,
-    Reply, ACCOUNT, PRODUCTS, REGION, SIGNING_NAME,
+    arn_prefix, as_str, call, encoded_label, harness, list_providers, provider_union, register,
+    send, Harness, Reply, ACCOUNT, PRODUCTS, REGION, SIGNING_NAME,
 };
 
 /// The sentence `DisassociateUser` answers a request that addresses no association
 /// with, from the handler that owns it.
-use service_com_amazonaws_licensemanagerusersubscriptions_licensemanagerusersubscriptions::ops::disassociate_user::IDENTIFIERS_REQUIRED;
+use service_com_amazonaws_licensemanagerusersubscriptions_licensemanagerusersubscriptions::ops::disassociate_user::identifiers_required;
 
 /// The `LicenseServerSettings` every `CreateLicenseServerEndpoint` row carries.
 ///
@@ -121,9 +121,10 @@ async fn register_provider(h: &Harness, body: &Value, case: &str) -> String {
 
 /// `ListTagsForResource` binds `ResourceArn` to ONE path segment (`GET
 /// /tags/{ResourceArn}`), so the `:` and `/` inside an ARN have to be percent-encoded or
-/// the value would split the segment.
+/// the value would split the segment. The encoder is the shared fixture's
+/// ([`encoded_label`]), so this suite and `refusals.rs` drive the route identically.
 fn encoded(arn: &str) -> String {
-    arn.replace('%', "%25").replace(':', "%3A").replace('/', "%2F")
+    encoded_label(arn)
 }
 
 async fn list_tags(h: &Harness, arn: &str) -> Reply {
@@ -423,10 +424,11 @@ async fn disassociate_user_refuses_an_incomplete_identifier_before_any_lookup() 
             reply.error_type,
             reply.body
         );
+        let identifiers_required = identifiers_required();
         assert_eq!(
             reply.body.get("message").and_then(Value::as_str),
-            Some(IDENTIFIERS_REQUIRED),
-            "case {case:?}: expected {IDENTIFIERS_REQUIRED:?}, got {:?}",
+            Some(identifiers_required.as_str()),
+            "case {case:?}: expected {identifiers_required:?}, got {:?}",
             reply.body
         );
     }

@@ -5,6 +5,23 @@
 //! Associates a user with an EC2 instance and persists the association in
 //! [`crate::state`], so `DisassociateUser` resolves the same record.
 //!
+//! The INSTANCE-AUTHORIZATION gate below is also run BEFORE the request's shape is
+//! validated, by `crate::service::EmulatedService::override_operation` over the same
+//! `authorizes_instance` predicate: this service refuses a call it will not authorize
+//! identically whether the request's `Tags` map is within the modelled `@length(max: 50)`
+//! or past it, and a handler cannot do that — the framework's centralized walk is
+//! deserialize -> validate -> handle, so by the time this function runs an over-length map
+//! has already been refused as a `ValidationException`. The gate here is what a request
+//! that reached the handler is judged by; the one in `service.rs` only hoists the SAME
+//! decision ahead of the boundary validator, so the two cannot disagree.
+//!
+//! The provider resolution that follows the gate keeps its own answer: an unregistered
+//! directory is this operation's modelled `ResourceNotFoundException`, not the fail-closed
+//! refusal the product-subscription operations give for an unregistered provider. The two
+//! differ deliberately — the instance is what this operation's authorization is ABOUT, and
+//! it has already been established by the time the directory is resolved, so there is
+//! nothing left to withhold.
+//!
 //! The order the refusals come in is the behaviour, not an implementation detail:
 //!
 //! 1. the INSTANCE-AUTHORIZATION gate runs first and fails CLOSED — the caller's
@@ -273,6 +290,18 @@ fn into_error(error: crate::state::StateError) -> AssociateUserError {
         crate::state::StateError::Validation(message) => {
             AssociateUserErrorModeled::ValidationException(ValidationException {
                 message: Some(message),
+            })
+            .into()
+        }
+        // This handler resolves the registration ITSELF (the inline branch above), and
+        // answers the modelled `ResourceNotFoundException` for one it cannot resolve — the
+        // contract this operation already landed with, which the
+        // `resource_resolution_refusals` suite pins and nothing in this change moves. The
+        // lookup therefore cannot report this here; the arm keeps that same class so the
+        // two paths cannot word one refusal two ways.
+        crate::state::StateError::ProviderNotRegistered => {
+            AssociateUserErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()),
             })
             .into()
         }

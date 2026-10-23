@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 && input.username.is_some())
         {
             return Err(DisassociateUserErrorModeled::ValidationException(ValidationException {
-                message: Some(IDENTIFIERS_REQUIRED.to_string()),
+                message: Some(identifiers_required()),
             })
             .into());
         }
@@ -207,4 +207,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// What a request that addresses no association is told, naming the members the service
 /// requires when `InstanceUserArn` is absent.
-pub const IDENTIFIERS_REQUIRED: &str = "IdentityProvider, InstanceId, and Username must be provided";
+///
+/// Built by [`crate::state::members_must_be_provided`], the one place this service's
+/// "<members> must be provided" sentence is formed, so this refusal and
+/// `StopProductSubscription`'s cannot drift into two forms of one rule.
+pub fn identifiers_required() -> String {
+    crate::state::members_must_be_provided(&["Username", "InstanceId", "IdentityProvider"])
+}

@@ -11,7 +11,10 @@
 //! ([`crate::scaffolded::Scaffolded::invalid_input_resource_arn`]) — the model declares
 //! no shape for that code (`smithy_query(query="operation",
 //! operation="UntagResource")` lists only InternalServerException and
-//! ResourceNotFoundException), so it cannot be a modelled variant.
+//! ResourceNotFoundException), so it cannot be a modelled variant. A value that is not
+//! shaped like an ARN at all never reaches here: the member's `@pattern` refuses it at the
+//! boundary, which `crate::service`'s `override_refusal` states with the same code and the
+//! bad-syntax sentence.
 //!
 //! Removing a key the resource does not carry is a no-op, which is what the operation's
 //! `@idempotent` trait asks for.

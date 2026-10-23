@@ -233,5 +233,14 @@ fn into_error(error: crate::state::StateError) -> ListLicenseServerEndpointsErro
             })
             .into()
         }
+        // This operation addresses no identity provider — it lists the endpoints — so the
+        // lookup cannot report this; it is worded the same way the other
+        // identity-provider-plane operations word it.
+        crate::state::StateError::ProviderNotRegistered => {
+            ListLicenseServerEndpointsErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()),
+            })
+            .into()
+        }
     }
 }

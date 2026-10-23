@@ -203,6 +203,17 @@ pub const BAD_REQUEST_EXCEPTION_CODE: &str = "BadRequestException";
 /// `ResourceArn` naming no resource this service holds.
 pub const INVALID_INPUT_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn";
 
+/// The FIXED sentence that travels with [`BAD_REQUEST_EXCEPTION_CODE`] for a
+/// `ResourceArn` that is not shaped like an ARN at all.
+///
+/// The tagging operations' `ResourceArn` carries the service's ARN `@pattern`, so a value
+/// outside it is refused by the boundary validator before any handler runs; this is the
+/// sentence this service states that refusal with (`crate::service`'s `override_refusal`
+/// is where it is applied), as distinct from [`INVALID_INPUT_RESOURCE_ARN_MESSAGE`] for an
+/// ARN that is well formed and resolves to nothing.
+pub const INVALID_INPUT_RESOURCE_ARN_SYNTAX_MESSAGE: &str =
+    "Invalid input resource arn: bad syntax";
+
 /// The HTTP status every [`ServiceRefusal`] is reported with.
 ///
 /// 400, the status this service's model gives its own client errors

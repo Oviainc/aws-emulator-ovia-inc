@@ -37,6 +37,11 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// The products `RegisterIdentityProvider`'s `Product` documentation lists:
 /// VISUAL_STUDIO_ENTERPRISE | VISUAL_STUDIO_PROFESSIONAL | OFFICE_PROFESSIONAL_PLUS |
 /// OFFICE_STANDARD | REMOTE_DESKTOP_SERVICES.
+///
+/// The published literals, spelled out here rather than read from the production set, so
+/// a change to `state::PRODUCTS` fails a test instead of silently changing what this
+/// suite accepts; `refusals::the_enforced_product_set_is_the_documented_one` is the
+/// assertion that ties the two together.
 pub(crate) const PRODUCTS: &[&str] = &[
     "VISUAL_STUDIO_ENTERPRISE",
     "VISUAL_STUDIO_PROFESSIONAL",
@@ -44,6 +49,21 @@ pub(crate) const PRODUCTS: &[&str] = &[
     "OFFICE_STANDARD",
     "REMOTE_DESKTOP_SERVICES",
 ];
+
+/// Percent-encode ONE URI path segment, for the tagging routes that bind `ResourceArn`
+/// to `@httpLabel` (`/tags/{ResourceArn}`): an ARN carries `:` and `/`, and a `/` left as
+/// it is would split the label into another path segment.
+///
+/// The one encoder for this crate's suites, so two suites cannot disagree about what a
+/// client sends. It encodes the three characters an ARN can carry that a path segment
+/// cannot take literally (`%` first, so an encoding is not re-encoded), which is the
+/// substitution the suite this helper was lifted out of already made.
+pub(crate) fn encoded_label(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace(':', "%3A")
+        .replace('/', "%2F")
+}
 
 /// One emulator: the router that dispatches, plus the shared engine its service was
 /// built from (so a test can read the store the handlers wrote).
@@ -62,8 +82,38 @@ pub(crate) fn harness() -> Harness {
     // service's.
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    // `RegisterIdentityProvider` resolves an AWS-managed `DirectoryId` against the
+    // account's directories, so the directories these registrations name are registered
+    // in that fleet first.
+    create_directories(&engine, AWS_MANAGED_DIRECTORIES);
     Harness { router, engine }
 }
+
+/// The AWS-managed directories this suite's registrations are for: every `d-` id
+/// [`REGISTRATIONS`] names. A `sd-` id is a directory shared INTO this account, which
+/// `ds:DescribeSharedDirectories` is what reports and which this service therefore does
+/// not resolve, so none is created here.
+const AWS_MANAGED_DIRECTORIES: &[&str] = &["d-0123456789", "d-00000000ff", "d-123456789a"];
+
+/// Register `directory_ids` in the account's directory fleet, each one ACTIVE — the stage
+/// an identity provider can be registered for.
+///
+/// Written through the state seam the account's own directory fleet is seeded by
+/// (`register_account_directory`) rather than through a Directory Service API, for the
+/// same reason the suite seeds instances that way: a create mints the id it chooses, and
+/// these registrations are written against specific ones.
+pub(crate) fn create_directories(engine: &Arc<engine::InMemoryEngine>, directory_ids: &[&str]) {
+    let store = engine.state::<ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState>();
+    let mut store = store.lock();
+    for directory_id in directory_ids {
+        store.register_account_directory(*directory_id, DIRECTORY_STAGE_ACTIVE);
+    }
+}
+
+/// The stage a directory has to be in before an identity provider can be registered for
+/// it, spelled out here rather than read from the production constant so a change to it
+/// fails a test instead of silently changing what this suite accepts.
+pub(crate) const DIRECTORY_STAGE_ACTIVE: &str = "Active";
 
 /// What a call answered: the HTTP status, the wire error code (if any) and the body.
 #[derive(Debug)]
@@ -81,6 +131,11 @@ impl Reply {
             self.status, self.body
         );
         &self.body
+    }
+
+    /// The `message` of a refusal, as a client reads it off the error body.
+    pub(crate) fn message(&self) -> Option<&str> {
+        self.body.get("message").and_then(Value::as_str)
     }
 }
 
@@ -683,7 +738,9 @@ async fn product_subscriptions_round_trip_and_stop_removes_them() {
 }
 
 /// RULE: a subscription can only be created through a registration that exists for that
-/// product, and only once per user.
+/// product, and only once per user. Subscribing a user is a USER-plane call, so a provider
+/// that is not registered for the requested product is not reported as missing: the call
+/// fails closed (`UnauthorizedException`), disclosing nothing about what is registered.
 #[tokio::test]
 async fn subscriptions_require_a_registration_and_are_unique_per_user() {
     let h = harness();
@@ -697,7 +754,12 @@ async fn subscriptions_require_a_registration_and_are_unique_per_user() {
     )
     .await;
     assert_eq!(
-        reply.status, 404,
+        reply.status, 400,
+        "an unregistered provider cannot subscribe a user, got {reply:?}"
+    );
+    assert_eq!(
+        reply.error_type.as_deref(),
+        Some("UnauthorizedException"),
         "an unregistered provider cannot subscribe a user, got {reply:?}"
     );
 
@@ -711,13 +773,13 @@ async fn subscriptions_require_a_registration_and_are_unique_per_user() {
         )
         .await;
         assert_eq!(
-            reply.status, 404,
+            reply.status, 400,
             "case {product:?}: the provider is not registered for this product, got {reply:?}"
         );
         assert_eq!(
             reply.error_type.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {product:?}: expected ResourceNotFoundException, got {reply:?}"
+            Some("UnauthorizedException"),
+            "case {product:?}: expected UnauthorizedException, got {reply:?}"
         );
     }
 
@@ -1198,14 +1260,22 @@ async fn deregistration_removes_the_registration_and_its_product_users() {
 
         let again = deregister(&h, &request).await;
         assert_eq!(
-            again.status, 404,
-            "case {:?}: a second deregistration has nothing to remove, got {again:?}",
+            again.status, 400,
+            "case {:?}: a second deregistration names an identifier that is no longer an \
+             identity provider of this account, got {again:?}",
             row.case
         );
         assert_eq!(
             again.error_type.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {:?}: expected ResourceNotFoundException, got {again:?}",
+            Some("ValidationException"),
+            "case {:?}: expected ValidationException, got {again:?}",
+            row.case
+        );
+        assert_eq!(
+            again.body.get("message").and_then(Value::as_str),
+            Some("Identity provider is not valid"),
+            "case {:?}: expected the service's own sentence for an identifier that names \
+             no registration, got {again:?}",
             row.case
         );
     }
@@ -1228,8 +1298,14 @@ async fn deregistration_removes_the_registration_and_its_product_users() {
     )
     .await;
     assert_eq!(
-        orphaned.status, 404,
-        "listing through a deregistered provider must be a 404, got {orphaned:?}"
+        orphaned.status, 400,
+        "listing through a provider that is no longer registered names an identifier that \
+         is not an identity provider of this account, got {orphaned:?}"
+    );
+    assert_eq!(
+        orphaned.error_type.as_deref(),
+        Some("ValidationException"),
+        "listing through a deregistered provider must be a ValidationException, got {orphaned:?}"
     );
     let state = h
         .engine

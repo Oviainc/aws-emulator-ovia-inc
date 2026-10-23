@@ -6,8 +6,9 @@
 //! registrations, the product users subscribed through them, the EC2 instances that
 //! provide those subscriptions, the users associated to those instances, the license
 //! server endpoints created for a registration, and the tags written against any of
-//! those resources' ARNs. The account's EC2 fleet — which this service authorizes an
-//! instance against but does not own — lives here too. The
+//! those resources' ARNs. The two fleets this service resolves a request against but
+//! does not own — the account's EC2 instances and its AWS Directory Service directories —
+//! live here too, each behind its own seed seam. The
 //! list/lookup/pagination/filter helpers live here as well, so the operation handlers in
 //! `ops/` all resolve a resource the same way instead of each growing its own copy.
 
@@ -131,6 +132,82 @@ pub enum StateError {
     /// The request is malformed in a way the model cannot express — HTTP 400
     /// `ValidationException`.
     Validation(String),
+    /// The identity provider the request addressed — by `IdentityProviderArn`, or by the
+    /// `(IdentityProvider, Product)` pair it would have been registered under — is not a
+    /// registration of this account.
+    ///
+    /// Carries no message, because the two planes of this service word it differently and
+    /// neither wording belongs to the lookup:
+    ///
+    /// * the operations that manage or report the REGISTRATION itself
+    ///   (`DeregisterIdentityProvider`, `ListProductSubscriptions`) report the identifier
+    ///   as an invalid parameter — the modelled `ValidationException` (HTTP 400) carrying
+    ///   [`IDENTITY_PROVIDER_NOT_VALID`];
+    /// * the operations that start or end a user's PRODUCT SUBSCRIPTION
+    ///   (`StartProductSubscription`, `StopProductSubscription`) fail closed with
+    ///   `UnauthorizedException` instead, disclosing nothing about whether the provider
+    ///   exists.
+    ///
+    /// `AssociateUser` is neither: it resolves its registration itself and answers its own
+    /// modelled `ResourceNotFoundException`, because the fact its authorization is about —
+    /// the caller's ownership of the EC2 instance — has already been established by the
+    /// time the directory is resolved, so there is nothing left to withhold.
+    ProviderNotRegistered,
+}
+
+/// The user-based subscription products this service admits.
+///
+/// `Product` is modelled as a plain `String`, so the boundary validator enforces nothing;
+/// the set comes from `RegisterIdentityProvider.Product`'s own documentation — "Valid
+/// values: VISUAL_STUDIO_ENTERPRISE | VISUAL_STUDIO_PROFESSIONAL |
+/// OFFICE_PROFESSIONAL_PLUS | OFFICE_STANDARD | REMOTE_DESKTOP_SERVICES" — which the
+/// `Product` member of `StartProductSubscription`, `StopProductSubscription`,
+/// `DeregisterIdentityProvider` and `ListProductSubscriptions` repeats verbatim.
+pub const PRODUCTS: [&str; 5] = [
+    "VISUAL_STUDIO_ENTERPRISE",
+    "VISUAL_STUDIO_PROFESSIONAL",
+    "OFFICE_PROFESSIONAL_PLUS",
+    "OFFICE_STANDARD",
+    "REMOTE_DESKTOP_SERVICES",
+];
+
+/// Refuse a `Product` outside [`PRODUCTS`], naming the rejected value so a caller sees
+/// which value was refused.
+///
+/// Every operation that takes a `Product` on the wire calls this before it resolves
+/// anything in the store: whether a product name is one this service serves does not
+/// depend on what is registered.
+pub fn validate_product(product: &str) -> Result<(), StateError> {
+    if PRODUCTS.contains(&product) {
+        Ok(())
+    } else {
+        Err(StateError::Validation(format!(
+            "Invalid product {product}"
+        )))
+    }
+}
+
+/// How this service states that a request named none of a set of members it had to name.
+///
+/// Several operations address a resource either by its ARN or by the members that identify
+/// it, and refuse a request supplying neither by LISTING those members — the form
+/// `StopProductSubscription` (`Username`/`IdentityProvider`/`Product`) and
+/// `DisassociateUser` (`Username`/`InstanceId`/`IdentityProvider`) both use. The members
+/// are listed in alphabetical order, as both of those sentences order them, so the
+/// sentence does not depend on the order a handler happens to pass them in.
+pub fn members_must_be_provided(members: &[&str]) -> String {
+    let mut names: Vec<&str> = members.to_vec();
+    names.sort_unstable();
+    let listed = match names.split_last() {
+        // A refusal that names no member states no requirement, so there is no sentence to
+        // build: every call site passes a literal, non-empty list of the members the
+        // operation's model declares.
+        None => unreachable!("a refusal must name the members it requires"),
+        Some((last, [])) => (*last).to_string(),
+        Some((last, [only])) => format!("{only} and {last}"),
+        Some((last, rest)) => format!("{}, and {last}", rest.join(", ")),
+    };
+    format!("{listed} must be provided")
 }
 
 /// A registered identity provider, as `RegisterIdentityProvider` stored it.
@@ -320,6 +397,17 @@ pub struct ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscrip
     /// store would publish instances for this service to read. A test registers its own
     /// with [`ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::register_account_instance`].
     pub account_instances: HashMap<String, String>,
+    /// The AWS Directory Service directories this account has, keyed by `DirectoryId`,
+    /// each carrying the `DirectoryStage` it is in.
+    ///
+    /// Whether an identity provider can be registered for a directory is a fact about the
+    /// ACCOUNT's directories, not about this service: this service models no operation
+    /// that creates one, so — exactly like [`account_instances`](Self::account_instances)
+    /// above — [`seed_account_directories`] is the fixture standing in for Directory
+    /// Service's own `CreateDirectory`, and the single place a directory store would
+    /// publish directories for this service to read. A test registers its own with
+    /// [`ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::register_account_directory`].
+    pub account_directories: HashMap<String, String>,
     /// The earliest instant at which a stored record owes the clock a status transition,
     /// or `None` when no record is in a non-terminal status.
     ///
@@ -352,6 +440,26 @@ pub fn seed_account_instances() -> Vec<(String, String)> {
     .collect()
 }
 
+/// The stage a directory has to be in before an identity provider can be registered for
+/// it: `Active`, one of the values AWS Directory Service's `DirectoryStage` publishes
+/// (`Requested`, `Creating`, `Created`, `Active`, `Inoperable`, `Impaired`, `Restoring`,
+/// `RestoreFailed`, `Deleting`, `Deleted`, `Failed`). A directory still being created, or
+/// being deleted, is not one a registration can be built on.
+pub const DIRECTORY_STAGE_ACTIVE: &str = "Active";
+
+/// The directories the account starts with, as `(DirectoryId, DirectoryStage)`.
+///
+/// Three `Active` directories with ids of Directory Service's own `d-[0-9a-f]{10}` form
+/// (the `@pattern` `ActiveDirectoryIdentityProvider.DirectoryId` carries). The set is
+/// deliberately small and fixed: it decides only whether a directory of that id EXISTS
+/// and is usable, which is all a registration reads.
+pub fn seed_account_directories() -> Vec<(String, String)> {
+    ["d-9f8e7d6c5b", "d-1a2b3c4d5e", "d-4455667788"]
+        .into_iter()
+        .map(|id| (id.to_string(), DIRECTORY_STAGE_ACTIVE.to_string()))
+        .collect()
+}
+
 impl Default for ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState {
     fn default() -> Self {
         Self {
@@ -371,6 +479,7 @@ impl Default for ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersu
             license_server_endpoint_order: Vec::new(),
             license_server_endpoint_index: HashMap::new(),
             account_instances: seed_account_instances().into_iter().collect(),
+            account_directories: seed_account_directories().into_iter().collect(),
             pending_transition_due_at: None,
             next_id: 0,
         }
@@ -473,6 +582,29 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     ) -> Option<String> {
         self.account_instances
             .insert(instance_id.into(), availability_zone.into())
+    }
+
+    /// Register a directory the account has, in `stage` — the seam
+    /// [`seed_account_directories`] fills and a test adds to.
+    pub fn register_account_directory(
+        &mut self,
+        directory_id: impl Into<String>,
+        stage: impl Into<String>,
+    ) -> Option<String> {
+        self.account_directories
+            .insert(directory_id.into(), stage.into())
+    }
+
+    /// Whether `directory_id` names a directory of this account that an identity provider
+    /// can be registered for: one the account holds, in the `Active` stage
+    /// ([`DIRECTORY_STAGE_ACTIVE`]).
+    ///
+    /// Every other outcome — no directory of that id, or one in any other stage — is the
+    /// one refusal, so a caller is told which id was refused and nothing else.
+    pub fn resolves_active_directory(&self, directory_id: &str) -> bool {
+        self.account_directories
+            .get(directory_id)
+            .is_some_and(|stage| stage == DIRECTORY_STAGE_ACTIVE)
     }
 
     /// Whether the caller may be shown to own `instance_id`: true exactly when the
@@ -736,29 +868,25 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         product: Option<&str>,
     ) -> Result<&IdentityProviderRecord, StateError> {
         if let Some(arn) = arn {
-            return self.identity_providers.get(arn).ok_or_else(|| {
-                StateError::NotFound(format!("identity provider {arn} is not registered"))
-            });
+            return self
+                .identity_providers
+                .get(arn)
+                .ok_or(StateError::ProviderNotRegistered);
         }
         let (Some(identity_provider), Some(product)) = (identity_provider, product) else {
-            return Err(StateError::Validation(
-                "address an identity provider either by IdentityProviderArn or by both \
-                 IdentityProvider and Product"
-                    .to_string(),
-            ));
+            return Err(StateError::Validation(members_must_be_provided(&[
+                "IdentityProvider",
+                "Product",
+            ])));
         };
         let key = provider_key(identity_provider)?;
         let arn = self
             .identity_provider_index
             .get(&(key, product.to_string()))
-            .ok_or_else(|| {
-                StateError::NotFound(format!(
-                    "the identity provider is not registered for product {product}"
-                ))
-            })?;
-        self.identity_providers.get(arn).ok_or_else(|| {
-            StateError::NotFound(format!("identity provider {arn} is not registered"))
-        })
+            .ok_or(StateError::ProviderNotRegistered)?;
+        self.identity_providers
+            .get(arn)
+            .ok_or(StateError::ProviderNotRegistered)
     }
 
     /// Resolve a product user from the two ways `StopProductSubscription` can address
@@ -783,11 +911,11 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             let (Some(username), Some(identity_provider), Some(product)) =
                 (username, identity_provider, product)
             else {
-                return Err(StateError::Validation(
-                    "address a product user either by ProductUserArn or by Username, \
-                     IdentityProvider and Product"
-                        .to_string(),
-                ));
+                return Err(StateError::Validation(members_must_be_provided(&[
+                    "Username",
+                    "IdentityProvider",
+                    "Product",
+                ])));
             };
             let provider =
                 self.resolve_identity_provider(None, Some(identity_provider), Some(product))?;
