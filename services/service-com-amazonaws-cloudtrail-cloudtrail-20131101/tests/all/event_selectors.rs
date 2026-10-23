@@ -741,13 +741,15 @@ async fn a_malformed_or_unknown_trail_identifier_is_refused() {
         (
             "a well-formed name naming no trail",
             "absent-trail",
-            404,
+            // CloudTrail answers a not-found trail with 400, not the 404 its model
+            // annotates; see `state::TRAIL_NOT_FOUND_STATUS`.
+            400,
             "TrailNotFoundException",
         ),
         (
             "a well-formed ARN naming no trail",
             "arn:aws:cloudtrail:us-east-1:000000000000:trail/absent-trail",
-            404,
+            400,
             "TrailNotFoundException",
         ),
     ];

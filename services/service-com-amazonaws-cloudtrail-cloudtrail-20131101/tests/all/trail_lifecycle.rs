@@ -207,7 +207,9 @@ async fn a_trail_lives_through_create_read_logging_and_delete() {
             .await
             .expect_error(
                 &format!("{operation} after DeleteTrail"),
-                404,
+                // CloudTrail answers a not-found trail with 400, not the 404 its
+                // model annotates; see `state::TRAIL_NOT_FOUND_STATUS`.
+                400,
                 "TrailNotFoundException",
             );
     }
@@ -470,7 +472,7 @@ async fn a_trail_identifier_is_a_name_or_a_trail_arn() {
             &json!({"Name": "arn:aws:cloudtrail:us-east-1:000000000000:trail/absent"}),
         )
         .await
-        .expect_error("GetTrail with an unknown trail ARN", 404, "TrailNotFoundException");
+        .expect_error("GetTrail with an unknown trail ARN", 400, "TrailNotFoundException");
 }
 
 /// A trail belongs to the Region it was created in: a bare name names a trail in
@@ -531,7 +533,7 @@ async fn region_decides_which_trails_a_caller_sees_and_can_drive() {
         .await
         .expect_error(
             "GetTrail by bare name from another Region",
-            404,
+            400,
             "TrailNotFoundException",
         );
     let by_arn = emulator
@@ -710,7 +712,7 @@ async fn one_name_can_be_a_trail_in_each_region() {
     emulator
         .call_in("GetTrail", "eu-west-1", &json!({"Name": "shared-name"}))
         .await
-        .expect_error("GetTrail after the delete", 404, "TrailNotFoundException");
+        .expect_error("GetTrail after the delete", 400, "TrailNotFoundException");
     for region in ["us-east-1", "ap-south-1"] {
         emulator
             .call_in("GetTrail", region, &json!({"Name": "shared-name"}))
@@ -831,7 +833,7 @@ async fn create_trail_refuses_values_outside_their_documented_bounds() {
                 .await
                 .expect_error(
                     &format!("{case}: GetTrail after the refusal"),
-                    404,
+                    400,
                     "TrailNotFoundException",
                 );
         }
