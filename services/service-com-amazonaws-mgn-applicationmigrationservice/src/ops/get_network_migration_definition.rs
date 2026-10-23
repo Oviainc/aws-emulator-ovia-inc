@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetNetworkMigrationDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetNetworkMigrationDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one stored network migration definition, by `networkMigrationDefinitionID`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetNetworkMigrationDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read: it reports the members the create (or a later update) stored and
+//! computes nothing per read, so two reads of an unchanged definition answer the same
+//! record. An id the caller's account holds no record of is the modelled
+//! `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -110,11 +107,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // here — hence the `GetNetworkMigrationDefinitionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mgn#GetNetworkMigrationDefinition")]
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mgn#GetNetworkMigrationDefinition",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetNetworkMigrationDefinitionErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -168,18 +172,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetNetworkMigrationDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetNetworkMigrationDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetNetworkMigrationDefinition"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetNetworkMigrationDefinitionErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        // The operation models no `accountID` member, so it reads only the definitions
+        // of the account the request is signed for.
+        let account = crate::state::account_key(None);
+        let store = state.lock();
+
+        let Some(definition) = store
+            .network_migration_definition_of(&account, &input.network_migration_definition_id)
+        else {
+            return Err(
+                GetNetworkMigrationDefinitionErrorModeled::ResourceNotFoundException(
+                    crate::state::network_migration_definition_not_found(
+                        &input.network_migration_definition_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        // The stored record, member for member: a read reports what a write stored.
+        let reported = definition.to_shape();
+        Ok(GetNetworkMigrationDefinitionOutput {
+            arn: reported.arn,
+            network_migration_definition_id: reported.network_migration_definition_id,
+            name: reported.name,
+            description: reported.description,
+            source_configurations: reported.source_configurations,
+            target_s3_configuration: reported.target_s3_configuration,
+            target_network: reported.target_network,
+            target_deployment: reported.target_deployment,
+            vpc_provisioning_strategy: reported.vpc_provisioning_strategy,
+            cidr_mappings: reported.cidr_mappings,
+            created_at: reported.created_at,
+            updated_at: reported.updated_at,
+            tags: reported.tags,
+            scope_tags: reported.scope_tags,
+        })
     }
 }
