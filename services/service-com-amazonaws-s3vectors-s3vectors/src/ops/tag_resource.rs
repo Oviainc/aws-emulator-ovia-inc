@@ -157,6 +157,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The `aws:` tag-key namespace is AWS's own, so a key in it is refused
+        // before anything is resolved or stored.
+        crate::state::validate_tag_keys("tags", input.tags.keys().map(String::as_str))
+            .map_err(refusal)?;
+
         let mut store = state.lock();
         // The resource must exist to be tagged: an ARN naming a vector bucket or
         // vector index this store does not hold is the modelled 404.

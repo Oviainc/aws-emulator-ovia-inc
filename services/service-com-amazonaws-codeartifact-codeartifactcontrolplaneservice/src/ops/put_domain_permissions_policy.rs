@@ -3,7 +3,9 @@
 //! @op PutDomainPermissionsPolicy
 //! Attaches a resource policy to a domain, replacing any policy already attached, and
 //! answers with the policy as it was stored. The stored document is the caller's own
-//! `policyDocument`, byte for byte; the `revision` is minted by the service.
+//! `policyDocument` minified (`crate::state::stored_policy_document`) — its structure and
+//! its string contents are the caller's, only the whitespace between its JSON tokens goes;
+//! the `revision` is minted by the service.
 //!
 //! `policyRevision` is optimistic locking: when the caller supplies one it must be the
 //! revision currently attached, otherwise the write is refused with `ConflictException`
@@ -181,7 +183,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A resource policy is "a valid displayable JSON Aspen policy string", and the
         // modelled pattern only forbids control characters — so JSON well-formedness is
         // the service's own rule, applied through the one check the whole policy family
-        // shares, before anything is written.
+        // shares, before anything is written. The document is parsed ONLY to check it:
+        // what gets stored is the caller's own JSON, minified.
         if let Some(refusal) = crate::state::policy_document_refusal(&input.policy_document) {
             return Err(
                 PutDomainPermissionsPolicyErrorModeled::ValidationException(refusal).into(),
@@ -219,10 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(PutDomainPermissionsPolicyErrorModeled::ConflictException(
                 ConflictException {
-                    message: crate::state::policy_revision_conflict_message(
-                        DOMAIN_RESOURCE_TYPE,
-                        &input.domain,
-                    ),
+                    message: crate::state::POLICY_REVISION_CONFLICT_MESSAGE.to_string(),
                     resource_id: Some(input.domain.clone()),
                     resource_type: Some(DOMAIN_RESOURCE_TYPE.to_string()),
                 },

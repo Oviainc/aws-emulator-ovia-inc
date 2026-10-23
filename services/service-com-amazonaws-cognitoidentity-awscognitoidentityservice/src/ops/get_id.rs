@@ -10,8 +10,8 @@
 //! (`smithy_query(query="doc", shape="GetIdInput", member="AccountId")`) — the account the
 //! pool belongs to, not an identifier of a user, so it cannot select one identity over
 //! another. What it does reach in the real service is the standard (classic) flow's
-//! developer-provider linking, which `Lookup`/`Merge`/`UnlinkDeveloperIdentity` and
-//! `GetOpenIdTokenForDeveloperIdentity` own — all still scaffolded (HTTP 501). This slice
+//! developer-provider linking, which `GetOpenIdTokenForDeveloperIdentity` owns (and
+//! `Lookup`/`Merge`/`UnlinkDeveloperIdentity`, still scaffolded at HTTP 501). This slice
 //! therefore keys an identity on its pool and its `Logins` only; sending `AccountId`
 //! changes nothing, exactly as sending it to a pool in the caller's own account does.
 //!

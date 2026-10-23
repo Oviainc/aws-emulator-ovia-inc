@@ -200,8 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // Built from the request: the type of resource whose policy was
                         // asked for, and the name the caller addressed it by.
                         message: crate::state::no_policy_message(
-                            DOMAIN_RESOURCE_TYPE,
-                            &input.domain,
+                            &[DOMAIN_RESOURCE_TYPE],
+                            &[&input.domain],
                         ),
                         resource_id: Some(input.domain.clone()),
                         resource_type: Some(DOMAIN_RESOURCE_TYPE.to_string()),

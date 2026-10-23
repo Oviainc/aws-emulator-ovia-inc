@@ -52,9 +52,9 @@ const CLOSED_RUNS: &[&str] = &["wf-reports", "wf-orders-b", "wf-orders-a"];
 /// The seeded run left running, so no listing of CLOSED executions may report it.
 const OPEN_RUN: &str = "wf-open";
 
-/// The only `CloseStatus` a run can reach through this emulator's implemented
-/// operations: `TerminateWorkflowExecution` closes a run as TERMINATED. Every other
-/// entry of [`CLOSE_STATUS_VALUES`] therefore matches no stored run here.
+/// The `CloseStatus` the runs seeded HERE reach: `TerminateWorkflowExecution` closes a
+/// run as TERMINATED, and no seeded run's start-to-close budget expires during this
+/// suite, so every other entry of [`CLOSE_STATUS_VALUES`] matches no stored run here.
 const REACHABLE_CLOSE_STATUS: &str = "TERMINATED";
 
 /// The task list and child policy the seeded workflow types are registered with, so a

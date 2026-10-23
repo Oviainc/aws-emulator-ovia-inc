@@ -168,6 +168,20 @@ pub fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// The `Message` member of an error body.
+pub fn error_message(body: &Value) -> String {
+    body.get("Message")
+        .and_then(Value::as_str)
+        .unwrap_or("<no Message>")
+        .to_string()
+}
+
+/// The text every `ResourceNotFoundException` this service answers carries, as
+/// recorded off the service: byte-identical across operations and resource
+/// kinds, naming neither the resource, nor its type, nor its ARN.
+pub const NOT_FOUND_MESSAGE: &str =
+    "No object with the provided name or resource identifier was found";
+
 /// Whether `value` satisfies the `ResourceId` / `UpdateToken` pattern
 /// `^([0-9a-f]{8})-([0-9a-f]{4}-){3}([0-9a-f]{12})$` (length 36).
 pub fn is_uuid_form(value: &str) -> bool {

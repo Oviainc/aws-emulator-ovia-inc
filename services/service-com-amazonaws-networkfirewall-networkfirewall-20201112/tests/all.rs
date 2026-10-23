@@ -15,6 +15,8 @@
 mod error_messages;
 #[path = "all/firewall_lifecycle.rs"]
 mod firewall_lifecycle;
+#[path = "all/flow_operations.rs"]
+mod flow_operations;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/resource_policies.rs"]

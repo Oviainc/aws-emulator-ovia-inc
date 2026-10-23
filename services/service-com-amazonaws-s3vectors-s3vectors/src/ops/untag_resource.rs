@@ -155,6 +155,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The `aws:` tag-key namespace is AWS's own: a tag in it cannot be deleted
+        // by a caller any more than it can be created by one, so a request naming
+        // such a key is refused before anything is resolved or removed.
+        crate::state::validate_tag_keys("tagKeys", input.tag_keys.iter().map(String::as_str))
+            .map_err(refusal)?;
+
         let mut store = state.lock();
         // The resource must exist for its tags to be removed: an ARN naming a vector
         // bucket or vector index this store does not hold is the modelled 404, which

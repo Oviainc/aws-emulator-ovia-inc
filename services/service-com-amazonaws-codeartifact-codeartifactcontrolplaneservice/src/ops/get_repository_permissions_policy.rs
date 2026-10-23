@@ -196,14 +196,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A repository holds at most one resource policy and starts with none: until
         // `PutRepositoryPermissionsPolicy` attaches one there is no policy resource to
-        // report, which is a not-found rather than an empty success.
+        // report, which is a not-found rather than an empty success. The message is built
+        // from the request through the rule every policy read shares — a repository's
+        // policy is addressed by TWO names, its domain's and its own.
         let Some(policy) = repository.policy.clone() else {
             return Err(
                 GetRepositoryPermissionsPolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "Repository policy not found. Repository '{}' in domain '{}' owned by account '{owner}' does not have a resource policy.",
-                            input.repository, input.domain
+                        message: crate::state::no_policy_message(
+                            &[
+                                crate::state::DOMAIN_RESOURCE_TYPE,
+                                crate::state::REPOSITORY_POLICY_RESOURCE_KIND,
+                            ],
+                            &[&input.domain, &input.repository],
                         ),
                         resource_id: Some(input.repository.clone()),
                         resource_type: Some("repository".to_string()),

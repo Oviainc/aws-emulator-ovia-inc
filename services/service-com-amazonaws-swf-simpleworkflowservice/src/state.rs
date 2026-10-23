@@ -8,6 +8,7 @@
 //! echoed back out of the request that asked for it.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use ::aws_smithy_types::DateTime;
 use ::sha2::{Digest, Sha256};
@@ -20,8 +21,10 @@ use crate::ops::types::{
     HistoryEvent, ResourceTag, TagFilter, TaskList, WorkflowExecution,
     WorkflowExecutionCancelRequestedEventAttributes,
     WorkflowExecutionConfiguration, WorkflowExecutionFilter, WorkflowExecutionInfo,
-    WorkflowExecutionOpenCounts, WorkflowExecutionStartedEventAttributes,
-    WorkflowExecutionTerminatedEventAttributes, WorkflowType, WorkflowTypeConfiguration,
+    WorkflowExecutionOpenCounts, WorkflowExecutionSignaledEventAttributes,
+    WorkflowExecutionStartedEventAttributes,
+    WorkflowExecutionTerminatedEventAttributes, WorkflowExecutionTimedOutEventAttributes,
+    WorkflowType, WorkflowTypeConfiguration,
     WorkflowTypeFilter, WorkflowTypeInfo,
 };
 
@@ -53,6 +56,58 @@ pub const EXECUTION_STATUS_CLOSED: &str = "CLOSED";
 /// `CloseStatus` of an execution closed by `TerminateWorkflowExecution`. One of
 /// [`crate::ops::types::CLOSE_STATUS_VALUES`].
 pub const CLOSE_STATUS_TERMINATED: &str = "TERMINATED";
+
+/// `CloseStatus` of an execution the service itself closed because its
+/// `executionStartToCloseTimeout` ran out. One of
+/// [`crate::ops::types::CLOSE_STATUS_VALUES`], whose own doc calls it "TIMED_OUT – the
+/// execution did not complete in the alloted time and was automatically timed out".
+pub const CLOSE_STATUS_TIMED_OUT: &str = "TIMED_OUT";
+
+/// The `timeoutType` a `WorkflowExecutionTimedOut` event carries: the only member of
+/// [`crate::ops::types::WORKFLOW_EXECUTION_TIMEOUT_TYPE_VALUES`], because the
+/// start-to-close budget is the one timeout an execution as a whole has.
+pub const WORKFLOW_EXECUTION_TIMEOUT_START_TO_CLOSE: &str = "START_TO_CLOSE";
+
+/// How long a run whose `executionStartToCloseTimeout` is the member's published lower
+/// bound of zero stays OPEN before the start-to-close sweep closes it.
+///
+/// `StartWorkflowExecution` answers with the `runId` of a run it has OPENED and
+/// recorded a first decision task for, so a caller that acts straight after the call
+/// must be able to see that run open: a zero-second budget cannot mean "closed in the
+/// same instant it started". Emulator-chosen, and the only budget it applies to — a
+/// duration of one second or more is honoured exactly.
+pub const MIN_OPEN_EXECUTION_SPAN: Duration = Duration::from_millis(500);
+
+/// The `cause` a `WorkflowExecutionTerminated` event carries when the SERVICE closed
+/// the run because its history reached [`MAX_HISTORY_EVENTS_PER_EXECUTION`]. One of
+/// [`crate::ops::types::WORKFLOW_EXECUTION_TERMINATED_CAUSE_VALUES`].
+pub const TERMINATED_CAUSE_EVENT_LIMIT_EXCEEDED: &str = "EVENT_LIMIT_EXCEEDED";
+
+/// How many history events one workflow execution holds. Amazon SWF Quotas records a
+/// maximum of 25,000 events per workflow execution history, and an execution that
+/// reaches it is terminated by the service rather than grown further — which is what
+/// [`Execution::terminate_for_event_limit`] does, and what bounds the memory one run's
+/// history can take however many times a caller signals or polls it.
+pub const MAX_HISTORY_EVENTS_PER_EXECUTION: usize = 25_000;
+
+/// How many simultaneous `PollForDecisionTask` long polls one task list admits. The
+/// Amazon SWF Developer Guide's "Quotas on task executions" records a maximum of 1,000
+/// pollers per task list; a poll offered past it is answered with the modelled
+/// `LimitExceededFault` ("Returned by any operation if a system imposed limitation has
+/// been reached").
+pub const MAX_POLLERS_PER_TASK_LIST: usize = 1_000;
+
+/// How long a decision-task long poll holds its answer open while its task list is
+/// empty. `PollForDecisionTask`'s own doc: "If no decision task is available in the
+/// specified task list before the timeout of 60 seconds expires, an empty result is
+/// returned."
+pub const DECISION_POLL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often an open decision-task long poll re-reads its task list. Emulator-chosen,
+/// and small enough that a task scheduled while a poll is waiting is handed over
+/// promptly ("responds as soon a task becomes available") without the pollers one list
+/// admits spinning on the state lock between them.
+pub const DECISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The maximum `workflowExecutionRetentionPeriodInDays` RegisterDomain accepts. The
 /// member's own doc: "The maximum workflow execution retention period is 90 days."
@@ -352,7 +407,9 @@ pub enum EventAttributes {
     /// `ActivityTaskScheduledEventAttributes` carries eleven members, several times the
     /// size of the other variants.
     ActivityTaskScheduled(Box<ActivityTaskScheduledEventAttributes>),
+    WorkflowExecutionSignaled(WorkflowExecutionSignaledEventAttributes),
     WorkflowExecutionTerminated(WorkflowExecutionTerminatedEventAttributes),
+    WorkflowExecutionTimedOut(WorkflowExecutionTimedOutEventAttributes),
     WorkflowExecutionCancelRequested(WorkflowExecutionCancelRequestedEventAttributes),
 }
 
@@ -367,7 +424,9 @@ impl EventAttributes {
             Self::DecisionTaskCompleted(_) => "DecisionTaskCompleted",
             Self::DecisionTaskTimedOut(_) => "DecisionTaskTimedOut",
             Self::ActivityTaskScheduled(_) => "ActivityTaskScheduled",
+            Self::WorkflowExecutionSignaled(_) => "WorkflowExecutionSignaled",
             Self::WorkflowExecutionTerminated(_) => "WorkflowExecutionTerminated",
+            Self::WorkflowExecutionTimedOut(_) => "WorkflowExecutionTimedOut",
             Self::WorkflowExecutionCancelRequested(_) => "WorkflowExecutionCancelRequested",
         }
     }
@@ -388,7 +447,9 @@ impl EventAttributes {
             | Self::DecisionTaskScheduled(_)
             | Self::DecisionTaskCompleted(_)
             | Self::ActivityTaskScheduled(_)
+            | Self::WorkflowExecutionSignaled(_)
             | Self::WorkflowExecutionTerminated(_)
+            | Self::WorkflowExecutionTimedOut(_)
             | Self::WorkflowExecutionCancelRequested(_) => None,
         }
     }
@@ -406,7 +467,9 @@ impl EventAttributes {
             | Self::DecisionTaskScheduled(_)
             | Self::DecisionTaskStarted(_)
             | Self::ActivityTaskScheduled(_)
+            | Self::WorkflowExecutionSignaled(_)
             | Self::WorkflowExecutionTerminated(_)
+            | Self::WorkflowExecutionTimedOut(_)
             | Self::WorkflowExecutionCancelRequested(_) => None,
         }
     }
@@ -431,7 +494,9 @@ impl EventAttributes {
             | Self::DecisionTaskCompleted(_)
             | Self::DecisionTaskTimedOut(_)
             | Self::ActivityTaskScheduled(_)
+            | Self::WorkflowExecutionSignaled(_)
             | Self::WorkflowExecutionTerminated(_)
+            | Self::WorkflowExecutionTimedOut(_)
             | Self::WorkflowExecutionCancelRequested(_) => None,
         }
     }
@@ -475,8 +540,14 @@ impl HistoryEventRecord {
             EventAttributes::ActivityTaskScheduled(attributes) => {
                 event.activity_task_scheduled_event_attributes = Some(attributes.as_ref().clone());
             }
+            EventAttributes::WorkflowExecutionSignaled(attributes) => {
+                event.workflow_execution_signaled_event_attributes = Some(attributes.clone());
+            }
             EventAttributes::WorkflowExecutionTerminated(attributes) => {
                 event.workflow_execution_terminated_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::WorkflowExecutionTimedOut(attributes) => {
+                event.workflow_execution_timed_out_event_attributes = Some(attributes.clone());
             }
             EventAttributes::WorkflowExecutionCancelRequested(attributes) => {
                 event.workflow_execution_cancel_requested_event_attributes =
@@ -647,6 +718,114 @@ impl Execution {
     /// Whether this run is still OPEN.
     pub fn is_open(&self) -> bool {
         self.status == EXECUTION_STATUS_OPEN
+    }
+
+    /// The instant this run's start-to-close budget runs out: the instant it started
+    /// plus the `executionStartToCloseTimeout` it resolved at start.
+    ///
+    /// The budget keeps the value the caller asked for — `executionStartToCloseTimeout`
+    /// is "The total duration for this workflow execution", in seconds — so it is read
+    /// off the stored configuration rather than chosen here. The one exception is the
+    /// published lower bound of that member ("an integer greater than or equal to 0"):
+    /// a zero budget would have the run close in the same instant it opened, so no
+    /// caller could ever observe the OPEN run `StartWorkflowExecution` reports, and it
+    /// is floored at [`MIN_OPEN_EXECUTION_SPAN`]. Every value of one second or more is
+    /// exact.
+    ///
+    /// `None` when the stored duration is not a number of seconds, which is the only
+    /// way a run can have no deadline at all.
+    pub fn start_to_close_deadline(&self) -> Option<DateTime> {
+        let budget = Duration::from_secs(decimal(
+            &self.effective_config.execution_start_to_close_timeout,
+        )?)
+        .max(MIN_OPEN_EXECUTION_SPAN);
+        let nanos =
+            u64::from(self.start_timestamp.subsec_nanos()) + u64::from(budget.subsec_nanos());
+        let seconds = i64::try_from(budget.as_secs() + nanos / 1_000_000_000).ok()?;
+        Some(DateTime::from_secs_and_nanos(
+            self.start_timestamp.secs().checked_add(seconds)?,
+            u32::try_from(nanos % 1_000_000_000).ok()?,
+        ))
+    }
+
+    /// The instant at which the clock already owed this run a start-to-close timeout,
+    /// when it is still open and that instant is no later than `at`; `None` when
+    /// nothing is owed.
+    ///
+    /// The answer is the DEADLINE, not `at`: the timeout happened when the budget ran
+    /// out, whether or not anybody called in that instant, so the event and the close
+    /// instant it produces are stamped there.
+    pub fn due_start_to_close_timeout(&self, at: DateTime) -> Option<DateTime> {
+        if !self.is_open() {
+            return None;
+        }
+        let due = self.start_to_close_deadline()?;
+        (instant_key(due) <= instant_key(at)).then_some(due)
+    }
+
+    /// Close this run as the start-to-close timeout the clock made due at `at`: exactly
+    /// one `WorkflowExecutionTimedOut` event (`timeoutType=START_TO_CLOSE`, carrying the
+    /// run's own `childPolicy`), `executionStatus=CLOSED` with
+    /// `closeStatus=TIMED_OUT`, and nothing left in flight.
+    ///
+    /// Only ever called on an open run (see [`Execution::due_start_to_close_timeout`]),
+    /// which is what makes the event appear exactly once however many times the sweep
+    /// runs.
+    pub fn time_out(&mut self, at: DateTime) {
+        self.status = EXECUTION_STATUS_CLOSED.to_string();
+        self.close_status = Some(CLOSE_STATUS_TIMED_OUT.to_string());
+        self.close_timestamp = Some(at);
+        self.open_decision_tasks = 0;
+        self.open_activity_tasks = 0;
+        self.open_timers = 0;
+        self.open_child_executions = 0;
+        self.open_lambda_functions = 0;
+        self.append_event(
+            at,
+            EventAttributes::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutEventAttributes {
+                timeout_type: WORKFLOW_EXECUTION_TIMEOUT_START_TO_CLOSE.to_string(),
+                child_policy: self.effective_config.child_policy.clone(),
+            }),
+        );
+    }
+
+    /// Whether this run's history can take `events` more events and still hold the one
+    /// `WorkflowExecutionTerminated` event the service appends when it cannot, without
+    /// passing [`MAX_HISTORY_EVENTS_PER_EXECUTION`].
+    ///
+    /// Every caller-driven append asks this first, which is what bounds the memory one
+    /// run's history can hold however many times a caller signals or polls it.
+    pub fn has_history_room_for(&self, events: usize) -> bool {
+        self.history.len() + events < MAX_HISTORY_EVENTS_PER_EXECUTION
+    }
+
+    /// Close this run the way Amazon SWF closes one that has reached the history-size
+    /// quota: `WorkflowExecutionTerminated` with `cause=EVENT_LIMIT_EXCEEDED`, carrying
+    /// the run's own `childPolicy`, and `closeStatus=TERMINATED`.
+    ///
+    /// `WorkflowExecutionTerminatedCause` models exactly this cause, and `cause`'s own
+    /// doc — "If set, indicates that the workflow execution was automatically
+    /// terminated, and specifies the cause" — says the service, not a caller, did it.
+    pub fn terminate_for_event_limit(&mut self, at: DateTime) {
+        self.status = EXECUTION_STATUS_CLOSED.to_string();
+        self.close_status = Some(CLOSE_STATUS_TERMINATED.to_string());
+        self.close_timestamp = Some(at);
+        self.open_decision_tasks = 0;
+        self.open_activity_tasks = 0;
+        self.open_timers = 0;
+        self.open_child_executions = 0;
+        self.open_lambda_functions = 0;
+        self.append_event(
+            at,
+            EventAttributes::WorkflowExecutionTerminated(
+                WorkflowExecutionTerminatedEventAttributes {
+                    reason: None,
+                    details: None,
+                    child_policy: self.effective_config.child_policy.clone(),
+                    cause: Some(TERMINATED_CAUSE_EVENT_LIMIT_EXCEEDED.to_string()),
+                },
+            ),
+        );
     }
 
     /// How many of this run's decision tasks are still WAITING in `task_list`: one per
@@ -925,6 +1104,12 @@ pub struct Domain {
     /// [`new_run_id`]. Strictly increasing and never reused, so no two runs of this
     /// domain can be given the same `runId`.
     pub next_run_sequence: u64,
+    /// Task-list name -> how many `PollForDecisionTask` long polls are open on that
+    /// list of this domain RIGHT NOW. A poll is counted while it holds its answer
+    /// open and uncounted the instant it ends, which is what
+    /// [`MAX_POLLERS_PER_TASK_LIST`] is enforced against; an entry drops out of the map
+    /// when its last poller leaves, so the map holds only lists with live pollers.
+    pub decision_pollers: HashMap<String, usize>,
 }
 
 impl Domain {
@@ -942,6 +1127,7 @@ impl Domain {
             executions: HashMap::new(),
             open_by_workflow_id: HashMap::new(),
             next_run_sequence: 0,
+            decision_pollers: HashMap::new(),
         }
     }
 
@@ -1079,6 +1265,129 @@ impl Domain {
             None => self.open_by_workflow_id.get(workflow_id).cloned(),
         }
     }
+
+    /// Close every run of this domain whose start-to-close budget the clock has
+    /// already spent, as of `at`.
+    ///
+    /// This is the service's own reaping of abandoned executions: the close was owed at
+    /// the deadline whether or not anybody called, so every operation materialises what
+    /// is already due before it answers — which is why a run left completely unattended
+    /// still reads back CLOSED/TIMED_OUT, is gone from the open listings and appears in
+    /// the closed ones.
+    pub fn materialise_due_timeouts(&mut self, at: DateTime) {
+        let mut timed_out: Vec<(String, String)> = Vec::new();
+        for execution in self.executions.values_mut() {
+            if let Some(due) = execution.due_start_to_close_timeout(at) {
+                execution.time_out(due);
+                timed_out.push((execution.workflow_id.clone(), execution.run_id.clone()));
+            }
+        }
+        // A timed-out run is no longer the open run of its `workflowId`, so that id
+        // becomes startable again.
+        for (workflow_id, run_id) in timed_out {
+            self.release_open_run(&workflow_id, &run_id);
+        }
+    }
+
+    /// How many decision-task long polls are open on `task_list` of this domain.
+    pub fn open_decision_pollers(&self, task_list: &str) -> usize {
+        self.decision_pollers.get(task_list).copied().unwrap_or(0)
+    }
+
+    /// Count one more decision-task poller on `task_list`, or answer `false` when that
+    /// list already holds [`MAX_POLLERS_PER_TASK_LIST`] of them — the admission a
+    /// `LimitExceededFault` refuses.
+    pub fn admit_decision_poller(&mut self, task_list: &str) -> bool {
+        let open = self
+            .decision_pollers
+            .entry(task_list.to_string())
+            .or_insert(0);
+        if *open >= MAX_POLLERS_PER_TASK_LIST {
+            return false;
+        }
+        *open += 1;
+        true
+    }
+
+    /// Give back one decision-task poller slot on `task_list`.
+    pub fn release_decision_poller(&mut self, task_list: &str) {
+        if let Some(open) = self.decision_pollers.get_mut(task_list) {
+            *open = open.saturating_sub(1);
+            if *open == 0 {
+                self.decision_pollers.remove(task_list);
+            }
+        }
+    }
+
+    /// Drop this domain's open-run index entry for `(workflow_id, run_id)`, the move a
+    /// close makes: the `workflowId` becomes startable again.
+    ///
+    /// Only that run's own entry is cleared — it is removed when the `runId` it points
+    /// at is the one just closed — so a future operation that relaxes the
+    /// one-open-run-per-`workflowId` invariant cannot drop another run's entry.
+    pub fn release_open_run(&mut self, workflow_id: &str, run_id: &str) {
+        if self
+            .open_by_workflow_id
+            .get(workflow_id)
+            .is_some_and(|open| open == run_id)
+        {
+            self.open_by_workflow_id.remove(workflow_id);
+        }
+    }
+}
+
+/// The task-list admission one open `PollForDecisionTask` long poll holds.
+///
+/// Dropping it releases the slot, so a poll that ends — with a task, with an empty
+/// result, or because the caller hung up and the handler's future was cancelled —
+/// never leaves the task list's poller count inflated. The slot keeps its own handle on
+/// the store for that, so it does not borrow the guard the admission was taken under.
+///
+/// NEVER drop one while holding the state lock: the drop takes that same lock to give
+/// the slot back.
+pub struct DecisionPollerSlot {
+    state: ::engine::ServiceState<ComAmazonawsSwfSimpleworkflowserviceState>,
+    domain: String,
+    task_list: String,
+}
+
+impl DecisionPollerSlot {
+    /// Take one poller slot on `(domain, task_list)` through the already-held `guard`,
+    /// or answer `None` when that task list is at [`MAX_POLLERS_PER_TASK_LIST`].
+    pub fn admit(
+        state: &::engine::ServiceState<ComAmazonawsSwfSimpleworkflowserviceState>,
+        guard: &mut ComAmazonawsSwfSimpleworkflowserviceState,
+        domain: &str,
+        task_list: &str,
+    ) -> Option<Self> {
+        guard
+            .domains
+            .get_mut(domain)?
+            .admit_decision_poller(task_list)
+            .then(|| Self {
+                state: state.clone(),
+                domain: domain.to_string(),
+                task_list: task_list.to_string(),
+            })
+    }
+}
+
+impl ::std::fmt::Debug for DecisionPollerSlot {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.debug_struct("DecisionPollerSlot")
+            .field("domain", &self.domain)
+            .field("task_list", &self.task_list)
+            .finish()
+    }
+}
+
+impl Drop for DecisionPollerSlot {
+    fn drop(&mut self) {
+        let mut guard = self.state.lock();
+        if let Some(domain) = guard.domains.get_mut(&self.domain) {
+            domain.release_decision_poller(&self.task_list);
+        }
+    }
 }
 
 /// Per-service state for com-amazonaws-swf-simpleworkflowservice. A handler reaches it through [`service_state`].
@@ -1101,6 +1410,21 @@ impl ComAmazonawsSwfSimpleworkflowserviceState {
     pub fn domain_by_arn(&self, arn: &str) -> Option<&Domain> {
         let name = domain_name_from_arn(arn)?;
         self.domains.get(name).filter(|domain| domain.arn == arn)
+    }
+
+    /// Materialise the clock-owed closes of ONE domain — the domain the call addresses
+    /// — before that domain is read or written (see
+    /// [`Domain::materialise_due_timeouts`]).
+    ///
+    /// Every handler that reads or writes an execution calls this first, so no caller
+    /// can observe a run that the service itself should already have reaped. It is
+    /// scoped to the one domain the call answers from: another domain's runs are reaped
+    /// by the call that asks about them, so the work one request does stays
+    /// proportional to what it reports on.
+    pub fn materialise_due_timeouts_in(&mut self, domain: &str, at: DateTime) {
+        if let Some(domain) = self.domains.get_mut(domain) {
+            domain.materialise_due_timeouts(at);
+        }
     }
 }
 
@@ -1386,6 +1710,50 @@ pub fn decode_history_page_token(token: &str, reverse_order: bool) -> Result<i64
 /// into a comparable key.
 pub fn instant_key(at: DateTime) -> (i64, u32) {
     (at.secs(), at.subsec_nanos())
+}
+
+/// One page of a run's history, and whether the log holds more after it.
+///
+/// Both readers of a history page follow this one rule — `GetWorkflowExecutionHistory`
+/// ("the result returned might be split up across a number of pages") and
+/// `PollForDecisionTask` ("a paginated view of the history of the workflow execution"):
+/// `reverse_order` chooses the direction ("By default the results are returned in
+/// ascending order of the eventTimestamp of the events"), `page_size` bounds the page,
+/// and `resume_after` names the event the previous page ended on, so appending to the
+/// log between two pages cannot shift what the next one holds.
+///
+/// `Err` when `resume_after` names an event this log does not hold — the token does not
+/// address this history.
+pub fn history_page(
+    history: &[HistoryEventRecord],
+    reverse_order: bool,
+    page_size: usize,
+    resume_after: Option<i64>,
+) -> Result<(Vec<&HistoryEventRecord>, bool), String> {
+    let ordered: Vec<&HistoryEventRecord> = if reverse_order {
+        history.iter().rev().collect()
+    } else {
+        history.iter().collect()
+    };
+    let total = ordered.len();
+    // The position is searched for rather than computed from the id, so the cursor
+    // stays correct for any log the store can hold — including one whose ids are not a
+    // dense 1..n range.
+    let start = match resume_after {
+        Some(event_id) => ordered
+            .iter()
+            .position(|record| record.event_id == event_id)
+            .map(|position| position + 1)
+            .ok_or_else(|| {
+                format!(
+                    "nextPageToken resumes after event {event_id}, which this execution's \
+                     history does not hold"
+                )
+            })?,
+        None => 0,
+    };
+    let end = (start + page_size).min(total);
+    Ok((ordered[start..end].to_vec(), end < total))
 }
 
 /// The total order a visibility listing of workflow executions pages through: the
