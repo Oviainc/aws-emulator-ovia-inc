@@ -17,6 +17,8 @@ mod approval_rules_and_commits;
 mod batch_get_repositories;
 #[path = "all/blob_content.rs"]
 mod blob_content;
+#[path = "all/branch_create.rs"]
+mod branch_create;
 #[path = "all/branch_creation.rs"]
 mod branch_creation;
 #[path = "all/comment_content_deletion.rs"]
