@@ -7,6 +7,12 @@
 //! `identify_languages`, so a batch answer and a single-document answer for the same
 //! text are the same answer — and is reported at its own zero-based input position.
 //!
+//! Both documented batch quotas are PRECONDITIONS OF THE REQUEST, checked before any
+//! document is identified and refusing the call whole: a `TextList` longer than the
+//! documented 25 documents with `BatchSizeLimitExceededException`, and a `TextList`
+//! carrying any document past the documented per-document byte ceiling with
+//! `TextSizeLimitExceededException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -82,14 +88,14 @@ use super::types::*;
 
 use super::detect_dominant_language::identify_languages;
 
-/// The most documents one call may carry.
-///
-/// From the modelled member documentation of
-/// `BatchDetectDominantLanguageRequest$TextList` ("The list can contain a maximum of
-/// 25 documents.") and from `BatchSizeLimitExceededException` itself ("The number of
-/// documents in the request exceeds the limit of 25."). A longer list is refused with
-/// that modelled error; the model's `@length` floor of 1 is enforced at the boundary.
-const MAX_BATCH_DOCUMENTS: usize = 25;
+/// The most documents one call may carry: the ONE ceiling the whole `BatchDetect*`
+/// family shares, [`crate::state::MAX_BATCH_DOCUMENTS`], from the modelled member
+/// documentation of `BatchDetectDominantLanguageRequest$TextList` ("The list can
+/// contain a maximum of 25 documents.") and from `BatchSizeLimitExceededException`
+/// itself ("The number of documents in the request exceeds the limit of 25."). A
+/// longer list is refused with that modelled error; the model's `@length` floor of 1
+/// is enforced at the boundary.
+const MAX_BATCH_DOCUMENTS: usize = crate::state::MAX_BATCH_DOCUMENTS;
 
 /// The largest single document in the batch, in UTF-8 bytes.
 ///
@@ -99,19 +105,13 @@ const MAX_BATCH_DOCUMENTS: usize = 25;
 /// documentation rounds it to "5 KB"; the enforced quota is a count of BYTES, so it
 /// is that constant and not a multiple of 1024.
 ///
-/// The quota is PER DOCUMENT, so an oversized document is reported as that
-/// document's `BatchItemError` rather than failing the whole call: the modelled
-/// `ErrorList` holds "one object for each document that contained an error", and its
-/// companion sentence — "If all of the documents contain an error, the ResultList is
-/// empty" — only describes a reachable response if a document's own failure leaves
-/// the call itself successful.
+/// The quota is measured per document and enforced over the REQUEST: a batch
+/// carrying any document past it is refused in its entirety with the modelled
+/// `TextSizeLimitExceededException`, through
+/// [`crate::state::batch_text_size_refusal`], rather than answered with a per-index
+/// `BatchItemError`. The modelled `ErrorList` describes documents a call that was
+/// ACCEPTED could not analyse; a document the quota refuses was never accepted.
 const MAX_DOCUMENT_BYTES: usize = crate::state::REALTIME_TEXT_QUOTA_BYTES;
-
-/// The `BatchItemError$ErrorCode` a document past [`MAX_DOCUMENT_BYTES`] carries: the
-/// screaming-snake-case spelling of the operation's own
-/// `TextSizeLimitExceededException`, which is the error that same document would get
-/// if it were submitted on its own.
-const TEXT_SIZE_LIMIT_ERROR_CODE: &str = "TEXT_SIZE_LIMIT_EXCEEDED";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -194,41 +194,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 BatchDetectDominantLanguageErrorModeled::BatchSizeLimitExceededException(
                     BatchSizeLimitExceededException {
-                        message: Some(format!(
-                            "The number of documents in the request ({}) exceeds the limit \
-                             of {MAX_BATCH_DOCUMENTS}. Try your request again with fewer \
-                             documents.",
-                            input.text_list.len()
-                        )),
+                        message: Some(crate::state::batch_size_limit_refusal()),
                     },
                 )
                 .into(),
             );
         }
 
-        // Both lists are built in input order, so each is "sorted in ascending order
-        // by the Index field" and every entry's `Index` is its document's own
-        // zero-based position — the only mapping a caller has back to its input.
+        // The per-document byte quota, applied to the WHOLE request: a batch
+        // carrying an oversized document is refused before anything is identified,
+        // so no partial `ResultList` travels with the refusal.
+        if let Some(message) = crate::state::batch_text_size_refusal(
+            input.text_list.iter().map(String::as_str),
+            MAX_DOCUMENT_BYTES,
+        ) {
+            return Err(
+                BatchDetectDominantLanguageErrorModeled::TextSizeLimitExceededException(
+                    TextSizeLimitExceededException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every precondition holds, so the whole batch is identified: `ResultList`
+        // is built in input order, so it is "sorted in ascending order by the Index
+        // field" and every entry's `Index` is its document's own zero-based position
+        // — the only mapping a caller has back to its input.
         //
         // Each document is identified through the same `identify_languages` seam the
         // single-document operation uses, so the engine runs off the async worker and
         // the `.await` between documents is a yield point: a 25-document batch cannot
         // hold a runtime worker for the whole call.
         let mut result_list = Vec::new();
-        let mut error_list = Vec::new();
         for (position, text) in input.text_list.into_iter().enumerate() {
-            let index = i32::try_from(position).ok();
-            // The ONE size check and the ONE size-report sentence every real-time
-            // inference operation shares; here it is the document's own
-            // `BatchItemError`, whose `Index` already says which document it is.
-            if let Some(message) = crate::state::text_size_refusal(&text, MAX_DOCUMENT_BYTES) {
-                error_list.push(BatchItemError {
-                    index,
-                    error_code: Some(TEXT_SIZE_LIMIT_ERROR_CODE.to_string()),
-                    error_message: Some(message),
-                });
-                continue;
-            }
             let languages = identify_languages(text).await.map_err(|message| {
                 BatchDetectDominantLanguageErrorModeled::InternalServerException(
                     InternalServerException {
@@ -237,14 +237,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
             result_list.push(BatchDetectDominantLanguageItemResult {
-                index,
+                index: i32::try_from(position).ok(),
                 languages: Some(languages),
             });
         }
 
         Ok(BatchDetectDominantLanguageOutput {
             result_list,
-            error_list,
+            // "A list containing one object for each document that contained an
+            // error": a document an ACCEPTED call could not analyse. Both conditions
+            // this operation can detect — the batch size and a document's size —
+            // refuse the request instead, and the identification engine answers for
+            // any accepted document, so an accepted batch leaves no document
+            // unanalysed and the list is empty, as the modelled member's own sentence
+            // provides for ("If there are no errors in the batch, the ErrorList is
+            // empty").
+            error_list: Vec::new(),
         })
     }
 }

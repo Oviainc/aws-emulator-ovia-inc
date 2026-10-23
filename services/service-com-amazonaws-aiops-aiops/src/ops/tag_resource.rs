@@ -148,24 +148,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // Every tag key's and value's length and pattern is a modelled constraint the
         // centralized walk has already refused anything outside of. The `Tags` map
-        // carries NO modelled length, so its bound is checked here — on the map this
-        // request sent, and then on the set the resource ends up with.
+        // carries NO modelled length, so the published per-resource maximum is applied
+        // here \u2014 to the set the resource ENDS UP with, which is what the rule bounds.
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the investigation group store is unavailable".to_string()),
             })
         })?;
-
-        let too_large = |why: String| {
-            TagResourceError::from(TagResourceErrorModeled::ValidationException(
-                ValidationException { message: Some(why) },
-            ))
-        };
-        if let Some(why) = crate::state::collection_bounds_rejection(Some(&input.tags), None, None)
-        {
-            return Err(too_large(why));
-        }
 
         let mut store = state.lock();
         // `resourceArn` is the `InvestigationGroup` resource's `identifier` (this
@@ -186,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|key| !group.tags.contains_key(*key))
             .count();
         if let Some(why) = crate::state::tag_capacity_rejection(group.tags.len() + added) {
-            return Err(too_large(why));
+            return Err(crate::scaffolded::Scaffolded::bad_request(why));
         }
         for (key, value) in input.tags {
             group.tags.insert(key, value);

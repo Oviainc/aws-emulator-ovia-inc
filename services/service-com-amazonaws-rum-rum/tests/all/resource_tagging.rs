@@ -29,29 +29,15 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
-use crate::support::{call, create, emulator, get_app_monitor, Reply, ACCOUNT, REGION};
+use crate::support::{
+    call, create, emulator, get_app_monitor, percent_encoded, Reply, ACCOUNT, REGION,
+};
 
-/// Percent-encode one URI path segment or query value.
-///
-/// A `ResourceArn` is a non-greedy `@httpLabel`, so an SDK encodes it into ONE path
-/// segment — its `:` and `/` included — and a tag key travels the same way in a
-/// `@httpQuery` value (so a `+` in a key is not read as a space). Every byte outside the
-/// RFC 3986 unreserved set is escaped, which is a superset of what either needs; the
-/// sibling tagging suite in this crate encodes the same label the same way, so this
-/// suite does it in kind rather than making the crate's manifest — contended by several
-/// in-flight fixes — carry a dev-dependency for eight lines.
-fn percent_encoded(label: &str) -> String {
-    let mut out = String::new();
-    for byte in label.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(char::from(*byte))
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
-}
+/// The status a successful `TagResource`/`UntagResource` answers with: 204 No Content,
+/// the status the service sends for a tag write whose modelled output declares no member
+/// (`crate::state::TAGGING_NO_CONTENT_STATUS`; the dedicated suite
+/// `tagging_no_content.rs` pins it over the whole class of tag writes).
+const NO_CONTENT: u16 = 204;
 
 /// The wire error code RUM's tagging surface answers an ARN naming no resource with.
 const NOT_FOUND_CODE: &str = "NotFoundException";
@@ -340,8 +326,8 @@ async fn tagging_a_resource_leaves_exactly_the_merged_map_for_both_readers_to_re
         let reply = tag_resource(&router, &arn, &case.applied).await;
         assert_eq!(
             reply.status,
-            200,
-            "case {:?}: expected TagResource to answer 200, got {} {:?}",
+            NO_CONTENT,
+            "case {:?}: expected TagResource to answer {NO_CONTENT}, got {} {:?}",
             case.case,
             reply.status,
             String::from_utf8_lossy(&reply.body)
@@ -365,8 +351,8 @@ async fn tagging_a_resource_leaves_exactly_the_merged_map_for_both_readers_to_re
         let again = tag_resource(&router, &arn, &case.applied).await;
         assert_eq!(
             again.status,
-            200,
-            "case {:?}: expected the repeated TagResource to answer 200, got {}",
+            NO_CONTENT,
+            "case {:?}: expected the repeated TagResource to answer {NO_CONTENT}, got {}",
             case.case,
             again.status
         );
@@ -473,8 +459,8 @@ async fn untagging_removes_exactly_the_named_keys_and_leaves_every_other_tag() {
         let reply = untag_resource(&router, &arn, &case.removed).await;
         assert_eq!(
             reply.status,
-            200,
-            "case {:?}: expected UntagResource to answer 200, got {} {:?}",
+            NO_CONTENT,
+            "case {:?}: expected UntagResource to answer {NO_CONTENT}, got {} {:?}",
             case.case,
             reply.status,
             String::from_utf8_lossy(&reply.body)
@@ -657,8 +643,8 @@ async fn the_documented_fifty_tag_ceiling_is_enforced_at_the_bound_and_one_past_
     let reply = tag_resource(&router, &arn, &at_bound).await;
     assert_eq!(
         reply.status,
-        200,
-        "case \"{MAX_TAGS} tags\": expected TagResource to answer 200, got {} {:?}",
+        NO_CONTENT,
+        "case \"{MAX_TAGS} tags\": expected TagResource to answer {NO_CONTENT}, got {} {:?}",
         reply.status,
         String::from_utf8_lossy(&reply.body)
     );
@@ -675,8 +661,8 @@ async fn the_documented_fifty_tag_ceiling_is_enforced_at_the_bound_and_one_past_
     let reply = tag_resource(&router, &arn, &replacement).await;
     assert_eq!(
         reply.status,
-        200,
-        "case \"replace at the bound\": expected TagResource to answer 200, got {} {:?}",
+        NO_CONTENT,
+        "case \"replace at the bound\": expected TagResource to answer {NO_CONTENT}, got {} {:?}",
         reply.status,
         String::from_utf8_lossy(&reply.body)
     );

@@ -264,15 +264,18 @@ struct Row {
 ///
 /// They differ along everything the rule generalises over: the length and shape of the
 /// `accountId` naming the configuration (both published bounds of `TargetAccountId`), the
-/// shape of the `roleArn` (a plain role, a role with a path, a role in another partition),
-/// and whether the `description` is absent, empty, plain text, non-ASCII, or at
-/// `TargetAccountConfigurationDescription`'s published ceiling.
+/// shape of the `roleArn` of that account (a plain role, a role with a path, a role in
+/// another partition), and whether the `description` is absent, empty, plain text,
+/// non-ASCII, or at `TargetAccountConfigurationDescription`'s published ceiling.
 fn rows() -> Vec<Row> {
     vec![
         Row {
             case: "account-id-at-the-floor-no-description",
             account_id: account_id_of(ACCOUNT_ID_FLOOR),
-            role_arn: "arn:aws:iam::123456789012:role/FisTargetAccount".to_string(),
+            role_arn: format!(
+                "arn:aws:iam::{}:role/FisTargetAccount",
+                account_id_of(ACCOUNT_ID_FLOOR)
+            ),
             description: None,
         },
         Row {
@@ -296,6 +299,10 @@ fn rows() -> Vec<Row> {
         Row {
             case: "account-id-at-the-ceiling-description-at-the-ceiling",
             account_id: account_id_of(ACCOUNT_ID_CEILING),
+            // An `accountId` at `TargetAccountId`'s ceiling is no account NUMBER, so it
+            // names no account for a role to belong to and any well-formed role ARN is
+            // admissible; the ownership rule itself is asserted in
+            // `target_account_role_ownership.rs`.
             role_arn: "arn:aws:iam::555555555555:role/fis-ceiling".to_string(),
             description: Some("d".repeat(DESCRIPTION_CEILING)),
         },

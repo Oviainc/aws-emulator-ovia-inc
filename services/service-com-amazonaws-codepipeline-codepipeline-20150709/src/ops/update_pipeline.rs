@@ -165,9 +165,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let state = crate::state::require_state(&*self.engine)?;
 
+        // The same role rule a create is held to: `PipelineDeclaration$roleArn` is the
+        // role CodePipeline assumes to run the pipeline's actions, so an update that
+        // names a role IAM positively reports absent would leave a stored pipeline that
+        // cannot run. Only a definitive "no such role" refuses it (see
+        // `state::role_is_absent`).
+        let role_absent = crate::state::role_is_absent(ctx, &input.pipeline.role_arn).await;
+
+        let name = input.pipeline.name.clone();
+        let mut state = state.lock();
+        // The name is resolved FIRST: an update that names no stored pipeline is refused
+        // for that, whatever its declaration says, because there is nothing for the
+        // declaration to replace.
+        if !state.pipelines.contains_key(&name) {
+            return Err(UpdatePipelineErrorModeled::PipelineNotFoundException(
+                PipelineNotFoundException {
+                    message: Some(crate::state::pipeline_not_found_message(&name)),
+                },
+            )
+            .into());
+        }
+
         // The same structural rules a create is held to: the declaration the caller
         // sends is the FULL structure of the pipeline, so a structure that cannot
         // describe a pipeline is refused with the error shape modelling that defect.
+        if role_absent {
+            return Err(UpdatePipelineErrorModeled::InvalidStructureException(
+                InvalidStructureException {
+                    message: Some(format!(
+                        "CodePipeline is not authorized to perform AssumeRole on role {}",
+                        input.pipeline.role_arn
+                    )),
+                },
+            )
+            .into());
+        }
         if let Err(problem) = crate::state::validate_declaration(&input.pipeline) {
             let message = Some(problem.message().to_string());
             return Err(match problem {
@@ -181,16 +213,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         InvalidStageDeclarationException { message },
                     )
                 }
+                // A declaration past a quota is not malformed: it is more than this
+                // service runs, which is what `LimitExceededException` reports.
+                crate::state::DeclarationProblem::Limit(_) => {
+                    UpdatePipelineErrorModeled::LimitExceededException(LimitExceededException {
+                        message,
+                    })
+                }
             }
             .into());
         }
 
-        let name = input.pipeline.name.clone();
-        let mut state = state.lock();
         let pipeline = state.pipelines.get_mut(&name).ok_or_else(|| {
             UpdatePipelineError::from(UpdatePipelineErrorModeled::PipelineNotFoundException(
                 PipelineNotFoundException {
-                    message: Some(format!("pipeline {name} does not exist")),
+                    message: Some(crate::state::pipeline_not_found_message(&name)),
                 },
             ))
         })?;

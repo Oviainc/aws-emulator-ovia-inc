@@ -849,6 +849,25 @@ pub fn access_denied(denial: &authorization::Denied) -> AccessDeniedException {
 /// request carried. So it is a constant here rather than a format string.
 pub const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
+/// The HTTP status RUM's ARN-addressed tag WRITES answer on success: 204 No Content.
+///
+/// `TagResource` and `UntagResource` are the two operations of this service whose
+/// modelled output declares no member at all, and both are served by the tagging
+/// frontend: there is nothing for the answer to carry, and the status the service sends
+/// says so. The AWS CloudWatch RUM API reference gives `HTTP/1.1 204` as the response
+/// syntax of both, and every recorded response of either in the corpus is a 204 with no
+/// content (eleven steps across five fixtures). The model's own `@http.code` is 200 for
+/// both — defaulted on `TagResource`, declared on `UntagResource`
+/// (`smithy_query(query="operation", operation="TagResource,UntagResource")`) — but a
+/// status is what the service PUTS ON THE WIRE, and a client that distinguishes 204 from
+/// 200 (empty-body handling, a cache, an assertion on the success class) sees the
+/// difference, so the recorded behaviour is what the two handlers answer with.
+///
+/// `ListTagsForResource`, the frontend's third operation, reports a document and keeps
+/// the 200 its own output needs; every other operation of this service is addressed by
+/// `Name` or by `Id`, reports a document, and keeps its modelled status.
+pub const TAGGING_NO_CONTENT_STATUS: u16 = 204;
+
 /// `ResourceNotFoundException` for a `ResourceArn` that names no resource this service
 /// holds — the not-found refusal every tagging operation answers (HTTP 404).
 ///

@@ -158,7 +158,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeTrustedTokenIssuerErrorModeled::InternalServerException(
                 InternalServerException {
@@ -166,7 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let store = state.lock();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A READ, except for what the CLOCK already owes: an instance whose deletion
+        // instant has passed is gone, and the trusted token issuers held inside it with
+        // it, whether or not anybody described one.
+        store.on_request(&region, ::std::time::SystemTime::now());
 
         // Never created, or already deleted — the same answer either way: there is no
         // such trusted token issuer to describe.
@@ -175,9 +179,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DescribeTrustedTokenIssuerErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "No trusted token issuer found with the ARN {}",
-                            input.trusted_token_issuer_arn
+                        message: Some(crate::state::trusted_token_issuer_not_found_message(
+                            &input.trusted_token_issuer_arn,
                         )),
                         reason: None,
                     },

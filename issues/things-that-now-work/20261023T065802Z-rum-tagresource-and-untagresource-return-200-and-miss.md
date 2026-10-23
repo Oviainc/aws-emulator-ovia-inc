@@ -60,3 +60,33 @@ Boot the emulator, create an app monitor and take its ARN (arn:aws:rum:<region>:
 2) Cause 2: curl -i -X DELETE 'http://<emulator>/tags/<url-encoded-arn>?tagKeys=k' -> HTTP 200; AWS answers 204.
 3) Cause 3: curl -i -X DELETE 'http://<emulator>/tags/<url-encoded-arn>' (no tagKeys, i.e. an empty key list) -> HTTP 501 {"__type":"NotImplemented"}; AWS answers 204.
 Or replay fixtures rum-app-monitor-lifecycle-with-tags (task#2, task#7) and rum-empty-and-boundary-tag-operations (task#4).
+
+## Resolution
+
+All three causes fixed; every `Issue-Key` of this record replays as `fixed`.
+
+- Causes 1 and 2: both handlers' `SUCCESS_STATUS` is now `crate::state::TAGGING_NO_CONTENT_STATUS`
+  (204) — one constant for the two operations of this service whose modelled output
+  declares no member, carrying the evidence (the AWS CloudWatch RUM API reference's
+  `HTTP/1.1 204` response syntax plus the recorded corpus) and the note that the model's
+  own `@http.code` of 200 disagrees with what the service sends.
+- Cause 3: `src/service.rs`'s `override_operation` serves `UntagResource` for a `DELETE`
+  whose path is `/tags/<one label>` when the protocol can name no operation at all (the
+  framework's required-query-binding rule rejects that route when `tagKeys` is absent),
+  and `UntagResourceWireInput` in `src/ops/untag_resource.rs` reads an absent `tagKeys` as
+  the empty key list `TagKeyList`'s `@length(min: 0)` admits. Nothing else is relaxed:
+  `ResourceArn` absent is still a refusal, and the modelled `TagKey`/`TagKeyList`
+  constraints are still validated (51 keys are refused on the bound).
+
+### Remaining gap: two bytes of content on the 204
+
+`TagResourceResponse`/`UntagResourceResponse` are member-less STRUCTURES rather than
+`smithy.api#Unit`, and the vendored restJson1 serializer renders a member-less structure
+output as `{}` (`vendor/smithy-schema-server/src/rest_json.rs`, where only an
+`is_unit_shape` output gets an empty body). So these answers are a 204 carrying `{}`,
+where AWS sends a 204 with no content at all — and RFC 9110 forbids content on a 204.
+Closing that needs a change in the read-only `vendor/` tree (give the serializer an
+empty body for any output shape with no members, not just `smithy.api#Unit`), so it
+cannot be done from inside a service crate; the recorded comparison treats the two as
+equal and this crate's tests accept "empty or `{}`". Every other RUM operation with a
+member-less output (`PutRumEvents`, the deletes) is in the same position.

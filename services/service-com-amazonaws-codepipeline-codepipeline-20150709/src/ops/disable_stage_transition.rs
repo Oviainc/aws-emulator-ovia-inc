@@ -190,9 +190,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DisableStageTransitionError::from(
                     DisableStageTransitionErrorModeled::PipelineNotFoundException(
                         PipelineNotFoundException {
-                            message: Some(format!(
-                                "pipeline {} does not exist",
-                                input.pipeline_name
+                            message: Some(crate::state::pipeline_not_found_message(
+                                &input.pipeline_name,
                             )),
                         },
                     ),
@@ -211,6 +210,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The hold is what keeps an execution out of (Inbound) or in (Outbound) the
+        // stage until `EnableStageTransition` releases that same transition.
         pipeline.set_transition(
             &input.stage_name,
             &input.transition_type,

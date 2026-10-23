@@ -5,6 +5,12 @@
 //! 16-character id in [`crate::state`] and answers 201 with the ARN built from that
 //! id, the request's signing region and the emulator's account.
 //!
+//! Creating one is a one-time setup task per Region: an account holds at most
+//! [`crate::state::MAX_INVESTIGATION_GROUPS_PER_REGION`] group in the Region the
+//! request is signed for, so a create attempted while that Region already holds one
+//! is refused with the modelled `ServiceQuotaExceededException` (402) under the same
+//! lock the insert takes.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -208,7 +214,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // constraints, so the centralized walk has already refused anything outside
         // them with a 400 `ValidationException` before this body runs. The `tags` and
         // `chatbotNotificationChannel` maps and the `tagKeyBoundaries` list carry NO
-        // modelled length, so their bounds are checked here.
+        // modelled length, so their bounds are checked here, and so is the one rule
+        // the model cannot express about a cross-account source role.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateInvestigationGroupErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the investigation group store is unavailable".to_string()),
@@ -219,8 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.encryption_configuration.as_ref(),
         )
         .or_else(|| {
+            crate::state::cross_account_configurations_rejection(
+                input.cross_account_configurations.as_deref(),
+            )
+        })
+        .or_else(|| {
             crate::state::collection_bounds_rejection(
-                input.tags.as_ref(),
                 input.tag_key_boundaries.as_deref(),
                 input.chatbot_notification_channel.as_ref(),
             )
@@ -231,44 +242,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The `tags` map is a tag write, so it is bounded by the published per-resource
+        // tag maximum and refused the way the tagging frontend refuses one.
+        if let Some(why) = crate::state::tag_capacity_rejection(
+            input.tags.as_ref().map_or(0, std::collections::HashMap::len),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::bad_request(why));
+        }
+
         let parts = ctx.parts();
         let region = crate::state::request_region(parts);
         let principal = crate::state::caller_principal(parts);
         let created_at = crate::state::now_epoch_seconds();
 
+        // The quota check and the insert happen under ONE lock, so concurrent creates
+        // are serialized: the first to take the lock stores the Region's group and
+        // every other one sees it and is refused.
         let mut store = state.lock();
 
-        // A group's name identifies it (`{identifier}` resolves by name as well as by
-        // id or ARN), so a second group cannot take a name already in use.
-        if store.name_index.contains_key(&input.name) {
-            // Only the name the caller supplied is named back: the existing group's
-            // id is not something this caller asked about.
-            let message = format!(
-                "an investigation group named '{}' already exists",
-                input.name
+        // Creating an investigation group is a one-time setup task per Region: an
+        // account holds at most one there, and a create attempted while that one
+        // exists is refused rather than minting a second record.
+        if store.group_count_in_region(&region) >= crate::state::MAX_INVESTIGATION_GROUPS_PER_REGION
+        {
+            return Err(
+                CreateInvestigationGroupErrorModeled::ServiceQuotaExceededException(
+                    crate::state::region_quota_exceeded(),
+                )
+                .into(),
             );
-            return Err(CreateInvestigationGroupErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(message),
-                },
-            )
-            .into());
         }
 
-        // The store is finite: a create that would take it past its cap is refused
-        // rather than growing it, the way the service refuses one past its quota.
+        // The store is finite across regions too: a create that would take it past its
+        // own cap is refused rather than growing it.
         if store.investigation_groups.len() >= crate::state::MAX_INVESTIGATION_GROUPS {
             return Err(
                 CreateInvestigationGroupErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "this account already holds the maximum of {} investigation groups",
-                            crate::state::MAX_INVESTIGATION_GROUPS
-                        )),
-                        resource_type: Some("investigation-group".to_string()),
-                        service_code: Some(crate::state::ARN_SERVICE.to_string()),
-                        ..Default::default()
-                    },
+                    crate::state::store_capacity_exceeded(),
                 )
                 .into(),
             );
@@ -279,9 +289,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.insert_group(crate::state::InvestigationGroup {
             id,
             arn: arn.clone(),
+            region: region.clone(),
             name: input.name,
             role_arn: input.role_arn,
-            encryption_configuration: input.encryption_configuration,
+            // Omitting `encryptionConfiguration` selects the Amazon Web Services owned
+            // key, which is a configuration like any other: it is stored, so every
+            // later read reports how this group's data is encrypted.
+            encryption_configuration: Some(
+                input
+                    .encryption_configuration
+                    .unwrap_or_else(crate::state::default_encryption_configuration),
+            ),
             // `retentionInDays` and `isCloudTrailEventHistoryEnabled` each document the
             // value the service applies when the request omits them, so the stored
             // group — and every later read of it — carries that value, not nothing.

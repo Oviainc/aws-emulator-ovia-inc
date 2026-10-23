@@ -10,12 +10,12 @@
 //! what that catalog has to cover and why.
 //!
 //! Every handler PROJECTS its response out of these records, so the results of
-//! different operations agree: a `PlaceId` handed out by Geocode, SearchText,
-//! SearchNearby or ReverseGeocode resolves through GetPlace to the same `Title` and
-//! `Address`, and a `Position` handed out by any of them reverse-geocodes back to the
-//! place it came from.
+//! different operations agree: a `PlaceId` handed out by Autocomplete, Geocode,
+//! SearchText, SearchNearby or ReverseGeocode resolves through GetPlace to the same
+//! `Title` and `Address`, and a `Position` handed out by any of them
+//! reverse-geocodes back to the place it came from.
 //!
-//! Nothing here is mutated by a request. All five implemented operations are
+//! Nothing here is mutated by a request. Every operation this crate implements is
 //! `@readonly`, so even their pagination carries no server-side cursor: a `NextToken`
 //! is a self-describing, opaque string (see [`encode_page_token`]) rather than an
 //! entry written into state by a read.
@@ -209,10 +209,19 @@ pub const DEFAULT_MAX_RESULTS: i32 = 20;
 /// `ReverseGeocodeRequest$MaxResults`.
 pub const DEFAULT_REVERSE_MAX_RESULTS: i32 = 1;
 
-/// The inclusive maximum of every implemented operation's modeled `MaxResults`
-/// range (`range 1..100`), which is also the maximum length of their
-/// `*ResultItemList` outputs (`len 0..100`).
+/// The inclusive maximum of Geocode's, SearchText's, SearchNearby's and
+/// ReverseGeocode's modeled `MaxResults` range (`range 1..100`), which is also the
+/// maximum length of their `*ResultItemList` outputs (`len 0..100`).
 pub const MAX_RESULTS_CEILING: i32 = 100;
+
+/// Default `MaxResults` for Autocomplete: "Default value: 5" in
+/// `AutocompleteRequest$MaxResults`.
+pub const AUTOCOMPLETE_DEFAULT_MAX_RESULTS: i32 = 5;
+
+/// The inclusive maximum of Autocomplete's modeled `MaxResults` range
+/// (`range 1..20`), which is also the maximum length of its
+/// `AutocompleteResultItemList` output (`len 0..20`).
+pub const AUTOCOMPLETE_MAX_RESULTS_CEILING: i32 = 20;
 
 /// The inclusive bounds of the modeled `QueryRadius` (`DistanceMeters`,
 /// `range 1..21000000`) on ReverseGeocode and SearchNearby.
@@ -553,6 +562,137 @@ fn locate(query: &QueryTokens<'_>, text: &str) -> Option<Located> {
         end_index: last.end as i32,
         value: query.text[first.byte_start..last.byte_end].to_string(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Highlighting a RESULT's own text
+// ---------------------------------------------------------------------------
+
+/// The inclusive maximum number of entries a `HighlightList` carries
+/// (`HighlightList`, `len 0..200`).
+pub const HIGHLIGHT_LIST_MAX: usize = 200;
+
+/// One section of a piece of a RESULT's text that a query's terms accounted for:
+/// the span it occupies in that text, as the CHAR indices a `Highlight` reports,
+/// and the text of the span as the response carries it.
+///
+/// `AutocompleteHighlights` is documented as "how the parts of the response element
+/// matched the input query by returning the sections OF THE RESPONSE which matched
+/// to input query terms", so a highlight points into the text the response reports —
+/// a result's `Title` or one of its address components — and not into the query.
+/// It is the complement of [`ComponentMatch`], which points into the query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextHighlight {
+    /// `Highlight$StartIndex`: the first char of the section.
+    pub start_index: i32,
+    /// `Highlight$EndIndex`: one past its last char.
+    pub end_index: i32,
+    /// `Highlight$Value`: the section as the response spells it.
+    pub value: String,
+}
+
+/// One word of a piece of a result's own text, with where it sits in that text.
+struct TextWord<'a> {
+    /// The word as the text spells it.
+    text: &'a str,
+    /// Char index of the word's first character in the whole text.
+    start: usize,
+    /// Byte offset of the word's first character in the whole text.
+    byte_start: usize,
+    /// The word normalized the way an indexed term is ([`normalize_tokens`]), so
+    /// it compares against a query token through [`affinity`].
+    normalized: String,
+}
+
+/// The words of a piece of text: the runs of alphanumeric characters
+/// [`normalize_tokens`] splits on, each one keeping its place in the text.
+fn words_of(text: &str) -> Vec<TextWord<'_>> {
+    fn word(text: &str, start: usize, byte_start: usize, byte_end: usize) -> TextWord<'_> {
+        let slice = &text[byte_start..byte_end];
+        TextWord {
+            text: slice,
+            start,
+            byte_start,
+            normalized: slice.to_lowercase(),
+        }
+    }
+
+    let mut words = Vec::new();
+    let mut open: Option<(usize, usize)> = None;
+    for (char_index, (byte_index, character)) in text.char_indices().enumerate() {
+        if character.is_alphanumeric() {
+            if open.is_none() {
+                open = Some((char_index, byte_index));
+            }
+        } else if let Some((start, byte_start)) = open.take() {
+            words.push(word(text, start, byte_start, byte_index));
+        }
+    }
+    if let Some((start, byte_start)) = open {
+        words.push(word(text, start, byte_start, text.len()));
+    }
+    words
+}
+
+/// The sections of one piece of a result's text that a query's terms accounted
+/// for, in the order they occur in that text.
+///
+/// A word of the text is a section when a query term [matches] it: the WHOLE word
+/// where the term named it in full (or by a standard abbreviation of it), and the
+/// leading characters a partially typed term covers otherwise — which is what a
+/// client asked to complete a query highlights as the user types. Two sections with
+/// no word of their own between them are reported as ONE section, because the
+/// characters separating them (a space, a comma) are not text the query left
+/// unmatched.
+///
+/// [matches]: affinity
+pub fn highlight_matches(text: &str, query_tokens: &[String]) -> Vec<TextHighlight> {
+    // `[char start, char end, byte start, byte end]` of each section, so a section
+    // that grows by joining the next one is sliced out of the text once, at the end.
+    let mut spans: Vec<[usize; 4]> = Vec::new();
+    for word in words_of(text) {
+        let matched = query_tokens
+            .iter()
+            .filter_map(|token| match affinity(&word.normalized, token)? {
+                score if score >= 1.0 => Some(word.normalized.chars().count()),
+                _ => Some(token.chars().count()),
+            })
+            .max();
+        let Some(matched) = matched else {
+            continue;
+        };
+        // Taken off the word AS THE TEXT SPELLS IT: a highlight's value is a
+        // section of the response, so it keeps the response's own casing. Counting
+        // the characters taken rather than assuming `matched` of them is what keeps
+        // the span right for a word whose lowercase form is longer than itself.
+        let taken: String = word.text.chars().take(matched).collect();
+        if taken.is_empty() {
+            continue;
+        }
+        let char_end = word.start + taken.chars().count();
+        let byte_end = word.byte_start + taken.len();
+        let joins_previous = spans.last().is_some_and(|last| {
+            !text[last[3]..word.byte_start]
+                .chars()
+                .any(char::is_alphanumeric)
+        });
+        match spans.last_mut().filter(|_| joins_previous) {
+            Some(last) => {
+                last[1] = char_end;
+                last[3] = byte_end;
+            }
+            None => spans.push([word.start, char_end, word.byte_start, byte_end]),
+        }
+    }
+    spans
+        .into_iter()
+        .take(HIGHLIGHT_LIST_MAX)
+        .map(|[start, end, byte_start, byte_end]| TextHighlight {
+            start_index: start as i32,
+            end_index: end as i32,
+            value: text[byte_start..byte_end].to_string(),
+        })
+        .collect()
 }
 
 /// One component of a place that a query matched: how well, and the span of the
@@ -1113,6 +1253,9 @@ pub struct PlaceRecord {
     /// The normalized tokens free-form text queries match against, derived from the
     /// record's own text by [`index_terms`].
     pub search_terms: Vec<String>,
+    /// The normalized tokens a partially typed query is completed against, derived
+    /// from the text this record REPORTS by [`text_terms`].
+    pub completion_terms: Vec<String>,
     /// How many OTHER records of the catalog this place's extent covers, computed
     /// once when the catalog is seeded.
     ///
@@ -1154,6 +1297,7 @@ impl PlaceRecord {
             access_points: Vec::new(),
             time_zone: None,
             search_terms: Vec::new(),
+            completion_terms: Vec::new(),
             places_covered: 0,
         }
     }
@@ -1508,21 +1652,22 @@ impl PlaceRecord {
     ///
     /// [matches]: affinity
     pub fn text_score(&self, query_tokens: &[String]) -> Option<f64> {
-        if query_tokens.is_empty() {
-            return None;
-        }
-        let mut matched = 0.0;
-        for token in query_tokens {
-            matched += self
-                .search_terms
-                .iter()
-                .filter_map(|term| affinity(term, token))
-                .fold(f64::NAN, f64::max);
-            if matched.is_nan() {
-                return None;
-            }
-        }
-        Some(matched / query_tokens.len() as f64)
+        score_against(&self.search_terms, query_tokens)
+    }
+
+    /// How well a partially typed query COMPLETES to this record, or `None` when it
+    /// does not complete to it. Scored like [`PlaceRecord::text_score`].
+    ///
+    /// The terms are the record's own reported text alone — the names it is known
+    /// by and its address — and not the category vocabulary a text search also
+    /// indexes: Autocomplete "completes potential places and addresses as the user
+    /// types" and "enhances the efficiency and accuracy of address by completing
+    /// query based on a few entered keystrokes", while it is Suggest that is
+    /// documented to answer "relevant places, points of interest, query terms or
+    /// search category". So a completion is always a completion of text the result
+    /// itself spells, which is what lets it mark the sections that matched.
+    pub fn completion_score(&self, query_tokens: &[String]) -> Option<f64> {
+        score_against(&self.completion_terms, query_tokens)
     }
 
     /// The share of a free-form query that named this place's OWN name — its title
@@ -1723,12 +1868,29 @@ fn synthesize_place_id(title: &str, position: [f64; 2]) -> String {
     hex::encode_upper(digest)[..PLACE_ID_LEN].to_string()
 }
 
-/// The normalized tokens a record is found by: every name it is known by, its
-/// address, its categories, its food types and its business chains.
-///
-/// The CATEGORIES and FOOD TYPES are indexed because a category word is a query
-/// term: a large part of what a text search is asked is "find me a coffee shop",
-/// which names what the place IS rather than what it is called.
+/// How well a query matches a set of indexed terms, or `None` when it does not
+/// match them at all: the shared body of [`PlaceRecord::text_score`] and
+/// [`PlaceRecord::completion_score`], which differ only in the terms they match
+/// against.
+fn score_against(terms: &[String], query_tokens: &[String]) -> Option<f64> {
+    if query_tokens.is_empty() {
+        return None;
+    }
+    let mut matched = 0.0;
+    for token in query_tokens {
+        matched += terms
+            .iter()
+            .filter_map(|term| affinity(term, token))
+            .fold(f64::NAN, f64::max);
+        if matched.is_nan() {
+            return None;
+        }
+    }
+    Some(matched / query_tokens.len() as f64)
+}
+
+/// The normalized tokens of the text a record REPORTS: every name it is known by,
+/// its assembled label and each component of its address.
 ///
 /// Every LANGUAGE the entry holds text in IS indexed: a place is findable by the
 /// name any language gives it, and the result then renders in the language the
@@ -1739,7 +1901,7 @@ fn synthesize_place_id(title: &str, position: [f64; 2]) -> String {
 /// under the attribution the request's view selects, and a query answered with an
 /// attribution it did not ask for would name a country the response then
 /// contradicts.
-fn index_terms(place: &PlaceRecord) -> Vec<String> {
+fn text_terms(place: &PlaceRecord) -> Vec<String> {
     let label = place.assembled_label();
     let mut sources: Vec<String> = place.names().map(str::to_string).collect();
     sources.push(label);
@@ -1768,15 +1930,33 @@ fn index_terms(place: &PlaceRecord) -> Vec<String> {
     for names in place.address.names_by_language.values() {
         sources.extend(names.given().map(str::to_string));
     }
-    sources.extend(
-        place
-            .categories
-            .iter()
-            .flat_map(|category| [category.id.clone(), category.name.clone()]),
-    );
+    normalized_terms(&sources)
+}
+
+/// The normalized tokens a record is found by: the text it reports
+/// ([`text_terms`]), its categories, its food types and its business chains.
+///
+/// The CATEGORIES and FOOD TYPES are indexed because a category word is a query
+/// term: a large part of what a text search is asked is "find me a coffee shop",
+/// which names what the place IS rather than what it is called.
+fn index_terms(place: &PlaceRecord) -> Vec<String> {
+    let mut sources: Vec<String> = place
+        .categories
+        .iter()
+        .flat_map(|category| [category.id.clone(), category.name.clone()])
+        .collect();
     sources.extend(place.food_types.iter().cloned());
     sources.extend(place.business_chains.iter().cloned());
 
+    let mut terms = normalized_terms(&sources);
+    terms.extend(text_terms(place));
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+/// The sorted, deduplicated normalized tokens of a set of texts.
+fn normalized_terms(sources: &[String]) -> Vec<String> {
     let mut terms: Vec<String> = sources
         .iter()
         .flat_map(|source| normalize_tokens(source))
@@ -2001,21 +2181,30 @@ pub fn non_empty(values: Option<&[String]>) -> Option<&[String]> {
 
 /// Refuse a `MaxResults` outside the modeled `range 1..100`.
 ///
-/// Every implemented operation declares that range, so a value outside it is
-/// outside the contract whether or not the boundary validator caught it first:
-/// refusing here means an in-process caller gets the same answer as a client,
-/// rather than a page quietly sized differently from the one it asked for.
+/// Geocode, SearchText, SearchNearby and ReverseGeocode declare that range, so a
+/// value outside it is outside the contract whether or not the boundary validator
+/// caught it first: refusing here means an in-process caller gets the same answer
+/// as a client, rather than a page quietly sized differently from the one it asked
+/// for.
 pub fn check_max_results(max_results: Option<i32>) -> Result<(), ValidationException> {
+    check_max_results_up_to(max_results, MAX_RESULTS_CEILING)
+}
+
+/// Refuse a `MaxResults` outside `1..=ceiling`, the modeled `range` of the
+/// operation being served: an operation's own ceiling is part of its contract
+/// (Autocomplete's is 20 where its siblings' is 100), so each one is held to the
+/// range its own model declares.
+pub fn check_max_results_up_to(
+    max_results: Option<i32>,
+    ceiling: i32,
+) -> Result<(), ValidationException> {
     let Some(requested) = max_results else {
         return Ok(());
     };
     let broken = if requested < 1 {
         Some(must_not_be_less_than("MaxResults", "1"))
-    } else if requested > MAX_RESULTS_CEILING {
-        Some(must_not_be_greater_than(
-            "MaxResults",
-            &MAX_RESULTS_CEILING.to_string(),
-        ))
+    } else if requested > ceiling {
+        Some(must_not_be_greater_than("MaxResults", &ceiling.to_string()))
     } else {
         None
     };
@@ -2374,12 +2563,27 @@ impl ComAmazonawsGeoplacesPlacesserviceState {
 
     /// Every record a free-form query matches, in no particular order.
     pub fn text_candidates(&self, query: &str) -> Vec<Scored> {
+        self.candidates(query, PlaceRecord::text_score)
+    }
+
+    /// Every record a partially typed query completes to, in no particular order.
+    pub fn completion_candidates(&self, query: &str) -> Vec<Scored> {
+        self.candidates(query, PlaceRecord::completion_score)
+    }
+
+    /// Every record one free-form query scores against, under the scoring the
+    /// calling operation uses.
+    fn candidates(
+        &self,
+        query: &str,
+        score: impl Fn(&PlaceRecord, &[String]) -> Option<f64>,
+    ) -> Vec<Scored> {
         let tokens = normalize_tokens(query);
         self.places
             .iter()
             .enumerate()
             .filter_map(|(index, place)| {
-                place.text_score(&tokens).map(|score| Scored {
+                score(place, &tokens).map(|score| Scored {
                     index,
                     score,
                     name_score: place.name_score(&tokens),
@@ -3574,6 +3778,7 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
     let positions: Vec<[f64; 2]> = places.iter().map(|place| place.position).collect();
     for (index, place) in places.iter_mut().enumerate() {
         place.search_terms = index_terms(place);
+        place.completion_terms = text_terms(place);
         place.places_covered = positions
             .iter()
             .enumerate()

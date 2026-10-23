@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRecommendationSummaries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRecommendationSummaries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRecommendationSummaries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: aggregates the account's FINDINGS CATALOG (`crate::state::AnalysedResource`)
+//! into one summary per `RecommendationSourceType` the account has analysed resources of —
+//! how many of them carry each `Finding` the service reports for that resource type and
+//! why, how many run each `CurrentPerformanceRisk`, and what adopting the recommendations
+//! would save per month — one page at a time: at most `maxResults` summaries plus an
+//! opaque `nextToken` while summaries remain.
+//!
+//! Every number is computed from the stored rows, so a count, a saving and a percentage
+//! can never disagree with each other or with the per-resource findings those same rows
+//! describe. This operation only reads: nothing it answers writes to the store.
+//!
+//! `idleSummaries` and `idleSavingsOpportunity` describe a resource the analysis found
+//! IDLE, which is a record of its own (`crate::state::IdleRecommendationStore`, what
+//! `GetIdleRecommendations` reports) that no operation of this API writes, so a summary
+//! reports neither while that record is empty, and `aggregatedSavingsOpportunity`
+//! aggregates the rightsizing opportunity alone.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +179,286 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRecommendationSummaries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRecommendationSummariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetRecommendationSummariesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The Compute Optimizer findings store is unavailable.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A malformed request is refused before the store is read, so
+        // InvalidParameterValueException takes precedence over the opt-in gate below, as
+        // it does in this service's other readers.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRecommendationSummaries"))
+        // From the model's own `accountIds` doc: "Only one account ID can be specified per
+        // request."
+        let requested_accounts = input.account_ids.as_deref().unwrap_or_default();
+        if requested_accounts.len() > 1 {
+            return Err(
+                GetRecommendationSummariesErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "The value supplied for parameter accountIds is not valid: only one \
+                             account ID can be specified per request, not {}.",
+                            requested_accounts.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // An absent (or empty) `accountIds` asks for the caller's own findings; a member
+        // account id asks for that account's, which this emulator holds none of.
+        let account_id = requested_accounts
+            .first()
+            .cloned()
+            .unwrap_or_else(|| ::engine::emulator_account_id().to_string());
+
+        // A `nextToken` this operation did not issue cannot name a page boundary.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_summary_page_token(token) {
+                Some(resource_type) => Some(resource_type),
+                None => {
+                    return Err(
+                        GetRecommendationSummariesErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(
+                                    "The value supplied for parameter nextToken is not valid."
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+        };
+
+        // `maxResults` is modelled 0..1000 (the boundary refuses anything outside that).
+        // Whatever it asks for, the page is capped at `MAX_PAGE_SIZE` so no number a
+        // request carries can size the response or the allocation that builds it; and a
+        // request naming no size (or naming the range's lower bound `0`, which the service
+        // documents no meaning for) gets `DEFAULT_PAGE_SIZE` plus a `nextToken` to walk
+        // the rest — the same rule `GetRecommendationPreferences` pages by.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .filter(|requested| *requested > 0)
+            .unwrap_or(crate::state::DEFAULT_PAGE_SIZE)
+            .min(crate::state::MAX_PAGE_SIZE);
+
+        let guard = state.lock();
+        // "The account is not opted in to Compute Optimizer": the service analyses an
+        // account's resources only once it has opted in, so an account that never did —
+        // or that opted back out — reads no findings at all.
+        if !guard.enrollment.is_opted_in() {
+            return Err(
+                GetRecommendationSummariesErrorModeled::OptInRequiredException(
+                    OptInRequiredException {
+                        message: Some(
+                            "The account is not opted in to Compute Optimizer.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut recommendation_summaries: Vec<RecommendationSummary> = Vec::new();
+        let mut next_token = None;
+        for (resource_type, resources) in guard.analysed_resources_by_type(&account_id) {
+            // A resource type this service names no `Finding` vocabulary for is not
+            // summarised, rather than summarised with an invented one.
+            if crate::state::findings_reported_for(resource_type).is_empty() {
+                continue;
+            }
+            if resume_at.as_deref().is_some_and(|start| resource_type < start) {
+                continue;
+            }
+            if recommendation_summaries.len() >= page_size {
+                // The page is full and this resource type is the next page's first.
+                next_token = Some(crate::state::encode_summary_page_token(resource_type));
+                break;
+            }
+            recommendation_summaries.push(summarise(resource_type, &account_id, &resources));
+        }
+
+        Ok(GetRecommendationSummariesOutput {
+            next_token,
+            recommendation_summaries: Some(recommendation_summaries),
+        })
     }
+}
+
+/// How many entries `inferredWorkloadSavings` reports, from that member's own doc: "The
+/// array contains the top five savings opportunites for the instances that run inferred
+/// workload types."
+const TOP_INFERRED_WORKLOAD_SAVINGS: usize = 5;
+
+/// One resource type's summary, computed from the account's analysed resources OF THAT
+/// TYPE: nothing here is stored as a summary, so a count, a saving and a percentage are
+/// always the same rows seen three ways.
+fn summarise(
+    resource_type: &str,
+    account_id: &str,
+    resources: &[&crate::state::AnalysedResource],
+) -> RecommendationSummary {
+    let current_monthly_cost: f64 = resources
+        .iter()
+        .map(|resource| resource.current_monthly_cost)
+        .sum();
+    let rightsizing_savings: f64 = resources
+        .iter()
+        .map(|resource| resource.monthly_savings())
+        .sum();
+
+    let inferred_workload_savings = inferred_workload_savings(resources);
+    RecommendationSummary {
+        summaries: Some(finding_summaries(resource_type, resources)),
+        // An idle resource is a record of its own, which nothing has written: see this
+        // module's header.
+        idle_summaries: None,
+        recommendation_resource_type: Some(resource_type.to_string()),
+        account_id: Some(account_id.to_string()),
+        savings_opportunity: Some(savings_opportunity(rightsizing_savings, current_monthly_cost)),
+        idle_savings_opportunity: None,
+        aggregated_savings_opportunity: Some(savings_opportunity(
+            rightsizing_savings,
+            current_monthly_cost,
+        )),
+        current_performance_risk_ratings: Some(performance_risk_ratings(resources)),
+        inferred_workload_savings: (!inferred_workload_savings.is_empty())
+            .then_some(inferred_workload_savings),
+    }
+}
+
+/// How many of `resources` carry each `Finding` this resource type's summary reports, in
+/// the order the service documents them — including a finding none of them carries, whose
+/// count is then zero, because the summary states the number of resources AT each finding
+/// rather than only the findings that occurred. Each finding also carries how many of the
+/// resources at it name each `FindingReasonCode`.
+fn finding_summaries(
+    resource_type: &str,
+    resources: &[&crate::state::AnalysedResource],
+) -> Vec<Summary> {
+    crate::state::findings_reported_for(resource_type)
+        .iter()
+        .map(|finding| {
+            let mut reason_codes: ::std::collections::BTreeMap<&str, f64> =
+                ::std::collections::BTreeMap::new();
+            let mut count = 0.0;
+            for resource in resources
+                .iter()
+                .filter(|resource| resource.finding == *finding)
+            {
+                count += 1.0;
+                for reason_code in &resource.finding_reason_codes {
+                    *reason_codes.entry(reason_code.as_str()).or_insert(0.0) += 1.0;
+                }
+            }
+            Summary {
+                name: Some((*finding).to_string()),
+                value: count,
+                reason_code_summaries: (!reason_codes.is_empty()).then(|| {
+                    reason_codes
+                        .into_iter()
+                        .map(|(name, value)| ReasonCodeSummary {
+                            name: Some(name.to_string()),
+                            value,
+                        })
+                        .collect()
+                }),
+            }
+        })
+        .collect()
+}
+
+/// How many of `resources` run each `CurrentPerformanceRisk`. Every rating is reported,
+/// including the ones no resource runs, because the shape's members are counts with a
+/// default of `0` rather than optional ones.
+fn performance_risk_ratings(
+    resources: &[&crate::state::AnalysedResource],
+) -> CurrentPerformanceRiskRatings {
+    let count_at = |rating: &str| -> i64 {
+        resources
+            .iter()
+            .filter(|resource| resource.current_performance_risk == rating)
+            .count() as i64
+    };
+    CurrentPerformanceRiskRatings {
+        high: count_at(crate::state::PERFORMANCE_RISK_HIGH),
+        medium: count_at(crate::state::PERFORMANCE_RISK_MEDIUM),
+        low: count_at(crate::state::PERFORMANCE_RISK_LOW),
+        very_low: count_at(crate::state::PERFORMANCE_RISK_VERY_LOW),
+    }
+}
+
+/// The top savings opportunities among the resources running inferred workload types, by
+/// the set of types inferred for them: what adopting their recommendations would save per
+/// month, largest first, at most [`TOP_INFERRED_WORKLOAD_SAVINGS`] of them. A set whose
+/// resources save nothing is no opportunity, so it is not reported.
+fn inferred_workload_savings(
+    resources: &[&crate::state::AnalysedResource],
+) -> Vec<InferredWorkloadSaving> {
+    let mut by_workload: ::std::collections::BTreeMap<&[String], f64> =
+        ::std::collections::BTreeMap::new();
+    for resource in resources {
+        if resource.inferred_workload_types.is_empty() {
+            continue;
+        }
+        *by_workload
+            .entry(resource.inferred_workload_types.as_slice())
+            .or_insert(0.0) += resource.monthly_savings();
+    }
+    let mut savings: Vec<(&[String], f64)> = by_workload
+        .into_iter()
+        .filter(|(_, value)| *value > 0.0)
+        .collect();
+    savings.sort_by(|left, right| right.1.total_cmp(&left.1));
+    savings.truncate(TOP_INFERRED_WORKLOAD_SAVINGS);
+    savings
+        .into_iter()
+        .map(|(workload_types, value)| InferredWorkloadSaving {
+            inferred_workload_types: Some(workload_types.to_vec()),
+            estimated_monthly_savings: Some(estimated_monthly_savings(value)),
+        })
+        .collect()
+}
+
+/// A savings opportunity: what the recommendations would save per month, and that saving
+/// "as a percentage of monthly cost" (`SavingsOpportunity$savingsOpportunityPercentage`).
+/// A resource type that costs nothing today has no percentage to state, so it reports the
+/// member's own default of `0`.
+fn savings_opportunity(savings: f64, current_monthly_cost: f64) -> SavingsOpportunity {
+    let percentage = if current_monthly_cost > 0.0 {
+        rounded_money(savings / current_monthly_cost * 100.0)
+    } else {
+        0.0
+    };
+    SavingsOpportunity {
+        savings_opportunity_percentage: percentage,
+        estimated_monthly_savings: Some(estimated_monthly_savings(savings)),
+    }
+}
+
+/// A monthly saving amount, in the currency the catalog's prices are denominated in.
+fn estimated_monthly_savings(value: f64) -> EstimatedMonthlySavings {
+    EstimatedMonthlySavings {
+        currency: Some(crate::state::CURRENCY_USD.to_string()),
+        value: rounded_money(value),
+    }
+}
+
+/// A money (or percentage) figure to the cent, so summing stored prices cannot report a
+/// figure like `140.16000000000003`.
+fn rounded_money(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
 }

@@ -17,13 +17,17 @@
 //!    maximum, pattern, value set, absence and a service rule the model does not
 //!    express), the members (`name`, `roleArn`, `retentionInDays`,
 //!    `encryptionConfiguration.type`, `identifier`, `maxResults`, `policy`) and the
-//!    four operations that can be refused this way.
+//!    four operations that can be refused this way. Two rows are rules the model does
+//!    NOT express — a resource policy that is not a JSON document, and a cross-account
+//!    source role in the investigation account — which a handler enforces itself and
+//!    words through the same builders.
 //! 2. A `ResourceNotFoundException` message names the modelled RESOURCE TYPE that is
 //!    absent — `<Resource> does not exist.` — and carries nothing of the identifier
 //!    that named it. The rows span the six operations that read or write a group by
-//!    `{identifier}`, the three identifier forms each accepts, and both resources the
-//!    policy operations reference (an absent GROUP is reported as the group; a group
-//!    that exists with no policy as the policy).
+//!    `{identifier}`, the identifier forms each accepts (only an ARN resolves a group,
+//!    so a bare name or id is reported absent too), and both resources the policy
+//!    operations reference (an absent GROUP is reported as the group; a group that
+//!    exists with no policy as the policy).
 
 use std::sync::Arc;
 
@@ -199,8 +203,10 @@ fn modelled_member_pattern(input: &Schema, member: &str) -> Option<&'static str>
     Some(declared.as_any().downcast_ref::<PatternTrait>()?.regex)
 }
 
-/// The three forms `InvestigationGroupIdentifier` admits, each naming a group that was
-/// never created: the bare name, the bare 16-character id, and the full ARN.
+/// The three forms `InvestigationGroupIdentifier` admits, each naming a group that
+/// cannot be resolved: a bare name and a bare 16-character id (which the service
+/// resolves no group from at all, whether or not a group carries them) and the full
+/// ARN of a group that was never created.
 fn unknown_identifiers() -> Vec<(&'static str, String)> {
     vec![
         ("a bare name", "no-such-group".to_string()),
@@ -212,6 +218,23 @@ fn unknown_identifiers() -> Vec<(&'static str, String)> {
             ),
         ),
     ]
+}
+
+/// The ARN of the group named `name`, read off `ListInvestigationGroups` — the only
+/// way to turn a name into the ARN that addresses the group.
+async fn arn_of(router: &MultiServiceRouter, name: &str) -> String {
+    let response = router
+        .dispatch(request("GET", "/investigationGroups", None))
+        .await;
+    let body: Value = serde_json::from_slice(&response.into_body()).expect("a JSON body");
+    body.get("investigationGroups")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("no investigationGroups in {body:?}"))
+        .iter()
+        .find(|item| item.get("name").and_then(Value::as_str) == Some(name))
+        .and_then(|item| item.get("arn").and_then(Value::as_str))
+        .unwrap_or_else(|| panic!("no group named {name:?} in {body:?}"))
+        .to_string()
 }
 
 /// The six operations that resolve a group through `{identifier}`, as
@@ -408,6 +431,42 @@ async fn a_validation_refusal_names_the_member_and_its_constraint_and_echoes_no_
             "\u{0}".to_string(),
             envelope(&[absent_clause("policy")]),
         ),
+        (
+            // A rule the model does not express: the document's modelled constraints
+            // bound only its length and character set, so the boundary walk admits
+            // any printable text and the operation checks the document itself.
+            "a policy document that is not JSON",
+            "POST",
+            "/investigationGroups/some-group/policy".to_string(),
+            Some(json!({ "policy": "{not-valid-json:::" })),
+            "{not-valid-json:::".to_string(),
+            envelope(&[clause(
+                "policy",
+                "Member must be a resource policy document in JSON format",
+            )]),
+        ),
+        (
+            // The same: a cross-account source role in the investigation account's own
+            // account satisfies `^arn:.*$` and is refused by the operation.
+            "a cross-account source role in the investigation account",
+            "POST",
+            "/investigationGroups".to_string(),
+            Some(json!({
+                "name": "own-account-source",
+                "roleArn": ROLE_ARN,
+                "crossAccountConfigurations": [
+                    { "sourceRoleArn": format!("arn:aws:iam::{}:role/Own", engine::EMULATOR_ACCOUNT_ID) }
+                ],
+            })),
+            format!("arn:aws:iam::{}:role/Own", engine::EMULATOR_ACCOUNT_ID),
+            envelope(&[clause(
+                "crossAccountConfigurations.sourceRoleArn",
+                &format!(
+                    "Member must name an account other than the investigation account {}",
+                    engine::EMULATOR_ACCOUNT_ID
+                ),
+            )]),
+        ),
     ];
 
     for (case, method, uri, body, submitted, expected) in cases {
@@ -504,17 +563,11 @@ async fn an_absent_policy_on_a_group_that_exists_is_a_different_resource() {
         "the two conditions must be distinguishable, got {group_absent:?} for both"
     );
 
-    // Rows: the same GET policy call against the same identifier at three points in
-    // that group's life, so what the 404 reports tracks the STORE and not the request.
-    let (status, _, _) = call(
-        &router,
-        "GET",
-        "/investigationGroups/policy-probe/policy",
-        None,
-    )
-    .await;
-    assert_eq!(status, 404, "case \"before the group exists\": expected 404");
-    let (_, _, before) = call(
+    // Rows: the same GET policy call against the same group at three points in that
+    // group's life, so what the 404 reports tracks the STORE and not the request. The
+    // group is addressed by the ARN its create handed back, the only identifier that
+    // resolves it.
+    let (status, code, before) = call(
         &router,
         "GET",
         "/investigationGroups/policy-probe/policy",
@@ -522,11 +575,16 @@ async fn an_absent_policy_on_a_group_that_exists_is_a_different_resource() {
     )
     .await;
     assert_eq!(
+        (status, code.as_str()),
+        (404, "ResourceNotFoundException"),
+        "case \"before the group exists\": expected a 404, got {before:?}"
+    );
+    assert_eq!(
         before, group_absent,
         "case \"before the group exists\": expected {group_absent:?}, got {before:?}"
     );
 
-    let (status, code, message) = call(
+    let (status, code, created) = call(
         &router,
         "POST",
         "/investigationGroups",
@@ -535,16 +593,43 @@ async fn an_absent_policy_on_a_group_that_exists_is_a_different_resource() {
     .await;
     assert_eq!(
         status, 201,
-        "creating the group: expected 201, got {status} / {code} / {message:?}"
+        "creating the group: expected 201, got {status} / {code} / {created:?}"
     );
+    let response = router
+        .dispatch(request(
+            "POST",
+            "/investigationGroups",
+            Some(&json!({ "name": "policy-probe-2", "roleArn": ROLE_ARN })),
+        ))
+        .await;
+    assert_eq!(
+        response.status().as_u16(),
+        402,
+        "a second create in one Region is refused, which is what keeps the probe alone"
+    );
+    let arn = arn_of(&router, "policy-probe").await;
+    let policy_uri = format!("/investigationGroups/{}/policy", label(&arn));
 
-    let (status, code, after_create) = call(
+    // The bare name is not an address, so the same call through it still reports the
+    // GROUP absent even though the group exists.
+    let (status, code, by_name) = call(
         &router,
         "GET",
         "/investigationGroups/policy-probe/policy",
         None,
     )
     .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (404, "ResourceNotFoundException"),
+        "case \"addressed by the bare name\": expected a 404, got {by_name:?}"
+    );
+    assert_eq!(
+        by_name, group_absent,
+        "case \"addressed by the bare name\": expected {group_absent:?}, got {by_name:?}"
+    );
+
+    let (status, code, after_create) = call(&router, "GET", &policy_uri, None).await;
     assert_eq!(
         (status, code.as_str()),
         (404, "ResourceNotFoundException"),
@@ -558,24 +643,13 @@ async fn an_absent_policy_on_a_group_that_exists_is_a_different_resource() {
 
     // With a policy stored the same call succeeds, which is what shows the 404s above
     // are read off the store rather than wired to the path.
-    let (status, code, message) = call(
-        &router,
-        "POST",
-        "/investigationGroups/policy-probe/policy",
-        Some(&json!({ "policy": POLICY })),
-    )
-    .await;
+    let (status, code, message) =
+        call(&router, "POST", &policy_uri, Some(&json!({ "policy": POLICY }))).await;
     assert_eq!(
         status, 200,
         "putting the policy: expected 200, got {status} / {code} / {message:?}"
     );
-    let response = router
-        .dispatch(request(
-            "GET",
-            "/investigationGroups/policy-probe/policy",
-            None,
-        ))
-        .await;
+    let response = router.dispatch(request("GET", &policy_uri, None)).await;
     assert_eq!(
         response.status().as_u16(),
         200,
@@ -589,19 +663,18 @@ async fn an_absent_policy_on_a_group_that_exists_is_a_different_resource() {
     );
 
     // And once the group is deleted every reader reports the GROUP again.
-    let (status, code, message) =
-        call(&router, "DELETE", "/investigationGroups/policy-probe", None).await;
+    let (status, code, message) = call(
+        &router,
+        "DELETE",
+        &format!("/investigationGroups/{}", label(&arn)),
+        None,
+    )
+    .await;
     assert_eq!(
         status, 200,
         "deleting the group: expected 200, got {status} / {code} / {message:?}"
     );
-    let (status, _, after_delete) = call(
-        &router,
-        "GET",
-        "/investigationGroups/policy-probe/policy",
-        None,
-    )
-    .await;
+    let (status, _, after_delete) = call(&router, "GET", &policy_uri, None).await;
     assert_eq!(
         (status, after_delete.as_str()),
         (404, group_absent.as_str()),

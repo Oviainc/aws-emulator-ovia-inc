@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableVolumeIO
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableVolumeIO`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: turns the I/O operations of the volume the request names back on in
+//! [`crate::state`]. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableVolumeIO::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Enables I/O operations for a volume that had I/O operations DISABLED because the data on
+//! the volume was potentially inconsistent" (`EnableVolumeIO`): the call has something to do
+//! only for a volume whose I/O is currently disabled, so one whose I/O is already enabled is
+//! refused with `IncorrectState` — the code EC2 answers when the resource exists but is not
+//! in a state that admits the request. Nothing in this emulator finds a volume's data
+//! inconsistent, so a stored volume has its I/O enabled
+//! ([`crate::state::VolumeRecord::io_enabled`]) until something disables it.
+//!
+//! The refusals in order: a malformed id (`InvalidVolumeID.Malformed`), then `DryRun`
+//! (`DryRunOperation`), then an id the account holds no volume for
+//! (`InvalidVolume.NotFound`), then the state (`IncorrectState`).
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +154,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableVolumeIO` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableVolumeIOErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableVolumeIO"))
+        use crate::state::{
+            dry_run_operation, incorrect_state, invalid_volume_id_malformed,
+            invalid_volume_id_not_found, require_service_state, volume_id_is_well_formed,
+        };
+
+        // A volume carries its own Availability Zone, so nothing here depends on the Region
+        // the request was signed for.
+        let _ = ctx;
+
+        if !volume_id_is_well_formed(&input.volume_id) {
+            return Err(invalid_volume_id_malformed(&input.volume_id));
+        }
+
+        // The permission question, answered before the resource one and before the write.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let Some(record) = store.volumes.get_mut(&input.volume_id) else {
+            return Err(invalid_volume_id_not_found(&input.volume_id));
+        };
+        if record.io_enabled {
+            return Err(incorrect_state(format!(
+                "The I/O operations of volume '{}' are already enabled, so there is nothing \
+                 to enable",
+                input.volume_id
+            )));
+        }
+        record.io_enabled = true;
+        Ok(EnableVolumeIOOutput)
     }
 }

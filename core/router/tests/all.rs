@@ -58,6 +58,11 @@ mod es_opensearch_and_elasticsearch_signing_name_routing;
 mod events_signing_name_routing;
 #[path = "all/events_store_ownership.rs"]
 mod events_store_ownership;
+// Declared HERE, beside the trust suite it is the sibling of, rather than appended at the
+// end of this file: the tail is where every landing in the same window appends, so it is
+// the contended region, while this span of the sorted list is untouched by those appends.
+#[path = "all/fis_execution_role_permissions.rs"]
+mod fis_execution_role_permissions;
 #[path = "all/fis_execution_role_trust.rs"]
 mod fis_execution_role_trust;
 #[path = "all/forecast_signing_name_routing.rs"]

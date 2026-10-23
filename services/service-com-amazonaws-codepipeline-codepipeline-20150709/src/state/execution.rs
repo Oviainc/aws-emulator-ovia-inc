@@ -1,0 +1,592 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The pipeline EXECUTION plane: what `StartPipelineExecution` sets running, how it
+//! moves forward, and what it publishes to `GetPipelineExecution`,
+//! `ListPipelineExecutions` and `GetPipelineState`.
+//!
+//! # The rule this module implements
+//!
+//! `StartPipelineExecution` does not just mint an id: the service then DRIVES the
+//! execution. Each stage's actions run in `runOrder` order (an action never starts
+//! before every action of a lower run order has finished; the actions of ONE run order
+//! are started one step apart rather than at the same instant, which changes when each
+//! begins but not what the stage waits for), an action's artifacts are produced into
+//! the pipeline's `artifactStore`, and the execution reaches a terminal
+//! `PipelineExecutionStatus` (`Succeeded`, `Failed`, `Stopped`, `Superseded`) that the
+//! reporting operations report. So the execution's progress is a function of the stored
+//! declaration and the CLOCK, not of what anybody asked for.
+//!
+//! # Where the work happens, and why a read may perform it
+//!
+//! Nothing here sleeps and nothing runs in the background: every step carries the
+//! instant it became DUE ([`ACTION_STEP`] after the step before it finished), and
+//! [`advance`] materialises only the steps whose instant has already passed. That is
+//! exactly the "a reporting operation may write only to materialise a change the clock
+//! already made due" case: an action owed at `t` is performed on the first call after
+//! `t`, whoever makes it, and a caller that polls faster never makes it run sooner.
+//!
+//! # What this engine can and cannot run
+//!
+//! An action is only reported `Succeeded` when its real work was actually performed:
+//!
+//! * `Approval` actions need no external work: the action goes `InProgress` with a
+//!   token and waits for `PutApprovalResult`.
+//! * `Source`/`Deploy` actions whose provider is `S3` move real bytes: the source
+//!   action reads the object and writes the artifact into the artifact store, and the
+//!   deploy action reads the artifact and writes the delivered object — both through
+//!   in-process S3 calls over the framework's callback.
+//! * every other provider (CodeBuild, CloudFormation, Lambda, a custom job worker …)
+//!   is work this emulator cannot perform, so its action FAILS with a reason saying so
+//!   and the execution reaches `Failed`. Nothing is ever reported as having run when
+//!   nothing ran.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::{Duration, SystemTime};
+
+use super::to_date_time;
+use crate::ops::types::{
+    ActionDeclaration, ActionExecution, ActionState, ErrorDetails, PipelineDeclaration, StageState,
+};
+
+/// How long after the step before it an action's work becomes due.
+///
+/// A real stage transition is not instantaneous, and a caller acting straight after
+/// `StartPipelineExecution` must still observe the transient state (an `InProgress`
+/// execution, a stage that has not started, an approval not yet reached) and the state
+/// errors that go with it. AWS's own span is neither documented nor constant, so this
+/// one is CHOSEN: 300 ms, inside the 250-750 ms band this project fixes for a
+/// clock-owed transition. The instant is stored per step and compared against the
+/// clock, so nothing sleeps.
+pub const ACTION_STEP: Duration = Duration::from_millis(300);
+
+/// How long an in-flight action may stay claimed before another call may run it again.
+///
+/// An action's work is performed without the store's lock held (it does in-process I/O),
+/// so the planner marks it claimed to keep a second concurrent call from running it
+/// twice. A request that is dropped mid-flight would otherwise leave the action claimed
+/// for ever, so a claim older than this is reclaimed.
+pub const CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most steps one [`advance`] call materialises before it returns.
+///
+/// Every step either finishes a unit of work or stops the walk, so this only bounds how
+/// much one request may do: the next call continues from the stored state.
+pub const MAX_ADVANCE_STEPS: usize = 32;
+
+/// The most executions one pipeline may have in flight (started or queued) before
+/// `StartPipelineExecution` refuses another with
+/// `ConcurrentPipelineExecutionsLimitExceededException`.
+///
+/// AWS publishes a default quota of 50 concurrent executions per pipeline for the
+/// QUEUED and PARALLEL execution modes; the figure is adjustable per account, so it is
+/// this emulator's bound rather than a universal constant, and it is what keeps the
+/// execution store from growing without limit under a burst of starts.
+pub const MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE: usize = 50;
+
+/// `PipelineExecutionStatus` values this engine publishes.
+pub const STATUS_SUCCEEDED: &str = "Succeeded";
+/// See [`STATUS_SUCCEEDED`].
+pub const STATUS_FAILED: &str = "Failed";
+/// See [`STATUS_SUCCEEDED`].
+pub const STATUS_STOPPED: &str = "Stopped";
+/// See [`STATUS_SUCCEEDED`].
+pub const STATUS_STOPPING: &str = "Stopping";
+/// See [`STATUS_SUCCEEDED`].
+pub const STATUS_SUPERSEDED: &str = "Superseded";
+
+/// The most entries one artifact archive may carry when a deploy action extracts it.
+///
+/// An archive is caller content: its entry COUNT, each entry's decompressed size and
+/// their sum all have to be bounded before any of it is allocated, because a deflate
+/// stream expands by up to ~1000:1 and the compressed input is bounded only by the S3
+/// emulator's per-bucket budget. Past any of these bounds the action fails with its
+/// reason instead of allocating. The counts are this emulator's own.
+pub const MAX_ARCHIVE_ENTRIES: usize = 1_024;
+
+/// The most bytes ONE extracted entry may carry.
+///
+/// Equal to [`MAX_EXTRACTED_BYTES`], because a single entry may legitimately be the
+/// whole archive's content.
+pub const MAX_EXTRACTED_ENTRY_BYTES: usize = MAX_EXTRACTED_BYTES;
+
+/// The most bytes one artifact archive may expand to in total.
+///
+/// 16 MiB, the same figure as the S3 emulator's `MAX_OBJECT_BYTES_PER_BUCKET`: every
+/// extracted entry is written to a bucket, so an extraction larger than that budget
+/// could not be delivered anyway, and the expansion ratio over a 16 MiB artifact is
+/// therefore capped at 1:1 rather than at deflate's ~1000:1.
+pub const MAX_EXTRACTED_BYTES: usize = 16 * 1024 * 1024;
+
+/// The `StageTransitionType` whose hold keeps an execution OUT of a stage.
+pub const TRANSITION_INBOUND: &str = "Inbound";
+
+/// The `StageTransitionType` whose hold keeps an execution from LEAVING a stage.
+pub const TRANSITION_OUTBOUND: &str = "Outbound";
+
+/// The `(stage name, StageTransitionType)` pairs a caller has DISABLED on `pipeline`.
+///
+/// The transitions a caller changed live on the stored pipeline
+/// ([`super::Pipeline::set_transition`]); a transition no call has changed is enabled,
+/// which is the state every stage starts in. Taken as an owned set so the driver can
+/// consult it while it writes to the executions of that same store.
+pub fn disabled_transitions(pipeline: &super::Pipeline) -> BTreeSet<(String, String)> {
+    pipeline
+        .transitions
+        .iter()
+        .filter(|(_, transition)| !transition.enabled)
+        .map(|((stage, kind), _)| (stage.clone(), kind.clone()))
+        .collect()
+}
+
+/// Whether the `kind` transition of `stage` is held (disabled).
+pub fn transition_held(
+    disabled: &BTreeSet<(String, String)>,
+    stage: &str,
+    kind: &str,
+) -> bool {
+    disabled.contains(&(stage.to_string(), kind.to_string()))
+}
+
+/// The `FailureType` reported for work the action's own run could not complete
+/// (`smithy_query query="shape" shape="FailureType"`).
+pub const FAILURE_JOB_FAILED: &str = "JobFailed";
+
+/// The `FailureType` reported for a declaration this emulator cannot execute at all.
+pub const FAILURE_CONFIGURATION_ERROR: &str = "ConfigurationError";
+
+/// Where an artifact's bytes live: one object in the pipeline's artifact store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRef {
+    /// The artifact store bucket.
+    pub bucket: String,
+    /// The object key the artifact's bytes were written to.
+    pub key: String,
+    /// The revision the artifact was produced from, when the producing action has one.
+    pub revision: Option<String>,
+}
+
+/// One action of one stage of one execution, as the engine runs it.
+///
+/// It carries only what the RUN is: what the action IS — its type, its configuration,
+/// the artifacts it consumes and produces — is read from the pipeline declaration this
+/// execution pinned ([`super::Pipeline::declaration_at`]), so a declaration is stored
+/// once per pipeline version rather than copied into every execution record.
+#[derive(Debug, Clone)]
+pub struct ActionRun {
+    /// `ActionDeclaration$name`.
+    pub name: String,
+    /// `ActionDeclaration$runOrder`, defaulted to 1 ("The default is 1").
+    pub run_order: i32,
+    /// The id this action's execution is reported under.
+    pub action_execution_id: String,
+    /// An `ActionExecutionStatus` value, or `None` while the action has not started.
+    pub status: Option<String>,
+    /// When this action's work becomes due, or `None` while it is not scheduled.
+    pub due: Option<SystemTime>,
+    /// Set while a call is performing this action's work (see [`CLAIM_TIMEOUT`]).
+    pub claimed: Option<SystemTime>,
+    /// The approval token an `Approval` action waits on.
+    pub token: Option<String>,
+    /// A human-readable summary of what the action did.
+    pub summary: Option<String>,
+    /// Who last moved the action (the approver, for an approval).
+    pub last_updated_by: Option<String>,
+    /// Why the action failed, when it did.
+    pub error: Option<(String, String)>,
+    /// When the action's status last changed.
+    pub last_status_change: SystemTime,
+}
+
+impl ActionRun {
+    /// This action as `GetPipelineState` reports it.
+    pub fn to_state(&self) -> ActionState {
+        ActionState {
+            action_name: Some(self.name.clone()),
+            // A revision is recorded by `PutActionRevision`, which this slice does not
+            // serve, so none is reported rather than invented.
+            current_revision: None,
+            latest_execution: self.status.as_ref().map(|status| ActionExecution {
+                action_execution_id: Some(self.action_execution_id.clone()),
+                status: Some(status.clone()),
+                summary: self.summary.clone(),
+                last_status_change: Some(to_date_time(self.last_status_change)),
+                token: self.token.clone(),
+                last_updated_by: self.last_updated_by.clone(),
+                external_execution_id: None,
+                external_execution_url: None,
+                percent_complete: None,
+                error_details: self.error.as_ref().map(|(code, message)| ErrorDetails {
+                    code: Some(code.clone()),
+                    message: Some(message.clone()),
+                }),
+                log_stream_arn: None,
+            }),
+            entity_url: None,
+            revision_url: None,
+        }
+    }
+
+    /// True once this action can no longer change on its own.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_deref(),
+            Some("Succeeded" | "Failed" | "Abandoned")
+        )
+    }
+
+    /// True while this action is running or waiting for an approval.
+    pub fn is_in_progress(&self) -> bool {
+        self.status.as_deref() == Some("InProgress")
+    }
+}
+
+/// One stage of one execution, as the engine runs it.
+#[derive(Debug, Clone)]
+pub struct StageRun {
+    /// `StageDeclaration$name`.
+    pub name: String,
+    /// A `StageExecutionStatus` value, or `None` while the stage has not been entered.
+    pub status: Option<String>,
+    /// This stage's actions, in declaration order.
+    pub actions: Vec<ActionRun>,
+}
+
+impl StageRun {
+    /// True once this stage can no longer change on its own.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_deref(),
+            Some("Succeeded" | "Failed" | "Stopped" | "Skipped" | "Cancelled")
+        )
+    }
+}
+
+/// A `StopPipelineExecution` request recorded against an execution.
+#[derive(Debug, Clone)]
+pub struct StopRequest {
+    /// `StopPipelineExecutionInput$abandon`: stop the execution without waiting for the
+    /// in-flight actions to finish.
+    pub abandon: bool,
+    /// The caller's reason, when it gave one.
+    pub reason: Option<String>,
+    /// When the stop was requested.
+    pub requested_at: SystemTime,
+}
+
+/// The stage/action plan an execution runs: taken from the pipeline declaration at the
+/// instant the execution starts, so a later `UpdatePipeline` does not rewrite a running
+/// execution.
+pub fn plan_stages(declaration: &PipelineDeclaration, now: SystemTime) -> Vec<StageRun> {
+    declaration
+        .stages
+        .iter()
+        .map(|stage| StageRun {
+            name: stage.name.clone(),
+            status: None,
+            actions: stage
+                .actions
+                .iter()
+                .map(|action| plan_action(action, now))
+                .collect(),
+        })
+        .collect()
+}
+
+/// One declared action, as the engine will run it.
+fn plan_action(action: &ActionDeclaration, now: SystemTime) -> ActionRun {
+    ActionRun {
+        name: action.name.clone(),
+        // `ActionDeclaration$runOrder` documents "The default is 1".
+        run_order: action.run_order.unwrap_or(1),
+        action_execution_id: super::random_uuid_v4(),
+        status: None,
+        due: None,
+        claimed: None,
+        token: None,
+        summary: None,
+        last_updated_by: None,
+        error: None,
+        last_status_change: now,
+    }
+}
+
+/// The artifact-store bucket a declaration's executions write their artifacts to, with
+/// the customer managed key that store declares, if any.
+///
+/// `CreatePipeline` documents "you must include either artifactStore or artifactStores",
+/// so exactly one of the two is present on a stored declaration; with `artifactStores`
+/// the entries are per Region and the one named for `region` is this execution's.
+pub fn artifact_store(
+    declaration: &PipelineDeclaration,
+    region: &str,
+) -> Option<(String, Option<String>)> {
+    let store = match &declaration.artifact_store {
+        Some(store) => store,
+        None => {
+            let stores = declaration.artifact_stores.as_ref()?;
+            stores.get(region).or_else(|| stores.values().next())?
+        }
+    };
+    Some((
+        store.location.clone(),
+        store.encryption_key.as_ref().map(|key| key.id.clone()),
+    ))
+}
+
+/// `#{namespace.key}` placeholders resolved against the variables an execution has
+/// already produced.
+///
+/// CodePipeline's variable syntax is `#{<namespace>.<key>}`, with the pipeline-level
+/// variables under the `variables` namespace and an action's output variables under the
+/// namespace that action declares. A placeholder naming a variable the execution does
+/// not carry is left exactly as written, so the action sees (and can fail on) the
+/// unresolved reference rather than an empty string.
+pub fn resolve_placeholders(value: &str, variables: &BTreeMap<String, String>) -> String {
+    let mut resolved = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("#{") {
+        resolved.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                let name = &after[..end];
+                match variables.get(name) {
+                    Some(replacement) => resolved.push_str(replacement),
+                    None => {
+                        resolved.push_str("#{");
+                        resolved.push_str(name);
+                        resolved.push('}');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                resolved.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+    }
+    resolved.push_str(rest);
+    resolved
+}
+
+/// The `StageState` list `GetPipelineState` reports for one pipeline.
+///
+/// Each stage reports its declared actions, enriched with the action execution of the
+/// newest execution that entered the stage; the inbound transition state is the one the
+/// transition calls persisted on the pipeline
+/// ([`super::Pipeline::transition_state`]) — and, as the stored-pipeline reader
+/// already words it, an inbound transition is the edge INTO a stage, so the first stage
+/// reports none unless a caller changed one for it.
+pub fn stage_states(
+    pipeline: &super::Pipeline,
+    executions: &[&super::PipelineExecutionRecord],
+    revisions: &BTreeMap<(String, String, String), crate::ops::types::ActionRevision>,
+) -> Vec<StageState> {
+    // One pass over the executions, newest first, builds both indexes: the newest
+    // execution that ENTERED each stage, and the newest non-terminal one still waiting
+    // to enter it. Without it this walk would rescan every execution for every declared
+    // stage. An execution WAITS at exactly one stage — the first it has not entered —
+    // so a stage further down the pipeline reports no inbound execution for it.
+    let mut entered: HashMap<&str, (&super::PipelineExecutionRecord, &StageRun)> = HashMap::new();
+    let mut waiting: HashMap<&str, &super::PipelineExecutionRecord> = HashMap::new();
+    for record in executions {
+        let mut waits_at: Option<&str> = None;
+        for run in &record.stages {
+            if run.status.is_some() {
+                entered.entry(run.name.as_str()).or_insert((record, run));
+            } else if waits_at.is_none() {
+                waits_at = Some(run.name.as_str());
+            }
+        }
+        if let (false, Some(stage)) = (is_terminal_status(&record.status), waits_at) {
+            waiting.entry(stage).or_insert(record);
+        }
+    }
+
+    pipeline
+        .declaration
+        .stages
+        .iter()
+        .enumerate()
+        .map(|(index, stage)| {
+            let run = entered.get(stage.name.as_str()).copied();
+            let inbound = waiting.get(stage.name.as_str()).copied();
+            // Only the INBOUND transition is what this member reports
+            // (`StageState$inboundTransitionState`); the outbound one governs leaving
+            // the stage and the model binds no member to it here. The rule for WHICH
+            // stages report one lives on the stored pipeline, so the two views of a
+            // stage cannot disagree.
+            let inbound_transition = pipeline.inbound_transition_state(index, &stage.name);
+            StageState {
+                stage_name: Some(stage.name.clone()),
+                inbound_execution: inbound.map(|record| crate::ops::types::StageExecution {
+                    pipeline_execution_id: record.pipeline_execution_id.clone(),
+                    status: record.status.clone(),
+                    r#type: Some(record.execution_type.clone()),
+                }),
+                inbound_executions: None,
+                inbound_transition_state: inbound_transition,
+                // Every declared action is reported, whether or not an execution has
+                // reached it: the one that has run carries its action execution, and the
+                // one that has not carries only its name, because there is no outcome
+                // for it yet. `currentRevision` is the revision `PutActionRevision`
+                // recorded for the action, keyed by `(pipeline, stage, action)`.
+                action_states: Some(
+                    stage
+                        .actions
+                        .iter()
+                        .map(|action| {
+                            let current_revision = revisions
+                                .get(&(
+                                    pipeline.declaration.name.clone(),
+                                    stage.name.clone(),
+                                    action.name.clone(),
+                                ))
+                                .cloned();
+                            run.and_then(|(_, run)| {
+                                run.actions
+                                    .iter()
+                                    .find(|candidate| candidate.name == action.name)
+                                    .map(ActionRun::to_state)
+                            })
+                            .map(|state| ActionState {
+                                current_revision: current_revision.clone(),
+                                ..state
+                            })
+                            .unwrap_or_else(|| ActionState {
+                                action_name: Some(action.name.clone()),
+                                current_revision,
+                                latest_execution: None,
+                                entity_url: None,
+                                revision_url: None,
+                            })
+                        })
+                        .collect(),
+                ),
+                latest_execution: run.map(|(record, run)| crate::ops::types::StageExecution {
+                    pipeline_execution_id: record.pipeline_execution_id.clone(),
+                    status: run.status.clone().unwrap_or_else(|| record.status.clone()),
+                    r#type: Some(record.execution_type.clone()),
+                }),
+                // A condition set has a state exactly when the stage DECLARES it:
+                // `beforeEntry` and `onSuccess` carry their conditions directly, while
+                // `onFailure` also carries the stage's failure `result` and retry
+                // configuration, which are declaration rather than state. The
+                // conditions themselves are evaluated by the rule plane, which this
+                // engine does not run, so no condition or rule carries an execution.
+                before_entry_condition_state: stage
+                    .before_entry
+                    .as_ref()
+                    .map(|before_entry| super::condition_state(&before_entry.conditions)),
+                on_success_condition_state: stage
+                    .on_success
+                    .as_ref()
+                    .map(|on_success| super::condition_state(&on_success.conditions)),
+                on_failure_condition_state: stage
+                    .on_failure
+                    .as_ref()
+                    .and_then(|on_failure| on_failure.conditions.as_deref())
+                    .map(super::condition_state),
+                retry_stage_metadata: run.and_then(|(record, _)| {
+                    (record.manual_retry_attempts > 0).then(|| {
+                        crate::ops::types::RetryStageMetadata {
+                            auto_stage_retry_attempt: None,
+                            manual_stage_retry_attempt: Some(record.manual_retry_attempts),
+                            latest_retry_trigger: Some("ManualStageRetry".to_string()),
+                        }
+                    })
+                }),
+            }
+        })
+        .collect()
+}
+
+/// True for a `PipelineExecutionStatus` an execution can no longer leave.
+pub fn is_terminal_status(status: &str) -> bool {
+    matches!(
+        status,
+        "Succeeded" | "Failed" | "Stopped" | "Superseded" | "Cancelled"
+    )
+}
+
+/// One unit of real work the engine has claimed and must now perform.
+#[derive(Debug, Clone)]
+pub enum Job {
+    /// An S3 source action: read the source object, write it into the artifact store.
+    S3Source {
+        /// The execution the action belongs to.
+        execution_id: String,
+        /// The stage's index in the execution's plan.
+        stage: usize,
+        /// The action's index in that stage.
+        action: usize,
+        /// The bucket the source object lives in.
+        bucket: String,
+        /// The source object's key.
+        key: String,
+        /// The object version the execution pinned, when it pinned one.
+        version_id: Option<String>,
+        /// Where the produced artifacts are written.
+        outputs: Vec<ArtifactRef>,
+    },
+    /// An S3 deploy action: read the input artifact, write the delivered object(s).
+    S3Deploy {
+        /// The execution the action belongs to.
+        execution_id: String,
+        /// The stage's index in the execution's plan.
+        stage: usize,
+        /// The action's index in that stage.
+        action: usize,
+        /// The artifact being deployed.
+        input: ArtifactRef,
+        /// The bucket the object is delivered to.
+        bucket: String,
+        /// The key (or, with `extract`, the key prefix) the object is delivered under.
+        key: String,
+        /// "Extract file before deploy": every entry of the artifact archive is
+        /// delivered under `key` instead of the archive itself.
+        extract: bool,
+    },
+}
+
+impl Job {
+    /// Where in the store this job's action lives.
+    pub fn target(&self) -> (&str, usize, usize) {
+        match self {
+            Self::S3Source {
+                execution_id,
+                stage,
+                action,
+                ..
+            }
+            | Self::S3Deploy {
+                execution_id,
+                stage,
+                action,
+                ..
+            } => (execution_id, *stage, *action),
+        }
+    }
+}
+
+/// What performing a [`Job`] produced.
+#[derive(Debug, Clone)]
+pub enum JobOutcome {
+    /// The work was performed: the summary, and the output variables it published.
+    Done {
+        /// What the action did, as the action's summary.
+        summary: String,
+        /// The revision the artifacts were produced from, when there is one.
+        revision: Option<String>,
+        /// The action's output variables, keyed by bare name.
+        variables: BTreeMap<String, String>,
+    },
+    /// The work could not be performed: a `FailureType` and why.
+    Failed {
+        /// A `FailureType` value.
+        code: String,
+        /// Why the action failed.
+        message: String,
+    },
+}

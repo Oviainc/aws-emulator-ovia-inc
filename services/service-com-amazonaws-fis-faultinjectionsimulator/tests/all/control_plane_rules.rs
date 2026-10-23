@@ -28,7 +28,7 @@ use service_com_amazonaws_fis_faultinjectionsimulator::ops::types::{
     ExperimentTemplateAction, ExperimentTemplateExperimentOptions,
 };
 use service_com_amazonaws_fis_faultinjectionsimulator::state::{
-    run_plan, ExperimentOutcome, ExperimentRecord, ExperimentTemplateRecord,
+    run_plan, ExperimentFailure, ExperimentOutcome, ExperimentRecord, ExperimentTemplateRecord,
 };
 use service_com_amazonaws_fis_faultinjectionsimulator::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -61,6 +61,10 @@ const TAG_MAP_CEILING: usize = 50;
 /// How long a case waits for a transition this service owes the clock. Every span the
 /// emulator chooses is a fraction of a second, so this is generous.
 const SETTLE_BUDGET: Duration = Duration::from_secs(5);
+
+/// The account id every ARN this emulator mints carries (`::engine::EMULATOR_ACCOUNT_ID`),
+/// spelled out so a changed account fails here.
+const ACCOUNT_ID: &str = "000000000000";
 
 /// A role ARN the emulator's IAM store holds no role for, which is the case every row here
 /// runs under: with no trust policy to read, `StartExperiment` has no evidence the role
@@ -153,8 +157,8 @@ async fn the_wait_actions_duration_is_bounded_when_the_template_is_created() {
     // The rows differ along the form and the magnitude of the duration: each published
     // bound, one past each of them, the same bound spelled in other units, a combined
     // span, a span whose length depends on the calendar, a value that is not a duration at
-    // all, and the parameter left out entirely.
-    let rows: [(&str, Option<&str>, bool); 14] = [
+    // all, a magnitude no `Duration` can hold, and the parameter left out entirely.
+    let rows: [(&str, Option<&str>, bool); 17] = [
         ("at the floor", Some("PT1M"), true),
         ("the floor in seconds", Some("PT60S"), true),
         ("a combined span", Some("PT1M30S"), true),
@@ -168,6 +172,23 @@ async fn the_wait_actions_duration_is_bounded_when_the_template_is_created() {
         ("a whole day", Some("P1D"), false),
         ("a calendar span", Some("P1Y"), false),
         ("not a duration", Some("13h"), false),
+        // A magnitude past what a `Duration` can hold: the parse reports no span rather
+        // than constructing one, so the request is REFUSED and the handler answers.
+        (
+            "more seconds than a Duration holds",
+            Some("PT99999999999999999999S"),
+            false,
+        ),
+        (
+            "more days than a Duration holds",
+            Some("P99999999999999999999D"),
+            false,
+        ),
+        (
+            "every field at that magnitude",
+            Some("P99999999999999999999DT99999999999999999999H99999999999999999999M99999999999999999999S"),
+            false,
+        ),
         ("the parameter left out", None, false),
     ];
 
@@ -738,34 +759,50 @@ async fn the_active_experiment_quota_refuses_the_start_beyond_it() {
 /// carries (if any) and the actions its `startAfter` names.
 type ActionRow = (&'static str, &'static str, Option<&'static str>, Vec<&'static str>);
 
-/// One row of the run-plan table: the case, its actions, and the run length in seconds
-/// expected of it (`None` for a run this emulator cannot perform, `Some(0)` for a graph
-/// with no path to measure).
-type GraphRow = (&'static str, Vec<ActionRow>, Option<u64>);
+/// One row of the run-plan table: the case, its actions, and the MODELLED length of the
+/// longest path through them, in seconds.
+type GraphRow = (&'static str, Vec<ActionRow>, u64);
 
 /// One row of the length-refusal table: the case, the method, the path prefix, the body,
 /// the over-long value and the member it belongs to.
 type LengthRow<'a> = (&'a str, &'a str, &'a str, Option<Value>, &'a str, &'a str);
 
-/// RULE: an experiment runs for as long as the longest path through its actions' waits and
-/// then reaches the terminal status those actions earn — `completed` for a run of waits,
-/// and the modelled `failed` for one carrying an action this emulator cannot inject. The
-/// span is never zero, so the transient `running` status is observable either way.
+/// How far the emulator compresses the modelled run against the wall clock, and the window
+/// it clamps the result into. Spelled out here rather than imported from the crate, so a
+/// wrong value in `src/state.rs` fails this suite.
+const RUN_CLOCK_SCALE: u32 = 60;
+/// See [`RUN_CLOCK_SCALE`].
+const MIN_RUN_SPAN: Duration = Duration::from_secs(5);
+/// See [`RUN_CLOCK_SCALE`].
+const MAX_RUN_SPAN: Duration = Duration::from_secs(15);
+
+/// The span the emulator owes a transition it chooses the length of, which is also the
+/// whole run of an experiment that failed before its actions started.
+const TRANSITION_DELAY: Duration = Duration::from_millis(500);
+
+/// RULE: a started experiment RUNS. It is observable in `running` for the longest path
+/// through its actions' `duration` parameters — compressed by [`RUN_CLOCK_SCALE`] and
+/// clamped into [`MIN_RUN_SPAN`]..=[`MAX_RUN_SPAN`], so the modelled span orders the real
+/// one without any caller waiting the modelled span out — and then reaches the terminal
+/// status its actions earned: `completed`, or `failed` carrying the failure the start
+/// showed against the run, which claims no run duration at all.
 ///
 /// Asserted on the state machine itself, at instants this case chooses, because the
-/// smallest wait FIS accepts is a whole minute: waiting one out per row would say nothing
-/// more than settling the record at the same offsets does.
+/// smallest duration FIS accepts for a wait is a whole minute: letting a modelled run
+/// elapse per row would say nothing more than settling the record at the same offsets does.
 #[test]
-fn an_experiment_runs_for_its_waits_and_then_ends_at_the_status_its_actions_earn() {
-    // The rows differ along the shape of the action graph: one wait, several in parallel,
-    // several chained through `startAfter`, a graph mixing a wait with an action that
-    // injects a fault, a graph with no wait at all, no actions at all, and a `startAfter`
-    // cycle no FIS template could carry.
-    let rows: [GraphRow; 8] = [
+fn an_experiment_runs_for_its_actions_durations_and_then_ends_at_the_status_they_earn() {
+    // The rows differ along the shape of the action graph (one action, several in
+    // parallel, several chained through `startAfter`, no actions at all, a `startAfter`
+    // cycle no FIS template could carry), along WHICH actions carry the duration (a wait,
+    // an action that injects a fault, a mix of the two, an action that takes no `duration`
+    // at all) and along the modelled length itself — under the compressed floor, between
+    // the floor and the ceiling, and past the ceiling.
+    let rows: [GraphRow; 10] = [
         (
-            "one wait",
+            "one wait, under the compressed floor",
             vec![("wait", "aws:fis:wait", Some("PT1M"), vec![])],
-            Some(60),
+            60,
         ),
         (
             "two waits in parallel",
@@ -773,7 +810,7 @@ fn an_experiment_runs_for_its_waits_and_then_ends_at_the_status_its_actions_earn
                 ("short", "aws:fis:wait", Some("PT1M"), vec![]),
                 ("long", "aws:fis:wait", Some("PT5M"), vec![]),
             ],
-            Some(300),
+            300,
         ),
         (
             "two waits chained",
@@ -781,7 +818,7 @@ fn an_experiment_runs_for_its_waits_and_then_ends_at_the_status_its_actions_earn
                 ("first", "aws:fis:wait", Some("PT1M"), vec![]),
                 ("second", "aws:fis:wait", Some("PT2M"), vec!["first"]),
             ],
-            Some(180),
+            180,
         ),
         (
             "three waits, two of them chained",
@@ -790,42 +827,74 @@ fn an_experiment_runs_for_its_waits_and_then_ends_at_the_status_its_actions_earn
                 ("second", "aws:fis:wait", Some("PT2M"), vec!["first"]),
                 ("aside", "aws:fis:wait", Some("PT4M"), vec![]),
             ],
-            Some(240),
+            240,
         ),
         (
-            "a wait beside a fault injection",
+            // An action that is not a wait carries its own `duration`, and the run lasts
+            // it: `duration` is "the duration of the action" for every action that takes
+            // it, not a parameter of one action id.
+            "one api-fault injection, inside the compressed window",
+            vec![(
+                "fault",
+                "aws:fis:inject-api-internal-error",
+                Some("PT10M"),
+                vec![],
+            )],
+            600,
+        ),
+        (
+            "two api-fault injections chained",
+            vec![
+                (
+                    "throttle",
+                    "aws:fis:inject-api-throttle-error",
+                    Some("PT6M"),
+                    vec![],
+                ),
+                (
+                    "internal",
+                    "aws:fis:inject-api-internal-error",
+                    Some("PT6M"),
+                    vec!["throttle"],
+                ),
+            ],
+            720,
+        ),
+        (
+            "a wait beside a fault injection, past the compressed ceiling",
             vec![
                 ("wait", "aws:fis:wait", Some("PT1M"), vec![]),
-                ("stop", "aws:ec2:stop-instances", None, vec![]),
+                (
+                    "fault",
+                    "aws:fis:inject-api-internal-error",
+                    Some("PT20M"),
+                    vec![],
+                ),
             ],
-            None,
+            1_200,
         ),
         (
-            "no wait at all",
+            // `aws:ec2:stop-instances` takes no `duration` (its
+            // `startInstancesAfterDuration` is some other span), so it names no length and
+            // the run is the observable floor.
+            "an action that names no duration",
             vec![("stop", "aws:ec2:stop-instances", None, vec![])],
-            None,
+            0,
         ),
         (
+            // A cycle is not a graph FIS would accept; what matters is that the plan is
+            // BOUNDED rather than endless, which this row asserts by answering at all.
             "a startAfter cycle",
             vec![
                 ("a", "aws:fis:wait", Some("PT1M"), vec!["b"]),
                 ("b", "aws:fis:wait", Some("PT1M"), vec!["a"]),
             ],
-            // A cycle is not a graph FIS would accept, so there is no path length to
-            // expect: what matters is that the plan is BOUNDED rather than endless, which
-            // the row below asserts by the fact that it answers at all.
-            Some(0),
+            0,
         ),
-        (
-            // Nothing to run at all: there is no path to measure, so the run is just the
-            // observable span and it completes.
-            "no actions at all",
-            Vec::new(),
-            Some(0),
-        ),
+        ("no actions at all", Vec::new(), 0),
     ];
 
-    for (case, actions, expected_seconds) in rows {
+    for (case, actions, modelled_seconds) in rows {
         let actions: HashMap<String, ExperimentTemplateAction> = actions
             .into_iter()
             .map(|(name, action_id, duration, start_after)| {
@@ -846,53 +915,48 @@ fn an_experiment_runs_for_its_waits_and_then_ends_at_the_status_its_actions_earn
             })
             .collect();
 
-        let (span, outcome) = run_plan(&actions);
-        // A transition this emulator chooses the span of is never zero, so a caller that
-        // polls straight after the start still observes `running`.
-        assert!(
-            span >= Duration::from_millis(250),
-            "case {case:?}: expected a non-zero run span, got {span:?}"
+        // The rule, computed here from the modelled length the row states rather than read
+        // back from the crate: a cycle is the one row whose modelled length this suite does
+        // not predict, and it only has to be bounded.
+        let expected_span = (Duration::from_secs(modelled_seconds) / RUN_CLOCK_SCALE)
+            .clamp(MIN_RUN_SPAN, MAX_RUN_SPAN);
+
+        let (span, outcome) = run_plan(&actions, None);
+        assert_eq!(
+            outcome,
+            ExperimentOutcome::Completed,
+            "case {case:?}: expected a run nothing was shown against to complete"
         );
-        match expected_seconds {
-            // A run of waits lasts exactly as long as the waits the caller asked for,
-            // unless that is shorter than the observable span. A zero expectation is a row
-            // whose graph names no path to measure (no actions, or a cycle): all that is
-            // required of it is a bounded span.
-            Some(0) => {
-                assert_eq!(
-                    outcome,
-                    ExperimentOutcome::Completed,
-                    "case {case:?}: expected a run of waits to complete"
-                );
-                assert!(
-                    span <= Duration::from_secs(60 * 720),
-                    "case {case:?}: expected a bounded run span, got {span:?}"
-                );
-            }
-            Some(seconds) => {
-                assert_eq!(
-                    outcome,
-                    ExperimentOutcome::Completed,
-                    "case {case:?}: expected a run of waits to complete"
-                );
-                assert_eq!(
-                    span.max(Duration::from_millis(750)),
-                    Duration::from_secs(seconds).max(Duration::from_millis(750)),
-                    "case {case:?}: expected the longest path through the waits, got {span:?}"
-                );
-            }
-            None => {
-                assert!(
-                    matches!(outcome, ExperimentOutcome::Failed(ref reason) if !reason.is_empty()),
-                    "case {case:?}: expected a run this emulator cannot perform to fail with \
-                     a reason, got {outcome:?}"
-                );
-                assert!(
-                    span <= Duration::from_millis(750),
-                    "case {case:?}: a run nothing performed claims no duration, got {span:?}"
-                );
-            }
-        }
+        assert_eq!(
+            span, expected_span,
+            "case {case:?}: expected the longest path through the actions' durations on the \
+             compressed clock, got {span:?}"
+        );
+        // Whatever the modelled durations are, the run stays inside the window: never
+        // instantaneous (so `running` is observable) and never unbounded.
+        assert!(
+            span >= MIN_RUN_SPAN && span <= MAX_RUN_SPAN,
+            "case {case:?}: expected a run span within the compressed window, got {span:?}"
+        );
+
+        // A run the start showed a failure against never begins: it claims no duration and
+        // ends `failed`, carrying that failure rather than any other.
+        let failure = ExperimentFailure::insufficient_privileges(
+            ROLE_ARN,
+            "blocked",
+            "aws:cloudwatch:assert-alarm-state",
+            "cloudwatch:DescribeAlarms",
+        );
+        let (failed_span, failed_outcome) = run_plan(&actions, Some(failure.clone()));
+        assert_eq!(
+            failed_span, TRANSITION_DELAY,
+            "case {case:?}: a run that never started claims no duration, got {failed_span:?}"
+        );
+        assert_eq!(
+            failed_outcome,
+            ExperimentOutcome::Failed(failure.clone()),
+            "case {case:?}: expected the failure the start showed, got {failed_outcome:?}"
+        );
 
         // The same plan, now driven through the record the clock settles: the status only
         // ever advances along the documented progression, and `endTime` arrives with the
@@ -906,11 +970,9 @@ fn an_experiment_runs_for_its_waits_and_then_ends_at_the_status_its_actions_earn
             "run-all",
             None,
             started,
+            None,
         );
-        let expected_terminal = match outcome {
-            ExperimentOutcome::Completed => "completed",
-            ExperimentOutcome::Failed(_) => "failed",
-        };
+        let expected_terminal = "completed";
         for (offset, expected) in [
             (Duration::ZERO, "initiating"),
             (Duration::from_millis(200), "initiating"),
@@ -942,7 +1004,61 @@ fn an_experiment_runs_for_its_waits_and_then_ends_at_the_status_its_actions_earn
                     settled.reason
                 );
             }
+            // `ExperimentError` is "the error information of the experiment when the
+            // action has FAILED", so a run that is initiating, running or completed
+            // reports none at all.
+            assert!(
+                settled.to_state().error.is_none(),
+                "case {case:?} at +{offset:?}: expected no error beside status {expected}, \
+                 got {:?}",
+                settled.to_state().error
+            );
         }
+
+        // The same graph started under a role the account's IAM store shows may not
+        // perform one of its actions: the run ends `failed` carrying BOTH halves of the
+        // attribution — the reason, and the `ExperimentError` the model pairs with it.
+        let mut denied = ExperimentRecord::from_template(
+            "EXP000000000002".to_string(),
+            "arn:aws:fis:us-east-1:000000000000:experiment/EXP000000000002".to_string(),
+            &template,
+            "run-all",
+            None,
+            started,
+            Some(failure.clone()),
+        );
+        denied.settle(started + TRANSITION_DELAY + TRANSITION_DELAY);
+        let state = denied.to_state();
+        assert_eq!(
+            state.status.as_deref(),
+            Some("failed"),
+            "case {case:?}: expected a run its role may not perform to fail, got {state:?}"
+        );
+        assert_eq!(
+            state.reason.as_deref(),
+            Some(failure.reason.as_str()),
+            "case {case:?}: expected the failure's own reason, got {state:?}"
+        );
+        let error = state
+            .error
+            .clone()
+            .unwrap_or_else(|| panic!("case {case:?}: a failed experiment reports an error, got {state:?}"));
+        assert_eq!(
+            error.code.as_deref(),
+            Some(failure.code.as_str()),
+            "case {case:?}: expected the failure's own error code, got {error:?}"
+        );
+        assert_eq!(
+            error.location.as_deref(),
+            Some("actions.blocked"),
+            "case {case:?}: expected the error to locate the action that failed, got {error:?}"
+        );
+        assert_eq!(
+            error.account_id.as_deref(),
+            Some(ACCOUNT_ID),
+            "case {case:?}: expected the error to name the account the run failed in, \
+             got {error:?}"
+        );
     }
 }
 
@@ -1091,9 +1207,9 @@ async fn stopping_an_experiment_in_a_final_state_is_refused() {
                 stopped.status, stopped.body
             );
         }
-        if case == "completed" {
+        if case == "completed" || case == "failed" {
             // As in `a_wait_experiment_is_reported_completed_once_its_run_has_elapsed`:
-            // the end of the minute-long wait is brought forward instead of waited out.
+            // the end of the run is brought forward instead of waited out.
             let state = service_com_amazonaws_fis_faultinjectionsimulator::state::service_state(
                 &*Arc::clone(&engine),
             )
@@ -1105,6 +1221,21 @@ async fn stopping_an_experiment_in_a_final_state_is_refused() {
                 .expect("the started experiment is in the store");
             record.transition_due = Some(SystemTime::now());
             record.run_span = Duration::from_millis(1);
+            if case == "failed" {
+                // The one way a run of this service ends `failed`: the experiment's
+                // execution role may not perform one of its actions. Put on the record
+                // here rather than reached through IAM, because the role records live in
+                // the IAM service and this suite carries only FIS — the rule that PRODUCES
+                // this outcome is asserted against the real IAM service in
+                // `core/router/tests/all/fis_execution_role_permissions.rs`.
+                record.outcome =
+                    ExperimentOutcome::Failed(ExperimentFailure::insufficient_privileges(
+                        ROLE_ARN,
+                        "stop",
+                        "aws:ec2:stop-instances",
+                        "ec2:StopInstances",
+                    ));
+            }
         }
 
         let before = poll_until_final(&router, &id, SETTLE_BUDGET).await;
@@ -1506,7 +1637,7 @@ async fn updating_a_target_account_configuration_changes_only_what_the_request_n
             &router,
             "PATCH",
             &format!("/experimentTemplates/{template}/targetAccountConfigurations/{account}"),
-            Some(json!({ "roleArn": "arn:aws:iam::111122223333:role/fis-target" })),
+            Some(json!({ "roleArn": format!("arn:aws:iam::{account}:role/fis-target") })),
             FALLBACK_REGION,
         )
         .await;

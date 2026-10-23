@@ -31,10 +31,35 @@
 //! transition (`initiating` -> `running`, `running` -> `completed`/`failed`, `stopping`
 //! -> `stopped`): the instant it falls due is stored on the record and materialised by
 //! [`ExperimentRecord::settle`], so no handler ever sleeps and a read never invents a
-//! status the clock did not already owe.
+//! status the clock did not already owe. An experiment that is STARTED therefore runs:
+//! it is observable in `running` for as long as the longest path through its actions'
+//! durations takes on the emulator's run clock ([`run_plan`], [`RUN_CLOCK_SCALE`]) and
+//! then reaches the terminal status its actions earned — `failed` with an
+//! insufficient-privileges reason when the account's IAM store shows the experiment's
+//! execution role may not perform an action's own API calls
+//! ([`action_permissions`]), and `completed` otherwise.
+//!
+//! Two things that run means here, and does NOT:
+//!
+//! * `completed` is the status of a RUN that elapsed, not a claim that an action's effect
+//!   was produced. What this service models is the experiment's own lifecycle, which is
+//!   FIS's record of the run; the effect of an action on another service (an
+//!   `aws:fis:inject-api-*` fault making the targeted role's calls to another service fail,
+//!   an instance stopping) happens in THAT service's responses, and this emulator does not
+//!   produce it. Nothing here reports such an effect as having happened: no injected fault
+//!   is announced, and the per-action `state`/`startTime`/`endTime` an experiment could
+//!   carry are left unset rather than filled in for work nothing performed
+//!   (see `experiment_action`).
+//! * the time members `startTime` and `endTime` bound the run on the COMPRESSED clock
+//!   ([`RUN_CLOCK_SCALE`]), so the span between them is shorter than the duration the
+//!   actions name — which is reported back verbatim, exactly as the template stored it.
+//!   That is deliberate, and the constant says why: an uncompressed run would make every
+//!   terminal status unobservable for up to the documented twelve hours.
 //!
 //! A template may also carry TARGET ACCOUNT CONFIGURATIONS, one per account id, which
-//! `UpdateTargetAccountConfiguration` changes in place.
+//! `UpdateTargetAccountConfiguration` changes in place. A configuration names one account
+//! and the role FIS assumes in it, so the two have to agree: the role has to belong to
+//! that account ([`target_account_role_arn_refusal`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
@@ -49,7 +74,8 @@ use crate::ops::types::{
     ExperimentReportConfiguration, ExperimentReportConfigurationCloudWatchDashboard,
     ExperimentReportConfigurationDataSources, ExperimentReportConfigurationOutputs,
     ExperimentReportConfigurationOutputsS3Configuration, ExperimentS3LogConfiguration,
-    ExperimentState, ExperimentStopCondition, ExperimentSummary, ExperimentTarget,
+    ExperimentError, ExperimentState, ExperimentStopCondition, ExperimentSummary,
+    ExperimentTarget,
     ExperimentTargetAccountConfiguration, ExperimentTargetAccountConfigurationSummary,
     ExperimentTargetFilter, ExperimentTemplate,
     ExperimentTemplateAction,
@@ -69,6 +95,8 @@ use crate::ops::types::{
     TargetAccountConfiguration, TargetAccountConfigurationSummary, ValidationException,
     ACCOUNT_TARGETING_VALUES, ACTIONS_MODE_VALUES, EMPTY_TARGET_RESOLUTION_MODE_VALUES,
 };
+
+pub mod action_permissions;
 
 /// The IAM store this service resolves an execution role against.
 ///
@@ -162,13 +190,15 @@ pub const MAX_TARGET_ACCOUNT_CONFIGURATIONS: usize = 1_000;
 pub const MAX_ACTIONS_PER_TEMPLATE: usize = 20;
 
 /// The built-in FIS action that waits: "aws:fis:wait — Run a wait action for a specified
-/// duration". It is the one action whose effect is pure elapsed time, so it is the one
-/// this emulator can carry out.
+/// duration". Its whole effect is elapsed time, and it is the action whose `duration`
+/// parameter FIS documents a range for.
 pub const WAIT_ACTION_ID: &str = "aws:fis:wait";
 
-/// The parameter `aws:fis:wait` takes: "duration — The duration of the wait", required,
-/// in ISO 8601 format.
-pub const WAIT_DURATION_PARAMETER: &str = "duration";
+/// The parameter an action's own length comes from: "duration — The duration of the
+/// action", in ISO 8601 format, which the FIS actions reference gives that meaning for
+/// every built-in action that takes it (required on `aws:fis:wait`, where it is "the
+/// duration of the wait").
+pub const DURATION_PARAMETER: &str = "duration";
 
 /// The smallest wait `aws:fis:wait` accepts: the documented range of its `duration` is
 /// 1 to 720 minutes (12 hours).
@@ -327,6 +357,39 @@ pub const STOP_CONDITION_SOURCE_ALARM: &str = "aws:cloudwatch:alarm";
 /// transient status, exactly as it would against the real service.
 pub const TRANSITION_DELAY: Duration = Duration::from_millis(500);
 
+/// How far the MODELLED clock of an experiment's run is compressed against the wall
+/// clock: one modelled minute per second of real time.
+///
+/// What this scales is how long the EMULATOR takes to walk a run, not what the run says it
+/// is: an action's `duration` is reported back verbatim, exactly as the template stored
+/// it. FIS documents `aws:fis:wait`'s `duration` as 1 to 720 minutes, so an uncompressed
+/// run would hold every caller that waits for an experiment to finish — and every test of
+/// one — for between a minute and twelve hours before any terminal status became readable.
+/// The run is therefore driven on this compressed clock, clamped into
+/// [`MIN_RUN_SPAN`]..=[`MAX_RUN_SPAN`], which keeps the compression monotonic (a longer
+/// modelled run is never a shorter real one) while every transient status stays observable
+/// and a terminal one arrives promptly.
+pub const RUN_CLOCK_SCALE: u32 = 60;
+
+/// The shortest a run takes once the experiment is `running`, whatever its actions'
+/// durations compress to — an experiment whose actions name no duration at all included.
+///
+/// Never zero, and deliberately several poll intervals long: `running` is a status FIS
+/// reports for every experiment it starts, so a client that polls a started experiment has
+/// to be able to SEE it. See [`RUN_CLOCK_SCALE`] for why a run is compressed at all.
+pub const MIN_RUN_SPAN: Duration = Duration::from_secs(5);
+
+/// The longest a run takes, whatever duration its actions name. See [`RUN_CLOCK_SCALE`].
+pub const MAX_RUN_SPAN: Duration = Duration::from_secs(15);
+
+/// `ExperimentStatusReason`'s modelled ceiling (`@length(min: 0, max: 512)`).
+///
+/// A state reason this service builds from the request — the role ARN of an experiment
+/// that failed on privileges, say, which `RoleArn` bounds at 2,048 characters — is clipped
+/// to it, so a value the caller chose cannot push a response outside the member's own
+/// bounds.
+pub const EXPERIMENT_STATUS_REASON_CEILING: usize = 512;
+
 /// The `state.reason` an experiment carries once `StopExperiment` has been called on it.
 ///
 /// FIS documents no wording for `ExperimentState$reason` ("The reason for the state"), so
@@ -342,11 +405,12 @@ pub const COMPLETED_REASON: &str = "Experiment completed";
 /// `ExperimentStatus` is modelled
 /// `pending | initiating | running | completed | stopping | stopped | failed | cancelled`.
 /// Six of the eight are reachable here: an experiment is minted `initiating`, becomes
-/// `running` when the clock says so, and then either `completed` (its wait actions
-/// elapsed) or `failed` (it carries an action this emulator cannot inject); a
-/// `StopExperiment` moves it `stopping` -> `stopped` instead. `pending` is the status FIS
-/// reports before it has accepted the run, and `cancelled` reports a run cancelled by
-/// something other than a stop request, neither of which this emulator produces.
+/// `running` when the clock says so, and then either `completed` (its actions ran to the
+/// end of the run) or `failed` (an action could not be run under the experiment's
+/// execution role); a `StopExperiment` moves it `stopping` -> `stopped` instead. `pending`
+/// is the status FIS reports before it has accepted the run, and `cancelled` reports a run
+/// cancelled by something other than a stop request, neither of which this emulator
+/// produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExperimentStatus {
     /// The experiment has been accepted and is starting up.
@@ -393,13 +457,90 @@ impl ExperimentStatus {
 /// run span elapses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExperimentOutcome {
-    /// Every action is `aws:fis:wait`, so the run is elapsed time and nothing else: it
-    /// ends `completed`.
+    /// Every action of the experiment ran to the end of the run, so it ends `completed`.
     Completed,
-    /// The experiment carries an action that injects a fault into another service, which
-    /// this emulator does not do. The run ends in the modelled `failed` state carrying
-    /// this reason, rather than reporting a success nothing performed.
-    Failed(String),
+    /// An action could not be run at all, so the run ends in the modelled `failed` state
+    /// carrying this failure.
+    Failed(ExperimentFailure),
+}
+
+/// Why an experiment's run ended `failed`: the `ExperimentState$reason` it reports and the
+/// `ExperimentError` that goes with it.
+///
+/// FIS reports BOTH for a failed experiment — "the reason for the state" and "the error
+/// information of the experiment when the action has failed" — and that pair is what says
+/// WHICH failure it was, so a client can tell a run AWS would have refused on IAM from one
+/// that failed for any other reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExperimentFailure {
+    /// `ExperimentState$reason`, within [`EXPERIMENT_STATUS_REASON_CEILING`].
+    pub reason: String,
+    /// `ExperimentError$code` — "the error code for the failed experiment", modelled only
+    /// as a string within `@length(0..128)`, `pattern ^[\S]+$`.
+    pub code: String,
+    /// `ExperimentError$location` — "context for the section of the experiment template
+    /// that failed", which is the action that could not be run: `actions.<name>`, the same
+    /// path this service's input refusals name an action by.
+    pub location: String,
+}
+
+impl ExperimentFailure {
+    /// The failure of an action the experiment's execution role is not allowed to perform.
+    ///
+    /// Every value in the reason comes from the request and the account's own stored
+    /// policies — the role the template names, the action that could not run, and the IAM
+    /// action that role is not allowed — around the attribution AWS words an
+    /// insufficient-privileges failure with, which is what makes this failure
+    /// distinguishable from every other one.
+    pub fn insufficient_privileges(
+        role_arn: &str,
+        action_name: &str,
+        action_id: &str,
+        permission: &str,
+    ) -> Self {
+        Self {
+            reason: clipped_reason(format!(
+                "Not enough privileges to run action {action_name} ({action_id}): the \
+                 experiment role {role_arn} is not allowed to perform {permission}"
+            )),
+            code: INSUFFICIENT_PRIVILEGES_CODE.to_string(),
+            location: format!("actions.{action_name}"),
+        }
+    }
+
+    /// The `ExperimentError` a failed experiment reports beside its reason.
+    ///
+    /// `accountId` is "the Amazon Web Services Account ID where the experiment failure
+    /// occurred" — this emulator's account, which is the account the experiment ran in.
+    pub fn to_error(&self) -> ExperimentError {
+        ExperimentError {
+            account_id: Some(::engine::emulator_account_id().to_string()),
+            code: Some(self.code.clone()),
+            location: Some(self.location.clone()),
+        }
+    }
+}
+
+/// The `ExperimentError$code` of a run that failed because the experiment's execution role
+/// is not allowed to perform an action's own API calls.
+///
+/// FIS publishes no catalog of `ExperimentErrorCode` values, so this is the emulator's own
+/// token for that condition rather than a reproduction of AWS's: what the contract
+/// requires is a code within the member's modelled `@length(0..128)` / `^[\S]+$` that
+/// tells this failure apart from any other, which is the same thing the reason does in
+/// prose.
+pub const INSUFFICIENT_PRIVILEGES_CODE: &str = "insufficientPrivileges";
+
+/// `reason` within `ExperimentStatusReason`'s modelled ceiling, cut at a character
+/// boundary so a clipped reason is still valid UTF-8.
+fn clipped_reason(reason: String) -> String {
+    if reason.chars().count() <= EXPERIMENT_STATUS_REASON_CEILING {
+        return reason;
+    }
+    reason
+        .chars()
+        .take(EXPERIMENT_STATUS_REASON_CEILING)
+        .collect()
 }
 
 /// One target account configuration of an experiment template, exactly as
@@ -698,8 +839,8 @@ pub struct ExperimentRecord {
     /// When the transition this experiment owes the clock falls due, or `None` when it
     /// owes none. [`ExperimentRecord::settle`] is what spends it.
     pub transition_due: Option<SystemTime>,
-    /// How long this experiment's actions take once it is `running` — the longest path
-    /// through its action graph, as [`run_plan`] computes it.
+    /// How long this experiment is `running` for — the longest path through its action
+    /// graph on the emulator's run clock, as [`run_plan`] computes it.
     pub run_span: Duration,
     /// The terminal status the run earns once [`run_span`](Self::run_span) elapses.
     pub outcome: ExperimentOutcome,
@@ -707,6 +848,12 @@ pub struct ExperimentRecord {
 
 impl ExperimentRecord {
     /// The record `StartExperiment` persists for `template`.
+    ///
+    /// `failure` is what the start already knows about the run: the one failure the
+    /// account's IAM store SHOWS the experiment's execution role cannot get past (see
+    /// [`action_permissions::permission_failure`]), or `None` when it shows none. It is
+    /// resolved by the caller, which is where the IAM store is reachable, and decides the
+    /// terminal status the run earns — see [`run_plan`].
     pub fn from_template(
         id: String,
         arn: String,
@@ -714,8 +861,9 @@ impl ExperimentRecord {
         actions_mode: &str,
         tags: Option<HashMap<String, String>>,
         now: SystemTime,
+        failure: Option<ExperimentFailure>,
     ) -> Self {
-        let (run_span, outcome) = run_plan(&template.actions);
+        let (run_span, outcome) = run_plan(&template.actions, failure);
         let targets: HashMap<String, ExperimentTarget> = template
             .targets
             .iter()
@@ -808,9 +956,9 @@ impl ExperimentRecord {
                             self.status = ExperimentStatus::Completed;
                             self.reason = Some(COMPLETED_REASON.to_string());
                         }
-                        ExperimentOutcome::Failed(reason) => {
+                        ExperimentOutcome::Failed(failure) => {
                             self.status = ExperimentStatus::Failed;
-                            self.reason = Some(reason.clone());
+                            self.reason = Some(failure.reason.clone());
                         }
                     }
                     // The experiment ended when the transition fell due, not when somebody
@@ -849,10 +997,15 @@ impl ExperimentRecord {
             status: Some(self.status.as_wire().to_string()),
             reason: self.reason.clone(),
             // `ExperimentError` carries "the error information of the experiment when the
-            // action has failed": an `accountId`, an error `code` and the `location` in
-            // the template. A run this emulator declines to perform produced no such
-            // error, so the reason says what happened and no code is invented for it.
-            error: None,
+            // action has failed", so it is reported exactly when this experiment HAS
+            // failed: the failure its run ended in, and nothing at all for a run that is
+            // still going, completed or stopped.
+            error: match (self.status, &self.outcome) {
+                (ExperimentStatus::Failed, ExperimentOutcome::Failed(failure)) => {
+                    Some(failure.to_error())
+                }
+                _ => None,
+            },
         }
     }
 
@@ -1399,6 +1552,49 @@ pub fn role_arn_refusal(member: &str, role_arn: Option<&str>) -> Option<Validati
     )))
 }
 
+/// The message FIS refuses a `roleArn` that does not belong to the `accountId` it is being
+/// configured for with.
+///
+/// `RoleArn` is modelled loosely (`@length(20..2048)`, `pattern ^[\S]+$`), so the rule is
+/// a server-side one and its wording is FIS's: the refusal names the parameter and the
+/// relationship it states, and carries neither the role ARN nor the account id (the
+/// identical text is recorded for different values). See
+/// [`target_account_role_arn_refusal`] for the rule itself.
+pub const TARGET_ACCOUNT_ROLE_NOT_OWNED: &str = "The roleArn parameter value is not valid. \
+     The IAM role must belong to the account specified in the accountId parameter value.";
+
+/// `None` when `role_arn` is a role of the account `account_id` names; otherwise the
+/// `ValidationException` that refuses it.
+///
+/// A target account configuration says WHICH role FIS assumes in ONE account, so the two
+/// members have to agree: the account field of the `roleArn` is the account the role
+/// belongs to, and a role belonging to any other account is refused with a 400
+/// `ValidationException` before anything is persisted — a rule the model cannot express
+/// and which therefore lives server-side. Every member of this service that names a role
+/// FOR a given account goes through here (`CreateTargetAccountConfiguration` and
+/// `UpdateTargetAccountConfiguration`), and the ARN's own syntax
+/// ([`role_arn_refusal`]) is checked with it, so a value that is no ARN at all — which
+/// names no account to compare — is still refused, by the rule that fits it.
+///
+/// The ownership comparison is only MADE for an `accountId` that is an AWS account number:
+/// `TargetAccountId` is modelled `@length(12..48)`, so a value inside those bounds that is
+/// not an account id names no account for a role to belong to, and refusing THAT value is
+/// the business of the rule on `accountId` itself rather than of this one.
+pub fn target_account_role_arn_refusal(
+    account_id: &str,
+    role_arn: Option<&str>,
+) -> Option<ValidationException> {
+    let role_arn = role_arn?;
+    let configured_account = is_account_id(account_id);
+    let named_account = ::service_common::arn::parse(role_arn).map(|arn| arn.account);
+    if let Some(named_account) = named_account {
+        if configured_account && named_account != account_id {
+            return Some(invalid_input(TARGET_ACCOUNT_ROLE_NOT_OWNED));
+        }
+    }
+    role_arn_refusal("roleArn", Some(role_arn))
+}
+
 /// True when `value` is a well-formed IAM role ARN:
 /// `arn:<partition>:iam::<12-digit account id>:role/<path segments>/<role name>`.
 ///
@@ -1593,30 +1789,18 @@ pub enum WaitDurationProblem {
 
 /// The wait an `aws:fis:wait` action's `duration` parameter names.
 ///
-/// "duration — The duration of the wait" is given in ISO 8601 format and its documented
-/// range is [`WAIT_DURATION_MIN_MINUTES`]..=[`WAIT_DURATION_MAX_MINUTES`] minutes, so a
-/// value outside that bound is not a wait this service accepts. A duration whose length
-/// depends on the calendar (a year or a month designator) names no fixed span and is
-/// refused as malformed rather than guessed at.
+/// "duration — The duration of the wait" is given in ISO 8601 format ([`iso8601_span`] is
+/// the parse) and its documented range is
+/// [`WAIT_DURATION_MIN_MINUTES`]..=[`WAIT_DURATION_MAX_MINUTES`] minutes, so a value
+/// outside that bound is not a wait this service accepts.
 pub fn wait_duration(value: &str) -> Result<Duration, WaitDurationProblem> {
-    let parsed = ::iso8601_duration::Duration::parse(value)
-        .map_err(|_| WaitDurationProblem::NotADuration)?;
-    if parsed.year != 0.0 || parsed.month != 0.0 {
-        return Err(WaitDurationProblem::NotADuration);
-    }
-    let seconds = f64::from(parsed.day) * 86_400.0
-        + f64::from(parsed.hour) * 3_600.0
-        + f64::from(parsed.minute) * 60.0
-        + f64::from(parsed.second);
-    if !seconds.is_finite() || seconds < 0.0 {
-        return Err(WaitDurationProblem::NotADuration);
-    }
-    let minutes = seconds / 60.0;
+    let span = iso8601_span(value).ok_or(WaitDurationProblem::NotADuration)?;
+    let minutes = span.as_secs_f64() / 60.0;
     #[allow(clippy::cast_precision_loss)]
     if minutes < WAIT_DURATION_MIN_MINUTES as f64 || minutes > WAIT_DURATION_MAX_MINUTES as f64 {
         return Err(WaitDurationProblem::OutOfRange);
     }
-    Ok(Duration::from_secs_f64(seconds))
+    Ok(span)
 }
 
 /// `None` when every action a `CreateExperimentTemplate` request carries satisfies what
@@ -1655,10 +1839,10 @@ pub fn actions_refusal(
         let duration = action
             .parameters
             .as_ref()
-            .and_then(|parameters| parameters.get(WAIT_DURATION_PARAMETER));
+            .and_then(|parameters| parameters.get(DURATION_PARAMETER));
         let Some(duration) = duration else {
             return Some(invalid_input(format!(
-                "actions.{name}.parameters must carry '{WAIT_DURATION_PARAMETER}' \
+                "actions.{name}.parameters must carry '{DURATION_PARAMETER}' \
                  for action {WAIT_ACTION_ID}."
             )));
         };
@@ -1666,13 +1850,13 @@ pub fn actions_refusal(
             Ok(_) => {}
             Err(WaitDurationProblem::OutOfRange) => {
                 return Some(invalid_input(format!(
-                    "'{WAIT_DURATION_PARAMETER}' must be within a range of \
+                    "'{DURATION_PARAMETER}' must be within a range of \
                      {WAIT_DURATION_MIN_MINUTES} to {WAIT_DURATION_MAX_MINUTES} minutes."
                 )))
             }
             Err(WaitDurationProblem::NotADuration) => {
                 return Some(invalid_input(format!(
-                    "actions.{name}.parameters.'{WAIT_DURATION_PARAMETER}' must be a \
+                    "actions.{name}.parameters.'{DURATION_PARAMETER}' must be a \
                      duration in ISO 8601 format."
                 )))
             }
@@ -1704,43 +1888,45 @@ pub fn actions_quota_refusal(
 /// How long an experiment's actions take once it is `running`, and what the run ends as.
 ///
 /// FIS starts an action as soon as every action its `startAfter` names has finished, so a
-/// run lasts as long as the longest path through that graph. The only action this emulator
-/// can carry out is [`WAIT_ACTION_ID`], whose whole effect is elapsed time: an experiment
-/// built from waits runs for that path and then completes. Any other action injects a
-/// fault into another service, which this emulator does not do — the experiment it belongs
-/// to ends in the modelled `failed` state with a reason naming those actions, and claims
-/// no duration for work nothing performed.
+/// run lasts as long as the longest path through that graph ([`critical_path`]), which is
+/// then compressed onto the emulator's run clock ([`run_span`]). An experiment that is
+/// started RUNS: it is observable in `running` for that span and then reaches the terminal
+/// status its actions earned.
 ///
-/// The span is never zero: a caller polling straight after `StartExperiment` observes
-/// `initiating` and then `running`, exactly as it would against the real service.
-pub fn run_plan(actions: &HashMap<String, ExperimentTemplateAction>) -> (Duration, ExperimentOutcome) {
-    let mut unperformable: Vec<&str> = actions
-        .values()
-        .filter_map(|action| action.action_id.as_deref())
-        .filter(|action_id| *action_id != WAIT_ACTION_ID)
-        .collect();
-    unperformable.sort_unstable();
-    unperformable.dedup();
-
-    if unperformable.is_empty() {
-        (
-            critical_path(actions).max(TRANSITION_DELAY),
+/// `failure` is what the start showed about the run before it began — the account's IAM
+/// store showing the experiment's execution role is not allowed to perform an action's own
+/// API calls. Such an action never starts, so that run claims no duration at all: it is
+/// one transition span long and ends `failed`, carrying the failure, which is the status
+/// and the attribution FIS reports for it. With nothing shown against it the run ends
+/// `completed`.
+///
+/// The span is never zero: a caller polling after `StartExperiment` observes `initiating`
+/// and then `running`, exactly as it would against the real service.
+pub fn run_plan(
+    actions: &HashMap<String, ExperimentTemplateAction>,
+    failure: Option<ExperimentFailure>,
+) -> (Duration, ExperimentOutcome) {
+    match failure {
+        Some(failure) => (TRANSITION_DELAY, ExperimentOutcome::Failed(failure)),
+        None => (
+            run_span(critical_path(actions)),
             ExperimentOutcome::Completed,
-        )
-    } else {
-        (
-            TRANSITION_DELAY,
-            ExperimentOutcome::Failed(format!(
-                "This emulator does not inject faults, so the experiment's \
-                 {} action could not be run",
-                unperformable.join(", ")
-            )),
-        )
+        ),
     }
 }
 
-/// The longest path through `actions`, where each action's own length is the wait it
-/// performs and every other action is instantaneous.
+/// `modelled` on the emulator's run clock: scaled by [`RUN_CLOCK_SCALE`] and clamped into
+/// [`MIN_RUN_SPAN`]..=[`MAX_RUN_SPAN`].
+///
+/// Monotonic in `modelled` — a longer modelled run is never a shorter real one — so two
+/// experiments ordered by the durations their actions name stay ordered by the spans they
+/// run for, up to the ceiling.
+pub fn run_span(modelled: Duration) -> Duration {
+    (modelled / RUN_CLOCK_SCALE).clamp(MIN_RUN_SPAN, MAX_RUN_SPAN)
+}
+
+/// The longest path through `actions`, where each action's own length is the `duration` it
+/// was asked for and an action that names none is instantaneous.
 ///
 /// Walked ONCE per action, with each action's finish offset memoised and its own span
 /// parsed exactly once up front, so the whole computation costs O(actions + `startAfter`
@@ -1795,26 +1981,68 @@ fn finish_offset<'a>(
         }
     }
     walking.pop();
-    let total = start + spans.get(name).copied().unwrap_or(Duration::ZERO);
+    // SATURATING: a template may name a `duration` of its own choosing for any action
+    // other than `aws:fis:wait` (whose range `actions_refusal` checks), so a chain of them
+    // can add up past what a `Duration` holds. The sum is capped there rather than
+    // overflowing — a run that long is clamped to [`MAX_RUN_SPAN`] either way.
+    let total = start.saturating_add(spans.get(name).copied().unwrap_or(Duration::ZERO));
     finish.insert(name, total);
     total
 }
 
-/// How long one action takes: the wait it was asked for, or nothing at all for an action
-/// this emulator does not perform.
+/// How long one action takes: the span its `duration` parameter names, and nothing at all
+/// for an action that carries none.
 ///
-/// A stored wait went through [`actions_refusal`] at create time, so its duration parses;
-/// one that somehow does not contributes nothing rather than a made-up span.
+/// SOURCE: the AWS FIS actions reference, where `duration` is "the duration of the action"
+/// (in ISO 8601 format) for every built-in action that takes it — `aws:fis:wait`, the
+/// `aws:fis:inject-api-*` family, `aws:ebs:pause-volume-io`,
+/// `aws:network:disrupt-connectivity`, … — so the parameter is read by its documented
+/// meaning rather than for one action id. An action whose effect is a single API call
+/// (`aws:ec2:reboot-instances`) takes no `duration` and so names no span; a parameter that
+/// is some other span (`aws:ec2:stop-instances`' `startInstancesAfterDuration`) is not
+/// this one and is not read as it.
+///
+/// A value that is not an ISO 8601 duration contributes nothing rather than a made-up
+/// span: [`wait_duration`]'s own 1..720-minute range is NOT applied here, because that is
+/// the range documented for `aws:fis:wait` and each other action publishes its own.
 fn action_span(action: &ExperimentTemplateAction) -> Duration {
-    if action.action_id.as_deref() != Some(WAIT_ACTION_ID) {
-        return Duration::ZERO;
-    }
     action
         .parameters
         .as_ref()
-        .and_then(|parameters| parameters.get(WAIT_DURATION_PARAMETER))
-        .and_then(|duration| wait_duration(duration).ok())
+        .and_then(|parameters| parameters.get(DURATION_PARAMETER))
+        .and_then(|duration| iso8601_span(duration))
         .unwrap_or(Duration::ZERO)
+}
+
+/// The fixed span the ISO 8601 duration `value` names, or `None` when it names none.
+///
+/// A duration whose length depends on the calendar (a year or a month designator) names no
+/// fixed span, so it is read as no duration at all rather than guessed at — the same
+/// reading [`wait_duration`], which is this parse under `aws:fis:wait`'s documented range,
+/// takes of one.
+///
+/// TOTAL over every string a caller can send: a value this cannot read as a fixed,
+/// representable span — one that is not a duration, one that is negative, and one whose
+/// span does not fit a [`Duration`] (the parser's fields are floats, so a request may name
+/// 1e20 seconds) — is `None`. Nothing here may panic: the `duration` of an action that is
+/// not `aws:fis:wait` is never range-checked when the template is created, so this parse
+/// runs on unvalidated request text inside `StartExperiment`, while that handler holds the
+/// store guard.
+pub fn iso8601_span(value: &str) -> Option<Duration> {
+    let parsed = ::iso8601_duration::Duration::parse(value).ok()?;
+    if parsed.year != 0.0 || parsed.month != 0.0 {
+        return None;
+    }
+    let seconds = f64::from(parsed.day) * 86_400.0
+        + f64::from(parsed.hour) * 3_600.0
+        + f64::from(parsed.minute) * 60.0
+        + f64::from(parsed.second);
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    // `try_from_secs_f64` is the non-panicking construction: a value a `Duration` cannot
+    // hold names no span this service can run, exactly like a value that is no duration.
+    Duration::try_from_secs_f64(seconds).ok()
 }
 
 /// `None` when this emulator has no reason to think FIS could not assume `role_arn`;
@@ -2135,9 +2363,11 @@ fn experiment_target(target: &ExperimentTemplateTarget) -> ExperimentTarget {
 /// The experiment's copy of one of the template's actions.
 ///
 /// `state`, `startTime` and `endTime` are left unset on purpose: they report the progress
-/// of an action that injects a fault into another service, and this emulator runs no
-/// action, so it reports no per-action status rather than claiming one for work nothing
-/// performed.
+/// of ONE action, and what this emulator models is the progress of the EXPERIMENT (its
+/// `ExperimentState` and the run span its actions' durations add up to), not the effect
+/// each action has on another service — so no per-action status is claimed for work this
+/// emulator did not carry out. Reporting them is the business of whatever models those
+/// effects.
 fn experiment_action(action: &ExperimentTemplateAction) -> ExperimentAction {
     ExperimentAction {
         action_id: action.action_id.clone(),
@@ -2252,6 +2482,16 @@ pub struct ActionCatalogEntry {
     /// The target resource types the action supports, empty for an action that needs no
     /// target.
     pub targets: &'static [ActionCatalogTarget],
+    /// The IAM actions the experiment's execution role has to be allowed to perform for
+    /// this action to run, empty for an action that calls no other service's API.
+    ///
+    /// NOT part of the `Action` shape — `GetAction` reports no permissions — but part of
+    /// what running the action MEANS: FIS runs it under the template's `roleArn`, so an
+    /// action whose API calls that role is not allowed to make cannot be carried out (see
+    /// [`action_permissions`]). The primary API call of each action, as the FIS actions
+    /// reference states it for that action; an action this table records no permission for
+    /// is never failed for privileges.
+    pub permissions: &'static [&'static str],
 }
 
 impl ActionCatalogEntry {
@@ -2296,6 +2536,17 @@ impl ActionCatalogEntry {
     }
 }
 
+/// The IAM action the `aws:fis:inject-api-*` family and the EC2 API-error actions need:
+/// the FIS actions reference states `ec2:InjectApiError` for them, scoped with the
+/// `ec2:FisActionId` condition key — which is why the gate decides with that key in the
+/// request's condition context (see [`action_permissions`]), so a policy written the way
+/// the reference writes it grants the action it names and only that action.
+pub const EC2_INJECT_API_ERROR: &str = "ec2:InjectApiError";
+
+/// The condition key the documented `ec2:InjectApiError` grant is scoped by: "the FIS
+/// action id", which is the value the experiment's action carries.
+pub const FIS_ACTION_ID_CONDITION_KEY: &str = "ec2:FisActionId";
+
 /// The built-in FIS actions this emulator serves.
 ///
 /// SOURCE: the AWS FIS actions reference
@@ -2303,8 +2554,11 @@ impl ActionCatalogEntry {
 /// `Action`'s own model documentation points at ("Describes an action. For more
 /// information, see FIS actions in the Fault Injection Service User Guide"). Each entry
 /// records what that reference states for the action: its id, a one-line summary of what
-/// it does, the parameters it accepts and which of them are required, and the target
-/// resource types it supports under the key an experiment template refers to them by.
+/// it does, the parameters it accepts and which of them are required, the target
+/// resource types it supports under the key an experiment template refers to them by, and
+/// the IAM action its own API call needs ("the IAM permissions required" the reference
+/// lists for each action), which the experiment's execution role has to be allowed to
+/// perform for the action to run.
 ///
 /// It is a SUBSET of the published catalog, not the whole of it: an id this table does
 /// not hold answers `ResourceNotFoundException` rather than a fabricated action.
@@ -2327,6 +2581,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             },
         ],
         targets: &[],
+        permissions: &["cloudwatch:DescribeAlarms"],
     },
     ActionCatalogEntry {
         id: "aws:ebs:pause-volume-io",
@@ -2340,6 +2595,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Volumes",
             resource_type: "aws:ec2:ebs-volume",
         }],
+        permissions: &["ec2:PauseVolumeIO"],
     },
     ActionCatalogEntry {
         id: "aws:ec2:api-insufficient-instance-capacity-error",
@@ -2366,6 +2622,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Roles",
             resource_type: "aws:iam:role",
         }],
+        permissions: &[EC2_INJECT_API_ERROR],
     },
     ActionCatalogEntry {
         id: "aws:ec2:asg-insufficient-instance-capacity-error",
@@ -2392,6 +2649,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "AutoScalingGroups",
             resource_type: "aws:ec2:autoscaling-group",
         }],
+        permissions: &[EC2_INJECT_API_ERROR],
     },
     ActionCatalogEntry {
         id: "aws:ec2:reboot-instances",
@@ -2401,6 +2659,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Instances",
             resource_type: "aws:ec2:instance",
         }],
+        permissions: &["ec2:RebootInstances"],
     },
     ActionCatalogEntry {
         id: "aws:ec2:send-spot-instance-interruptions",
@@ -2415,6 +2674,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "SpotInstances",
             resource_type: "aws:ec2:spot-instance",
         }],
+        permissions: &["ec2:SendSpotInstanceInterruptions"],
     },
     ActionCatalogEntry {
         id: "aws:ec2:stop-instances",
@@ -2437,6 +2697,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Instances",
             resource_type: "aws:ec2:instance",
         }],
+        permissions: &["ec2:StopInstances"],
     },
     ActionCatalogEntry {
         id: "aws:ec2:terminate-instances",
@@ -2446,6 +2707,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Instances",
             resource_type: "aws:ec2:instance",
         }],
+        permissions: &["ec2:TerminateInstances"],
     },
     ActionCatalogEntry {
         id: "aws:ecs:drain-container-instances",
@@ -2466,6 +2728,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Clusters",
             resource_type: "aws:ecs:cluster",
         }],
+        permissions: &["ecs:UpdateContainerInstancesState"],
     },
     ActionCatalogEntry {
         id: "aws:ecs:stop-task",
@@ -2475,6 +2738,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Tasks",
             resource_type: "aws:ecs:task",
         }],
+        permissions: &["ecs:StopTask"],
     },
     ActionCatalogEntry {
         id: "aws:eks:terminate-nodegroup-instances",
@@ -2488,6 +2752,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Nodegroups",
             resource_type: "aws:eks:nodegroup",
         }],
+        permissions: &["ec2:TerminateInstances"],
     },
     ActionCatalogEntry {
         id: "aws:fis:inject-api-internal-error",
@@ -2519,6 +2784,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Roles",
             resource_type: "aws:iam:role",
         }],
+        permissions: &[EC2_INJECT_API_ERROR],
     },
     ActionCatalogEntry {
         id: "aws:fis:inject-api-throttle-error",
@@ -2549,6 +2815,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Roles",
             resource_type: "aws:iam:role",
         }],
+        permissions: &[EC2_INJECT_API_ERROR],
     },
     ActionCatalogEntry {
         id: "aws:fis:inject-api-unavailable-error",
@@ -2580,6 +2847,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Roles",
             resource_type: "aws:iam:role",
         }],
+        permissions: &[EC2_INJECT_API_ERROR],
     },
     ActionCatalogEntry {
         id: "aws:fis:wait",
@@ -2590,6 +2858,9 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             required: true,
         }],
         targets: &[],
+        // The wait calls no other service's API, so the execution role needs no
+        // permission for it: it is the one action whose whole effect is elapsed time.
+        permissions: &[],
     },
     ActionCatalogEntry {
         id: "aws:network:disrupt-connectivity",
@@ -2610,6 +2881,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Subnets",
             resource_type: "aws:ec2:subnet",
         }],
+        permissions: &["ec2:CreateNetworkAcl"],
     },
     ActionCatalogEntry {
         id: "aws:rds:failover-db-cluster",
@@ -2619,6 +2891,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Clusters",
             resource_type: "aws:rds:cluster",
         }],
+        permissions: &["rds:FailoverDBCluster"],
     },
     ActionCatalogEntry {
         id: "aws:rds:reboot-db-instances",
@@ -2632,6 +2905,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "DBInstances",
             resource_type: "aws:rds:db",
         }],
+        permissions: &["rds:RebootDBInstance"],
     },
     ActionCatalogEntry {
         id: "aws:ssm:send-command",
@@ -2662,6 +2936,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Instances",
             resource_type: "aws:ec2:instance",
         }],
+        permissions: &["ssm:SendCommand"],
     },
     ActionCatalogEntry {
         id: "aws:ssm:start-automation-execution",
@@ -2695,6 +2970,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             },
         ],
         targets: &[],
+        permissions: &["ssm:StartAutomationExecution"],
     },
 ];
 

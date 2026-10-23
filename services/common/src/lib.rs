@@ -515,6 +515,37 @@ fn first_path_segment(path: &str) -> Option<&str> {
     (!segment.is_empty()).then_some(segment)
 }
 
+/// The PATH of a request URI: no scheme, no authority, no query string and no fragment.
+///
+/// The framework hands `Service::can_handle` an `http::request::Parts`, whose `uri.path()`
+/// is already just the path — but the two seams that take a whole runtime-API request
+/// (`Service::override_operation`, `Service::override_protocol`) see the URI as a `&str`
+/// that may be absolute (`https://host/path?query`), which is the form the AWS SDK sends.
+/// A service deciding anything from the path of such a request needs the path alone, and
+/// several crates had each grown a private copy of this reader; this is the shared one, so
+/// [`nth_path_segment`] and [`first_path_segment`] can be applied to a whole URI as well
+/// as to a `Parts` path.
+///
+/// A URI with no authority is already a path and is returned as it is. A URI whose
+/// authority is followed by nothing has the root path, which is what a request to the
+/// authority addresses.
+pub fn uri_path(uri: &str) -> &str {
+    let after_authority = match uri.find("://") {
+        None => uri,
+        Some(scheme_end) => {
+            let authority = &uri[scheme_end + 3..];
+            match authority.find('/') {
+                Some(path_start) => &authority[path_start..],
+                None => "/",
+            }
+        }
+    };
+    after_authority
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(after_authority)
+}
+
 /// The `index`-th (0-based) `/`-separated segment of a URI path, or `None` when the path
 /// has no such segment.
 ///
@@ -875,6 +906,41 @@ mod tests {
             assert_eq!(
                 claimed, expected,
                 "case {case:?}: expected claimed == {expected}, got {claimed}"
+            );
+        }
+    }
+
+    /// The path of a whole request URI, in each form the seams that read one see: an
+    /// absolute URI as an SDK sends it, with and without a query string or a fragment, and
+    /// a bare path as a `Parts` already carries.
+    #[test]
+    fn uri_path_reads_the_path_of_a_whole_uri() {
+        // (case, uri, expected path)
+        let rows: [(&str, &str, &str); 9] = [
+            ("an absolute URI", "https://rum.us-east-1.amazonaws.com/tags/arn", "/tags/arn"),
+            (
+                "an absolute URI with a query string",
+                "https://rum.us-east-1.amazonaws.com/tags/arn?tagKeys=Env",
+                "/tags/arn",
+            ),
+            (
+                "an absolute URI with a fragment",
+                "https://host/appmonitor/name#frag",
+                "/appmonitor/name",
+            ),
+            ("an authority and nothing else", "https://host", "/"),
+            ("an authority and a bare slash", "https://host/", "/"),
+            ("a bare path", "/tags/arn", "/tags/arn"),
+            ("a bare path with a query string", "/tags/arn?tagKeys=Env", "/tags/arn"),
+            ("the root path", "/", "/"),
+            ("an empty URI", "", ""),
+        ];
+
+        for (case, uri, expected) in rows {
+            let actual = uri_path(uri);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: the path of {uri:?} expected {expected:?}, got {actual:?}"
             );
         }
     }

@@ -6,7 +6,7 @@
 //! it — `GetComplianceInquiryMetadata` here, `ListComplianceInquiries` and the tag
 //! operations once they are implemented — answers from the one stored resource.
 //!
-//! Three rules shape the handler:
+//! Four rules shape the handler:
 //!
 //! * The inquiry is created NON-TERMINAL. AWS answers this operation with HTTP 202 and
 //!   an inquiry whose `status` is `PROCESSING`, so the terminal status is owed by the
@@ -20,6 +20,15 @@
 //!   and the same token on DIFFERENT content is refused with the modelled
 //!   `ConflictException` — an idempotency token identifies one call, so honouring it on
 //!   other content would hide the second submission.
+//! * The name every READ of the inquiry reports is DERIVED FROM ITS CONTENT when the
+//!   content derives one: a submission made of a single text query is reported under that
+//!   query text, which is the only content-derived handle `InquirySummary` exposes, so a
+//!   caller that submitted a query finds its inquiry in `ListComplianceInquiries` under
+//!   exactly what it sent. The caller-supplied title is kept verbatim on the record and
+//!   stands as the reported name only for content that derives none (an uploaded
+//!   document, whose queries are written inside the file). The one projection
+//!   ([`crate::state::ComplianceInquiry::display_name`]) serves this create, the listing,
+//!   `GetComplianceInquiryMetadata` and the exported document.
 //! * The inquiry's RESPONSES are model-generated compliance answers, and no such engine
 //!   runs in this emulator. Nothing is synthesised to look generated: no query ever
 //!   carries a `response`, and that absence is the signal — a query read off the request's
@@ -233,6 +242,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = store.mint_inquiry_id();
         let inquiry = crate::state::ComplianceInquiry {
             arn: crate::state::inquiry_arn(&region, &id),
+            // The submitted title, kept verbatim as the title of record. The name every
+            // read REPORTS is the projection
+            // [`crate::state::ComplianceInquiry::display_name`]: content that derives its
+            // own name (a single text query) is reported under that name, and the title
+            // stands only for content that derives none.
             name: input.name,
             status: crate::state::INQUIRY_STATUS_PROCESSING.to_string(),
             status_message: crate::state::INQUIRY_MESSAGE_IN_PROGRESS.to_string(),

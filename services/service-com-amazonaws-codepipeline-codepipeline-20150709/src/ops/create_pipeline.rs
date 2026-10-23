@@ -175,11 +175,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         InvalidStageDeclarationException { message },
                     )
                 }
+                // A declaration past a quota is not malformed: it is more than this
+                // service runs, which is what `LimitExceededException` reports.
+                crate::state::DeclarationProblem::Limit(_) => {
+                    CreatePipelineErrorModeled::LimitExceededException(LimitExceededException {
+                        message,
+                    })
+                }
             }
             .into());
         }
 
         let name = input.pipeline.name.clone();
+        // `PipelineDeclaration$roleArn` is "the Amazon Resource Name (ARN) for
+        // CodePipeline to use to either perform actions with no actionRoleArn, or to use
+        // to assume roles for actions with an actionRoleArn" — a role that cannot be
+        // assumed makes the pipeline unable to run any action, which is what
+        // `InvalidStructureException` reports. The role is looked up in IAM through the
+        // framework's in-process callback; only a definitive "no such role" refuses the
+        // create, so an emulator without IAM mounted still accepts the declaration
+        // rather than refusing on an unanswered question.
+        if crate::state::role_is_absent(ctx, &input.pipeline.role_arn).await {
+            return Err(CreatePipelineErrorModeled::InvalidStructureException(
+                InvalidStructureException {
+                    message: Some(format!(
+                        "CodePipeline is not authorized to perform AssumeRole on role {}",
+                        input.pipeline.role_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
         let arn = ::engine::emulator_arn(
             crate::state::ARN_SERVICE,
             &crate::state::request_region(&ctx.parts().headers),
@@ -223,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if state.pipelines.contains_key(&name) {
                 return Err(CreatePipelineErrorModeled::PipelineNameInUseException(
                     PipelineNameInUseException {
-                        message: Some(format!("pipeline {name} already exists")),
+                        message: Some(crate::state::pipeline_name_in_use_message(&name)),
                     },
                 )
                 .into());

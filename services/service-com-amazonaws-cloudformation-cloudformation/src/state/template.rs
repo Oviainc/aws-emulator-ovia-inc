@@ -33,7 +33,7 @@
 //! [`conventional_attributes`]) — and the intrinsic functions an output composes them
 //! with are evaluated rather than dropped.
 //!
-//! ## What this does NOT do
+//! ## Creating the resource in the service that owns it
 //!
 //! CREATING the resource in the service that owns it is
 //! [`super::provisioning`](crate::state::provisioning), which calls that service's own
@@ -86,7 +86,7 @@
 //!   `Fn::Sub` resolves each of its variables ONCE per substitution however many times its
 //!   source names it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ::serde_json::{Map, Value};
 
@@ -1116,7 +1116,7 @@ pub fn provision(
     budget: &mut Budget,
 ) -> Vec<StoredResource> {
     let mut names: Vec<(&DeclaredResource, String)> = Vec::new();
-    for declared in &template.resources {
+    for declared in creation_order(template) {
         if !is_created(declared, scope, budget) {
             continue;
         }
@@ -1159,6 +1159,173 @@ pub fn provision(
         attach_attributes(resource, declared, name, &resolved, budget);
     }
     provisioned
+}
+
+/// The template's resources in CREATION order: each one after every resource of the same
+/// template it DEPENDS ON.
+///
+/// That is the order CloudFormation creates a stack's resources in — it reads `DependsOn`
+/// and the implicit dependencies a `Ref` or an `Fn::GetAtt` to another resource creates,
+/// and creates each resource only once the resources it needs exist. It matters because
+/// [`crate::state::provisioning`] walks this order when it calls the owning services: a
+/// pipeline whose `RoleArn` is `Fn::GetAtt` of a role of the same template cannot be
+/// created before that role is.
+///
+/// A stable topological order: among resources with no dependency between them the
+/// DECLARATION order is kept, so a template whose resources are independent is created,
+/// recorded and reported exactly as it is written. A dependency cycle (which no stack
+/// could deploy) leaves the resources it holds in declaration order rather than dropping
+/// them.
+fn creation_order(template: &Template) -> Vec<&DeclaredResource> {
+    let declared: Vec<&DeclaredResource> = template.resources.iter().collect();
+    let needs: Vec<BTreeSet<String>> = declared
+        .iter()
+        .map(|resource| dependencies_of(resource, template))
+        .collect();
+    let mut emitted: BTreeSet<String> = BTreeSet::new();
+    let mut ordered: Vec<&DeclaredResource> = Vec::with_capacity(declared.len());
+    let mut taken = vec![false; declared.len()];
+    // One pass per resource at most: each pass emits every resource whose dependencies
+    // are already out, in declaration order.
+    for _ in 0..declared.len() {
+        let mut progressed = false;
+        for (index, resource) in declared.iter().enumerate() {
+            if taken[index] {
+                continue;
+            }
+            if needs[index]
+                .iter()
+                .any(|needed| !emitted.contains(needed.as_str()))
+            {
+                continue;
+            }
+            taken[index] = true;
+            emitted.insert(resource.logical_id.clone());
+            ordered.push(resource);
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    // Anything a cycle held back, in declaration order.
+    for (index, resource) in declared.iter().enumerate() {
+        if !taken[index] {
+            ordered.push(resource);
+        }
+    }
+    ordered
+}
+
+/// The logical ids of the resources of the same template that `resource` depends on:
+/// every one its `DependsOn` names, plus every one a `Ref`, an `Fn::GetAtt` or an
+/// `Fn::Sub` variable inside its declaration resolves against.
+///
+/// Only names the template declares as RESOURCES count: a `Ref` to a parameter or to a
+/// pseudo parameter is not a dependency on anything that has to be created first.
+fn dependencies_of(resource: &DeclaredResource, template: &Template) -> BTreeSet<String> {
+    let mut referenced = BTreeSet::new();
+    collect_references(&resource.declaration, 0, &mut referenced);
+    if let Some(depends_on) = resource.declaration.get("DependsOn") {
+        match depends_on {
+            Value::String(name) => {
+                referenced.insert(name.clone());
+            }
+            Value::Array(names) => {
+                for name in names {
+                    if let Some(name) = name.as_str() {
+                        referenced.insert(name.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    referenced.remove(&resource.logical_id);
+    referenced
+        .into_iter()
+        .filter(|name| {
+            template
+                .resources
+                .iter()
+                .any(|declared| &declared.logical_id == name)
+        })
+        .collect()
+}
+
+/// Every name the intrinsic functions inside one declaration refer to.
+fn collect_references(value: &Value, depth: usize, into: &mut BTreeSet<String>) {
+    if depth > MAX_TEMPLATE_DEPTH {
+        return;
+    }
+    match value {
+        Value::Object(members) => {
+            for (key, member) in members {
+                match (key.as_str(), member) {
+                    ("Ref", Value::String(name)) => {
+                        into.insert(name.clone());
+                    }
+                    // `Fn::GetAtt` takes `[logicalId, attribute]` or the `logicalId.attribute`
+                    // short form.
+                    ("Fn::GetAtt", Value::Array(arguments)) => {
+                        if let Some(name) = arguments.first().and_then(Value::as_str) {
+                            into.insert(name.to_string());
+                        }
+                    }
+                    ("Fn::GetAtt", Value::String(path)) => {
+                        into.insert(path.split('.').next().unwrap_or(path).to_string());
+                    }
+                    // `Fn::Sub`'s `${Name}` and `${Name.Attribute}` variables name the
+                    // same resources `Ref` and `Fn::GetAtt` do.
+                    ("Fn::Sub", _) => {
+                        let source = match member {
+                            Value::String(text) => Some(text.as_str()),
+                            Value::Array(arguments) => {
+                                arguments.first().and_then(Value::as_str)
+                            }
+                            _ => None,
+                        };
+                        if let Some(source) = source {
+                            for name in substitution_names(source) {
+                                into.insert(name);
+                            }
+                        }
+                        collect_references(member, depth + 1, into);
+                    }
+                    _ => collect_references(member, depth + 1, into),
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_references(item, depth + 1, into);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The variable names an `Fn::Sub` source string names, each `${…}` without its
+/// attribute path.
+fn substitution_names(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = source;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else { break };
+        let variable = after[..end].trim();
+        if !variable.is_empty() && !variable.starts_with('!') {
+            names.push(
+                variable
+                    .split('.')
+                    .next()
+                    .unwrap_or(variable)
+                    .to_string(),
+            );
+        }
+        rest = &after[end + 1..];
+    }
+    names
 }
 
 /// How many rounds [`resolve_dependent_identities`] recomputes a dependent identity in.
@@ -1714,8 +1881,16 @@ fn gateway_label_char(c: char) -> bool {
 /// This is the list of extensions the registry of every account and Region holds as
 /// Amazon-Web-Services-published public resource types (see
 /// [`crate::state::registry::aws_published`]): the registry reports an extension for a
-/// resource type this emulator provisions, and nothing for a name it knows nothing about.
-/// Keep it in step with the `match` in [`return_values`] — one entry per arm.
+/// resource type this emulator carries the return values of, and nothing for a name it
+/// knows nothing about. Keep it in step with the `match` in [`return_values`] — one entry
+/// per arm.
+///
+/// It is NOT the set [`crate::state::provisioning`] creates in the owning service: the two
+/// questions are independent — a type can have published return values this module knows
+/// and no owning service mounted here (`AWS::Transfer::Server`), or an owning service that
+/// creates it and no published return value beyond its name
+/// (`AWS::CodePipeline::Pipeline`, whose `Ref` is the pipeline name, which is the default
+/// this module already gives every type).
 pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::BedrockAgentCore::Browser",
     "AWS::BedrockAgentCore::CodeInterpreter",

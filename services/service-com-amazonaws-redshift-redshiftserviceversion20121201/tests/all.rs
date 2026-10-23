@@ -19,6 +19,8 @@ mod cluster_parameter_groups;
 mod cluster_parameters;
 #[path = "all/cluster_versions.rs"]
 mod cluster_versions;
+#[path = "all/error_envelope.rs"]
+mod error_envelope;
 #[path = "all/modify_cluster_parameter_group.rs"]
 mod modify_cluster_parameter_group;
 #[path = "all/orderable_cluster_options.rs"]

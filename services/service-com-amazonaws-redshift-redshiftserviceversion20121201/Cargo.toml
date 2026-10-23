@@ -22,7 +22,9 @@ http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # Stable, content-addressed derivation of a cluster's endpoint host token and
-# namespace id (never a per-run value).
+# namespace id (never a per-run value), and of the per-response correlation id the
+# awsQuery `<ErrorResponse>` envelope carries
+# (`service::query_error_envelope::new_request_id`).
 sha2 = { workspace = true }
 hex = { workspace = true }
 

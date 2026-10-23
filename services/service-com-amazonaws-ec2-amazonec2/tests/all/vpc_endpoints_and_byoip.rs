@@ -100,6 +100,7 @@ fn seed_connections(engine: &engine::InMemoryEngine) -> Connections {
                 tags: Some(vec![tag("Name", "shared")]),
                 ..Default::default()
             })
+            .expect("the store holds the seeded endpoint service")
         })
         .collect();
 
@@ -301,6 +302,7 @@ fn seed_endpoints(engine: &engine::InMemoryEngine) -> Vec<String> {
                 tags: Some(fixture.tags),
                 ..Default::default()
             })
+            .expect("the store holds the seeded endpoint")
         })
         .collect()
 }
@@ -375,7 +377,8 @@ async fn every_stored_endpoint_is_reported_and_a_later_write_is_visible() {
             vpc_endpoint_type: Some("Interface".to_string()),
             state: Some(VPC_ENDPOINT_STATE_AVAILABLE.to_string()),
             ..Default::default()
-        });
+        })
+        .expect("the store holds the later endpoint");
     let mut expected = seeded.clone();
     expected.push(late.clone());
     assert_eq!(
@@ -750,6 +753,7 @@ async fn moving_a_range_to_ipam_is_checked_and_then_visible() {
                 public_ip_source: Some("byoip".to_string()),
                 ..Default::default()
             })
+            .expect("the store holds the seeded IPAM pool")
         };
         (
             pool(ADDRESS_FAMILY_IPV4, &account, IPAM_SCOPE_TYPE_PUBLIC),

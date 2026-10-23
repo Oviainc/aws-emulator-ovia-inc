@@ -26,7 +26,10 @@ pub struct ListWorkerConfigurationsOutput {
     pub worker_configurations: Option<Vec<WorkerConfigurationSummary>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafkaconnect#WorkerConfigurationSummary")]
+/// `creationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kc_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="WorkerConfigurationSummary")`.
 #[derive(Debug, Clone, Default)]
 pub struct WorkerConfigurationSummary {
     pub creation_time: Option<::aws_smithy_types::DateTime>,
@@ -36,4 +39,39 @@ pub struct WorkerConfigurationSummary {
     pub worker_configuration_arn: Option<String>,
     pub worker_configuration_state: Option<String>,
 }
+
+kc_schema_and_codec!(
+    WorkerConfigurationSummary,
+    WORKER_CONFIGURATION_SUMMARY_SCHEMA,
+    "com.amazonaws.kafkaconnect#WorkerConfigurationSummary",
+    "com.amazonaws.kafkaconnect",
+    "WorkerConfigurationSummary",
+    (M_CREATION_TIME, creation_time, "creationTime", 0, opt, date_time),
+    (M_DESCRIPTION, description, "description", 1, opt, string),
+    (
+        M_LATEST_REVISION,
+        latest_revision,
+        "latestRevision",
+        2,
+        opt,
+        struct_of(WorkerConfigurationRevisionSummary)
+    ),
+    (M_NAME, name, "name", 3, opt, string),
+    (
+        M_WORKER_CONFIGURATION_ARN,
+        worker_configuration_arn,
+        "workerConfigurationArn",
+        4,
+        opt,
+        string
+    ),
+    (
+        M_WORKER_CONFIGURATION_STATE,
+        worker_configuration_state,
+        "workerConfigurationState",
+        5,
+        opt,
+        string
+    ),
+);
 

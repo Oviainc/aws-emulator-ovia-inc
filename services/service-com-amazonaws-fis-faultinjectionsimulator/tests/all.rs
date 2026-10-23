@@ -19,6 +19,8 @@ mod control_plane_rules;
 mod delete_target_account_configuration;
 #[path = "all/experiment_lifecycle.rs"]
 mod experiment_lifecycle;
+#[path = "all/experiment_run.rs"]
+mod experiment_run;
 #[path = "all/experiment_target_account_configurations.rs"]
 mod experiment_target_account_configurations;
 #[path = "all/experiment_template_not_found.rs"]
@@ -35,3 +37,5 @@ mod state_roundtrip;
 mod target_account_configuration_errors;
 #[path = "all/target_account_configurations.rs"]
 mod target_account_configurations;
+#[path = "all/target_account_role_ownership.rs"]
+mod target_account_role_ownership;

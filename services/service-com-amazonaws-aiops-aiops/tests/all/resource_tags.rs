@@ -14,6 +14,9 @@
 //! per key and is idempotent, and `ListTagsForResource` reports exactly that stored set
 //! — empty when the resource carries no tags — without changing it. An identifier
 //! naming no resource is a modelled 404 from all three.
+//!
+//! An account holds ONE investigation group per Region, so every row below that needs
+//! its own group signs for its own Region ([`region`]).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -22,8 +25,31 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_aiops_aiops::state::MAX_TAGS;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every request below signs for.
+/// The region a case signs for when it only needs one.
 const REGION: &str = "us-west-2";
+
+/// Regions the rows that each need their own group sign for, in order.
+const REGIONS: &[&str] = &[
+    "us-west-2",
+    "us-east-1",
+    "eu-central-1",
+    "eu-west-2",
+    "ap-southeast-1",
+    "ap-northeast-1",
+    "sa-east-1",
+    "ca-central-1",
+];
+
+/// The Region row `n` signs for.
+///
+/// An account holds one investigation group per Region, so a row that needs its own
+/// group needs its own Region. The names are real AWS Regions; past the list they are
+/// synthetic ones inside what a SigV4 credential scope admits (`[a-zA-Z0-9-]`).
+fn region(n: usize) -> String {
+    REGIONS
+        .get(n)
+        .map_or_else(|| format!("region-{n:03}"), |name| (*name).to_string())
+}
 
 /// A role ARN that satisfies the modelled `RoleArn` (len 20..2048, `^arn:.*$`).
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/AIOpsAssistantRole";
@@ -39,16 +65,21 @@ fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// A request signed for `aiops` in [`REGION`], the signal the router routes on.
-fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes::Bytes> {
+/// A request signed for `aiops` in `region`, the signal the router routes on.
+fn request(
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> http::Request<bytes::Bytes> {
     let mut builder = http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", format!("aiops.{REGION}.amazonaws.com"))
+        .header("host", format!("aiops.{region}.amazonaws.com"))
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDAIOPSTEST/20260101/{REGION}/aiops/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDAIOPSTEST/20260101/{region}/aiops/aws4_request, \
                  SignedHeaders=host, Signature=0000"
             ),
         );
@@ -63,13 +94,14 @@ fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes
 }
 
 /// Status and parsed body of one call. An empty body reads as `Value::Null`.
-async fn call(
+async fn call_in(
     router: &MultiServiceRouter,
+    region: &str,
     method: &str,
     uri: &str,
     body: Option<&Value>,
 ) -> (u16, Value) {
-    let response = router.dispatch(request(method, uri, body)).await;
+    let response = router.dispatch(request(region, method, uri, body)).await;
     let status = response.status().as_u16();
     let error_type = response
         .headers()
@@ -90,6 +122,17 @@ async fn call(
             .or_insert_with(|| Value::String(error_type));
     }
     (status, parsed)
+}
+
+/// [`call_in`] in [`REGION`]: every operation below but the create resolves its
+/// resource through an ARN, which names its own Region.
+async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
+    call_in(router, REGION, method, uri, body).await
 }
 
 /// The modelled error shape a failed call reported.
@@ -118,9 +161,9 @@ fn encode(value: &str) -> String {
         .collect()
 }
 
-/// Create a group and answer its ARN.
-async fn create_ok(router: &MultiServiceRouter, body: &Value) -> String {
-    let (status, created) = call(router, "POST", "/investigationGroups", Some(body)).await;
+/// Create a group that must succeed in `region`, and answer its ARN.
+async fn create_ok(router: &MultiServiceRouter, region: &str, body: &Value) -> String {
+    let (status, created) = call_in(router, region, "POST", "/investigationGroups", Some(body)).await;
     assert_eq!(
         status, 201,
         "create {body}: expected 201, got {status} / {created:?}"
@@ -213,9 +256,10 @@ fn tags_body(pairs: &[(&str, &str)]) -> Value {
     Value::Object(map)
 }
 
-/// A group created with `tags`, answering its ARN.
+/// A group created in `region` with `tags`, answering its ARN.
 async fn group_with_tags(
     router: &MultiServiceRouter,
+    region: &str,
     name: &str,
     tags: Option<&[(&str, &str)]>,
 ) -> String {
@@ -223,7 +267,7 @@ async fn group_with_tags(
     if let Some(pairs) = tags {
         body["tags"] = tags_body(pairs);
     }
-    create_ok(router, &body).await
+    create_ok(router, region, &body).await
 }
 
 /// One row of the create-with-tags table: the case name and the `tags` map the create
@@ -282,7 +326,9 @@ async fn list_tags_reports_exactly_the_tags_a_create_stored() {
     ];
 
     for (index, (case, pairs)) in cases.iter().enumerate() {
-        let arn = group_with_tags(&router, &format!("group-{index}"), pairs.as_deref()).await;
+        let arn =
+            group_with_tags(&router, &region(index), &format!("group-{index}"), pairs.as_deref())
+                .await;
         let want = expected(pairs.as_deref().unwrap_or(&[]));
         let got = list_tags_ok(&router, &arn, case).await;
         assert_eq!(
@@ -387,7 +433,13 @@ async fn tagging_and_untagging_are_per_key_over_the_stored_set() {
 
     for (index, case) in cases.iter().enumerate() {
         let name = case.name;
-        let arn = group_with_tags(&router, &format!("group-{index}"), Some(case.at_create)).await;
+        let arn = group_with_tags(
+            &router,
+            &region(index),
+            &format!("group-{index}"),
+            Some(case.at_create),
+        )
+        .await;
 
         let (status, body) = tag(&router, &arn, &tags_body(case.add)).await;
         assert_eq!(
@@ -435,44 +487,64 @@ async fn tagging_and_untagging_are_per_key_over_the_stored_set() {
     }
 }
 
-/// `resourceArn` is the investigation group's `identifier` (the operations'
-/// `@references` trait), so every form that names the group — its ARN, its name and its
-/// bare id — addresses the SAME stored tag set.
+/// `resourceArn` resolves the investigation group through its ARN and through nothing
+/// else: the bare forms the modelled identifier pattern also admits — the group's name
+/// and its bare id — name no resource, so all three tagging operations report a
+/// modelled 404 for them while the ARN addresses the stored set.
 #[tokio::test]
-async fn every_identifier_form_addresses_one_tag_set() {
+async fn only_the_arn_addresses_the_tag_set() {
     let router = emulator();
-    let arn = group_with_tags(&router, "shared-tags", Some(&[("Team", "ops")])).await;
+    let arn = group_with_tags(&router, REGION, "shared-tags", Some(&[("Team", "ops")])).await;
     let id = arn
         .rsplit('/')
         .next()
         .unwrap_or_else(|| panic!("a group ARN carries an id segment, got {arn:?}"))
         .to_string();
-    let forms = [
-        ("the ARN", arn.clone()),
-        ("the name", "shared-tags".to_string()),
-        ("the id", id),
-    ];
 
-    // Write through one form at a time; every other form must see the write.
-    for (via, identifier) in &forms {
-        let key = format!("WrittenVia{}", via.replace(' ', ""));
-        let (status, body) = tag(&router, identifier, &tags_body(&[(&key, "yes")])).await;
-        assert_eq!(
-            status,
-            200,
-            "case tag via {via:?}: expected 200, got {status} / {} / {body:?}",
-            error_code(&body)
-        );
+    // The ARN is the address: a write through it is visible to a read through it.
+    let (status, body) = tag(&router, &arn, &tags_body(&[("WrittenViaArn", "yes")])).await;
+    assert_eq!(
+        status,
+        200,
+        "case \"tag via the ARN\": expected 200, got {status} / {} / {body:?}",
+        error_code(&body)
+    );
+    let got = list_tags_ok(&router, &arn, "written via the ARN").await;
+    assert_eq!(
+        got,
+        expected(&[("Team", "ops"), ("WrittenViaArn", "yes")]),
+        "case \"written via the ARN\": expected the stored set, got {got:?}"
+    );
 
-        for (read_via, read_identifier) in &forms {
-            let case = format!("written via {via}, read via {read_via}");
-            let got = list_tags_ok(&router, read_identifier, &case).await;
-            assert!(
-                got.get(&key).map(String::as_str) == Some("yes"),
-                "case {case:?}: expected {key:?} = \"yes\" in the one stored set, got {got:?}"
+    // The bare forms address nothing — on every one of the three operations.
+    for (via, identifier) in [("the name", "shared-tags".to_string()), ("the bare id", id)] {
+        for (operation, (status, body)) in [
+            ("ListTagsForResource", list_tags(&router, &identifier).await),
+            (
+                "TagResource",
+                tag(&router, &identifier, &tags_body(&[("WrittenViaLabel", "no")])).await,
+            ),
+            ("UntagResource", untag(&router, &identifier, &["Team"]).await),
+        ] {
+            assert_eq!(
+                status, 404,
+                "case {via:?} on {operation}: expected 404, got {status} / {body:?}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case {via:?} on {operation}: expected ResourceNotFoundException, got {body:?}"
             );
         }
     }
+
+    // None of those refused calls touched the stored set.
+    let after = list_tags_ok(&router, &arn, "after the refused calls").await;
+    assert_eq!(
+        after,
+        expected(&[("Team", "ops"), ("WrittenViaArn", "yes")]),
+        "a refused call must leave the stored set alone, got {after:?}"
+    );
 }
 
 /// The per-resource tag maximum applies to the set the resource ENDS UP with, and a
@@ -480,7 +552,9 @@ async fn every_identifier_form_addresses_one_tag_set() {
 /// and a request that only replaces values at the maximum (which does not grow the set).
 ///
 /// The bound is the `tags` member's own documentation ("You can associate as many as 50
-/// tags with an investigation group"), surfaced as `state::MAX_TAGS`.
+/// tags with an investigation group"), surfaced as `state::MAX_TAGS`; the refusal is the
+/// tagging frontend's HTTP 400 `BadRequestException` rather than this service's own
+/// `ValidationException`, which is what a 51-tag call is recorded answering.
 #[tokio::test]
 async fn the_per_resource_tag_maximum_bounds_the_resulting_set() {
     let router = emulator();
@@ -494,7 +568,7 @@ async fn the_per_resource_tag_maximum_bounds_the_resulting_set() {
         .collect();
 
     // One tag short of the maximum, so the next distinct key lands exactly on it.
-    let arn = group_with_tags(&router, "filling-up", Some(&at_max[..MAX_TAGS - 1])).await;
+    let arn = group_with_tags(&router, REGION, "filling-up", Some(&at_max[..MAX_TAGS - 1])).await;
 
     let last = at_max[MAX_TAGS - 1];
     let (status, body) = tag(&router, &arn, &tags_body(&[last])).await;
@@ -520,8 +594,8 @@ async fn the_per_resource_tag_maximum_bounds_the_resulting_set() {
     );
     assert_eq!(
         error_code(&body),
-        "ValidationException",
-        "case \"one key past the maximum\": expected ValidationException, got {body:?}"
+        "BadRequestException",
+        "case \"one key past the maximum\": expected BadRequestException, got {body:?}"
     );
     let after = list_tags_ok(&router, &arn, "one key past the maximum").await;
     assert_eq!(
@@ -565,7 +639,7 @@ async fn the_per_resource_tag_maximum_bounds_the_resulting_set() {
 #[tokio::test]
 async fn an_unknown_resource_is_a_modelled_404() {
     let router = emulator();
-    let arn = group_with_tags(&router, "doomed", Some(&[("Team", "ops")])).await;
+    let arn = group_with_tags(&router, REGION, "doomed", Some(&[("Team", "ops")])).await;
     let id = arn
         .rsplit('/')
         .next()
@@ -652,8 +726,14 @@ async fn an_unknown_resource_is_a_modelled_404() {
 #[tokio::test]
 async fn tag_sets_are_per_resource() {
     let router = emulator();
-    let first = group_with_tags(&router, "first", Some(&[("Team", "ops")])).await;
-    let second = group_with_tags(&router, "second", Some(&[("Team", "research")])).await;
+    let first = group_with_tags(&router, &region(0), "first", Some(&[("Team", "ops")])).await;
+    let second = group_with_tags(
+        &router,
+        &region(1),
+        "second",
+        Some(&[("Team", "research")]),
+    )
+    .await;
 
     let (status, body) = tag(&router, &first, &tags_body(&[("Environment", "prod")])).await;
     assert_eq!(

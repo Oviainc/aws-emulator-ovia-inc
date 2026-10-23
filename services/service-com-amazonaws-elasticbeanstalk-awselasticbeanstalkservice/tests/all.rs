@@ -61,3 +61,5 @@ mod swap_environment_cnames;
 mod tag_batch_conflicts;
 #[path = "all/update_application.rs"]
 mod update_application;
+#[path = "all/update_application_lifecycle_projection.rs"]
+mod update_application_lifecycle_projection;

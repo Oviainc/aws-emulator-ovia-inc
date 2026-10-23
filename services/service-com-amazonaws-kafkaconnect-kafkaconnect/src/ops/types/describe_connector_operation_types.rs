@@ -17,7 +17,10 @@ pub struct DescribeConnectorOperationInput {
     pub connector_operation_arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafkaconnect#DescribeConnectorOperationResponse")]
+/// `creationTime` and `endTime` target `__timestampIso8601`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `kc_schema_and_codec!` — see `types/date_time_wire.rs`. Member set, order and
+/// requiredness from `smithy_query(query="shape", shape="DescribeConnectorOperationResponse")`.
 #[derive(Debug, Clone, Default)]
 pub struct DescribeConnectorOperationOutput {
     pub connector_arn: Option<String>,
@@ -33,6 +36,68 @@ pub struct DescribeConnectorOperationOutput {
     pub creation_time: Option<::aws_smithy_types::DateTime>,
     pub end_time: Option<::aws_smithy_types::DateTime>,
 }
+
+kc_schema_and_codec!(
+    DescribeConnectorOperationOutput,
+    DESCRIBE_CONNECTOR_OPERATION_OUTPUT_SCHEMA,
+    "com.amazonaws.kafkaconnect#DescribeConnectorOperationResponse",
+    "com.amazonaws.kafkaconnect",
+    "DescribeConnectorOperationResponse",
+    (M_CONNECTOR_ARN, connector_arn, "connectorArn", 0, opt, string),
+    (M_CONNECTOR_OPERATION_ARN, connector_operation_arn, "connectorOperationArn", 1, opt, string),
+    (
+        M_CONNECTOR_OPERATION_STATE,
+        connector_operation_state,
+        "connectorOperationState",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_CONNECTOR_OPERATION_TYPE,
+        connector_operation_type,
+        "connectorOperationType",
+        3,
+        opt,
+        string
+    ),
+    (M_OPERATION_STEPS, operation_steps, "operationSteps", 4, opt, list_of(ConnectorOperationStep)),
+    (
+        M_ORIGIN_WORKER_SETTING,
+        origin_worker_setting,
+        "originWorkerSetting",
+        5,
+        opt,
+        struct_of(WorkerSetting)
+    ),
+    (
+        M_ORIGIN_CONNECTOR_CONFIGURATION,
+        origin_connector_configuration,
+        "originConnectorConfiguration",
+        6,
+        opt,
+        map_of_string
+    ),
+    (
+        M_TARGET_WORKER_SETTING,
+        target_worker_setting,
+        "targetWorkerSetting",
+        7,
+        opt,
+        struct_of(WorkerSetting)
+    ),
+    (
+        M_TARGET_CONNECTOR_CONFIGURATION,
+        target_connector_configuration,
+        "targetConnectorConfiguration",
+        8,
+        opt,
+        map_of_string
+    ),
+    (M_ERROR_INFO, error_info, "errorInfo", 9, opt, struct_of(StateDescription)),
+    (M_CREATION_TIME, creation_time, "creationTime", 10, opt, date_time),
+    (M_END_TIME, end_time, "endTime", 11, opt, date_time),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.kafkaconnect#ConnectorOperationStep")]
 #[derive(Debug, Clone, Default)]

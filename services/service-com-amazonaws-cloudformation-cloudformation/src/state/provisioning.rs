@@ -77,19 +77,21 @@
 //! stays `false` and nothing is created in any service. Such a resource still carries the
 //! physical id and the attributes CloudFormation DOCUMENTS for its type, because those are
 //! computed from the template and the stack's own identity; that is what lets a stack's
-//! `Outputs` name the bucket the template asked for while `s3`'s own `CreateBucket` is a
-//! 501 stub (`services/service-com-amazonaws-s3-amazons3/src/ops/create_bucket.rs`). The
-//! per-resource reads (`DescribeStackResources` and its siblings) report it as the stack
-//! DECLARED it, with the status of the deployment that recorded it — this emulator's
-//! inherited scope for a resource type no service here creates yet, not a claim that the
-//! resource exists in that service. Adding a provisioner for another type is a local
-//! change: one arm in [`provisioner_for`](super::provisioner::provisioner_for) and the
-//! create/delete pair it names, and that type's resources then really are created and
-//! deleted.
+//! `Outputs` name a resource of a type no service here creates yet. The per-resource reads
+//! (`DescribeStackResources` and its siblings) report it as the stack DECLARED it, with
+//! the status of the deployment that recorded it — this emulator's inherited scope for
+//! such a type, not a claim that the resource exists in that service. Adding a provisioner
+//! for another type is a local change: one arm in
+//! [`provisioner_for`](super::provisioner::provisioner_for) and the create/delete pair it
+//! names, and that type's resources then really are created and deleted.
 //!
 //! A type that DOES have an entry is never passed off as created: whatever its owning
-//! service answers — a modelled refusal, or the 501 of an operation this emulator has not
-//! implemented — leaves the stack `CREATE_FAILED` with that answer as the reason.
+//! service answers short of success — a modelled refusal, the 501 of an operation this
+//! emulator has not implemented, or an answer that identifies nothing at all — leaves the
+//! stack `CREATE_FAILED` with that answer as the reason, because the one thing an
+//! attempted create that did not answer 2xx tells you is that the resource was not
+//! created. A declaration that is missing a property its resource type REQUIRES is
+//! refused the same way, naming that property.
 //!
 //! ## Identity, and the isolation these calls can and cannot carry
 //!
@@ -123,7 +125,6 @@
 //! untouched. Both are held to that by
 //! `core/router/tests/all/cloudformation_provisions_stack_resources.rs`.
 
-use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use serde_json::Value;
@@ -208,16 +209,19 @@ pub async fn reconcile(
         }
         let created = match provisioner_for(&resource.resource_type) {
             Some(provisioner) => provisioner.create(ctx, region, &resource).await,
-            None => Ok(BTreeMap::new()),
+            // No provisioner for this type: nothing is asked of any service, and the
+            // resource stays DECLARED-ONLY.
+            None => {
+                outcome.resources.push(resource);
+                continue;
+            }
         };
         match created {
+            // The owning service created it, and what IT answered wins over the computed
+            // value: that is the resource's real identity.
             Ok(reported) => {
-                if provisioner_for(&resource.resource_type).is_some() {
-                    // What the owning service answered wins over the computed value: it
-                    // is the resource's real identity.
-                    resource.attributes.extend(reported);
-                    resource.materialised = true;
-                }
+                resource.attributes.extend(reported);
+                resource.materialised = true;
             }
             Err(refusal) => {
                 outcome.failure = Some(format!(
@@ -348,11 +352,7 @@ pub async fn delete(
         }
         let resource = &outcome.resources[index];
         let deleted = match provisioner_for(&resource.resource_type) {
-            Some(provisioner) => {
-                provisioner
-                    .delete(ctx, region, &resource.physical_resource_id)
-                    .await
-            }
+            Some(provisioner) => provisioner.delete(ctx, region, resource).await,
             None => Ok(()),
         };
         match deleted {
@@ -388,6 +388,11 @@ impl ::std::fmt::Display for Refusal {
         }
     }
 }
+
+/// What stands in for an error code an answer did not carry: not a code any service
+/// answers, so it can never collide with one. An answer that identifies nothing is still
+/// a failed create — the status it came back with is what the stack's reason reports.
+const UNNAMED_CODE_PREFIX: &str = "HTTP ";
 
 /// Call one awsJson operation of another emulated service in-process and read its
 /// answer document. `Err(refusal)` is the service's own refusal: its code, and the message
@@ -441,7 +446,7 @@ fn refusal_of(status: u16, document: &Value) -> Refusal {
         .or_else(|| document.get("Code"))
         .and_then(Value::as_str)
         .map(|code| code.rsplit('#').next().unwrap_or(code).to_string())
-        .unwrap_or_else(|| format!("HTTP {status}"));
+        .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}"));
     let message = document
         .get("message")
         .or_else(|| document.get("Message"))

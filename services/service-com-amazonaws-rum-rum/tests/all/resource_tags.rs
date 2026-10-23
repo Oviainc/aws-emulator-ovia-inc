@@ -68,6 +68,12 @@ const BAD_REQUEST_ERROR_CODE: &str = "BadRequestException";
 /// Source: the same recorded unit, whose check asserts the message for `not-an-arn-at-all`.
 const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn: bad syntax";
 
+/// The status a successful `UntagResource` answers with: 204 No Content, the status the
+/// service sends for a tag write whose modelled output declares no member
+/// (`crate::state::TAGGING_NO_CONTENT_STATUS`; the dedicated suite `tagging_no_content.rs`
+/// pins it over the whole class of tag writes).
+const NO_CONTENT: u16 = 204;
+
 /// `TagKey`'s modelled length bounds.
 /// Source: `smithy_query(query="shape", shape="TagMap")` — the key is `@length(min: 1,
 /// max: 128)`.
@@ -128,19 +134,12 @@ impl Reply {
     }
 }
 
-/// Percent-encode every byte that is not an RFC 3986 unreserved character, which is how
-/// an SDK writes a value into a non-greedy path label (`/tags/{ResourceArn}`, where the
-/// ARN's own `/` and `:` cannot be left literal) and into a query value.
-fn percent_encode(raw: &str) -> String {
-    raw.bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                (byte as char).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
+/// Percent-encode a path label or a query value: the shared harness's encoder
+/// (`crate::support::percent_encoded`), which every suite in this crate uses. This suite
+/// brings its own router, `call` and `Reply` because it asserts on raw bytes, but the
+/// encoding of a `@httpLabel` and of a `@httpQuery` value is the same question for all of
+/// them, so it is asked in one place.
+use crate::support::percent_encoded as percent_encode;
 
 async fn call(
     router: &MultiServiceRouter,
@@ -366,8 +365,8 @@ async fn untag_resource_removes_exactly_the_named_keys_from_the_stored_resource(
         let reply = untag(&router, &arn, &keys).await;
         assert_eq!(
             reply.status,
-            200,
-            "case {case:?}: expected UntagResource to answer 200, got {} {:?}",
+            NO_CONTENT,
+            "case {case:?}: expected UntagResource to answer {NO_CONTENT}, got {} {:?}",
             reply.status,
             String::from_utf8_lossy(&reply.body)
         );
@@ -397,8 +396,8 @@ async fn untag_resource_touches_only_the_resource_its_arn_names() {
     .await;
     assert_eq!(
         reply.status,
-        200,
-        "case {case:?}: expected UntagResource to answer 200, got {} {:?}",
+        NO_CONTENT,
+        "case {case:?}: expected UntagResource to answer {NO_CONTENT}, got {} {:?}",
         reply.status,
         String::from_utf8_lossy(&reply.body)
     );
@@ -434,8 +433,8 @@ async fn untag_resource_is_idempotent() {
         let first = untag(&router, &arn, &keys).await;
         assert_eq!(
             first.status,
-            200,
-            "case {case:?}: expected the first UntagResource to answer 200, got {} {:?}",
+            NO_CONTENT,
+            "case {case:?}: expected the first UntagResource to answer {NO_CONTENT}, got {} {:?}",
             first.status,
             String::from_utf8_lossy(&first.body)
         );
@@ -444,8 +443,9 @@ async fn untag_resource_is_idempotent() {
         let second = untag(&router, &arn, &keys).await;
         assert_eq!(
             second.status,
-            200,
-            "case {case:?}: expected the repeated UntagResource to answer 200, got {} {:?}",
+            NO_CONTENT,
+            "case {case:?}: expected the repeated UntagResource to answer {NO_CONTENT}, got {} \
+             {:?}",
             second.status,
             String::from_utf8_lossy(&second.body)
         );

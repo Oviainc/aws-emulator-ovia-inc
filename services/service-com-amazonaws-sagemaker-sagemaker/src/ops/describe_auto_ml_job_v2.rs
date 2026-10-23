@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAutoMLJobV2
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAutoMLJobV2`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports an AutoML job V2 from what `CreateAutoMLJobV2` persisted in
+//! [`crate::state`], materialising the one transition the clock already owes it
+//! ([`crate::state::AutoMLJobV2::settle_status`]) so a caller polling the job sees it
+//! leave `InProgress` without any call having moved it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAutoMLJobV2::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! AWS documents this operation as reporting a job created by EITHER `CreateAutoMLJobV2`
+//! or the V1 `CreateAutoMLJob`. `CreateAutoMLJob` is still a scaffold answering 501 in
+//! this emulator (its own stub issue), so no V1 job can exist to be reported and the one
+//! AutoML job store this reads is the whole namespace: when that operation is
+//! implemented, it shares this store rather than opening a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +186,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAutoMLJobV2` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAutoMLJobV2ErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAutoMLJobV2"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let key = crate::state::entity_key(&input.auto_ml_job_name);
+        let mut store = state.lock();
+        let Some(job) = store.auto_ml_jobs_v2.get_mut(&key) else {
+            return Err(DescribeAutoMLJobV2ErrorModeled::ResourceNotFound(ResourceNotFound {
+                // Worded by the crate's one helper, so every operation that fails to
+                // resolve a reference states the same fact the same way, quoting the
+                // identifier as the caller sent it.
+                message: Some(crate::state::could_not_find(
+                    crate::state::AUTO_ML_JOB_KIND_LABEL,
+                    &input.auto_ml_job_name,
+                )),
+            })
+            .into());
+        };
+
+        // The only write a reporting call makes: the transition the clock already owed.
+        // It was due at the stored instant whether or not anybody described the job, so
+        // a poller terminates and no caller's read changes the outcome.
+        let settled = job.settle_status(::std::time::SystemTime::now());
+        let job_arn = job.arn.clone();
+
+        let output = DescribeAutoMLJobV2Output {
+            auto_ml_job_name: job.name.clone(),
+            auto_ml_job_arn: job_arn.clone(),
+            auto_ml_job_input_data_config: job.input_data_config.clone(),
+            output_data_config: job.output_data_config.clone(),
+            role_arn: job.role_arn.clone(),
+            auto_ml_job_objective: job.objective.clone(),
+            auto_ml_problem_type_config: Some(job.problem_type_config.clone()),
+            // Derived from the stored configuration, so the reported name and the
+            // reported configuration can never name different problem types.
+            auto_ml_problem_type_config_name: Some(
+                crate::state::auto_ml_problem_type_config_name(&job.problem_type_config)
+                    .to_string(),
+            ),
+            creation_time: crate::state::timestamp(job.creation_time),
+            end_time: job.end_time.map(crate::state::timestamp),
+            last_modified_time: crate::state::timestamp(job.last_modified_time),
+            failure_reason: job.failure_reason.clone(),
+            // No training ran, so there is no candidate to report, no leaderboard, no
+            // notebook written to the output path, no resolved attribute that only data
+            // analysis could resolve, and no deployed endpoint: every one of these would
+            // claim work this emulator did not do. `FailureReason` above says so.
+            partial_failure_reasons: None,
+            best_candidate: None,
+            auto_ml_job_status: job.status.clone(),
+            auto_ml_job_secondary_status: job.secondary_status.clone(),
+            auto_ml_job_artifacts: None,
+            resolved_attributes: None,
+            model_deploy_config: job.model_deploy_config.clone(),
+            model_deploy_result: None,
+            data_split_config: job.data_split_config.clone(),
+            security_config: job.security_config.clone(),
+            auto_ml_compute_config: job.compute_config.clone(),
+        };
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &job_arn, ctx);
+        }
+        Ok(output)
     }
 }
+

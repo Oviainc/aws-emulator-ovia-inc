@@ -43,13 +43,25 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
+/// The AutoML job V2 slice: the record, its clock and its constants. Re-exported below,
+/// so a handler names them as `crate::state::…` like every other slice.
+pub mod auto_ml_job_v2;
+pub use auto_ml_job_v2::{
+    auto_ml_problem_type_config_name, AutoMLJobV2, AUTO_ML_JOB_KIND_LABEL, AUTO_ML_JOB_QUOTA,
+    AUTO_ML_JOB_TERMINAL_AFTER, AUTO_ML_NOT_TRAINED_FAILURE_REASON,
+    AUTO_ML_SECONDARY_STATUS_FAILED, AUTO_ML_SECONDARY_STATUS_STARTING, AUTO_ML_STATUS_FAILED,
+    AUTO_ML_STATUS_IN_PROGRESS,
+};
+
 use crate::ops::types::{
     AdditionalInferenceSpecificationDefinition, AppSpecification, ArtifactSource,
-    AsyncInferenceConfig, BatchDataCaptureConfig, CodeEditorAppImageConfig, ContainerDefinition,
-    DataCaptureConfig, DataProcessing, DriftCheckBaselines, ExperimentConfig, ExplainerConfig,
-    GitConfig, IamIdentity, InferenceExecutionConfig, InferenceSpecification,
-    JupyterLabAppImageConfig, KernelGatewayImageConfig, ManagedConfiguration, MetadataProperties,
-    MetricsConfig, ModelCardSecurityConfig, ModelClientConfig, ModelLifeCycle, ModelMetrics,
+    AsyncInferenceConfig, AutoMLComputeConfig, AutoMLDataSplitConfig, AutoMLJobChannel,
+    AutoMLJobObjective, AutoMLOutputDataConfig, AutoMLProblemTypeConfig, AutoMLSecurityConfig,
+    BatchDataCaptureConfig, CodeEditorAppImageConfig, ContainerDefinition, DataCaptureConfig,
+    DataProcessing, DriftCheckBaselines, ExperimentConfig, ExplainerConfig, GitConfig, IamIdentity,
+    InferenceExecutionConfig, InferenceSpecification, JupyterLabAppImageConfig,
+    KernelGatewayImageConfig, ManagedConfiguration, MetadataProperties, MetricsConfig,
+    ModelCardSecurityConfig, ModelClientConfig, ModelDeployConfig, ModelLifeCycle, ModelMetrics,
     ModelPackageModelCard, ModelPackageSecurityConfig, ModelPackageStatusDetails,
     ModelPackageStatusItem, ModelPackageValidationSpecification, NetworkConfig,
     ParallelismConfiguration, Parameter, ProcessingInput, ProcessingOutputConfig,
@@ -431,6 +443,28 @@ pub const DETAILED_MODEL_PACKAGE_STATUS_COMPLETED: &str = "Completed";
 /// none: SageMaker's model registry documents a new version as awaiting manual approval,
 /// and `CreateModelPackage` documents the member as optional for versioned models.
 pub const MODEL_APPROVAL_PENDING_MANUAL: &str = "PendingManualApproval";
+
+/// How many `UpdateModelPackage` idempotency tokens one model package remembers.
+///
+/// `ClientToken` "guarantees that the call to this API is idempotent", so a retry must
+/// replay rather than append a second copy of the additional inference specifications it
+/// carried. Keeping the tokens on the record bounds them by the record's own lifetime,
+/// and this cap bounds how many one record holds, so a caller updating a package in a
+/// loop cannot grow the store without end. It is the emulator's own bound, not an AWS
+/// one: real SageMaker's deduplication window is not published.
+pub const MODEL_PACKAGE_UPDATE_TOKEN_HISTORY: usize = 64;
+
+/// The largest number of additional inference specifications one model package may hold:
+/// "Total number of additional Inference Specifications can not exceed 15"
+/// (`UpdateModelPackageInput$AdditionalInferenceSpecificationsToAdd`'s model doc). The
+/// member's own modelled length bounds ONE request's list, so the running total is
+/// enforced in the handler.
+pub const ADDITIONAL_INFERENCE_SPECIFICATIONS_MAX: usize = 15;
+
+/// The largest number of customer metadata properties one model package may hold: the
+/// modelled `length` of `CustomerMetadataMap` (`min 1, max 50`), which bounds the map a
+/// request carries and therefore the merged map a later read replays.
+pub const CUSTOMER_METADATA_PROPERTIES_MAX: usize = 50;
 
 /// `AppStatus`'s members this emulator moves an app through. The modelled enum
 /// (`smithy_query(query="shape", shape="AppStatus")`) also carries `Deleting`,
@@ -1272,6 +1306,16 @@ impl ComAmazonawsSagemakerSagemakerState {
 /// `completed_at` is the instant the clock owes the `Pending` -> `Completed` transition;
 /// it is stored, never slept on, and materialised by whichever reporting call first runs
 /// at or after it.
+///
+/// `last_modified_by` stays absent until a CALL modifies the package (`UpdateModelPackage`
+/// records it), the way [`ModelCardVersion`]'s does: the clock settling the registration
+/// status is not a caller, so it moves `last_modified_time` without claiming an identity.
+///
+/// `update_client_tokens` holds the idempotency tokens whose update has already been
+/// applied, newest last, so a retry replays instead of appending a second copy of an
+/// `AdditionalInferenceSpecificationsToAdd`. It is capped at
+/// [`MODEL_PACKAGE_UPDATE_TOKEN_HISTORY`] entries so a caller updating in a loop cannot
+/// grow the record without end.
 #[derive(Debug, Clone)]
 pub struct ModelPackage {
     pub name: String,
@@ -1302,7 +1346,10 @@ pub struct ModelPackage {
     pub managed_storage_type: Option<String>,
     pub tags: Vec<Tag>,
     pub created_by: UserContext,
+    pub last_modified_by: Option<UserContext>,
     pub client_token: Option<String>,
+    /// The `ClientToken`s of the updates already applied to this package, newest last.
+    pub update_client_tokens: Vec<String>,
     pub status: String,
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
@@ -1315,6 +1362,25 @@ impl ModelPackage {
     /// resource part of the package's ARN, so one identifier serves both.
     pub fn key(&self) -> String {
         model_package_key(&self.name, self.version)
+    }
+
+    /// Whether `token` has already applied an update to this package, i.e. this call is a
+    /// retry of one this record has seen.
+    pub fn update_token_applied(&self, token: &str) -> bool {
+        self.update_client_tokens.iter().any(|seen| seen == token)
+    }
+
+    /// Remember `token` as applied, dropping the oldest entries once the history is at
+    /// [`MODEL_PACKAGE_UPDATE_TOKEN_HISTORY`], so the record stays bounded.
+    pub fn remember_update_token(&mut self, token: String) {
+        self.update_client_tokens.push(token);
+        let excess = self
+            .update_client_tokens
+            .len()
+            .saturating_sub(MODEL_PACKAGE_UPDATE_TOKEN_HISTORY);
+        if excess > 0 {
+            self.update_client_tokens.drain(..excess);
+        }
     }
 
     /// Materialise the `Pending` -> `Completed` transition the clock already owes.
@@ -1420,6 +1486,8 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub endpoint_configs: BTreeMap<String, EndpointConfig>,
     /// Keyed by `EndpointName`.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// AutoML jobs V2, keyed by [`entity_key`] of their `AutoMLJobName`.
+    pub auto_ml_jobs_v2: BTreeMap<String, AutoMLJobV2>,
     /// Lineage contexts, keyed by `ContextArn`: `ContextName` is documented unique to an
     /// account in a Region, so the ARN — which carries the Region beside the name — is
     /// what identifies one context. See [`context_key`].
@@ -3581,14 +3649,16 @@ impl ComAmazonawsSagemakerSagemakerState {
     }
 }
 
-/// The store key a `TrialComponentName` (or any other `ExperimentEntityName`) maps to.
+/// The store key a `TrialComponentName` (or any other case-insensitive SageMaker name,
+/// such as an `AutoMLJobName`) maps to.
 ///
 /// The member's model doc says the name "must be unique in your Amazon Web Services
-/// account and is not case-sensitive", so two names differing only in case are ONE
+/// account and is not case-sensitive" (`AutoMLJobName`'s says "must be unique to your
+/// account and is case insensitive"), so two names differing only in case are ONE
 /// entity: the store is keyed by the case-folded name, while the record keeps the casing
-/// the caller sent so a reader replays it. `ExperimentEntityName` is ASCII (pattern
-/// `^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,119}$`), so ASCII folding is exact for every name the
-/// boundary validator lets through.
+/// the caller sent so a reader replays it. Every such name is ASCII (`ExperimentEntityName`
+/// is `^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,119}$`, `AutoMLJobName` the same shape bounded at 32),
+/// so ASCII folding is exact for every name the boundary validator lets through.
 pub fn entity_key(name: &str) -> String {
     name.to_ascii_lowercase()
 }

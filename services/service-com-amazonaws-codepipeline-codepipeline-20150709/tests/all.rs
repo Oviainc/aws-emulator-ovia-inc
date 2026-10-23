@@ -19,6 +19,8 @@ mod action_revisions;
 mod action_type_catalog;
 #[path = "all/custom_action_types.rs"]
 mod custom_action_types;
+#[path = "all/execution_engine.rs"]
+mod execution_engine;
 #[path = "all/pipeline_lifecycle.rs"]
 mod pipeline_lifecycle;
 #[path = "all/pipeline_state.rs"]
@@ -37,5 +39,7 @@ mod third_party_job_results;
 mod third_party_jobs;
 #[path = "all/update_pipeline.rs"]
 mod update_pipeline;
+#[path = "all/validation_and_messages.rs"]
+mod validation_and_messages;
 #[path = "all/webhooks.rs"]
 mod webhooks;

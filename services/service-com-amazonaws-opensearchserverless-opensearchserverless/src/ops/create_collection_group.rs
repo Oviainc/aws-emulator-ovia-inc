@@ -3,9 +3,14 @@
 //! @op CreateCollectionGroup
 //! IMPLEMENTED: mints a `CollectionGroupId`, derives the group's ARN from that id and the
 //! request's Region, stores a `CollectionGroupRecord` in [`crate::state`] under the id
-//! (indexed by name), and answers from the stored record. A second create for a name
-//! already taken is a `ConflictException`; capacity limits whose floor exceeds its own
-//! ceiling are a `ValidationException`.
+//! (indexed by name), and answers from the stored record. The stored record carries the
+//! group's EFFECTIVE capacity limits — every member the request named plus the service
+//! default for each CEILING it omitted
+//! ([`crate::state::effective_capacity_limits`]) — so the create detail and every later
+//! read report the group's ceiling instead of nothing, and its `storageConfiguration` is
+//! computed from the generation the record stores. A second create for a name
+//! already taken is a `ConflictException`; capacity limits whose floor exceeds the ceiling
+//! the SAME REQUEST named are a `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -200,7 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         // The relation between a capacity floor and its own ceiling, which no single
-        // member's own `@range` can express.
+        // member's own `@range` can express. Checked over the halves the REQUEST named,
+        // which are the only ones a caller can contradict: the service default this
+        // emulator fills an unnamed ceiling with is not evidence that a higher floor is
+        // refusable, so a floor named without a ceiling is accepted and stored.
         if let Some(limits) = &input.capacity_limits {
             if let Err(message) = crate::state::validate_capacity_limits(limits) {
                 return Err(CreateCollectionGroupErrorModeled::ValidationException(
@@ -211,6 +219,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
+        let capacity_limits =
+            crate::state::effective_capacity_limits(input.capacity_limits.as_ref());
 
         let mut store = state.lock();
 
@@ -275,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             generation: input
                 .generation
                 .unwrap_or_else(|| crate::state::SERVERLESS_GENERATION_CLASSIC.to_string()),
-            capacity_limits: input.capacity_limits,
+            capacity_limits,
             tags: input.tags.unwrap_or_default(),
             created_date,
             last_modified_date: created_date,

@@ -19,6 +19,8 @@ mod channel_error_envelope;
 mod dashboard_enumeration;
 #[path = "all/dashboard_lifecycle.rs"]
 mod dashboard_lifecycle;
+#[path = "all/dashboard_refresh.rs"]
+mod dashboard_refresh;
 #[path = "all/disable_federation.rs"]
 mod disable_federation;
 #[path = "all/emulator.rs"]

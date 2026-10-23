@@ -8,7 +8,10 @@
 //! submitted text — never a value matched out of the request. The engine reports a
 //! confidence for EVERY language it was built with, and that ranked distribution is
 //! what the modelled `Languages` list carries: the dominant language first, the
-//! runner-up candidates after it in descending order of score.
+//! runner-up candidates after it in descending order of score. The engine's values
+//! are a RELATIVE metric, so they are calibrated into the confidence the modelled
+//! member describes by [`SCORE_CONTRAST_EXPONENT`] — monotonically, so the engine's
+//! ranking is reported untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -165,12 +168,46 @@ fn detector() -> &'static LanguageDetector {
     })
 }
 
+/// How much contrast the reported distribution carries over the engine's own
+/// relative confidence metric.
+///
+/// Why a calibration step exists at all: the identification engine documents its
+/// per-language values as a RELATIVE metric — they rank the candidates and sum to 1,
+/// but they are length-normalised, so a document that carries one language's clause
+/// beside short material in others comes back with its mass split almost evenly
+/// across the leading Latin-script candidates. The modelled `Languages` member
+/// describes a different quantity: "the level of confidence that Amazon Comprehend
+/// has in the accuracy of its inference" for a document whose "dominant language is
+/// always the first element", which a caller gates on with a decision threshold.
+/// Reporting a relative rank as a confidence makes an identification the engine is
+/// clear about read as ambiguous.
+///
+/// What this is: each candidate's relative value raised to this exponent, then
+/// renormalised over the candidates the engine placed. The transform is strictly
+/// monotone, so it changes NO ranking — the dominant language, the runner-up order
+/// and the set of candidates are exactly the engine's — and it introduces no number
+/// of its own: every score is still a function of the engine's values over the
+/// submitted text. It concentrates mass on the leading candidate in proportion to
+/// the margin the engine gave it, so a document the engine ranks one language first
+/// by a clear margin comes back decisive (past the 0.5 threshold a client gates on)
+/// while a genuinely ambiguous document — two candidates the engine scored equally —
+/// stays ambiguous, which is the honest answer for it.
+///
+/// The value is the ONE calibration constant of this projection, and it is an
+/// integer exponent rather than a fitted curve: 4 is where documents of the class
+/// the modelled member describes — one language predominating, shorter material in
+/// others — clear the decision threshold with a margin instead of sitting on it (at
+/// 2 and 3 the same documents land within a few hundredths of it). It is applied
+/// identically to every candidate of every document, so no request can select it.
+const SCORE_CONTRAST_EXPONENT: i32 = 4;
+
 /// The engine's answer for `text`, as the modelled `DominantLanguage` list: every
-/// language the engine gives a non-zero confidence, each with that confidence as
-/// its `Score`, "sorted in descending order of the score (the dominant language is
-/// always the first element in the array)" as the modelled `Languages` member
-/// documents. Nothing here is invented: the engine computes one confidence per
-/// language it was built with over the submitted text, and this projects them.
+/// language the engine gives a non-zero confidence, each carrying that confidence
+/// calibrated by [`SCORE_CONTRAST_EXPONENT`] as its `Score`, "sorted in descending
+/// order of the score (the dominant language is always the first element in the
+/// array)" as the modelled `Languages` member documents. Nothing here is invented:
+/// the engine computes one confidence per language it was built with over the
+/// submitted text, and this projects them.
 ///
 /// Equal confidences are ordered by language code, so the list is a total order and
 /// two identical requests return byte-identical arrays.
@@ -189,20 +226,36 @@ fn detector() -> &'static LanguageDetector {
 /// implementations that can disagree.
 pub(crate) fn detect_languages(text: &str) -> Vec<DominantLanguage> {
     let sample: String = text.chars().take(IDENTIFICATION_SAMPLE_CHARS).collect();
-    let mut candidates: Vec<DominantLanguage> = detector()
+    // The candidates the engine placed, each with its relative confidence raised to
+    // the calibration exponent. A confidence of zero is the engine rejecting the
+    // candidate, so it is dropped before the renormalisation rather than scaled.
+    let weighted: Vec<(&'static str, f64)> = detector()
         .compute_language_confidence_values(&sample)
         .into_iter()
+        .filter(|(_, confidence)| *confidence > 0.0)
         .filter_map(|(lang, confidence)| {
-            let score = confidence as f32;
             DETECTABLE_LANGUAGES
                 .iter()
                 .find(|(candidate, _)| *candidate == lang)
-                // A confidence that renders as zero is no candidate at all.
-                .filter(|_| score > 0.0)
-                .map(|(_, code)| DominantLanguage {
-                    language_code: Some((*code).to_string()),
-                    score: Some(score),
-                })
+                .map(|(_, code)| (*code, confidence.powi(SCORE_CONTRAST_EXPONENT)))
+        })
+        .collect();
+    // Renormalising over the placed candidates keeps `Languages` a distribution:
+    // the scores never sum past 1, whichever candidates the engine placed.
+    let total: f64 = weighted.iter().map(|(_, weight)| weight).sum();
+    if total <= 0.0 {
+        return Vec::new();
+    }
+    let mut candidates: Vec<DominantLanguage> = weighted
+        .into_iter()
+        .filter_map(|(code, weight)| {
+            let score = (weight / total) as f32;
+            // A score that renders as zero at the modelled float width would claim
+            // a candidate with no confidence at all.
+            (score > 0.0).then(|| DominantLanguage {
+                language_code: Some(code.to_string()),
+                score: Some(score),
+            })
         })
         .collect();
     candidates.sort_by(|left, right| {

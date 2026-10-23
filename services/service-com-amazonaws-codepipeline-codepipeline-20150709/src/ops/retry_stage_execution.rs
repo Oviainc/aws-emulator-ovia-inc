@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RetryStageExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RetryStageExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RetryStageExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +162,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RetryStageExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RetryStageExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RetryStageExecution"))
+        let state = crate::state::require_state(&*self.engine)?;
+        // Whether the stage failed at all is a fact the clock may still owe, so every
+        // due step is materialised before the request is judged.
+        crate::state::advance(&*self.engine, ctx, &input.pipeline_name).await;
+        let now = ::std::time::SystemTime::now();
+
+        {
+            let mut state = state.lock();
+            if !state.pipelines.contains_key(&input.pipeline_name) {
+                return Err(
+                    RetryStageExecutionErrorModeled::PipelineNotFoundException(
+                        PipelineNotFoundException {
+                            message: Some(crate::state::pipeline_not_found_message(
+                                &input.pipeline_name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // "You can retry a stage that has failed without having to run a pipeline
+            // again from the beginning" — and only for the LATEST execution of the
+            // pipeline: an older one is what `NotLatestPipelineExecutionException`
+            // reports.
+            let latest = state
+                .executions_by_pipeline
+                .get(&input.pipeline_name)
+                .and_then(|ids| ids.last().cloned());
+            if latest.as_deref() != Some(input.pipeline_execution_id.as_str()) {
+                return Err(
+                    RetryStageExecutionErrorModeled::NotLatestPipelineExecutionException(
+                        NotLatestPipelineExecutionException {
+                            message: Some(format!(
+                                "Pipeline execution {} is not the latest execution of \
+                                 pipeline {}, so its stages cannot be retried",
+                                input.pipeline_execution_id, input.pipeline_name
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            let Some(record) = state.executions.get_mut(&input.pipeline_execution_id) else {
+                return Err(
+                    RetryStageExecutionErrorModeled::NotLatestPipelineExecutionException(
+                        NotLatestPipelineExecutionException {
+                            message: Some(format!(
+                                "Pipeline {} has no execution {}",
+                                input.pipeline_name, input.pipeline_execution_id
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            let Some(stage) = record
+                .stages
+                .iter_mut()
+                .find(|stage| stage.name == input.stage_name)
+            else {
+                return Err(RetryStageExecutionErrorModeled::StageNotFoundException(
+                    StageNotFoundException {
+                        message: Some(format!(
+                            "Pipeline '{}' does not have a stage with name '{}'",
+                            input.pipeline_name, input.stage_name
+                        )),
+                    },
+                )
+                .into());
+            };
+            // Only a FAILED stage is retryable.
+            if stage.status.as_deref() != Some(crate::state::STATUS_FAILED) {
+                return Err(RetryStageExecutionErrorModeled::StageNotRetryableException(
+                    StageNotRetryableException {
+                        message: Some(format!(
+                            "Stage '{}' of pipeline execution {} is not in a failed state, \
+                             so it cannot be retried",
+                            input.stage_name, input.pipeline_execution_id
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // `StageRetryMode`: `FAILED_ACTIONS` re-runs only the actions that failed,
+            // `ALL_ACTIONS` re-runs every action of the stage. A re-run action starts
+            // from scratch: no status, no due instant, a fresh execution id.
+            let all_actions = input.retry_mode == "ALL_ACTIONS";
+            for action in &mut stage.actions {
+                let failed = action.status.as_deref() == Some(crate::state::STATUS_FAILED);
+                if all_actions || failed {
+                    action.status = None;
+                    action.due = None;
+                    action.claimed = None;
+                    action.error = None;
+                    action.summary = None;
+                    action.token = None;
+                    action.action_execution_id = crate::state::random_uuid_v4();
+                    action.last_status_change = now;
+                }
+            }
+            stage.status = Some("InProgress".to_string());
+            record.status = crate::state::STATUS_IN_PROGRESS.to_string();
+            record.status_summary = None;
+            record.manual_retry_attempts = record.manual_retry_attempts.saturating_add(1);
+            record.last_update_time = now;
+        }
+
+        // The retried actions become due a span from now, like any other step.
+        crate::state::advance(&*self.engine, ctx, &input.pipeline_name).await;
+
+        Ok(RetryStageExecutionOutput {
+            pipeline_execution_id: Some(input.pipeline_execution_id),
+        })
     }
 }

@@ -17,7 +17,10 @@ pub struct DescribeCustomPluginInput {
     pub custom_plugin_arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafkaconnect#DescribeCustomPluginResponse")]
+/// `creationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kc_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="DescribeCustomPluginResponse")`.
 #[derive(Debug, Clone, Default)]
 pub struct DescribeCustomPluginOutput {
     pub creation_time: Option<::aws_smithy_types::DateTime>,
@@ -28,4 +31,26 @@ pub struct DescribeCustomPluginOutput {
     pub name: Option<String>,
     pub state_description: Option<StateDescription>,
 }
+
+kc_schema_and_codec!(
+    DescribeCustomPluginOutput,
+    DESCRIBE_CUSTOM_PLUGIN_OUTPUT_SCHEMA,
+    "com.amazonaws.kafkaconnect#DescribeCustomPluginResponse",
+    "com.amazonaws.kafkaconnect",
+    "DescribeCustomPluginResponse",
+    (M_CREATION_TIME, creation_time, "creationTime", 0, opt, date_time),
+    (M_CUSTOM_PLUGIN_ARN, custom_plugin_arn, "customPluginArn", 1, opt, string),
+    (M_CUSTOM_PLUGIN_STATE, custom_plugin_state, "customPluginState", 2, opt, string),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (
+        M_LATEST_REVISION,
+        latest_revision,
+        "latestRevision",
+        4,
+        opt,
+        struct_of(CustomPluginRevisionSummary)
+    ),
+    (M_NAME, name, "name", 5, opt, string),
+    (M_STATE_DESCRIPTION, state_description, "stateDescription", 6, opt, struct_of(StateDescription)),
+);
 

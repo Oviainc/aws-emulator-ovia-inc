@@ -25,6 +25,12 @@ mod comprehend_client;
 mod document_classifiers;
 #[path = "all/dominant_language_jobs.rs"]
 mod dominant_language_jobs;
+#[path = "all/entity_detection.rs"]
+mod entity_detection;
+// Declared beside the suite it backs rather than under `s`: `scratch_dump` holds the
+// whole-document baselines that `entity_detection` asserts the rules of.
+#[path = "all/scratch_dump.rs"]
+mod scratch_dump;
 #[path = "all/key_phrases_jobs.rs"]
 mod key_phrases_jobs;
 #[path = "all/pii_detection.rs"]
@@ -43,6 +49,8 @@ mod sentiment_jobs;
 mod state_roundtrip;
 #[path = "all/sync_inference.rs"]
 mod sync_inference;
+#[path = "all/sync_inference_refusals.rs"]
+mod sync_inference_refusals;
 #[path = "all/syntax.rs"]
 mod syntax;
 #[path = "all/targeted_sentiment.rs"]

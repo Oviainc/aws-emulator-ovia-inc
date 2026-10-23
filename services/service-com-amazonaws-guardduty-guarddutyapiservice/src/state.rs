@@ -87,6 +87,19 @@ pub struct ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// into it directly.
     pub malware_protection_plan_client_tokens:
         HashMap<(String, String), MalwareProtectionPlanTokenRecord>,
+    /// GuardDuty's own catalogue of custom detection rules, materialised when this
+    /// service's store is created.
+    ///
+    /// A rule is the SERVICE's, not an account's: the API models no operation that
+    /// creates, updates or deletes one — `ListCustomDetectionRules` "Returns all
+    /// available custom detection rules in GuardDuty"
+    /// (`smithy_query(query="doc",shape="ListCustomDetectionRules")`), and the only
+    /// writes it models against a rule are the ASSOCIATIONS an account makes
+    /// (`CreateCustomDetectionRuleAssociation`). So the catalogue is seeded once,
+    /// reads the same for every account and every Region, and is FINITE by
+    /// construction: it is the fixed table behind
+    /// [`CustomDetectionRuleCatalog::default`].
+    pub custom_detection_rules: CustomDetectionRuleCatalog,
     /// Last instant handed out by [`Self::tick_millis`], so two mutations in the
     /// same millisecond still get strictly increasing timestamps.
     last_millis: i64,
@@ -2998,6 +3011,502 @@ pub fn scan_criterion_shape(
             })
             .collect(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Custom detection rules
+//
+// A custom detection rule is published BY GuardDuty: the API models no create,
+// update or delete for one, only the associations an account makes against it,
+// so the catalogue below is the service's own and the same for every caller.
+// ---------------------------------------------------------------------------
+
+/// The wire name of the `RuleId` member, as a request carries it — a `jsonName`
+/// `ruleId` on `CreateCustomDetectionRuleAssociation` and the URI label on
+/// `GetCustomDetectionRule`
+/// (`smithy_query(operation="GetCustomDetectionRule,CreateCustomDetectionRuleAssociation")`).
+pub const RULE_ID_MEMBER: &str = "ruleId";
+
+/// The wire name of `ListCustomDetectionRules`'s filter list: its `Filters` member
+/// has `jsonName` `filters` (`smithy_query(operation="ListCustomDetectionRules")`).
+pub const FILTERS_MEMBER: &str = "filters";
+
+/// `RuleLanguage`'s only member (`smithy_query(shape="RuleLanguage")`): the
+/// language every published rule expresses its detection logic in.
+pub const RULE_LANGUAGE_SQL: &str = "SQL";
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::RULE_LANGUAGE_VALUES,
+    RULE_LANGUAGE_SQL
+));
+
+/// `RuleSchema`'s only member (`smithy_query(shape="RuleSchema")`): the schema a
+/// rule over CloudTrail management events is written against. A rule over another
+/// data source has no schema member to report, so it reports none.
+pub const RULE_SCHEMA_CLOUD_TRAIL: &str = "CloudTrail";
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::RULE_SCHEMA_VALUES,
+    RULE_SCHEMA_CLOUD_TRAIL
+));
+
+/// The two `DetectionRuleDataSource` members — "The data source that the rule
+/// analyzes" (`smithy_query(shape="DetectionRuleDataSource")`).
+pub const DETECTION_RULE_DATA_SOURCE_CLOUD_TRAIL: &str = "CloudTrailManagementEvent";
+/// See [`DETECTION_RULE_DATA_SOURCE_CLOUD_TRAIL`].
+pub const DETECTION_RULE_DATA_SOURCE_RUNTIME: &str = "RuntimeMonitoring";
+
+/// The `DetectionRuleSeverity` members (`smithy_query(shape="DetectionRuleSeverity")`).
+pub const DETECTION_RULE_SEVERITY_CRITICAL: &str = "CRITICAL";
+/// See [`DETECTION_RULE_SEVERITY_CRITICAL`].
+pub const DETECTION_RULE_SEVERITY_HIGH: &str = "HIGH";
+/// See [`DETECTION_RULE_SEVERITY_CRITICAL`].
+pub const DETECTION_RULE_SEVERITY_MEDIUM: &str = "MEDIUM";
+/// See [`DETECTION_RULE_SEVERITY_CRITICAL`].
+pub const DETECTION_RULE_SEVERITY_LOW: &str = "LOW";
+
+/// The `DetectionRuleFilterCondition` members — "The condition to apply to the
+/// filter. For example, `EQUALS` or `CONTAINS`"
+/// (`smithy_query(query="doc",shape="DetectionRuleFilter",member="Condition")`).
+/// [`FILTER_CONDITION_EQUALS`] is what a filter that names no condition asks for:
+/// a filter is a selection by value, and the exact value is the narrower reading.
+pub const FILTER_CONDITION_EQUALS: &str = "EQUALS";
+/// See [`FILTER_CONDITION_EQUALS`].
+pub const FILTER_CONDITION_CONTAINS: &str = "CONTAINS";
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::DETECTION_RULE_FILTER_CONDITION_VALUES,
+    FILTER_CONDITION_EQUALS
+));
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::DETECTION_RULE_FILTER_CONDITION_VALUES,
+    FILTER_CONDITION_CONTAINS
+));
+
+/// Every `FilterFieldName` member — the rule fields a `DetectionRuleFilter` may
+/// name (`smithy_query(shape="FilterFieldName")`). Each one is the `jsonName` of a
+/// `RuleSummary` member, which is why [`CustomDetectionRuleRecord::field`] resolves
+/// them straight onto the record.
+pub const DETECTION_RULE_FILTER_FIELDS: &[&str] =
+    crate::ops::types::shared_types::FILTER_FIELD_NAME_VALUES;
+
+/// The platforms a Runtime Monitoring rule can run on, as
+/// `DetectionRuleRuntimePlatforms` names them: "The presence of a platform member
+/// indicates that the rule is supported on that platform"
+/// (`smithy_query(query="doc",shape="DetectionRuleRuntimeMonitoringDetails",member="Platforms")`).
+pub const RUNTIME_PLATFORM_EKS: &str = "EKS";
+/// See [`RUNTIME_PLATFORM_EKS`].
+pub const RUNTIME_PLATFORM_EC2: &str = "EC2";
+/// See [`RUNTIME_PLATFORM_EKS`].
+pub const RUNTIME_PLATFORM_ECS_FARGATE: &str = "ECS_FARGATE";
+
+/// The message a read of a rule the catalogue does not publish answers with.
+///
+/// It names the member at fault and states the rule it broke, without quoting the
+/// caller's value back — the wording every rejection on this service follows.
+pub fn custom_detection_rule_not_found_message() -> String {
+    format!(
+        "The request is rejected because the input {RULE_ID_MEMBER} does not refer to a custom detection rule published by GuardDuty."
+    )
+}
+
+/// The ARN of the custom detection rule `rule_id` as `region`'s endpoint reports
+/// it.
+///
+/// Derived, never stored, exactly as [`malware_protection_plan_arn`] is: the rule's
+/// own id and the Region serving the read are the only variable parts, so a read
+/// cannot report an ARN that disagrees with the id it was asked about. The resource
+/// type is the one the ARN's own shape names (`DetectionRuleArn`).
+pub fn custom_detection_rule_arn(region: &str, rule_id: &str) -> String {
+    ::engine::emulator_arn(
+        GUARDDUTY_ARN_SERVICE,
+        region,
+        &format!("detection-rule/{rule_id}"),
+    )
+}
+
+/// One custom detection rule as the store holds it.
+///
+/// `Language`/`Schema`/`UpdatedAt` are the model's optional members and are held as
+/// `Option`, so a rule that has none reports none rather than an invented value.
+#[derive(Debug, Clone)]
+pub struct CustomDetectionRuleRecord {
+    /// `RuleId`: `len 1..100`, `pattern ^[a-z0-9]+(-[a-z0-9]+)*$`
+    /// (`smithy_query(shape="RuleId")`).
+    pub rule_id: String,
+    /// `RuleSummary.Name` — the rule's display name.
+    pub name: String,
+    /// `RuleSummary.Description` — "A description of what the rule detects".
+    pub description: String,
+    /// One of the [`DETECTION_RULE_SEVERITY_CRITICAL`] family.
+    pub severity: String,
+    /// [`DETECTION_RULE_DATA_SOURCE_CLOUD_TRAIL`] or
+    /// [`DETECTION_RULE_DATA_SOURCE_RUNTIME`].
+    pub data_source: String,
+    /// The MITRE ATT&CK tactic the rule detects.
+    pub tactic: String,
+    /// The MITRE ATT&CK technique the rule detects.
+    pub technique: String,
+    /// The Amazon Web Services service the rule is about.
+    pub service: String,
+    /// `RuleDefinition.Expression` — the rule's detection logic, which only
+    /// `GetCustomDetectionRule` reports (`RuleSummary` carries no definition).
+    pub expression: String,
+    /// The language the expression is written in, or `None` when the rule declares
+    /// none.
+    pub language: Option<String>,
+    /// The schema the expression is written against, or `None` when the rule
+    /// declares none.
+    pub schema: Option<String>,
+    /// The Runtime Monitoring platforms the rule is supported on, empty for a rule
+    /// that is not a Runtime Monitoring rule.
+    pub runtime_platforms: Vec<String>,
+    /// When the store first held this rule.
+    pub created_at_millis: i64,
+    /// When it last changed, or `None` for a rule nothing has changed since it was
+    /// published — `UpdatedAt` is optional on both `RuleSummary` and `RuleDetail`.
+    pub updated_at_millis: Option<i64>,
+}
+
+impl CustomDetectionRuleRecord {
+    /// The value of the rule field a `DetectionRuleFilter` names, by the field's
+    /// own wire name.
+    ///
+    /// The `FilterFieldName` members are the `jsonName`s of `RuleSummary`'s own
+    /// members, so a filter selects on the value a list REPORTS for that member.
+    /// A name outside [`DETECTION_RULE_FILTER_FIELDS`] resolves to nothing, so a
+    /// filter over a field no rule carries selects no rule.
+    pub fn field(&self, field: &str) -> Option<&str> {
+        match field {
+            "name" => Some(&self.name),
+            "description" => Some(&self.description),
+            "dataSource" => Some(&self.data_source),
+            "severity" => Some(&self.severity),
+            "tactic" => Some(&self.tactic),
+            "technique" => Some(&self.technique),
+            "service" => Some(&self.service),
+            _ => None,
+        }
+    }
+}
+
+// Every field name the model lists is one `field` above resolves: the arms there
+// and the enum's members cannot drift apart without failing the build, so a member
+// the model gains is a build error rather than a filter that silently selects
+// nothing.
+const _: () = {
+    let mut index = 0;
+    while index < DETECTION_RULE_FILTER_FIELDS.len() {
+        assert!(enum_carries(
+            &[
+                "name",
+                "description",
+                "dataSource",
+                "severity",
+                "tactic",
+                "technique",
+                "service"
+            ],
+            DETECTION_RULE_FILTER_FIELDS[index]
+        ));
+        index += 1;
+    }
+    assert!(DETECTION_RULE_FILTER_FIELDS.len() == 7);
+};
+
+/// GuardDuty's catalogue of custom detection rules, held by this service's store.
+///
+/// Opaque on purpose: the catalogue is READ by every operation that resolves a
+/// rule, and written by nothing, so it hands out `&`-references and no way to
+/// insert. That is what makes "a rule a caller cannot create" also "a rule a
+/// caller cannot change".
+#[derive(Debug)]
+pub struct CustomDetectionRuleCatalog {
+    /// Every published rule, in `RuleId` order — the total order a page token is an
+    /// offset into.
+    rules: Vec<CustomDetectionRuleRecord>,
+}
+
+impl Default for CustomDetectionRuleCatalog {
+    /// Materialise the published catalogue, every rule carrying the instant the
+    /// store came up as its `CreatedAt`.
+    ///
+    /// The instant is read ONCE here, when the store is created, rather than per
+    /// call: `CreatedAt` is required on both `RuleSummary` and `RuleDetail`, and a
+    /// rule that reported a fresh instant on every read would not be the same rule
+    /// twice.
+    fn default() -> Self {
+        let published_at = now_millis();
+        let mut rules: Vec<CustomDetectionRuleRecord> = PUBLISHED_CUSTOM_DETECTION_RULES
+            .iter()
+            .map(|published| published.record(published_at))
+            .collect();
+        rules.sort_by(|left, right| left.rule_id.cmp(&right.rule_id));
+        Self { rules }
+    }
+}
+
+impl CustomDetectionRuleCatalog {
+    /// Every published rule, in `RuleId` order.
+    pub fn rules(&self) -> &[CustomDetectionRuleRecord] {
+        &self.rules
+    }
+
+    /// The published rule `rule_id` names, if the catalogue carries it.
+    ///
+    /// Matching is EXACT: a rule id is an identifier, so a near miss is a different
+    /// string and not a rule. A linear scan over a fixed table of single-digit
+    /// length: the catalogue has no key a map would index it by faster.
+    pub fn rule(&self, rule_id: &str) -> Option<&CustomDetectionRuleRecord> {
+        self.rules.iter().find(|rule| rule.rule_id == rule_id)
+    }
+}
+
+/// One entry of the published catalogue.
+///
+/// `Language` and `Schema` are not members here: every published rule expresses its
+/// logic in the one `RuleLanguage` member the model carries, and the one
+/// `RuleSchema` member is `CloudTrail`, so both follow from the data source — see
+/// [`Self::record`].
+struct PublishedRule {
+    rule_id: &'static str,
+    name: &'static str,
+    description: &'static str,
+    severity: &'static str,
+    data_source: &'static str,
+    tactic: &'static str,
+    technique: &'static str,
+    service: &'static str,
+    expression: &'static str,
+    /// The Runtime Monitoring platforms the rule runs on; empty for a rule over
+    /// another data source, which has no Runtime Monitoring details to report.
+    runtime_platforms: &'static [&'static str],
+}
+
+impl PublishedRule {
+    /// This entry as a stored record, published at `published_at`.
+    fn record(&self, published_at: i64) -> CustomDetectionRuleRecord {
+        CustomDetectionRuleRecord {
+            rule_id: self.rule_id.to_string(),
+            name: self.name.to_string(),
+            description: self.description.to_string(),
+            severity: self.severity.to_string(),
+            data_source: self.data_source.to_string(),
+            tactic: self.tactic.to_string(),
+            technique: self.technique.to_string(),
+            service: self.service.to_string(),
+            expression: self.expression.to_string(),
+            language: Some(RULE_LANGUAGE_SQL.to_string()),
+            // `RuleSchema` carries exactly one member, `CloudTrail`, so a rule over
+            // CloudTrail management events reports it and a rule over any other
+            // data source has no schema the model can name.
+            schema: (self.data_source == DETECTION_RULE_DATA_SOURCE_CLOUD_TRAIL)
+                .then(|| RULE_SCHEMA_CLOUD_TRAIL.to_string()),
+            runtime_platforms: self
+                .runtime_platforms
+                .iter()
+                .map(|platform| (*platform).to_string())
+                .collect(),
+            created_at_millis: published_at,
+            // Nothing in the API changes a published rule, so a rule the store has
+            // never changed reports no `UpdatedAt` rather than repeating
+            // `CreatedAt`.
+            updated_at_millis: None,
+        }
+    }
+}
+
+/// Every custom detection rule this emulator publishes.
+///
+/// The catalogue is the SERVICE's own, the way [`INVESTIGATION_REGIONS`] and the
+/// sample-finding type catalogue are: the Smithy model names no rule and binds no
+/// operation that creates one, so there is nothing for a caller to add and nothing
+/// to read a rule list out of. Each entry's `severity` and `dataSource` are members
+/// of the model's own enums (asserted below), each `tactic`/`technique` pair names
+/// an MITRE ATT&CK Enterprise tactic and technique, and each `expression` is the
+/// SQL that detects it over the entry's data source.
+///
+/// The rows span the whole surface a caller can select on: both
+/// `DetectionRuleDataSource` members, all four `DetectionRuleSeverity` members,
+/// several services and tactics, and both a rule with Runtime Monitoring platform
+/// requirements and rules with none.
+///
+/// The ids are this emulator's, because AWS publishes none the model or any
+/// response here names: an operation handed a `ruleId` from the real service — a
+/// `CreateCustomDetectionRuleAssociation`, say — answers the modelled "no such
+/// rule" rather than inventing a rule to match it, which is the correct answer for
+/// a rule this service does not publish. Should a recorded response ever expose the
+/// real catalogue, replace these rows with it; nothing outside this table names a
+/// rule.
+const PUBLISHED_CUSTOM_DETECTION_RULES: &[PublishedRule] = &[
+    PublishedRule {
+        rule_id: "cloudtrail-logging-disabled",
+        name: "CloudTrail logging disabled",
+        description: "Detects a call that stops or deletes an AWS CloudTrail trail, which an adversary uses to hide the activity that follows.",
+        severity: DETECTION_RULE_SEVERITY_HIGH,
+        data_source: DETECTION_RULE_DATA_SOURCE_CLOUD_TRAIL,
+        tactic: "Defense Evasion",
+        technique: "T1562.008 Impair Defenses: Disable or Modify Cloud Logs",
+        service: "cloudtrail",
+        expression: "SELECT * FROM cloudtrail WHERE eventSource = 'cloudtrail.amazonaws.com' AND eventName IN ('StopLogging', 'DeleteTrail', 'UpdateTrail')",
+        runtime_platforms: &[],
+    },
+    PublishedRule {
+        rule_id: "guardduty-detector-disabled",
+        name: "GuardDuty detector disabled or deleted",
+        description: "Detects a call that disables or deletes a GuardDuty detector, which removes threat detection for the Region it served.",
+        severity: DETECTION_RULE_SEVERITY_CRITICAL,
+        data_source: DETECTION_RULE_DATA_SOURCE_CLOUD_TRAIL,
+        tactic: "Defense Evasion",
+        technique: "T1562.001 Impair Defenses: Disable or Modify Tools",
+        service: "guardduty",
+        expression: "SELECT * FROM cloudtrail WHERE eventSource = 'guardduty.amazonaws.com' AND eventName IN ('DeleteDetector', 'UpdateDetector')",
+        runtime_platforms: &[],
+    },
+    PublishedRule {
+        rule_id: "iam-access-key-created-for-another-user",
+        name: "Access key created for another IAM user",
+        description: "Detects an IAM access key created for a principal other than the caller, a durable credential an adversary leaves behind.",
+        severity: DETECTION_RULE_SEVERITY_HIGH,
+        data_source: DETECTION_RULE_DATA_SOURCE_CLOUD_TRAIL,
+        tactic: "Persistence",
+        technique: "T1098.001 Account Manipulation: Additional Cloud Credentials",
+        service: "iam",
+        expression: "SELECT * FROM cloudtrail WHERE eventSource = 'iam.amazonaws.com' AND eventName = 'CreateAccessKey' AND requestParameters.userName IS NOT NULL AND requestParameters.userName <> userIdentity.userName",
+        runtime_platforms: &[],
+    },
+    PublishedRule {
+        rule_id: "kms-key-scheduled-for-deletion",
+        name: "KMS key scheduled for deletion",
+        description: "Detects a call that schedules an AWS KMS key for deletion or disables it, which makes the data it protects unreadable.",
+        severity: DETECTION_RULE_SEVERITY_HIGH,
+        data_source: DETECTION_RULE_DATA_SOURCE_CLOUD_TRAIL,
+        tactic: "Impact",
+        technique: "T1485 Data Destruction",
+        service: "kms",
+        expression: "SELECT * FROM cloudtrail WHERE eventSource = 'kms.amazonaws.com' AND eventName IN ('ScheduleKeyDeletion', 'DisableKey')",
+        runtime_platforms: &[],
+    },
+    PublishedRule {
+        rule_id: "root-credential-api-activity",
+        name: "Root credential API activity",
+        description: "Detects an API call signed with the account root user's credentials, which day-to-day activity does not use.",
+        severity: DETECTION_RULE_SEVERITY_MEDIUM,
+        data_source: DETECTION_RULE_DATA_SOURCE_CLOUD_TRAIL,
+        tactic: "Privilege Escalation",
+        technique: "T1078.004 Valid Accounts: Cloud Accounts",
+        service: "iam",
+        expression: "SELECT * FROM cloudtrail WHERE userIdentity.type = 'Root' AND eventType <> 'AwsServiceEvent'",
+        runtime_platforms: &[],
+    },
+    PublishedRule {
+        rule_id: "s3-bucket-public-access-granted",
+        name: "S3 bucket opened to public access",
+        description: "Detects a call that grants public access to an Amazon S3 bucket by relaxing its policy, ACL or public access block.",
+        severity: DETECTION_RULE_SEVERITY_HIGH,
+        data_source: DETECTION_RULE_DATA_SOURCE_CLOUD_TRAIL,
+        tactic: "Exfiltration",
+        technique: "T1567 Exfiltration Over Web Service",
+        service: "s3",
+        expression: "SELECT * FROM cloudtrail WHERE eventSource = 's3.amazonaws.com' AND eventName IN ('PutBucketPolicy', 'PutBucketAcl', 'DeletePublicAccessBlock', 'PutPublicAccessBlock')",
+        runtime_platforms: &[],
+    },
+    PublishedRule {
+        rule_id: "console-login-without-mfa",
+        name: "Console sign-in without MFA",
+        description: "Detects a successful AWS Management Console sign-in that presented no multi-factor authentication.",
+        severity: DETECTION_RULE_SEVERITY_LOW,
+        data_source: DETECTION_RULE_DATA_SOURCE_CLOUD_TRAIL,
+        tactic: "Initial Access",
+        technique: "T1078.004 Valid Accounts: Cloud Accounts",
+        service: "signin",
+        expression: "SELECT * FROM cloudtrail WHERE eventName = 'ConsoleLogin' AND responseElements.ConsoleLogin = 'Success' AND additionalEventData.MFAUsed = 'No'",
+        runtime_platforms: &[],
+    },
+    PublishedRule {
+        rule_id: "runtime-shell-launched-by-server-process",
+        name: "Interactive shell launched by a server process",
+        description: "Detects an interactive shell launched by a long-running server process, the usual first step after a remote code execution.",
+        severity: DETECTION_RULE_SEVERITY_HIGH,
+        data_source: DETECTION_RULE_DATA_SOURCE_RUNTIME,
+        tactic: "Execution",
+        technique: "T1059.004 Command and Scripting Interpreter: Unix Shell",
+        service: "ec2",
+        expression: "SELECT * FROM runtime_monitoring WHERE eventType = 'PROCESS_LAUNCH' AND parentProcessName IN ('httpd', 'nginx', 'java', 'node') AND processName IN ('sh', 'bash', 'dash', 'zsh')",
+        runtime_platforms: &[
+            RUNTIME_PLATFORM_EC2,
+            RUNTIME_PLATFORM_EKS,
+            RUNTIME_PLATFORM_ECS_FARGATE,
+        ],
+    },
+    PublishedRule {
+        rule_id: "runtime-kernel-module-loaded",
+        name: "Kernel module loaded at runtime",
+        description: "Detects a process loading a kernel module, which an adversary uses to hide activity below the processes a host reports.",
+        severity: DETECTION_RULE_SEVERITY_MEDIUM,
+        data_source: DETECTION_RULE_DATA_SOURCE_RUNTIME,
+        tactic: "Defense Evasion",
+        technique: "T1547.006 Boot or Logon Autostart Execution: Kernel Modules and Extensions",
+        service: "ec2",
+        expression: "SELECT * FROM runtime_monitoring WHERE eventType = 'PROCESS_LAUNCH' AND processName IN ('insmod', 'modprobe', 'kmod')",
+        runtime_platforms: &[RUNTIME_PLATFORM_EC2, RUNTIME_PLATFORM_EKS],
+    },
+];
+
+// Every published rule carries values the model admits: a `severity` and a
+// `dataSource` from their own enums, and a `ruleId` matching `RuleId`'s pattern and
+// length. The build fails rather than the wire carrying a value the model does not
+// name.
+const _: () = {
+    let mut index = 0;
+    while index < PUBLISHED_CUSTOM_DETECTION_RULES.len() {
+        let rule = &PUBLISHED_CUSTOM_DETECTION_RULES[index];
+        assert!(enum_carries(
+            crate::ops::types::shared_types::DETECTION_RULE_SEVERITY_VALUES,
+            rule.severity
+        ));
+        assert!(enum_carries(
+            crate::ops::types::shared_types::DETECTION_RULE_DATA_SOURCE_VALUES,
+            rule.data_source
+        ));
+        assert!(is_rule_id_pattern(rule.rule_id));
+        assert!(!rule.name.is_empty() && rule.name.len() <= 255);
+        assert!(!rule.description.is_empty() && rule.description.len() <= 1024);
+        assert!(!rule.tactic.is_empty() && rule.tactic.len() <= 255);
+        assert!(!rule.technique.is_empty() && rule.technique.len() <= 255);
+        assert!(!rule.service.is_empty() && rule.service.len() <= 128);
+        assert!(!rule.expression.is_empty() && rule.expression.len() <= 4096);
+        index += 1;
+    }
+};
+
+/// Does `rule_id` satisfy `RuleId`'s own form — `len 1..100`, `pattern
+/// ^[a-z0-9]+(-[a-z0-9]+)*$` (`smithy_query(shape="RuleId")`)?
+///
+/// A `const fn` so the catalogue above is checked at BUILD time; the request
+/// boundary checks a caller's `ruleId` against the same model constraint before any
+/// handler runs.
+const fn is_rule_id_pattern(rule_id: &str) -> bool {
+    let bytes = rule_id.as_bytes();
+    if bytes.is_empty() || bytes.len() > 100 {
+        return false;
+    }
+    let mut index = 0;
+    // A segment must be non-empty, so a dash may neither open nor close the id nor
+    // follow another dash.
+    let mut segment_len = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'-' {
+            if segment_len == 0 {
+                return false;
+            }
+            segment_len = 0;
+        } else if matches!(byte, b'a'..=b'z' | b'0'..=b'9') {
+            segment_len += 1;
+        } else {
+            return false;
+        }
+        index += 1;
+    }
+    segment_len > 0
 }
 
 /// The AWS Region a request was signed for, which is the Region the resources it

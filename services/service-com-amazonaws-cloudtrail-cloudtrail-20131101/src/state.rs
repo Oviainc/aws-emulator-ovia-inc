@@ -1333,6 +1333,9 @@ pub mod channels;
 /// Per-service state for com-amazonaws-cloudtrail-cloudtrail-20131101. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudtrailCloudtrail20131101State {
+    /// How many dashboard refreshes this process has minted an id for;
+    /// `StartDashboardRefresh` counts refresh ids off this.
+    pub refreshes_started: u64,
     /// Every trail in the account, keyed by [`TrailKey`].
     pub trails: BTreeMap<TrailKey, TrailRecord>,
     /// Every import job in the account, keyed by [`ImportKey`]. `StartImport` adds a
@@ -1699,10 +1702,12 @@ pub struct DashboardRecord {
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
     pub home_region: String,
-    /// Set by `StartDashboardRefresh`, which is not implemented yet, so a dashboard
-    /// has never been refreshed.
+    /// The id of the refresh `StartDashboardRefresh` last began for this dashboard,
+    /// and `None` until one has been started.
     pub last_refresh_id: Option<String>,
-    /// See [`DashboardRecord::last_refresh_id`].
+    /// Why the dashboard's last refresh failed. Nothing sets it: a refresh is started
+    /// and recorded, but no Lake query runs for it (`StartQuery` is still a scaffold),
+    /// so no refresh of this emulator's own fails.
     pub last_refresh_failure_reason: Option<String>,
 }
 

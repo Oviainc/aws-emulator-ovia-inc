@@ -21,6 +21,8 @@ mod app_image_config_registry;
 mod artifact_deletion;
 #[path = "all/artifact_lineage.rs"]
 mod artifact_lineage;
+#[path = "all/automl_job_v2_lifecycle.rs"]
+mod automl_job_v2_lifecycle;
 #[path = "all/batch_describe_model_packages.rs"]
 mod batch_describe_model_packages;
 #[path = "all/batch_transform_jobs.rs"]
@@ -77,6 +79,8 @@ mod model_package_group_lifecycle;
 mod model_package_group_policy;
 #[path = "all/model_package_registry.rs"]
 mod model_package_registry;
+#[path = "all/model_package_updates.rs"]
+mod model_package_updates;
 #[path = "all/notebook_instance_lifecycle.rs"]
 mod notebook_instance_lifecycle;
 #[path = "all/notebook_instance_stop.rs"]

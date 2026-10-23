@@ -7,15 +7,17 @@
 //! request "is rejected if … An instance already exists in the same account"):
 //!
 //! 1. an account holds AT MOST ONE instance, so a create made while it already holds one
-//!    is refused with the modelled `ServiceQuotaExceededException` (HTTP 402) and the
-//!    instance it holds is left untouched — whatever the request carries;
+//!    is refused with the modelled `ServiceQuotaExceededException` — at the HTTP 400 this
+//!    awsJson1_1 service answers every refusal of a request with
+//!    (`crate::scaffolded::modeled_error_status`) — and the instance it holds is left
+//!    untouched, whatever the request carries;
 //! 2. a create on an account that holds none stores the instance and every later read
 //!    answers from that record: it starts `CREATE_IN_PROGRESS` and is `ACTIVE` once the
 //!    clock makes its activation due, it is an ACCOUNT instance (so it serves no
 //!    permission sets), and it echoes the `Name` and `Tags` the request set;
 //! 3. `ClientToken` is `@idempotencyToken`: the same token with the same parameters
 //!    answers with the instance that token created, and with different parameters is the
-//!    modelled `ConflictException` (409).
+//!    modelled `ConflictException`.
 //!
 //! The rows differ along what the rules generalise over: which optional members the
 //! request carries, `Name` at its published upper bound (`length 0..255`), tag order, and
@@ -27,28 +29,27 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_ssoadmin_swbexternalservice::state::{
-    self, ComAmazonawsSsoadminSwbexternalserviceState as Store,
-};
+use service_com_amazonaws_ssoadmin_swbexternalservice::state;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ssoadmin_permission_sets::{call, error_code, is_instance_arn, router, router_over};
-
-/// Read or write this service's store the way a handler does.
-fn with_store<R>(engine: &Arc<engine::InMemoryEngine>, change: impl FnOnce(&mut Store) -> R) -> R {
-    let service_state = state::service_state(&**engine).expect("the SSO Admin state store");
-    let mut store = service_state.lock();
-    change(&mut store)
-}
+use crate::ssoadmin_permission_sets::{
+    call, error_code, is_instance_arn, router, router_over, with_store, UNKNOWN_INSTANCE_ARN,
+};
 
 /// A router over an account that holds NO instance — the account state `CreateInstance`
 /// is documented for.
 ///
-/// Nothing in this API empties an account (`DeleteInstance` is still a scaffold), so the
-/// test clears the store directly; everything it then asserts goes over the wire.
+/// That is the state a completed `DeleteInstance` leaves behind: the account's ambient
+/// instance has been enabled once and is now gone, so no later request enables another
+/// one. The delete path itself is driven over the wire in `instance_delete.rs`; this
+/// helper sets the same two fields directly so a create can be tested without waiting out
+/// a deletion, and everything it then asserts goes over the wire.
 fn empty_account_router() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    with_store(&engine, |store| store.instances.clear());
+    with_store(&engine, |store| {
+        store.instances.clear();
+        store.ambient_instance_enabled = true;
+    });
     (router_over(Arc::clone(&engine)), engine)
 }
 
@@ -93,7 +94,7 @@ async fn listed_arns(router: &MultiServiceRouter) -> Vec<String> {
 }
 
 /// RULE 1 — with an instance already held, every shape of `CreateInstance` request is
-/// refused 402, and the held instance does not move.
+/// refused 400 `ServiceQuotaExceededException`, and the held instance does not move.
 #[tokio::test]
 async fn a_second_instance_is_refused_and_the_held_one_is_untouched() {
     let router = router();
@@ -131,8 +132,15 @@ async fn a_second_instance_is_refused_and_the_held_one_is_untouched() {
     for (label, body) in rows {
         let (status, answer) = call(&router, "CreateInstance", &body).await;
         assert_eq!(
-            status, 402,
+            status, 400,
             "case {label:?}: expected the modelled quota refusal, got {status} {answer}"
+        );
+        assert!(
+            answer["Message"]
+                .as_str()
+                .is_some_and(|message| message.contains(engine::EMULATOR_ACCOUNT_ID)),
+            "case {label:?}: the quota refusal names the account it was crossed in, got \
+             {answer}"
         );
         assert_eq!(
             error_code(&answer),
@@ -344,8 +352,8 @@ async fn the_created_instance_is_stored_and_read_back() {
         // And the account now holds one, so the next create is refused.
         let (status, second) = call(&router, "CreateInstance", &request).await;
         assert_eq!(
-            status, 402,
-            "case {label:?}: a second create expected 402, got {status} {second}"
+            status, 400,
+            "case {label:?}: a second create expected 400, got {status} {second}"
         );
         assert_eq!(
             listed_arns(&router).await,
@@ -398,42 +406,127 @@ async fn the_client_token_makes_a_retry_idempotent() {
         "Name": "Idempotent",
     });
 
-    // (label, request, expected status)
-    let rows: Vec<(&str, Value, u16)> = vec![
-        ("the request verbatim", request.clone(), 200),
-        ("the same tags in another order", reordered_tags, 200),
-        ("the same token, another Name", other_name, 409),
-        ("the same token, fewer tags", other_tags, 409),
-        ("a token the account never saw", other_token, 402),
+    // (label, request, expected error code — empty for the idempotent 200)
+    let rows: Vec<(&str, Value, &str)> = vec![
+        ("the request verbatim", request.clone(), ""),
+        ("the same tags in another order", reordered_tags, ""),
+        ("the same token, another Name", other_name, "ConflictException"),
+        ("the same token, fewer tags", other_tags, "ConflictException"),
+        (
+            "a token the account never saw",
+            other_token,
+            "ServiceQuotaExceededException",
+        ),
     ];
     for (label, body, expected) in rows {
         let (status, answer) = call(&router, "CreateInstance", &body).await;
+        // Every refusal of a request on this awsJson1_1 surface is HTTP 400; what tells
+        // them apart is the error code.
+        let expected_status = if expected.is_empty() { 200 } else { 400 };
         assert_eq!(
-            status, expected,
-            "case {label:?}: expected HTTP {expected}, got {status} {answer}"
+            status, expected_status,
+            "case {label:?}: expected HTTP {expected_status}, got {status} {answer}"
         );
-        match expected {
-            200 => assert_eq!(
+        if expected.is_empty() {
+            assert_eq!(
                 answer["InstanceArn"].as_str(),
                 Some(instance_arn.as_str()),
                 "case {label:?}: a retry must answer with the instance the token created, \
                  got {answer}"
-            ),
-            409 => assert_eq!(
+            );
+        } else {
+            assert_eq!(
                 error_code(&answer),
-                "ConflictException",
-                "case {label:?}: expected ConflictException, got {answer}"
-            ),
-            _ => assert_eq!(
-                error_code(&answer),
-                "ServiceQuotaExceededException",
-                "case {label:?}: expected ServiceQuotaExceededException, got {answer}"
-            ),
+                expected,
+                "case {label:?}: expected {expected}, got {answer}"
+            );
         }
         assert_eq!(
             listed_arns(&router).await,
             vec![instance_arn.clone()],
             "case {label:?}: the account must still hold exactly the one instance"
+        );
+    }
+}
+
+/// RULE 2, at the other end: WHICH instance the account holds is decided by the FIRST
+/// request that needs one, and the account never holds two.
+///
+/// A `CreateInstance` that comes first enables the instance the caller asked for — the
+/// account's enablement is the caller's — while any other first request finds the
+/// account's ambient instance, after which the create is refused on the one-instance
+/// quota. The rows differ along which operation touches the account first, over the
+/// read-, write- and refusal-shaped ones.
+#[tokio::test]
+async fn the_first_request_decides_which_instance_the_account_holds() {
+    // A create that comes first IS the account's enablement.
+    let own = router();
+    let (status, created) = call(&own, "CreateInstance", &json!({"Name": "Mine"})).await;
+    assert_eq!(
+        status, 200,
+        "a create on an untouched account expected 200, got {status} {created}"
+    );
+    let created_arn = created["InstanceArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no InstanceArn in {created}"))
+        .to_string();
+    assert_eq!(
+        listed_arns(&own).await,
+        vec![created_arn.clone()],
+        "the account holds exactly the instance the create minted — no ambient instance \
+         beside it"
+    );
+    let described = describe(&own, &created_arn).await;
+    assert_eq!(
+        described["Name"].as_str(),
+        Some("Mine"),
+        "the account's instance is the created one, got {described}"
+    );
+
+    // Any other first request finds the account's ambient instance, and then the create
+    // is refused: the account holds one, so there is no second to create.
+    let rows: Vec<(&str, &str, Value)> = vec![
+        ("ListInstances", "ListInstances", json!({})),
+        (
+            "DescribeInstance of an ARN the account does not hold",
+            "DescribeInstance",
+            json!({"InstanceArn": UNKNOWN_INSTANCE_ARN}),
+        ),
+        (
+            "ListPermissionSets of an ARN the account does not hold",
+            "ListPermissionSets",
+            json!({"InstanceArn": UNKNOWN_INSTANCE_ARN}),
+        ),
+    ];
+    for (label, operation, body) in rows {
+        let ambient = router();
+        let (status, first) = call(&ambient, operation, &body).await;
+        assert!(
+            (200..600).contains(&status),
+            "case {label:?}: {operation} answered {status} {first}"
+        );
+        let held = listed_arns(&ambient).await;
+        assert_eq!(
+            held.len(),
+            1,
+            "case {label:?}: the account's ambient instance must be the one it holds, got \
+             {held:?}"
+        );
+        let (status, refused) = call(&ambient, "CreateInstance", &json!({})).await;
+        assert_eq!(
+            status, 400,
+            "case {label:?}: with an instance held the create is refused, got {status} \
+             {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ServiceQuotaExceededException",
+            "case {label:?}: expected the quota refusal, got {refused}"
+        );
+        assert_eq!(
+            listed_arns(&ambient).await,
+            held,
+            "case {label:?}: the refused create must not have added an instance"
         );
     }
 }

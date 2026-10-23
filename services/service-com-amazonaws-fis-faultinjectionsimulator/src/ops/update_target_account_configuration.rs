@@ -154,12 +154,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every modelled constraint on this input — the required `experimentTemplateId`
         // and `accountId`, and the lengths and patterns on all four members — was already
-        // refused at the boundary. What the model cannot express is that `roleArn` names
-        // an IAM ROLE: a value inside `RoleArn`'s bounds that is not a well-formed IAM
-        // role ARN is refused here, BEFORE the lookup and before any state write, so the
-        // configuration this call names keeps the `roleArn` it already held.
-        if let Some(refusal) = crate::state::role_arn_refusal("roleArn", input.role_arn.as_deref())
-        {
+        // refused at the boundary. What the model cannot express is the RELATIONSHIP
+        // between the two members this configuration names: a `roleArn` the request
+        // carries has to be a well-formed IAM role ARN AND name a role of the account
+        // `accountId` names. Refused here, BEFORE the lookup and before any state write,
+        // so the configuration this call names keeps the `roleArn` it already held.
+        if let Some(refusal) = crate::state::target_account_role_arn_refusal(
+            input.account_id.as_str(),
+            input.role_arn.as_deref(),
+        ) {
             return Err(
                 UpdateTargetAccountConfigurationErrorModeled::ValidationException(refusal).into(),
             );

@@ -35,11 +35,18 @@ pub(crate) fn auto_scaling_group_arn(name: &str) -> String {
 
 /// One emulator: one engine, one shared store, reached only over HTTP.
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same emulator, with the engine it was built on — for a suite that has to RECORD
+/// analysis output (an idle resource recommendation, say) that no operation of this API
+/// creates, and then read it back over the wire like any client.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
 }
 
 /// Call one operation and return the HTTP status and the parsed JSON body.

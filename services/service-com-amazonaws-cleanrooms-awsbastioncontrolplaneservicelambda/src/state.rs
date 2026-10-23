@@ -33,7 +33,10 @@
 //! parties whose approval it needs — is derived from the stored collaboration by
 //! [`change_types_for`], [`change_request_is_auto_approved`] and
 //! [`CleanRoomsState::change_request_approvals`], and a committed change is written back
-//! onto the collaboration by [`CleanRoomsState::apply_collaboration_change`].
+//! onto the collaboration by [`CleanRoomsState::apply_collaboration_change`]. The status
+//! a request's recorded votes put it in is derived the same way, by
+//! [`change_request_status_from_approvals`], and [`change_request_is_terminal`] says
+//! which statuses admit no further decision.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -41,7 +44,8 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AccessBudgetsPrivacyTemplateParametersOutput, Change, ChangeSpecification, Collaboration,
+    AccessBudgetsPrivacyTemplateParametersOutput, ApprovalStatusDetails, Change, ChangeSpecification,
+    Collaboration,
     CollaborationChangeRequest, CollaborationSummary, ComputeConfiguration, ConfiguredTable,
     DataEncryptionMetadata, DifferentialPrivacyTemplateParametersOutput, MLMemberAbilities,
     MemberChangeSpecification, MemberSpecification, Membership, MembershipJobComputePaymentConfig,
@@ -152,12 +156,31 @@ pub const ABILITY_CAN_RUN_JOB: &str = "CAN_RUN_JOB";
 pub const CHANGE_REQUEST_STATUS_PENDING: &str = "PENDING";
 /// See [`CHANGE_REQUEST_STATUS_PENDING`].
 pub const CHANGE_REQUEST_STATUS_COMMITTED: &str = "COMMITTED";
+/// See [`CHANGE_REQUEST_STATUS_PENDING`].
+pub const CHANGE_REQUEST_STATUS_APPROVED: &str = "APPROVED";
+/// See [`CHANGE_REQUEST_STATUS_PENDING`].
+pub const CHANGE_REQUEST_STATUS_DENIED: &str = "DENIED";
+/// See [`CHANGE_REQUEST_STATUS_PENDING`].
+pub const CHANGE_REQUEST_STATUS_CANCELLED: &str = "CANCELLED";
 
 /// `ApprovalStatus` values this slice produces (model shape `ApprovalStatus`:
 /// APPROVED | DENIED | PENDING).
 pub const APPROVAL_STATUS_PENDING: &str = "PENDING";
 /// See [`APPROVAL_STATUS_PENDING`].
 pub const APPROVAL_STATUS_APPROVED: &str = "APPROVED";
+/// See [`APPROVAL_STATUS_PENDING`].
+pub const APPROVAL_STATUS_DENIED: &str = "DENIED";
+
+/// `ChangeRequestAction` values (model shape `ChangeRequestAction`: APPROVE | DENY |
+/// CANCEL | COMMIT) — the actions `UpdateCollaborationChangeRequest` performs on a
+/// change request.
+pub const CHANGE_REQUEST_ACTION_APPROVE: &str = "APPROVE";
+/// See [`CHANGE_REQUEST_ACTION_APPROVE`].
+pub const CHANGE_REQUEST_ACTION_DENY: &str = "DENY";
+/// See [`CHANGE_REQUEST_ACTION_APPROVE`].
+pub const CHANGE_REQUEST_ACTION_CANCEL: &str = "CANCEL";
+/// See [`CHANGE_REQUEST_ACTION_APPROVE`].
+pub const CHANGE_REQUEST_ACTION_COMMIT: &str = "COMMIT";
 
 /// `ChangeSpecificationType` values (model shape `ChangeSpecificationType`: MEMBER |
 /// COLLABORATION) — one per member of the `ChangeSpecification` union, which is what
@@ -940,6 +963,42 @@ pub fn change_request_is_auto_approved(record: &CollaborationRecord, changes: &[
                 .iter()
                 .all(|change_type| auto_approved.contains(change_type))
         })
+}
+
+/// Whether a change request's status admits no further action: a COMMITTED, DENIED or
+/// CANCELLED request has reached the end of the `ChangeRequestStatus` lifecycle, so
+/// there is no decision left to take on it.
+pub fn change_request_is_terminal(status: &str) -> bool {
+    status == CHANGE_REQUEST_STATUS_COMMITTED
+        || status == CHANGE_REQUEST_STATUS_DENIED
+        || status == CHANGE_REQUEST_STATUS_CANCELLED
+}
+
+/// The `ChangeRequestStatus` a change request's recorded votes put it in.
+///
+/// `ApprovalStatusDetails$status` is "the approval status of a member's vote on the
+/// change request … PENDING (if they haven't voted), APPROVED, or DENIED", and
+/// `UpdateCollaborationChangeRequest` documents DENY as rejecting the change, so one
+/// DENIED vote settles the request as DENIED, a request every party has APPROVED is
+/// APPROVED (ready for the owner to COMMIT), and one still holding a PENDING vote stays
+/// PENDING. An EMPTY tally is PENDING: there is no vote to conclude anything from.
+pub fn change_request_status_from_approvals(
+    approvals: &HashMap<String, ApprovalStatusDetails>,
+) -> &'static str {
+    if approvals
+        .values()
+        .any(|details| details.status == APPROVAL_STATUS_DENIED)
+    {
+        return CHANGE_REQUEST_STATUS_DENIED;
+    }
+    if !approvals.is_empty()
+        && approvals
+            .values()
+            .all(|details| details.status == APPROVAL_STATUS_APPROVED)
+    {
+        return CHANGE_REQUEST_STATUS_APPROVED;
+    }
+    CHANGE_REQUEST_STATUS_PENDING
 }
 
 /// The modelled `MembershipSummary` projection of a stored `Membership`.

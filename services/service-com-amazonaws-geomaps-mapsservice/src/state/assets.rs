@@ -951,38 +951,60 @@ pub struct SpriteLayout {
     pub pixel_ratio: u32,
 }
 
-/// Lay a sheet's icons out in a fixed grid, at `pixel_ratio` device pixels per
-/// style pixel. The layout is the single source for both the PNG and the JSON
-/// index, which is why the index always describes the sheet it is paired with.
+/// Lay a sheet's icons out, at `pixel_ratio` device pixels per style pixel.
+///
+/// The icons of a published sheet are not one size, so they are packed in rows
+/// rather than in a grid of equal cells: each icon takes the next free
+/// horizontal run of its own width, an icon that would cross the sheet's width
+/// bound starts the next row, and a row is as tall as its tallest icon. Rows
+/// are top-aligned and icons within a row abut, which is what the manifest the
+/// asset endpoint serves reports (consecutive entries share a `y` and the next
+/// entry's `x` is the previous one's `x` plus its width).
+///
+/// Every dimension scales with `pixel_ratio`, including the width bound, so the
+/// `@2x` sheet is the same layout at twice the size: an icon's rectangle there
+/// is exactly twice its rectangle here.
+///
+/// The layout is the single source for both the PNG and the JSON index, which
+/// is why the index always describes the sheet it is paired with.
 pub fn layout_sprites(sheet: &SpriteSheetRecord, pixel_ratio: u32) -> SpriteLayout {
     let ratio = pixel_ratio.max(1);
-    let columns = sheet.columns.max(1);
-    let largest = sheet.icons.iter().map(|icon| icon.size).max().unwrap_or(16);
-    let cell = (largest + sheet.gutter * 2) * ratio;
-    let rows = (sheet.icons.len() as u32).div_ceil(columns).max(1);
-    let slots = sheet
-        .icons
-        .iter()
-        .enumerate()
-        .map(|(index, icon)| {
-            let column = index as u32 % columns;
-            let row = index as u32 / columns;
-            let size = icon.size * ratio;
-            SpriteSlot {
-                name: icon.name.clone(),
-                x: column * cell + (cell - size) / 2,
-                y: row * cell + (cell - size) / 2,
-                width: size,
-                height: size,
-                tint: icon.tint,
-                shape: icon.shape,
-            }
-        })
-        .collect();
+    let widest = sheet.icons.iter().map(|icon| icon.width).max().unwrap_or(0);
+    // A sheet is never narrower than its widest icon, whatever bound the record
+    // carries: an icon that cannot fit any row would never be placed.
+    let bound = sheet.max_width.max(widest) * ratio;
+    let mut slots = Vec::with_capacity(sheet.icons.len());
+    let mut x = 0;
+    let mut y = 0;
+    let mut row_height = 0;
+    let mut width = 0;
+    for icon in &sheet.icons {
+        let icon_width = (icon.width * ratio).max(1);
+        let icon_height = (icon.height * ratio).max(1);
+        if x > 0 && x + icon_width > bound {
+            y += row_height;
+            x = 0;
+            row_height = 0;
+        }
+        slots.push(SpriteSlot {
+            name: icon.name.clone(),
+            x,
+            y,
+            width: icon_width,
+            height: icon_height,
+            tint: icon.tint,
+            shape: icon.shape,
+        });
+        x += icon_width;
+        row_height = row_height.max(icon_height);
+        width = width.max(x);
+    }
     SpriteLayout {
         slots,
-        width: columns * cell,
-        height: rows * cell,
+        // A sheet with no icons is still a 1x1 image rather than a zero-sized
+        // one, which no PNG decoder accepts.
+        width: width.max(1),
+        height: (y + row_height).max(1),
         pixel_ratio: ratio,
     }
 }
@@ -998,7 +1020,14 @@ pub fn render_sprite_sheet(layout: &SpriteLayout) -> Vec<u8> {
         match slot.shape {
             IconShape::Square => canvas.fill_rect(x, y, slot.width, slot.height, slot.tint),
             IconShape::Disc => {
-                canvas.disc(x + w / 2, y + h / 2, slot.width / 2, slot.tint);
+                // The inscribed disc of the icon's box, so a box that is not
+                // square stays inside it.
+                canvas.disc(
+                    x + w / 2,
+                    y + h / 2,
+                    slot.width.min(slot.height) / 2,
+                    slot.tint,
+                );
             }
             IconShape::Pin => {
                 // A map pin: a head, and a stem down the middle to the point.
@@ -1018,7 +1047,8 @@ pub fn render_sprite_sheet(layout: &SpriteLayout) -> Vec<u8> {
 }
 
 /// The sheet's JSON index, in the MapLibre sprite-index format: one entry per
-/// icon, naming the rectangle it occupies in the paired PNG.
+/// icon, naming the rectangle it occupies in the paired PNG and the pixel ratio
+/// that rectangle is measured in.
 pub fn sprite_index_json(layout: &SpriteLayout) -> Vec<u8> {
     let mut index = serde_json::Map::new();
     for slot in &layout.slots {
@@ -1030,27 +1060,46 @@ pub fn sprite_index_json(layout: &SpriteLayout) -> Vec<u8> {
                 "width": slot.width,
                 "height": slot.height,
                 "pixelRatio": layout.pixel_ratio,
-                "sdf": false,
             }),
         );
     }
     to_json_bytes(&serde_json::Value::Object(index))
 }
 
-/// The media type and `pixelRatio` of a sprite file, from its name.
+/// Which of a sheet's two paired files a `FileName` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpriteFileKind {
+    /// The PNG sheet itself.
+    Sheet,
+    /// The JSON index of the sheet.
+    Index,
+}
+
+/// A sprite file the model's `FileName` admits: which of the sheet's two paired
+/// files it is, and the pixel ratio it is served at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpriteFile {
+    pub kind: SpriteFileKind,
+    pub pixel_ratio: u32,
+}
+
+/// The file kind and `pixelRatio` of a sprite file, from its name.
 ///
 /// Matched against the exact set the modeled
 /// `GetSpritesRequest$FileName` pattern (`^sprites(@2x)?\.(png|json)$`) admits,
 /// rather than by looking at the extension alone, so a name the model refuses
-/// is refused here too.
-pub fn sprite_file(file_name: &str) -> Option<(&'static str, u32)> {
-    match file_name {
-        "sprites.png" => Some(("image/png", 1)),
-        "sprites@2x.png" => Some(("image/png", 2)),
-        "sprites.json" => Some(("application/json", 1)),
-        "sprites@2x.json" => Some(("application/json", 2)),
-        _ => None,
-    }
+/// is refused here too. The MEDIA TYPE is not decided here: a sprite file is
+/// served as a stored object, so its `Content-Type` comes from the catalog's
+/// asset-delivery record.
+pub fn sprite_file(file_name: &str) -> Option<SpriteFile> {
+    let (kind, pixel_ratio) = match file_name {
+        "sprites.png" => (SpriteFileKind::Sheet, 1),
+        "sprites@2x.png" => (SpriteFileKind::Sheet, 2),
+        "sprites.json" => (SpriteFileKind::Index, 1),
+        "sprites@2x.json" => (SpriteFileKind::Index, 2),
+        _ => return None,
+    };
+    Some(SpriteFile { kind, pixel_ratio })
 }
 
 // ---------------------------------------------------------------------------

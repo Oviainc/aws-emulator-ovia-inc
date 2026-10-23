@@ -39,6 +39,7 @@ pub struct CollectionGroupDetail {
     pub current_capacity: Option<CurrentCapacity>,
     pub number_of_collections: Option<i32>,
     pub generation: Option<String>,
+    pub storage_configuration: Option<CollectionGroupStorageConfiguration>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.opensearchserverless#CurrentCapacity")]

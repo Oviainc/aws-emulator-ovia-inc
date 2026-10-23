@@ -55,7 +55,11 @@ async fn an_update_replaces_the_stored_structure_at_the_next_version() {
                 "name": "demo",
                 "roleArn": ROLE_ARN,
                 "artifactStore": {"type": "S3", "location": "my-bucket"},
-                "stages": [build_stage("Build", 1)],
+                // A pipeline's first stage is its SOURCE stage (AWS: "the first stage
+                // must contain at least one source action, and can only contain source
+                // actions", enforced by `state::validate_declaration`), so a
+                // replacement of the only stage is a different SOURCE stage.
+                "stages": [source_stage("Origin")],
             }),
             "V1",
             "SUPERSEDED",

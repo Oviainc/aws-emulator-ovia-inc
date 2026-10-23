@@ -13,7 +13,10 @@
 //!   well-formed IAM role ARN — `arn:<partition>:iam::<12-digit account>:role/<path and
 //!   name>` — and a value inside `RoleArn`'s modelled `@length(20..2048)`/`^[\S]+$` that
 //!   is not one is refused with HTTP 400 `ValidationException` while the stored
-//!   configuration keeps the `roleArn` it already held;
+//!   configuration keeps the `roleArn` it already held. The role of a target account
+//!   configuration also has to BELONG to the account it configures, which is the rule
+//!   `target_account_role_ownership.rs` asserts; every row here carries a role of its own
+//!   account, so what it refuses can only be the ARN form;
 //! * a target account configuration the named experiment TEMPLATE does not hold is
 //!   refused 404 `ResourceNotFoundException` with the service's constant message, which
 //!   names neither the template nor the account;
@@ -264,9 +267,12 @@ async fn get_experiment_configuration(
     .await
 }
 
-/// The `roleArn` the configurations this suite updates are CREATED with, so what a
-/// refused update failed to overwrite is visible.
-const BASELINE_ROLE_ARN: &str = "arn:aws:iam::900000000000:role/fis-refusal-baseline";
+/// The `roleArn` a configuration this suite updates is CREATED with: a role of the account
+/// it configures (the two members have to agree about that), so what a refused update
+/// failed to overwrite is visible.
+fn baseline_role_arn(account_id: &str) -> String {
+    format!("arn:aws:iam::{account_id}:role/fis-refusal-baseline")
+}
 
 /// The values that are NOT well-formed IAM role ARNs, each inside `RoleArn`'s modelled
 /// `@length(20..2048)` and `pattern ^[\S]+$` so the refusal can only come from the ARN
@@ -333,33 +339,39 @@ fn malformed_role_arns() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The values that ARE well-formed IAM role ARNs: the rows differ along partition, the
-/// role path, the characters of the role name, and the overall length — the shortest form
-/// the syntax admits and `RoleArn`'s published ceiling.
-fn well_formed_role_arns() -> Vec<(&'static str, String)> {
+/// The values that ARE well-formed IAM role ARNs, each with the account it is configured
+/// FOR: the rows differ along partition, the role path, the characters of the role name,
+/// and the overall length — the shortest form the syntax admits and `RoleArn`'s published
+/// ceiling.
+fn well_formed_role_arns() -> Vec<(&'static str, &'static str, String)> {
     vec![
         (
             "plain-role",
+            "123456789012",
             "arn:aws:iam::123456789012:role/FisTargetAccount".to_string(),
         ),
         (
             "service-role-path",
-            "arn:aws:iam::123456789012:role/service-role/fis-target".to_string(),
+            "210987654321",
+            "arn:aws:iam::210987654321:role/service-role/fis-target".to_string(),
         ),
         (
             "nested-path",
-            "arn:aws-us-gov:iam::210987654321:role/path/to/fis-target".to_string(),
+            "310987654321",
+            "arn:aws-us-gov:iam::310987654321:role/path/to/fis-target".to_string(),
         ),
         (
             "china-partition-non-ascii-name",
+            "444444444444",
             "arn:aws-cn:iam::444444444444:role/fis-目标账户".to_string(),
         ),
         (
             "shortest-well-formed",
+            "000000000000",
             "arn:aws:iam::000000000000:role/r".to_string(),
         ),
-        ("role-name-at-the-length-ceiling", {
-            let prefix = "arn:aws:iam::000000000000:role/";
+        ("role-name-at-the-length-ceiling", "555555555555", {
+            let prefix = "arn:aws:iam::555555555555:role/";
             format!("{prefix}{}", "r".repeat(ROLE_ARN_CEILING - prefix.len()))
         }),
     ]
@@ -409,7 +421,10 @@ async fn a_role_arn_that_is_not_an_iam_role_arn_is_refused_and_never_persists() 
             &router,
             &template_id,
             &account_id,
-            create_body(BASELINE_ROLE_ARN, Some(&format!("token-update-{index}"))),
+            create_body(
+                &baseline_role_arn(&account_id),
+                Some(&format!("token-update-{index}")),
+            ),
         )
         .await;
         assert_eq!(
@@ -435,7 +450,7 @@ async fn a_role_arn_that_is_not_an_iam_role_arn_is_refused_and_never_persists() 
         let fetched = get_configuration(&router, &template_id, &account_id).await;
         assert_eq!(
             fetched.role_arn(),
-            BASELINE_ROLE_ARN,
+            baseline_role_arn(&account_id),
             "case {case:?}: a refused update must leave the stored roleArn alone, got {:?}",
             fetched.body
         );
@@ -471,13 +486,12 @@ async fn a_well_formed_role_arn_is_accepted_by_the_create_and_the_update() {
     let router = emulator();
     let template_id = template(&router, "well-formed-role-arns").await;
 
-    for (index, (case, role_arn)) in well_formed_role_arns().into_iter().enumerate() {
-        let account_id = format!("5000000000{index:02}");
+    for (case, account_id, role_arn) in well_formed_role_arns() {
         let created = create_configuration(
             &router,
             &template_id,
-            &account_id,
-            create_body(&role_arn, Some(&format!("token-ok-{index}"))),
+            account_id,
+            create_body(&role_arn, Some(&format!("token-ok-{account_id}"))),
         )
         .await;
         assert_eq!(
@@ -496,7 +510,7 @@ async fn a_well_formed_role_arn_is_accepted_by_the_create_and_the_update() {
         );
 
         // The round trip: the read reports what the create persisted.
-        let fetched = get_configuration(&router, &template_id, &account_id).await;
+        let fetched = get_configuration(&router, &template_id, account_id).await;
         assert_eq!(
             fetched.role_arn(),
             role_arn,
@@ -505,16 +519,17 @@ async fn a_well_formed_role_arn_is_accepted_by_the_create_and_the_update() {
         );
 
         // And an UPDATE onto another well-formed value replaces it, so the rule admits
-        // the same class on both paths.
-        let replacement = "arn:aws:iam::900000000000:role/service-role/fis-replacement";
-        let updated = update_configuration(&router, &template_id, &account_id, replacement).await;
+        // the same class on both paths. Another role of the same account: the role an
+        // update names belongs to the account it configures too.
+        let replacement = format!("arn:aws:iam::{account_id}:role/service-role/fis-replacement");
+        let updated = update_configuration(&router, &template_id, account_id, &replacement).await;
         assert_eq!(
             updated.status, 200,
             "case {case:?}: expected HTTP 200 from UpdateTargetAccountConfiguration, got {} \
              with {:?}",
             updated.status, updated.body
         );
-        let fetched = get_configuration(&router, &template_id, &account_id).await;
+        let fetched = get_configuration(&router, &template_id, account_id).await;
         assert_eq!(
             fetched.role_arn(),
             replacement,
@@ -534,7 +549,7 @@ async fn a_template_scoped_configuration_miss_answers_the_services_constant_mess
         &router,
         &configured,
         account_id,
-        create_body(BASELINE_ROLE_ARN, Some("token-constant-message")),
+        create_body(&baseline_role_arn(account_id), Some("token-constant-message")),
     )
     .await;
     assert_eq!(
@@ -578,7 +593,7 @@ async fn a_template_scoped_configuration_miss_answers_the_services_constant_mess
         );
 
         let updated =
-            update_configuration(&router, template_id, account, BASELINE_ROLE_ARN).await;
+            update_configuration(&router, template_id, account, &baseline_role_arn(account)).await;
         assert_eq!(
             updated.status, 404,
             "case update/{case:?}: expected HTTP 404, got {} with {:?}",
@@ -608,7 +623,10 @@ async fn an_experiment_scoped_configuration_miss_names_the_experiment_and_the_ac
         &router,
         &template_id,
         configured_account,
-        create_body(BASELINE_ROLE_ARN, Some("token-experiment-message")),
+        create_body(
+            &baseline_role_arn(configured_account),
+            Some("token-experiment-message"),
+        ),
     )
     .await;
     assert_eq!(

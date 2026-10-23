@@ -5,11 +5,16 @@
 //! (`crate::state`), one page at a time. This is the ONLY file to touch for this
 //! operation.
 //!
-//! The account's instance is seeded once, when the state store is first touched, and
-//! `CreateInstance` mints one for an account that holds none. This read writes nothing of
-//! its own: the only change it applies is a transition the CLOCK already owes — an
-//! instance whose activation instant has passed is `ACTIVE` whether or not anybody listed
-//! (`crate::state::ComAmazonawsSsoadminSwbexternalserviceState::materialize_due`).
+//! The account's ambient instance is enabled once, by the first request that reaches the
+//! state store, in the Region that request was made in, and `CreateInstance` mints one for
+//! an account that holds none. This read writes nothing of its own: the only changes it
+//! applies are transitions the CLOCK already owes — an instance whose activation instant
+//! has passed is `ACTIVE`, and one whose deletion instant has passed is gone, whether or
+//! not anybody listed
+//! (`crate::state::ComAmazonawsSsoadminSwbexternalserviceState::on_request`).
+//!
+//! Every page that returned an instance carries a `NextToken`, as AWS's own
+//! `ListInstances` does; following it ends the enumeration with an empty page.
 //!
 //! ## Shape of an operation
 //!
@@ -153,12 +158,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListInstancesErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the SSO Admin state store is unavailable".to_string()),
             })
         })?;
+        let region = crate::state::request_region(ctx.parts());
 
         // A `NextToken` this service did not issue for THIS enumeration is a bad
         // request, not an empty page: answering an empty page would silently end a
@@ -176,11 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Keyed by `InstanceArn`, which is also the map's order, so the next page
         // resumes from the key this one ends on. A READ, except for what the CLOCK
-        // already owes: an instance whose activation instant has passed is ACTIVE
-        // whether or not anybody listed.
+        // already owes: an instance whose activation instant has passed is ACTIVE and one
+        // whose deletion instant has passed is gone, whether or not anybody listed.
         let ordered: Vec<(String, InstanceMetadata)> = {
             let mut store = state.lock();
-            store.materialize_due(::std::time::SystemTime::now());
+            store.on_request(&region, ::std::time::SystemTime::now());
             store
                 .instances
                 .values()
@@ -194,6 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             after.as_deref(),
             input.max_results,
         );
+        // This enumeration issues a continuation token for every page that returned an
+        // instance, not only for a truncated one: AWS's `ListInstances` answers with a
+        // `NextToken` even when the page holds the account's only instance, so a caller
+        // confirms the end of the enumeration by following it — and following it lands on
+        // the key the page ended at, so the next page is empty and carries no token.
+        let next_token = next_token.or_else(|| {
+            instances
+                .last()
+                .and_then(|instance| instance.instance_arn.as_deref())
+                .map(|arn| crate::state::encode_page_token(crate::state::CURSOR_INSTANCES, arn))
+        });
         Ok(ListInstancesOutput {
             instances: Some(instances),
             next_token,

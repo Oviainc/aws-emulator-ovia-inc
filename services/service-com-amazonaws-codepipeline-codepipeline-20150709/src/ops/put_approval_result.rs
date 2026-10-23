@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutApprovalResult
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutApprovalResult`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutApprovalResult::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +157,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutApprovalResult` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutApprovalResultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutApprovalResult"))
+        let state = crate::state::require_state(&*self.engine)?;
+        // The approval can only be answered once the action has actually been reached,
+        // which is a step the clock owes (see `state::driver`).
+        crate::state::advance(&*self.engine, ctx, &input.pipeline_name).await;
+
+        // `ApprovalResult$status` is an `ApprovalStatus`: the framework has already
+        // refused a value outside the enum, so reaching here means it is one of them.
+        let approved = input.result.status == "Approved";
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        if !state.pipelines.contains_key(&input.pipeline_name) {
+            return Err(PutApprovalResultErrorModeled::PipelineNotFoundException(
+                PipelineNotFoundException {
+                    message: Some(crate::state::pipeline_not_found_message(
+                        &input.pipeline_name,
+                    )),
+                },
+            )
+            .into());
+        }
+        if !state.pipelines[&input.pipeline_name]
+            .declaration
+            .stages
+            .iter()
+            .any(|stage| stage.name == input.stage_name)
+        {
+            return Err(PutApprovalResultErrorModeled::StageNotFoundException(
+                StageNotFoundException {
+                    message: Some(format!(
+                        "Pipeline '{}' does not have a stage with name '{}'",
+                        input.pipeline_name, input.stage_name
+                    )),
+                },
+            )
+            .into());
+        }
+        if !state.pipelines[&input.pipeline_name]
+            .declaration
+            .stages
+            .iter()
+            .filter(|stage| stage.name == input.stage_name)
+            .flat_map(|stage| &stage.actions)
+            .any(|action| action.name == input.action_name)
+        {
+            return Err(PutApprovalResultErrorModeled::ActionNotFoundException(
+                ActionNotFoundException {
+                    message: Some(format!(
+                        "Stage '{}' of pipeline '{}' does not have an action with name '{}'",
+                        input.stage_name, input.pipeline_name, input.action_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The newest execution whose named action is waiting for THIS approval. An
+        // execution whose approval has already been answered is what
+        // `ApprovalAlreadyCompletedException` reports; a token that names no waiting
+        // approval is what `InvalidApprovalTokenException` reports, which is also the
+        // answer to a STALE token (the action moved on, so the token it published is no
+        // longer the one in force).
+        let ids: Vec<String> = state
+            .executions_by_pipeline
+            .get(&input.pipeline_name)
+            .map(|ids| ids.iter().rev().cloned().collect())
+            .unwrap_or_default();
+        let mut already_completed = false;
+        for id in ids {
+            let Some(record) = state.executions.get_mut(&id) else {
+                continue;
+            };
+            let Some(action) = record
+                .stages
+                .iter_mut()
+                .filter(|stage| stage.name == input.stage_name)
+                .flat_map(|stage| stage.actions.iter_mut())
+                .find(|action| action.name == input.action_name)
+            else {
+                continue;
+            };
+            if action.is_terminal() {
+                already_completed = true;
+                continue;
+            }
+            if !action.is_in_progress() {
+                continue;
+            }
+            if action.token.as_deref() != Some(input.token.as_str()) {
+                continue;
+            }
+            action.status = Some(
+                if approved { "Succeeded" } else { "Failed" }.to_string(),
+            );
+            action.summary = Some(input.result.summary.clone());
+            // `ActionExecution$lastUpdatedBy` is the identity that answered the
+            // approval. This emulator does not resolve a caller identity, so the member
+            // stays absent rather than carrying an invented one — the same convention
+            // `ExecutionTrigger$triggerDetail` follows.
+            action.last_updated_by = None;
+            action.last_status_change = now;
+            action.token = None;
+            if !approved {
+                action.error = Some((
+                    "JobFailed".to_string(),
+                    format!("the approval was rejected: {}", input.result.summary),
+                ));
+            }
+            record.last_update_time = now;
+            return Ok(PutApprovalResultOutput {
+                approved_at: Some(crate::state::to_date_time(now)),
+            });
+        }
+
+        if already_completed {
+            return Err(
+                PutApprovalResultErrorModeled::ApprovalAlreadyCompletedException(
+                    ApprovalAlreadyCompletedException {
+                        message: Some(format!(
+                            "The approval action '{}' in stage '{}' of pipeline '{}' has \
+                             already received a response",
+                            input.action_name, input.stage_name, input.pipeline_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        Err(
+            PutApprovalResultErrorModeled::InvalidApprovalTokenException(
+                InvalidApprovalTokenException {
+                    message: Some(format!(
+                        "The approval token '{}' does not match the token of an approval \
+                         awaiting a response in stage '{}' of pipeline '{}'",
+                        input.token, input.stage_name, input.pipeline_name
+                    )),
+                },
+            )
+            .into(),
+        )
     }
 }

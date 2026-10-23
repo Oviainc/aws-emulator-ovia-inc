@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInvestigationGroups
-//! Reports the ARN and name of every investigation group in [`crate::state`], one
-//! `@paginated` page at a time. A pure read: it writes nothing.
+//! Reports the ARN and name of every investigation group [`crate::state`] holds in
+//! the Region the request is signed for, one `@paginated` page at a time. A pure
+//! read: it writes nothing.
+//!
+//! A group belongs to the Region its ARN names and an account holds at most
+//! [`crate::state::MAX_INVESTIGATION_GROUPS_PER_REGION`] group there, so a regional
+//! caller sees that one group and never another Region's.
 //!
 //! ## Shape of an operation
 //!
@@ -194,6 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // This operation is regional: it reports the groups of the Region the request
+        // is signed for, which is the Region every ARN it answers with carries.
+        let region = crate::state::request_region(ctx.parts());
+
         // The page size is the server's own decision: clamped into 1..=MAX_PAGE_SIZE
         // whatever the request asked for, so no allocation below is sized by input.
         let page_size = input.max_results.map_or(MAX_PAGE_SIZE, |requested| {
@@ -209,7 +218,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut remaining = match &start {
             Some(id) => store.investigation_groups.range(id.clone()..),
             None => store.investigation_groups.range::<String, _>(..),
-        };
+        }
+        .filter(|(_, group)| group.region == region);
 
         // Reserve no more than the store can actually yield.
         let mut investigation_groups =

@@ -3,7 +3,9 @@
 //! @op BatchGetCollectionGroup
 //! IMPLEMENTED: answers each requested collection group id or name from [`crate::state`],
 //! reporting a stored group as a `CollectionGroupDetail` — with `numberOfCollections`
-//! counted over the collections that name it — and an unknown one as the modelled
+//! counted over the collections that name it, and the group's effective `capacityLimits`
+//! and `storageConfiguration` rendered by the stored record itself, so a read reports the
+//! same limits the create did — and an unknown one as the modelled
 //! `NOT_FOUND` error detail. `ids` and `names` in the same request, or neither, are a
 //! `ValidationException`. This operation only READS: it writes nothing.
 //!
