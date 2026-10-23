@@ -17,5 +17,7 @@ mod access_policy;
 mod collection_group_lifecycle;
 #[path = "all/collection_lifecycle.rs"]
 mod collection_lifecycle;
+#[path = "all/security_configs.rs"]
+mod security_configs;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
