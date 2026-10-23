@@ -137,7 +137,7 @@ fn is_widget_id(id: &str) -> bool {
 /// A widget config whose data comes from a cost-and-usage query and is displayed as a
 /// graph. `metric` is a `MetricName` value and `visual` a `VisualType` value (sources:
 /// the `MetricName` / `VisualType` / `Granularity` enums in the model).
-fn graph_config(metric: &str, visual: &str, granularity: &str) -> Value {
+pub(crate) fn graph_config(metric: &str, visual: &str, granularity: &str) -> Value {
     json!({
         "queryParameters": {
             "costAndUsage": {
@@ -372,7 +372,7 @@ fn assert_widgets(case: &CreateCase, widgets: &Value, request_widgets: &[Value])
     ids
 }
 
-fn timestamp(body: &Value, member: &str, label: &str) -> f64 {
+pub(crate) fn timestamp(body: &Value, member: &str, label: &str) -> f64 {
     body.get(member)
         .and_then(Value::as_f64)
         .unwrap_or_else(|| panic!("{label}: {member} is not an epoch-seconds number: {body}"))
