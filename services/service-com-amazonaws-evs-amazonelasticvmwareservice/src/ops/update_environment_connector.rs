@@ -194,6 +194,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // change at all.
         let _ = &input.client_token;
         let region = crate::state::request_region(ctx.parts());
+        // Authorization first: AWS decides it at the IAM layer, before the resource the
+        // request names is evaluated, so the ARN is the one the REQUEST names.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&crate::state::environment_arn(&region, &input.environment_id)),
+        ) {
+            return Err(denied);
+        }
 
         let mut state = state.lock();
         // Reporting only: this materialises the state changes the clock already owed,

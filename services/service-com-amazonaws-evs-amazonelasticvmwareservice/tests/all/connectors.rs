@@ -41,7 +41,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::environment_lifecycle::{call, call_in_region, create, emulator, error_type};
+use crate::environment_lifecycle::{call, call_in_region, create, emulator, error_type, Emulator};
 
 /// Every `ConnectorType` the model declares, from the catalog this crate generated
 /// from the model (`smithy_query(query="shape", shape="ConnectorType")`).
@@ -159,7 +159,7 @@ async fn only_connector(router: &MultiServiceRouter, case: &str, environment_id:
 /// Create an environment with one connector and return the environment id and the
 /// reported connector.
 async fn environment_with_connector(
-    router: &MultiServiceRouter,
+    router: &Emulator,
     case: &str,
     connector_type: &str,
     appliance_fqdn: &str,
