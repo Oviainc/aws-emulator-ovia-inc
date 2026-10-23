@@ -40,13 +40,19 @@ async fn update(harness: &Harness, name: &str, profiling_enabled: bool) -> crate
         .await
 }
 
-/// A modelled timestamp member as epoch seconds. restJson1's default timestamp format
-/// is epoch-seconds, so these arrive as JSON numbers.
+/// A modelled timestamp member as epoch seconds. Every `Timestamp` of this service
+/// carries `@timestampFormat("date-time")`, so these arrive as ISO-8601 strings and are
+/// parsed back to an instant here, which is what the comparison below is about.
 fn epoch_seconds(description: &serde_json::Value, member: &str) -> f64 {
-    description
+    let value = description
         .get(member)
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or_else(|| panic!("no numeric {member} in {description:?}"))
+        .unwrap_or_else(|| panic!("no {member} in {description:?}"));
+    let text = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{member} must be a date-time string, got {value}"));
+    aws_smithy_types::DateTime::from_str(text, aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| panic!("{member} {text:?} must parse as a date-time: {error}"))
+        .as_secs_f64()
 }
 
 /// Every member of the description an update must leave exactly as it stood, plus the
@@ -122,8 +128,11 @@ async fn an_update_stores_the_orchestration_config_and_answers_from_the_stored_g
         let created_description = created.json();
         // What the group reported just before each update: the members the update must
         // leave alone are compared against THIS, since the reads interleaved below
-        // (`ConfigureAgent` records the agent ping) move the profiling status.
-        let mut previous_description = created_description.clone();
+        // (`ConfigureAgent` records the agent ping) move the profiling status. It is a
+        // READ of the group, not the create's payload — the two differ by exactly
+        // `profilingStatus`, which a create omits while nothing has been reported and a
+        // read reports as the (empty) container.
+        let mut previous_description = harness.describe(&case.name).await.json();
 
         for (step, enabled) in TOGGLES.iter().copied().enumerate() {
             let label = format!("update {step} -> {enabled}");
