@@ -14,7 +14,8 @@
 //! ([`claim_bucket_object_store`]) rather than keeping a second object map here —
 //! the **managed relational database** (a MySQL or PostgreSQL database the service
 //! runs for the account), the **load balancer** (a regional resource that spreads
-//! HTTP traffic across the instances attached to it), the append-only
+//! HTTP traffic across the instances attached to it), the **static IP** (a public
+//! IPv4 address the account reserves and attaches to an instance), the append-only
 //! **operation log** every mutating call
 //! writes, and the service's static **Region catalog** — the Regions and
 //! Availability Zones `GetRegions` lists and every other operation validates a
@@ -57,7 +58,7 @@ use crate::ops::types::{
     InstancePortInfo, InstanceState, LoadBalancer, LoadBalancerTlsCertificateSummary,
     MonitoredResourceInfo, MonthlyTransfer, Operation, PrivateRegistryAccess, Region,
     RelationalDatabaseBundle,
-    ResourceLocation, ResourceReceivingAccess, Tag, REGION_NAME_VALUES,
+    ResourceLocation, ResourceReceivingAccess, StaticIp, Tag, REGION_NAME_VALUES,
 };
 
 // ---------------------------------------------------------------------------
@@ -154,6 +155,16 @@ pub const DISK_SNAPSHOT_ARN_RESOURCE_PREFIX: &str = "DiskSnapshot/";
 /// `DiskSnapshot$resourceType` documentation names ("The Lightsail resource type
 /// (`DiskSnapshot`)").
 pub const RESOURCE_TYPE_DISK_SNAPSHOT: &str = "DiskSnapshot";
+
+/// The resource portion a static IP ARN carries before its id, from the modelled
+/// `StaticIp$arn` documentation
+/// (`arn:aws:lightsail:us-east-2:123456789101:StaticIp/9cbb4a9e-…`).
+pub const STATIC_IP_ARN_RESOURCE_PREFIX: &str = "StaticIp/";
+
+/// The `resourceType` a static IP and its operations report, from the modelled
+/// `StaticIp$resourceType` documentation ("the resource type (usually
+/// `StaticIp`)") and the same modelled `ResourceType` enum.
+pub const RESOURCE_TYPE_STATIC_IP: &str = "StaticIp";
 
 /// The `resourceType` an alarm and its operations report, from the same modelled
 /// `ResourceType` enum — the value the modelled `Alarm$resourceType` member
@@ -366,6 +377,8 @@ pub const OPERATION_TYPE_CREATE_BUCKET_ACCESS_KEY: &str = "CreateBucketAccessKey
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_BUCKET_ACCESS_KEY: &str = "DeleteBucketAccessKey";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_ALLOCATE_STATIC_IP: &str = "AllocateStaticIp";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_PUT_ALARM: &str = "PutAlarm";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_ALARM: &str = "DeleteAlarm";
@@ -424,6 +437,14 @@ pub const MAX_RELATIONAL_DATABASES: usize = 500;
 /// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
 /// refused with the modelled `InvalidInputException`.
 pub const MAX_DISK_SNAPSHOTS: usize = 500;
+
+/// The most static IP addresses this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota (Lightsail's own static-IP quota is
+/// far tighter, and deliberately not enforced here so a suite can allocate as
+/// many as a listing needs): an allocation that would exceed it is refused with
+/// the modelled `InvalidInputException`.
+pub const MAX_STATIC_IPS: usize = 500;
 
 /// The most recordset entries this emulator will hold in one domain.
 ///
@@ -3730,6 +3751,53 @@ impl StoredDomain {
 }
 
 // ---------------------------------------------------------------------------
+// Static IPs
+// ---------------------------------------------------------------------------
+
+/// One stored static IP: the public IPv4 address `AllocateStaticIp` reserved for
+/// the account under a name, and the instance it is attached to while one is.
+///
+/// The address itself is drawn from the store's own allocator, so it is unique
+/// within this process and stable for the life of the allocation — a static IP is
+/// static precisely because every later read reports the same address.
+#[derive(Debug, Clone)]
+pub struct StoredStaticIp {
+    /// The static IP name the request named, kept verbatim — it is this record's
+    /// store key and the `name` every read reports.
+    pub name: String,
+    pub arn: String,
+    pub support_code: String,
+    pub created_at_ms: i64,
+    pub location: StoredLocation,
+    /// The reserved address, in the dotted-quad form the modelled `IpAddress`
+    /// pattern requires.
+    pub ip_address: String,
+    /// The instance this static IP is attached to, while one is. `AttachStaticIp`
+    /// is what sets it; a newly allocated static IP is attached to nothing.
+    pub attached_to: Option<String>,
+}
+
+impl StoredStaticIp {
+    /// This record as the modelled `StaticIp`.
+    pub fn view(&self) -> StaticIp {
+        StaticIp {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            support_code: Some(self.support_code.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            location: Some(self.location.view()),
+            resource_type: Some(RESOURCE_TYPE_STATIC_IP.to_string()),
+            ip_address: Some(self.ip_address.clone()),
+            attached_to: self.attached_to.clone(),
+            // `isAttached` is exactly "whether the static IP is attached", so it
+            // is derived from the one stored attachment rather than tracked
+            // beside it, where the two could disagree.
+            is_attached: Some(self.attached_to.is_some()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Managed relational databases
 // ---------------------------------------------------------------------------
 
@@ -5805,6 +5873,12 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// every database operation takes. A `BTreeMap` so `GetRelationalDatabases`
     /// walks a stable, total order and a page token can name the next database.
     pub relational_databases: BTreeMap<String, StoredRelationalDatabase>,
+    /// Every static IP, keyed by its static IP name — the identifier every static
+    /// IP operation takes, and the same key an instance is held under, because a
+    /// static IP is attached to an instance by name. A `BTreeMap` so
+    /// `GetStaticIps` walks a stable, total order and a page token can name the
+    /// next static IP.
+    pub static_ips: BTreeMap<String, StoredStaticIp>,
     /// Every alarm, keyed by its name — the identifier every alarm operation
     /// takes, and the one `PutAlarm` creates or updates a record under. A
     /// `BTreeMap` so `GetAlarms` walks a stable, total order and a page token can
@@ -5915,6 +5989,16 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// The disk snapshot `name` names, for a reporting operation.
     pub fn disk_snapshot(&self, name: &str) -> Option<&StoredDiskSnapshot> {
         self.disk_snapshots.get(name)
+    }
+
+    /// The static IP `name` names, for a reporting operation.
+    pub fn static_ip(&self, name: &str) -> Option<&StoredStaticIp> {
+        self.static_ips.get(name)
+    }
+
+    /// Store a newly allocated static IP.
+    pub fn insert_static_ip(&mut self, static_ip: StoredStaticIp) {
+        self.static_ips.insert(static_ip.name.clone(), static_ip);
     }
 
     /// Store a newly created disk snapshot.
@@ -6167,6 +6251,19 @@ impl ComAmazonawsLightsailLightsail20161128State {
                 Vec::new()
             },
         )
+    }
+
+    /// The next public IPv4 address to reserve for a static IP, consumed so no
+    /// two static IPs — and no static IP and instance — in this process share an
+    /// address.
+    ///
+    /// Drawn from the SAME counter and the SAME public range
+    /// [`Self::fresh_addresses`] gives an instance its public address from: one
+    /// counter means one address is handed out once, whichever resource asked for
+    /// it.
+    pub fn fresh_static_ip_address(&mut self) -> String {
+        let offset = self.fresh_address_offset();
+        ipv4(PUBLIC_IPV4_BASE, offset)
     }
 
     /// An identifier shaped like the UUID Lightsail answers with for an instance
@@ -6713,6 +6810,15 @@ pub fn domain_arn(id: &str) -> String {
         ARN_SERVICE,
         DOMAIN_ARN_REGION,
         &format!("{DOMAIN_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The ARN of the static IP `id` in `region`.
+pub fn static_ip_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{STATIC_IP_ARN_RESOURCE_PREFIX}{id}"),
     )
 }
 

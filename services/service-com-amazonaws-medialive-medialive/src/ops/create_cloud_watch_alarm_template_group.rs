@@ -189,13 +189,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         ) {
             Ok(id) => id,
-            Err(crate::state::AlarmTemplateGroupRefusal::NameTaken { id, name }) => {
+            Err(crate::state::AlarmTemplateGroupRefusal::NameTaken { .. }) => {
                 return Err(
                     CreateCloudWatchAlarmTemplateGroupErrorModeled::ConflictException(
                         ConflictException {
-                            message: Some(format!(
-                                "a cloudwatch alarm template group named {name} already exists in {region} (id {id})"
-                            )),
+                            message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
                         },
                     )
                     .into(),

@@ -39,6 +39,16 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! One of those seams is taken here: `override_operation` serves every routable request
+//! through [`error_detail::ErrorDetailOperation`], which reports the detail text of a
+//! failure in the `Message` member ConnectHealth carries it in, for the one reason named
+//! in [`error_detail`] — every exception shape in this model spells that member `message`
+//! and declares no `@jsonName`, so the framework's renderers write a key no ConnectHealth
+//! client reads. Routing, status, the error code and the text itself all stay with the
+//! framework.
+
+pub mod error_detail;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -52,6 +62,9 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The wrapper `override_operation` hands back. Stateless, and held here rather than
+    /// built per request because that method answers with a reference to it.
+    error_detail: error_detail::ErrorDetailOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +74,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            error_detail: error_detail::ErrorDetailOperation,
         }
     }
 }
@@ -87,12 +101,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every request the generated routing table can serve is served through the
+        // wrapper, which delegates to that same operation and then reports the detail
+        // text of whatever it answered in this service's `Message` member (see
+        // [`error_detail`]). A request the table cannot serve is left to the framework.
+        error_detail::routes(&self.entry, req).then_some(&self.error_detail as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
