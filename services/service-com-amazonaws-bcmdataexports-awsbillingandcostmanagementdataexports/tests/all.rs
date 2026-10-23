@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/catalog_dictionary.rs"]
 mod catalog_dictionary;
+#[path = "all/catalog_published_text.rs"]
+mod catalog_published_text;
 #[path = "all/catalog_schema.rs"]
 mod catalog_schema;
 #[path = "all/execution_lookup.rs"]

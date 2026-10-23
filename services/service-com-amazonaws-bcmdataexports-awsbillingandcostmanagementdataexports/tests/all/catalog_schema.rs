@@ -7,16 +7,15 @@
 //! The rules under test, each asserted over the whole catalog rather than over the one
 //! table that showed the defect:
 //!
-//! 1. A table the dictionary publishes as a VIEW over another table reports its own
-//!    aggregate columns plus the viewed table's columns UNCHANGED: one name, one kind of
-//!    data, one description, so a client that moves a query between the two reads one
-//!    schema. A column the viewed table gates on a table property the view does not
-//!    publish is not part of the view.
+//! 1. A CURATED table (the cost and usage dashboard) publishes exactly the aggregate
+//!    columns the dictionary lists for it and NONE of the underlying table's own
+//!    line-item columns: the dictionary's column set for a table name is that table's,
+//!    so a client writing a query for it cannot select a column AWS would reject.
 //! 2. A column's `Type` is the token ITS schema's dictionary publishes for it: the cost
 //!    and usage dictionary measures costs with `Number` and publishes the Savings Plan
-//!    commitment and rate as `String`, while the recommendations dictionary measures
-//!    money and percentages with `Double` and counts days with `Integer`. A token is
-//!    never generalised from one schema onto another.
+//!    commitment and rate as `String`, while the recommendations and carbon emissions
+//!    dictionaries publish every numeric column — money, percentages and day counts
+//!    alike — as `Double`. A token is never generalised from one schema onto another.
 //! 3. A measure the dictionary publishes as a value and a unit is published as BOTH: a
 //!    `*_value` column has a `*_unit` sibling and the other way round, so a consumer
 //!    never has to assume the unit of a measure.
@@ -25,8 +24,9 @@
 //!    it in force only for a request that names it, and it still refuses a value outside
 //!    its published list.
 //! 5. A table property is published by the tables that have it and by no others —
-//!    deprecation by a preview table, row granularity by the tables whose rows are
-//!    aggregated over a period.
+//!    deprecation by a superseded preview table, row granularity by the tables whose
+//!    rows are aggregated over a period, the billing view by the tables the dictionary
+//!    scopes that way.
 //!
 //! The literal expectations below cite their source: the AWS Data Exports table
 //! dictionary, which `ListTables` mirrors and `GetTable` reports. The router, the request
@@ -39,10 +39,11 @@ use serde_json::{json, Value};
 
 use super::export_lifecycle::{error_code, Client};
 
-/// The table the dictionary publishes as a view over the cost and usage data.
+/// The table the dictionary publishes as a curated dashboard over the cost and usage
+/// data.
 const DASHBOARD: &str = "COST_AND_USAGE_DASHBOARD";
 
-/// The table the view above is a view OF.
+/// The table the dashboard above aggregates.
 const COST_AND_USAGE_REPORT: &str = "COST_AND_USAGE_REPORT";
 
 /// The table the cost optimization recommendations are published for.
@@ -55,14 +56,13 @@ const CARBON_EMISSIONS: &str = "CARBON_EMISSIONS";
 /// dictionary).
 const DASHBOARD_DESCRIPTION: &str = "A view over CUR for CostAndUsageDashboard";
 
-/// How many columns the dashboard view publishes: its own aggregate columns plus the cost
-/// and usage columns it carries over (AWS Data Exports table dictionary).
-const DASHBOARD_COLUMN_COUNT: usize = 149;
+/// How many columns the dashboard publishes: its aggregate dimensions and measures, and
+/// only those (AWS Data Exports table dictionary).
+const DASHBOARD_COLUMN_COUNT: usize = 37;
 
-/// The columns the dashboard view describes ITSELF — the dimensions and measures it
-/// aggregates the underlying line items into — with the kind of data each stores (AWS
-/// Data Exports table dictionary). Every OTHER column of the view is a cost and usage
-/// column, which rule 1 checks against the viewed table rather than restating here.
+/// The columns the dashboard publishes, with the kind of data each stores (AWS Data
+/// Exports table dictionary). This is the WHOLE published column set for the table, which
+/// is what rule 1 is about: no cost and usage line-item column belongs to it.
 const DASHBOARD_OWN_COLUMNS: &[(&str, &str)] = &[
     ("amortized_cost", "Number"),
     ("availability_zone", "String"),
@@ -103,31 +103,29 @@ const DASHBOARD_OWN_COLUMNS: &[(&str, &str)] = &[
     ("usage_type", "String"),
 ];
 
-/// Cost and usage columns the dashboard view carries over, including ones the issue that
-/// prompted this suite did not cite: the view is not a hand-picked handful.
-const DASHBOARD_VIEWED_SPOT_CHECKS: &[&str] = &[
+/// Cost and usage line-item columns the dashboard does NOT publish, including ones the
+/// issue that prompted this suite did not cite: the dashboard is not the cost and usage
+/// schema under another name.
+const NOT_PUBLISHED_BY_THE_DASHBOARD: &[&str] = &[
     "identity_line_item_id",
     "bill_invoicing_entity",
+    "bill_payer_account_id",
     "line_item_usage_start_date",
+    "line_item_usage_amount",
     "pricing_rate_id",
+    "pricing_unit",
+    "product_from_location",
     "product_instancesku",
     "reservation_modification_status",
     "resource_tags",
     "savings_plan_used_commitment",
     "tags",
-];
-
-/// Columns the cost and usage table gates on a table property the dashboard view does
-/// NOT publish, so the view carries none of them (AWS Data Exports table dictionary).
-const GATED_IN_THE_VIEWED_TABLE: &[&str] = &[
+    // Columns the cost and usage table gates on a table property the dashboard does not
+    // publish at all.
     "line_item_resource_id",
     "split_line_item_split_cost",
     "split_line_item_split_usage_ratio",
 ];
-
-/// Columns the cost and usage table publishes that the view aggregates away, so a
-/// consumer cannot read them off the view.
-const AGGREGATED_AWAY_BY_THE_VIEW: &[&str] = &["pricing_unit", "product_from_location"];
 
 /// `(table, column, the kind of data the table's dictionary publishes it with)` — rows
 /// spanning every token in the vocabulary and the schemas that disagree on the token for
@@ -149,8 +147,8 @@ const PUBLISHED_TYPES: &[(&str, &str, &str)] = &[
     ),
     (COST_AND_USAGE_REPORT, "cost_category", "Map"),
     (COST_AND_USAGE_REPORT, "bill_invoice_id", "String"),
-    // The recommendations dictionary: money and percentages are Double, a day count is
-    // Integer, a flag is Boolean and the resource's tags are text.
+    // The recommendations dictionary: money, percentages and the lookback day count are
+    // all Double, a flag is Boolean and the resource's tags are a key-value map.
     (
         RECOMMENDATIONS,
         "estimated_monthly_cost_before_discount",
@@ -174,15 +172,15 @@ const PUBLISHED_TYPES: &[(&str, &str, &str)] = &[
     (
         RECOMMENDATIONS,
         "recommendation_lookback_period_in_days",
-        "Integer",
+        "Double",
     ),
-    (RECOMMENDATIONS, "tags", "String"),
+    (RECOMMENDATIONS, "tags", "Map"),
     (RECOMMENDATIONS, "restart_needed", "Boolean"),
     // Entries the issue did not cite.
     (RECOMMENDATIONS, "account_id", "String"),
     (RECOMMENDATIONS, "implementation_effort", "String"),
     (RECOMMENDATIONS, "last_refresh_timestamp", "Timestamp"),
-    (CARBON_EMISSIONS, "total_scope_1_emissions_value", "Number"),
+    (CARBON_EMISSIONS, "total_scope_1_emissions_value", "Double"),
     (CARBON_EMISSIONS, "total_scope_1_emissions_unit", "String"),
     (DASHBOARD, "billing_period", "Timestamp"),
     ("FOCUS_1_0_AWS", "BilledCost", "Number"),
@@ -208,6 +206,19 @@ const PROPERTY_OWNERS: &[(&str, &str)] = &[
     (COST_AND_USAGE_REPORT, "INCLUDE_IAM_PRINCIPAL_DATA"),
     (COST_AND_USAGE_REPORT, "INCLUDE_RESOURCES"),
     (RECOMMENDATIONS, "INCLUDE_ALL_RECOMMENDATIONS"),
+];
+
+/// Whether each table publishes the billing view property (AWS Data Exports table
+/// dictionary): the superseded preview table and the FOCUS 1.2 table do not, and neither
+/// does the recommendations table, whose rows are not scoped by a billing view.
+const BILLING_VIEW_PUBLISHERS: &[(&str, bool)] = &[
+    (CARBON_EMISSIONS, true),
+    (DASHBOARD, true),
+    (COST_AND_USAGE_REPORT, true),
+    ("FOCUS_1_0_AWS", true),
+    ("FOCUS_1_0_AWS_PREVIEW", false),
+    ("FOCUS_1_2_AWS", false),
+    (RECOMMENDATIONS, false),
 ];
 
 /// Tables whose rows are aggregated over a period of time, so the dictionary publishes
@@ -344,17 +355,17 @@ async fn listed_properties(client: &Client) -> BTreeMap<String, Vec<Value>> {
 }
 
 #[tokio::test]
-async fn the_dashboard_view_reports_the_viewed_columns_unchanged() {
+async fn the_dashboard_publishes_its_own_curated_columns_and_no_others() {
     let client = Client::new();
 
     let body = get_table(&client, DASHBOARD, None).await;
     assert_eq!(
         body.get("Description").and_then(Value::as_str),
         Some(DASHBOARD_DESCRIPTION),
-        "case {DASHBOARD:?}: expected the dictionary's description of the view, got {body}"
+        "case {DASHBOARD:?}: expected the dictionary's description of the table, got {body}"
     );
 
-    let (view, order) = schema_of(DASHBOARD, &body);
+    let (dashboard, order) = schema_of(DASHBOARD, &body);
     assert_eq!(
         order.len(),
         DASHBOARD_COLUMN_COUNT,
@@ -362,17 +373,26 @@ async fn the_dashboard_view_reports_the_viewed_columns_unchanged() {
         order.len()
     );
     assert_eq!(
-        view.len(),
+        dashboard.len(),
         order.len(),
         "case {DASHBOARD:?}: a column must be published once, got {order:?}"
     );
 
-    // The view's OWN aggregate columns, at the kind of data the dictionary publishes.
+    // The published column set is exactly the dictionary's, at the kind of data it
+    // publishes each column with.
+    let published: BTreeSet<&str> = DASHBOARD_OWN_COLUMNS.iter().map(|(name, _)| *name).collect();
+    let reported: BTreeSet<&str> = order.iter().map(String::as_str).collect();
+    assert_eq!(
+        reported, published,
+        "case {DASHBOARD:?}: expected the dictionary's column set, extra {:?} / missing {:?}",
+        reported.difference(&published).collect::<Vec<_>>(),
+        published.difference(&reported).collect::<Vec<_>>()
+    );
     for (name, data_type) in DASHBOARD_OWN_COLUMNS {
         let case = format!("{DASHBOARD}.{name}");
-        let column = view
+        let column = dashboard
             .get(*name)
-            .unwrap_or_else(|| panic!("case {case:?}: the view must publish the column"));
+            .unwrap_or_else(|| panic!("case {case:?}: the table must publish the column"));
         assert_eq!(
             column.data_type, *data_type,
             "case {case:?}: expected Type {data_type:?}, got {:?}",
@@ -380,44 +400,25 @@ async fn the_dashboard_view_reports_the_viewed_columns_unchanged() {
         );
     }
 
-    // Every other column of the view is the viewed table's, reported unchanged.
-    let (viewed, _) = schema_of(
+    // And no column of the cost and usage table it aggregates, whether that table
+    // publishes it always or behind a table property.
+    let (aggregated, _) = schema_of(
         COST_AND_USAGE_REPORT,
         &get_table(&client, COST_AND_USAGE_REPORT, None).await,
     );
-    let own: BTreeSet<&str> = DASHBOARD_OWN_COLUMNS.iter().map(|(name, _)| *name).collect();
-    for (name, column) in &view {
-        if own.contains(name.as_str()) {
-            continue;
-        }
-        let case = format!("{DASHBOARD}.{name}");
-        let source = viewed.get(name).unwrap_or_else(|| {
-            panic!("case {case:?}: a column of the view that is neither its own nor {COST_AND_USAGE_REPORT}'s")
-        });
-        assert_eq!(
-            column, source,
-            "case {case:?}: a viewed column must be reported as {COST_AND_USAGE_REPORT} reports it, got {column:?}"
-        );
-    }
-    for name in DASHBOARD_VIEWED_SPOT_CHECKS {
+    for name in NOT_PUBLISHED_BY_THE_DASHBOARD {
         let case = format!("{DASHBOARD}.{name}");
         assert!(
-            view.contains_key(*name),
-            "case {case:?}: expected the view to carry the cost and usage column, got {order:?}"
+            !dashboard.contains_key(*name),
+            "case {case:?}: a cost and usage line-item column is not part of this table, got {:?}",
+            dashboard.get(*name)
         );
     }
-
-    // A column the viewed table gates on a property this table does not publish is not
-    // part of the view, and neither is one the view aggregates away.
-    for name in GATED_IN_THE_VIEWED_TABLE
-        .iter()
-        .chain(AGGREGATED_AWAY_BY_THE_VIEW)
-    {
+    for name in aggregated.keys() {
         let case = format!("{DASHBOARD}.{name}");
         assert!(
-            !view.contains_key(*name),
-            "case {case:?}: the view must not publish the column, got {:?}",
-            view.get(*name)
+            !dashboard.contains_key(name.as_str()) || published.contains(name.as_str()),
+            "case {case:?}: only the dictionary's own columns are published by this table"
         );
     }
 }
@@ -468,7 +469,7 @@ async fn a_measure_published_as_a_value_and_a_unit_reports_both() {
     for name in &order {
         for (suffix, sibling_suffix, sibling_type) in [
             ("_value", "_unit", "String"),
-            ("_unit", "_value", "Number"),
+            ("_unit", "_value", "Double"),
         ] {
             let Some(measure) = name.strip_suffix(suffix) else {
                 continue;
@@ -623,6 +624,34 @@ async fn a_table_property_is_published_by_the_tables_that_have_it() {
             *publishes,
             "case {case:?}: expected published={publishes}"
         );
+    }
+
+    for (table, publishes) in BILLING_VIEW_PUBLISHERS {
+        let case = format!("{table}/BILLING_VIEW_ARN");
+        assert_eq!(
+            names_of(table).contains("BILLING_VIEW_ARN"),
+            *publishes,
+            "case {case:?}: expected published={publishes}, got {:?}",
+            names_of(table)
+        );
+        // A property a table does not publish is refused for it, so a client cannot set
+        // a configuration the dictionary does not advertise.
+        if !*publishes {
+            let (status, body) = client
+                .call(
+                    "GetTable",
+                    &json!({
+                        "TableName": table,
+                        "TableProperties": { "BILLING_VIEW_ARN": "arn:aws:billing::123456789012:billingview/primary" },
+                    }),
+                )
+                .await;
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: a property this table does not publish must be refused, got {body}"
+            );
+        }
     }
 
     // The preview table reports its deprecation in force, so a client reading one table

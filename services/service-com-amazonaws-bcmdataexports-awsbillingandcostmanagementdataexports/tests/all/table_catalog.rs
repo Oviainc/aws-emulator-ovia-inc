@@ -23,7 +23,8 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::{
-    TablePropertySpec, TableSpec, PROPERTY_FALSE, PROPERTY_INCLUDE_ALL_RECOMMENDATIONS,
+    TablePropertySpec, TableSpec, PROPERTY_ANY_VALUE, PROPERTY_FALSE,
+    PROPERTY_INCLUDE_ALL_RECOMMENDATIONS,
     PROPERTY_INCLUDE_RESOURCES, PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
     PROPERTY_TIME_GRANULARITY, PROPERTY_TRUE, TABLE_CATALOG,
 };
@@ -44,7 +45,8 @@ const CARBON_EMISSIONS: &str = "CARBON_EMISSIONS";
 
 /// Values to exercise a FREE-FORM table property at — one whose value the caller writes
 /// rather than picks from a published list (a billing view ARN, a filter expression), so
-/// the catalog publishes no `ValidValues` for it and it accepts any value.
+/// the catalog publishes either no `ValidValues` for it or the wildcard, and it accepts
+/// any value.
 const FREE_FORM_VALUES: &[&str] = &["{}", "arn:aws:billing::123456789012:billingview/primary"];
 
 /// One request's `TableProperties`, as `(property, value)` pairs.
@@ -53,7 +55,7 @@ type Properties = Vec<(&'static str, &'static str)>;
 /// The values a row sets `property` to: the ones the catalog publishes for it, or — for
 /// a free-form property — [`FREE_FORM_VALUES`].
 fn exercised_values(property: &TablePropertySpec) -> &'static [&'static str] {
-    if property.valid_values.is_empty() {
+    if property.valid_values.is_empty() || property.valid_values.contains(&PROPERTY_ANY_VALUE) {
         FREE_FORM_VALUES
     } else {
         property.valid_values
@@ -270,10 +272,10 @@ const KNOWN_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             ("account_id", "String"),
             ("account_name", "String"),
             ("estimated_monthly_savings_after_discount", "Double"),
-            ("recommendation_lookback_period_in_days", "Integer"),
+            ("recommendation_lookback_period_in_days", "Double"),
             ("last_refresh_timestamp", "Timestamp"),
             ("restart_needed", "Boolean"),
-            ("tags", "String"),
+            ("tags", "Map"),
         ],
     ),
     (

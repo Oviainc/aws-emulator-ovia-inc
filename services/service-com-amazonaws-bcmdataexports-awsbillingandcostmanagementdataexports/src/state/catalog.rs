@@ -16,16 +16,27 @@
 //! `src/ops/create_export.rs`). It is service data, not account data: see `super`'s
 //! header for why it is a static rather than a field of the state struct.
 //!
+//! The catalog is RESPONSE DATA, not documentation: a client reads `Column.Description`
+//! and `Column.Type` to decide what a column holds and what to cast it to, and reads a
+//! `TablePropertyDescription`'s `ValidValues` to decide whether a `TableConfigurations`
+//! value is legal before calling `CreateExport`. So every string below is the
+//! dictionary's PUBLISHED text for that column or property, carried over as published,
+//! rather than a shorter re-wording of it: a paraphrase is a different value on the wire.
+//!
 //! The column TYPE vocabulary is the dictionary's: a column's `Type` names the KIND of
 //! data the column stores ("The kind of data a column stores" — smithy_query shape
 //! `Column`, member `Type`) in the dictionary's own mixed-case words — `String`,
-//! `Number`, `Double`, `Integer`, `Timestamp`, `Boolean`, `Map` — never a storage-engine
-//! type name such as `STRING` or `MAP<STRING,STRING>`, which the catalog does not
-//! publish. The vocabulary is PER SCHEMA, not per kind of value: the cost and usage
-//! dictionary measures costs with `Number` while the recommendations dictionary measures
-//! them with `Double` and counts days with `Integer`, so each table below carries the
-//! token ITS dictionary publishes rather than one token chosen for every numeric column
-//! of the catalog.
+//! `Number`, `Double`, `Timestamp`, `Boolean`, `Map` — never a storage-engine type name
+//! such as `STRING` or `MAP<STRING,STRING>`, which the catalog does not publish. The
+//! vocabulary is PER SCHEMA, not per kind of value: the cost and usage dictionary
+//! measures costs with `Number` while the recommendations and carbon emissions
+//! dictionaries measure theirs with `Double`, so each table below carries the token ITS
+//! dictionary publishes rather than one token chosen for every numeric column of the
+//! catalog.
+//!
+//! A schema that SUPERSEDES another (FOCUS 1.2 over FOCUS 1.0) publishes its own text for
+//! the columns its specification re-words, and the superseded schema keeps the text it
+//! was published with: see [`ColumnGroup::Revised`].
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -35,20 +46,18 @@ use crate::ops::types::{Column, ValidationException, ValidationExceptionField};
 /// A column's `Type` for text the dictionary does not further constrain.
 const STRING: &str = "String";
 /// A column's `Type` for a numeric measure (a cost, a rate, a quantity, a count) in the
-/// cost and usage dictionary.
+/// cost and usage and FOCUS dictionaries.
 const NUMBER: &str = "Number";
-/// A column's `Type` for a floating-point measure (a cost, a percentage) in the
-/// recommendations dictionary, which publishes its numeric columns as `Double`.
+/// A column's `Type` for a floating-point measure (a cost, a percentage, an emissions
+/// quantity, a day count) in the recommendations and carbon emissions dictionaries, which
+/// publish every numeric column as `Double`.
 const DOUBLE: &str = "Double";
-/// A column's `Type` for a whole-number count (a number of days) in the recommendations
-/// dictionary.
-const INTEGER: &str = "Integer";
 /// A column's `Type` for a date and time.
 const TIMESTAMP: &str = "Timestamp";
 /// A column's `Type` for a true/false flag.
 const BOOLEAN: &str = "Boolean";
 /// A column's `Type` for the key-value columns that carry tags, product attributes,
-/// cost categories and discounts.
+/// cost categories, discounts and SKU price details.
 const MAP: &str = "Map";
 
 /// The value a boolean-valued table property takes to switch its data or columns ON.
@@ -60,9 +69,18 @@ pub const PROPERTY_FALSE: &str = "FALSE";
 /// publishes them.
 const BOOLEAN_PROPERTY_VALUES: &[&str] = &[PROPERTY_TRUE, PROPERTY_FALSE];
 
-/// The valid values of a FREE-FORM table property: none, because the property's value
-/// is not drawn from a published list but written by the caller (an ARN, a filter
-/// expression). Such a property accepts any value — see [`TablePropertySpec::accepts`].
+/// The WILDCARD valid value: the catalog publishes it for a property whose value the
+/// caller writes rather than picks, to say that any value is legal. A client validates a
+/// `TableConfigurations` value against `ValidValues` before calling `CreateExport`, so a
+/// property that accepts anything has to publish that fact rather than an empty list —
+/// see [`TablePropertySpec::accepts`].
+pub const PROPERTY_ANY_VALUE: &str = "*";
+
+/// The valid values of a free-form table property the catalog publishes the wildcard for.
+const WILDCARD_PROPERTY_VALUES: &[&str] = &[PROPERTY_ANY_VALUE];
+
+/// The valid values of a free-form table property the catalog publishes NO list for.
+/// Such a property accepts any value too — see [`TablePropertySpec::accepts`].
 const FREE_FORM_PROPERTY_VALUES: &[&str] = &[];
 
 /// Table property: the time granularity of each line item in a cost and usage table.
@@ -100,8 +118,9 @@ pub const PROPERTY_INCLUDE_ALL_RECOMMENDATIONS: &str = "INCLUDE_ALL_RECOMMENDATI
 pub struct TablePropertySpec {
     /// The property name a request's `TableProperties` key must match.
     pub name: &'static str,
-    /// The values this property accepts; anything else is refused. EMPTY for a free-form
-    /// property, which accepts any value — see [`Self::accepts`].
+    /// The values this property accepts, as the catalog publishes them — the wildcard
+    /// [`PROPERTY_ANY_VALUE`] for a free-form property that publishes one, and empty for
+    /// a free-form property the catalog publishes no list for. See [`Self::accepts`].
     pub valid_values: &'static [&'static str],
     /// The value the property takes when a request does not name it, or `None` for a
     /// property the catalog publishes NO default for: such a property is in force only
@@ -115,9 +134,12 @@ pub struct TablePropertySpec {
 impl TablePropertySpec {
     /// Whether this property accepts `value`: one of the values the catalog publishes
     /// for it, or — for a free-form property, whose value the caller writes rather than
-    /// picks — any value at all.
+    /// picks — any value at all. A free-form property is one that publishes the wildcard
+    /// [`PROPERTY_ANY_VALUE`] or publishes no list.
     pub fn accepts(&self, value: &str) -> bool {
-        self.valid_values.is_empty() || self.valid_values.contains(&value)
+        self.valid_values.is_empty()
+            || self.valid_values.contains(&PROPERTY_ANY_VALUE)
+            || self.valid_values.contains(&value)
     }
 }
 
@@ -127,9 +149,9 @@ pub struct ColumnSpec {
     /// The column name.
     pub name: &'static str,
     /// The kind of data the column stores, as the dictionary publishes it: one of
-    /// [`STRING`], [`NUMBER`], [`TIMESTAMP`], [`BOOLEAN`], [`MAP`].
+    /// [`STRING`], [`NUMBER`], [`DOUBLE`], [`TIMESTAMP`], [`BOOLEAN`], [`MAP`].
     pub data_type: &'static str,
-    /// What the column holds, as the dictionary documents it — the modelled
+    /// What the column holds, as the dictionary publishes it — the modelled
     /// `Column$Description` ("The description for a column").
     pub description: &'static str,
     /// The `(property, value)` pair that has to hold for this column to be part of the
@@ -188,6 +210,19 @@ pub enum ColumnGroup {
         /// the resulting schema, so a name that resolves to nothing fails them.
         columns: &'static [&'static str],
     },
+    /// Every column of another schema's group, with the DESCRIPTIONS this schema's own
+    /// specification revises applied over them. A later version of a specification
+    /// re-words some of the columns it carries forward while keeping the rest, and the
+    /// earlier version keeps the text IT was published with, so the two schemas publish
+    /// the same column with different text — which is why a revision cannot be edited
+    /// into the shared group.
+    Revised {
+        /// The group the columns are carried forward from, in its own order.
+        of: &'static [ColumnSpec],
+        /// `(column name, the description this schema publishes for it)`. A name the
+        /// group does not describe revises nothing.
+        revisions: &'static [(&'static str, &'static str)],
+    },
 }
 
 impl ColumnGroup {
@@ -201,6 +236,19 @@ impl ColumnGroup {
                 .map(|column| ColumnSpec {
                     requires: None,
                     ..*column
+                })
+                .collect(),
+            Self::Revised { of, revisions } => of
+                .iter()
+                .map(|column| match revisions
+                    .iter()
+                    .find(|(name, _)| *name == column.name)
+                {
+                    Some((_, description)) => ColumnSpec {
+                        description,
+                        ..*column
+                    },
+                    None => *column,
                 })
                 .collect(),
         }
@@ -421,47 +469,47 @@ const COST_OPTIMIZATION_RECOMMENDATIONS_PROPERTIES: &[TablePropertySpec] = &[
     },
     TablePropertySpec {
         name: PROPERTY_FILTER,
-        // Free-form: a JSON filter expression over the recommendation columns, which the
-        // catalog cannot enumerate. The default is the empty filter: every row.
-        valid_values: FREE_FORM_PROPERTY_VALUES,
+        // Free-form, and the catalog SAYS so by publishing the wildcard: the value is a
+        // JSON filter over the recommendation columns, which no list could enumerate, so
+        // a client validating against the published list has to see that any value is
+        // legal. The default is the empty filter: every row.
+        valid_values: WILDCARD_PROPERTY_VALUES,
         default_value: Some("{}"),
-        description: "The filter that the rows in the table are restricted to.",
+        description: "The constraints that you want all returned recommendations to match. Expressed as a json of AWS Cost Optimization Hub's Filter SDK object. See COST_OPTIMIZATION_RECOMMENDATIONS table documentation for further details.",
     },
 ];
 
-/// The table properties of the general FOCUS tables.
+/// The table properties of the general FOCUS 1.0 table.
 const FOCUS_PROPERTIES: &[TablePropertySpec] = &[BILLING_VIEW_ARN_PROPERTY];
 
-/// The table properties of the FOCUS PREVIEW table: a preview table publishes, beside
-/// the billing view, that it is deprecated — which is how a client learns not to build
-/// new exports on it.
-const FOCUS_PREVIEW_PROPERTIES: &[TablePropertySpec] = &[
-    TablePropertySpec {
-        name: PROPERTY_DEPRECATED,
-        // The only value this property takes for a preview table the catalog publishes as
-        // deprecated: there is no configuration of it that is not deprecated.
-        valid_values: &[PROPERTY_TRUE],
-        default_value: Some(PROPERTY_TRUE),
-        description: "Whether the table is deprecated.",
-    },
-    BILLING_VIEW_ARN_PROPERTY,
-];
+/// The table properties of the FOCUS PREVIEW table: the one thing the catalog publishes
+/// about a superseded preview table is that it is deprecated, which is how a client
+/// learns not to build new exports on it. It publishes no billing view, because no new
+/// export is configured against it at all.
+const FOCUS_PREVIEW_PROPERTIES: &[TablePropertySpec] = &[TablePropertySpec {
+    name: PROPERTY_DEPRECATED,
+    // The only value this property takes for a preview table the catalog publishes as
+    // deprecated: there is no configuration of it that is not deprecated.
+    valid_values: &[PROPERTY_TRUE],
+    default_value: Some(PROPERTY_TRUE),
+    description: "This table has been deprecated. New exports for this table are no longer supported.",
+}];
 
-/// The table properties of the FOCUS 1.2 table, which — unlike FOCUS 1.0 — publishes the
-/// granularity of its rows.
-const FOCUS_1_2_PROPERTIES: &[TablePropertySpec] =
-    &[TIME_GRANULARITY_PROPERTY, BILLING_VIEW_ARN_PROPERTY];
+/// The table properties of the FOCUS 1.2 table, whose rows — unlike FOCUS 1.0's — are
+/// aggregated over a period of time, so it publishes the granularity of those rows.
+const FOCUS_1_2_PROPERTIES: &[TablePropertySpec] = &[TIME_GRANULARITY_PROPERTY];
 
 /// The table properties of the tables the catalog scopes by billing view alone.
 const BILLING_VIEW_ONLY_PROPERTIES: &[TablePropertySpec] = &[BILLING_VIEW_ARN_PROPERTY];
 
-/// The billing view property, which every table publishes: the data in any table can be
-/// scoped to a billing view.
+/// The billing view property: the data in the table it is published for can be scoped to
+/// a billing view.
 const BILLING_VIEW_ARN_PROPERTY: TablePropertySpec = TablePropertySpec {
     name: PROPERTY_BILLING_VIEW_ARN,
     // Free-form: the value is a billing view ARN the caller owns, not a value the
-    // catalog can enumerate. The default is the empty string: no billing view, so the
-    // table covers the whole of the account's data.
+    // catalog can enumerate, and the catalog publishes no list for it at all. The
+    // default is the empty string: no billing view, so the table covers the whole of the
+    // account's data.
     valid_values: FREE_FORM_PROPERTY_VALUES,
     default_value: Some(""),
     description: "The arn of the billing conductor group that this CUR2.0/ FOCUS Data Export is for.",
@@ -480,7 +528,8 @@ const TIME_GRANULARITY_PROPERTY: TablePropertySpec = TablePropertySpec {
 // Columns
 // ---------------------------------------------------------------------------
 
-/// The columns of `CARBON_EMISSIONS`, in the dictionary's order.
+/// The columns of `CARBON_EMISSIONS`, in the dictionary's order. Every emissions measure
+/// is published as a `Double` value beside the `String` unit it is measured in.
 const CARBON_EMISSIONS_COLUMNS: &[ColumnSpec] = &[
     col(
         "payer_account_id",
@@ -490,42 +539,42 @@ const CARBON_EMISSIONS_COLUMNS: &[ColumnSpec] = &[
     col(
         "usage_account_id",
         STRING,
-        "The account ID of the account whose usage the emissions are estimated for.",
+        "The account ID of the account associated with the carbon footprint value. For organizations, this can be either the management account or a member account.",
     ),
     col(
         "usage_period_start",
         TIMESTAMP,
-        "The inclusive start of the usage period that the estimate covers, in UTC.",
+        "The start date of the period that is covered by this report, in UTC. The format is YYYY-MM-DDTHH:mm:ssZ.",
     ),
     col(
         "usage_period_end",
         TIMESTAMP,
-        "The exclusive end of the usage period that the estimate covers, in UTC.",
+        "The end date of the period that is covered by this report, in UTC. The format is YYYY-MM-DDTHH:mm:ssZ.",
     ),
     col(
         "last_refresh_timestamp",
         TIMESTAMP,
-        "The date and time that the emissions estimate was last refreshed, in UTC.",
+        "The date and time that the data in this report was last refreshed, in UTC. The format is YYYY-MM-DDTHH:mm:ssZ.",
     ),
     col(
         "model_version",
         STRING,
-        "The version of the model that the emissions were estimated with.",
+        "The version of the carbon emissions model that was used to calculate the carbon footprint value.",
     ),
     col(
         "product_code",
         STRING,
-        "The code of the Amazon Web Services service whose usage the emissions are estimated for.",
+        "The code of the AWS service that is associated with the carbon footprint value.",
     ),
     col(
         "region_code",
         STRING,
-        "The Region code of the usage that the emissions are estimated for.",
+        "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone. Each AWS Region consists of a minimum of three, isolated, and physically separate AZs within a geographic area.",
     ),
     col(
         "location",
         STRING,
-        "The location of the usage that the emissions are estimated for.",
+        "The location that is associated with the carbon footprint value.",
     ),
     // The emissions MEASURES. Each one is reported as a value and the unit that value is
     // measured in, rather than as a single column in an assumed unit: the table publishes
@@ -533,73 +582,73 @@ const CARBON_EMISSIONS_COLUMNS: &[ColumnSpec] = &[
     // the scope's own total.
     col(
         "total_lbm_emissions_value",
-        NUMBER,
-        "The total estimated carbon emissions of the usage under the location-based method.",
+        DOUBLE,
+        "The total carbon emissions associated with your AWS usage, calculated using the location-based method (LBM).",
     ),
     col(
         "total_lbm_emissions_unit",
         STRING,
-        "The unit that the total location-based-method emissions are measured in.",
+        "The unit of measurement for the total location-based method (LBM) carbon emissions.",
     ),
     col(
         "total_mbm_emissions_value",
-        NUMBER,
-        "The total estimated carbon emissions of the usage under the market-based method.",
+        DOUBLE,
+        "The total carbon emissions associated with your AWS usage, calculated using the market-based method (MBM).",
     ),
     col(
         "total_mbm_emissions_unit",
         STRING,
-        "The unit that the total market-based-method emissions are measured in.",
+        "The unit of measurement for the total market-based method (MBM) carbon emissions.",
     ),
     col(
         "total_scope_1_emissions_value",
-        NUMBER,
-        "The total estimated scope 1 carbon emissions of the usage.",
+        DOUBLE,
+        "The total scope 1 carbon emissions associated with your AWS usage. Scope 1 covers the direct emissions from sources that AWS owns or controls.",
     ),
     col(
         "total_scope_1_emissions_unit",
         STRING,
-        "The unit that the total scope 1 emissions are measured in.",
+        "The unit of measurement for the total scope 1 carbon emissions.",
     ),
     col(
         "total_scope_2_lbm_emissions_value",
-        NUMBER,
-        "The total estimated scope 2 carbon emissions of the usage under the location-based method.",
+        DOUBLE,
+        "The total scope 2 carbon emissions associated with your AWS usage, calculated using the location-based method (LBM). Scope 2 covers the indirect emissions from the generation of purchased energy.",
     ),
     col(
         "total_scope_2_lbm_emissions_unit",
         STRING,
-        "The unit that the total scope 2 location-based-method emissions are measured in.",
+        "The unit of measurement for the total scope 2 location-based method (LBM) carbon emissions.",
     ),
     col(
         "total_scope_2_mbm_emissions_value",
-        NUMBER,
-        "The total estimated scope 2 carbon emissions of the usage under the market-based method.",
+        DOUBLE,
+        "The total scope 2 carbon emissions associated with your AWS usage, calculated using the market-based method (MBM). Scope 2 covers the indirect emissions from the generation of purchased energy.",
     ),
     col(
         "total_scope_2_mbm_emissions_unit",
         STRING,
-        "The unit that the total scope 2 market-based-method emissions are measured in.",
+        "The unit of measurement for the total scope 2 market-based method (MBM) carbon emissions.",
     ),
     col(
         "total_scope_3_lbm_emissions_value",
-        NUMBER,
-        "The total estimated scope 3 carbon emissions of the usage under the location-based method.",
+        DOUBLE,
+        "The total scope 3 carbon emissions associated with your AWS usage, calculated using the location-based method (LBM). Scope 3 covers the indirect emissions that occur in the value chain.",
     ),
     col(
         "total_scope_3_lbm_emissions_unit",
         STRING,
-        "The unit that the total scope 3 location-based-method emissions are measured in.",
+        "The unit of measurement for the total scope 3 location-based method (LBM) carbon emissions.",
     ),
     col(
         "total_scope_3_mbm_emissions_value",
-        NUMBER,
-        "The total estimated scope 3 carbon emissions of the usage under the market-based method.",
+        DOUBLE,
+        "The total scope 3 carbon emissions associated with your AWS usage, calculated using the market-based method (MBM). Scope 3 covers the indirect emissions that occur in the value chain.",
     ),
     col(
         "total_scope_3_mbm_emissions_unit",
         STRING,
-        "The unit that the total scope 3 market-based-method emissions are measured in.",
+        "The unit of measurement for the total scope 3 market-based method (MBM) carbon emissions.",
     ),
 ];
 
@@ -609,667 +658,669 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
     col(
         "bill_bill_type",
         STRING,
-        "The type of bill that this line item covers.",
+        "The type of bill that this report covers.",
     ),
     col(
         "bill_billing_entity",
         STRING,
-        "The Amazon Web Services organization that the charge in this line item was made through, which identifies an AWS Marketplace purchase.",
+        "Helps you identify whether your invoices or transactions are for AWS Marketplace or for purchases of other AWS services.",
     ),
     col(
         "bill_billing_period_end_date",
         TIMESTAMP,
-        "The end date and time of the billing period that includes this line item, in UTC.",
+        "The end date of the billing period that is covered by this report, in UTC. The format is YYYY-MM-DDTHH:mm:ssZ.",
     ),
     col(
         "bill_billing_period_start_date",
         TIMESTAMP,
-        "The start date and time of the billing period that includes this line item, in UTC.",
+        "The start date of the billing period that is covered by this report, in UTC. The format is YYYY-MM-DDTHH:mm:ssZ.",
     ),
     col(
         "bill_invoice_id",
         STRING,
-        "The ID of the invoice that includes this line item.",
+        "The ID associated with a specific line item. Until the report is final, the InvoiceId is blank.",
     ),
     col(
         "bill_invoicing_entity",
         STRING,
-        "The Amazon Web Services entity that issues the invoice for this line item.",
+        "The AWS entity that issues the invoice.",
     ),
     col(
         "bill_payer_account_id",
         STRING,
-        "The account ID of the management account that pays for the usage in this line item.",
+        "The account ID of the paying account. For an organization in AWS Organizations, this is the account ID of the management account.",
     ),
     col(
         "bill_payer_account_name",
         STRING,
-        "The name of the management account that pays for the usage in this line item.",
+        "The name of the paying account.",
     ),
     col(
         "cost_category",
         MAP,
-        "The cost categories that apply to this line item, as key-value pairs.",
+        "Cost categories that are applied to the line item.",
     ),
     col(
         "discount",
         MAP,
-        "The discounts that apply to this line item, as key-value pairs.",
+        "Discounts that are applied to the line item.",
     ),
     col(
         "discount_bundled_discount",
         NUMBER,
-        "The bundled discount applied to the usage in this line item.",
+        "The bundled discount applied to the line item. A bundled discount is a usage-based discount that provides free or discounted usage of a service or feature based on the usage of another service or feature.",
     ),
     col(
         "discount_total_discount",
         NUMBER,
-        "The sum of the discounts applied to this line item.",
+        "The sum of all the discount columns for the corresponding line item.",
     ),
     col(
         "identity_line_item_id",
         STRING,
-        "A unique identifier for every line item in a single delivery of the export.",
+        "This field is generated for each line item and is unique in a given partition. This does not guarantee that the field will be unique across an entire delivery (that is, all partitions in an update) of the AWS CUR. The line item ID isn't consistent between different Cost and Usage Reports and can't be used to identify the same line item across different reports.",
     ),
     col(
         "identity_time_interval",
         STRING,
-        "The time interval that this line item applies to, in UTC.",
+        "The time interval that this line item applies to, in the following format: YYYY-MM-DDTHH:mm:ssZ/YYYY-MM-DDTHH:mm:ssZ. The time interval is in UTC and can be either daily or hourly, depending on the granularity of the report.",
     ),
     col(
         "line_item_availability_zone",
         STRING,
-        "The Availability Zone that hosts the usage in this line item.",
+        "The Availability Zone that hosts this line item.",
     ),
     col(
         "line_item_blended_cost",
         NUMBER,
-        "The blended rate multiplied by the usage amount of this line item.",
+        "The BlendedRate multiplied by the UsageAmount.",
     ),
     col(
         "line_item_blended_rate",
         STRING,
-        "The average rate of the usage in this line item across the consolidated billing family.",
+        "The BlendedRate is the average cost incurred for each SKU across an organization.",
     ),
     col(
         "line_item_currency_code",
         STRING,
-        "The currency that the cost of this line item is reported in.",
+        "The currency that this line item is shown in. All AWS customers are billed in US dollars by default. To change your billing currency, see Changing which currency you use to pay your bill in the AWS Billing User Guide.",
     ),
     col(
         "line_item_legal_entity",
         STRING,
-        "The Amazon Web Services seller of record for the usage in this line item.",
+        "The seller of record for a specific product or service.",
     ),
     col(
         "line_item_line_item_description",
         STRING,
-        "The description of the usage in this line item.",
+        "The description of the line item type.",
     ),
     col(
         "line_item_line_item_type",
         STRING,
-        "The type of charge that this line item covers, such as usage, tax, credit or refund.",
+        "The type of charge covered by this line item.",
     ),
     col(
         "line_item_net_unblended_cost",
         NUMBER,
-        "The unblended cost of this line item after all discounts.",
+        "The actual after-discount cost that you're paying for the line item.",
     ),
     col(
         "line_item_net_unblended_rate",
         STRING,
-        "The unblended rate of this line item after all discounts.",
+        "The actual after-discount rate that you're paying for the line item.",
     ),
     col(
         "line_item_normalization_factor",
         NUMBER,
-        "The normalization factor of the instance size that the usage in this line item ran on.",
+        "As long as the instance has shared tenancy, AWS can apply all Regional Linux or Unix Amazon EC2 and Amazon RDS RI discounts to all instance sizes in an instance family and AWS Region. This also applies to RI discounts for member accounts in an organization. All new and existing Amazon EC2 and Amazon RDS size-flexible RIs are sized according to a normalization factor, based on the instance size.",
     ),
     col(
         "line_item_normalized_usage_amount",
         NUMBER,
-        "The usage amount of this line item normalized to the smallest size of its instance family.",
+        "The amount of usage that you incurred, in normalized units, for size-flexible RIs. The NormalizedUsageAmount is equal to UsageAmount multiplied by NormalizationFactor.",
     ),
     col(
         "line_item_operation",
         STRING,
-        "The specific operation covered by this line item.",
+        "The specific AWS operation covered by this line item. This describes the specific usage of the line item.",
     ),
     col(
         "line_item_product_code",
         STRING,
-        "The code of the Amazon Web Services service that the usage in this line item belongs to.",
+        "The code of the product measured.",
     ),
     col_when(
         "line_item_resource_id",
         STRING,
-        "The identifier of the resource that the usage in this line item ran on.",
+        "If you chose to include individual resource IDs in your report, this column contains the ID of the resource that you provisioned.",
         PROPERTY_INCLUDE_RESOURCES,
         PROPERTY_TRUE,
     ),
     col(
         "line_item_tax_type",
         STRING,
-        "The type of tax that this line item charges.",
+        "The type of tax that AWS applied to this line item.",
     ),
     col(
         "line_item_unblended_cost",
         NUMBER,
-        "The unblended rate multiplied by the usage amount of this line item.",
+        "The unblended rate multiplied by the usage amount.",
     ),
     col(
         "line_item_unblended_rate",
         STRING,
-        "The rate charged for the usage in this line item.",
+        "The uncombined rate for specific usage.",
     ),
     col(
         "line_item_usage_account_id",
         STRING,
-        "The account ID of the account that used the resource in this line item.",
+        "The account ID of the account that used this line item. For organizations, this can be either the management account or a member account. You can use this field to track costs and usage.",
     ),
     col(
         "line_item_usage_account_name",
         STRING,
-        "The name of the account that used the resource in this line item.",
+        "The name of the account that used this line item. For organizations, this can be either the management account or a member account.",
     ),
     col(
         "line_item_usage_amount",
         NUMBER,
-        "The amount of usage that this line item covers.",
+        "The amount of usage that you incurred during the specified time period.",
     ),
     col(
         "line_item_usage_end_date",
         TIMESTAMP,
-        "The exclusive end date and time of the usage in this line item, in UTC.",
+        "The end date and time for the corresponding line item in UTC, exclusive. The format is YYYY-MM-DDTHH:mm:ssZ.",
     ),
     col(
         "line_item_usage_start_date",
         TIMESTAMP,
-        "The inclusive start date and time of the usage in this line item, in UTC.",
+        "The start date and time for the line item in UTC, inclusive. The format is YYYY-MM-DDTHH:mm:ssZ.",
     ),
     col(
         "line_item_usage_type",
         STRING,
-        "The usage details of this line item.",
+        "The usage details of the line item.",
     ),
     col(
         "line_item_user_identifier",
         STRING,
-        "The identifier of the identity that the usage in this line item is attributed to.",
+        "The unique identifier of the IAM principal that made the request that generated this line item.",
     ),
     col(
         "pricing_currency",
         STRING,
-        "The currency that the pricing of this line item is expressed in.",
+        "The currency that the pricing data is shown in.",
     ),
     col(
         "pricing_lease_contract_length",
         STRING,
-        "The length of the term of the Reserved Instance or Savings Plan that applies to this line item.",
+        "The length of time that your Reserved Instance is reserved for.",
     ),
     col(
         "pricing_offering_class",
         STRING,
-        "The offering class of the Reserved Instance that applies to this line item.",
+        "The offering class of the Reserved Instance.",
     ),
     col(
         "pricing_public_on_demand_cost",
         NUMBER,
-        "The cost of the usage in this line item at public On-Demand rates.",
+        "The total cost for the line item based on public On-Demand Instance rates.",
     ),
     col(
         "pricing_public_on_demand_rate",
         STRING,
-        "The public On-Demand rate of the usage in this line item.",
+        "The public On-Demand Instance rate in this billing period for the specific line item of usage.",
     ),
     col(
         "pricing_purchase_option",
         STRING,
-        "How the usage in this line item is paid for: all upfront, partial upfront or no upfront.",
+        "How you chose to pay for this line item. Valid values are All Upfront, Partial Upfront, and No Upfront.",
     ),
     col(
         "pricing_rate_code",
         STRING,
-        "The code of the rate that applies to this line item.",
+        "A unique code for a product/offer/pricing-tier combination. The product and term combinations can have multiple price dimensions, such as a free tier, low-use tier, and high-use tier.",
     ),
     col(
         "pricing_rate_id",
         STRING,
-        "The identifier of the rate that applies to this line item.",
+        "The ID of the rate for a line item.",
     ),
     col(
         "pricing_term",
         STRING,
-        "Whether the usage in this line item is reserved or On-Demand.",
+        "Whether your AWS usage is Reserved or On-Demand.",
     ),
     col(
         "pricing_unit",
         STRING,
-        "The unit that Amazon Web Services prices the usage in this line item in.",
+        "The pricing unit that AWS used for calculating your usage cost. For example, the pricing unit for Amazon EC2 instance usage is in hours.",
     ),
     col(
         "product",
         MAP,
-        "The attributes of the product that the usage in this line item covers, as key-value pairs.",
+        "A map column containing key-value pairs of the product attributes of the line item, where the key is the attribute name and the value is the attribute value.",
     ),
     col(
         "product_comment",
         STRING,
-        "A comment about the product that the usage in this line item covers.",
+        "A comment regarding the product.",
     ),
     col(
         "product_fee_code",
         STRING,
-        "The fee code of the product that the usage in this line item covers.",
+        "The fee code of the product.",
     ),
     col(
         "product_fee_description",
         STRING,
-        "The description of the fee that this line item charges.",
+        "The description of the fee for the product.",
     ),
     col(
         "product_from_location",
         STRING,
-        "The location that the request in this line item came from.",
+        "Describes the location where the usage originated from.",
     ),
     col(
         "product_from_location_type",
         STRING,
-        "The type of the location that the request in this line item came from.",
+        "Describes the location type where the usage originated from.",
     ),
     col(
         "product_from_region_code",
         STRING,
-        "The Region code that the request in this line item came from.",
+        "Describes the Region code where the usage originated from.",
     ),
     col(
         "product_instance_family",
         STRING,
-        "The instance family of the instance that the usage in this line item ran on.",
+        "Describes the Amazon EC2 instance family.",
     ),
     col(
         "product_instance_type",
         STRING,
-        "The instance type of the instance that the usage in this line item ran on.",
+        "Describes the instance type, size, and family, which define the CPU, networking, and storage capacity of your instance.",
     ),
     col(
         "product_instancesku",
         STRING,
-        "The SKU of the instance that the usage in this line item ran on.",
+        "The SKU of the instance.",
     ),
     col(
         "product_location",
         STRING,
-        "The location of the resource that the usage in this line item ran on.",
+        "Describes the Region that your resource resides in.",
     ),
     col(
         "product_location_type",
         STRING,
-        "The type of the location of the resource that the usage in this line item ran on.",
+        "Describes the endpoint of your task.",
     ),
     col(
         "product_operation",
         STRING,
-        "The operation that the product in this line item performed.",
+        "The specific AWS operation covered by this line item.",
     ),
     col(
         "product_pricing_unit",
         STRING,
-        "The smallest billing unit that the product in this line item is priced in.",
+        "The smallest billing unit for an AWS service. For example, 0.01c per API call.",
     ),
     col(
         "product_product_family",
         STRING,
-        "The family of the product that the usage in this line item covers.",
+        "The category for the type of product.",
     ),
     col(
         "product_region_code",
         STRING,
-        "The Region code of the resource that the usage in this line item ran in.",
+        "The Region that the resource resides in.",
     ),
     col(
         "product_servicecode",
         STRING,
-        "The code of the Amazon Web Services service that the product in this line item belongs to.",
+        "The code of the AWS service.",
     ),
     col(
         "product_sku",
         STRING,
-        "The SKU of the product that the usage in this line item covers.",
+        "A unique code for a product. The SKU is created by combining the ProductCode, UsageType, and Operation.",
     ),
     col(
         "product_to_location",
         STRING,
-        "The location that the request in this line item was sent to.",
+        "Describes the location where the usage is sent to.",
     ),
     col(
         "product_to_location_type",
         STRING,
-        "The type of the location that the request in this line item was sent to.",
+        "Describes the location type where the usage is sent to.",
     ),
     col(
         "product_to_region_code",
         STRING,
-        "The Region code that the request in this line item was sent to.",
+        "Describes the Region code where the usage is sent to.",
     ),
     col(
         "product_usagetype",
         STRING,
-        "The usage type of the product that the usage in this line item covers.",
+        "The usage type of the product.",
     ),
     col(
         "reservation_amortized_upfront_cost_for_usage",
         NUMBER,
-        "The upfront payment for the Reserved Instance, amortized over the usage in this line item.",
+        "The initial upfront payment for all upfront Reserved Instances and partial upfront Reserved Instances amortized for usage time.",
     ),
     col(
         "reservation_amortized_upfront_fee_for_billing_period",
         NUMBER,
-        "The upfront fee of the Reserved Instance, amortized over the billing period.",
+        "Describes how much of your upfront fee for this reservation is costing you for the billing period.",
     ),
     col(
         "reservation_availability_zone",
         STRING,
-        "The Availability Zone of the resource covered by the Reserved Instance.",
+        "The Availability Zone of the resource that is associated with this line item.",
     ),
     col(
         "reservation_effective_cost",
         NUMBER,
-        "The amortized upfront fee plus the recurring fee of the usage covered by the Reserved Instance.",
+        "The sum of both the upfront and hourly rate of your Reserved Instance, averaged into an effective hourly rate.",
     ),
     col(
         "reservation_end_time",
         STRING,
-        "The end date and time of the term of the Reserved Instance.",
+        "The end date of the associated Reserved Instance lease term.",
     ),
     col(
         "reservation_modification_status",
         STRING,
-        "Whether the Reserved Instance was modified, and how.",
+        "Shows whether the Reserved Instance lease was modified or if it is unaltered.",
     ),
     col(
         "reservation_net_amortized_upfront_cost_for_usage",
         NUMBER,
-        "The amortized upfront cost of the usage covered by the Reserved Instance, after discounts.",
+        "The initial upfront payment for All Upfront Reserved Instances and Partial Upfront Reserved Instances amortized for usage time, with discounts applied.",
     ),
     col(
         "reservation_net_amortized_upfront_fee_for_billing_period",
         NUMBER,
-        "The amortized upfront fee of the Reserved Instance for the billing period, after discounts.",
+        "The cost of the reservation's upfront fee for the billing period, with discounts applied.",
     ),
     col(
         "reservation_net_effective_cost",
         NUMBER,
-        "The effective cost of the usage covered by the Reserved Instance, after discounts.",
+        "The effective cost for the Reserved Instance, with discounts applied.",
     ),
     col(
         "reservation_net_recurring_fee_for_usage",
         NUMBER,
-        "The recurring fee of the usage covered by the Reserved Instance, after discounts.",
+        "The after-discount cost of the recurring usage fee.",
     ),
     col(
         "reservation_net_unused_amortized_upfront_fee_for_billing_period",
         NUMBER,
-        "The amortized upfront fee of the unused Reserved Instance capacity in the billing period, after discounts.",
+        "The amortized portion of the initial upfront fee for unused reservation hours, with discounts applied.",
     ),
     col(
         "reservation_net_unused_recurring_fee",
         NUMBER,
-        "The recurring fee of the unused Reserved Instance capacity, after discounts.",
+        "The recurring fees associated with unused reservation hours for Partial Upfront and No Upfront Reserved Instances, with discounts applied.",
     ),
     col(
         "reservation_net_upfront_value",
         NUMBER,
-        "The upfront value of the Reserved Instance, after discounts.",
+        "The upfront value of the Reserved Instance, with discounts applied.",
     ),
     col(
         "reservation_normalized_units_per_reservation",
         STRING,
-        "The number of normalized units of each reservation.",
+        "The number of normalized units for each instance of a reservation subscription.",
     ),
     col(
         "reservation_number_of_reservations",
         STRING,
-        "The number of reservations that this line item covers.",
+        "The number of reservations that are covered by this subscription. For example, one Reserved Instance subscription might have four associated Reserved Instance reservations.",
     ),
     col(
         "reservation_recurring_fee_for_usage",
         NUMBER,
-        "The recurring fee of the usage covered by the Reserved Instance.",
+        "The recurring fee amortized for usage time, for partial upfront Reserved Instances and no upfront Reserved Instances.",
     ),
     col(
         "reservation_reservation_a_r_n",
         STRING,
-        "The ARN of the Reserved Instance that applies to this line item.",
+        "The Amazon Resource Name (ARN) of the Reserved Instance that this line item benefited from. This is also called the Reserved Instance Lease ID. The value string also contains the AWS service name and the Region where the Reserved Instance was purchased.",
     ),
     col(
         "reservation_start_time",
         STRING,
-        "The start date and time of the term of the Reserved Instance.",
+        "The start date of the term of the associated Reserved Instance.",
     ),
     col(
         "reservation_subscription_id",
         STRING,
-        "The identifier of the subscription that the Reserved Instance belongs to.",
+        "A unique identifier that maps a line item with the associated offer. We recommend you use the Reserved Instance ARN as your identifier of joining with Reserved Instance related data.",
     ),
     col(
         "reservation_total_reserved_normalized_units",
         STRING,
-        "The total number of normalized units that the reservations cover.",
+        "The total number of reserved normalized units for all instances for a reservation subscription.",
     ),
     col(
         "reservation_total_reserved_units",
         STRING,
-        "The total number of units that the reservations cover.",
+        "For Amazon EC2 and Amazon RDS, this is the total number of units reserved for all instances for a reservation subscription.",
     ),
     col(
         "reservation_units_per_reservation",
         STRING,
-        "The number of units of each reservation.",
+        "For Amazon EC2 and Amazon RDS, this is the total number of units reserved for a single instance.",
     ),
     col(
         "reservation_unused_amortized_upfront_fee_for_billing_period",
         NUMBER,
-        "The amortized upfront fee of the unused Reserved Instance capacity in the billing period.",
+        "The amortized portion of the initial upfront fee for all upfront Reserved Instances and partial upfront Reserved Instances that you did not use during the billing period.",
     ),
     col(
         "reservation_unused_normalized_unit_quantity",
         NUMBER,
-        "The number of unused normalized units of the Reserved Instance.",
+        "The number of unused normalized units for a size-flexible Regional Reserved Instance that you didn't use during this billing period.",
     ),
     col(
         "reservation_unused_quantity",
         NUMBER,
-        "The number of unused units of the Reserved Instance.",
+        "The number of reservation hours that you didn't use during this billing period.",
     ),
     col(
         "reservation_unused_recurring_fee",
         NUMBER,
-        "The recurring fee of the unused Reserved Instance capacity.",
+        "The recurring fees associated with your unused reservation hours for partial upfront and no upfront Reserved Instances.",
     ),
     col(
         "reservation_upfront_value",
         NUMBER,
-        "The upfront value of the Reserved Instance.",
+        "The upfront price paid for your AWS Reserved Instance. For no upfront Reserved Instances, this value is 0.",
     ),
     col(
         "resource_tags",
         MAP,
-        "The tags of the resource that the usage in this line item ran on, as key-value pairs.",
+        "A map column containing key-value pairs of the AWS generated and user-defined tags of the resource of the line item.",
     ),
     col(
         "savings_plan_amortized_upfront_commitment_for_billing_period",
         // The cost and usage dictionary publishes the Savings Plan commitment and rate as
         // TEXT, not as a numeric measure like the other cost columns of this schema.
         STRING,
-        "The upfront payment for the Savings Plan, amortized over the billing period.",
+        "The amount of upfront fee a Savings Plan subscription is costing you for the billing period.",
     ),
     col(
         "savings_plan_end_time",
         STRING,
-        "The end date and time of the term of the Savings Plan.",
+        "The expiration date for the Savings Plan agreement.",
     ),
     col(
         "savings_plan_instance_type_family",
         STRING,
-        "The instance family that the Savings Plan applies to.",
+        "The instance family that is associated with the specified Savings Plan.",
     ),
     col(
         "savings_plan_net_amortized_upfront_commitment_for_billing_period",
         NUMBER,
-        "The amortized upfront commitment of the Savings Plan for the billing period, after discounts.",
+        "The amortized Savings Plan upfront commitment for the billing period, with discounts applied.",
     ),
     col(
         "savings_plan_net_recurring_commitment_for_billing_period",
         NUMBER,
-        "The recurring commitment of the Savings Plan for the billing period, after discounts.",
+        "The Savings Plan recurring commitment for the billing period, with discounts applied.",
     ),
     col(
         "savings_plan_net_savings_plan_effective_cost",
         NUMBER,
-        "The effective cost of the usage covered by the Savings Plan, after discounts.",
+        "The effective cost for the Savings Plan, with discounts applied.",
     ),
     col(
         "savings_plan_offering_type",
         STRING,
-        "The type of the Savings Plan offering.",
+        "Describes the type of Savings Plan purchased.",
     ),
     col(
         "savings_plan_payment_option",
         STRING,
-        "How the Savings Plan is paid for: all upfront, partial upfront or no upfront.",
+        "The payment option for your Savings Plan.",
     ),
     col(
         "savings_plan_purchase_term",
         STRING,
-        "The length of the term of the Savings Plan.",
+        "Describes the duration, or term, of the Savings Plan.",
     ),
     col(
         "savings_plan_recurring_commitment_for_billing_period",
         NUMBER,
-        "The recurring commitment of the Savings Plan for the billing period.",
+        "The monthly recurring fee for your Savings Plan subscriptions.",
     ),
     col(
         "savings_plan_region",
         STRING,
-        "The Region that the Savings Plan was purchased in.",
+        "The AWS Region (geographic area) that hosts your AWS services.",
     ),
     col(
         "savings_plan_savings_plan_a_r_n",
         STRING,
-        "The ARN of the Savings Plan that applies to this line item.",
+        "The unique Savings Plan identifier.",
     ),
     col(
         "savings_plan_savings_plan_effective_cost",
         NUMBER,
-        "The effective cost of the usage covered by the Savings Plan.",
+        "The proportion of the Savings Plan monthly commitment amount that is allocated to each usage line.",
     ),
     col(
         "savings_plan_savings_plan_rate",
         STRING,
-        "The Savings Plan rate of the usage in this line item.",
+        "The Savings Plan rate for the usage.",
     ),
     col(
         "savings_plan_start_time",
         STRING,
-        "The start date and time of the term of the Savings Plan.",
+        "The start date of the Savings Plan agreement.",
     ),
     col(
         "savings_plan_total_commitment_to_date",
         NUMBER,
-        "The commitment of the Savings Plan used to date.",
+        "The total amortized upfront commitment and recurring commitment to date, for a Savings Plan.",
     ),
     col(
         "savings_plan_used_commitment",
         NUMBER,
-        "The portion of the Savings Plan commitment that this line item uses.",
+        "The total of the Savings Plan commitment that was used.",
     ),
     col_when(
         "split_line_item_actual_usage",
         NUMBER,
-        "The usage of the shared resource that this line item is attributed.",
+        "The usage for vCPU or memory based on the metric that you selected for allocating costs.",
         PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
         PROPERTY_TRUE,
     ),
     col_when(
         "split_line_item_net_split_cost",
         NUMBER,
-        "The split cost of the shared resource attributed to this line item, after discounts.",
+        "The effective cost for split cost allocation data, with discounts applied.",
         PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
         PROPERTY_TRUE,
     ),
     col_when(
         "split_line_item_net_unused_cost",
         NUMBER,
-        "The cost of the unused capacity of the shared resource, after discounts.",
+        "The effective unused cost for split cost allocation data, with discounts applied.",
         PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
         PROPERTY_TRUE,
     ),
     col_when(
         "split_line_item_parent_resource_id",
         STRING,
-        "The identifier of the shared resource whose cost this line item splits.",
+        "The resource ID of the parent EC2 instance that is associated with the split cost allocation data.",
         PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
         PROPERTY_TRUE,
     ),
     col_when(
         "split_line_item_public_on_demand_split_cost",
         NUMBER,
-        "The split cost of the shared resource attributed to this line item at public On-Demand rates.",
+        "The split cost for the task, based on public On-Demand Instance rates.",
         PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
         PROPERTY_TRUE,
     ),
     col_when(
         "split_line_item_public_on_demand_unused_cost",
         NUMBER,
-        "The cost of the unused capacity of the shared resource at public On-Demand rates.",
+        "The unused cost for the task, based on public On-Demand Instance rates.",
         PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
         PROPERTY_TRUE,
     ),
     col_when(
         "split_line_item_reserved_usage",
         NUMBER,
-        "The reserved usage of the shared resource that this line item is attributed.",
+        "The usage for vCPU or memory that you reserved for the task.",
         PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
         PROPERTY_TRUE,
     ),
     col_when(
         "split_line_item_split_cost",
         NUMBER,
-        "The cost of the shared resource attributed to this line item.",
+        "The cost of vCPU or memory for the task, based on your usage.",
         PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
         PROPERTY_TRUE,
     ),
     col_when(
         "split_line_item_split_usage",
         NUMBER,
-        "The usage of the shared resource split to this line item.",
+        "The usage for vCPU or memory that was used by the task.",
         PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
         PROPERTY_TRUE,
     ),
     col_when(
         "split_line_item_split_usage_ratio",
         NUMBER,
-        "The ratio of the shared resource's usage that this line item is attributed.",
+        "The ratio of vCPU or memory that the task used, out of the total usage of the EC2 instance.",
         PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
         PROPERTY_TRUE,
     ),
     col_when(
         "split_line_item_unused_cost",
         NUMBER,
-        "The cost of the unused capacity of the shared resource.",
+        "The cost of unused vCPU or memory for the EC2 instance.",
         PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
         PROPERTY_TRUE,
     ),
     col(
         "tags",
         MAP,
-        "The user-defined tags of the resource that the usage in this line item ran on, as key-value pairs.",
+        "A map column containing key-value pairs of the user-defined tags of the line item.",
     ),
 ];
 
-/// The columns of `COST_OPTIMIZATION_RECOMMENDATIONS`, in the dictionary's order.
+/// The columns of `COST_OPTIMIZATION_RECOMMENDATIONS`, in the dictionary's order. This
+/// dictionary publishes every numeric column — costs, percentages and the lookback day
+/// count alike — as `Double`, and the resource's tags as a key-value `Map`.
 const COST_OPTIMIZATION_RECOMMENDATIONS_COLUMNS: &[ColumnSpec] = &[
     col(
         "account_id",
@@ -1284,57 +1335,57 @@ const COST_OPTIMIZATION_RECOMMENDATIONS_COLUMNS: &[ColumnSpec] = &[
     col(
         "action_type",
         STRING,
-        "The action to take to realize the recommendation.",
+        "The type of action you can take to realize the estimated savings for the recommendation.",
     ),
     col(
         "currency_code",
         STRING,
-        "The currency that the estimated costs and savings are reported in.",
+        "The currency code used for the recommendation.",
     ),
     col(
         "current_resource_details",
         STRING,
-        "The configuration of the resource in its current state.",
+        "Details about the current resource, in a JSON string.",
     ),
     col(
         "current_resource_summary",
         STRING,
-        "A summary of the resource in its current state.",
+        "A summary of the current resource configuration.",
     ),
     col(
         "current_resource_type",
         STRING,
-        "The type of the resource in its current state.",
+        "The type of the current resource.",
     ),
     col(
         "estimated_monthly_cost_after_discount",
         DOUBLE,
-        "The estimated monthly cost of the recommended resource, after discounts.",
+        "The estimated monthly cost of the recommended resource after discounts. For Reserved Instances and Savings Plans, it refers to the cost for eligible usage.",
     ),
     col(
         "estimated_monthly_cost_before_discount",
         DOUBLE,
-        "The estimated monthly cost of the recommended resource, before discounts.",
+        "The estimated monthly cost of the current resource before discounts. For Reserved Instances and Savings Plans, it refers to the cost for eligible usage.",
     ),
     col(
         "estimated_monthly_savings_after_discount",
         DOUBLE,
-        "The estimated monthly savings of the recommendation, after discounts.",
+        "The estimated monthly savings amount for the recommendation after discounts.",
     ),
     col(
         "estimated_monthly_savings_before_discount",
         DOUBLE,
-        "The estimated monthly savings of the recommendation, before discounts.",
+        "The estimated monthly savings amount for the recommendation before discounts.",
     ),
     col(
         "estimated_savings_percentage_after_discount",
         DOUBLE,
-        "The estimated savings of the recommendation as a percentage of the current cost, after discounts.",
+        "The estimated savings percentage relative to the total cost over the cost calculation lookback period, after discounts.",
     ),
     col(
         "estimated_savings_percentage_before_discount",
         DOUBLE,
-        "The estimated savings of the recommendation as a percentage of the current cost, before discounts.",
+        "The estimated savings percentage relative to the total cost over the cost calculation lookback period, before discounts.",
     ),
     col(
         "implementation_effort",
@@ -1349,66 +1400,67 @@ const COST_OPTIMIZATION_RECOMMENDATIONS_COLUMNS: &[ColumnSpec] = &[
     col("recommendation_id", STRING, "The ID for the recommendation."),
     col(
         "recommendation_lookback_period_in_days",
-        INTEGER,
+        DOUBLE,
         "The number of days of usage that the recommendation was generated from.",
     ),
     col(
         "recommendation_source",
         STRING,
-        "The source that generated the recommendation.",
+        "The source of the recommendation.",
     ),
     col(
         "recommended_resource_details",
         STRING,
-        "The configuration of the resource that the recommendation proposes.",
+        "Details about the recommended resource, in a JSON string.",
     ),
     col(
         "recommended_resource_summary",
         STRING,
-        "A summary of the resource that the recommendation proposes.",
+        "A summary of the recommended resource configuration.",
     ),
     col(
         "recommended_resource_type",
         STRING,
-        "The type of the resource that the recommendation proposes.",
+        "The type of the recommended resource.",
     ),
     col(
         "region",
         STRING,
-        "The Region of the resource that the recommendation is for.",
+        "The AWS Region of the resource.",
     ),
     col(
         "resource_arn",
         STRING,
-        "The ARN of the resource that the recommendation is for.",
+        "The Amazon Resource Name (ARN) of the resource.",
     ),
     col(
         "restart_needed",
         BOOLEAN,
-        "Whether implementing the recommendation requires restarting the resource.",
+        "Whether or not implementing the recommendation requires a restart.",
     ),
     col(
         "rollback_possible",
         BOOLEAN,
-        "Whether the recommendation can be rolled back once it is implemented.",
+        "Whether or not implementing the recommendation can be rolled back.",
     ),
     col(
         "tags",
-        // The recommendations dictionary publishes the resource's tags as TEXT: one
-        // column carrying the tag set, not a key-value map column like the cost and
-        // usage dictionary's.
-        STRING,
+        // The recommendations dictionary publishes the resource's tags as a key-value
+        // column, which is what a consumer casts the column to.
+        MAP,
         "The tags of the resource that the recommendation is for.",
     ),
 ];
 
-/// The standard columns of the FOCUS 1.0 schema, in the dictionary's order. Shared by
-/// every FOCUS table, because FOCUS 1.2 extends this schema rather than replacing it.
+/// The standard columns of the FOCUS 1.0 schema, in the dictionary's order, with the text
+/// the FOCUS 1.0 specification publishes for each. Shared by the FOCUS 1.0 tables and
+/// carried forward — with the revisions in [`FOCUS_1_2_REVISED_DESCRIPTIONS`] — by FOCUS
+/// 1.2, which extends this schema rather than replacing it.
 const FOCUS_1_0_COLUMNS: &[ColumnSpec] = &[
     col(
         "AvailabilityZone",
         STRING,
-        "A provider-assigned identifier for a physically separated and isolated area within a region.",
+        "A provider-assigned identifier for a physically separated and isolated area within a Region that provides high availability and fault tolerance.",
     ),
     col(
         "BilledCost",
@@ -1428,17 +1480,17 @@ const FOCUS_1_0_COLUMNS: &[ColumnSpec] = &[
     col(
         "BillingCurrency",
         STRING,
-        "The currency that a charge was billed in.",
+        "Represents the currency that a charge was billed in.",
     ),
     col(
         "BillingPeriodEnd",
         TIMESTAMP,
-        "The exclusive end bound of a billing period.",
+        "Represents the exclusive end date and time of a billing period.",
     ),
     col(
         "BillingPeriodStart",
         TIMESTAMP,
-        "The inclusive start bound of a billing period.",
+        "Represents the inclusive start date and time of a billing period.",
     ),
     col(
         "ChargeCategory",
@@ -1453,98 +1505,102 @@ const FOCUS_1_0_COLUMNS: &[ColumnSpec] = &[
     col(
         "ChargeDescription",
         STRING,
-        "A self-contained summary of the charge.",
+        "Self-contained summary of the charge's purpose and price.",
     ),
-    col("ChargeFrequency", STRING, "How often a charge occurs."),
+    col(
+        "ChargeFrequency",
+        STRING,
+        "Indicates how often a charge will occur.",
+    ),
     col(
         "ChargePeriodEnd",
         TIMESTAMP,
-        "The exclusive end bound of a charge period.",
+        "Represents the exclusive end date and time of a charge period.",
     ),
     col(
         "ChargePeriodStart",
         TIMESTAMP,
-        "The inclusive start bound of a charge period.",
+        "Represents the inclusive start date and time within a charge period.",
     ),
     col(
         "CommitmentDiscountCategory",
         STRING,
-        "Whether the commitment discount applies to spend or to usage quantity.",
+        "Indicates whether the commitment-based discount identified in the CommitmentDiscountId column is based on usage quantity or cost (aka \"spend\").",
     ),
     col(
         "CommitmentDiscountId",
         STRING,
-        "The identifier assigned to a commitment discount by the provider.",
+        "The identifier assigned to a commitment-based discount by the provider.",
     ),
     col(
         "CommitmentDiscountName",
         STRING,
-        "The display name assigned to a commitment discount.",
+        "The display name assigned to a commitment-based discount.",
     ),
     col(
         "CommitmentDiscountStatus",
         STRING,
-        "Whether the charge covers used or unused commitment discount capacity.",
+        "Indicates whether the charge corresponds with the consumption of a commitment-based discount or the unused portion of the committed amount.",
     ),
     col(
         "CommitmentDiscountType",
         STRING,
-        "The provider's name for the type of commitment discount applied to the charge.",
+        "A provider-assigned identifier for the type of commitment-based discount applied to the row.",
     ),
     col(
         "ConsumedQuantity",
         NUMBER,
-        "The volume of a metered SKU associated with a resource or service used.",
+        "The volume of a given SKU associated with a resource or service used, based on the Consumed Unit.",
     ),
     col(
         "ConsumedUnit",
         STRING,
-        "The unit that the consumed quantity is measured in.",
+        "Provider-specified measurement unit indicating how a provider measures usage of a given SKU associated with a resource or service.",
     ),
     col(
         "ContractedCost",
         NUMBER,
-        "The contracted unit price multiplied by the pricing quantity.",
+        "Cost calculated by multiplying contracted unit price and the corresponding Pricing Quantity.",
     ),
     col(
         "ContractedUnitPrice",
         NUMBER,
-        "The agreed-upon unit price for a single pricing unit of the SKU.",
+        "The agreed-upon unit price for a single Pricing Unit of the associated SKU, inclusive of negotiated discounts, if present, while excluding negotiated commitment-based discounts or any other discounts.",
     ),
     col(
         "EffectiveCost",
         NUMBER,
-        "The amortized cost of the charge, including the portion of upfront payments that applies to the charge period.",
+        "The amortized cost of the charge after applying all reduced rates, discounts, and the applicable portion of relevant, prepaid purchases (one-time or recurring) that covered this charge.",
     ),
     col(
         "InvoiceIssuerName",
         STRING,
-        "The name of the entity responsible for invoicing the resources or services consumed.",
+        "The name of the entity responsible for invoicing for the resources or services consumed.",
     ),
     col(
         "ListCost",
         NUMBER,
-        "The list unit price multiplied by the pricing quantity.",
+        "Cost calculated by multiplying the list unit price and the corresponding Pricing Quantity.",
     ),
     col(
         "ListUnitPrice",
         NUMBER,
-        "The suggested provider-published unit price for a single pricing unit of the SKU.",
+        "The suggested provider-published unit price for a single Pricing Unit of the associated SKU, exclusive of any discounts.",
     ),
     col(
         "PricingCategory",
         STRING,
-        "The pricing model of the charge at the time of use or purchase.",
+        "Describes the pricing model used for a charge at the time of use or purchase.",
     ),
     col(
         "PricingQuantity",
         NUMBER,
-        "The volume of a given SKU associated with a resource or service used, measured in pricing units.",
+        "The volume of a given SKU associated with a resource or service used or purchased, based on the Pricing Unit.",
     ),
     col(
         "PricingUnit",
         STRING,
-        "The unit that the provider prices a SKU in.",
+        "Provider-specified measurement unit for determining unit prices, indicating how the provider rates measured usage and purchase quantities after applying pricing rules like block pricing.",
     ),
     col(
         "ProviderName",
@@ -1554,67 +1610,82 @@ const FOCUS_1_0_COLUMNS: &[ColumnSpec] = &[
     col(
         "PublisherName",
         STRING,
-        "The name of the entity that produced the resources or services purchased.",
+        "The name of the entity that produced the resources or services that were purchased.",
     ),
     col(
         "RegionId",
         STRING,
-        "The provider-assigned identifier of an isolated geographic area where a resource is provisioned.",
+        "Provider-assigned identifier for an isolated geographic area where a resource is provisioned or a service is provided.",
     ),
     col(
         "RegionName",
         STRING,
-        "The name of an isolated geographic area where a resource is provisioned.",
+        "The name of an isolated geographic area where a resource is provisioned or a service is provided.",
     ),
     col(
         "ResourceId",
         STRING,
-        "The identifier assigned to a resource by the provider.",
+        "Identifier assigned to a resource by the provider.",
     ),
     col(
         "ResourceName",
         STRING,
-        "The display name assigned to a resource.",
+        "Display name assigned to a resource.",
     ),
     col(
         "ResourceType",
         STRING,
-        "The kind of resource that the charge applies to.",
+        "The kind of resource for which you are being charged.",
     ),
     col(
         "ServiceCategory",
         STRING,
-        "The highest-level classification of a service, based on its core function.",
+        "Highest-level classification of a service based on the core function of the service.",
     ),
     col(
         "ServiceName",
         STRING,
-        "The name of the offering that the charge applies to.",
+        "An offering that can be purchased from a provider (for example, cloud virtual machine, SaaS database, professional services from a systems integrator).",
     ),
     col(
         "SkuId",
         STRING,
-        "The provider-assigned identifier of a SKU.",
+        "A unique identifier that defines a provider-supported construct for organizing properties that are common across one or more SKU Prices.",
     ),
     col(
         "SkuPriceId",
         STRING,
-        "The provider-assigned identifier of the SKU price that the charge was rated at.",
+        "A unique identifier that defines the unit price used to calculate the charge.",
     ),
     col(
         "SubAccountId",
         STRING,
-        "The identifier assigned to a grouping of resources or services by the provider.",
+        "An ID assigned to a grouping of resources or services, often used to manage access and/or cost.",
     ),
     col(
         "SubAccountName",
         STRING,
-        "The display name assigned to a sub account.",
+        "A name assigned to a grouping of resources or services, often used to manage access and/or cost.",
     ),
     col(
         "Tags",
         MAP,
-        "The tags of the charge's resource or service, as key-value pairs.",
+        "The set of tags assigned to a resource or charge, which may include both provider-defined and user-defined tags.",
+    ),
+];
+
+/// The descriptions the FOCUS 1.2 specification REVISES over FOCUS 1.0's, applied by
+/// [`ColumnGroup::Revised`] when the FOCUS 1.2 schema carries those columns forward. The
+/// FOCUS 1.0 tables keep the text they were published with, so the same column name
+/// carries different published text in the two schemas.
+const FOCUS_1_2_REVISED_DESCRIPTIONS: &[(&str, &str)] = &[
+    (
+        "ChargeCategory",
+        "Represents the highest-level classification of a charge based on the nature of how it is billed.",
+    ),
+    (
+        "ChargeClass",
+        "Indicates whether the row represents a correction to a previously invoiced billing period.",
     ),
 ];
 
@@ -1633,62 +1704,62 @@ const FOCUS_1_2_ADDED_COLUMNS: &[ColumnSpec] = &[
     col(
         "CapacityReservationStatus",
         STRING,
-        "Whether the charge covers used or unused capacity reservation capacity.",
+        "Indicates whether the charge represents either the consumption of a capacity reservation or when a capacity reservation is unused.",
     ),
     col(
         "CommitmentDiscountQuantity",
         NUMBER,
-        "The amount of a commitment discount purchased or accounted for in commitment-discount-related rows.",
+        "The amount of a commitment-based discount purchased or accounted for in commitment-based discount related rows.",
     ),
     col(
         "CommitmentDiscountUnit",
         STRING,
-        "The unit that the commitment discount quantity is measured in.",
+        "The provider-specified measurement unit indicating the quantity of units of a commitment-based discount purchased or accounted for in commitment-based discount related rows.",
     ),
     col(
         "InvoiceId",
         STRING,
-        "The identifier assigned to an invoice by the invoice issuer.",
+        "The unique identifier assigned to an invoice by the invoice issuer.",
     ),
     col(
         "PricingCurrency",
         STRING,
-        "The currency that the pricing of a charge is expressed in.",
+        "Represents the currency of the pricing of a charge.",
     ),
     col(
         "PricingCurrencyContractedUnitPrice",
         NUMBER,
-        "The contracted unit price, expressed in the pricing currency.",
+        "Represents the contracted unit price for a single pricing unit of the associated SKU, in the pricing currency.",
     ),
     col(
         "PricingCurrencyEffectiveCost",
         NUMBER,
-        "The effective cost, expressed in the pricing currency.",
+        "Represents the effective cost of a charge, in the pricing currency.",
     ),
     col(
         "PricingCurrencyListUnitPrice",
         NUMBER,
-        "The list unit price, expressed in the pricing currency.",
+        "Represents the list unit price for a single pricing unit of the associated SKU, in the pricing currency.",
     ),
     col(
         "ServiceSubcategory",
         STRING,
-        "The secondary classification of a service within its service category.",
+        "Secondary classification of the service category for a service.",
     ),
     col(
         "SkuMeter",
         STRING,
-        "A provider-specified description of what the SKU meters.",
+        "A provider-specified description of the metric or event that a SKU measures.",
     ),
     col(
         "SkuPriceDetails",
         MAP,
-        "The provider-specified details of the SKU price, as key-value pairs.",
+        "A map column containing the provider-specified details of a SKU price.",
     ),
     col(
         "SubAccountType",
         STRING,
-        "The provider's name for the type of the sub account.",
+        "A provider-assigned name to identify the type of a sub account.",
     ),
 ];
 
@@ -1698,27 +1769,27 @@ const FOCUS_AWS_EXTENSION_COLUMNS: &[ColumnSpec] = &[
     col(
         "x_CostCategories",
         MAP,
-        "The cost categories that apply to the charge, as key-value pairs.",
+        "A map column containing key-value pairs of the cost categories that are applied to the row.",
     ),
     col(
         "x_Discounts",
         MAP,
-        "The discounts that apply to the charge, as key-value pairs.",
+        "A map column containing key-value pairs of any specific discounts that apply to this row.",
     ),
     col(
         "x_Operation",
         STRING,
-        "The specific Amazon Web Services operation that the charge covers.",
+        "The specific AWS operation covered by this row. This describes the specific usage of the row.",
     ),
     col(
         "x_ServiceCode",
         STRING,
-        "The code of the Amazon Web Services service that the charge applies to.",
+        "The code of the AWS service.",
     ),
     col(
         "x_UsageType",
         STRING,
-        "The usage type of the Amazon Web Services usage that the charge covers.",
+        "The usage details of the row.",
     ),
 ];
 
@@ -1736,10 +1807,12 @@ const FOCUS_DESCRIPTION: &str = "FinOps Open Cost & Usage Specification";
 /// per usage date, rather than a dataset of its own.
 const COST_AND_USAGE_DASHBOARD_DESCRIPTION: &str = "A view over CUR for CostAndUsageDashboard";
 
-/// The columns `COST_AND_USAGE_DASHBOARD` describes itself: the dimensions and measures
-/// the view aggregates the underlying cost and usage line items into. The line-item
-/// columns it carries unchanged are taken over from the cost and usage group instead —
-/// see [`COST_AND_USAGE_DASHBOARD_VIEWED_COLUMNS`].
+/// The columns `COST_AND_USAGE_DASHBOARD` publishes, in the dictionary's order: the
+/// dimensions and measures the view aggregates the underlying cost and usage line items
+/// into, and nothing else. The view is a CURATED schema — it does not re-publish the
+/// cost and usage table's own `bill_*`/`line_item_*`/`pricing_*`/`product_*`/
+/// `reservation_*`/`savings_plan_*` columns, because a client selecting from this table
+/// selects from these aggregate columns.
 const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
     col(
         "billing_period",
@@ -1749,7 +1822,7 @@ const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
     col(
         "usage_date",
         TIMESTAMP,
-        "The date of the usage that this row aggregates, in UTC.",
+        "The start date for the line item in UTC, inclusive. The format is YYYY-MM-DDTHH:mm:ssZ.",
     ),
     col(
         "payer_account_id",
@@ -1759,292 +1832,173 @@ const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
     col(
         "payer_account_name",
         STRING,
-        "The name of the account that pays for the usage in this row.",
+        "The account name of the paying account. For an organization in AWS Organizations, this is the account name of the management account.",
     ),
     col(
         "linked_account_id",
         STRING,
-        "The account ID of the member account that the usage in this row belongs to.",
+        "The account ID of the account that used this line item. For organizations, this can be either the management account or a member account.",
     ),
     col(
         "linked_account_name",
         STRING,
-        "The name of the member account that the usage in this row belongs to.",
+        "The account name of the account that used this line item. For organizations, this can be either the management account or a member account.",
     ),
     col(
         "invoice_id",
         STRING,
-        "The ID of the invoice that includes the usage in this row.",
+        "The ID associated with a specific line item. Until the report is final, the InvoiceId is blank.",
     ),
     col(
         "charge_type",
         STRING,
-        "The type of charge that this row covers, such as usage, tax, credit or refund.",
+        "The type of charge covered by this line item.",
     ),
     col(
         "charge_category",
         STRING,
-        "The classification of the charge that this row covers, based on the nature of how it is billed.",
+        "The category of charge covered by this line item possible values are Running_Usage and non_usage.",
     ),
     col(
         "billing_entity",
         STRING,
-        "The Amazon Web Services organization that the charge in this row was made through, which identifies an AWS Marketplace purchase.",
+        "Helps you identify whether your invoices or transactions are for AWS Marketplace or for purchases of other AWS services.",
     ),
     col(
         "legal_entity",
         STRING,
-        "The Amazon Web Services seller of record for the usage in this row.",
+        "The Seller of Record of a specific product or service.",
     ),
     col(
         "service",
         STRING,
-        "The Amazon Web Services service that the usage in this row belongs to.",
+        "The AWS service that the line item applies to.",
     ),
     col(
         "product_code",
         STRING,
-        "The code of the Amazon Web Services service that the usage in this row belongs to.",
+        "The code of the product measured.",
     ),
     col(
         "product_name",
         STRING,
-        "The name of the product that the usage in this row covers.",
+        "The full name of the AWS service.",
     ),
     col(
         "product_family",
         STRING,
-        "The family of the product that the usage in this row covers.",
+        "The category for the type of product.",
     ),
     col(
         "product_group",
         STRING,
-        "The group of the product that the usage in this row covers.",
+        "The group of products that the line item applies to.",
     ),
     col(
         "operation",
         STRING,
-        "The specific operation that the usage in this row covers.",
+        "The specific AWS operation covered by this line item. This describes the specific usage of the line item.",
     ),
-    col("usage_type", STRING, "The usage details of this row."),
+    col(
+        "usage_type",
+        STRING,
+        "The usage details of the line item.",
+    ),
     col(
         "item_description",
         STRING,
-        "The description of the usage in this row.",
+        "The description of the line item type.",
     ),
     col(
         "region",
         STRING,
-        "The Region that the usage in this row ran in.",
+        "The Region that the usage occurred in.",
     ),
     col(
         "availability_zone",
         STRING,
-        "The Availability Zone that hosted the usage in this row.",
+        "The Availability Zone that hosts this line item. For example, us-east-1a or us-east-1b.",
     ),
     col(
         "instance_type",
         STRING,
-        "The instance type of the instance that the usage in this row ran on.",
+        "Describes the instance type, size, and family, which define the CPU, networking, and storage capacity of your instance.",
     ),
     col(
         "instance_type_family",
         STRING,
-        "The instance family of the instance that the usage in this row ran on.",
+        "The instance family that is associated with the specified usage.",
     ),
     col(
         "current_generation",
         STRING,
-        "Whether the instance that the usage in this row ran on is of the current generation.",
+        "Indicates whether the instance type is of the current generation.",
     ),
     col(
         "platform",
         STRING,
-        "The operating system of the instance that the usage in this row ran on.",
+        "The operating system of the instance.",
     ),
     col(
         "processor",
         STRING,
-        "The processor of the instance that the usage in this row ran on.",
+        "The processor of the instance.",
     ),
     col(
         "processor_features",
         STRING,
-        "The processor features of the instance that the usage in this row ran on.",
+        "The features of the processor of the instance.",
     ),
     col(
         "database_engine",
         STRING,
-        "The database engine that the usage in this row ran.",
+        "The database engine that is running on the instance.",
     ),
     col(
         "tenancy",
         STRING,
-        "The tenancy of the instance that the usage in this row ran on.",
+        "The tenancy of the instance. For example, shared or dedicated.",
     ),
     col(
         "purchase_option",
         STRING,
-        "How the usage in this row is paid for: On-Demand, Reserved or Spot.",
+        "Whether your AWS usage is Reserved, On-Demand, or Spot.",
     ),
     col(
         "usage_quantity",
         NUMBER,
-        "The amount of usage that this row aggregates.",
+        "The amount of usage that you incurred during the specified time period.",
     ),
     col(
         "unblended_cost",
         NUMBER,
-        "The cost of the usage in this row at the rate it was charged at.",
+        "The UnblendedRate multiplied by the UsageAmount.",
     ),
     col(
         "amortized_cost",
         NUMBER,
-        "The cost of the usage in this row with upfront payments amortized over the term they cover.",
+        "The upfront and recurring costs of a reservation or Savings Plan, distributed across the term that they apply to.",
     ),
     col(
         "public_cost",
         NUMBER,
-        "The cost of the usage in this row at public On-Demand rates.",
+        "The total cost for the line item based on public On-Demand Instance rates.",
     ),
     col(
         "ri_sp_arn",
         STRING,
-        "The ARN of the Reserved Instance or Savings Plan that covers the usage in this row.",
+        "The Amazon Resource Name (ARN) of the Reserved Instance or Savings Plan that this line item benefited from.",
     ),
     col(
         "ri_sp_trueup",
         NUMBER,
-        "The true-up charge of the Reserved Instance or Savings Plan that covers the usage in this row.",
+        "The true-up charge for the Reserved Instance or Savings Plan that this line item benefited from.",
     ),
     col(
         "ri_sp_upfront_fees",
         NUMBER,
-        "The upfront fees of the Reserved Instance or Savings Plan that covers the usage in this row.",
+        "The upfront fees for the Reserved Instance or Savings Plan that this line item benefited from.",
     ),
-];
-
-/// The cost and usage columns `COST_AND_USAGE_DASHBOARD` carries unchanged, in the order
-/// it publishes them: the view reports the same column, kind of data and description as
-/// the table it views, so a client that moves a query between the two reads one schema.
-///
-/// The cost and usage columns NOT named here are the ones the view aggregates away: the
-/// line item's own identifier is kept, while the per-resource and split-cost columns the
-/// cost and usage table gates on a table property are not part of this table at all —
-/// this table publishes no such property.
-const COST_AND_USAGE_DASHBOARD_VIEWED_COLUMNS: &[&str] = &[
-    "bill_bill_type",
-    "bill_billing_entity",
-    "bill_billing_period_end_date",
-    "bill_billing_period_start_date",
-    "bill_invoice_id",
-    "bill_invoicing_entity",
-    "bill_payer_account_id",
-    "bill_payer_account_name",
-    "cost_category",
-    "discount",
-    "discount_bundled_discount",
-    "discount_total_discount",
-    "identity_line_item_id",
-    "identity_time_interval",
-    "line_item_availability_zone",
-    "line_item_blended_cost",
-    "line_item_blended_rate",
-    "line_item_currency_code",
-    "line_item_legal_entity",
-    "line_item_line_item_description",
-    "line_item_line_item_type",
-    "line_item_net_unblended_cost",
-    "line_item_net_unblended_rate",
-    "line_item_normalization_factor",
-    "line_item_normalized_usage_amount",
-    "line_item_operation",
-    "line_item_product_code",
-    "line_item_tax_type",
-    "line_item_unblended_cost",
-    "line_item_unblended_rate",
-    "line_item_usage_account_id",
-    "line_item_usage_account_name",
-    "line_item_usage_amount",
-    "line_item_usage_end_date",
-    "line_item_usage_start_date",
-    "line_item_usage_type",
-    "line_item_user_identifier",
-    "pricing_currency",
-    "pricing_lease_contract_length",
-    "pricing_offering_class",
-    "pricing_public_on_demand_cost",
-    "pricing_public_on_demand_rate",
-    "pricing_purchase_option",
-    "pricing_rate_code",
-    "pricing_rate_id",
-    "pricing_term",
-    "product",
-    "product_comment",
-    "product_fee_code",
-    "product_fee_description",
-    "product_from_location_type",
-    "product_from_region_code",
-    "product_instance_family",
-    "product_instance_type",
-    "product_instancesku",
-    "product_location",
-    "product_location_type",
-    "product_operation",
-    "product_pricing_unit",
-    "product_product_family",
-    "product_region_code",
-    "product_servicecode",
-    "product_sku",
-    "product_to_location_type",
-    "product_to_region_code",
-    "product_usagetype",
-    "reservation_amortized_upfront_cost_for_usage",
-    "reservation_amortized_upfront_fee_for_billing_period",
-    "reservation_availability_zone",
-    "reservation_effective_cost",
-    "reservation_end_time",
-    "reservation_modification_status",
-    "reservation_net_amortized_upfront_cost_for_usage",
-    "reservation_net_amortized_upfront_fee_for_billing_period",
-    "reservation_net_effective_cost",
-    "reservation_net_recurring_fee_for_usage",
-    "reservation_net_unused_amortized_upfront_fee_for_billing_period",
-    "reservation_net_unused_recurring_fee",
-    "reservation_net_upfront_value",
-    "reservation_normalized_units_per_reservation",
-    "reservation_number_of_reservations",
-    "reservation_recurring_fee_for_usage",
-    "reservation_reservation_a_r_n",
-    "reservation_start_time",
-    "reservation_subscription_id",
-    "reservation_total_reserved_normalized_units",
-    "reservation_total_reserved_units",
-    "reservation_units_per_reservation",
-    "reservation_unused_amortized_upfront_fee_for_billing_period",
-    "reservation_unused_normalized_unit_quantity",
-    "reservation_unused_quantity",
-    "reservation_unused_recurring_fee",
-    "reservation_upfront_value",
-    "resource_tags",
-    "savings_plan_amortized_upfront_commitment_for_billing_period",
-    "savings_plan_end_time",
-    "savings_plan_instance_type_family",
-    "savings_plan_net_amortized_upfront_commitment_for_billing_period",
-    "savings_plan_net_recurring_commitment_for_billing_period",
-    "savings_plan_net_savings_plan_effective_cost",
-    "savings_plan_offering_type",
-    "savings_plan_payment_option",
-    "savings_plan_purchase_term",
-    "savings_plan_recurring_commitment_for_billing_period",
-    "savings_plan_region",
-    "savings_plan_savings_plan_a_r_n",
-    "savings_plan_savings_plan_effective_cost",
-    "savings_plan_savings_plan_rate",
-    "savings_plan_start_time",
-    "savings_plan_total_commitment_to_date",
-    "savings_plan_used_commitment",
-    "tags",
 ];
 
 /// Every table data exports publishes, ordered by name — the one catalog `GetTable`
@@ -2060,15 +2014,9 @@ pub const TABLE_CATALOG: &[TableSpec] = &[
         name: "COST_AND_USAGE_DASHBOARD",
         description: COST_AND_USAGE_DASHBOARD_DESCRIPTION,
         properties: BILLING_VIEW_ONLY_PROPERTIES,
-        // A VIEW over the cost and usage data: its own aggregate dimensions and measures
-        // first, then the line-item columns it carries over from the viewed table.
-        column_groups: &[
-            ColumnGroup::Own(COST_AND_USAGE_DASHBOARD_COLUMNS),
-            ColumnGroup::View {
-                of: COST_AND_USAGE_REPORT_COLUMNS,
-                columns: COST_AND_USAGE_DASHBOARD_VIEWED_COLUMNS,
-            },
-        ],
+        // A curated VIEW over the cost and usage data: the aggregate dimensions and
+        // measures it publishes, and only those.
+        column_groups: &[ColumnGroup::Own(COST_AND_USAGE_DASHBOARD_COLUMNS)],
     },
     TableSpec {
         name: "COST_AND_USAGE_REPORT",
@@ -2107,7 +2055,13 @@ pub const TABLE_CATALOG: &[TableSpec] = &[
         description: FOCUS_DESCRIPTION,
         properties: FOCUS_1_2_PROPERTIES,
         column_groups: &[
-            ColumnGroup::Own(FOCUS_1_0_COLUMNS),
+            // The FOCUS 1.0 columns carried forward, at the text the 1.2 specification
+            // publishes for them …
+            ColumnGroup::Revised {
+                of: FOCUS_1_0_COLUMNS,
+                revisions: FOCUS_1_2_REVISED_DESCRIPTIONS,
+            },
+            // … the columns 1.2 adds, and the extensions it still needs.
             ColumnGroup::Own(FOCUS_1_2_ADDED_COLUMNS),
             ColumnGroup::View {
                 of: FOCUS_AWS_EXTENSION_COLUMNS,
