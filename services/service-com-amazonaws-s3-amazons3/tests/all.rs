@@ -33,6 +33,8 @@ mod bucket_public_access_block;
 mod bucket_tagging;
 #[path = "all/bucket_versioning.rs"]
 mod bucket_versioning;
+#[path = "all/bucket_website.rs"]
+mod bucket_website;
 #[path = "all/error_message_envelope.rs"]
 mod error_message_envelope;
 // Deliberately empty: this fix's own table for the error-message rule was folded into

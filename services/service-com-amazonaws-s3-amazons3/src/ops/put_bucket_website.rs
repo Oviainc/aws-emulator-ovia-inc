@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketWebsite
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketWebsite`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The website subresource of a general purpose bucket: this handler stores the
+//! `WebsiteConfiguration` the request carries on the bucket it names, and
+//! `GetBucketWebsite` reports it back.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketWebsite::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -129,14 +126,22 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketWebsiteOutput {
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutBucketWebsiteError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketWebsite")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutBucketWebsite")` reports `errors: []`),
+// but `Bucket` is an @httpLabel, so a request can name a bucket that does not exist and
+// AWS answers the service-wide `NoSuchBucket` ("The specified bucket does not exist",
+// `httpError 404`). `extra_errors` widens the set with that shape, which the SERVICE
+// models, so this handler answers the same 404 every other bucket-scoped operation does
+// rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketWebsite",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutBucketWebsiteErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -190,18 +195,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketWebsite` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketWebsiteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketWebsite"))
+        // A write needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine that
+            // is not the shared `InMemoryEngine`; nothing can then be persisted, and
+            // answering 200 would report a configuration that was never recorded, so this
+            // goes out as the server fault S3 publishes for a request it could not carry
+            // out (`InternalError`, HTTP 500) — the channel the bucket subresource put
+            // beside this one uses for the same case.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+
+        // The container the request carried, in the order it arrived. `WebsiteConfiguration`
+        // is the @httpPayload and is required, so reaching here means the boundary parsed
+        // it; `ChecksumAlgorithm` and `ContentMD5` describe the integrity of the bytes that
+        // parsed, so neither changes what is stored.
+        let _ = (&input.checksum_algorithm, &input.content_md5);
+        let configuration = stored_configuration(&input.website_configuration);
+
+        // The bucket is looked up FIRST, so a request that names a bucket this emulator
+        // does not hold answers that — the order every other bucket subresource put keeps —
+        // rather than reporting whatever is wrong with a configuration the bucket could
+        // never have carried.
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(PutBucketWebsiteErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+
+        // Validated BEFORE anything is written, so a refused put leaves the bucket's
+        // current website configuration exactly as it was. AWS refuses a configuration its
+        // own documentation rules out with `InvalidArgument`, a code this service's model
+        // declares no shape for, so the refusal goes out through the unmodelled channel
+        // carrying the code and status a client branches on — the same channel
+        // `PutBucketNotificationConfiguration` answers its container refusals through.
+        if let Err(rejection) = crate::state::validate_website_configuration(&configuration) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                rejection.to_string(),
+            ));
+        }
+
+        // "Sets the configuration of the website that is specified in the website
+        // subresource" (this operation's own documentation): the payload is the complete
+        // container, so what it names becomes the bucket's website configuration in full,
+        // whether the bucket carried one already or none.
+        bucket.set_website(configuration);
+
+        // `Unit` output: success is the modelled 200 and an empty body.
+        Ok(PutBucketWebsiteOutput)
+    }
+}
+
+/// The stored form of the `WebsiteConfiguration` a request carried.
+///
+/// A straight transcription of the modelled container into the store's own shapes: every
+/// member is kept as it arrived, in the order it arrived, because this operation is the one
+/// place a bucket's website configuration comes from and `GetBucketWebsite` has to report it
+/// back unchanged.
+fn stored_configuration(configuration: &WebsiteConfiguration) -> crate::state::BucketWebsite {
+    crate::state::BucketWebsite {
+        index_document_suffix: configuration
+            .index_document
+            .as_ref()
+            .map(|document| document.suffix.clone()),
+        error_document_key: configuration
+            .error_document
+            .as_ref()
+            .map(|document| document.key.clone()),
+        redirect_all_requests_to: configuration.redirect_all_requests_to.as_ref().map(
+            |redirect| crate::state::WebsiteRedirectAllRequestsTo {
+                host_name: redirect.host_name.clone(),
+                protocol: redirect.protocol.clone(),
+            },
+        ),
+        routing_rules: configuration
+            .routing_rules
+            .iter()
+            .flatten()
+            .map(|rule| crate::state::WebsiteRoutingRule {
+                condition: rule.condition.as_ref().map(|condition| {
+                    crate::state::WebsiteRoutingCondition {
+                        http_error_code_returned_equals: condition
+                            .http_error_code_returned_equals
+                            .clone(),
+                        key_prefix_equals: condition.key_prefix_equals.clone(),
+                    }
+                }),
+                redirect: crate::state::WebsiteRedirect {
+                    host_name: rule.redirect.host_name.clone(),
+                    http_redirect_code: rule.redirect.http_redirect_code.clone(),
+                    protocol: rule.redirect.protocol.clone(),
+                    replace_key_prefix_with: rule.redirect.replace_key_prefix_with.clone(),
+                    replace_key_with: rule.redirect.replace_key_with.clone(),
+                },
+            })
+            .collect(),
     }
 }

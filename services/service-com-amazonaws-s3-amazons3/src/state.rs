@@ -1312,6 +1312,369 @@ pub fn default_encryption_rule() -> BucketEncryptionRule {
     }
 }
 
+/// Every value the `Protocol` enum publishes: the two schemes a website redirect may be
+/// made over. Re-exported from the model-generated value list, like [`EVENT_VALUES`], so
+/// there is ONE source of truth for the set.
+pub use crate::ops::types::PROTOCOL_VALUES;
+
+/// How many routing rules one bucket's website configuration may carry.
+///
+/// The published limitation, from `PutBucketWebsite`'s own documentation: "Amazon S3 has a
+/// limitation of 50 routing rules per website configuration. If you require more than 50
+/// routing rules, you can use object redirect." The model bounds `RoutingRules` at neither
+/// end (`smithy_query(query="shape",shape="RoutingRules")`), so this check is what enforces
+/// the limitation, and it also bounds what one bucket's record parks in this process's
+/// memory — a put past it is refused rather than recorded.
+pub const MAX_WEBSITE_ROUTING_RULES: usize = 50;
+
+/// The lowest and highest HTTP status a `Redirect$HttpRedirectCode` may name.
+///
+/// "The HTTP redirect code to use on the response" (that member's own documentation): a
+/// response code that redirects is one of the 3xx class, so a value outside it could not be
+/// used as the member says. The model types the member as a plain string
+/// (`smithy_query(query="shape",shape="HttpRedirectCode")`), so nothing refuses a
+/// non-redirect code before the store does.
+pub const HTTP_REDIRECT_CODES: std::ops::RangeInclusive<u16> = 300..=399;
+
+/// Where every request to a bucket's website endpoint is redirected, as the
+/// `RedirectAllRequestsTo` container of the configuration named it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebsiteRedirectAllRequestsTo {
+    /// `RedirectAllRequestsTo$HostName`, a REQUIRED member: "Name of the host where
+    /// requests are redirected."
+    pub host_name: String,
+    /// `RedirectAllRequestsTo$Protocol`: one of [`PROTOCOL_VALUES`], or `None` when the
+    /// container named none. Nothing is stored for an absent protocol because the default
+    /// is a property of the REQUEST, not of the configuration — "The default is the
+    /// protocol that is used in the original request" (that member's documentation) — so a
+    /// reader reports no protocol rather than inventing one.
+    pub protocol: Option<String>,
+}
+
+/// The condition a stored routing rule applies under: one `Condition` container.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebsiteRoutingCondition {
+    /// `Condition$HttpErrorCodeReturnedEquals`: "The HTTP error code when the redirect is
+    /// applied."
+    pub http_error_code_returned_equals: Option<String>,
+    /// `Condition$KeyPrefixEquals`: "The object key name prefix when the redirect is
+    /// applied."
+    pub key_prefix_equals: Option<String>,
+}
+
+impl WebsiteRoutingCondition {
+    /// Whether the condition names NEITHER of its two members, in which case there is no
+    /// condition to apply the rule under.
+    ///
+    /// Each member is required when the other is absent — "Required when parent element
+    /// `Condition` is specified and sibling `KeyPrefixEquals` is not specified" and the
+    /// mirror sentence on the other member — so a container naming neither is one S3
+    /// refuses rather than records.
+    pub fn is_empty(&self) -> bool {
+        self.http_error_code_returned_equals.is_none() && self.key_prefix_equals.is_none()
+    }
+}
+
+/// Where a stored routing rule redirects to: one `Redirect` container.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebsiteRedirect {
+    /// `Redirect$HostName`: "The host name to use in the redirect request."
+    pub host_name: Option<String>,
+    /// `Redirect$HttpRedirectCode`, within [`HTTP_REDIRECT_CODES`].
+    pub http_redirect_code: Option<String>,
+    /// `Redirect$Protocol`: one of [`PROTOCOL_VALUES`].
+    pub protocol: Option<String>,
+    /// `Redirect$ReplaceKeyPrefixWith`: "The object key prefix to use in the redirect
+    /// request." Mutually exclusive with [`Self::replace_key_with`].
+    pub replace_key_prefix_with: Option<String>,
+    /// `Redirect$ReplaceKeyWith`: "The specific object key to use in the redirect request."
+    pub replace_key_with: Option<String>,
+}
+
+impl WebsiteRedirect {
+    /// Whether the container names none of its members, in which case it specifies no
+    /// redirect at all.
+    ///
+    /// Every member of `Redirect` is documented "Not required if one of the siblings is
+    /// present", so at least one sibling has to be — a container naming none specifies
+    /// nothing and is refused rather than recorded.
+    pub fn is_empty(&self) -> bool {
+        self.host_name.is_none()
+            && self.http_redirect_code.is_none()
+            && self.protocol.is_none()
+            && self.replace_key_prefix_with.is_none()
+            && self.replace_key_with.is_none()
+    }
+}
+
+/// One `RoutingRule` of a bucket's website configuration: when a redirect is applied, and
+/// where to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebsiteRoutingRule {
+    /// `RoutingRule$Condition`, or `None` when the rule names none — in which case the
+    /// redirect applies to every request.
+    pub condition: Option<WebsiteRoutingCondition>,
+    /// `RoutingRule$Redirect`, a REQUIRED member.
+    pub redirect: WebsiteRedirect,
+}
+
+/// One bucket's website configuration, as `PutBucketWebsite` last set it.
+///
+/// Two shapes of configuration, which the container's own documentation keeps apart: one
+/// that redirects EVERY request ([`Self::redirect_all_requests_to`] alone — "If you specify
+/// this property, you can't specify any other property"), and one that serves the bucket as
+/// a website, which "must provide an index document for the bucket" and may add an error
+/// document and routing rules. [`validate_website_configuration`] is what keeps a stored
+/// configuration to one of those two shapes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BucketWebsite {
+    /// `IndexDocument$Suffix`: "A suffix that is appended to a request that is for a
+    /// directory on the website endpoint", or `None` for a redirect-everything
+    /// configuration.
+    pub index_document_suffix: Option<String>,
+    /// `ErrorDocument$Key`: "The object key name to use when a 4XX class error occurs", or
+    /// `None` when the configuration names no error document.
+    pub error_document_key: Option<String>,
+    /// `WebsiteConfiguration$RedirectAllRequestsTo`, or `None` for a configuration that
+    /// serves the bucket as a website rather than redirecting every request.
+    pub redirect_all_requests_to: Option<WebsiteRedirectAllRequestsTo>,
+    /// `WebsiteConfiguration$RoutingRules`, in the order the request carried them, and
+    /// EMPTY when the configuration carried no `RoutingRules` container.
+    ///
+    /// A plain `Vec` rather than an `Option`, because "no routing rules" is ONE state here:
+    /// the XML boundary parses a `RoutingRules` container that names no `RoutingRule` to the
+    /// same absent list as no container at all, so there is nothing for a `None` to mean
+    /// that an empty list does not — and a reader reports the container exactly when there
+    /// is a rule in it.
+    pub routing_rules: Vec<WebsiteRoutingRule>,
+}
+
+/// Why a website configuration is not one S3 would apply to a bucket.
+///
+/// Each variant names the member that is wrong and the constraint it breaks, so the
+/// refusal's message states the rule the caller has to satisfy rather than one request's
+/// wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebsiteConfigurationRejection {
+    /// `RedirectAllRequestsTo` beside another member of the container: "If you specify this
+    /// property, you can't specify any other property"
+    /// (`WebsiteConfiguration$RedirectAllRequestsTo`).
+    RedirectAllNotExclusive {
+        /// The sibling member that may not accompany it.
+        member: &'static str,
+    },
+    /// A configuration that neither redirects every request nor names an index document:
+    /// "the website configuration must provide an index document for the bucket, because
+    /// some requests might not be redirected" (`PutBucketWebsite`'s own documentation).
+    NoIndexDocument,
+    /// An `IndexDocument$Suffix` that is empty or carries a slash: "The suffix must not be
+    /// empty and must not include a slash character" (that member's documentation).
+    InvalidIndexDocumentSuffix {
+        /// The suffix the request carried.
+        suffix: String,
+    },
+    /// An `ErrorDocument$Key` that is empty, which `ObjectKey`'s `length {min 1}` forbids.
+    EmptyErrorDocumentKey,
+    /// More routing rules than [`MAX_WEBSITE_ROUTING_RULES`].
+    TooManyRoutingRules {
+        /// How many the request carried.
+        count: usize,
+    },
+    /// A `Condition` naming neither of its members. See
+    /// [`WebsiteRoutingCondition::is_empty`].
+    EmptyCondition {
+        /// Which routing rule carries it, counted from 1 as the document orders them.
+        rule: usize,
+    },
+    /// A `Redirect` naming none of its members. See [`WebsiteRedirect::is_empty`].
+    EmptyRedirect {
+        /// Which routing rule carries it, counted from 1.
+        rule: usize,
+    },
+    /// A `Redirect` naming both `ReplaceKeyPrefixWith` and `ReplaceKeyWith`: each "can be
+    /// present only if" the other "is not provided" (both members' documentation).
+    ConflictingKeyReplacement {
+        /// Which routing rule carries it, counted from 1.
+        rule: usize,
+    },
+    /// A `Protocol` outside [`PROTOCOL_VALUES`].
+    UnsupportedProtocol {
+        /// The member the value arrived on.
+        member: String,
+        /// The value that is not a published protocol.
+        protocol: String,
+    },
+    /// An `HttpRedirectCode` outside [`HTTP_REDIRECT_CODES`].
+    InvalidHttpRedirectCode {
+        /// Which routing rule carries it, counted from 1.
+        rule: usize,
+        /// The value that is not an HTTP redirect code.
+        code: String,
+    },
+}
+
+impl std::fmt::Display for WebsiteConfigurationRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RedirectAllNotExclusive { member } => write!(
+                f,
+                "WebsiteConfiguration.RedirectAllRequestsTo cannot be specified together \
+                 with {member}"
+            ),
+            Self::NoIndexDocument => write!(
+                f,
+                "WebsiteConfiguration must provide an IndexDocument unless it specifies \
+                 RedirectAllRequestsTo"
+            ),
+            Self::InvalidIndexDocumentSuffix { suffix } => write!(
+                f,
+                "IndexDocument.Suffix must not be empty and must not include a slash \
+                 character, got {suffix:?}"
+            ),
+            Self::EmptyErrorDocumentKey => {
+                write!(f, "ErrorDocument.Key must be at least one character long")
+            }
+            Self::TooManyRoutingRules { count } => write!(
+                f,
+                "WebsiteConfiguration.RoutingRules carries {count} rules, more than the \
+                 {MAX_WEBSITE_ROUTING_RULES} per website configuration"
+            ),
+            Self::EmptyCondition { rule } => write!(
+                f,
+                "RoutingRule {rule}: Condition must specify HttpErrorCodeReturnedEquals or \
+                 KeyPrefixEquals"
+            ),
+            Self::EmptyRedirect { rule } => write!(
+                f,
+                "RoutingRule {rule}: Redirect must specify at least one of HostName, \
+                 HttpRedirectCode, Protocol, ReplaceKeyPrefixWith or ReplaceKeyWith"
+            ),
+            Self::ConflictingKeyReplacement { rule } => write!(
+                f,
+                "RoutingRule {rule}: Redirect.ReplaceKeyPrefixWith can be present only if \
+                 Redirect.ReplaceKeyWith is not provided"
+            ),
+            Self::UnsupportedProtocol { member, protocol } => write!(
+                f,
+                "{member} must be one of {}, got {protocol:?}",
+                PROTOCOL_VALUES.join(", ")
+            ),
+            Self::InvalidHttpRedirectCode { rule, code } => write!(
+                f,
+                "RoutingRule {rule}: Redirect.HttpRedirectCode must be an HTTP redirect \
+                 code between {} and {}, got {code:?}",
+                HTTP_REDIRECT_CODES.start(),
+                HTTP_REDIRECT_CODES.end()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WebsiteConfigurationRejection {}
+
+/// Whether `configuration` is one S3 applies to a bucket, and what is wrong with it when it
+/// is not.
+///
+/// Checked BEFORE anything is written, so a refused put leaves the bucket's current website
+/// configuration exactly as it was — the same order every other bucket subresource put
+/// keeps.
+///
+/// Two of the rules here (`ErrorDocument$Key`'s minimum length and `Protocol`'s value set)
+/// are ALSO modelled constraints the boundary validator refuses before any handler runs.
+/// They are still checked here because this function, not the wire, is what guards the
+/// STORE: a configuration no reader could report back is never recorded, whoever writes it.
+pub fn validate_website_configuration(
+    configuration: &BucketWebsite,
+) -> Result<(), WebsiteConfigurationRejection> {
+    if let Some(redirect_all) = &configuration.redirect_all_requests_to {
+        // "If you specify this property, you can't specify any other property"
+        // (`WebsiteConfiguration$RedirectAllRequestsTo`).
+        for (member, present) in [
+            ("IndexDocument", configuration.index_document_suffix.is_some()),
+            ("ErrorDocument", configuration.error_document_key.is_some()),
+            ("RoutingRules", !configuration.routing_rules.is_empty()),
+        ] {
+            if present {
+                return Err(WebsiteConfigurationRejection::RedirectAllNotExclusive { member });
+            }
+        }
+        check_protocol("RedirectAllRequestsTo.Protocol", &redirect_all.protocol)?;
+        return Ok(());
+    }
+
+    // No redirect-everything container, so the configuration serves the bucket as a website
+    // and "must provide an index document for the bucket" (`PutBucketWebsite`).
+    let Some(suffix) = configuration.index_document_suffix.as_deref() else {
+        return Err(WebsiteConfigurationRejection::NoIndexDocument);
+    };
+    if suffix.is_empty() || suffix.contains('/') {
+        return Err(WebsiteConfigurationRejection::InvalidIndexDocumentSuffix {
+            suffix: suffix.to_string(),
+        });
+    }
+    if configuration
+        .error_document_key
+        .as_deref()
+        .is_some_and(str::is_empty)
+    {
+        return Err(WebsiteConfigurationRejection::EmptyErrorDocumentKey);
+    }
+    if configuration.routing_rules.len() > MAX_WEBSITE_ROUTING_RULES {
+        return Err(WebsiteConfigurationRejection::TooManyRoutingRules {
+            count: configuration.routing_rules.len(),
+        });
+    }
+
+    for (index, rule) in configuration.routing_rules.iter().enumerate() {
+        // Counted the way the document orders the rules, so the message names the rule a
+        // caller can find.
+        let position = index + 1;
+        if rule.condition.as_ref().is_some_and(|condition| condition.is_empty()) {
+            return Err(WebsiteConfigurationRejection::EmptyCondition { rule: position });
+        }
+        if rule.redirect.is_empty() {
+            return Err(WebsiteConfigurationRejection::EmptyRedirect { rule: position });
+        }
+        if rule.redirect.replace_key_prefix_with.is_some() && rule.redirect.replace_key_with.is_some()
+        {
+            return Err(WebsiteConfigurationRejection::ConflictingKeyReplacement {
+                rule: position,
+            });
+        }
+        check_protocol(
+            &format!("RoutingRule {position}: Redirect.Protocol"),
+            &rule.redirect.protocol,
+        )?;
+        if let Some(code) = rule.redirect.http_redirect_code.as_deref() {
+            let status = code.parse::<u16>().ok();
+            if !status.is_some_and(|status| HTTP_REDIRECT_CODES.contains(&status)) {
+                return Err(WebsiteConfigurationRejection::InvalidHttpRedirectCode {
+                    rule: position,
+                    code: code.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Refuse a `Protocol` value outside [`PROTOCOL_VALUES`], naming the member it arrived on.
+fn check_protocol(
+    member: &str,
+    protocol: &Option<String>,
+) -> Result<(), WebsiteConfigurationRejection> {
+    match protocol.as_deref() {
+        Some(value) if !PROTOCOL_VALUES.contains(&value) => {
+            Err(WebsiteConfigurationRejection::UnsupportedProtocol {
+                member: member.to_string(),
+                protocol: value.to_string(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 /// One general purpose bucket this emulator holds.
 #[derive(Debug, Clone, Default)]
 pub struct Bucket {
@@ -1404,6 +1767,18 @@ pub struct Bucket {
     /// Private, like `tags` and `ownership_controls`, so the accessor pair below is the
     /// only way in or out.
     encryption: Option<Vec<BucketEncryptionRule>>,
+    /// The bucket's website configuration, as `PutBucketWebsite` last set it, or `None`
+    /// while no website configuration is associated with the bucket.
+    ///
+    /// `None` is the state a bucket is created in — a bucket is configured as a website
+    /// only by "adding a website configuration" to it (`GetBucketWebsite`'s own
+    /// documentation) — and it is what makes a read answer
+    /// [`NO_SUCH_WEBSITE_CONFIGURATION_CODE`] rather than report a configuration that does
+    /// not exist. Nothing is derived for a never-configured bucket, so a read of one writes
+    /// nothing, the way it does not for [`Self::encryption`].
+    ///
+    /// Private, like `tags`, so the accessor pair below is the only way in or out.
+    website: Option<BucketWebsite>,
     /// The objects the bucket holds, by key, as `PutObject` last recorded each.
     ///
     /// The CURRENT version of each key, and so the whole of a bucket that was never
@@ -1611,6 +1986,23 @@ impl Bucket {
     /// names becomes the bucket's configuration in full.
     pub fn set_encryption(&mut self, rules: Vec<BucketEncryptionRule>) {
         self.encryption = Some(rules);
+    }
+
+    /// The bucket's website configuration, or `None` when no website configuration is
+    /// associated with the bucket.
+    pub fn website(&self) -> Option<&BucketWebsite> {
+        self.website.as_ref()
+    }
+
+    /// Associate `configuration` with the bucket as its whole website configuration.
+    ///
+    /// A replacement, not a merge: `PutBucketWebsite` "sets the configuration of the
+    /// website that is specified in the website subresource" from the complete
+    /// `WebsiteConfiguration` it carries as its payload (that operation's own
+    /// documentation), so what the request names becomes the bucket's configuration in
+    /// full — the way [`Bucket::set_ownership_controls`] replaces the ownership controls.
+    pub fn set_website(&mut self, configuration: BucketWebsite) {
+        self.website = Some(configuration);
     }
 
     /// The object stored at `key`, or `None` when the bucket holds no such key.
@@ -2603,6 +2995,17 @@ pub const NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_CODE: &str =
 /// See [`NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_CODE`].
 pub const NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_MESSAGE: &str =
     "The public access block configuration was not found";
+/// The code S3 answers a read of a bucket that has no website configuration associated
+/// with it, with HTTP 404: "NoSuchWebsiteConfiguration - The specified bucket does not have
+/// a website configuration" (Amazon S3 "Error responses", list of error codes). The
+/// subresource-not-there case, answered the way [`OWNERSHIP_CONTROLS_NOT_FOUND_CODE`]
+/// answers it for ownership controls, because `GetBucketWebsite` reports the configuration
+/// as its WHOLE output document and so has no way to report "there is none" in a 200.
+pub const NO_SUCH_WEBSITE_CONFIGURATION_CODE: &str = "NoSuchWebsiteConfiguration";
+/// See [`NO_SUCH_WEBSITE_CONFIGURATION_CODE`] — the text that same list publishes for it.
+pub const NO_SUCH_WEBSITE_CONFIGURATION_MESSAGE: &str =
+    "The specified bucket does not have a website configuration";
+
 /// The code S3 answers a request whose XML payload does not validate against the schema
 /// the API publishes for it: "MalformedXML - The XML provided does not match the schema"
 /// (`PutBucketTagging`'s own list of special errors), with HTTP 400.
