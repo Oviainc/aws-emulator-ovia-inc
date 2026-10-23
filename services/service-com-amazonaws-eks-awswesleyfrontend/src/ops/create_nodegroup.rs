@@ -177,6 +177,9 @@
 //! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below): the
 //!   model's `errors` list for this operation omits it, but the SERVICE models it and it is
 //!   what a pass-role this caller may not perform is refused with.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see below):
+//!   the model's `errors` list for this operation omits it, but the SERVICE models it and it
+//!   is this API's 404 for a `clusterName` that resolves to no cluster.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -205,9 +208,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // which this one does not list — is widened in through `extra_errors`: `nodeRole` is a role
 // Amazon EKS passes to the node group's instances, so a role the caller may not pass is a
 // PERMISSION failure (403) rather than a bad parameter, exactly as it is on `CreateCluster`.
+// `ResourceNotFoundException` is widened in for the same reason: it is the 404 this SERVICE
+// gives an unresolvable resource (`DescribeNodegroup`, `CreateAddon`, `CreateCapability` and
+// every other operation that resolves a cluster declare it), and a `clusterName` that names
+// no cluster is exactly that — absence, which a client retries after creating the parent,
+// not a 400 bad request.
 #[smithy_macros::operation_error(
     "com.amazonaws.eks#CreateNodegroup",
-    extra_errors = ["AccessDeniedException"]
+    extra_errors = ["AccessDeniedException", "ResourceNotFoundException"]
 )]
 #[derive(Debug)]
 pub enum CreateNodegroupErrorModeled {
@@ -217,6 +225,7 @@ pub enum CreateNodegroupErrorModeled {
     InvalidRequestException(InvalidRequestException),
     ResourceInUseException(ResourceInUseException),
     ResourceLimitExceededException(ResourceLimitExceededException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServerException(ServerException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -319,6 +328,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A node group belongs to one cluster, and a cluster name identifies a
+        // cluster only within one region, so the cluster is resolved in the
+        // region the request is signed for. "Amazon EKS clusters and node groups
+        // are Amazon Web Services Region specific"
+        // (`ResourceNotFoundException`).
+        let cluster_key = (region.clone(), input.cluster_name.clone());
+        // A `clusterName` that resolves to no cluster is ABSENCE, and this service
+        // reports absence one way: the 404 `ResourceNotFoundException` naming the
+        // cluster ([`state::cluster_not_found`]), exactly as `CreateAddon`,
+        // `CreateCapability` and `CreateAccessEntry` do for the same miss. It names
+        // only the resource it could not resolve, so `nodegroupName` — a node group
+        // that was never created — stays unset.
+        let cluster_not_found = || {
+            CreateNodegroupError::from(CreateNodegroupErrorModeled::ResourceNotFoundException(
+                state::cluster_not_found(&input.cluster_name),
+            ))
+        };
+
+        // THE PARENT RESOURCE BEFORE THE REST OF THE REQUEST, as `CreateCapability`
+        // resolves its own: a request that names no cluster is answered for the cluster,
+        // whatever else it carries. The lock is taken only to resolve it, because the
+        // subnet resolution below is a call out to another service.
+        {
+            let mut guard = store.lock();
+            guard.materialize_due_transitions(now);
+            if !guard.clusters.contains_key(&cluster_key) {
+                return Err(cluster_not_found());
+            }
+        }
+
         // The node group's Auto Scaling group launches its nodes into the subnets the
         // request names, so those subnets have to exist — resolved against EC2, which
         // owns them, exactly as `CreateCluster` resolves its own
@@ -335,25 +374,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = store.lock();
         guard.materialize_due_transitions(now);
 
-        // A node group belongs to one cluster, and a cluster name identifies a
-        // cluster only within one region, so the cluster is resolved in the
-        // region the request is signed for. "Amazon EKS clusters and node groups
-        // are Amazon Web Services Region specific"
-        // (`ResourceNotFoundException`).
-        let cluster_key = (region.clone(), input.cluster_name.clone());
+        // The lock was released for that call, so the cluster is resolved AGAIN here:
+        // everything below is decided and written against the cluster as it is now.
         let Some(cluster) = guard.clusters.get(&cluster_key) else {
-            // `CreateNodegroup` models no `ResourceNotFoundException` (see the
-            // error list in this file's header), so a cluster name that names
-            // nothing is reported with the modelled error whose documentation
-            // covers it: `ClientException`, "Actions can include ... specifying
-            // an identifier that is not valid."
-            return Err(CreateNodegroupErrorModeled::ClientException(ClientException {
-                cluster_name: Some(input.cluster_name.clone()),
-                nodegroup_name: Some(input.nodegroup_name.clone()),
-                message: Some(format!("No cluster found for name: {}.", input.cluster_name)),
-                ..Default::default()
-            })
-            .into());
+            return Err(cluster_not_found());
         };
         // "You can only create a node group for your cluster that is equal to
         // the current Kubernetes version for the cluster" — which an EXTERNAL

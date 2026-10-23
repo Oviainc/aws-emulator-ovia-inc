@@ -45,6 +45,44 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether this service serves the request these `parts` came from.
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable
+/// owner of this rule, and it is CALLED here rather than re-implemented: the request's
+/// routing key must match this service's signing name AND its first URI path segment
+/// must be one the generated, model-derived `ROUTE_PATH_SEGMENTS` declares, by exact
+/// segment equality.
+///
+/// That path conjunct is what separates services sharing one SigV4 signing name. FIVE
+/// emulated services sign as `kinesisvideo` and are addressed by that one endpoint
+/// prefix — this archived-media endpoint, the Kinesis Video control plane, Media,
+/// Signaling Channels and WebRTC Storage — so the routing key alone matches all five
+/// and the router, which refuses rather than guesses, answers `500 AmbiguousService`
+/// for ALL of them: a code no AWS model carries. Their modelled path spaces are
+/// DISJOINT at the first segment (`getClip`, `getHLSStreamingSessionURL`,
+/// `listFragments`, … here; `createStream`/`listTagsForStream`/… in the control plane;
+/// `getMedia` in Media; `v1` in Signaling Channels; `joinStorageSession` in WebRTC
+/// Storage), which is exactly the case this framework discriminator exists for.
+///
+/// The helper takes a whole `http::Request` while [`Service::can_handle`] is handed
+/// only the request's parts, so the two things it reads — the URI and the headers —
+/// are re-presented to it as a bodiless request. It reads neither the body nor the
+/// method, so nothing it decides on is missing.
+fn can_handle_parts(parts: &http::request::Parts) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    emulator_server::can_handle_based_on_route_key_and_path(
+        &request,
+        crate::ROUTE_KEY,
+        crate::ROUTE_PATH_SEGMENTS,
+    )
+}
+
 /// The `com-amazonaws-kinesisvideoarchivedmedia-awsacuityreader` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +112,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // Delegated to the framework's own predicate — see [`can_handle_parts`]: this
+        // service's signing name (`kinesisvideo`) is shared with the Kinesis Video
+        // control plane, Media, Signaling Channels and WebRTC Storage, so the claim is
+        // the routing key AND the model-derived first URI path segment. Matching on
+        // the signing name alone would have five services claim every `kinesisvideo`
+        // request, which the router answers with 500 `AmbiguousService` instead of
+        // serving any of them.
+        can_handle_parts(parts)
     }
 
     fn override_operation(

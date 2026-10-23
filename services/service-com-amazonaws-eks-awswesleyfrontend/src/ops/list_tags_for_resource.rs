@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! IMPLEMENTED. Returns the tag map STORED on the resource `resourceArn` names —
-//! create-time `tags` plus every later `TagResource` merge — never an echo of the
-//! request. An ARN no resource in the store owns is a `NotFoundException`.
+//! IMPLEMENTED. PARSES `resourceArn` first — a value that is not a resource ARN of
+//! this service is a `BadRequestException` (400), before any lookup — and then returns
+//! the tag map STORED on the resource it names — create-time `tags` plus every later
+//! `TagResource` merge — never an echo of the request. A well-formed ARN no resource
+//! in the store owns is a `NotFoundException` (404).
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -120,6 +122,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // THE INPUT FIRST: `resourceArn` "identifies the resource to list tags for",
+        // so a value that is not a resource ARN of this service names nothing this API
+        // can address — a syntax failure on the input, which is what
+        // `BadRequestException` ("the request contains a semantic error") reports. The
+        // read path answers it exactly as `TagResource` does, before any lookup: a
+        // malformed ARN is not an absent resource.
+        if !crate::state::is_eks_resource_arn(&input.resource_arn) {
+            return Err(ListTagsForResourceErrorModeled::BadRequestException(
+                crate::state::invalid_resource_arn(),
+            )
+            .into());
+        }
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTagsForResourceError::from(ListTagsForResourceErrorModeled::ServerException(
                 ServerException {

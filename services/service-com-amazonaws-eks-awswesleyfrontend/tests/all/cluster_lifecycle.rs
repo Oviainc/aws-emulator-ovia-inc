@@ -44,7 +44,7 @@ pub(crate) async fn describe(router: &MultiServiceRouter, name: &str) -> Answer 
     .await
 }
 
-async fn delete(router: &MultiServiceRouter, name: &str) -> Answer {
+pub(crate) async fn delete(router: &MultiServiceRouter, name: &str) -> Answer {
     call(
         router,
         REGION,
@@ -665,8 +665,12 @@ async fn tagging_merges_into_the_stored_map_and_is_read_back() {
     }
 }
 
-/// An ARN no resource in the store owns is a 404 on both tag operations — including
-/// the ARN of a cluster that has been deleted.
+/// A WELL-FORMED resource ARN of this service that no resource in the store owns is a
+/// 404 on both tag operations — including the ARN of a cluster that has been deleted.
+///
+/// A value that is not a resource ARN of this service at all is a different answer (400
+/// `BadRequestException`, refused on the input before any lookup); that half of the
+/// rule, and the boundary between the two, is `tests/all/error_class_selection.rs`.
 #[tokio::test]
 async fn an_unowned_resource_arn_is_not_found_on_both_tag_operations() {
     let router = emulator();
@@ -683,8 +687,8 @@ async fn an_unowned_resource_arn_is_not_found_on_both_tag_operations() {
         ("a cluster ARN for a name never created", format!("arn:aws:eks:{REGION}:000000000000:cluster/never")),
         ("the ARN of a deleted cluster", deleted_arn),
         ("a nodegroup ARN, a resource kind this slice does not hold", format!("arn:aws:eks:{REGION}:000000000000:nodegroup/c/n/uuid")),
-        ("an ARN of another service entirely", "arn:aws:s3:::some-bucket".to_string()),
-        ("not an ARN at all", "just-a-string".to_string()),
+        ("a cluster ARN in another partition", "arn:aws-cn:eks:cn-north-1:000000000000:cluster/never".to_string()),
+        ("a partition-global cluster ARN, whose region and account fields are empty", "arn:aws:eks:::cluster/never".to_string()),
     ];
 
     for (case, arn) in &cases {

@@ -666,6 +666,85 @@ pub const FINDING_SCHEMA_VERSION: &str = "2.0";
 /// `arn:aws:...`).
 pub const PARTITION: &str = "aws";
 
+/// The only member of the `DestinationType` enum: "Currently only Amazon S3
+/// buckets are supported" (`smithy_query(shape="DestinationType")` lists `S3`).
+pub const DESTINATION_TYPE_S3: &str = "S3";
+
+/// Every member of `DestinationType`, in model order
+/// (`smithy_query(shape="DestinationType")`).
+pub const DESTINATION_TYPES: [&str; 1] = [DESTINATION_TYPE_S3];
+
+/// A freshly created publishing destination's `PublishingStatus`: GuardDuty has
+/// not yet verified that it can write to the destination
+/// (`smithy_query(shape="PublishingStatus")`).
+pub const PENDING_VERIFICATION: &str = "PENDING_VERIFICATION";
+
+/// A verified destination's `PublishingStatus`: GuardDuty is exporting findings
+/// to it (`smithy_query(shape="PublishingStatus")`).
+pub const PUBLISHING: &str = "PUBLISHING";
+
+/// Every member of `PublishingStatus`, in model order
+/// (`smithy_query(shape="PublishingStatus")`).
+pub const PUBLISHING_STATUSES: [&str; 4] = [
+    PENDING_VERIFICATION,
+    PUBLISHING,
+    "UNABLE_TO_PUBLISH_FIX_DESTINATION_PROPERTY",
+    "STOPPED",
+];
+
+/// How long after `CreatePublishingDestination` the
+/// `PENDING_VERIFICATION` -> [`PUBLISHING`] transition comes due.
+///
+/// A new destination is returned in a non-terminal status, so the move to
+/// [`PUBLISHING`] is a transition the CLOCK owes. AWS documents no span for the
+/// verification, so this one is chosen: non-zero, so a caller reading straight
+/// back still observes `PENDING_VERIFICATION` (and whatever that status refuses),
+/// and short enough that nothing has to wait long for the settled status.
+pub const VERIFICATION_DELAY_MILLIS: i64 = 500;
+
+/// How many publishing destinations one detector may hold.
+///
+/// `ListPublishingDestinations` reports a detector's destinations in pages of
+/// `MaxResults` `range 1..50`
+/// (`smithy_query(operation="ListPublishingDestinations")`), so a detector's whole
+/// collection fits in one page of at most 50. Neither the model nor this
+/// operation's documentation carries a destinations-per-detector figure, so — like
+/// [`MAX_MALWARE_PROTECTION_PLANS_PER_ACCOUNT_PER_REGION`] — this is an
+/// EMULATOR-CHOSEN bound rather than a published quota: a 51st destination is
+/// refused here, where the real service may accept it.
+///
+/// The same number BOUNDS the store: a destination is retained until its detector
+/// is deleted and has no expiry of its own, and it carries the `ClientToken` that
+/// minted it, so without this maximum a caller varying or omitting `ClientToken`
+/// could make the service retain records — and token mappings — without limit.
+pub const PUBLISHING_DESTINATIONS_PER_DETECTOR: usize = 50;
+
+/// The message a create past [`PUBLISHING_DESTINATIONS_PER_DETECTOR`] is refused
+/// with. Like every other rejection here it names the resource class and the
+/// limit, never the caller's values.
+pub fn publishing_destination_limit_message() -> String {
+    format!(
+        "The request is rejected because the detector has reached the limit of {PUBLISHING_DESTINATIONS_PER_DETECTOR} publishing destinations."
+    )
+}
+
+/// Is `arn` a well-formed ARN of `service`?
+///
+/// Form only — nothing resolves the resource it names. An ARN is
+/// `arn:<partition>:<service>:<region>:<account-id>:<resource>` with a non-empty
+/// partition and resource; `region` and `account-id` are empty for the S3 bucket
+/// ARNs GuardDuty publishes to (`arn:aws:s3:::DOC-EXAMPLE-BUCKET/myFolder/` —
+/// `smithy_query(query="doc",shape="DestinationProperties",member="DestinationArn")`),
+/// and the resource keeps any further `:` it carries.
+pub fn is_arn_for(service: &str, arn: &str) -> bool {
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    fields.len() == 6
+        && fields[0] == "arn"
+        && !fields[1].is_empty()
+        && fields[2] == service
+        && !fields[5].is_empty()
+}
+
 // ---------------------------------------------------------------------------
 // Client rejections
 //
@@ -685,6 +764,28 @@ pub const DETECTOR_ID_MEMBER: &str = "detectorId";
 /// The wire name of the `NextToken` member every paginated operation here carries
 /// (`smithy_query(operation="ListDetectors")`), for the same reason.
 pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
+
+/// The wire name of the `DestinationId` member
+/// (`smithy_query(operation="DescribePublishingDestination")` renders it as the
+/// `destinationId` JSON name / URI label).
+pub const DESTINATION_ID_MEMBER: &str = "destinationId";
+
+/// The wire path of `DestinationProperties.DestinationArn`, as a rejection names
+/// it (`smithy_query(shape="DestinationProperties")` gives the members the JSON
+/// names `destinationArn`, `kmsKeyArn` and `expectedBucketOwner`).
+pub const DESTINATION_ARN_MEMBER: &str = "destinationProperties.destinationArn";
+
+/// The wire path of `DestinationProperties.KmsKeyArn`. See
+/// [`DESTINATION_ARN_MEMBER`].
+pub const KMS_KEY_ARN_MEMBER: &str = "destinationProperties.kmsKeyArn";
+
+/// The wire name of the `DestinationType` member
+/// (`smithy_query(operation="CreatePublishingDestination")`).
+pub const DESTINATION_TYPE_MEMBER: &str = "destinationType";
+
+/// The wire path of `DestinationProperties.ExpectedBucketOwner`. See
+/// [`DESTINATION_ARN_MEMBER`].
+pub const EXPECTED_BUCKET_OWNER_MEMBER: &str = "destinationProperties.expectedBucketOwner";
 
 /// The wire name of the `ThreatIntelSetId` member, as the request carries it in the
 /// URI (`smithy_query(operation="GetThreatIntelSet")` renders it
@@ -733,6 +834,12 @@ pub fn is_detector_id(id: &str) -> bool {
 /// The message for a member whose VALUE cannot be a value of that member at all.
 pub fn invalid_parameter_message(member: &str) -> String {
     format!("The request is rejected because the parameter {member} has an invalid value.")
+}
+
+/// The message for a member the request left out that the service cannot act
+/// without.
+pub fn missing_parameter_message(member: &str) -> String {
+    format!("The request is rejected because the parameter {member} is required.")
 }
 
 /// The message for a well-formed id that this account does not own — an id
@@ -949,6 +1056,13 @@ pub fn not_authorized_message(member: &str) -> String {
 /// account/Region does not hold is an ownership failure.
 pub fn detector_id_rejection(detector_id: &str) -> String {
     minted_id_rejection(DETECTOR_ID_MEMBER, detector_id)
+}
+
+/// Classify a `DestinationId` the detector does not hold, the same way: a
+/// publishing destination id is one of the ids this service mints, so it is
+/// refused exactly as a detector id is.
+pub fn destination_id_rejection(destination_id: &str) -> String {
+    minted_id_rejection(DESTINATION_ID_MEMBER, destination_id)
 }
 
 /// The wire name of the `MalwareProtectionPlanId` member, as the request carries
@@ -1328,6 +1442,17 @@ pub struct Detector {
     /// This detector's filters, keyed by filter name. `DeleteDetector` drops them
     /// with the detector.
     pub filters: BTreeMap<String, FilterRecord>,
+    /// This detector's publishing destinations, keyed by `DestinationId`. A
+    /// destination belongs to the detector it was created under, so
+    /// `DeleteDetector` drops them with the detector.
+    ///
+    /// BOUNDED by [`PUBLISHING_DESTINATIONS_PER_DETECTOR`]: a destination is
+    /// retained until its detector is deleted and has no expiry of its own, and
+    /// each one carries the `ClientToken` that minted it
+    /// ([`Detector::publishing_destination_for_token`]), so the idempotency index
+    /// is bounded by the same maximum rather than growing with the
+    /// REQUEST-chosen tokens.
+    pub publishing_destinations: BTreeMap<String, PublishingDestinationRecord>,
     /// This detector's ThreatIntelSets, keyed by minted `ThreatIntelSetId`.
     /// `DeleteDetector` drops them with the detector.
     pub threat_intel_sets: BTreeMap<String, ThreatIntelSetRecord>,
@@ -1482,6 +1607,22 @@ impl Detector {
                 additional_configuration: Vec::new(),
             });
         }
+    }
+
+    /// The publishing destination a create carrying `token` already minted, if any
+    /// — the `@idempotencyToken` lookup, scoped to the detector the destination
+    /// hangs off, the way [`Self::threat_intel_set_for_token`] is.
+    ///
+    /// The token lives ON the record, so the index is bounded by
+    /// [`PUBLISHING_DESTINATIONS_PER_DETECTOR`] with the destinations themselves
+    /// and a mapping cannot outlive the resource it names.
+    pub fn publishing_destination_for_token(
+        &self,
+        token: &str,
+    ) -> Option<&PublishingDestinationRecord> {
+        self.publishing_destinations
+            .values()
+            .find(|destination| destination.client_token.as_deref() == Some(token))
     }
 
     /// Put every named finding this detector holds into the `archived` state,
@@ -2384,6 +2525,72 @@ pub struct MalwareProtectionPlan {
     pub status: String,
 }
 
+/// One publishing destination: the resource a detector exports its findings to,
+/// plus the KMS key those findings are encrypted with.
+///
+/// The destination properties are stored exactly as the create accepted them —
+/// nothing is published, so the ARNs are only ever reported back.
+#[derive(Debug, Clone)]
+pub struct PublishingDestinationRecord {
+    pub id: String,
+    /// `DestinationType`: a member of [`DESTINATION_TYPES`].
+    pub destination_type: String,
+    /// "The ARN of the resource to publish to"
+    /// (`smithy_query(shape="DestinationProperties")`).
+    pub destination_arn: String,
+    /// "The ARN of the KMS key to use for encryption"
+    /// (`smithy_query(shape="DestinationProperties")`).
+    pub kms_key_arn: String,
+    /// The expected owner of the destination bucket. "This field appears in the
+    /// response only if it was provided when the publishing destination was
+    /// created or updated"
+    /// (`smithy_query(query="doc",shape="DestinationProperties",member="ExpectedBucketOwner")`),
+    /// so it stays absent until a request supplies it.
+    pub expected_bucket_owner: Option<String>,
+    /// `PublishingStatus`: a member of [`PUBLISHING_STATUSES`].
+    pub status: String,
+    /// The instant the verification this destination is waiting on comes due, in
+    /// epoch milliseconds; `None` once [`Self::settle`] has materialised it.
+    pub verification_due_millis: Option<i64>,
+    /// "The time, in epoch millisecond format, at which GuardDuty was first unable
+    /// to publish findings to the destination"
+    /// (`smithy_query(query="doc",shape="DescribePublishingDestinationResponse",member="PublishingFailureStartTimestamp")`).
+    /// Zero while publishing to this destination has never failed, which is every
+    /// destination this emulator holds: nothing is published, so nothing fails.
+    pub publishing_failure_start_millis: i64,
+    pub tags: BTreeMap<String, String>,
+    /// The `ClientToken` the create that minted this destination carried, if any —
+    /// the `@idempotencyToken` index, kept on the record so it cannot outlive the
+    /// destination it names. Read it through
+    /// [`Detector::publishing_destination_for_token`].
+    pub client_token: Option<String>,
+    pub created_at_millis: i64,
+    pub updated_at_millis: i64,
+}
+
+impl PublishingDestinationRecord {
+    /// Materialise the verification the clock already owes: a destination created
+    /// at `t` reports [`PENDING_VERIFICATION`] until `t +
+    /// VERIFICATION_DELAY_MILLIS` and [`PUBLISHING`] from then on.
+    ///
+    /// Only the clock moves the status here, and it moves it at an instant fixed
+    /// by the create, so a read that settles it shows exactly what a read at the
+    /// same instant would have shown had nobody called in between. A status a
+    /// request moved away from `PENDING_VERIFICATION` is left alone.
+    pub fn settle(&mut self, now: i64) {
+        let Some(due) = self.verification_due_millis else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.verification_due_millis = None;
+        if self.status == PENDING_VERIFICATION {
+            self.status = PUBLISHING.to_string();
+        }
+    }
+}
+
 /// One stored finding. Timestamps are kept as epoch milliseconds — the single
 /// source for both the ISO-8601 strings the wire carries and the numeric
 /// comparisons `FindingCriteria` makes.
@@ -2856,6 +3063,81 @@ pub fn validate_feature_configurations(
     }
     Ok(())
 }
+
+/// Refuse a `DestinationType` this service does not support, returning the AWS
+/// service a destination of that type is an ARN of.
+///
+/// The accepted set is the `DestinationType` enum itself
+/// (`smithy_query(shape="DestinationType")`), checked here rather than at the
+/// boundary because this service validates its enum-valued members in the
+/// handler, the way `Features` is checked above.
+pub fn validate_destination_type(destination_type: &str) -> Result<&'static str, String> {
+    DESTINATION_SERVICES
+        .iter()
+        .find(|(name, _)| *name == destination_type)
+        .map(|(_, service)| *service)
+        .ok_or_else(|| {
+            format!(
+                "{DESTINATION_TYPE_MEMBER}: '{destination_type}' is not a supported destination type. Supported types are {}.",
+                DESTINATION_TYPES.join(", ")
+            )
+        })
+}
+
+/// Refuse a `DestinationProperties` this service cannot accept, returning the
+/// destination and KMS key ARNs it validated, or the message the refusal carries.
+///
+/// `CreatePublishingDestination` takes "the properties of the publishing
+/// destination, including the ARNs for the destination and the KMS key used for
+/// encryption"
+/// (`smithy_query(query="doc",shape="CreatePublishingDestinationRequest",member="DestinationProperties")`),
+/// so both ARNs are required; each must be a well-formed ARN of the service its
+/// own member names ("The ARN of the resource to publish to", "The ARN of the KMS
+/// key to use for encryption" — `smithy_query(shape="DestinationProperties")`),
+/// and `ExpectedBucketOwner`, where supplied, must be "The 12-digit Amazon Web
+/// Services account ID of the account that owns the Amazon S3 bucket".
+///
+/// `destination_service` is the one [`validate_destination_type`] resolved, so
+/// the destination ARN is checked against the service its TYPE names rather than
+/// against a hard-coded one.
+pub fn validate_destination_properties(
+    destination_service: &str,
+    properties: &crate::ops::types::DestinationProperties,
+) -> Result<(String, String), String> {
+    let destination_arn = properties
+        .destination_arn
+        .as_deref()
+        .filter(|arn| !arn.is_empty())
+        .ok_or_else(|| missing_parameter_message(DESTINATION_ARN_MEMBER))?;
+    if !is_arn_for(destination_service, destination_arn) {
+        return Err(invalid_parameter_message(DESTINATION_ARN_MEMBER));
+    }
+    let kms_key_arn = properties
+        .kms_key_arn
+        .as_deref()
+        .filter(|arn| !arn.is_empty())
+        .ok_or_else(|| missing_parameter_message(KMS_KEY_ARN_MEMBER))?;
+    if !is_arn_for(KMS_SERVICE, kms_key_arn) {
+        return Err(invalid_parameter_message(KMS_KEY_ARN_MEMBER));
+    }
+    if let Some(owner) = properties.expected_bucket_owner.as_deref() {
+        if !owner.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid_parameter_message(EXPECTED_BUCKET_OWNER_MEMBER));
+        }
+    }
+    Ok((destination_arn.to_string(), kms_key_arn.to_string()))
+}
+
+/// The AWS service each `DestinationType` member publishes to: an `S3`
+/// destination is an Amazon S3 bucket ARN
+/// (`smithy_query(shape="DestinationType")`, whose only member is `S3`).
+const DESTINATION_SERVICES: [(&str, &str); 1] = [(DESTINATION_TYPE_S3, S3_SERVICE)];
+
+/// The service namespace of an Amazon S3 ARN.
+const S3_SERVICE: &str = "s3";
+
+/// The service namespace of a KMS key ARN.
+const KMS_SERVICE: &str = "kms";
 
 /// Write a `Features` list onto `detector`. A feature the list does not name keeps
 /// the status it already had.
