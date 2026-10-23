@@ -11,11 +11,12 @@
 //! [`FeatureGroupStore::record_identifier_feature_name`] and
 //! [`FeatureGroupStore::event_time_feature_name`].
 //!
-//! The store is held in memory for the life of the process, so its two growth sites are
-//! bounded by a maximum count: [`MAX_FEATURE_GROUPS`] groups, each holding at most
-//! [`MAX_RECORDS_PER_GROUP`] records. A write past either bound is refused (the handler
-//! answers the modelled `ServiceUnavailable`) rather than growing without limit, and a
-//! record carrying a `TtlDuration` is additionally evicted once its expiry is due.
+//! The store is held in memory for the life of the process, so its three growth sites
+//! are bounded by a maximum count: [`MAX_FEATURE_GROUPS`] groups, each holding at most
+//! [`MAX_RECORDS_PER_GROUP`] records, each holding at most [`MAX_FEATURES_PER_RECORD`]
+//! feature values. A write past any of the three is refused (the handler answers the
+//! modelled `ServiceUnavailable`) rather than growing without limit, and a record
+//! carrying a `TtlDuration` is additionally evicted once its expiry is due.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -34,6 +35,16 @@ pub const MAX_FEATURE_GROUPS: usize = 1_000;
 /// identifier, and a caller that passes no `TtlDuration` would otherwise grow the group
 /// without limit.
 pub const MAX_RECORDS_PER_GROUP: usize = 10_000;
+
+/// The most feature values one record of a feature group's OnlineStore keeps.
+///
+/// Same reason as [`MAX_RECORDS_PER_GROUP`], for the one dimension `PutRecord` cannot
+/// grow: a `PutRecord` replaces a record's feature values wholesale, so its residency is
+/// bounded by one request, but `UpdateRecord` is a PARTIAL update — a feature name the
+/// stored record does not carry yet is appended to it — so successive calls naming fresh
+/// names would otherwise grow one record without limit, and each `ValueAsString` is
+/// modelled `len 0..358400`. A merge past this bound is refused rather than taken.
+pub const MAX_FEATURES_PER_RECORD: usize = 1_000;
 
 /// The page size `ListRecords` uses when the caller names no `MaxResults`.
 ///

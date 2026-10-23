@@ -21,3 +21,5 @@ mod pattern_refusal_rendering;
 mod sagemaker_signing_name_routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_record_partial_update.rs"]
+mod update_record_partial_update;
