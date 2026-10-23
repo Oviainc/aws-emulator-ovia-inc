@@ -111,6 +111,36 @@ pub const MAX_APPROVAL_TEAMS: usize = 1_000;
 /// binds (`ListApprovalTeams`, `ListPolicies`, …).
 pub const MAX_LIST_PAGE: i32 = 20;
 
+/// Largest number of tags one resource holds.
+///
+/// AWS's tagging limits allow 50 tags per resource, and this service's own model
+/// corroborates that number: `UntagResource`'s `TagKeys` is `length(min: 0, max: 50)`
+/// (`smithy_query(query="shape",shape="TagKeyList")`), so a single untag call can name
+/// every key a resource is able to carry. `TagResource` reports a request that would
+/// take a resource past it with the `TooManyTagsException` (400) the model declares for
+/// exactly that condition.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// Number of tags a resource holding `existing` would hold once `incoming` keys are
+/// merged into it.
+///
+/// Tagging is a per-key upsert, so a key the resource already carries replaces its
+/// value and adds nothing to the count; only keys it does not carry yet do.
+///
+/// The two borrows are independent: `existing` is only read, and only the keys
+/// `incoming` adds are held, so `incoming` may be borrowed from anywhere.
+#[must_use]
+pub fn merged_tag_count<'a, I>(existing: &BTreeMap<String, String>, incoming: I) -> usize
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let added: ::std::collections::BTreeSet<&str> = incoming
+        .into_iter()
+        .filter(|key| !existing.contains_key(*key))
+        .collect();
+    existing.len() + added.len()
+}
+
 /// The pending deletion window `days` names, or `None` when `days` is not a day count
 /// this service can turn into a duration.
 #[must_use]
@@ -625,6 +655,25 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     /// The stored team with this ARN, for update.
     pub fn team_mut(&mut self, arn: &str) -> Option<&mut ApprovalTeam> {
         self.approval_teams.get_mut(arn)
+    }
+
+    /// The tags of the resource `arn` names, or `None` when this store holds no
+    /// resource under that ARN.
+    ///
+    /// The one place a tagging operation resolves a resource ARN, so `TagResource` and
+    /// `ListTagsForResource` agree on which resources exist and read the same map. The
+    /// approval team is the only resource this service stores, so an ARN naming
+    /// anything else is not found; when another resource is added here, both operations
+    /// pick it up from this one function.
+    #[must_use]
+    pub fn resource_tags(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        self.team(arn).map(|team| &team.tags)
+    }
+
+    /// The tags of the resource `arn` names, for update. Same resolution as
+    /// [`ComAmazonawsMpaAwsfluffycoreserviceState::resource_tags`].
+    pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        self.team_mut(arn).map(|team| &mut team.tags)
     }
 
     /// Every stored team in creation order — the stable ordering

@@ -23,6 +23,10 @@
 //! * The store holds at most [`crate::state::MAX_APPROVAL_TEAMS`] teams; past that the
 //!   call earns the modelled `ServiceQuotaExceededException` (402), so a caller looping
 //!   on create cannot grow this process's memory without end.
+//! * `Tags` naming more than [`crate::state::MAX_TAGS_PER_RESOURCE`] tags earns
+//!   `ValidationException` (400) — the same per-resource ceiling `TagResource` reports
+//!   with `TooManyTagsException`, which this operation does not declare — so no team is
+//!   ever stored already past it.
 //!
 //! A new team is `PENDING` / `PENDING_ACTIVATION` until its approvers have answered their
 //! invitations; see [`crate::state`] for who materialises that.
@@ -253,6 +257,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 },
             )
+            .into());
+        }
+
+        // One resource carries at most `MAX_TAGS_PER_RESOURCE` tags, the ceiling
+        // `TagResource` reports with `TooManyTagsException`. Create is the other path
+        // that writes tags, so it holds the same ceiling and no team is stored already
+        // past it; `CreateApprovalTeam` does not declare `TooManyTagsException`, so the
+        // request is refused with the `ValidationException` (400) it does declare.
+        let tag_count = input
+            .tags
+            .as_ref()
+            .map_or(0, ::std::collections::HashMap::len);
+        if tag_count > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateApprovalTeamErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "Tags names {tag_count} tags, more than the maximum of {} tags allowed \
+                     per resource.",
+                    crate::state::MAX_TAGS_PER_RESOURCE
+                ),
+            })
             .into());
         }
 
