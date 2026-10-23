@@ -23,6 +23,8 @@ mod config_read_shape_and_compliance;
 mod config_retention_configuration_lifecycle;
 #[path = "all/config_setup_and_rule_loop.rs"]
 mod config_setup_and_rule_loop;
+#[path = "all/config_tagging.rs"]
+mod config_tagging;
 #[path = "all/discovered_resources.rs"]
 mod discovered_resources;
 #[path = "all/list_configuration_recorders.rs"]
