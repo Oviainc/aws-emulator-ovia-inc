@@ -216,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // specify values for the following settings because Amazon Aurora uses the values
         // from the specified source DB cluster: DatabaseName Engine EngineVersion
         // StorageEncrypted."
-        if let Some(source) = &input.source_db_cluster_identifier {
+        if input.source_db_cluster_identifier.is_some() {
             let conflicting: Vec<&str> = [
                 ("DatabaseName", input.database_name.is_some()),
                 ("Engine", input.engine.is_some()),
@@ -236,21 +236,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 ));
             }
-            // This service holds NO DB cluster records: every operation that could create
-            // one — `CreateDBCluster`, `RestoreDBClusterFromSnapshot`,
-            // `RestoreDBClusterToPointInTime` — is still a scaffolded 501 (their own stub
-            // issues), so no value resolves to a cluster this global database could take
-            // as its primary, which is the modelled `DBClusterNotFoundFault`. When one of
-            // those operations stores a cluster, this is the lookup that adopts it as the
-            // first member.
-            return Err(CreateGlobalClusterErrorModeled::DBClusterNotFoundFault(
-                DBClusterNotFoundFault {
-                    message: Some(format!(
-                        "The source cluster could not be found or cannot be accessed: {source}"
-                    )),
-                },
-            )
-            .into());
+            // Resolved inside the store section below, against the clusters
+            // `CreateDBCluster` stored: the source becomes the global database's first
+            // member, its PRIMARY, and the four settings above come from it.
         }
         // "Valid Values: aurora-mysql | aurora-postgresql" — a global database is an
         // Aurora resource, so an engine outside that list names nothing it can run.
@@ -325,6 +313,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
+        // `SourceDBClusterIdentifier` resolves against the clusters `CreateDBCluster`
+        // stored — identifier or ARN, case-insensitively, as every cluster-naming member
+        // accepts. A value that resolves to nothing is the modelled
+        // `DBClusterNotFoundFault`, and nothing is stored for it. "Amazon Aurora uses the
+        // values from the specified source DB cluster: DatabaseName Engine EngineVersion
+        // StorageEncrypted", so those four come from the cluster rather than from this
+        // request, which carries none of them (refused above), and the cluster itself
+        // becomes the global database's first member: its primary.
+        let mut inherited = None;
+        if let Some(source) = &input.source_db_cluster_identifier {
+            let Some(cluster) = store.resolve_db_cluster(&_region, source) else {
+                return Err(CreateGlobalClusterErrorModeled::DBClusterNotFoundFault(
+                    DBClusterNotFoundFault {
+                        message: Some(format!(
+                            "The source cluster could not be found or cannot be accessed: {source}"
+                        )),
+                    },
+                )
+                .into());
+            };
+            inherited = Some(SourceCluster {
+                arn: cluster.arn(),
+                engine: cluster.engine.clone(),
+                engine_version: cluster.engine_version.clone(),
+                database_name: cluster.database_name.clone(),
+                storage_encrypted: cluster.storage_encrypted,
+            });
+        }
         // The identifier names one global cluster in the account, and the store is keyed
         // by it alone: a second create under the same identifier is the modelled
         // already-exists fault rather than a silent overwrite of the first.
@@ -367,22 +383,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // primary and secondary DB clusters in the global database" — so it is usable
             // the moment it exists and owes no transition to a later status.
             status: crate::state::GLOBAL_CLUSTER_STATUS_AVAILABLE.to_string(),
-            engine: input.engine,
-            engine_version,
+            engine: match &inherited {
+                Some(source) => Some(source.engine.clone()),
+                None => input.engine,
+            },
+            engine_version: match &inherited {
+                Some(source) => source.engine_version.clone(),
+                None => engine_version,
+            },
             engine_lifecycle_support: input
                 .engine_lifecycle_support
                 .unwrap_or_else(|| crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT.to_string()),
-            database_name: input.database_name,
+            database_name: match &inherited {
+                Some(source) => source.database_name.clone(),
+                None => input.database_name,
+            },
             // "Specifies whether to enable storage encryption for the new global database
             // cluster" / "deletion protection", each off unless the request asks for it.
-            storage_encrypted: input.storage_encrypted.unwrap_or(false),
+            storage_encrypted: match &inherited {
+                Some(source) => source.storage_encrypted,
+                None => input.storage_encrypted.unwrap_or(false),
+            },
             deletion_protection: input.deletion_protection.unwrap_or(false),
-            // The members of a global database are its primary and secondary DB clusters,
-            // which only a DB cluster create or `CreateGlobalCluster`'s own
-            // `SourceDBClusterIdentifier` can supply. Neither can have here (both are
-            // refused above), so the cluster is reported with an EMPTY member list — the
-            // list an empty global database has — rather than an invented member.
-            member_cluster_arns: Vec::new(),
+            // The members of a global database are its primary and secondary DB clusters:
+            // the source cluster this create adopted, when it named one, and otherwise
+            // none — "You can create a global database that is initially empty" — which is
+            // reported as an EMPTY member list rather than an invented member. A later
+            // `CreateDBCluster` naming this global database joins it as a member too.
+            member_cluster_arns: inherited
+                .as_ref()
+                .map(|source| vec![source.arn.clone()])
+                .unwrap_or_default(),
             endpoint_host: crate::state::mint_endpoint_host(mint),
             tags,
         };
@@ -393,4 +424,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             global_cluster: Some(global_cluster),
         })
     }
+}
+
+/// The settings a global database takes from the source DB cluster it was created from,
+/// and that cluster's ARN — its first member.
+struct SourceCluster {
+    arn: String,
+    engine: String,
+    engine_version: Option<String>,
+    database_name: Option<String>,
+    storage_encrypted: bool,
 }

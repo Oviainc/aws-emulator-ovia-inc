@@ -2,10 +2,11 @@
 
 //! @op GetObjectTagging
 //!
-//! Reports the tag set `PutObjectTagging` stored on the named object, and an EMPTY
-//! `TagSet` when the object carries none — this operation's documentation names no
-//! `NoSuchTagSet` error, unlike `GetBucketTagging`'s. Reporting only: nothing about the
-//! object changes, so a later caller sees what this one saw.
+//! Reports the tag set the named object carries — the one a write's `x-amz-tagging` header
+//! stored or `PutObjectTagging` replaced afterwards — and an EMPTY `TagSet` when the object
+//! carries none: this operation's documentation names no `NoSuchTagSet` error, unlike
+//! `GetBucketTagging`'s. Reporting only: nothing about the object changes, so a later
+//! caller sees what this one saw.
 //!
 //! ## Shape of an operation
 //!

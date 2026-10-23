@@ -17,6 +17,8 @@ mod agent_runtime_lifecycle;
 mod gateway_lifecycle;
 #[path = "all/gateway_wire_shape.rs"]
 mod gateway_wire_shape;
+#[path = "all/service_claim.rs"]
+mod service_claim;
 #[path = "all/signing_name_routing.rs"]
 mod signing_name_routing;
 #[path = "all/state_roundtrip.rs"]
