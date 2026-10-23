@@ -238,6 +238,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let bus_name = crate::state::effective_bus_name(input.event_bus_name.as_deref());
+        // The request's own tag count is charged BEFORE the store lock is taken, for
+        // the reason `crate::state::bound_tag_count` records: `TagList` carries no
+        // modelled `@length`, so the work a request can ask for inside the critical
+        // section has to be bounded by the per-resource quota up front.
+        if let Some(reason) = input
+            .tags
+            .as_ref()
+            .map(|tags| crate::state::bound_tag_count(tags.len()))
+            .and_then(Result::err)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
         let mut store = state.lock();
 
         // A rule is bound to an event bus, so a bus that does not exist is a
@@ -277,6 +289,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             |rule| rule.arn.clone(),
         );
         let targets = existing.map(|rule| rule.targets.clone()).unwrap_or_default();
+        // The tag set is NOT part of the configuration this call replaces: "if you
+        // are updating an existing rule, any tags you specify in the PutRule
+        // operation are ignored. To update the tags of an existing rule, use
+        // TagResource and UntagResource" — so a stored rule keeps exactly the tags
+        // the tagging operations left it, and only a rule this call CREATES takes
+        // the request's tags. They go through the same merge every tag write of this
+        // service uses, so one request's repeated key and the per-resource tag bound
+        // are resolved identically wherever tags are written.
+        let mut tags = existing.map(|rule| rule.tags.clone()).unwrap_or_default();
+        if existing.is_none() {
+            if let Err(reason) =
+                crate::state::merge_tags(&mut tags, input.tags.unwrap_or_default())
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(reason));
+            }
+        }
         let record = crate::state::RuleRecord {
             name: input.name.clone(),
             arn: arn.clone(),
@@ -291,6 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_by: Some(crate::state::account_id().to_string()),
             event_bus_name: bus_name,
             targets,
+            tags,
         };
         bus.rules.insert(input.name, record);
 

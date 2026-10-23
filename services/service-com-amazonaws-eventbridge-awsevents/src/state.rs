@@ -94,6 +94,16 @@ pub const MAX_RULES_PER_BUS: usize = 300;
 /// resolved.
 pub const MAX_TARGETS_PER_RULE: usize = 5;
 
+/// Largest number of tags one taggable resource of this service carries.
+///
+/// "You can associate as many as 50 tags with a resource" (`TagResource`). The
+/// modelled `TagList` carries no `@length`, so nothing refuses a longer list
+/// before a handler runs; it is also what bounds the store, since a tag write
+/// past it is refused rather than growing a record without limit. It is charged
+/// on the RESULT of a write, which is what the limit is about: re-setting a key
+/// the resource already carries does not grow its tag set.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 /// The `version` every EventBridge event envelope carries.
 pub const EVENT_VERSION: &str = "0";
 
@@ -225,6 +235,11 @@ pub struct RuleRecord {
     /// Insertion-ordered, which is the order `ListTargetsByRule` pages through;
     /// upsert is keyed by [`StoredTarget::id`].
     pub targets: Vec<StoredTarget>,
+    /// The tags this rule carries, in the order their keys were first written,
+    /// so a tag read reports back exactly what the tag writes left. "In
+    /// EventBridge, rules and event buses can be tagged" (`TagResource`), so a
+    /// rule holds its own tag set beside the bus's ([`EventBus::tags`]).
+    pub tags: Vec<Tag>,
 }
 
 impl RuleRecord {
@@ -624,6 +639,36 @@ impl ComAmazonawsEventbridgeAwseventsState {
         self.buses.get_mut(bus_name)?.rules.get_mut(name)
     }
 
+    /// The tag set of the resource an ARN named ([`parse_tagged_resource`]), for
+    /// a REPORTING operation. `None` when this store holds no such resource,
+    /// which a reader answers with the modelled missing-resource error rather
+    /// than with an empty tag set.
+    pub fn tags_of(&self, resource: &TaggedResource) -> Option<&Vec<Tag>> {
+        match resource {
+            TaggedResource::EventBus(name) => self.bus(name).map(|bus| &bus.tags),
+            TaggedResource::Rule {
+                event_bus_name,
+                name,
+            } => self.rule(event_bus_name, name).map(|rule| &rule.tags),
+        }
+    }
+
+    /// The same tag set, mutably: the ONE place a tag write reaches, so a tag
+    /// write and a tag read can never resolve one ARN to two different records.
+    /// Creates nothing — a resource comes into existence through its own create
+    /// operation, never through a tag write.
+    pub fn tags_of_mut(&mut self, resource: &TaggedResource) -> Option<&mut Vec<Tag>> {
+        match resource {
+            TaggedResource::EventBus(name) => self.bus_mut(name).map(|bus| &mut bus.tags),
+            TaggedResource::Rule {
+                event_bus_name,
+                name,
+            } => self
+                .rule_mut(event_bus_name, name)
+                .map(|rule| &mut rule.tags),
+        }
+    }
+
     /// Append one routed event to the log, evicting the oldest records first so
     /// the log never holds more than [`MAX_DELIVERED_EVENTS`] records or
     /// [`MAX_DELIVERED_BYTES`] bytes of event text.
@@ -741,6 +786,186 @@ pub fn effective_bus_name(event_bus_name_or_arn: Option<&str>) -> String {
 /// Whether `value` names one of `RuleState`'s values.
 pub fn is_rule_state(value: &str) -> bool {
     RULE_STATE_VALUES.contains(&value)
+}
+
+/// A resource of this service a tag can be written to, as an ARN names one.
+///
+/// "In EventBridge, rules and event buses can be tagged" (`TagResource`), and
+/// those are exactly the two resource kinds this emulator holds, so an ARN
+/// resolves to one of them or to nothing at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// `arn:aws:events:<region>:<account>:event-bus/<name>`.
+    EventBus(String),
+    /// `arn:aws:events:<region>:<account>:rule/<bus-if-not-default>/<name>`.
+    Rule {
+        event_bus_name: String,
+        name: String,
+    },
+}
+
+/// The resource an `Arn` names, or `Err(reason)` when the text names no
+/// taggable resource of this service at all.
+///
+/// The ONE place a tagging operation reads a `ResourceARN`, so `TagResource`,
+/// `UntagResource` and `ListTagsForResource` resolve one ARN to one record. The
+/// forms are the ones this service MINTS ([`event_bus_arn`], [`rule_arn`]): an
+/// `events` ARN whose resource segment is `event-bus/<name>`, `rule/<name>` (a
+/// rule on the account's `default` bus) or `rule/<bus>/<name>`. A rule name
+/// carries no `/` (`RuleName`'s pattern `^[\.\-_A-Za-z0-9]+$`) while a bus name
+/// may, so a rule ARN's name is the text after its LAST `/` and the bus is
+/// everything between the resource type and it.
+///
+/// `Arn` is modelled as a plain 1..1600 string, so the boundary validator
+/// passes any text: a value that is not an ARN, or names another service, or
+/// names a resource kind this service does not tag, is a bad request — not a
+/// missing resource. Whether the named resource EXISTS is a separate question,
+/// answered by [`ComAmazonawsEventbridgeAwseventsState::tags_of`]; the ARN's
+/// region and account segments are not part of the identity this store keys on,
+/// which is the resource name, exactly as every other reader of this service
+/// resolves a bus or a rule.
+pub fn parse_tagged_resource(arn: &str) -> Result<TaggedResource, String> {
+    let invalid = || {
+        format!("Parameter ResourceARN is not valid. Reason: {arn:?} is not the ARN of an EventBridge rule or event bus.")
+    };
+    if !is_arn(arn) {
+        return Err(invalid());
+    }
+    let mut fields = arn.splitn(6, ':');
+    let service = fields.nth(2).unwrap_or_default();
+    let resource = fields.nth(2).unwrap_or_default();
+    if service != ARN_NAMESPACE {
+        return Err(invalid());
+    }
+    if let Some(name) = resource.strip_prefix("event-bus/") {
+        if name.is_empty() {
+            return Err(invalid());
+        }
+        return Ok(TaggedResource::EventBus(name.to_string()));
+    }
+    if let Some(path) = resource.strip_prefix("rule/") {
+        let (event_bus_name, name) = match path.rsplit_once('/') {
+            Some((bus, name)) => (bus, name),
+            None => (DEFAULT_EVENT_BUS_NAME, path),
+        };
+        if event_bus_name.is_empty() || name.is_empty() {
+            return Err(invalid());
+        }
+        return Ok(TaggedResource::Rule {
+            event_bus_name: event_bus_name.to_string(),
+            name: name.to_string(),
+        });
+    }
+    Err(invalid())
+}
+
+/// Write `submitted` into the tag set `stored`, or `Err(reason)` when the
+/// request, or the set it would leave, carries more than
+/// [`MAX_TAGS_PER_RESOURCE`] tags.
+///
+/// "If you specify a new tag key, this tag is appended to the list of tags
+/// associated with the resource. If you specify a tag key that is already
+/// associated with the resource, the new tag value that you specify replaces
+/// the previous value for that tag" (`TagResource`) — so this MERGES: a key the
+/// request names takes the value it names, in the position that key already
+/// held, and a key the request does not name keeps the value it had. Entries of
+/// one request are applied in order, so a request repeating a key leaves the
+/// value it names LAST, which is the same rule applied twice.
+///
+/// The bound is charged on the REQUEST's own list FIRST, before anything
+/// caller-sized is built: `TagList` carries no modelled `@length`, so the
+/// request's entry count is bounded only by the request body, while the merged
+/// set always holds at least the request's distinct keys — so a request
+/// carrying more entries than the quota can never be stored anyway, and
+/// refusing it up front keeps every allocation and every comparison below
+/// bounded by the quota rather than by the body. Then the merge runs through a
+/// key→position index, so it is ONE pass over the request rather than a scan of
+/// the merged set per entry. This is the same order `PutTargets` charges
+/// [`MAX_TARGETS_PER_RULE`] in.
+///
+/// All-or-nothing: the bound is charged against the merged set before anything
+/// is written, so a refusal leaves the resource carrying exactly the tags it
+/// carried before.
+pub fn merge_tags(stored: &mut Vec<Tag>, submitted: Vec<Tag>) -> Result<(), String> {
+    bound_tag_count(submitted.len())?;
+    let mut merged = stored.clone();
+    let mut positions: BTreeMap<String, usize> = merged
+        .iter()
+        .enumerate()
+        .map(|(position, tag)| (tag.key.clone(), position))
+        .collect();
+    for tag in submitted {
+        match positions.get(&tag.key) {
+            Some(&position) => merged[position].value = tag.value,
+            None => {
+                positions.insert(tag.key.clone(), merged.len());
+                merged.push(tag);
+            }
+        }
+    }
+    if merged.len() > MAX_TAGS_PER_RESOURCE {
+        return Err(tag_quota_violation(
+            "the request would leave it carrying",
+            merged.len(),
+        ));
+    }
+    *stored = merged;
+    Ok(())
+}
+
+/// Why one request's `Tags` list cannot be stored on any resource, or `Ok(())`
+/// when it can.
+///
+/// A resource carries at most [`MAX_TAGS_PER_RESOURCE`] tags and a merge leaves
+/// at least the request's distinct keys, so a longer list is refused whatever
+/// the resource already carries. A handler calls this BEFORE it takes the store
+/// lock, so the work a request can ask for inside the critical section is
+/// bounded by the quota rather than by the request body.
+pub fn bound_tag_count(count: usize) -> Result<(), String> {
+    if count > MAX_TAGS_PER_RESOURCE {
+        return Err(tag_quota_violation("the request carries", count));
+    }
+    Ok(())
+}
+
+/// What a refusal states for a tag write past [`MAX_TAGS_PER_RESOURCE`]: the
+/// quota, and how many tags the request named or would have left.
+///
+/// The message is built from the request, naming the parameter and the count
+/// that was rejected, the way this service's other request-derived refusals do.
+fn tag_quota_violation(subject: &str, count: usize) -> String {
+    format!(
+        "Parameter Tags is not valid. Reason: a resource can carry at most \
+         {MAX_TAGS_PER_RESOURCE} tags, and {subject} {count}."
+    )
+}
+
+/// Remove from `stored` every tag whose key `keys` names, leaving the order of
+/// the ones that stay.
+///
+/// "Removes one or more tags from the specified EventBridge resource"
+/// (`UntagResource`): the request names keys, so a key the resource does not
+/// carry removes nothing and is not an error — the resource ends up carrying no
+/// tag under any key the request named, which is what was asked for.
+///
+/// `TagKeyList` carries no modelled `@length`, so the request's key count is
+/// bounded only by the request body: the keys are collected into an ordered SET
+/// once and each stored tag is then looked up in it, so the work inside the
+/// store lock is one lookup per STORED tag (at most
+/// [`MAX_TAGS_PER_RESOURCE`] of them) instead of a scan of the request's list
+/// per stored tag.
+pub fn remove_tags(stored: &mut Vec<Tag>, keys: &[String]) {
+    let removed: BTreeSet<&str> = keys.iter().map(String::as_str).collect();
+    stored.retain(|tag| !removed.contains(tag.key.as_str()));
+}
+
+/// What a tagging operation reports for a well-formed ARN naming a resource
+/// this store holds no record of.
+///
+/// The message is built from the request: it names the ARN the caller sent,
+/// the way this service's other request-derived refusals do.
+pub fn no_such_tagged_resource(arn: &str) -> String {
+    format!("Resource {arn} does not exist.")
 }
 
 /// Why a `LogConfig` is not one EventBridge accepts, or `None` when it is.

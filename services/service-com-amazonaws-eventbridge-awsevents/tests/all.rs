@@ -21,6 +21,8 @@ mod event_bus_lifecycle;
 mod input_validation;
 #[path = "all/reserved_event_source.rs"]
 mod reserved_event_source;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/rule_lifecycle.rs"]
 mod rule_lifecycle;
 #[path = "all/state_roundtrip.rs"]
