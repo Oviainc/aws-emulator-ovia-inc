@@ -25,6 +25,8 @@ mod delete_method_response;
 mod documentation_parts;
 #[path = "all/epoch_second_timestamps.rs"]
 mod epoch_second_timestamps;
+#[path = "all/gateway_response.rs"]
+mod gateway_response;
 #[path = "all/method_integration.rs"]
 mod method_integration;
 #[path = "all/method_response.rs"]

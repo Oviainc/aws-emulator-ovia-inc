@@ -36,12 +36,17 @@ pub const SERVICE_SIGNING_NAME: &str = "codeartifact";
 /// generated client config uses.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// The only status a domain this emulator holds can be in: CodeArtifact creates a
+/// The only status a domain this emulator HOLDS can be in: CodeArtifact creates a
 /// domain synchronously and `DescribeDomain` reports it `Active` from the first read, so
 /// there is no transient creating state to move through. (`DomainStatus` models exactly
-/// `Active` and `Deleted`; `Deleted` is never observable, because a deleted domain is
-/// gone from the store.)
+/// `Active` and `Deleted` — `smithy_query(query="shape",shape="DomainStatus")`.)
 pub const DOMAIN_STATUS_ACTIVE: &str = "Active";
+
+/// The terminal status of a domain that has been deleted — the other half of
+/// `DomainStatus`. No domain in the store ever carries it: it belongs to the description
+/// `DeleteDomain` answers with ([`Domain::deleted_description`]), which reports the state
+/// the domain is in AFTER the call, not the record as it was before.
+pub const DOMAIN_STATUS_DELETED: &str = "Deleted";
 
 /// The only status an external connection this emulator holds can be in.
 /// `ExternalConnectionStatus` models exactly one value, `Available`, and the
@@ -573,6 +578,20 @@ impl Domain {
             repository_count: self.repository_count(),
             asset_size_bytes: self.asset_size_bytes(),
             s3_bucket_arn: Some(self.s3_bucket_arn.clone()),
+        }
+    }
+
+    /// The modelled `DomainDescription` of this domain AFTER it has been deleted: the
+    /// projection [`Domain::description`] builds, with `status` moved to the terminal
+    /// [`DOMAIN_STATUS_DELETED`].
+    ///
+    /// A delete answers for the post-delete state of the resource, so the status it
+    /// reports is the one the domain reached by being removed — never the `Active` the
+    /// record carried while it was still held.
+    pub fn deleted_description(&self) -> DomainDescription {
+        DomainDescription {
+            status: Some(DOMAIN_STATUS_DELETED.to_string()),
+            ..self.description()
         }
     }
 
@@ -1431,6 +1450,22 @@ pub fn attached_policy(resource_arn: &str, document: String, attachment: u64) ->
         resource_arn: Some(resource_arn.to_string()),
         document: Some(document),
     }
+}
+
+/// The `ResourcePolicy` a policy delete answers with for the resource `resource_arn`
+/// names: `removed` is the record the resource held, or `None` when it held no policy.
+///
+/// Removing a policy that is not there is the delete's goal already met, not a failure, so
+/// the answer is the bare `ResourcePolicy` ENVELOPE — `resourceArn` identifying the
+/// resource the request targeted, with no `revision` and no `document`, both of which the
+/// model leaves optional. Shared by the domain and the repository policy delete so the two
+/// cannot report "there was nothing to delete" differently.
+pub fn deleted_policy(resource_arn: &str, removed: Option<ResourcePolicy>) -> ResourcePolicy {
+    removed.unwrap_or_else(|| ResourcePolicy {
+        resource_arn: Some(resource_arn.to_string()),
+        revision: None,
+        document: None,
+    })
 }
 
 /// The revision a resource policy carries once it is written.

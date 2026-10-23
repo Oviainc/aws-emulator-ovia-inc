@@ -14,6 +14,10 @@
 //!   against. AWS holds at most ONE per account; the map is keyed by ARN like the
 //!   other two so every replication-set read path resolves the same stored object,
 //!   and the creating path is the single place that invariant is enforced.
+//!   `ssm-contacts` is FRONTED by that onboarding, but it does NOT read this map: that
+//!   service keeps the account's set as its own record
+//!   (`ComAmazonawsSsmcontactsSsmcontactsState::replication_set`), which is what its
+//!   data-plane gate consults.
 //!
 //! `idempotency` records the ARN each `@idempotencyToken` minted the first time, so a
 //! replayed `clientToken` answers with the same ARN instead of creating a second

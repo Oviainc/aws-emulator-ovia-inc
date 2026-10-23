@@ -15,7 +15,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::ops::types::JOB_EXECUTION_STATUS_VALUES;
 use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::state::{
-    command_registry, MAX_PENDING_EXECUTIONS_PER_THING, MAX_STATUS_DETAIL_NAME_LEN,
+    command_registry, MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING, MAX_STATUS_DETAIL_NAME_LEN,
     MAX_STATUS_DETAIL_PAIRS, MAX_STATUS_DETAIL_VALUE_LEN, MAX_TERMINAL_EXECUTIONS_PER_THING,
 };
 use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::EmulatedService;
@@ -1090,10 +1090,12 @@ async fn start_command_execution_refuses_arns_that_name_no_thing_or_command() {
     }
 }
 
-/// RULE: the store a request grows is BOUNDED. A thing may hold at most
-/// `MAX_PENDING_EXECUTIONS_PER_THING` pending executions — a further
-/// `StartCommandExecution` is refused with the modeled
-/// `ServiceQuotaExceededException` and stores nothing — and a thing keeps at most
+/// RULE: the store a request grows is BOUNDED. A device admits at most
+/// `MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING` command executions that have not
+/// reached a terminal status — a further `StartCommandExecution` is refused with
+/// the modeled `ServiceQuotaExceededException` and stores nothing (the limit over a
+/// set of devices and drain states is asserted in
+/// `command_execution_concurrency.rs`) — and a thing keeps at most
 /// `MAX_TERMINAL_EXECUTIONS_PER_THING` finished executions, the oldest evicted
 /// first as new ones are enqueued.
 #[tokio::test]
@@ -1101,7 +1103,7 @@ async fn the_execution_store_is_bounded_per_thing() {
     let emulator = Emulator::new();
 
     let thing = "laser-quota";
-    for index in 0..MAX_PENDING_EXECUTIONS_PER_THING {
+    for index in 0..MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING {
         let (status, body) = emulator
             .start_command(json!({
                 "targetArn": format!("arn:aws:iot:us-east-1:111122223333:thing/{thing}"),
@@ -1132,7 +1134,7 @@ async fn the_execution_store_is_bounded_per_thing() {
     let (_, pending) = emulator.pending(thing).await;
     assert_eq!(
         job_ids(&pending["queuedJobs"]).len(),
-        MAX_PENDING_EXECUTIONS_PER_THING,
+        MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING,
         "case over the quota: the refused request must store nothing"
     );
 

@@ -190,7 +190,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // The account gate comes FIRST: it is evaluated before `ContactId` is resolved, so
-        // a non-onboarded account is refused identically whether or not its contact exists.
+        // a non-onboarded account is refused identically whether or not its contact exists,
+        // and nothing is written.
         state
             .require_active_replication_set()
             .map_err(account_precondition_failed)?;
@@ -227,10 +228,9 @@ const CONTACT_RESOURCE_TYPE: &str = "contact";
 /// The account precondition's refusal: this operation's modelled `ValidationException`,
 /// which the model classifies `client` with `httpError` 400.
 ///
-/// `reason` carries `OTHER` because the failure is not a member-level one, and `OTHER` is
-/// the modelled `ValidationExceptionReason` value for that (the whole value set is rendered
-/// as [`VALIDATION_EXCEPTION_REASON_VALUES`]); `fields` is present but EMPTY for the same
-/// reason — no field of the request is at fault.
+/// `reason` carries `OTHER` (the account-level failure is none of the model's
+/// `CANNOT_PARSE`/`FIELD_VALIDATION_FAILED`/`UNKNOWN_OPERATION`) and `fields` is present
+/// but EMPTY, because no member of the request is at fault.
 fn account_precondition_failed(message: String) -> UpdateContactError {
     UpdateContactErrorModeled::ValidationException(ValidationException {
         message,

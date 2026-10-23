@@ -44,7 +44,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::{AccessDeniedException, RecommendationResourcesAggregates};
+use crate::ops::types::{
+    AccessDeniedException, RecommendationCostOptimizingAggregates,
+    RecommendationPillarSpecificAggregates, RecommendationResourcesAggregates,
+};
 
 /// What this service answers a caller whose account's support plan does not
 /// include the Trusted Advisor API: the support-level gate's refusal, carried by
@@ -115,6 +118,25 @@ pub const EXCLUSION_EXCLUDED: &str = "excluded";
 /// move: its model doc says "This API only supports prioritized
 /// recommendations".
 pub const RECOMMENDATION_TYPE_PRIORITY: &str = "priority";
+
+/// The one `RecommendationPillar`
+/// `RecommendationPillarSpecificAggregates` reports an aggregate for: that
+/// structure models exactly one member, `costOptimizing`, and
+/// `Recommendation$pillarSpecificAggregates` is documented "The pillar
+/// aggregations for cost savings" (`RECOMMENDATION_PILLAR_VALUES` in
+/// `ops::types::shared_types` holds every pillar a recommendation can carry).
+pub const PILLAR_COST_OPTIMIZING: &str = "cost_optimizing";
+
+/// The check-metadata column a Trusted Advisor cost check reports a resource's
+/// estimated monthly saving in — the per-resource figure the cost aggregate
+/// sums.
+///
+/// The savings are read out of the resource's own metadata because that is
+/// where the check reports them (`CheckSummary$metadata` names the columns and
+/// `RecommendationResourceSummary$metadata` carries this resource's values), so
+/// the aggregate is derived from the ONE copy a caller can also read, rather
+/// than from a second, shadow number that could disagree with the column.
+pub const METADATA_ESTIMATED_MONTHLY_SAVINGS: &str = "Estimated Monthly Savings";
 
 /// The three values `ResourceStatus` models, each with the
 /// `RecommendationResourcesAggregates` counter it feeds (see
@@ -329,6 +351,15 @@ pub struct ResourceEntry {
     pub metadata: BTreeMap<String, String>,
     pub last_updated_at_millis: i64,
     pub exclusion_status: String,
+    /// What this resource currently costs per month — the DENOMINATOR of
+    /// `RecommendationCostOptimizingAggregates$estimatedPercentMonthlySavings`,
+    /// which is the recommendation's estimated monthly saving as a percentage
+    /// of what its resources are being spent on today.
+    ///
+    /// `None` for a resource of a check that does not look at cost: no modelled
+    /// member reports this figure, so it exists only where a cost aggregate is
+    /// computed from it, and a non-cost resource contributes nothing.
+    pub estimated_monthly_spend: Option<f64>,
 }
 
 /// Per-service state for com-amazonaws-trustedadvisor-trustedadvisor. A handler reaches it through [`service_state`].
@@ -426,6 +457,96 @@ impl ComAmazonawsTrustedadvisorTrustedadvisorState {
             excluded_count: Some(excluded_count),
         }
     }
+
+    /// The check a recommendation was produced from, or `None` for a
+    /// recommendation that names no check (`Recommendation$checkArn` is
+    /// optional) or names one the store does not hold.
+    ///
+    /// The check map is keyed by check id, so the id is taken back out of the
+    /// stored ARN rather than scanning the map.
+    pub fn check_of(&self, recommendation: &RecommendationEntry) -> Option<&Check> {
+        let arn = recommendation.check_arn.as_deref()?;
+        let (_, check_id) = arn.split_once(":check/")?;
+        self.checks.get(check_id)
+    }
+
+    /// `pillarSpecificAggregates` for a recommendation, COMPUTED from that
+    /// recommendation's own resources on every read.
+    ///
+    /// `Some(..)` exactly when the recommendation optimizes the cost pillar
+    /// ([`PILLAR_COST_OPTIMIZING`]): the structure models one member,
+    /// `costOptimizing`, so a recommendation that optimizes no cost has no
+    /// pillar aggregate to report and the optional member stays absent.
+    ///
+    /// Both members the cost aggregate declares `@required` are totals over
+    /// that recommendation's resources:
+    ///
+    /// * `estimatedMonthlySavings` sums the per-resource saving the check
+    ///   reports in its [`METADATA_ESTIMATED_MONTHLY_SAVINGS`] column;
+    /// * `estimatedPercentMonthlySavings` is that sum as a percentage of the
+    ///   same resources' [`ResourceEntry::estimated_monthly_spend`] — zero when
+    ///   nothing is being spent on them, since no percentage of zero spend is
+    ///   defined.
+    ///
+    /// Both totals span EVERY resource of the recommendation, exactly as
+    /// [`Self::aggregates_for`]'s status counts do: an exclusion is reported on
+    /// its own, as `resourcesAggregates.excludedCount`, rather than by taking
+    /// the resource out of the other aggregates. Nothing is stored, so a
+    /// resource's metadata or spend changing is visible on the very next read.
+    pub fn pillar_aggregates_for(
+        &self,
+        recommendation_arn: &str,
+    ) -> Option<RecommendationPillarSpecificAggregates> {
+        let entry = self.recommendations.get(recommendation_arn)?;
+        if !entry
+            .pillars
+            .iter()
+            .any(|pillar| pillar == PILLAR_COST_OPTIMIZING)
+        {
+            return None;
+        }
+
+        // The positional key of the savings column in this check's headings;
+        // `None` for a cost check that reports no such column, whose resources
+        // then contribute no saving.
+        let savings_column = self
+            .check_of(entry)
+            .and_then(|check| metadata_column(check, METADATA_ESTIMATED_MONTHLY_SAVINGS));
+
+        let mut savings = 0.0f64;
+        let mut spend = 0.0f64;
+        for (_, resource) in self.resources_of(recommendation_arn) {
+            savings += savings_column
+                .and_then(|column| resource.metadata.get(column))
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .unwrap_or(0.0);
+            spend += resource.estimated_monthly_spend.unwrap_or(0.0);
+        }
+
+        let percent = if spend > 0.0 {
+            savings / spend * 100.0
+        } else {
+            0.0
+        };
+        Some(RecommendationPillarSpecificAggregates {
+            cost_optimizing: Some(RecommendationCostOptimizingAggregates {
+                estimated_monthly_savings: savings,
+                estimated_percent_monthly_savings: percent,
+            }),
+        })
+    }
+}
+
+/// The key under which a check's resources carry the `heading` column, i.e. the
+/// positional index of that heading in the check's `metadata` headings, as the
+/// string both metadata maps are keyed by. `None` when the check declares no
+/// such column.
+fn metadata_column<'a>(check: &'a Check, heading: &str) -> Option<&'a str> {
+    check
+        .metadata
+        .iter()
+        .find(|(_, column)| column.as_str() == heading)
+        .map(|(key, _)| key.as_str())
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +689,16 @@ struct SeedResource {
     /// Positionally aligned with the check's `metadata_headings`.
     metadata: &'static [&'static str],
     exclusion_status: &'static str,
+    /// What the account is spending on this resource per month, for a resource
+    /// of a cost-optimizing check: the denominator
+    /// `estimatedPercentMonthlySavings` is taken against (see
+    /// [`ComAmazonawsTrustedadvisorTrustedadvisorState::pillar_aggregates_for`]).
+    /// `None` for a resource of a check that does not look at cost.
+    ///
+    /// Each figure is at least the resource's "Estimated Monthly Savings"
+    /// column: a check's saving is what stopping or right-sizing the resource
+    /// would recover out of that spend, so it can never exceed it.
+    estimated_monthly_spend: Option<f64>,
 }
 
 /// One seeded check, the recommendation it produced, and that recommendation's
@@ -702,6 +833,7 @@ const SEED: &[SeedRow] = &[
                 status: RESOURCE_STATUS_WARNING,
                 metadata: &["us-east-1", "i-0abc1de23f4567890", "m5.xlarge", "72.00"],
                 exclusion_status: EXCLUSION_INCLUDED,
+                estimated_monthly_spend: Some(144.00),
             },
             SeedResource {
                 id: "res-ec2-0002",
@@ -710,6 +842,7 @@ const SEED: &[SeedRow] = &[
                 status: RESOURCE_STATUS_OK,
                 metadata: &["us-west-2", "i-0abc2de23f4567891", "t3.medium", "0.00"],
                 exclusion_status: EXCLUSION_INCLUDED,
+                estimated_monthly_spend: Some(36.00),
             },
             SeedResource {
                 id: "res-ec2-0003",
@@ -718,6 +851,7 @@ const SEED: &[SeedRow] = &[
                 status: RESOURCE_STATUS_WARNING,
                 metadata: &["eu-west-1", "i-0abc3de23f4567892", "c5.2xlarge", "148.00"],
                 exclusion_status: EXCLUSION_INCLUDED,
+                estimated_monthly_spend: Some(260.00),
             },
         ],
     },
@@ -811,6 +945,8 @@ const SEED: &[SeedRow] = &[
                     "412",
                 ],
                 exclusion_status: EXCLUSION_INCLUDED,
+                // Fault tolerance, not cost: nothing to take a percentage of.
+                estimated_monthly_spend: None,
             },
             SeedResource {
                 id: "res-ebs-0002",
@@ -826,6 +962,7 @@ const SEED: &[SeedRow] = &[
                 // Seeded excluded, so the `exclusionStatus` filter and
                 // `excludedCount` have a row from the first read.
                 exclusion_status: EXCLUSION_EXCLUDED,
+                estimated_monthly_spend: None,
             },
         ],
     },
@@ -909,6 +1046,7 @@ const SEED: &[SeedRow] = &[
             status: RESOURCE_STATUS_OK,
             metadata: &["us-east-1", "build-agent", "AKIAIOSFODNN7EXAMPLE", "14"],
             exclusion_status: EXCLUSION_INCLUDED,
+            estimated_monthly_spend: None,
         }],
     },
     SeedRow {
@@ -1003,6 +1141,7 @@ const SEED: &[SeedRow] = &[
                 status: RESOURCE_STATUS_WARNING,
                 metadata: &["us-east-1", "reporting-prod", "db.m5.large", "21", "131.40"],
                 exclusion_status: EXCLUSION_INCLUDED,
+                estimated_monthly_spend: Some(146.00),
             },
             SeedResource {
                 id: "res-rds-0002",
@@ -1011,6 +1150,7 @@ const SEED: &[SeedRow] = &[
                 status: RESOURCE_STATUS_OK,
                 metadata: &["us-west-2", "analytics-staging", "db.t3.medium", "1", "0.00"],
                 exclusion_status: EXCLUSION_INCLUDED,
+                estimated_monthly_spend: Some(72.00),
             },
         ],
     },
@@ -1114,6 +1254,7 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
                         metadata: positional_map(resource.metadata),
                         last_updated_at_millis,
                         exclusion_status: resource.exclusion_status.to_string(),
+                        estimated_monthly_spend: resource.estimated_monthly_spend,
                     },
                 );
             }

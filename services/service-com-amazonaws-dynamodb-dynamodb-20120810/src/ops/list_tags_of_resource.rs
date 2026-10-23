@@ -146,13 +146,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
 
-        // The ARN is this operation's whole selector, and it names the region the
-        // table lives in as well as the table.
-        let resource = crate::state::resolve_resource_arn(&input.resource_arn).map_err(lift)?;
+        // The ARN is this operation's whole selector, and it must address a table of
+        // the endpoint this request reached — the region it is signed for.
+        let resource = crate::state::resolve_resource_arn(
+            &input.resource_arn,
+            &crate::state::request_region(ctx.parts()),
+        )
+        .map_err(lift)?;
 
         // A resource carries at most `MAX_TAGS_PER_TABLE` tags, so its whole set fits
         // in one page and this operation never mints a `NextToken`. A token it never
@@ -170,9 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whose DeleteTable span has elapsed is gone, and this is a read, so that is
         // the only write it makes.
         store.apply_due_transitions(now);
-        let table = store
-            .table(&resource.region, &resource.table)
-            .map_err(lift)?;
+        let table = store.table_by_arn(&resource).map_err(lift)?;
 
         Ok(ListTagsOfResourceOutput {
             tags: Some(crate::state::tag_list(&table.tags)),

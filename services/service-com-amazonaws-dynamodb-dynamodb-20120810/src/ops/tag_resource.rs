@@ -184,13 +184,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
 
-        // The ARN is this operation's whole selector, and it names the region the
-        // table lives in as well as the table.
-        let resource = crate::state::resolve_resource_arn(&input.resource_arn).map_err(lift)?;
+        // The ARN is this operation's whole selector, and it must address a table of
+        // the endpoint this request reached — the region it is signed for.
+        let resource = crate::state::resolve_resource_arn(
+            &input.resource_arn,
+            &crate::state::request_region(ctx.parts()),
+        )
+        .map_err(lift)?;
 
         // The request's tag list is caller-sized, so it is bounded BEFORE anything
         // walks it: a table may carry at most `MAX_TAGS_PER_TABLE` tags, so a list
@@ -204,9 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Finish the transition the clock already made due, so a table whose
         // DeleteTable span has elapsed is not tagged after it is gone.
         store.apply_due_transitions(now);
-        let table = store
-            .table_mut(&resource.region, &resource.table)
-            .map_err(lift)?;
+        let table = store.table_by_arn_mut(&resource).map_err(lift)?;
         // "The operation conflicts with the resource's availability" — a table being
         // deleted cannot take a configuration change, so the tag write is refused
         // rather than applied to a table that is on its way out.
@@ -214,8 +215,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(TagResourceErrorModeled::ResourceInUseException(
                 ResourceInUseException {
                     message: Some(format!(
-                        "Table {} is being deleted and cannot be tagged",
-                        resource.table
+                        "Resource {} is being deleted and cannot be tagged",
+                        resource.arn
                     )),
                 },
             )

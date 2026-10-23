@@ -5,6 +5,11 @@
 //! Removes the resource policy attached to a repository, under the same
 //! optimistic-locking rule as the put (`crate::state::policy_revision_matches`).
 //!
+//! A repository that holds no policy has nothing to remove, which is the delete's goal
+//! already met: the call succeeds with the bare `ResourcePolicy` envelope naming the
+//! repository it targeted ([`crate::state::deleted_policy`]), the same way the domain
+//! policy delete answers.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -211,28 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // Nothing to delete is a not-found, and it is decided BEFORE the lock below so a
-        // repository that never had a policy answers the same way whether or not the
-        // caller named a revision.
-        if repository.policy.is_none() {
-            return Err(
-                DeleteRepositoryPermissionsPolicyErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "Repository policy not found. Repository '{}' in domain '{}' owned by account '{owner}' does not have a resource policy.",
-                            input.repository, input.domain
-                        ),
-                        resource_id: Some(input.repository.clone()),
-                        resource_type: Some("repository".to_string()),
-                    },
-                )
-                .into(),
-            );
-        }
-
         // The optimistic lock, exactly as the put applies it: a caller that named a
         // revision is deleting the policy it read, so a stale revision is refused and the
-        // policy stays attached.
+        // policy stays attached. A repository holding no policy carries no revision, so a
+        // named revision cannot match it either.
         if !crate::state::policy_revision_matches(
             repository.policy.as_ref(),
             input.policy_revision.as_deref(),
@@ -255,9 +242,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The response is the policy as it was immediately before removal, and the
-        // removal is observable to the very next call.
-        let policy = repository.policy.take();
+        // removal is observable to the very next call. A repository that held none is not a
+        // failure: the answer is the envelope naming the repository the request targeted.
+        let removed = repository.policy.take();
 
-        Ok(DeleteRepositoryPermissionsPolicyOutput { policy })
+        Ok(DeleteRepositoryPermissionsPolicyOutput {
+            policy: Some(crate::state::deleted_policy(&repository.arn, removed)),
+        })
     }
 }

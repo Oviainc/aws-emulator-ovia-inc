@@ -5,17 +5,20 @@
 //! ## What this handler does
 //!
 //! Reports the tags stored on the resource its `arn` addresses — the same map
-//! `TagResource` writes and `UntagResource` removes from — and refuses an ARN naming no
-//! live resource with the modelled `ResourceNotFoundException` (HTTP 404). A resource
-//! carrying no tags reports an empty `tags` map rather than an error.
+//! `TagResource` writes and `UntagResource` removes from — and refuses an ARN addressing
+//! no live resource with the modelled not-found payload under HTTP 400
+//! ([`crate::state::unresolvable_arn_refusal`]). A resource carrying no tags reports an
+//! empty `tags` map rather than an error.
 //!
-//! WHICH RESOURCE AN ARN ADDRESSES: the ARN is matched in FULL against the one the
-//! resource was minted with (partition, region and the single account this emulator
-//! presents included), so an ARN naming another account's or another region's resource
-//! resolves to nothing and is answered with that 404 — this surface never reports the
-//! tags of a resource the ARN does not name. Caller-identity authorization beyond that
-//! (IAM policy evaluation, `AccessDeniedException`) is not modelled by this emulator at
-//! all, here or in any other operation of this service.
+//! WHICH RESOURCE AN ARN ADDRESSES: the ARN is resolved by the identity it names
+//! ([`crate::state::parse_resource_arn`]) — partition, account, resource type and
+//! resource id, which is everything that selects a resource of this partitional service
+//! — so another account's or another kind's ARN addresses nothing here and earns that
+//! 400, while the region field, which names nothing to choose between for a service
+//! whose own ARNs leave it empty, does not keep an ARN from resolving. This surface
+//! never reports the tags of a resource the ARN does not name. Caller-identity
+//! authorization beyond that (IAM policy evaluation, `AccessDeniedException`) is not
+//! modelled by this emulator at all, here or in any other operation of this service.
 //!
 //! This operation is `@readonly`: it changes nothing except materialising what the clock
 //! had already made due ([`crate::state::ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::settle`]),
@@ -73,7 +76,10 @@
 //!
 //! ## Errors
 //!
-//! * `ResourceNotFoundException` (HTTP 404) — The specified resource was not found.
+//! * `ResourceNotFoundException` (HTTP 404) — The specified resource was not found. On
+//!   this surface it is what an `arn` resolving to no resource of this account earns, and
+//!   the recorded service answers it under HTTP 400 rather than its modelled 404: see
+//!   [`crate::state::unresolvable_arn_refusal`].
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -170,14 +176,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle(crate::state::now_millis());
 
         let Some(tags) = state.resource_tags(&input.arn) else {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("No resource found with ARN {}", input.arn),
-                    resource_id: input.arn.clone(),
-                    resource_type: crate::state::arn_resource_label(&input.arn),
-                },
-            )
-            .into());
+            // An ARN that addresses nothing is bad INPUT on this surface: the modelled
+            // not-found payload under a 400, as `crate::state::unresolvable_arn_refusal`
+            // explains.
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                    crate::state::unresolvable_arn_refusal(&input.arn),
+                ),
+                crate::state::UNRESOLVABLE_ARN_STATUS,
+            ));
         };
 
         // A resource carrying no tags reports an EMPTY map: the resource exists and the
