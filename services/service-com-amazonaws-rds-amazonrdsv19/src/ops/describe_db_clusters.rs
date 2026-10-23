@@ -259,6 +259,8 @@ fn matches_filter(record: &crate::state::DbClusterRecord, filter: &Filter) -> bo
         // clone group therefore matches nothing, which is what it should: the clusters here
         // are in no clone group.
         "clone-group-id" => false,
+        // Unreachable: `check_filter_names` has already refused every name outside
+        // `SUPPORTED_FILTER_NAMES`. A `&str` match needs the arm all the same.
         _ => false,
     })
 }

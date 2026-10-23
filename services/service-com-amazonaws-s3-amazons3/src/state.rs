@@ -1381,14 +1381,17 @@ pub struct Object {
     pub website_redirect_location: Option<String>,
     /// The user-defined metadata the request carried in its `x-amz-meta-` headers.
     pub metadata: BTreeMap<String, String>,
-    /// The object's tag set, in the order the tagging request carried it.
+    /// The object's tag set, in the order the request that set it carried it — the
+    /// `x-amz-tagging` header of the write, or the modelled `Tagging` container of a later
+    /// `PutObjectTagging`.
     ///
     /// Empty when no tag set is associated with the object: "no tags" and "an empty tag
     /// set" are the same state, which is why `PutObjectTagging` with an empty `TagSet`
     /// leaves an object where `DeleteObjectTagging` would. A `PutObject` REPLACES the
     /// whole object ("You cannot use PutObject to only update a single piece of metadata
-    /// for an existing object"), so the tag set of the object it replaces goes with it;
-    /// only [`ComAmazonawsS3Amazons3State::replace_object_tags`] sets one afterwards.
+    /// for an existing object"), so the tag set of the object it replaces goes with it:
+    /// the write's own header decides the new one, and
+    /// [`ComAmazonawsS3Amazons3State::replace_object_tags`] is what sets one afterwards.
     pub tags: Vec<ResourceTag>,
 }
 

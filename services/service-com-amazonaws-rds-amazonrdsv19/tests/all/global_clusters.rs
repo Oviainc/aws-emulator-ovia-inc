@@ -748,3 +748,124 @@ async fn the_account_allowance_bounds_what_one_account_may_hold() {
         "GlobalClusterQuotaExceededFault",
     );
 }
+
+#[tokio::test]
+async fn a_global_database_created_from_a_stored_cluster_adopts_it() {
+    let router = emulator();
+
+    // (case, how the create NAMES the source cluster). `SourceDBClusterIdentifier` is
+    // resolved the way every cluster-naming member accepts a cluster — the identifier or
+    // the ARN, in either case — so the rows differ along that form, which is what the
+    // rule generalises over.
+    /// How one row NAMES the source cluster: the form the member accepts it in.
+    type NameSource = fn(&str) -> String;
+    let rows: [(&str, NameSource); 4] = [
+        ("by identifier", |identifier| identifier.to_string()),
+        ("by identifier in another case", |identifier| {
+            identifier.to_ascii_uppercase()
+        }),
+        ("by ARN", |identifier| {
+            format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:{identifier}")
+        }),
+        ("by ARN in another case", |identifier| {
+            format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:{}", {
+                identifier.to_ascii_uppercase()
+            })
+        }),
+    ];
+    for (index, (case, name_source)) in rows.iter().enumerate() {
+        let source = format!("emu-global-source-{index}");
+        let global = format!("emu-global-adopt-{index}");
+        // The source cluster carries the four settings the member documents a global
+        // database takes from it: "Amazon Aurora uses the values from the specified source
+        // DB cluster: DatabaseName Engine EngineVersion StorageEncrypted."
+        expect_ok(
+            case,
+            call(
+                &router,
+                "CreateDBCluster",
+                &[
+                    ("DBClusterIdentifier", source.clone()),
+                    ("Engine", "aurora-postgresql".to_string()),
+                    ("EngineVersion", "15.8".to_string()),
+                    ("DatabaseName", "ledger".to_string()),
+                    ("StorageEncrypted", "true".to_string()),
+                ],
+            )
+            .await,
+        );
+        let created = expect_ok(
+            case,
+            call(
+                &router,
+                "CreateGlobalCluster",
+                &[
+                    ("GlobalClusterIdentifier", global.clone()),
+                    ("SourceDBClusterIdentifier", name_source(&source)),
+                ],
+            )
+            .await,
+        );
+        // The global database reports the source's settings and adopts it as its FIRST
+        // member — its primary, which is what `IsWriter` reports — and a later describe
+        // reads the same record back.
+        let read_back = expect_ok(
+            case,
+            call(
+                &router,
+                "DescribeGlobalClusters",
+                &[("GlobalClusterIdentifier", global.as_str())],
+            )
+            .await,
+        );
+        for body in [&created, &read_back] {
+            for (element, want) in [
+                ("Engine", "aurora-postgresql".to_string()),
+                ("EngineVersion", "15.8".to_string()),
+                ("DatabaseName", "ledger".to_string()),
+                ("StorageEncrypted", "true".to_string()),
+                (
+                    "DBClusterArn",
+                    format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:{source}"),
+                ),
+                ("IsWriter", "true".to_string()),
+            ] {
+                assert_eq!(
+                    text(body, element),
+                    want,
+                    "case {case:?}: the global database takes <{element}> from the cluster it \
+                     adopted, expected {want:?}, got {body}"
+                );
+            }
+        }
+    }
+
+    // The counterpart, which the row above is the complement of: a source nothing created
+    // resolves to no cluster, so the create is the modelled not-found fault and stores no
+    // global database. (The identifier forms above all resolve; this one cannot.)
+    expect_error(
+        "a source cluster no create stored",
+        call(
+            &router,
+            "CreateGlobalCluster",
+            &[
+                ("GlobalClusterIdentifier", "emu-global-adopt-absent"),
+                ("SourceDBClusterIdentifier", "emu-cluster-never-created"),
+            ],
+        )
+        .await,
+        404,
+        "DBClusterNotFoundFault",
+    );
+    expect_error(
+        "a source cluster no create stored",
+        call(
+            &router,
+            "DescribeGlobalClusters",
+            &[("GlobalClusterIdentifier", "emu-global-adopt-absent")],
+        )
+        .await,
+        404,
+        "GlobalClusterNotFoundFault",
+    );
+}
