@@ -23,8 +23,8 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Hex codec for ListModels' opaque NextToken (the page boundary, encoded) and for
-# rendering the hex id a lineage entity's ARN carries.
+# Hex codec for the opaque NextToken (the page boundary, encoded) this service's
+# listings mint, and for rendering the hex id a lineage entity's ARN carries.
 hex = { workspace = true }
 # Digest behind `state::mint_opaque_resource_id`, the server-generated id an ARN that
 # does not carry its resource's name is minted with.

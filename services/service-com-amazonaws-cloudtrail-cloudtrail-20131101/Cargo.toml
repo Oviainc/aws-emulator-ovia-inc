@@ -8,12 +8,14 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# `service-common` carries two readers this crate needs.
 # `rpc_target`: the one reading of an `awsJson` `X-Amz-Target` — which service and which
 # operation it names — which this service's routing seams read because its published
 # target prefix is the fully qualified Coral name and so carries dots of its own.
 # `arn`: the ONE parse of a caller-supplied resource ARN (the six fields, the vendor,
 # the resource type and the id of a resource of that type), which every tagging call
-# reads its `ResourceId` through.
+# reads its `ResourceId` through and which the resource-policy operations read their
+# `ResourceArn` through.
 service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

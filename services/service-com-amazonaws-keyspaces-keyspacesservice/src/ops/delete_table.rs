@@ -166,7 +166,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // The service-managed keyspaces and their system tables are part of the account
+        // before any call.
+        store.ensure_service_managed_catalog(&region);
         store.settle(now);
+
+        // A system table of a service-managed keyspace is the SERVICE's table, not the
+        // caller's: Cassandra refuses DDL against a system keyspace as an invalid query
+        // ("system keyspace is not user-modifiable"), which is this operation's
+        // `ValidationException`. It exists, so a 404 would be wrong, and the next caller
+        // must still find it, so a delete would be worse.
+        if crate::state::is_service_managed_keyspace(&input.keyspace_name) {
+            return Err(DeleteTableErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::service_managed_rejection(&input.keyspace_name)),
+            })
+            .into());
+        }
 
         let Some(keyspace) = store.keyspaces.get_mut(&input.keyspace_name) else {
             return Err(DeleteTableErrorModeled::ResourceNotFoundException(

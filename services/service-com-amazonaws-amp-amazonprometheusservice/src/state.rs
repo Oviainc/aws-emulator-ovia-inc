@@ -222,10 +222,28 @@ pub const QUERY_LOGGING_RESOURCE_TYPE: &str = "AWS::APS::QueryLoggingConfigurati
 /// operations — reads the same value every time.
 pub const WORKSPACE_NOT_FOUND_MESSAGE: &str = "Workspace not found.";
 
-/// The `message` the modelled `ResourceNotFoundException` reports for a `resourceArn`
-/// the `/tags/{resourceArn}` operations resolve to nothing. Constant and id-free for the
-/// same reason [`WORKSPACE_NOT_FOUND_MESSAGE`] is; the ARN is reported in `resourceId`.
-pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found.";
+/// The `message` the ARN-addressed `/tags/{resourceArn}` operations report for a
+/// `resourceArn` that resolves to nothing — RECORDED BEHAVIOUR, like
+/// [`RESOURCE_NOT_FOUND_CODE`] beside it. Constant and ARN-free for the same reason
+/// [`WORKSPACE_NOT_FOUND_MESSAGE`] is: nothing of the request is echoed back into it.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The wire error code the ARN-addressed `/tags/{resourceArn}` operations answer for a
+/// `resourceArn` that resolves to no live resource.
+///
+/// RECORDED BEHAVIOUR: those three operations model `ResourceNotFoundException`
+/// (@httpError 404) — `smithy_query(query="operation",operation="TagResource,UntagResource,ListTagsForResource")`
+/// — but the recorded real-aps response for an ARN that names nothing carries the code
+/// `NotFoundException` at that same 404, whatever ARN type it names. A client branches on
+/// the CODE, so that is what this service answers; the code is not a shape the model
+/// declares, which is why it is raised through [`arn_not_found`] and the synthetic
+/// [`crate::scaffolded::NotFoundException`] rather than through an operation's modelled
+/// error enum.
+///
+/// The operations addressed by RESOURCE ID rather than by ARN keep the modelled
+/// `ResourceNotFoundException`, which is what they are recorded answering (a
+/// `DescribeAnomalyDetector` for a detector that is gone, for one).
+pub const RESOURCE_NOT_FOUND_CODE: &str = "NotFoundException";
 
 /// The `message` the modelled `ResourceNotFoundException` reports for a rule groups
 /// namespace a workspace does not hold. Constant and id-free for the same reason
@@ -858,6 +876,9 @@ pub fn policy_mutation_allowed(workspace: &Workspace) -> bool {
 /// current revision, and on a workspace that holds no policy the only id that matches
 /// is [`NO_POLICY_REVISION_ID`]: "For the first PUT request on a workspace that doesn't
 /// have an existing resource policy, you can specify `NO_POLICY` as the revision ID."
+///
+/// A request whose `revisionId` does not match is refused through
+/// [`stale_revision_rejection`].
 pub fn revision_matches(policy: Option<&ResourcePolicy>, revision_id: Option<&str>) -> bool {
     match (policy, revision_id) {
         (_, None) => true,
@@ -1047,6 +1068,52 @@ pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 /// enforces itself reads like one the model declares.
 pub fn reserved_tag_key_requirement() -> String {
     format!("Member must not contain a key beginning with {RESERVED_TAG_KEY_PREFIX}")
+}
+
+/// The refusal the three ARN-addressed `/tags/{resourceArn}` operations share for a
+/// `resourceArn` that resolves to no live resource: [`RESOURCE_NOT_FOUND_CODE`] at 404,
+/// carrying [`RESOURCE_NOT_FOUND_MESSAGE`].
+///
+/// ONE composition for all three, so `TagResource`, `UntagResource` and
+/// `ListTagsForResource` cannot drift apart, and generic over the operation's modelled
+/// error enum so each returns it through its own error channel.
+pub fn arn_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::not_found(RESOURCE_NOT_FOUND_MESSAGE)
+}
+
+/// How a `revisionId` that does not name the policy's current revision is refused: the
+/// modelled `ValidationException` (400) naming the `revisionId` member and the
+/// requirement it failed.
+///
+/// RECORDED BEHAVIOUR: `PutResourcePolicy` and `DeleteResourcePolicy` model BOTH
+/// `ValidationException` (@httpError 400) and `ConflictException` (@httpError 409), and a
+/// recorded real-aps put carrying a revision the policy is no longer at is refused
+/// `ValidationException`. The two codes are not interchangeable to a caller: a 400
+/// `ValidationException` says "the value you sent is wrong — re-read the revision and
+/// send the fresh one", while a 409 `ConflictException` reads as a transient
+/// resource-state conflict that SDK and hand-written retry wrappers replay unchanged. The
+/// optimistic lock is a MEMBER the caller got wrong, so it is refused as one.
+///
+/// `ConflictException` stays what it is for: the resource being in a status that forbids
+/// the call at all ("Update/Deletion is disallowed until Resource-based Policy is ACTIVE
+/// and Workspace is ACTIVE"), which no value in the request can fix.
+pub fn stale_revision_rejection() -> crate::ops::types::ValidationException {
+    member_validation_failed(REVISION_ID_MEMBER, &stale_revision_requirement())
+}
+
+/// The wire name of the optimistic-lock member, as `fieldList` reports it.
+const REVISION_ID_MEMBER: &str = "revisionId";
+
+/// The requirement a `revisionId` fails when it does not name the revision the policy is
+/// currently at, worded as [`constraint_requirement`] words a modelled constraint — the
+/// same reason [`reserved_tag_key_requirement`] is worded that way. It names the member's
+/// own documented purpose ("Use this parameter to ensure that you are updating the correct
+/// version of the policy") and echoes no value from the request.
+pub fn stale_revision_requirement() -> String {
+    format!(
+        "Member must name the current revision of the resource-based policy, or {NO_POLICY_REVISION_ID} \
+         while the workspace holds none"
+    )
 }
 
 /// The reserved tag key a request carries, if any — the lowest one, so the refusal

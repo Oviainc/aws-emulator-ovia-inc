@@ -191,6 +191,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
+        // The service-managed keyspaces are part of the account before any call, so a type
+        // asked for in one is a missing TYPE rather than a missing keyspace.
+        store.ensure_service_managed_catalog(&region);
         // Reporting, not mutating: `settle` only materialises the status changes the clock
         // had already made due at this instant, so this report shows what any caller would
         // have seen now whether or not anybody read the type.

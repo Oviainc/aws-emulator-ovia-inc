@@ -900,8 +900,10 @@ async fn creating_past_the_store_cap_answers_the_modelled_quota_error() {
         "ServiceQuotaExceededException",
     );
 
-    // Keyspaces: one keyspace already exists, so fill the rest and then ask for one more.
-    for index in 1..keyspaces::MAX_KEYSPACES {
+    // Keyspaces: the account already holds the service-managed keyspaces and the one this
+    // test created, so fill the room that is left and then ask for one more.
+    let already_held = keyspaces::SERVICE_MANAGED_KEYSPACES.len() + 1;
+    for index in already_held..keyspaces::MAX_KEYSPACES {
         assert_ok(
             "fill the account to its keyspace cap",
             emulator

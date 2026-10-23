@@ -19,6 +19,8 @@ mod default_scraper_configuration;
 mod logging_configuration;
 #[path = "all/query_logging_configuration.rs"]
 mod query_logging_configuration;
+#[path = "all/rejection_codes.rs"]
+mod rejection_codes;
 #[path = "all/resource_policy_lifecycle.rs"]
 mod resource_policy_lifecycle;
 #[path = "all/rule_groups_namespace_lifecycle.rs"]

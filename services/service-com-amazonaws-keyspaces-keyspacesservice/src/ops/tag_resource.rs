@@ -153,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
@@ -165,9 +165,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
+        // The service-managed keyspaces and their system tables are part of the account
+        // before any call, so an ARN that names one resolves here.
+        store.ensure_service_managed_catalog(&crate::state::request_region(ctx));
         // The status transitions the clock already owed at this instant, so a table whose
         // deletion has completed is no longer a resource this call can tag.
         store.settle(::std::time::SystemTime::now());
+
+        // A service-managed keyspace and its system tables are the SERVICE's resources:
+        // a client cannot change them, tags included, and Cassandra refuses a change to a
+        // system keyspace as an invalid query ("system keyspace is not user-modifiable") —
+        // this operation's `ValidationException`.
+        if let Some(keyspace_name) = crate::state::arn_keyspace_name(&input.resource_arn) {
+            if crate::state::is_service_managed_keyspace(&keyspace_name) {
+                return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::service_managed_rejection(&keyspace_name)),
+                })
+                .into());
+            }
+        }
 
         // Tags attach to the resource the ARN names, so the ARN — not a name — is what is
         // resolved; one that names no stored resource is the 404 the model declares.

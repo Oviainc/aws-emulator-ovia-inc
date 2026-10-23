@@ -28,6 +28,10 @@ bumpalo = "=3.20.3"
 # group with, over the in-process callback into this same emulator (no network client
 # feature is enabled: the transport is the emulator's own).
 aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The Amazon S3 client TestParsing reads the EDI document at `inputFile` with, over the
+# in-process callback into this same emulator (no network client feature is enabled: the
+# transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -64,6 +68,9 @@ hex = { workspace = true }
 # The b2bi tests mount the CloudWatch Logs service beside b2bi on one engine, because
 # CreateProfile provisions a logging-ENABLED profile's log group by calling it.
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# The TestParsing suite mounts the S3 service beside b2bi on one engine, because
+# TestParsing reads the EDI document it parses from the S3 object `inputFile` names.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

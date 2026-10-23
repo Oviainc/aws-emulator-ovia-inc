@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccessPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccessPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccessPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replaces the stored `AccessPolicyRecord`'s document and description with
+//! the ones this request names, mints a FRESH `policyVersion`, stamps `lastModifiedDate`,
+//! and answers from the record it wrote — so a following `GetAccessPolicy` reports exactly
+//! what this call stored. The request's `policyVersion` is the optimistic-concurrency
+//! precondition: a version that is not the stored one is refused and writes nothing.
+//! Every exit leaves one structured `emulator::audit` record for the call.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +84,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::PolicyWrite;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +157,194 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccessPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAccessPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccessPolicy"))
+        use crate::state::AuditOutcome;
+
+        // Every exit below leaves exactly one audit record naming this `(type, name)` pair,
+        // so a state-changing call is observable whatever it answered.
+        let resource = crate::state::audit_access_policy_resource(&input.r#type, &input.name);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::StoreUnreachable,
+                Some(&resource),
+            );
+            return Err(UpdateAccessPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `AccessPolicyType` is an enum the boundary validator does not narrow, so the
+        // handler refuses a value outside the model's own value list.
+        if !ACCESS_POLICY_TYPE_VALUES.contains(&input.r#type.as_str()) {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::ValidationRefused,
+                Some(&resource),
+            );
+            return Err(UpdateAccessPolicyErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "type must be one of [{}], got {:?}",
+                        ACCESS_POLICY_TYPE_VALUES.join(", "),
+                        input.r#type
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `policy` arrives as text and `AccessPolicyDetail$policy` is a document, so a
+        // named document has to parse as JSON for there to be a policy at all. It is
+        // stored PARSED, which is what makes a read answer "the JSON policy document
+        // without any whitespaces" rather than the caller's own formatting. A request that
+        // names no `policy` replaces none.
+        let policy = match input.policy.as_deref() {
+            Some(text) => {
+                let parsed: serde_json::Value = match serde_json::from_str(text) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        crate::state::audit(
+                            Self::NAME,
+                            ctx,
+                            AuditOutcome::ValidationRefused,
+                            Some(&resource),
+                        );
+                        return Err(UpdateAccessPolicyErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(format!("policy must be a JSON document: {error}")),
+                            },
+                        )
+                        .into());
+                    }
+                };
+                // A document nested past the emulator's own conversion bound is refused
+                // rather than converted; see `crate::state::MAX_DOCUMENT_DEPTH`.
+                let Some(document) = crate::state::document_from_json(&parsed) else {
+                    crate::state::audit(
+                        Self::NAME,
+                        ctx,
+                        AuditOutcome::ValidationRefused,
+                        Some(&resource),
+                    );
+                    return Err(UpdateAccessPolicyErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "policy must not nest deeper than {} levels",
+                                crate::state::MAX_DOCUMENT_DEPTH
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                Some(document)
+            }
+            None => None,
+        };
+
+        let key = (input.r#type.clone(), input.name.clone());
+        let mut store = state.lock();
+
+        // A replayed `clientToken` is a RETRY of the write this call already performed, so
+        // it answers that record and writes nothing: without it a retry would be refused
+        // by its own precondition (the first call moved the version on) or would mint a
+        // second version for one write.
+        if let Some(token) = input.client_token.as_deref() {
+            let replayed = store
+                .replayed_access_policy(Self::NAME, token)
+                .filter(|record| record.kind == key.0 && record.name == key.1)
+                .map(crate::state::AccessPolicyRecord::detail);
+            if let Some(detail) = replayed {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    AuditOutcome::IdempotentReplay,
+                    Some(&resource),
+                );
+                return Ok(UpdateAccessPolicyOutput {
+                    access_policy_detail: Some(detail),
+                });
+            }
+        }
+
+        let Some(stored_version) = store
+            .access_policies
+            .get(&key)
+            .map(|record| record.policy_version.clone())
+        else {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::NotFound, Some(&resource));
+            return Err(UpdateAccessPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Policy with name {} and type {} is not found",
+                        input.name, input.r#type
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // `policyVersion` is `@required` on the request and names "the version of the
+        // policy being updated", so it is the precondition of the write: a version that is
+        // not the stored one means another writer has moved the policy on, which is the
+        // conflict `ConflictException` reports. Nothing is written when it fails.
+        if stored_version != input.policy_version {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::VersionMismatch,
+                Some(&resource),
+            );
+            return Err(UpdateAccessPolicyErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Policy with name {} and type {} is at version {}, not {}",
+                        input.name, input.r#type, stored_version, input.policy_version
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let written_at = crate::state::now_epoch_millis();
+        let policy_version = store.next_policy_version(written_at);
+        let write = PolicyWrite {
+            description: input.description,
+            policy,
+            policy_version,
+            written_at,
+        };
+        let Some(record) = store.access_policies.get_mut(&key) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::StoreUnreachable,
+                Some(&resource),
+            );
+            return Err(UpdateAccessPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+        record.apply(write);
+        // Rendered from the record that is now STORED, so the update cannot report
+        // anything a later `GetAccessPolicy` would not.
+        let detail = record.detail();
+        if let Some(token) = input.client_token.as_deref() {
+            let value = crate::state::policy_token_value(&key.0, &key.1);
+            store.remember_token(Self::NAME, token, &value);
+        }
+        drop(store);
+
+        crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyUpdated, Some(&resource));
+        Ok(UpdateAccessPolicyOutput {
+            access_policy_detail: Some(detail),
+        })
     }
 }

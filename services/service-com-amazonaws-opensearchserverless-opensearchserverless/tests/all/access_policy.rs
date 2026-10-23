@@ -761,43 +761,136 @@ async fn every_access_policy_call_emits_one_structured_audit_record() {
     ];
 
     for (case, operation, request, expected_status, outcome) in rows {
-        let kind = text(&request, "type");
-        let name = text(&request, "name");
-        let (status, code, answer) = call(&router, operation, request).await;
-        assert_eq!(
-            status, expected_status,
-            "case {case}: expected {expected_status}, got {status} {code} with {answer}"
-        );
-
-        let records = audit_records(&captured.drain());
-        assert_eq!(
-            records.len(),
-            1,
-            "case {case}: exactly one audit record per call, got {records:?}"
-        );
-        let record = &records[0];
-        for expected in [
-            "service=aoss".to_string(),
-            format!("operation={operation}"),
-            format!("resource=access-policy/{kind}/{name}"),
-            format!("outcome={outcome}"),
-            "request_target=POST /".to_string(),
-            // The identity the request presented: the harness signs with this access key
-            // id, so the field's CONTENT is checked, not merely its presence.
-            format!("access_key_id={AUDIT_ACCESS_KEY_ID}"),
-        ] {
-            assert!(
-                record.contains(&expected),
-                "case {case}: the audit record must carry {expected:?}, got {record:?}"
-            );
-        }
-        // Metadata only: neither the caller's policy document nor its description nor the
-        // request signature reaches the log.
-        for forbidden in ["do-not-log-this", "deadbeef"] {
-            assert!(
-                !record.contains(forbidden),
-                "case {case}: the audit record must not carry {forbidden:?}, got {record:?}"
-            );
-        }
+        audited(
+            &router,
+            captured,
+            case,
+            operation,
+            request,
+            expected_status,
+            outcome,
+        )
+        .await;
     }
+
+    // The write path is audited on the same terms. Its rows are driven in sequence rather
+    // than from the table above because each one is addressed with the `policyVersion` the
+    // call before it returned.
+    let written = audited(
+        &router,
+        captured,
+        "a policy to write to was created",
+        "CreateAccessPolicy",
+        json!({ "type": "data", "name": "audited-written", "policy": r#"{"Rules":[]}"# }),
+        200,
+        "policy-created",
+    )
+    .await;
+    let version = text(at(&written, "accessPolicyDetail"), "policyVersion");
+
+    // (case, operation, request, expected status, expected outcome token). The second write
+    // carries the version the FIRST one superseded, so it is the stale-version refusal.
+    let writes: Vec<(&str, &str, Value, u16, &str)> = vec![
+        (
+            "the policy was written",
+            "UpdateAccessPolicy",
+            json!({ "type": "data", "name": "audited-written", "policy": secret_document, "policyVersion": version, "description": "do-not-log-this-either" }),
+            200,
+            "policy-updated",
+        ),
+        (
+            "the version is not the stored one",
+            "UpdateAccessPolicy",
+            json!({ "type": "data", "name": "audited-written", "policyVersion": version, "description": "do-not-log-this-either" }),
+            409,
+            "version-mismatch",
+        ),
+        (
+            "the write names no policy",
+            "UpdateAccessPolicy",
+            json!({ "type": "data", "name": "audited-absent", "policyVersion": version }),
+            404,
+            "not-found",
+        ),
+        (
+            "the policy was deleted",
+            "DeleteAccessPolicy",
+            json!({ "type": "data", "name": "audited-written" }),
+            200,
+            "policy-deleted",
+        ),
+        (
+            "the delete names no policy",
+            "DeleteAccessPolicy",
+            json!({ "type": "data", "name": "audited-written" }),
+            404,
+            "not-found",
+        ),
+    ];
+    for (case, operation, request, expected_status, outcome) in writes {
+        audited(
+            &router,
+            captured,
+            case,
+            operation,
+            request,
+            expected_status,
+            outcome,
+        )
+        .await;
+    }
+}
+
+/// Drive `operation` with `request`, assert it answered `expected_status`, and assert the
+/// call left exactly ONE structured audit record for the `(type, name)` pair the request
+/// named, carrying `outcome` and none of the caller's own data. Answers the response body.
+#[allow(clippy::too_many_arguments)]
+async fn audited(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    captured: &CapturedRecords,
+    case: &str,
+    operation: &str,
+    request: Value,
+    expected_status: u16,
+    outcome: &str,
+) -> Value {
+    let kind = text(&request, "type");
+    let name = text(&request, "name");
+    let (status, code, answer) = call(router, operation, request).await;
+    assert_eq!(
+        status, expected_status,
+        "case {case}: expected {expected_status}, got {status} {code} with {answer}"
+    );
+
+    let records = audit_records(&captured.drain());
+    assert_eq!(
+        records.len(),
+        1,
+        "case {case}: exactly one audit record per call, got {records:?}"
+    );
+    let record = &records[0];
+    for expected in [
+        "service=aoss".to_string(),
+        format!("operation={operation}"),
+        format!("resource=access-policy/{kind}/{name}"),
+        format!("outcome={outcome}"),
+        "request_target=POST /".to_string(),
+        // The identity the request presented: the harness signs with this access key
+        // id, so the field's CONTENT is checked, not merely its presence.
+        format!("access_key_id={AUDIT_ACCESS_KEY_ID}"),
+    ] {
+        assert!(
+            record.contains(&expected),
+            "case {case}: the audit record must carry {expected:?}, got {record:?}"
+        );
+    }
+    // Metadata only: neither the caller's policy document nor its description nor the
+    // request signature reaches the log.
+    for forbidden in ["do-not-log-this", "deadbeef"] {
+        assert!(
+            !record.contains(forbidden),
+            "case {case}: the audit record must not carry {forbidden:?}, got {record:?}"
+        );
+    }
+    answer
 }

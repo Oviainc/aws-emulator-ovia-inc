@@ -2,7 +2,9 @@
 
 //! @op UntagResource
 //! IMPLEMENTED: removes the given `tagKeys` from the stored workspace the
-//! `resourceArn` names.
+//! `resourceArn` names, and refuses an ARN that resolves to no live resource with
+//! `NotFoundException` (404), the code aps answers on this ARN-addressed path
+//! (`crate::state::arn_not_found`).
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -158,14 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(workspace) =
             resolved.and_then(|workspace_id| store.workspaces.get_mut(&workspace_id))
         else {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
-                    resource_id: input.resource_arn.clone(),
-                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
-                },
-            )
-            .into());
+            // The same refusal `TagResource` answers for an ARN that resolves to no live
+            // resource — one composition for all three tagging operations.
+            return Err(crate::state::arn_not_found());
         };
 
         // `@idempotent`: a key the resource does not carry is simply not there

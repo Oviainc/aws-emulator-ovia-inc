@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
@@ -213,6 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // The service-managed keyspaces and their system tables are part of the account
+        // before any call, so an ARN that names one resolves here: a resource Amazon
+        // Keyspaces always holds reports the tags it holds (none) rather than a 404.
+        store.ensure_service_managed_catalog(&crate::state::request_region(ctx));
         // Reporting, not mutating: `settle` only materialises the status changes the clock
         // had already made due at this instant, so this report shows what any caller would
         // have seen now whether or not anybody read the tags.

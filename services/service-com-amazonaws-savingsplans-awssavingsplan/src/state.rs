@@ -338,6 +338,24 @@ pub fn paginate<T: Clone>(
     (page, next)
 }
 
+/// The page the offerings search serves when the caller names no size.
+///
+/// `DescribeSavingsPlansOfferings$maxResults` is `@required` with `@default: 0`
+/// and a `PageSize` range of 0..1000, so 0 is "no size asked for" and the
+/// service picks one: a search of a catalog the service owns comes back as one
+/// page of it, resumable through `nextToken`, never as the whole catalog.
+///
+/// A chosen bound, not a documented one: AWS publishes no default page size for
+/// this search. What the recorded answers show is only that a search WAS
+/// answered with one page and a cursor the next call resumed, which is the part
+/// this constant exists to keep true.
+///
+/// The seeded catalog is deliberately larger than this, so the page is
+/// observable: `a_search_that_names_no_page_size_gets_the_services_own_page`
+/// asserts a search that names no size answers exactly one page of this many
+/// offerings, and fails loudly if the catalog ever shrinks below it.
+pub const DEFAULT_OFFERINGS_PAGE_SIZE: usize = 20;
+
 /// Whether a list-shaped request filter admits `value`: an absent or empty list
 /// constrains nothing, a populated one admits only the values it names.
 pub fn filter_admits(filter: Option<&Vec<String>>, value: &str) -> bool {
@@ -500,32 +518,119 @@ impl Offering {
     }
 }
 
-/// The terms AWS sells Savings Plans in: a one-year and a three-year term,
-/// in seconds (`SavingsPlanOffering$durationSeconds`).
-const TERMS: [(i64, &str); 2] = [(31_536_000, "1 year"), (94_608_000, "3 year")];
-
-/// Every `SavingsPlanPaymentOption` the model declares.
-const PAYMENT_OPTIONS: [&str; 3] = [
-    PAYMENT_ALL_UPFRONT,
-    PAYMENT_PARTIAL_UPFRONT,
-    PAYMENT_NO_UPFRONT,
+/// The terms AWS sells Savings Plans in: a one-year and a three-year term, each
+/// as `(durationSeconds, description label, usage-type token)`.
+///
+/// `durationSeconds` is the term the wire reports
+/// (`SavingsPlanOffering$durationSeconds`); the description label is how the
+/// term is spelled in `description` and the usage-type token how it is spelled
+/// in the billing `usageType` (see [`offering_description`] and
+/// [`offering_usage_type`]).
+const TERMS: [(i64, &str, &str); 2] = [
+    (31_536_000, "1 year", "1yr"),
+    (94_608_000, "3 year", "3yr"),
 ];
 
+/// Every `SavingsPlanPaymentOption` the model declares, in the order the
+/// catalog enumerates them.
+///
+/// The catalog is walked in a stable total order over the attributes that
+/// distinguish one offering from another — ascending term, then payment option
+/// in LEXICOGRAPHIC order, then (where the plan type is scoped to them) region
+/// and instance family — so page N of a search is the same rows on every call
+/// and two searches agree on which offering comes first. Lexicographic order is
+/// not the model's declaration order (`All Upfront`, `Partial Upfront`,
+/// `No Upfront`), which is why this list is not in the enum's order.
+const PAYMENT_OPTIONS: [&str; 3] = [
+    PAYMENT_ALL_UPFRONT,
+    PAYMENT_NO_UPFRONT,
+    PAYMENT_PARTIAL_UPFRONT,
+];
+
+/// How an offering's `description` names it: the term, the payment option and
+/// the plan type, in that order (`SavingsPlanDescription`, pattern
+/// `^[a-zA-Z0-9_\- ]+$`, so no punctuation beyond `-` and `_`).
+fn offering_description(term_label: &str, payment_option: &str, plan_label: &str) -> String {
+    format!("{term_label} {payment_option} {plan_label} Savings Plan")
+}
+
+/// The billing `usageType` of an offering's line item: the usage-type family of
+/// the plan type (prefixed by the region it is scoped to, where it is scoped to
+/// one) followed by the term and payment option that line item is billed
+/// under — so every offering reports the usage type a billing report would show
+/// for it, and no two offerings of one plan type share a usage type.
+///
+/// `family` carries the region prefix and any further dimension the plan type is
+/// scoped to (an EC2 instance family). `SavingsPlanUsageType` admits `:`, `.`,
+/// `/` and `-` (pattern `^[a-zA-Z0-9_ \/.:-]+$`), so the `:`-separated form is
+/// inside the model's constraint.
+fn offering_usage_type(family: &str, term_token: &str, payment_option: &str) -> String {
+    let payment_token: String = payment_option
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    format!("{family}:{term_token}{payment_token}")
+}
+
 /// The regions the catalog is seeded for, each with the `CurrencyCode` the
-/// region bills in — the three the model's `CurrencyCode` enum declares.
-const REGIONS: [(&str, &str); 3] = [
+/// region bills in.
+///
+/// Savings Plans are sold in every commercial region, so the catalog carries a
+/// region-scoped offering for each one rather than for a handful: a client that
+/// searches for offerings in the region it runs in finds them, and the catalog
+/// is the size a real one is — bigger than any one page a caller may ask for
+/// (`PageSize` tops out at 1000), so a search of it is genuinely paginated.
+///
+/// The currency is the one the model's `CurrencyCode` enum offers for that
+/// region's billing: `CNY` in the China partition, `EUR` in Europe, `USD`
+/// elsewhere.
+const REGIONS: [(&str, &str); 22] = [
     ("us-east-1", "USD"),
+    ("us-east-2", "USD"),
+    ("us-west-1", "USD"),
+    ("us-west-2", "USD"),
+    ("ca-central-1", "USD"),
+    ("sa-east-1", "USD"),
     ("eu-west-1", "EUR"),
+    ("eu-west-2", "EUR"),
+    ("eu-west-3", "EUR"),
+    ("eu-central-1", "EUR"),
+    ("eu-north-1", "EUR"),
+    ("eu-south-1", "EUR"),
+    ("ap-south-1", "USD"),
+    ("ap-east-1", "USD"),
+    ("ap-northeast-1", "USD"),
+    ("ap-northeast-2", "USD"),
+    ("ap-southeast-1", "USD"),
+    ("ap-southeast-2", "USD"),
+    ("me-south-1", "USD"),
+    ("af-south-1", "USD"),
     ("cn-north-1", "CNY"),
+    ("cn-northwest-1", "CNY"),
 ];
 
 /// The EC2 instance families the catalog carries EC2 Instance offerings for
-/// (`SavingsPlanOffering$properties` -> `instanceFamily`).
-const EC2_INSTANCE_FAMILIES: [&str; 2] = ["m5", "c5"];
+/// (`SavingsPlanOffering$properties` -> `instanceFamily`): the general purpose,
+/// compute, memory and storage optimised families of several generations, so a
+/// search by instance family finds the family a client is actually running.
+const EC2_INSTANCE_FAMILIES: [&str; 18] = [
+    "m5", "m6a", "m6i", "m7g", "c5", "c6a", "c6i", "c7g", "r5", "r6a", "r6i", "r7g", "t3",
+    "t3a", "t4g", "i3", "i4i", "x2idn",
+];
 
-/// Build the catalog: one offering per plan type x payment option x term, times
+/// Build the catalog: one offering per plan type x term x payment option, times
 /// the region (and, for EC2 Instance plans, the instance family) each plan type
 /// is scoped to.
+///
+/// The catalog is enumerated BY PLAN TYPE — the order the model's
+/// `SavingsPlanType` enum declares (Compute, EC2Instance, SageMaker, Database) —
+/// then by ascending term, then by payment option, then by the region and
+/// instance family the plan type is scoped to. That is the order the recorded
+/// catalog answers in: a search narrowed to Compute plans answers with that plan
+/// type's six term/payment-option rows as the first rows of the catalog, in
+/// payment-option order. Plan types that are not scoped to a region (Compute)
+/// carry one row per term and payment option; the scoped ones carry one per
+/// region, and EC2 Instance plans one per instance family within the region.
 ///
 /// The product types of each plan type are the ones AWS covers with it:
 /// Compute Savings Plans apply to EC2, Fargate and Lambda usage in any region;
@@ -533,33 +638,44 @@ const EC2_INSTANCE_FAMILIES: [&str; 2] = ["m5", "c5"];
 /// and Database Savings Plans to their own products.
 fn seed_offerings(id_seed: u128) -> Vec<Offering> {
     let mut offerings = Vec::new();
-    for (duration_seconds, term_label) in TERMS {
+    for (duration_seconds, term_label, term_token) in TERMS {
         for payment_option in PAYMENT_OPTIONS {
             offerings.push(offering(
                 "Compute",
-                &["EC2", "Fargate", "Lambda"],
-                &format!("Compute Savings Plans {term_label} {payment_option}"),
+                // The order a Compute Savings Plan's coverage is reported in,
+                // as the recorded AWS catalog row lists it. The order of a
+                // coverage list carries no meaning on the wire; the catalog
+                // mirrors the recorded one so a client diffing the two sees the
+                // same row.
+                &["Fargate", "EC2", "Lambda"],
+                &offering_description(term_label, payment_option, "Compute"),
                 payment_option,
                 duration_seconds,
                 "USD",
                 "ComputeSavingsPlans",
-                "ComputeSP:Hrs",
+                &offering_usage_type("ComputeSP", term_token, payment_option),
                 "",
                 Vec::new(),
             ));
+        }
+    }
+    for (duration_seconds, term_label, term_token) in TERMS {
+        for payment_option in PAYMENT_OPTIONS {
             for (region, currency) in REGIONS {
                 for family in EC2_INSTANCE_FAMILIES {
                     offerings.push(offering(
                         "EC2Instance",
                         &["EC2"],
-                        &format!(
-                            "EC2 Instance Savings Plans {family} {region} {term_label} {payment_option}"
-                        ),
+                        &offering_description(term_label, payment_option, "EC2 Instance"),
                         payment_option,
                         duration_seconds,
                         currency,
                         "AmazonEC2",
-                        &format!("{region}-EC2SP:{family}"),
+                        &offering_usage_type(
+                            &format!("{region}-EC2SP:{family}"),
+                            term_token,
+                            payment_option,
+                        ),
                         "RunInstances",
                         vec![
                             (PROPERTY_INSTANCE_FAMILY.to_string(), family.to_string()),
@@ -567,27 +683,47 @@ fn seed_offerings(id_seed: u128) -> Vec<Offering> {
                         ],
                     ));
                 }
+            }
+        }
+    }
+    for (duration_seconds, term_label, term_token) in TERMS {
+        for payment_option in PAYMENT_OPTIONS {
+            for (region, currency) in REGIONS {
                 offerings.push(offering(
                     "SageMaker",
                     &["SageMaker"],
-                    &format!("SageMaker Savings Plans {region} {term_label} {payment_option}"),
+                    &offering_description(term_label, payment_option, "SageMaker"),
                     payment_option,
                     duration_seconds,
                     currency,
                     "AmazonSageMaker",
-                    &format!("{region}-SageMakerSP:Hrs"),
+                    &offering_usage_type(
+                        &format!("{region}-SageMakerSP"),
+                        term_token,
+                        payment_option,
+                    ),
                     "RunInstance",
                     vec![(PROPERTY_REGION.to_string(), region.to_string())],
                 ));
+            }
+        }
+    }
+    for (duration_seconds, term_label, term_token) in TERMS {
+        for payment_option in PAYMENT_OPTIONS {
+            for (region, currency) in REGIONS {
                 offerings.push(offering(
                     "Database",
                     &["RDS", "DocDB", "Neptune", "ElastiCache"],
-                    &format!("Database Savings Plans {region} {term_label} {payment_option}"),
+                    &offering_description(term_label, payment_option, "Database"),
                     payment_option,
                     duration_seconds,
                     currency,
                     "AmazonRDS",
-                    &format!("{region}-DatabaseSP:Hrs"),
+                    &offering_usage_type(
+                        &format!("{region}-DatabaseSP"),
+                        term_token,
+                        payment_option,
+                    ),
                     "CreateDBInstance",
                     vec![(PROPERTY_REGION.to_string(), region.to_string())],
                 ));
