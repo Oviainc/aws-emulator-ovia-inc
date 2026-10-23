@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcknowledgeThirdPartyJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcknowledgeThirdPartyJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcknowledgeThirdPartyJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Confirms that a partner's job worker has received a third-party job.
+//!
+//! The job is resolved in the service's third-party job queues
+//! (`ComAmazonawsCodepipelineCodepipeline20150709State::third_party_job_mut`, the one
+//! lookup every third-party job operation of this crate shares) and every answer is
+//! computed from the STORED job:
+//!
+//! * an id no queued job carries is not a job -> `JobNotFoundException`;
+//! * a `clientToken` other than the one the job was handed out with does not
+//!   "verify that the calling entity is allowed access to the job" ->
+//!   `InvalidClientTokenException`;
+//! * a `nonce` that is not the job's current one does not admit a worker to the job
+//!   (nor does any nonce once the job's work has ended) -> `InvalidNonceException`;
+//! * otherwise the receipt is recorded — the job is now being worked on, so it
+//!   carries `InProgress` and its outcome is that worker's to report through
+//!   `PutThirdPartyJobSuccessResult` — and that PERSISTED status is what the response
+//!   reports.
+//!
+//! Recording the receipt is a mutation this operation's own contract states
+//! ("Confirms a job worker has received the specified job"), and it is idempotent:
+//! the worker holding the nonce may repeat it and sees the same status.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +163,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcknowledgeThirdPartyJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcknowledgeThirdPartyJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcknowledgeThirdPartyJob"))
+        let state = crate::state::require_state(&*self.engine)?;
+        let mut state = state.lock();
+
+        // The job the worker names, if the service is holding one under that id and
+        // the call carries the `clientToken` it was handed out with. Both refusals
+        // come from the store — the same lookup every third-party job operation of
+        // this crate goes through — so no id is accepted without a job behind it,
+        // and a job that was found is what rejects a token it was not handed out
+        // with.
+        let job = match state.third_party_job_mut(&input.job_id, &input.client_token) {
+            Ok(job) => job,
+            Err(problem) => {
+                let (outcome, error) = match problem {
+                    crate::state::ThirdPartyJobProblem::NotFound(message) => (
+                        "refused: job not found",
+                        AcknowledgeThirdPartyJobError::from(
+                            AcknowledgeThirdPartyJobErrorModeled::JobNotFoundException(
+                                JobNotFoundException {
+                                    message: Some(message),
+                                },
+                            ),
+                        ),
+                    ),
+                    crate::state::ThirdPartyJobProblem::ClientToken(message) => (
+                        "refused: invalid client token",
+                        AcknowledgeThirdPartyJobError::from(
+                            AcknowledgeThirdPartyJobErrorModeled::InvalidClientTokenException(
+                                InvalidClientTokenException {
+                                    message: Some(message),
+                                },
+                            ),
+                        ),
+                    ),
+                };
+                audit(ctx, &input.job_id, outcome);
+                return Err(error);
+            }
+        };
+
+        // Only the nonce the job currently carries admits a worker to it, and only
+        // while the job is still live: the nonce exists so that the job "is being
+        // worked on by only one job worker", so a stale nonce — or any nonce for a
+        // job whose work has already ended — is refused. The message names the job
+        // the check was made against and never repeats the rejected value.
+        if !job.admits_nonce(&input.nonce) {
+            let message = format!(
+                "the nonce given does not grant job {} to a worker",
+                input.job_id
+            );
+            audit(ctx, &input.job_id, "refused: invalid nonce");
+            return Err(AcknowledgeThirdPartyJobErrorModeled::InvalidNonceException(
+                InvalidNonceException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        job.acknowledge(::std::time::SystemTime::now());
+        // The PERSISTED status, read back off the job this call just wrote.
+        let status = job.status.clone();
+        drop(state);
+
+        audit(ctx, &input.job_id, "job acknowledged");
+
+        Ok(AcknowledgeThirdPartyJobOutput {
+            status: Some(status),
+        })
     }
+}
+
+/// The audit record this state-changing operation emits for every outcome: who
+/// presented which access key id, which job it named, and what the service did with
+/// it.
+///
+/// No secret is recorded — the access key id is the public half the request already
+/// carries in its SigV4 scope, and neither the `clientToken` nor the `nonce` the call
+/// presents is ever logged. `job_id` is request-supplied text, so it is recorded with
+/// `Debug` formatting, which escapes control characters (a newline cannot forge a
+/// second log line).
+fn audit(ctx: &smithy_server_runtime::OperationContext<'_>, job_id: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "AcknowledgeThirdPartyJob",
+        access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+        job_id = ?job_id,
+        outcome = outcome,
+        "codepipeline state change"
+    );
 }

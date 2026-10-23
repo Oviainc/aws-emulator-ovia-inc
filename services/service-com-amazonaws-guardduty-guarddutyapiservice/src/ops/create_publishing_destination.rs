@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePublishingDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePublishingDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a publishing destination under the detector named in the URI and
+//! persists it in [`crate::state`]. The destination is returned in
+//! `PENDING_VERIFICATION` and the clock moves it to `PUBLISHING`
+//! ([`crate::state::VERIFICATION_DELAY_MILLIS`] after this call); a replayed
+//! `ClientToken` returns the destination the first call minted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePublishingDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +147,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePublishingDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePublishingDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePublishingDestination"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreatePublishingDestinationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        // Refuse an unacceptable request before anything is written, so a rejected
+        // create leaves no destination behind. Both checks read the REQUEST only:
+        // what the store holds does not change whether the input is acceptable.
+        let destination_service =
+            crate::state::validate_destination_type(&input.destination_type).map_err(bad_request)?;
+        let (destination_arn, kms_key_arn) = crate::state::validate_destination_properties(
+            destination_service,
+            &input.destination_properties,
+        )
+        .map_err(bad_request)?;
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        let now = state.tick_millis();
+
+        // `ClientToken` is `@idempotencyToken`
+        // (`smithy_query(operation="CreatePublishingDestination")`), so a replayed
+        // create returns the destination the first call minted instead of minting
+        // a second one. Resolved under the same borrow as the detector the
+        // destination hangs off — a detector is regional, so an id another Region's
+        // endpoint created is not visible here.
+        let token = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+        let already_minted = {
+            let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+                return Err(bad_request(crate::state::detector_id_rejection(
+                    &input.detector_id,
+                )));
+            };
+            let replayed = token
+                .as_deref()
+                .and_then(|token| detector.publishing_destination_for_token(token))
+                .map(|destination| destination.id.clone());
+            // Nothing is minted past the per-detector maximum: this is the branch
+            // that BOUNDS `Detector::publishing_destinations` (and with it the
+            // `ClientToken` index each record carries), so the store a caller can
+            // make this service retain is at most
+            // `PUBLISHING_DESTINATIONS_PER_DETECTOR` records per detector,
+            // released with the detector by `DeleteDetector`. Checked after the
+            // idempotency lookup, because a replay mints nothing.
+            if replayed.is_none()
+                && detector.publishing_destinations.len()
+                    >= crate::state::PUBLISHING_DESTINATIONS_PER_DETECTOR
+            {
+                return Err(bad_request(
+                    crate::state::publishing_destination_limit_message(),
+                ));
+            }
+            replayed
+        };
+        if let Some(destination_id) = already_minted {
+            return Ok(CreatePublishingDestinationOutput { destination_id });
+        }
+
+        let minted = state.mint_id();
+        let record = crate::state::PublishingDestinationRecord {
+            id: minted.clone(),
+            destination_type: input.destination_type.clone(),
+            destination_arn,
+            kms_key_arn,
+            // Absent unless the request supplied it: "This field appears in the
+            // response only if it was provided when the publishing destination was
+            // created or updated"
+            // (`smithy_query(query="doc",shape="DestinationProperties",member="ExpectedBucketOwner")`).
+            expected_bucket_owner: input.destination_properties.expected_bucket_owner.clone(),
+            // GuardDuty has not verified that it can write to the destination yet,
+            // so the destination starts in the non-terminal status and the CLOCK
+            // owes the move to `PUBLISHING`.
+            status: crate::state::PENDING_VERIFICATION.to_string(),
+            verification_due_millis: Some(
+                now.saturating_add(crate::state::VERIFICATION_DELAY_MILLIS),
+            ),
+            // Nothing is published, so publishing to this destination has never
+            // failed.
+            publishing_failure_start_millis: 0,
+            tags: input
+                .tags
+                .as_ref()
+                .map(|tags| {
+                    tags.iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                })
+                .unwrap_or_default(),
+            // The token that minted it, so a replay resolves to this destination
+            // for as long as the destination exists and no longer.
+            client_token: token,
+            created_at_millis: now,
+            updated_at_millis: now,
+        };
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        };
+        detector
+            .publishing_destinations
+            .insert(minted.clone(), record);
+        // The detector itself changed: it holds one more sub-resource than before.
+        detector.updated_at_millis = now;
+
+        Ok(CreatePublishingDestinationOutput {
+            destination_id: minted,
+        })
     }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member.
+fn bad_request(message: impl Into<String>) -> CreatePublishingDestinationError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }
