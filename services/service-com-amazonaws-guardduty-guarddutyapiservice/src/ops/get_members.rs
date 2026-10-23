@@ -15,7 +15,9 @@
 //! member account" (the modelled contract below), a resource in another account that
 //! this emulator does not hold, and the member is optional in the model. Likewise
 //! `InvitedAt` is absent until `InviteMembers` is implemented and there is an
-//! invitation instant to report.
+//! invitation instant to report. The projection itself lives in
+//! [`crate::state::member_view`], shared with `ListMembers` so two reads of one
+//! member cannot disagree.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -197,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             match detector.members.get(account_id) {
-                Some(member) => members.push(member_view(member, &administrator)),
+                Some(member) => members.push(crate::state::member_view(member, &administrator)),
                 None => unprocessed.push(UnprocessedAccount {
                     account_id: account_id.clone(),
                     result: crate::state::not_a_member_message(&administrator),
@@ -209,27 +211,5 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             members,
             unprocessed_accounts: unprocessed,
         })
-    }
-}
-
-/// Project one stored member onto the modelled `Member`.
-///
-/// `MasterId` and `AdministratorId` are both "the administrator account ID"
-/// (`smithy_query(shape="Member")`) — the same fact under the old and the current
-/// name — so both carry the account that owns the detector this member hangs off.
-fn member_view(member: &crate::state::MemberRecord, administrator: &str) -> Member {
-    Member {
-        account_id: member.account_id.clone(),
-        // The member account's own detector is not a resource this emulator holds;
-        // the member is optional, so it is absent rather than invented.
-        detector_id: None,
-        master_id: administrator.to_string(),
-        administrator_id: Some(administrator.to_string()),
-        email: member.email.clone(),
-        relationship_status: member.relationship_status.clone(),
-        // No invitation is modelled yet (`InviteMembers` is still a scaffold), so
-        // there is no instant at which one was sent.
-        invited_at: None,
-        updated_at: crate::state::iso8601(member.updated_at_millis),
     }
 }

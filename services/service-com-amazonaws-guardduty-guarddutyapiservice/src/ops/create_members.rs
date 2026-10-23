@@ -201,8 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
             if !crate::state::is_member_email(&detail.email) {
+                // The email rule has GuardDuty's own wording, which names the
+                // member it refuses; see `crate::state::MEMBER_EMAIL_FORMAT_MESSAGE`.
                 return Err(crate::scaffolded::Scaffolded::invalid_input(
-                    crate::state::invalid_parameter_message(crate::state::EMAIL_MEMBER),
+                    crate::state::MEMBER_EMAIL_FORMAT_MESSAGE,
                 ));
             }
         }

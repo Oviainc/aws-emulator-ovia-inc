@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the member accounts the administrator detector holds, out of stored
+//! state: `CreateMembers` is what writes them, and this is a pure report — it
+//! never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +147,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMembers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListMembersErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // `OnlyAssociated` is modelled as a plain `String`
+        // (`smithy_query(operation="ListMembers")`), so the boundary validator lets
+        // any text through and the handler is what refuses a value that is not the
+        // boolean the member means. Absent (or empty) asks for no narrowing at all:
+        // the parameter "specifies whether to only return associated members or to
+        // return all members"
+        // (`smithy_query(query="doc",shape="ListMembersRequest",member="OnlyAssociated")`),
+        // so the full list is what a caller that does not ask for narrowing gets.
+        let only_associated = match input.only_associated.as_deref() {
+            None | Some("") => false,
+            Some(value) if value.eq_ignore_ascii_case("true") => true,
+            Some(value) if value.eq_ignore_ascii_case("false") => false,
+            Some(_) => {
+                return Err(bad_request(crate::state::invalid_parameter_message(
+                    crate::state::ONLY_ASSOCIATED_MEMBER,
+                )))
+            }
+        };
+
+        let region = crate::state::request_region(ctx);
+        let administrator = crate::state::administrator_account_id();
+        // A pure report: nothing below writes to the store.
+        let state = state.lock();
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            // Classified from the REQUEST: a value that cannot be a detector id is
+            // a parameter failure, a well-formed one this account does not hold an
+            // ownership failure.
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        };
+
+        // Account-id order, which is a total order over the members this detector
+        // holds: that is what makes a page token mean the same thing on the call
+        // that hands it back.
+        let account_ids = detector.member_ids(only_associated);
+        let (page, next_token) = crate::state::paginate(
+            &account_ids,
+            input.max_results,
+            input.next_token.as_deref(),
+            MEMBERS_MAX,
+        )
+        .map_err(|_| {
+            // Under the error CLASS, naming the parameter at fault and not quoting
+            // the token back.
+            bad_request(crate::state::invalid_parameter_message(
+                crate::state::NEXT_TOKEN_MEMBER,
+            ))
+        })?;
+
+        // The members this page names, each through the one projection a read
+        // reports a member with (`crate::state::member_view`, shared with
+        // `GetMembers`).
+        let members: Vec<Member> = page
+            .iter()
+            .filter_map(|account_id| detector.members.get(account_id))
+            .map(|member| crate::state::member_view(member, &administrator))
+            .collect();
+
+        Ok(ListMembersOutput {
+            // Present and empty when the detector holds no member: an empty list is
+            // the answer, and a client reads it the same way as a full one.
+            members: Some(members),
+            next_token,
+        })
     }
+}
+
+/// `Members` is `len 0..50` (`smithy_query(operation="ListMembers")`), so one page
+/// can never carry more than 50 members whatever `maxResults` asks for — which is
+/// also the modelled ceiling on `MaxResults` itself (range 1..50).
+const MEMBERS_MAX: usize = 50;
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member.
+fn bad_request(message: impl Into<String>) -> ListMembersError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }

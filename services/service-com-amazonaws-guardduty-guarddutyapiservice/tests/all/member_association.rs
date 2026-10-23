@@ -97,6 +97,14 @@ fn invalid_parameter(member: &str) -> String {
     format!("The request is rejected because the parameter {member} has an invalid value.")
 }
 
+/// The message an `AccountDetail.Email` that breaks one of the documented email
+/// rules is refused with: GuardDuty's own wording for that rule, read from the
+/// handler so the test and the service cannot drift apart.
+fn email_format_message() -> String {
+    service_com_amazonaws_guardduty_guarddutyapiservice::state::MEMBER_EMAIL_FORMAT_MESSAGE
+        .to_string()
+}
+
 /// The message a well-formed id this account does not own is refused with.
 fn not_owned(member: &str) -> String {
     format!(
@@ -104,7 +112,7 @@ fn not_owned(member: &str) -> String {
     )
 }
 
-async fn create_members(
+pub(crate) async fn create_members(
     router: &Router,
     detector_id: &str,
     accounts: &[(&str, &str)],
@@ -132,7 +140,7 @@ async fn get_members(router: &Router, detector_id: &str, account_ids: &[&str]) -
     .await
 }
 
-async fn disassociate_members(
+pub(crate) async fn disassociate_members(
     router: &Router,
     detector_id: &str,
     account_ids: &[&str],
@@ -635,7 +643,7 @@ const EMAIL_RULES: [(&str, bool, &str); 14] = [
 async fn create_members_applies_the_documented_email_rules() {
     let router = new_router();
     let detector_id = enabled_detector(&router).await;
-    let expected_message = invalid_parameter("email");
+    let expected_message = email_format_message();
 
     for (index, (email, valid, why)) in EMAIL_RULES.iter().enumerate() {
         // A fresh account id per row, so one row cannot mask another.
