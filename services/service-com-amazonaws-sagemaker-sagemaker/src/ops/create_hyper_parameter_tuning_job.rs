@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHyperParameterTuningJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHyperParameterTuningJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: refuses a request whose requested capacity is past a published
+//! per-tuning-job quota with the modelled `ResourceLimitExceeded`, a request that breaks
+//! a cross-member rule the model cannot express with a 400 `ValidationException`, and a
+//! name another tuning job already holds with the modelled `ResourceInUse`; otherwise it
+//! stores the job in `crate::state` as `InProgress` together with the instant the clock
+//! owes its terminal status. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHyperParameterTuningJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## No training job ever runs here
+//!
+//! A tuning job's work is the training jobs it launches, and this emulator runs no
+//! training container, so the job it accepts ends `Failed` with
+//! [`crate::state::NO_TRAINING_RUNNER_FAILURE_REASON`] rather than reporting a best
+//! training job, an objective metric value or model artifacts nothing computed.
 //!
 //! ## Shape of an operation
 //!
@@ -174,6 +178,309 @@ impl<Eng> CreateHyperParameterTuningJob<Eng> {
     }
 }
 
+/// The `Strategy` value whose own internal early stopping rules out
+/// `TrainingJobEarlyStoppingType`, and whose `StrategyConfig` is the only one the model
+/// defines (`HyperParameterTuningJobStrategyType`).
+const STRATEGY_HYPERBAND: &str = "Hyperband";
+/// The `Strategy` value that enumerates the combinations to try, so every searched
+/// hyperparameter has to be categorical (`HyperParameterTuningJobStrategyType`).
+const STRATEGY_GRID: &str = "Grid";
+/// The `TrainingJobEarlyStoppingType` value that turns early stopping on
+/// (`TrainingJobEarlyStoppingType`; the other member is `Off`).
+const EARLY_STOPPING_AUTO: &str = "Auto";
+
+/// Every `ParameterRanges` this request searches over: the tuning job config's, plus the
+/// one each training job definition carries.
+///
+/// The rules below hold of a `ParameterRanges` wherever it appears, so they are applied
+/// to all of them rather than to the config's alone.
+fn parameter_ranges(input: &CreateHyperParameterTuningJobInput) -> Vec<&ParameterRanges> {
+    let from_definitions = input
+        .training_job_definition
+        .iter()
+        .chain(input.training_job_definitions.iter().flatten())
+        .filter_map(|definition| definition.hyper_parameter_ranges.as_ref());
+    input
+        .hyper_parameter_tuning_job_config
+        .parameter_ranges
+        .iter()
+        .chain(from_definitions)
+        .collect()
+}
+
+/// How many hyperparameters a `ParameterRanges` searches over: one per entry of its
+/// integer, continuous and categorical lists (`AutoParameters` are hints Autotune turns
+/// into ranges, not searched hyperparameters in their own right).
+fn searched_hyperparameters(ranges: &ParameterRanges) -> usize {
+    ranges
+        .integer_parameter_ranges
+        .as_ref()
+        .map_or(0, Vec::len)
+        + ranges
+            .continuous_parameter_ranges
+            .as_ref()
+            .map_or(0, Vec::len)
+        + ranges
+            .categorical_parameter_ranges
+            .as_ref()
+            .map_or(0, Vec::len)
+}
+
+/// Why one `ParameterRanges`' bounds are not searchable, if they are not.
+///
+/// `MinValue`/`MaxValue` are modelled as free strings (`pattern .*`), so the type the
+/// range declares and the ordering of its two bounds are rules the service enforces
+/// itself: an integer range carries integers, a continuous range carries finite
+/// floating-point values, and in both the minimum may not exceed the maximum.
+fn parameter_range_bounds_refusal(ranges: &ParameterRanges) -> Option<String> {
+    for range in ranges.integer_parameter_ranges.iter().flatten() {
+        let (Ok(min), Ok(max)) = (
+            range.min_value.trim().parse::<i64>(),
+            range.max_value.trim().parse::<i64>(),
+        ) else {
+            return Some(format!(
+                "The integer parameter range for hyperparameter \"{}\" must carry integer \
+                 MinValue and MaxValue values, but carries \"{}\" and \"{}\".",
+                range.name, range.min_value, range.max_value
+            ));
+        };
+        if min > max {
+            return Some(format!(
+                "The integer parameter range for hyperparameter \"{}\" has MinValue {min}, \
+                 which is greater than its MaxValue {max}.",
+                range.name
+            ));
+        }
+    }
+    for range in ranges.continuous_parameter_ranges.iter().flatten() {
+        let (Ok(min), Ok(max)) = (
+            range.min_value.trim().parse::<f64>(),
+            range.max_value.trim().parse::<f64>(),
+        ) else {
+            return Some(format!(
+                "The continuous parameter range for hyperparameter \"{}\" must carry numeric \
+                 MinValue and MaxValue values, but carries \"{}\" and \"{}\".",
+                range.name, range.min_value, range.max_value
+            ));
+        };
+        if !min.is_finite() || !max.is_finite() {
+            return Some(format!(
+                "The continuous parameter range for hyperparameter \"{}\" must carry finite \
+                 MinValue and MaxValue values, but carries \"{}\" and \"{}\".",
+                range.name, range.min_value, range.max_value
+            ));
+        }
+        if min > max {
+            return Some(format!(
+                "The continuous parameter range for hyperparameter \"{}\" has MinValue {min}, \
+                 which is greater than its MaxValue {max}.",
+                range.name
+            ));
+        }
+    }
+    None
+}
+
+/// Why this request is not a tuning job the service can start, if it is not — every rule
+/// the model's own constraints cannot express, checked over the whole request.
+fn validation_refusal(input: &CreateHyperParameterTuningJobInput) -> Option<String> {
+    let config = &input.hyper_parameter_tuning_job_config;
+
+    // The two members are alternatives: one definition, or a list of them. The model
+    // makes both optional, so "exactly one" is this operation's own rule.
+    match (
+        input.training_job_definition.is_some(),
+        input.training_job_definitions.is_some(),
+    ) {
+        (false, false) => {
+            return Some(
+                "Either TrainingJobDefinition or TrainingJobDefinitions must be provided."
+                    .to_string(),
+            )
+        }
+        (true, true) => {
+            return Some(
+                "Only one of TrainingJobDefinition and TrainingJobDefinitions may be provided."
+                    .to_string(),
+            )
+        }
+        _ => {}
+    }
+
+    let ranges = parameter_ranges(input);
+    for range in &ranges {
+        if let Some(message) = parameter_range_bounds_refusal(range) {
+            return Some(message);
+        }
+    }
+
+    // The bound is on the hyperparameters ONE training job definition searches: the
+    // tuning job config's ranges plus that definition's own. `ParameterRanges`' doc says
+    // the figure the model states per list is "also the maximum for the hyperparameter
+    // tuning job itself", and a request carrying several definitions tunes a different
+    // algorithm in each, so the counts are summed per definition rather than across them
+    // — the narrower reading, so a multi-algorithm request the service accepts is not
+    // refused here.
+    let config_searched = config
+        .parameter_ranges
+        .as_ref()
+        .map_or(0, searched_hyperparameters);
+    let searched = input
+        .training_job_definition
+        .iter()
+        .chain(input.training_job_definitions.iter().flatten())
+        .map(|definition| {
+            config_searched
+                + definition
+                    .hyper_parameter_ranges
+                    .as_ref()
+                    .map_or(0, searched_hyperparameters)
+        })
+        .max()
+        .unwrap_or(config_searched);
+    if searched > crate::state::MAX_SEARCHED_HYPERPARAMETERS {
+        return Some(format!(
+            "A hyperparameter tuning job can search over at most {} hyperparameters, but {} \
+             integer, continuous and categorical ranges were specified.",
+            crate::state::MAX_SEARCHED_HYPERPARAMETERS,
+            searched
+        ));
+    }
+
+    // `HyperParameterTuningJobStrategyType`'s doc for Grid: the strategy evaluates every
+    // combination of the values given, so there is nothing to enumerate for a numeric
+    // range — a grid search tunes categorical hyperparameters only.
+    if config.strategy == STRATEGY_GRID {
+        let numeric = ranges.iter().any(|range| {
+            searched_hyperparameters(range)
+                > range
+                    .categorical_parameter_ranges
+                    .as_ref()
+                    .map_or(0, Vec::len)
+        });
+        if numeric {
+            return Some(format!(
+                "The {STRATEGY_GRID} strategy searches categorical hyperparameters only, but \
+                 integer or continuous parameter ranges were specified."
+            ));
+        }
+    }
+
+    if config.strategy == STRATEGY_HYPERBAND {
+        // `TrainingJobEarlyStoppingType`'s doc: because Hyperband has its own advanced
+        // internal early stopping mechanism, the member must be `Off` to use Hyperband.
+        if config.training_job_early_stopping_type.as_deref() == Some(EARLY_STOPPING_AUTO) {
+            return Some(format!(
+                "TrainingJobEarlyStoppingType must be Off when the tuning strategy is \
+                 {STRATEGY_HYPERBAND}, which has its own internal early stopping."
+            ));
+        }
+    }
+
+    // `HyperbandStrategyConfig`'s two bounds are the resource a training job starts with
+    // and the most it may use, so the minimum may not exceed the maximum.
+    if let Some(hyperband) = config
+        .strategy_config
+        .as_ref()
+        .and_then(|strategy| strategy.hyperband_strategy_config.as_ref())
+    {
+        if let (Some(min), Some(max)) = (hyperband.min_resource, hyperband.max_resource) {
+            if min > max {
+                return Some(format!(
+                    "HyperbandStrategyConfig has MinResource {min}, which is greater than its \
+                     MaxResource {max}."
+                ));
+            }
+        }
+    }
+
+    // A parallel bound is drawn from the total the job may launch, so it cannot exceed
+    // it. `handle` runs `limit_refusal` before this function, so a request past BOTH the
+    // published quota and its own total is answered as the limit failure it is.
+    if let Some(total) = config.resource_limits.max_number_of_training_jobs {
+        let parallel = config.resource_limits.max_parallel_training_jobs;
+        if parallel > total {
+            return Some(format!(
+                "MaxParallelTrainingJobs {parallel} is greater than MaxNumberOfTrainingJobs \
+                 {total}: a tuning job cannot run more training jobs at once than it may \
+                 launch in total."
+            ));
+        }
+    }
+
+    // Rules a single training job definition has to hold, applied to every definition
+    // the request carries rather than to the first one.
+    for definition in input
+        .training_job_definition
+        .iter()
+        .chain(input.training_job_definitions.iter().flatten())
+    {
+        let named = definition
+            .definition_name
+            .as_deref()
+            .map_or(String::new(), |name| format!(" \"{name}\""));
+
+        // `StoppingCondition$MaxWaitTimeInSeconds`' doc: the wait covers the time spent
+        // waiting for capacity PLUS the time the job may run, so "it must be equal to or
+        // greater than MaxRuntimeInSeconds".
+        if let (Some(wait), Some(runtime)) = (
+            definition.stopping_condition.max_wait_time_in_seconds,
+            definition.stopping_condition.max_runtime_in_seconds,
+        ) {
+            if wait < runtime {
+                return Some(format!(
+                    "The training job definition{named} has MaxWaitTimeInSeconds {wait}, which \
+                     is less than its MaxRuntimeInSeconds {runtime}."
+                ));
+            }
+        }
+
+        // `HyperParameterTrainingJobDefinition$ResourceConfig`'s doc names
+        // `HyperParameterTuningResourceConfig` as the alternative to use instead of it, so
+        // the two are alternatives rather than a pair.
+        if definition.resource_config.is_some()
+            && definition.hyper_parameter_tuning_resource_config.is_some()
+        {
+            return Some(format!(
+                "The training job definition{named} may carry only one of ResourceConfig and \
+                 HyperParameterTuningResourceConfig."
+            ));
+        }
+    }
+
+    None
+}
+
+/// Why the capacity this request asks for is past a published per-tuning-job quota, if
+/// it is — the modelled `ResourceLimitExceeded`'s message.
+fn limit_refusal(limits: &ResourceLimits) -> Option<String> {
+    let quotas = [
+        (
+            "MaxNumberOfTrainingJobs",
+            "Maximum number of training jobs per hyperparameter tuning job",
+            limits.max_number_of_training_jobs.unwrap_or(0),
+            crate::state::MAX_TRAINING_JOBS_PER_TUNING_JOB,
+        ),
+        (
+            "MaxParallelTrainingJobs",
+            "Maximum number of parallel training jobs per hyperparameter tuning job",
+            limits.max_parallel_training_jobs,
+            crate::state::MAX_PARALLEL_TRAINING_JOBS_PER_TUNING_JOB,
+        ),
+    ];
+    quotas
+        .into_iter()
+        .find(|(_, _, requested, quota)| requested > quota)
+        .map(|(member, quota_name, requested, quota)| {
+            // The quota is per tuning job, so there is no account utilisation to state:
+            // what the limit is, and what this request asked for, is the whole story.
+            format!(
+                "The service limit '{quota_name}' is {quota}, and {member} requested \
+                 {requested}."
+            )
+        })
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateHyperParameterTuningJob<Eng>
 {
@@ -191,18 +498,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHyperParameterTuningJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHyperParameterTuningJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHyperParameterTuningJob"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // The capacity the request asks for, against the account's published limits.
+        // This comes first: a request for more training jobs than the account may run is
+        // a limit failure whatever else is wrong with its numbers.
+        if let Some(message) = limit_refusal(&input.hyper_parameter_tuning_job_config.resource_limits)
+        {
+            return Err(CreateHyperParameterTuningJobErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // Then the rules the model's constraints cannot express. This operation models no
+        // client-input error, so they are refused as `ValidationException`.
+        if let Some(message) = validation_refusal(&input) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(
+            &region,
+            "hyper-parameter-tuning-job",
+            &input.hyper_parameter_tuning_job_name,
+        );
+
+        let mut store = state.lock();
+        // The name identifies the job, so a second create under a name already taken is
+        // the modelled `ResourceInUse` rather than a second record. Checked before the
+        // store bound: a collision adds no record, so it cannot be a limit failure. The
+        // name is not case sensitive, so it is folded through the crate's one key helper.
+        let key = crate::state::entity_key(&input.hyper_parameter_tuning_job_name);
+        if let Some(held) = store.tuning_jobs.get(&key) {
+            return Err(CreateHyperParameterTuningJobErrorModeled::ResourceInUse(
+                ResourceInUse {
+                    message: Some(format!(
+                        "Hyperparameter tuning job names must be unique within an Amazon Web \
+                         Services account and Region, and \"{}\" is already in use.",
+                        held.name
+                    )),
+                },
+            )
+            .into());
+        }
+        // The store is bounded, so a caller varying the job name cannot grow it without
+        // end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.tuning_jobs_below_quota() {
+            return Err(CreateHyperParameterTuningJobErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for hyperparameter tuning jobs is {}, \
+                         with current utilization of {} and a request delta of 1.",
+                        crate::state::HYPER_PARAMETER_TUNING_JOB_QUOTA,
+                        store.tuning_jobs.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        // A warm start reads the results of the tuning jobs it names, so a parent this
+        // service holds no record of cannot be one.
+        for parent in input
+            .warm_start_config
+            .iter()
+            .flat_map(|config| config.parent_hyper_parameter_tuning_jobs.iter())
+        {
+            let Some(name) = parent.hyper_parameter_tuning_job_name.as_deref() else {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Each entry of WarmStartConfig.ParentHyperParameterTuningJobs must name a \
+                     HyperParameterTuningJobName."
+                        .to_string(),
+                ));
+            };
+            if !store
+                .tuning_jobs
+                .contains_key(&crate::state::entity_key(name))
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Could not find the parent hyperparameter tuning job \"{name}\" named by \
+                     WarmStartConfig."
+                )));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        store.tuning_jobs.insert(
+            key,
+            crate::state::HyperParameterTuningJob {
+                name: input.hyper_parameter_tuning_job_name.clone(),
+                arn: arn.clone(),
+                config: input.hyper_parameter_tuning_job_config.clone(),
+                training_job_definition: input.training_job_definition.clone(),
+                training_job_definitions: input.training_job_definitions.clone(),
+                warm_start_config: input.warm_start_config.clone(),
+                autotune: input.autotune.clone(),
+                // SageMaker sets the status to `InProgress` when it accepts the job; the
+                // terminal status is owed by the clock, not by this call.
+                status: crate::state::TUNING_STATUS_IN_PROGRESS.to_string(),
+                failure_reason: None,
+                tags: input.tags.clone().unwrap_or_default(),
+                creation_time: now,
+                last_modified_time: now,
+                end_time: None,
+                settles_at: now + crate::state::TUNING_JOB_SETTLES_AFTER,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateHyperParameterTuningJobOutput {
+            hyper_parameter_tuning_job_arn: arn,
+        })
     }
 }

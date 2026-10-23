@@ -3,9 +3,9 @@
 //! Engine state for the com-amazonaws-sagemaker-sagemaker service.
 //!
 //! The inference-deployment lifecycle (model -> endpoint config -> endpoint), the
-//! pipeline lifecycle, the model-card governance resources, batch-transform jobs and
-//! the AI benchmarking control plane's workload configurations and benchmark jobs are
-//! kept here, in
+//! hyperparameter tuning jobs, the pipeline lifecycle, the model-card governance
+//! resources, batch-transform jobs and the AI benchmarking control plane's workload
+//! configurations and benchmark jobs are kept here, in
 //! `BTreeMap`s keyed by the resource name AWS keys them by, so `ListModels` has one
 //! stable order to sort and paginate over and every `Describe*` replays exactly what
 //! the matching `Create*` stored. The Studio AppImageConfig registry, the Git
@@ -57,13 +57,14 @@ use crate::ops::types::{
     AdditionalInferenceSpecificationDefinition, AppSpecification, ArtifactSource,
     AsyncInferenceConfig, AutoMLComputeConfig, AutoMLDataSplitConfig, AutoMLJobChannel,
     AutoMLJobObjective, AutoMLOutputDataConfig, AutoMLProblemTypeConfig, AutoMLSecurityConfig,
-    BatchDataCaptureConfig, CodeEditorAppImageConfig,
-    ContainerDefinition, DataCaptureConfig, DataProcessing, DriftCheckBaselines, ExperimentConfig,
-    ExplainerConfig, GitConfig, IamIdentity, InferenceExecutionConfig, InferenceSpecification,
-    JupyterLabAppImageConfig, KernelGatewayImageConfig, ManagedConfiguration, MetadataProperties,
-    MetricsConfig, ModelCardExportOutputConfig, ModelCardSecurityConfig, ModelClientConfig,
-    ModelDeployConfig, ModelLifeCycle, ModelMetrics, ModelPackageModelCard,
-    ModelPackageSecurityConfig, ModelPackageStatusDetails,
+    Autotune, BatchDataCaptureConfig, CodeEditorAppImageConfig, ContainerDefinition,
+    DataCaptureConfig, DataProcessing, DriftCheckBaselines, ExperimentConfig, ExplainerConfig,
+    GitConfig, HyperParameterTrainingJobDefinition, HyperParameterTuningJobConfig,
+    HyperParameterTuningJobWarmStartConfig, IamIdentity, InferenceExecutionConfig,
+    InferenceSpecification, JupyterLabAppImageConfig, KernelGatewayImageConfig,
+    ManagedConfiguration, MetadataProperties, MetricsConfig, ModelCardExportOutputConfig,
+    ModelCardSecurityConfig, ModelClientConfig, ModelDeployConfig, ModelLifeCycle, ModelMetrics,
+    ModelPackageModelCard, ModelPackageSecurityConfig, ModelPackageStatusDetails,
     ModelPackageStatusItem, ModelPackageValidationSpecification, NetworkConfig,
     ParallelismConfiguration, Parameter, ProcessingInput, ProcessingOutputConfig,
     ProcessingResources, ProcessingStoppingCondition, ProductionVariant, ProductionVariantSummary,
@@ -216,6 +217,62 @@ pub const DEFAULT_PRESIGNED_URL_SESSION_SECONDS: i32 = 1800;
 /// [`ComAmazonawsSagemakerSagemakerState::ensure_lineage_group`], so that
 /// `DescribeLineageGroup` reports the group those entities are in.
 pub const DEFAULT_LINEAGE_GROUP: &str = "sagemaker-default-lineage-group";
+
+/// See [`MODEL_QUOTA`]. `DeleteHyperParameterTuningJob` is still a stub, so no call
+/// releases a tuning-job record yet; the bound is what keeps the store finite in the
+/// meantime.
+pub const HYPER_PARAMETER_TUNING_JOB_QUOTA: usize = 1_000;
+
+/// The most training jobs one hyperparameter tuning job may be asked to launch
+/// (`ResourceLimits$MaxNumberOfTrainingJobs`).
+///
+/// SageMaker publishes this as the adjustable account quota "Maximum number of training
+/// jobs per hyperparameter tuning job" and refuses a larger request with the modelled
+/// `ResourceLimitExceeded`. This emulator models neither Service Quotas nor an account's
+/// adjustments, so every account is held to the published default.
+pub const MAX_TRAINING_JOBS_PER_TUNING_JOB: i32 = 750;
+
+/// The most training jobs one hyperparameter tuning job may run at a time
+/// (`ResourceLimits$MaxParallelTrainingJobs`), from the published adjustable quota
+/// "Maximum number of parallel training jobs per hyperparameter tuning job". See
+/// [`MAX_TRAINING_JOBS_PER_TUNING_JOB`] for why the default is what every account gets.
+pub const MAX_PARALLEL_TRAINING_JOBS_PER_TUNING_JOB: i32 = 10;
+
+/// The most hyperparameters one tuning job may search over, across
+/// `ParameterRanges`' integer, continuous and categorical lists together.
+///
+/// The model bounds each of those lists at 30 entries and `ParameterRanges`' own doc
+/// says that figure "refers to the maximum number of hyperparameters for each range and
+/// also the maximum for the hyperparameter tuning job itself" — the sum is held to the
+/// same bound the model states per list.
+pub const MAX_SEARCHED_HYPERPARAMETERS: usize = 30;
+
+/// How long after `CreateHyperParameterTuningJob` the clock owes the tuning job's
+/// `InProgress` -> terminal transition.
+///
+/// A caller that describes the job straight after creating it still observes
+/// `InProgress`; one that waits observes the terminal status, so a waiter terminates.
+/// Real tuning jobs take hours; the span is compressed, never zero, and sits at the top
+/// of the band this emulator uses for a clock-owed transition so a caller (or a test)
+/// reading the transient status right after the create is not racing the clock.
+pub const TUNING_JOB_SETTLES_AFTER: Duration = Duration::from_millis(700);
+
+/// `HyperParameterTuningJobStatus`'s members this emulator moves a tuning job through.
+pub const TUNING_STATUS_IN_PROGRESS: &str = "InProgress";
+/// See [`TUNING_STATUS_IN_PROGRESS`].
+pub const TUNING_STATUS_FAILED: &str = "Failed";
+
+/// Why a hyperparameter tuning job this emulator accepted ends in `Failed`.
+///
+/// A tuning job's work is the training jobs it launches, and this emulator runs no
+/// training container: nothing evaluates an objective metric and nothing writes model
+/// artifacts. Reporting `Completed`, a best training job or a metric value would claim
+/// results of work that never ran, so the job ends in the modelled failure status
+/// carrying this reason instead.
+pub const NO_TRAINING_RUNNER_FAILURE_REASON: &str =
+    "This emulator does not run training jobs: no training job was launched for this \
+hyperparameter tuning job, so no objective metric was evaluated and no model artifacts were \
+written to the output S3 location.";
 
 /// How long after `CreateProcessingJob` the clock owes the job's move out of
 /// `InProgress` into its terminal status.
@@ -918,6 +975,55 @@ impl InferenceComponent {
             (None, Some(list)) => list.as_slice(),
             _ => &[],
         }
+    }
+}
+
+/// A hyperparameter tuning job created by `CreateHyperParameterTuningJob`, as
+/// `DescribeHyperParameterTuningJob` replays it.
+///
+/// `settles_at` is the instant the clock owes the `InProgress` -> terminal transition;
+/// it is stored, never slept on, and materialised by whichever reporting call first
+/// runs at or after it.
+#[derive(Debug, Clone)]
+pub struct HyperParameterTuningJob {
+    pub name: String,
+    pub arn: String,
+    pub config: HyperParameterTuningJobConfig,
+    pub training_job_definition: Option<HyperParameterTrainingJobDefinition>,
+    pub training_job_definitions: Option<Vec<HyperParameterTrainingJobDefinition>>,
+    pub warm_start_config: Option<HyperParameterTuningJobWarmStartConfig>,
+    pub autotune: Option<Autotune>,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    /// `HyperParameterTuningEndTime`: set when the job reaches a terminal status.
+    pub end_time: Option<SystemTime>,
+    pub settles_at: SystemTime,
+}
+
+impl HyperParameterTuningJob {
+    /// Materialise the `InProgress` -> `Failed` transition the clock already owes.
+    ///
+    /// The one write a reporting operation may make: the transition was due at
+    /// `settles_at` whether or not anybody described the job, so the observer makes no
+    /// difference to the result. The end and last-modified times move to the instant the
+    /// transition was due rather than to "now", so they are stable across later reads.
+    ///
+    /// The job fails because this emulator launches no training job — see
+    /// [`NO_TRAINING_RUNNER_FAILURE_REASON`].
+    ///
+    /// Answers whether the transition happened on this call, so the caller can record it.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == TUNING_STATUS_IN_PROGRESS && now >= self.settles_at {
+            self.status = TUNING_STATUS_FAILED.to_string();
+            self.failure_reason = Some(NO_TRAINING_RUNNER_FAILURE_REASON.to_string());
+            self.end_time = Some(self.settles_at);
+            self.last_modified_time = self.settles_at;
+            return true;
+        }
+        false
     }
 }
 
@@ -1998,6 +2104,12 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub endpoint_configs: BTreeMap<String, EndpointConfig>,
     /// Keyed by `EndpointName`.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// Keyed by [`entity_key`] of their `HyperParameterTuningJobName`:
+    /// `HyperParameterTuningJobName`'s doc says the name "must be unique within the same
+    /// Amazon Web Services account and Amazon Web Services Region" and "is not case
+    /// sensitive", so two spellings differing only in case are ONE job, while the record
+    /// keeps the casing the create sent (and the ARN minted from it).
+    pub tuning_jobs: BTreeMap<String, HyperParameterTuningJob>,
     /// Trials, keyed by [`entity_key`] of their `TrialName`: the name "must be unique in
     /// your Amazon Web Services account and is not case-sensitive"
     /// (`CreateTrial$TrialName`), so two spellings differing only in case are ONE trial.
@@ -2147,6 +2259,12 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// Whether another endpoint fits, i.e. the store is below [`ENDPOINT_QUOTA`].
     pub fn endpoints_below_quota(&self) -> bool {
         self.endpoints.len() < ENDPOINT_QUOTA
+    }
+
+    /// Whether another hyperparameter tuning job fits, i.e. the store is below
+    /// [`HYPER_PARAMETER_TUNING_JOB_QUOTA`].
+    pub fn tuning_jobs_below_quota(&self) -> bool {
+        self.tuning_jobs.len() < HYPER_PARAMETER_TUNING_JOB_QUOTA
     }
 
     /// Whether another pipeline fits, i.e. the store is below [`PIPELINE_QUOTA`].
