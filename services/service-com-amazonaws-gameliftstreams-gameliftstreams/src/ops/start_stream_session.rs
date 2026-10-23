@@ -347,6 +347,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = crate::state::region_of(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartStreamSessionErrorModeled::InternalServerException(
                 InternalServerException {
@@ -361,10 +362,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize(now);
 
         let Some(group) = state.stream_group(&input.identifier) else {
+            // The stream group is the resource this create path addresses, so the
+            // message names the ARN the request's `Identifier` resolves to.
             return Err(StartStreamSessionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no stream group matches identifier {}", input.identifier),
-                },
+                crate::state::resource_not_found(&crate::state::resolved_arn(
+                    &region,
+                    &input.identifier,
+                    crate::state::STREAM_GROUP_RESOURCE,
+                )),
             )
             .into());
         };
@@ -401,13 +406,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
 
                 let Some(application) = state.application(&input.application_identifier) else {
+                    // Same rule for an identifier that is not a path label: the
+                    // message names the ARN `ApplicationIdentifier` resolves to.
                     return Err(StartStreamSessionErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: format!(
-                                "no application matches ApplicationIdentifier {}",
-                                input.application_identifier
-                            ),
-                        },
+                        crate::state::resource_not_found(&crate::state::resolved_arn(
+                            &region,
+                            &input.application_identifier,
+                            crate::state::APPLICATION_RESOURCE,
+                        )),
                     )
                     .into());
                 };
@@ -525,7 +531,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 }
 
-                let region = crate::state::region_of(ctx.parts());
                 let session_id = state.mint_id("ss-");
                 let arn =
                     crate::state::stream_session_arn(&region, &group_id, &session_id);

@@ -174,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::region_of(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(AddStreamGroupLocationsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -189,10 +189,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize(now);
 
         let Some(group) = state.stream_group_mut(&input.identifier) else {
+            // The message names the ARN the request's `Identifier` resolves to.
             return Err(AddStreamGroupLocationsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no stream group matches identifier {}", input.identifier),
-                },
+                crate::state::resource_not_found(&crate::state::resolved_arn(
+                    &region,
+                    &input.identifier,
+                    crate::state::STREAM_GROUP_RESOURCE,
+                )),
             )
             .into());
         };

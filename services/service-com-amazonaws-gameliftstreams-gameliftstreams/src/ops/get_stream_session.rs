@@ -249,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::region_of(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetStreamSessionErrorModeled::InternalServerException(
                 InternalServerException {
@@ -265,27 +265,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // due at `now`, which were owed whether or not anybody read.
         state.materialize(now);
 
-        let Some(group) = state.stream_group(&input.identifier) else {
-            return Err(GetStreamSessionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no stream group matches identifier {}", input.identifier),
-                },
-            )
-            .into());
-        };
-        let session = crate::state::identifier_id(
-            &input.stream_session_identifier,
-            crate::state::STREAM_SESSION_RESOURCE,
-        )
-        .and_then(|session_id| group.sessions.get(&session_id));
+        // Session-scoped: the resource this call addresses is the stream session the
+        // two path labels name, so an absent group and an absent session are the SAME
+        // miss, reported against the composite stream session ARN rather than
+        // short-circuiting on the enclosing group.
+        let session = state
+            .stream_group(&input.identifier)
+            .and_then(|group| {
+                crate::state::identifier_id(
+                    &input.stream_session_identifier,
+                    crate::state::STREAM_SESSION_RESOURCE,
+                )
+                .and_then(|session_id| group.sessions.get(&session_id))
+            });
         let Some(session) = session else {
             return Err(GetStreamSessionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "no stream session matches identifier {} in stream group {}",
-                        input.stream_session_identifier, group.id
+                crate::state::stream_session_not_found(
+                    &crate::state::resolved_stream_session_arn(
+                        &region,
+                        &input.identifier,
+                        &input.stream_session_identifier,
                     ),
-                },
+                ),
             )
             .into());
         };

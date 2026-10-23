@@ -252,9 +252,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation names no region of its
-        // own, because it writes to a record whose ARN was minted when it was created.
-        let _ = ctx;
+        // The region a not-found message's resolved ARN is built in. It is never
+        // written to a record: a stream group this call updates keeps the ARN it was
+        // minted with.
+        let region = crate::state::region_of(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateStreamGroupErrorModeled::InternalServerException(
                 InternalServerException {
@@ -300,10 +301,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // ---- the stream group this call updates ----
         let Some(group) = state.stream_group(&input.identifier) else {
+            // The message names the ARN the request's `Identifier` resolves to.
             return Err(UpdateStreamGroupErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no stream group matches identifier {}", input.identifier),
-                },
+                crate::state::resource_not_found(&crate::state::resolved_arn(
+                    &region,
+                    &input.identifier,
+                    crate::state::STREAM_GROUP_RESOURCE,
+                )),
             )
             .into());
         };
@@ -397,12 +401,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let default_application = match input.default_application_identifier.as_deref() {
             Some(identifier) => {
                 let Some(application) = state.application(identifier) else {
+                    // Same rule for an identifier that is not a path label: the
+                    // message names the ARN `DefaultApplicationIdentifier` resolves
+                    // to.
                     return Err(UpdateStreamGroupErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: format!(
-                                "no application matches DefaultApplicationIdentifier {identifier}"
-                            ),
-                        },
+                        crate::state::resource_not_found(&crate::state::resolved_arn(
+                            &region,
+                            identifier,
+                            crate::state::APPLICATION_RESOURCE,
+                        )),
                     )
                     .into());
                 };
