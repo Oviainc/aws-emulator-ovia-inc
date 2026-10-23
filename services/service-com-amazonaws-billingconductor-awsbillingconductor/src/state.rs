@@ -515,6 +515,30 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         is_aws_managed_pricing_plan(arn) || self.pricing_plans.contains_key(arn)
     }
 
+    /// The pricing rules associated with the plan `plan_arn` names: FULL rule ARNs,
+    /// deduplicated and in ARN order, or `None` when this account has no such plan.
+    ///
+    /// The association is to the RULE, not to the spelling the association was
+    /// recorded with, so each stored value is normalised
+    /// ([`normalize_pricing_rule_arn`]) and two spellings of one rule collapse to
+    /// one association. An AWS-managed plan exists without the caller creating it
+    /// and carries no rule of the caller's, so it associates an EMPTY set rather
+    /// than being unknown. The order is the ARN order the ids are minted in, so a
+    /// `NextToken` cut over this sequence names the same point on the next call.
+    pub fn associated_pricing_rule_arns(&self, plan_arn: &str) -> Option<Vec<String>> {
+        match self.pricing_plans.get(plan_arn) {
+            Some(plan) => Some(
+                plan.pricing_rule_arns
+                    .iter()
+                    .map(|arn| normalize_pricing_rule_arn(arn))
+                    .collect::<BTreeSet<String>>()
+                    .into_iter()
+                    .collect(),
+            ),
+            None => is_aws_managed_pricing_plan(plan_arn).then(Vec::new),
+        }
+    }
+
     /// The pricing rule a name is taken by, when it is not `rule_arn`'s own name.
     pub fn conflicting_pricing_rule_name(&self, name: &str, rule_arn: &str) -> Option<&str> {
         self.pricing_rule_names

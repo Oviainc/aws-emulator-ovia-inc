@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAppVersionAppComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAppVersionAppComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAppVersionAppComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: adds an Application Component to the application's DRAFT version in
+//! [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState::app_versions`],
+//! so `DescribeAppVersionAppComponent` reads back what this call persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +179,215 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAppVersionAppComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAppVersionAppComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAppVersionAppComponent"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        // Every modeled constraint on this input is already refused by the boundary
+        // validator before this handler runs, EXCEPT the one it structurally cannot
+        // reach: the `@length` of the value list inside an `AdditionalInfoMap`.
+        if let Some(additional_info) = input.additional_info.as_ref() {
+            if let Some(message) =
+                crate::state::additional_info_violation("additionalInfo", additional_info)
+            {
+                return Err(invalid_request(message));
+            }
+        }
+
+        let mut store = state.lock();
+
+        // The Application Component belongs to an application, so the application
+        // has to exist: storing it under an unknown `appArn` would make a later
+        // read report a component of an application that was never created.
+        if !store.apps.contains_key(&input.app_arn) {
+            return Err(app_not_found(&input.app_arn));
+        }
+
+        // A replayed `@idempotencyToken` returns the component its first call
+        // created instead of creating a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(first_resource) = store.created_by_token(Self::NAME, token).cloned() {
+                let first_id = component_id_of(&first_resource, &input.app_arn);
+                let first = first_id.and_then(|id| {
+                    store
+                        .app_version(&input.app_arn, crate::state::DRAFT_APP_VERSION)
+                        .and_then(|version| version.app_components.get(id))
+                });
+                match first {
+                    Some(first) if describes_same_component(first, &input) => {
+                        return Ok(draft_output(input.app_arn.clone(), first.clone()));
+                    }
+                    // The token is in use: either for a component of this app that
+                    // this request describes differently, or for a resource of
+                    // another application altogether.
+                    _ => {
+                        return Err(conflict(
+                            format!(
+                                "clientToken {token} was already used to create \
+                                 {first_resource} with different parameters"
+                            ),
+                            first_resource,
+                            "AppComponent",
+                        ));
+                    }
+                }
+            }
+        }
+
+        // An `id` the caller did not supply is server-generated, as it is for every
+        // other resource this service mints.
+        let id = input
+            .id
+            .clone()
+            .unwrap_or_else(crate::state::mint_app_component_id);
+
+        let draft = store.draft_app_version_mut(&input.app_arn);
+
+        // The `id` identifies the component within the app version, so a second
+        // component cannot take one that is already in use.
+        if draft.app_components.contains_key(&id) {
+            return Err(conflict(
+                format!(
+                    "an Application Component with id {id} already exists in the {} version of \
+                     application {}",
+                    crate::state::DRAFT_APP_VERSION,
+                    input.app_arn
+                ),
+                id,
+                "AppComponent",
+            ));
+        }
+
+        // The store is bounded: past the ceiling no further component is created.
+        if draft.app_components.len() >= crate::state::MAX_APP_COMPONENTS_PER_APP_VERSION {
+            return Err(quota_exceeded());
+        }
+
+        let app_component = AppComponent {
+            name: input.name,
+            r#type: input.r#type,
+            id: Some(id.clone()),
+            additional_info: input.additional_info,
+        };
+        draft
+            .app_components
+            .insert(id.clone(), app_component.clone());
+
+        if let Some(token) = input.client_token.as_deref() {
+            let resource = component_resource_key(&input.app_arn, &id);
+            store.record_idempotency_token(Self::NAME, token, &resource);
+        }
+
+        Ok(draft_output(input.app_arn, app_component))
     }
+}
+
+/// The response for a component of `app_arn`'s draft version.
+///
+/// The operation "updates the Resilience Hub application draft version" (the
+/// model's own documentation for it), so the version it reports is always the
+/// draft: `PublishAppVersion` is what mints a numbered version from it.
+fn draft_output(
+    app_arn: String,
+    app_component: AppComponent,
+) -> CreateAppVersionAppComponentOutput {
+    CreateAppVersionAppComponentOutput {
+        app_arn,
+        app_version: crate::state::DRAFT_APP_VERSION.to_string(),
+        app_component: Some(app_component),
+    }
+}
+
+/// How this operation records what a `clientToken` created: the sub-resource key
+/// `<appArn>/app-component/<id>`, so `DeleteApp` releases it with the rest of the
+/// application's tokens.
+fn component_resource_key(app_arn: &str, id: &str) -> String {
+    format!("{app_arn}/app-component/{id}")
+}
+
+/// The component `id` a remembered token created, when the token created one under
+/// `app_arn` — `None` when the same token was first used for another application,
+/// which is a conflict rather than a replay.
+fn component_id_of<'a>(resource: &'a str, app_arn: &str) -> Option<&'a str> {
+    resource.strip_prefix(&component_resource_key(app_arn, ""))
+}
+
+/// Whether `stored` is the Application Component `request` asks for — the
+/// idempotency check: a replayed token with the same parameters replays the first
+/// result, a replayed token with different parameters is a conflict.
+///
+/// Covers EVERY member this operation stores from the request. The request's `id`
+/// is compared only when it names one: a replay that left the id to the server
+/// cannot disagree with the id the server generated.
+fn describes_same_component(
+    stored: &AppComponent,
+    request: &CreateAppVersionAppComponentInput,
+) -> bool {
+    stored.name == request.name
+        && stored.r#type == request.r#type
+        && stored.additional_info == request.additional_info
+        && request
+            .id
+            .as_ref()
+            .is_none_or(|id| stored.id.as_ref() == Some(id))
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> CreateAppVersionAppComponentError {
+    CreateAppVersionAppComponentErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
+}
+
+/// A 400 `ValidationException` — the operation's OWN modelled one, not the
+/// scaffold's synthetic shape — for a request outside a modelled constraint the
+/// boundary validator could not reach.
+fn invalid_request(message: String) -> CreateAppVersionAppComponentError {
+    CreateAppVersionAppComponentErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for an `appArn` that was never created, or was
+/// deleted.
+fn app_not_found(app_arn: &str) -> CreateAppVersionAppComponentError {
+    CreateAppVersionAppComponentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("application {app_arn} does not exist")),
+        resource_id: Some(app_arn.to_string()),
+        resource_type: Some("App".to_string()),
+    })
+    .into()
+}
+
+/// A 409 `ConflictException` naming the resource already holding the id or the
+/// replayed `clientToken`.
+fn conflict(
+    message: impl Into<String>,
+    resource_id: String,
+    resource_type: &str,
+) -> CreateAppVersionAppComponentError {
+    CreateAppVersionAppComponentErrorModeled::ConflictException(ConflictException {
+        message: Some(message.into()),
+        resource_id: Some(resource_id),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
+}
+
+/// The 402 for a request that would take one app version past
+/// [`crate::state::MAX_APP_COMPONENTS_PER_APP_VERSION`].
+fn quota_exceeded() -> CreateAppVersionAppComponentError {
+    CreateAppVersionAppComponentErrorModeled::ServiceQuotaExceededException(
+        ServiceQuotaExceededException {
+            message: Some(format!(
+                "this emulator stores at most {} Application Components per app version; \
+                 delete one before creating another",
+                crate::state::MAX_APP_COMPONENTS_PER_APP_VERSION
+            )),
+        },
+    )
+    .into()
 }

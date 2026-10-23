@@ -17,6 +17,8 @@ mod change_set_lifecycle;
 mod error_envelope;
 #[path = "all/stack_lifecycle.rs"]
 mod stack_lifecycle;
+#[path = "all/stack_output_resolution.rs"]
+mod stack_output_resolution;
 #[path = "all/stack_outputs.rs"]
 mod stack_outputs;
 #[path = "all/stack_reported_members.rs"]

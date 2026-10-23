@@ -5,7 +5,9 @@
 //! `ParameterGroupName` (a MemoryDB resource name is a case-insensitive identifier,
 //! refused outright when it breaks the service's name rule) and answers with the stored
 //! record — including the default `Description` the service gives a group created
-//! without one — so `DescribeParameterGroups` reports exactly what was persisted.
+//! without one — so `DescribeParameterGroups` reports exactly what was persisted. The
+//! creation is also recorded as a `parameter-group` event, which `DescribeEvents`
+//! reports.
 //!
 //! ## Shape of an operation
 //!
@@ -251,7 +253,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let response = group.to_api();
         state
             .parameter_groups
-            .insert(parameter_group_name, group);
+            .insert(parameter_group_name.clone(), group);
+        // The change this call made, recorded against the parameter group it made it
+        // to, so `DescribeEvents` reports it.
+        state.record_event(
+            crate::state::event_source_type::PARAMETER_GROUP,
+            &parameter_group_name,
+            crate::state::EventKind::Created,
+        );
         Ok(CreateParameterGroupOutput {
             parameter_group: Some(response),
         })

@@ -2,7 +2,11 @@
 
 //! @op GetCommit
 //! Implemented: answers with the stored commit the full object id names, read from
-//! `crate::state` and projected through [`crate::state::Commit::info`].
+//! `crate::state` and projected through [`crate::state::Commit::info`] — the
+//! read-back path for `CreateCommit` and `PutFile`, so the writers and this reader
+//! cannot disagree. A `commitId` the repository does not hold is refused with the
+//! modelled `CommitIdDoesNotExistException`; one that is not a git object name at
+//! all with `InvalidCommitIdException`. Reporting only — nothing here writes.
 //!
 //! ## Shape of an operation
 //!

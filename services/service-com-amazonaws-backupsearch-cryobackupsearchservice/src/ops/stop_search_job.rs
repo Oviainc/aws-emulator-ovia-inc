@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let job = state.job_mut(&identifier).ok_or_else(|| {
             StopSearchJobError::from(StopSearchJobErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("no search job with identifier '{identifier}' exists"),
+                    message: crate::state::RESOURCE_NOT_FOUND.to_string(),
                     resource_id: identifier.clone(),
                     resource_type: SEARCH_JOB_RESOURCE.to_string(),
                 },

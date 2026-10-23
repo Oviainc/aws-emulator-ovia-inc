@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIdNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIdNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Replaces the CONFIGURATION of an ID namespace `CreateIdNamespace` already persisted
+//! in
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::id_namespaces`],
+//! in place, and re-stamps its `updatedAt`. The namespace's IDENTITY is not touched:
+//! the `idNamespaceName` key, the `idNamespaceArn` minted at create time, the `type`
+//! and the `createdAt` stamp are not members of this request, and neither are the tags,
+//! so they all survive the update and `GetIdNamespace` reads the new configuration on
+//! the same resource. Every configuration member this `PUT` models is REPLACED by what
+//! the request carries, so an optional member the request omits (`description`,
+//! `inputSourceConfig`, `idMappingWorkflowProperties`, `roleArn`) is cleared rather
+//! than kept. An `idNamespaceName` no namespace is stored under answers the modelled
+//! `ResourceNotFoundException` (HTTP 404) and persists nothing — an update is not a
+//! create.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIdNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Unlike `GetIdNamespace`, whose label is an `EntityNameOrIdNamespaceArn`, this
+//! operation's `idNamespaceName` label is an `EntityName`
+//! (`^[a-zA-Z_0-9-]*$`, `smithy_query(query="operation",operation="UpdateIdNamespace")`),
+//! which admits no ARN: the label IS the store's key.
 //!
 //! ## Shape of an operation
 //!
@@ -176,20 +185,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIdNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIdNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIdNamespace"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateIdNamespaceErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        let updated = crate::state::now();
+
+        let mut store = state.lock();
+        let stored = store
+            .id_namespaces
+            .get_mut(&input.id_namespace_name)
+            .ok_or_else(|| {
+                UpdateIdNamespaceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::messages::UPDATE_ID_NAMESPACE_NOT_FOUND.to_string(),
+                        ),
+                    },
+                )
+            })?;
+
+        // The configuration members this operation models are replaced wholesale; the
+        // identity members (`idNamespaceName`, `idNamespaceArn`, `type`, `createdAt`)
+        // and the tags are NOT members of this request, so they stay as
+        // `CreateIdNamespace` and `TagResource` left them.
+        stored.description = input.description;
+        stored.input_source_config = input.input_source_config;
+        stored.id_mapping_workflow_properties = input.id_mapping_workflow_properties;
+        stored.role_arn = input.role_arn;
+        stored.updated_at = updated;
+
+        // Answered from the STORED record, not from the request object: this response
+        // and a later `GetIdNamespace` therefore cannot disagree.
+        Ok(UpdateIdNamespaceOutput {
+            id_namespace_name: stored.id_namespace_name.clone(),
+            id_namespace_arn: stored.id_namespace_arn.clone(),
+            description: stored.description.clone(),
+            input_source_config: stored.input_source_config.clone(),
+            id_mapping_workflow_properties: stored.id_mapping_workflow_properties.clone(),
+            r#type: stored.r#type.clone(),
+            role_arn: stored.role_arn.clone(),
+            created_at: stored.created_at,
+            updated_at: stored.updated_at,
+        })
     }
 }

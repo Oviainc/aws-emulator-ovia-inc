@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the named tags from the resource the request's `ResourceArn` names: the stored
+//! app monitor whose ARN is that one (app monitors are RUM's only taggable resource), or
+//! HTTP 404 when no stored resource has it. The tag map it writes is the one
+//! `CreateAppMonitor` seeds and `GetAppMonitor` reports, so a removal is visible to every
+//! other operation that reads the monitor.
 //!
 //! ## Shape of an operation
 //!
@@ -74,10 +71,10 @@ use super::types::*;
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-rum-rum.json");
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `UntagResourceError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
+// model declares for this operation, so neither the scaffold's `NotImplemented` nor the
+// wire-only `NotFoundException` code below can live here — hence the `UntagResourceError`
+// channel that wraps this enum. Every declared error stays listed even when this handler
+// does not construct it: the list is the model's, not the handler's.
 #[smithy_macros::operation_error("com.amazonaws.rum#UntagResource")]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
@@ -86,18 +83,98 @@ pub enum UntagResourceErrorModeled {
     ValidationException(ValidationException),
 }
 
-/// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::untag_resource::UntagResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type UntagResourceError = crate::scaffolded::Scaffolded<UntagResourceErrorModeled>;
+/// The error code RUM's tagging frontend names a resource it cannot find by on the wire.
+///
+/// The model declares `ResourceNotFoundException` for this operation, and that shape's
+/// `@httpError` 404 and its members are what the response carries — but the code the
+/// service puts in `x-amzn-errortype` / the body's `__type` for an ARN that resolves to
+/// nothing is the shorter `NotFoundException`, which the model does not declare at all.
+/// The recorded corpus unit `rum.untag-resource-unknown-resource-rejected` pins it
+/// (`err["Code"] == "NotFoundException"`), and it is specific to the ARN-addressed
+/// tagging operations: RUM's app-monitor operations, addressed by `Name`, do answer
+/// `ResourceNotFoundException`. A client branches on the code it is SENT, so the emulator
+/// sends the one the service sends rather than the one the model lists.
+const NOT_FOUND_ERROR_CODE: &str = "NotFoundException";
 
-/// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
-/// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// This operation's error channel, as the generated `impl Operation` names it
+/// (`crate::ops::untag_resource::UntagResourceError`).
+///
+/// It is NOT `crate::scaffolded::Scaffolded` any more: this operation is implemented, so
+/// it needs neither the 501 (that variant is the stub signal) nor the framework's
+/// synthetic `ValidationException` (its own model declares one). What it does need, and
+/// what no generic wrapper can express, is the one wire code above — so the channel is
+/// the modelled enum plus that single refusal.
+#[derive(Debug)]
+pub enum UntagResourceError {
+    /// One of the operation's modelled errors, rendered exactly as the model declares it.
+    Modeled(UntagResourceErrorModeled),
+    /// "That ARN names no resource", carrying the modelled `ResourceNotFoundException`
+    /// payload and its 404 under the [`NOT_FOUND_ERROR_CODE`] the service answers with.
+    NotFound(ResourceNotFoundException),
+}
+
+/// Lets `?` and `.into()` lift a modeled failure into the error channel, so the handler
+/// writes `Err(SomeModeledError.into())` rather than naming the wrapper variant.
 impl From<UntagResourceErrorModeled> for UntagResourceError {
     fn from(modeled: UntagResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Modeled(modeled)
+    }
+}
+
+impl ::std::fmt::Display for UntagResourceError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Modeled(e) => write!(f, "{e}"),
+            Self::NotFound(e) => write!(f, "{NOT_FOUND_ERROR_CODE}: {}", e.message),
+        }
+    }
+}
+
+impl ::std::error::Error for UntagResourceError {}
+
+/// Every method delegates to the modelled error, so a modelled failure is rendered
+/// exactly as `#[operation_error]` renders it. The `NotFound` variant differs in ONE
+/// respect — the wire code, which the framework reads from `shape_name` rather than from
+/// the schema — and is otherwise the modelled `ResourceNotFoundException`: its schema
+/// decides which members the body carries, and its `@httpError` is the status.
+impl ::smithy_server_runtime::OperationError for UntagResourceError {
+    fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::as_serializable(e),
+            Self::NotFound(e) => e,
+        }
+    }
+
+    fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::variant_schema(e),
+            Self::NotFound(_) => &super::types::SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
+        }
+    }
+
+    fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::shape_name(e),
+            Self::NotFound(_) => NOT_FOUND_ERROR_CODE,
+        }
+    }
+
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::http_status(e),
+            // `ResourceNotFoundException`'s own modelled `@httpError`: the code on the
+            // wire changes, the status does not.
+            Self::NotFound(_) => 404,
+        }
+    }
+
+    fn query_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::query_error_code(e),
+            // restJson1 is this service's only protocol, and the shape carries no
+            // `awsQueryError` trait to honour in any case.
+            Self::NotFound(_) => None,
+        }
     }
 }
 
@@ -137,18 +214,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The ARN in the request is the whole identity of the resource; nothing about
+        // this call depends on how the request was signed.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // "Removes one or more tags from the specified resource": the resource is the one
+        // whose stored ARN the request names, and an ARN naming none is refused with 404
+        // (see [`UntagResourceError::NotFound`]) rather than answered as a silent success.
+        let Some(record) = store.app_monitor_by_arn_mut(&input.resource_arn) else {
+            return Err(UntagResourceError::NotFound(
+                crate::state::tagged_resource_not_found(&input.resource_arn),
+            ));
+        };
+        // Each named key is dropped from the resource's tag map and every key NOT named
+        // is left exactly as it was. Removal is by key, so a key the resource does not
+        // carry (and a key named twice in one request) removes nothing and is not an
+        // error — which is what makes the operation `@idempotent`, as the model declares
+        // it: the same request applied again leaves the same tag set.
+        for key in &input.tag_keys {
+            record.tags.remove(key);
+        }
+        // `LastModified` is "the date and time of the most recent changes to this app
+        // monitor's CONFIGURATION" (the model, `AppMonitor$LastModified`); tags are not
+        // configuration, so removing one does not move it.
+        Ok(UntagResourceOutput {})
     }
 }

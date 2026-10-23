@@ -183,6 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Release what the create allocated: the idempotency token that recorded
         // this app, so a create/delete workload cannot grow the token store.
         store.forget_idempotency_tokens_for(&input.app_arn);
+        // And what the app's versions hold (their Application Components), so
+        // nothing of a deleted application outlives it.
+        store.forget_app_versions(&input.app_arn);
 
         Ok(DeleteAppOutput {
             app_arn: input.app_arn,

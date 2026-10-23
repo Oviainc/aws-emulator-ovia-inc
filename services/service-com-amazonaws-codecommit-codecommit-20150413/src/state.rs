@@ -16,12 +16,12 @@
 //! message changes the commit id — it is simply not byte-identical to the SHA-1 a git
 //! client would compute for the same object.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{Comment, Location, RepositoryMetadata, UserInfo};
+use crate::ops::types::{ApprovalRuleTemplate, Comment, Location, RepositoryMetadata, UserInfo};
 
 /// The region an ARN or clone URL uses when the request carries no SigV4
 /// credential scope to read one from (an unsigned request).
@@ -111,6 +111,59 @@ pub const MAX_BRANCHES_PER_REPOSITORY: usize = 64;
 /// 6 MB".
 pub const MAX_FOLDER_CONTENT_BYTES: i64 = 6 * 1024 * 1024;
 
+/// The combined size of all the file content one commit may carry, in bytes.
+/// CodeCommit documents this on `FileContentSizeLimitExceededException`: "The
+/// maximum file size is 6 MB, and the combined file content change size is 7 MB."
+/// (The per-file 6 MB is `FileContent`'s modelled maximum, refused at the
+/// boundary.)
+pub const MAX_COMBINED_CONTENT_BYTES: usize = 7 * 1024 * 1024;
+
+/// How many approval rule templates the store holds before
+/// `CreateApprovalRuleTemplate` refuses with the modelled
+/// `NumberOfRuleTemplatesExceededException`.
+///
+/// The emulator's OWN bound on the template map rather than a claim about any
+/// account's adjustable quota: a caller creates one template per request, so this
+/// is what stops the map growing without end. Every record it holds is released by
+/// `DeleteApprovalRuleTemplate`.
+pub const APPROVAL_RULE_TEMPLATE_QUOTA: usize = 1_000;
+
+/// How many approval rule templates one repository may be associated with before
+/// `AssociateApprovalRuleTemplateWithRepository` refuses with the modelled
+/// `MaximumRuleTemplatesAssociatedWithRepositoryException`.
+///
+/// The emulator's OWN bound on one repository's association set, not a published
+/// AWS quota; `DisassociateApprovalRuleTemplateFromRepository` is its release path.
+pub const MAX_TEMPLATES_PER_REPOSITORY: usize = 100;
+
+/// How many file entries one `CreateCommit` may carry before it refuses with the
+/// modelled `MaximumFileEntriesExceededException`.
+///
+/// The emulator's OWN bound, not a published AWS quota: the entry lists are
+/// caller-sized and each one is hashed into the commit's tree, so this is what
+/// bounds the per-request work.
+pub const MAX_FILE_ENTRIES_PER_COMMIT: usize = 100;
+
+/// The smallest `maxResults` a paginated CodeCommit list operation accepts; one
+/// below it is refused with `InvalidMaxResultsException`. CodeCommit documents the
+/// member as "a non-zero, non-negative integer" and words the refusal "A valid
+/// limit is between 1 and 1000".
+pub const MIN_MAX_RESULTS: i32 = 1;
+
+/// The largest `maxResults` a paginated CodeCommit list operation accepts — the
+/// upper end of the same published range (see [`MIN_MAX_RESULTS`]).
+pub const MAX_MAX_RESULTS: i32 = 1_000;
+
+/// The page size a paginated list operation uses when the caller names no
+/// `maxResults`: the largest page the service allows, so an unpaginated caller sees
+/// everything in one answer.
+pub const DEFAULT_MAX_RESULTS: i32 = MAX_MAX_RESULTS;
+
+/// The file a commit leaves behind in a folder that its deletions emptied, when the
+/// caller asked to keep the folder. CodeCommit documents `keepEmptyFolders`: "If
+/// true, a ..gitkeep file is created for empty folders."
+pub const KEEP_EMPTY_FOLDERS_PLACEHOLDER: &str = ".gitkeep";
+
 /// How many distinct principals' reactions one comment holds before
 /// `PutCommentReaction` refuses a new one.
 ///
@@ -183,11 +236,17 @@ pub fn is_reaction_removal(value: &str) -> bool {
 /// repositories, each holding at most [`MAX_FILES_PER_TREE`] files per tree,
 /// [`MAX_COMMITS_RETAINED`] commits, [`MAX_BRANCHES_PER_REPOSITORY`] branches and
 /// [`MAX_COMMENTS_PER_REPOSITORY`] comments, with blobs released as soon as no
-/// retained commit references them.
+/// retained commit references them, and at most
+/// [`APPROVAL_RULE_TEMPLATE_QUOTA`] approval rule templates.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCodecommitCodecommit20150413State {
     /// Live repositories, keyed by `repositoryName` (unique per account).
     pub repositories: BTreeMap<String, Repository>,
+    /// Live approval rule templates, keyed by `approvalRuleTemplateName` (unique
+    /// per account per Region). Which repositories a template is associated with
+    /// is held once, on the repository ([`Repository::associated_templates`]), so
+    /// the two sides of an association cannot disagree.
+    pub approval_rule_templates: BTreeMap<String, ApprovalRuleTemplateRecord>,
 }
 
 impl ComAmazonawsCodecommitCodecommit20150413State {
@@ -233,6 +292,10 @@ pub struct Repository {
     pub branches: BTreeMap<String, Branch>,
     pub commits: BTreeMap<String, Commit>,
     pub blobs: BTreeMap<String, Vec<u8>>,
+    /// The names of the approval rule templates associated with this repository.
+    /// A set, so associating the same template twice is the no-op CodeCommit makes
+    /// it, and bounded by [`MAX_TEMPLATES_PER_REPOSITORY`].
+    pub associated_templates: BTreeSet<String>,
     /// The sequence number the next commit takes, so the oldest commits can be
     /// told from the newest when [`Repository::prune_history`] runs.
     pub next_commit_sequence: u64,
@@ -443,6 +506,7 @@ impl Repository {
             branches: BTreeMap::new(),
             commits: BTreeMap::new(),
             blobs: BTreeMap::new(),
+            associated_templates: BTreeSet::new(),
             next_commit_sequence: 0,
             comments: BTreeMap::new(),
             comment_tokens: BTreeMap::new(),
@@ -566,6 +630,68 @@ impl Repository {
     }
 }
 
+/// One approval rule template and everything CodeCommit reports about it.
+///
+/// Which repositories it is associated with is NOT held here: that lives once, on
+/// each repository's [`Repository::associated_templates`].
+#[derive(Debug, Clone)]
+pub struct ApprovalRuleTemplateRecord {
+    pub template_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub content: String,
+    pub creation_date: SystemTime,
+    pub last_modified_date: SystemTime,
+    /// The ARN of the identity that made the most recent change, as CodeCommit
+    /// reports it in `lastModifiedUser`.
+    pub last_modified_user: String,
+}
+
+impl ApprovalRuleTemplateRecord {
+    /// Build a template, deriving every generated field from the name, the content
+    /// and the creation instant.
+    pub fn new(
+        name: &str,
+        content: String,
+        description: Option<String>,
+        last_modified_user: String,
+        created: SystemTime,
+    ) -> Self {
+        Self {
+            template_id: approval_rule_template_id(name, created),
+            name: name.to_string(),
+            description,
+            content,
+            creation_date: created,
+            last_modified_date: created,
+            last_modified_user,
+        }
+    }
+
+    /// This template as the modeled `ApprovalRuleTemplate` shape — the one place
+    /// that projection is written, so `CreateApprovalRuleTemplate`,
+    /// `GetApprovalRuleTemplate` and any later updater cannot disagree about a
+    /// stored template.
+    pub fn to_modeled(&self) -> ApprovalRuleTemplate {
+        ApprovalRuleTemplate {
+            approval_rule_template_id: Some(self.template_id.clone()),
+            approval_rule_template_name: Some(self.name.clone()),
+            approval_rule_template_description: self.description.clone(),
+            approval_rule_template_content: Some(self.content.clone()),
+            rule_content_sha256: Some(content_sha256(&self.content)),
+            last_modified_date: Some(to_date_time(self.last_modified_date)),
+            creation_date: Some(to_date_time(self.creation_date)),
+            last_modified_user: Some(self.last_modified_user.clone()),
+        }
+    }
+}
+
+/// The SHA-256 hash signature CodeCommit reports for a template's content
+/// (`ruleContentSha256`): the digest of the content bytes, hex encoded.
+pub fn content_sha256(content: &str) -> String {
+    ::hex::encode(Sha256::digest(content.as_bytes()))
+}
+
 /// The repository's opaque id: an RFC 9562 version-8 (custom) UUID whose 122
 /// implementation-defined bits are a digest of the account, the repository name and
 /// the creation instant. It is therefore stable for the life of the repository and
@@ -574,6 +700,18 @@ fn repository_id(name: &str, created: SystemTime) -> String {
     let nanos = nanos_since_epoch(created);
     uuid_v8(&format!(
         "codecommit/{}/{name}/{nanos}",
+        ::engine::emulator_account_id()
+    ))
+}
+
+/// An approval rule template's opaque `approvalRuleTemplateId`: the same kind of
+/// version-8 UUID, over the account, the template name and the instant it was
+/// created. It is therefore stable for the life of the template and distinct for a
+/// template of the same name created later.
+fn approval_rule_template_id(name: &str, created: SystemTime) -> String {
+    let nanos = nanos_since_epoch(created);
+    uuid_v8(&format!(
+        "codecommit/{}/approval-rule-template/{name}/{nanos}",
         ::engine::emulator_account_id()
     ))
 }
@@ -923,6 +1061,184 @@ pub fn normalize_path(raw: &str) -> Result<String, PathProblem> {
         return Err(PathProblem::Invalid);
     }
     Ok(trimmed.to_string())
+}
+
+/// Why a paginated list request cannot be served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageProblem {
+    /// `maxResults` is outside the published range: the list operations model
+    /// `InvalidMaxResultsException` for this. Carries the refusal message.
+    InvalidMaxResults(String),
+    /// `nextToken` is not a token this service issued: the list operations model
+    /// `InvalidContinuationTokenException` for this. Carries the refusal message.
+    InvalidContinuationToken(String),
+}
+
+/// One page of an ordered sequence of names, and the token that resumes after it.
+///
+/// The single pagination rule for this service's `maxResults`/`nextToken`
+/// operations: `maxResults` must lie in [`MIN_MAX_RESULTS`]..=[`MAX_MAX_RESULTS`]
+/// (absent means [`DEFAULT_MAX_RESULTS`]), `nextToken` must be a token this service
+/// issued FOR THIS LISTING (see [`page_token`]) that still addresses a position in
+/// the sequence, and the answer carries a token only when a further page exists.
+///
+/// `scope` names the listing the token belongs to — the operation, plus whatever
+/// else picks the sequence out (the repository a per-repository listing reads), so
+/// a token issued for one listing is not a token for another.
+pub fn page_of(
+    scope: &str,
+    ordered: &[String],
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+) -> Result<(Vec<String>, Option<String>), PageProblem> {
+    let limit = match max_results {
+        None => DEFAULT_MAX_RESULTS,
+        Some(requested) if (MIN_MAX_RESULTS..=MAX_MAX_RESULTS).contains(&requested) => requested,
+        Some(requested) => {
+            return Err(PageProblem::InvalidMaxResults(format!(
+                "the maxResults value {requested} is not valid: a valid limit is between \
+                 {MIN_MAX_RESULTS} and {MAX_MAX_RESULTS}"
+            )));
+        }
+    };
+    let start = match next_token {
+        None => 0usize,
+        Some(token) => page_offset(scope, token)
+            // A token this service issued always names a position the sequence
+            // still holds: one is only ever issued while a further page exists.
+            .filter(|offset| *offset < ordered.len())
+            .ok_or_else(|| {
+                PageProblem::InvalidContinuationToken(format!(
+                    "error parsing next token: {token}"
+                ))
+            })?,
+    };
+    let end = ordered
+        .len()
+        .min(start.saturating_add(usize::try_from(limit).unwrap_or(0)));
+    Ok((
+        ordered[start..end].to_vec(),
+        (end < ordered.len()).then(|| page_token(scope, end)),
+    ))
+}
+
+/// The marker every continuation token this service issues carries, so a decimal
+/// offset a caller invents is not mistaken for a token the service handed out.
+const PAGE_TOKEN_MARKER: &str = "codecommit-page:";
+
+/// The continuation token that resumes the `scope` listing at `offset`.
+///
+/// Hex-encoded so the token is opaque to the caller and carries no structure a
+/// caller can act on. It is not integrity-protected and claims nothing: a caller
+/// that reverses it can only name a position in the SAME listing, which is what
+/// [`page_of`] already bounds.
+fn page_token(scope: &str, offset: usize) -> String {
+    ::hex::encode(format!("{PAGE_TOKEN_MARKER}{scope}:{offset}"))
+}
+
+/// The position a continuation token names in the `scope` listing, or `None` for
+/// anything this service did not issue for that listing. Every step is fallible on
+/// purpose: the token is caller-supplied.
+fn page_offset(scope: &str, token: &str) -> Option<usize> {
+    let decoded = ::hex::decode(token).ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    text.strip_prefix(&format!("{PAGE_TOKEN_MARKER}{scope}:"))?
+        .parse::<usize>()
+        .ok()
+}
+
+/// The approval-rule-template content schema version CodeCommit publishes for the
+/// `approvalRuleTemplateContent` document (the `Version` member of every template
+/// body in the CodeCommit User Guide's approval rule template examples).
+pub const APPROVAL_RULE_TEMPLATE_VERSION: &str = "2018-11-08";
+
+/// The only `Statements[].Type` CodeCommit's approval rule template schema defines.
+pub const APPROVAL_RULE_STATEMENT_TYPE: &str = "Approvers";
+
+/// Is this `approvalRuleTemplateContent` a valid approval rule document?
+///
+/// CodeCommit's template content is a JSON document, not free text: an object with
+/// a `Version` string, a non-empty `Statements` array whose every entry is an
+/// `Approvers` statement carrying a positive `NumberOfApprovalsNeeded` and, where
+/// present, an `ApprovalPoolMembers` array of strings, plus an optional
+/// `DestinationReferences` array of strings (the structure the CodeCommit User
+/// Guide documents for an approval rule template). `Err` carries the reason, which
+/// the operations report as `InvalidApprovalRuleTemplateContentException`.
+pub fn validate_approval_rule_template_content(content: &str) -> Result<(), String> {
+    let document: ::serde_json::Value = ::serde_json::from_str(content)
+        .map_err(|error| format!("the content is not a valid JSON document: {error}"))?;
+    let object = document
+        .as_object()
+        .ok_or_else(|| "the content must be a JSON object".to_string())?;
+
+    match object.get("Version").and_then(::serde_json::Value::as_str) {
+        Some(version) if version == APPROVAL_RULE_TEMPLATE_VERSION => {}
+        Some(version) => {
+            return Err(format!(
+                "the content Version {version} is not valid: the supported version is \
+                 {APPROVAL_RULE_TEMPLATE_VERSION}"
+            ))
+        }
+        None => return Err("the content must carry a Version string".to_string()),
+    }
+
+    let statements = object
+        .get("Statements")
+        .and_then(::serde_json::Value::as_array)
+        .ok_or_else(|| "the content must carry a Statements array".to_string())?;
+    if statements.is_empty() {
+        return Err("the content Statements array must carry at least one statement".to_string());
+    }
+    for statement in statements {
+        let statement = statement
+            .as_object()
+            .ok_or_else(|| "every Statements entry must be a JSON object".to_string())?;
+        match statement.get("Type").and_then(::serde_json::Value::as_str) {
+            Some(kind) if kind == APPROVAL_RULE_STATEMENT_TYPE => {}
+            Some(kind) => {
+                return Err(format!(
+                    "the statement Type {kind} is not valid: the supported type is \
+                     {APPROVAL_RULE_STATEMENT_TYPE}"
+                ))
+            }
+            None => return Err("every statement must carry a Type string".to_string()),
+        }
+        match statement
+            .get("NumberOfApprovalsNeeded")
+            .and_then(::serde_json::Value::as_i64)
+        {
+            Some(needed) if needed >= 1 => {}
+            Some(needed) => {
+                return Err(format!(
+                    "the statement NumberOfApprovalsNeeded {needed} is not valid: it must be \
+                     at least 1"
+                ))
+            }
+            None => {
+                return Err(
+                    "every statement must carry a NumberOfApprovalsNeeded number".to_string()
+                )
+            }
+        }
+        if let Some(members) = statement.get("ApprovalPoolMembers") {
+            let members = members
+                .as_array()
+                .ok_or_else(|| "ApprovalPoolMembers must be an array".to_string())?;
+            if members.iter().any(|member| !member.is_string()) {
+                return Err("every ApprovalPoolMembers entry must be a string".to_string());
+            }
+        }
+    }
+
+    if let Some(references) = object.get("DestinationReferences") {
+        let references = references
+            .as_array()
+            .ok_or_else(|| "DestinationReferences must be an array".to_string())?;
+        if references.iter().any(|reference| !reference.is_string()) {
+            return Err("every DestinationReferences entry must be a string".to_string());
+        }
+    }
+    Ok(())
 }
 
 /// The canonical form of a `folderPath`: leading and trailing separators removed,

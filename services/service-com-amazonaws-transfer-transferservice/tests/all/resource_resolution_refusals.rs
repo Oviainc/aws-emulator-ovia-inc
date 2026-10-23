@@ -792,6 +792,10 @@ fn seed_execution(emulator: &Emulator, workflow_id: &str, execution_id: &str, to
                 .iter()
                 .map(|token| ((*token).to_string(), None))
                 .collect(),
+            // The rest of the record (the run's status, the file it started on, the
+            // session it arrived on) is what a reader reports, and this suite is about
+            // the callback, so it takes the defaults.
+            ..st::WorkflowExecution::default()
         },
     );
 }

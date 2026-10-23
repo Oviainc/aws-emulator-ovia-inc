@@ -32,6 +32,10 @@ pub(crate) const REGION: &str = "us-west-2";
 /// Build the emulator the way the router does: one shared engine, this service
 /// mounted on it, request authentication off so the test signs nothing. The
 /// engine is returned too, so a test can read the store the handlers write.
+///
+/// `pub(crate)` here and below: this module is the wire harness every suite in
+/// this test target shares, so a sibling suite drives the emulator exactly the
+/// same way rather than building a second copy of it.
 pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();

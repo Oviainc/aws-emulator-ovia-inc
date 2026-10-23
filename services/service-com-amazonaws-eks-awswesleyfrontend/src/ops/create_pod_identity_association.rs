@@ -369,14 +369,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.namespace,
             &input.service_account,
         );
-        let association_arn = ::engine::emulator_arn(
-            "eks",
-            &region,
-            &format!(
-                "podidentityassociation/{}/{association_id}",
-                input.cluster_name
-            ),
-        );
+        let association_arn =
+            state::derive_association_arn(&region, &input.cluster_name, &association_id);
         let record = PodIdentityAssociationRecord {
             cluster_name: input.cluster_name.clone(),
             association_id: association_id.clone(),
@@ -406,6 +400,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_request_token: input.client_request_token.clone(),
             // No update has applied to a brand-new association.
             update_request_token: None,
+            // An association created through THIS API is owned by the caller:
+            // `ownerArn` is set only on one an Amazon EKS add-on created
+            // (`CreateAddon$podIdentityAssociations`).
+            owner_arn: None,
         };
 
         let association = record.to_association();

@@ -2,6 +2,7 @@
 
 //! @op CreateUser
 //! IMPLEMENTED: inserts the user into [`crate::state`] keyed by its FOLDED `UserName`
+//! and records the `user` event `DescribeEvents` reports for the creation
 //! (a MemoryDB resource name is a case-insensitive identifier, refused outright when it
 //! breaks the service's name rule) and answers with the stored record, so
 //! `DescribeUsers` reports exactly what was persisted. The `AccessString` is stored in
@@ -273,7 +274,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove(user_name.as_str())
             .unwrap_or_default();
         let response = user.to_api(acl_names);
-        state.users.insert(user_name, user);
+        state.users.insert(user_name.clone(), user);
+        // The change this call made, recorded against the user it made it to, so
+        // `DescribeEvents` reports it.
+        state.record_event(
+            crate::state::event_source_type::USER,
+            &user_name,
+            crate::state::EventKind::Created,
+        );
         Ok(CreateUserOutput {
             user: Some(response),
         })

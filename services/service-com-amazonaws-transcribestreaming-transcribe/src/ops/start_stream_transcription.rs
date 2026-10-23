@@ -52,6 +52,18 @@
 //!   the current stream has been terminated.
 //! * `InternalFailureException` (HTTP 500), `LimitExceededException` (HTTP 429),
 //!   `ServiceUnavailableException` (HTTP 503).
+//!
+//! ## The WebSocket transport
+//!
+//! The same operation is also reachable at [`WEBSOCKET_PATH`] — the modeled URI plus
+//! `-websocket` — where the input above is carried as query parameters instead of
+//! `x-amzn-transcribe-*` headers (`sample-rate`, `media-encoding`, `language-code`,
+//! …). Those parameters are read back onto the same modeled shape and validated
+//! against the same constraints ([`settings_from_query`]), so this transport refuses
+//! what the header transport refuses and with the same modeled
+//! `BadRequestException`. The stream itself is then refused with the modeled
+//! `ServiceUnavailableException`: an upgrade cannot be completed from inside a
+//! service here, and [`NO_WEBSOCKET_TRANSPORT`] records why.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -62,6 +74,15 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-transcribestreaming-transcribe.json");
+
+/// The URI the model binds this operation to
+/// (smithy_query(query="operation", operation="StartStreamTranscription"):
+/// `POST /stream-transcription`). Its WebSocket transport is this path plus
+/// [`WEBSOCKET_PATH_SUFFIX`].
+pub const MODELED_PATH: &str = "/stream-transcription";
+
+/// Where the WebSocket transport of this operation is reached.
+pub const WEBSOCKET_PATH: &str = "/stream-transcription-websocket";
 
 /// The operation's MODELED errors; `#[operation_error]` accepts only variants the
 /// model declares for it.
@@ -114,6 +135,50 @@ fn limit_exceeded(message: impl Into<String>) -> StartStreamTranscriptionErrorMo
     })
 }
 
+/// A stream this service cannot carry: the modeled error the model declares for
+/// exactly that, HTTP 503.
+fn service_unavailable(message: impl Into<String>) -> StartStreamTranscriptionErrorModeled {
+    StartStreamTranscriptionErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+        message: Some(message.into()),
+    })
+}
+
+/// The rules this operation's input must satisfy ACROSS its members, which no
+/// single-member constraint trait can express. Checked on both transports, from the
+/// same settings shape, so neither transport accepts a combination the other
+/// refuses.
+fn cross_member_refusal(settings: &StartStreamTranscriptionSettings) -> Option<String> {
+    channel_identification_refusal(
+        settings.enable_channel_identification,
+        settings.number_of_channels,
+    )
+    .or_else(|| {
+        partial_results_stability_refusal(
+            settings.enable_partial_results_stabilization,
+            settings.partial_results_stability.as_deref(),
+        )
+    })
+}
+
+/// Answer the WebSocket transport of this operation: read the input off the query
+/// string, validate it exactly as the header transport is validated, and refuse the
+/// stream with the modeled `ServiceUnavailableException` ([`NO_WEBSOCKET_TRANSPORT`]
+/// says why). Nothing is stored: no stream was carried, so no session exists.
+fn websocket_refusal(
+    protocol: &dyn ServerHttpProtocol,
+    req: &Request,
+) -> StartStreamTranscriptionErrorModeled {
+    let settings: StartStreamTranscriptionSettings =
+        match settings_from_query(protocol, req, &StartStreamTranscriptionSettings::SCHEMA) {
+            Ok(settings) => settings,
+            Err(message) => return bad_request(message),
+        };
+    match cross_member_refusal(&settings) {
+        Some(message) => bad_request(message),
+        None => service_unavailable(NO_WEBSOCKET_TRANSPORT),
+    }
+}
+
 /// Word an event-stream decode failure as the modeled error for its kind.
 fn from_event_stream(error: EventStreamError) -> StartStreamTranscriptionErrorModeled {
     match error {
@@ -144,6 +209,9 @@ impl<Eng: Send + Sync + 'static> StartStreamTranscription<Eng> {
         let settings: StartStreamTranscriptionSettings =
             settings_from_headers(protocol, req, &StartStreamTranscriptionSettings::SCHEMA)
                 .map_err(bad_request)?;
+        if let Some(message) = cross_member_refusal(&settings) {
+            return Err(bad_request(message));
+        }
         let body = req
             .body()
             .bytes()
@@ -315,9 +383,17 @@ impl<Eng: Send + Sync + 'static> EventStreamOperation for StartStreamTranscripti
     ) -> BoxFuture<'r, Response> {
         Box::pin(async move {
             let protocol = svc.definition().protocol();
-            let response = match self.respond(protocol, req) {
-                Ok(response) => response,
-                Err(error) => error_response(protocol, &error),
+            // Which transport the request arrived on decides where the input is read
+            // from: the WebSocket spelling carries it in the query string, the
+            // modeled HTTP/2 one in `x-amzn-transcribe-*` headers with the audio in
+            // the body.
+            let response = if is_websocket_transport_of(req.uri(), MODELED_PATH) {
+                error_response(protocol, &websocket_refusal(protocol, req))
+            } else {
+                match self.respond(protocol, req) {
+                    Ok(response) => response,
+                    Err(error) => error_response(protocol, &error),
+                }
             };
             // One access record per request, so a refused stream is diagnosable.
             // No request payload and no credential reaches it.

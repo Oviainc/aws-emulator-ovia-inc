@@ -23,5 +23,8 @@ mod import_file_task_listing;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
 
+#[path = "all/server_inventory.rs"]
+mod server_inventory;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

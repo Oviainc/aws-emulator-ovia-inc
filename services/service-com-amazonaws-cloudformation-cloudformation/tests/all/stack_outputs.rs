@@ -27,11 +27,11 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{
 
 /// One `Output` as the response carries it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WireOutput {
-    key: Option<String>,
-    value: Option<String>,
-    description: Option<String>,
-    export_name: Option<String>,
+pub(crate) struct WireOutput {
+    pub(crate) key: Option<String>,
+    pub(crate) value: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) export_name: Option<String>,
 }
 
 /// Every `Output` in the first `Stack` of a `DescribeStacks` response, in wire order.
@@ -39,7 +39,7 @@ struct WireOutput {
 /// Read member by member rather than tag by tag, so an output's key stays paired with
 /// its own value (and so a declared output that carries NO `OutputValue` is visible as
 /// such instead of silently borrowing the next one's).
-fn wire_outputs(xml: &str) -> Vec<WireOutput> {
+pub(crate) fn wire_outputs(xml: &str) -> Vec<WireOutput> {
     let Some(start) = xml.find("<Outputs>") else {
         return Vec::new();
     };
@@ -78,7 +78,7 @@ fn element(entry: &str, tag: &str) -> Option<String> {
 
 /// The `OutputValue` the response carries for one key, and whether the key is there at
 /// all.
-fn output_for<'a>(outputs: &'a [WireOutput], key: &str) -> Option<&'a WireOutput> {
+pub(crate) fn output_for<'a>(outputs: &'a [WireOutput], key: &str) -> Option<&'a WireOutput> {
     outputs
         .iter()
         .find(|output| output.key.as_deref() == Some(key))
@@ -467,9 +467,11 @@ fn output_cases() -> Vec<OutputCase> {
         OutputCase {
             // The resource types the EventBridge Scheduler issue's templates declare:
             // neither is in the return-value catalogue, so `Ref` answers the physical
-            // name — the name the template declared — and `Fn::GetAtt` for an attribute
-            // nothing publishes is reported without a value rather than with a guess.
-            case: "an uncatalogued type: Ref is its physical name, GetAtt has no value",
+            // name — the name the template declared — and `Fn::GetAtt Arn` answers the
+            // resource's ARN under CloudFormation's uniform naming (the type's service
+            // segment as the ARN namespace, its type segment as the resource path),
+            // rather than leaving a declared output of a CREATE_COMPLETE stack valueless.
+            case: "an uncatalogued type: Ref is its physical name, GetAtt Arn its arn",
             stack_name: "scheduler",
             template: r#"{"Resources":{
                    "G":{"Type":"AWS::Scheduler::ScheduleGroup","Properties":{"Name":"probe-group"}},
@@ -477,13 +479,22 @@ fn output_cases() -> Vec<OutputCase> {
                      "GroupName":{"Ref":"G"}}}},
                  "Outputs":{"GroupName":{"Value":{"Ref":"G"}},
                    "ScheduleName":{"Value":{"Ref":"S"}},
+                   "ScheduleGroup":{"Value":{"Fn::GetAtt":["S","GroupName"]}},
                    "ScheduleArn":{"Value":{"Fn::GetAtt":["S","Arn"]}}}}"#
                 .to_string(),
             parameters: vec![],
             expected: vec![
                 ("GroupName", Expected::Value("probe-group".to_string())),
                 ("ScheduleName", Expected::Value("probe-schedule".to_string())),
-                ("ScheduleArn", Expected::NoValue),
+                // The attribute IS the property the template declared for it, and that
+                // property names another resource of the same template.
+                ("ScheduleGroup", Expected::Value("probe-group".to_string())),
+                (
+                    "ScheduleArn",
+                    Expected::Value(format!(
+                        "arn:aws:scheduler:{REGION}:{ACCOUNT_ID}:schedule/probe-schedule"
+                    )),
+                ),
             ],
         },
         OutputCase {

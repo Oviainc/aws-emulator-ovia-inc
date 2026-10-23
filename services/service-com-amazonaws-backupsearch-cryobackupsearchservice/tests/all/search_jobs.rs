@@ -9,6 +9,10 @@
 //! differ in the members the rule generalises over (name, scope, resource type, filters,
 //! tags, signing region, page size, job count), never over the one request the issue
 //! happened to cite.
+//!
+//! The HTTP harness below (`emulator`, `call`, `Answer`) and the two transition-span
+//! constants are `pub(crate)` because the export-job suite (`tests/all/export_jobs.rs`)
+//! drives the same emulator the same way.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -24,16 +28,16 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::EmulatedService;
 
 /// Longer than `crate::state::TRANSITION_DELAY`, so the clock has made a search job's
 /// owed status transition due by the time the next call is made.
-const PAST_THE_DUE_INSTANT: Duration = Duration::from_millis(900);
+pub(crate) const PAST_THE_DUE_INSTANT: Duration = Duration::from_millis(900);
 
 /// Shorter than the transition span, to pin that the span is NOT zero: a caller acting
 /// straight after `StartSearchJob` still observes the transient `RUNNING`.
-const WITHIN_THE_DUE_INSTANT: Duration = Duration::from_millis(50);
+pub(crate) const WITHIN_THE_DUE_INSTANT: Duration = Duration::from_millis(50);
 
 /// One emulator holding one service over one shared engine, as the router builds it,
 /// with that engine so a test can seed the store directly where driving thousands of
 /// requests would only be a slow way to reach the same state.
-fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -42,7 +46,7 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// One emulator holding one service over one shared engine, as the router builds it.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_engine().0
 }
 
@@ -58,20 +62,20 @@ fn authorization(region: &str) -> String {
 
 /// What one call answered: the HTTP status, the parsed JSON body (`Value::Null` for an
 /// empty one) and the wire error code restJson1 resolves an error shape from.
-struct Answer {
-    status: u16,
-    body: Value,
-    error_code: Option<String>,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
+    pub(crate) error_code: Option<String>,
 }
 
 impl Answer {
     /// The body member `name`, or `Value::Null` when the response does not carry it.
-    fn get(&self, name: &str) -> &Value {
+    pub(crate) fn get(&self, name: &str) -> &Value {
         self.body.get(name).unwrap_or(&Value::Null)
     }
 
     /// A string body member, for the many members modelled as strings.
-    fn string(&self, name: &str) -> String {
+    pub(crate) fn string(&self, name: &str) -> String {
         self.get(name)
             .as_str()
             .unwrap_or_default()
@@ -79,7 +83,7 @@ impl Answer {
     }
 }
 
-async fn call(
+pub(crate) async fn call(
     emulator: &MultiServiceRouter,
     region: &str,
     method: &str,
@@ -735,36 +739,66 @@ async fn a_client_token_is_idempotent_for_the_same_body_and_conflicts_for_a_diff
 async fn an_identifier_no_job_exists_for_is_not_found_on_every_operation_that_takes_one() {
     let emulator = emulator();
     // Routes that resolve a search job by identifier, and the tagging routes that
-    // resolve one by ARN.
-    let cases: Vec<(&str, &str, &str, Option<Value>)> = vec![
-        ("GetSearchJob", "GET", "/search-jobs/does-not-exist", None),
+    // resolve one by ARN. The last element says whether the refusal carries this
+    // service's fixed not-found text: every JOB-IDENTIFIER lookup does, and none of them
+    // echoes the identifier back (`state::RESOURCE_NOT_FOUND`), while the tag APIs, which
+    // resolve a resource by ARN, are recorded with a refusal of their own.
+    let cases: Vec<(&str, &str, &str, Option<Value>, bool)> = vec![
+        (
+            "GetSearchJob",
+            "GET",
+            "/search-jobs/does-not-exist",
+            None,
+            true,
+        ),
         (
             "ListSearchJobResults",
             "GET",
             "/search-jobs/does-not-exist/search-results",
             None,
+            true,
         ),
         (
             "StopSearchJob",
             "PUT",
             "/search-jobs/does-not-exist/actions/cancel",
             None,
+            true,
+        ),
+        (
+            "GetSearchResultExportJob",
+            "GET",
+            "/export-search-jobs/does-not-exist",
+            None,
+            true,
+        ),
+        (
+            "StartSearchResultExportJob",
+            "PUT",
+            "/export-search-jobs",
+            Some(json!({
+                "SearchJobIdentifier": "does-not-exist",
+                "ExportSpecification": {"s3ExportSpecification": {"DestinationBucket": "b"}}
+            })),
+            true,
         ),
         (
             "ListTagsForResource",
             "GET",
             "/tags/arn%3Aaws%3Abackup-search%3Aus-west-2%3A000000000000%3Asearch-job%2Fdoes-not-exist",
             None,
+            false,
         ),
         (
             "TagResource",
             "POST",
             "/tags/arn%3Aaws%3Abackup-search%3Aus-west-2%3A000000000000%3Asearch-job%2Fdoes-not-exist",
             Some(json!({"Tags": {"env": "test"}})),
+            false,
         ),
     ];
 
-    for (operation, method, uri, body) in cases {
+    for (operation, method, uri, body, fixed_text) in cases {
         let answer = call(&emulator, "us-west-2", method, uri, body).await;
         assert_eq!(
             answer.status, 404,
@@ -777,6 +811,24 @@ async fn an_identifier_no_job_exists_for_is_not_found_on_every_operation_that_ta
             "case {operation:?}: the refusal must carry ResourceNotFoundException, got {:?}",
             answer.error_code
         );
+        if fixed_text {
+            let message = answer.string("message");
+            // The recorded sentence, pinned literally: the constant the handlers use must
+            // be THIS text, so a drift in it fails here rather than passing silently.
+            assert_eq!(
+                message, "Resource is not found",
+                "case {operation:?}: a job-identifier lookup refuses with this service's fixed not-found text, got {message:?}"
+            );
+            assert_eq!(
+                message,
+                state::RESOURCE_NOT_FOUND,
+                "case {operation:?}: every handler must take that text from one constant, got {message:?}"
+            );
+            assert!(
+                !message.contains("does-not-exist"),
+                "case {operation:?}: the fixed not-found text must not echo the requested identifier, got {message:?}"
+            );
+        }
     }
 }
 

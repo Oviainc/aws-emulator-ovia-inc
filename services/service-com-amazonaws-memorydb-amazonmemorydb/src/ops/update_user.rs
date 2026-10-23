@@ -8,7 +8,8 @@
 //! values); an absent member leaves the stored value alone, and a request carrying
 //! neither asks for no change at all. The accepted update leaves the user `modifying`
 //! until the clock owes it `active` again, so `DescribeUsers` reports exactly what this
-//! operation persisted.
+//! operation persisted. The change is also recorded as a `user` event, which
+//! `DescribeEvents` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -293,8 +294,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // materialises (`ComAmazonawsMemorydbAmazonmemorydbState::settle`).
         user.status = crate::state::user_status::MODIFYING.to_string();
         user.settles_at = Some(now + crate::state::SETTLE_AFTER);
+        let response = user.to_api(acl_names);
+        // The change this call made, recorded against the user it changed, so
+        // `DescribeEvents` reports it.
+        state.record_event(
+            crate::state::event_source_type::USER,
+            &user_name,
+            crate::state::EventKind::Modified,
+        );
         Ok(UpdateUserOutput {
-            user: Some(user.to_api(acl_names)),
+            user: Some(response),
         })
     }
 }

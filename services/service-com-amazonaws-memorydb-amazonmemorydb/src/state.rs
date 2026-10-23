@@ -18,8 +18,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    Authentication, AuthenticationMode, Cluster, Endpoint, EngineVersionInfo, Node, Parameter,
-    ParameterGroup, SecurityGroupMembership, Shard, Tag, User, ACL,
+    Authentication, AuthenticationMode, Cluster, Endpoint, EngineVersionInfo, Event, Node,
+    Parameter, ParameterGroup, SecurityGroupMembership, Shard, Tag, User, ACL,
 };
 
 /// The region an ARN or endpoint carries when the request is unsigned, matching the
@@ -142,6 +142,139 @@ pub const TOTAL_SLOTS: i32 = 16_384;
 /// waits for the resource is quick. Never zero, and never slept on — the due instant
 /// is stored and materialised by whichever later call observes the resource.
 pub const SETTLE_AFTER: Duration = Duration::from_millis(500);
+
+/// How far back a recorded event stays reportable.
+///
+/// `DescribeEvents` — "you can retrieve up to 14 days' worth of events if necessary":
+/// 14 days is the age past which the service holds no event, so an event older than
+/// this is dropped from the store rather than kept in a log nothing can report.
+pub const EVENT_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// The window `DescribeEvents` reports when the request bounds none itself:
+/// "By default, only the events occurring within the last hour are returned".
+pub const DEFAULT_EVENT_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// The smallest `DescribeEvents$Duration` ("The number of minutes worth of events to
+/// retrieve") that names a window at all: a window of zero or fewer minutes selects
+/// nothing, so it is a value the listing cannot serve.
+pub const MIN_EVENT_DURATION_MINUTES: i32 = 1;
+
+/// The largest `DescribeEvents$Duration` the service can serve: [`EVENT_RETENTION`] in
+/// the whole minutes that member is given in (14 days = 20160 minutes), because no
+/// event older than that is kept.
+pub const MAX_EVENT_DURATION_MINUTES: i32 = 14 * 24 * 60;
+
+/// The most events this store keeps.
+///
+/// A ceiling THIS EMULATOR chooses, on top of [`EVENT_RETENTION`], so that a caller
+/// driving many changes inside the retention window cannot grow the store without
+/// bound; the OLDEST events are the ones dropped, so the log a `DescribeEvents` window
+/// is most likely to ask about is the one that survives.
+pub const MAX_EVENTS_RETAINED: usize = 2_000;
+
+/// The `SourceType` tokens this store records events under, named so the handlers that
+/// record one branch on a constant rather than a literal.
+///
+/// Each is a member of the GENERATED catalog
+/// `crate::ops::types::SOURCE_TYPE_VALUES` (`acl`, `cluster`, `node`,
+/// `parameter-group`, `subnet-group`, `user`), which is also what `DescribeEvents`
+/// validates a requested `SourceType` against, so neither can drift from the model.
+/// The catalog's other two tokens are recorded by nothing: a subnet group has no
+/// implemented write path in this service (every subnet-group operation still answers
+/// 501), and a node has no lifecycle of its own here — nodes exist only as the layout
+/// of the cluster whose own events already report the change.
+pub mod event_source_type {
+    pub const CLUSTER: &str = "cluster";
+    pub const ACL: &str = "acl";
+    pub const USER: &str = "user";
+    pub const PARAMETER_GROUP: &str = "parameter-group";
+}
+
+/// What happened to a resource, as the event recording it reports.
+///
+/// One vocabulary for every source type, so the message an event carries is built by
+/// one rule rather than spelled out per operation: a create records
+/// [`EventKind::Created`], a change to an existing resource [`EventKind::Modified`] and
+/// a delete [`EventKind::Deleted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    Created,
+    Modified,
+    Deleted,
+}
+
+impl EventKind {
+    /// The past-tense verb this kind reads as in an event message.
+    fn verb(self) -> &'static str {
+        match self {
+            EventKind::Created => "created",
+            EventKind::Modified => "modified",
+            EventKind::Deleted => "deleted",
+        }
+    }
+}
+
+/// How an event message names the kind of resource it is about, per source type.
+///
+/// AWS documents no message text for `Event$Message` ("The text of the event"), so the
+/// WORDING is this emulator's: the kind of resource and what happened to it, with WHICH
+/// resource left to `Event$SourceName` — which is what the service fixes.
+fn source_type_label(source_type: &str) -> &str {
+    match source_type {
+        event_source_type::CLUSTER => "Cluster",
+        event_source_type::ACL => "ACL",
+        event_source_type::USER => "User",
+        event_source_type::PARAMETER_GROUP => "Parameter group",
+        other => other,
+    }
+}
+
+/// An event as this emulator records it: what happened to which resource, and when.
+///
+/// Recorded by the call that MAKES the change (`CreateUser`, `UpdateACL`,
+/// `DeleteCluster`, …) and only read by `DescribeEvents`, so the events a listing
+/// reports are the changes this store actually took, never a canned log.
+#[derive(Debug, Clone)]
+pub struct StoredEvent {
+    /// The order this event was recorded in, counting from zero over the store's whole
+    /// life. It is the event's identity for pagination: `Date` comes from the wall
+    /// clock and two changes can share one, while the sequence cannot, so a page
+    /// boundary always names exactly one position in the log.
+    pub sequence: u64,
+    /// `Event$SourceType`: which kind of resource the event is about, one of
+    /// [`event_source_type`].
+    pub source_type: String,
+    /// `Event$SourceName`: "The identifier for the source of the event" — the resource
+    /// name, as the store keys it (folded).
+    pub source_name: String,
+    /// `Event$Message`: "The text of the event".
+    pub message: String,
+    /// `Event$Date`: "The date and time when the event occurred", the instant the
+    /// change was made.
+    pub date: SystemTime,
+}
+
+impl StoredEvent {
+    /// The modelled `Event` for this stored event.
+    pub fn to_api(&self) -> Event {
+        Event {
+            source_name: Some(self.source_name.clone()),
+            source_type: Some(self.source_type.clone()),
+            message: Some(self.message.clone()),
+            date: Some(::aws_smithy_types::DateTime::from(self.date)),
+        }
+    }
+
+    /// This event's position in the log, as the key [`paginate`] pages by.
+    ///
+    /// The listing reports events NEWEST FIRST, and `paginate` walks keys in ascending
+    /// string order, so the key is the sequence COUNTED DOWN from `u64::MAX` and
+    /// zero-padded: string order over the keys is newest-first order, and a `NextToken`
+    /// names the first event of the next page.
+    pub fn page_key(&self) -> String {
+        format!("{:020}", u64::MAX - self.sequence)
+    }
+}
 
 /// One engine version this service offers, as `DescribeEngineVersions` reports it.
 ///
@@ -879,6 +1012,18 @@ pub struct ComAmazonawsMemorydbAmazonmemorydbState {
     /// with a null Value is permitted" (`Tag`), and such a tag carries the EMPTY value
     /// from then on, so a stored tag always has one.
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
+    /// The events this store has recorded, oldest first.
+    ///
+    /// Appended to by every call that creates, modifies or deletes a resource (see
+    /// [`ComAmazonawsMemorydbAmazonmemorydbState::record_event`]) and read only by
+    /// `DescribeEvents`, so the log reports the changes this store actually took. A
+    /// `Vec` in record order, which is both the chronological order the listing reports
+    /// and the order its pagination keys sort in.
+    pub events: Vec<StoredEvent>,
+    /// The sequence the next recorded event takes, counting from zero over the store's
+    /// whole life. Held separately from `events.len()` so that dropping an event the
+    /// retention window has passed never re-uses a pagination key.
+    pub next_event_sequence: u64,
 }
 
 impl ComAmazonawsMemorydbAmazonmemorydbState {
@@ -905,6 +1050,44 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
                 user.status = user_status::ACTIVE.to_string();
                 user.settles_at = None;
             }
+        }
+    }
+
+    /// Record one event against the resource a call has just changed.
+    ///
+    /// Every write path in this service that creates, modifies or deletes a resource
+    /// calls this, so the event log is a record of what the store actually took rather
+    /// than something `DescribeEvents` makes up: the event carries the resource's
+    /// `SourceType` and its stored (folded) name, the instant of the change, and a
+    /// message built by one rule for every source type.
+    pub fn record_event(&mut self, source_type: &str, source_name: &str, kind: EventKind) {
+        let date = SystemTime::now();
+        let sequence = self.next_event_sequence;
+        self.next_event_sequence = sequence.saturating_add(1);
+        self.events.push(StoredEvent {
+            sequence,
+            source_type: source_type.to_string(),
+            source_name: source_name.to_string(),
+            message: format!(
+                "{} {}",
+                source_type_label(source_type),
+                kind.verb()
+            ),
+            date,
+        });
+        self.forget_unreportable_events(date);
+    }
+
+    /// Drop the events no `DescribeEvents` window can report any more: those older than
+    /// [`EVENT_RETENTION`], and — once the log is longer than [`MAX_EVENTS_RETAINED`] —
+    /// the oldest beyond that ceiling. Called on the RECORDING path, so a read never
+    /// changes which events a later caller sees.
+    fn forget_unreportable_events(&mut self, now: SystemTime) {
+        if let Some(cutoff) = now.checked_sub(EVENT_RETENTION) {
+            self.events.retain(|event| event.date >= cutoff);
+        }
+        if let Some(excess) = self.events.len().checked_sub(MAX_EVENTS_RETAINED) {
+            self.events.drain(..excess);
         }
     }
 

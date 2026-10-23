@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPricingRulesAssociatedToPricingPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPricingRulesAssociatedToPricingPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPricingRulesAssociatedToPricingPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the pricing rules associated with ONE pricing plan, read out of
+//! [`crate::state`]: the plan's association set as `CreatePricingPlan` persisted
+//! it, normalised to full rule ARNs, deduplicated, ordered by ARN and paginated.
+//! The operation is `@readonly` and writes nothing.
+//!
+//! The order the answers are decided in:
+//!
+//! 1. a plan this account does not hold is `ResourceNotFoundException` (404). This
+//!    service stores ONE account's plans, keyed by the ARN it minted for them, so a
+//!    `PricingPlanArn` carrying another account's id is a plan this store does not
+//!    hold and is answered the same 404;
+//! 2. an AWS-managed plan (`BasicPricingPlan` / `Passthrough`) exists without the
+//!    caller having created it and carries no rule of the caller's, so it reports
+//!    an empty association set.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +167,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPricingRulesAssociatedToPricingPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPricingRulesAssociatedToPricingPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPricingRulesAssociatedToPricingPlan"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListPricingRulesAssociatedToPricingPlanErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the billingconductor store is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        // The modelled `PricingPlanArn` accepts the full ARN or the bare resource id,
+        // and both name one plan.
+        let pricing_plan_arn = crate::state::normalize_pricing_plan_arn(&input.pricing_plan_arn);
+
+        let Some(rule_arns) = state.associated_pricing_rule_arns(&pricing_plan_arn) else {
+            return Err(
+                ListPricingRulesAssociatedToPricingPlanErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: "the pricing plan does not exist".to_string(),
+                        resource_id: pricing_plan_arn,
+                        resource_type: "pricingplan".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The rule ARN is both the element and its page key: the sequence is ordered
+        // by ARN, so the `NextToken` handed back names the first rule left out and
+        // resuming from it skips exactly the rules already reported.
+        let keyed: Vec<(String, String)> =
+            rule_arns.into_iter().map(|arn| (arn.clone(), arn)).collect();
+        let (page, next_token) =
+            crate::state::paginate(keyed, input.next_token.as_deref(), input.max_results);
+
+        Ok(ListPricingRulesAssociatedToPricingPlanOutput {
+            // "The billing period for which the pricing rule associations are
+            // listed." This emulator keeps no per-billing-period history, so every
+            // period reports the plan's current associations and the answer names the
+            // period the request asked about; a request that named none leaves it
+            // absent rather than inventing one — the same rule `list_pricing_rules`
+            // applies to this member.
+            billing_period: input.billing_period,
+            pricing_plan_arn: Some(pricing_plan_arn),
+            // `PricingRuleArns` is modelled `@length(min: 1)`, so a plan with no
+            // association reports no member rather than an empty list.
+            pricing_rule_arns: (!page.is_empty()).then_some(page),
+            next_token,
+        })
     }
 }

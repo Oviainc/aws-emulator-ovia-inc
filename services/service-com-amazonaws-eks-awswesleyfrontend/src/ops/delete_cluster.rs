@@ -189,6 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found());
         };
         guard.arn_index.remove(&record.arn);
+        // An add-on exists only inside its cluster, so the add-ons installed on this
+        // one go with it; otherwise a cluster created again under the same name would
+        // inherit the add-ons of the cluster that is gone.
+        guard.remove_cluster_addons(&key.0, &key.1);
         guard.remove_capabilities_of(&key.0, &key.1);
         // An EKS Pod Identity association is a child of its cluster, so the
         // cluster's associations go with it: a cluster later created with the same

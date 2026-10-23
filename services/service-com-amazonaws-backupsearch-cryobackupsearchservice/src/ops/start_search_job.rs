@@ -178,7 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(now);
 
-        let fingerprint = request_fingerprint(&input).map_err(|reason| {
+        let fingerprint = crate::state::request_fingerprint(
+            super::types::START_SEARCH_JOB_INPUT_SCHEMA,
+            &input,
+        )
+        .map_err(|reason| {
             StartSearchJobError::from(StartSearchJobErrorModeled::InternalServerException(
                 InternalServerException {
                     message: format!("could not record the StartSearchJob request: {reason}"),
@@ -307,49 +311,4 @@ fn store_unavailable() -> StartSearchJobError {
         retry_after_seconds: None,
     })
     .into()
-}
-
-/// A canonical rendering of this request's body, stored with the job so a later call
-/// under the same `ClientToken` can be told apart: the same body is a repeat, a
-/// different body is a conflict.
-///
-/// The body is re-serialized with the protocol's own JSON codec — so exactly the
-/// modelled members are compared, however the client sent them — with every object's
-/// members put in key order, because a JSON object's member order is not part of the
-/// request while a list's order is.
-fn request_fingerprint(input: &StartSearchJobInput) -> Result<String, String> {
-    use ::aws_smithy_schema::codec::{Codec, FinishSerializer};
-    use ::aws_smithy_schema::serde::ShapeSerializer;
-
-    let mut serializer =
-        ::aws_smithy_schema_server::json::JsonCodec::rest_json().create_serializer();
-    serializer
-        .write_struct(super::types::START_SEARCH_JOB_INPUT_SCHEMA, input)
-        .map_err(|error| error.to_string())?;
-    let json = serializer.finish();
-    let value: ::serde_json::Value =
-        ::serde_json::from_slice(&json).map_err(|error| error.to_string())?;
-    ::serde_json::to_string(&key_ordered(&value)).map_err(|error| error.to_string())
-}
-
-/// `value` rebuilt with every object's members in key order, so two bodies differing
-/// only in member order render identically.
-///
-/// The ordering is imposed here rather than left to `serde_json::Map`, whose iteration
-/// order is sorted only while nothing in the build enables the crate's `preserve_order`
-/// feature; inserting in sorted order is correct either way.
-fn key_ordered(value: &::serde_json::Value) -> ::serde_json::Value {
-    match value {
-        ::serde_json::Value::Object(members) => {
-            let ordered: ::std::collections::BTreeMap<String, ::serde_json::Value> = members
-                .iter()
-                .map(|(name, member)| (name.clone(), key_ordered(member)))
-                .collect();
-            ::serde_json::Value::Object(ordered.into_iter().collect())
-        }
-        ::serde_json::Value::Array(elements) => {
-            ::serde_json::Value::Array(elements.iter().map(key_ordered).collect())
-        }
-        scalar => scalar.clone(),
-    }
 }

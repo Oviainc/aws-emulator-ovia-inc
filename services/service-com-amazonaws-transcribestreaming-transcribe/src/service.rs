@@ -40,10 +40,10 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use crate::ops::start_medical_scribe_stream::StartMedicalScribeStream;
-use crate::ops::start_medical_stream_transcription::StartMedicalStreamTranscription;
-use crate::ops::start_stream_transcription::StartStreamTranscription;
-use crate::ops::types::EventStreamRoute;
+use crate::ops::start_medical_scribe_stream::{self, StartMedicalScribeStream};
+use crate::ops::start_medical_stream_transcription::{self, StartMedicalStreamTranscription};
+use crate::ops::start_stream_transcription::{self, StartStreamTranscription};
+use crate::ops::types::{request_path, EventStreamRoute, WEBSOCKET_PATH_SEGMENTS};
 use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
@@ -62,6 +62,15 @@ use std::sync::Arc;
 /// the request's parts, so the two things it reads — the URI and the headers — are
 /// re-presented to it as a bodiless request. It reads neither the body nor the method,
 /// so nothing it decides on is missing.
+///
+/// It is called TWICE, over two path spaces this service owns, because the model
+/// describes only one of them. `crate::ROUTE_PATH_SEGMENTS` is the model-derived set:
+/// the first segment of each operation's `@http` URI, which is the HTTP/2 transport.
+/// The same operations are also reachable over their WebSocket transport, at those
+/// URIs plus a `-websocket` suffix, which the model does not describe at all (see
+/// `WEBSOCKET_PATH_SEGMENTS`) — so that set is passed through the SAME framework rule
+/// rather than matched by a hand-rolled one: a request still has to resolve to this
+/// service's signing name, and still has to match a declared segment exactly.
 fn can_handle_parts(parts: &http::request::Parts) -> bool {
     let Ok(mut request) = http::Request::builder()
         .uri(parts.uri.clone())
@@ -70,25 +79,14 @@ fn can_handle_parts(parts: &http::request::Parts) -> bool {
         return false;
     };
     *request.headers_mut() = parts.headers.clone();
-    emulator_server::can_handle_based_on_route_key_and_path(
-        &request,
-        crate::ROUTE_KEY,
-        crate::ROUTE_PATH_SEGMENTS,
-    )
-}
-
-/// The path of a request URI, without its query string.
-fn request_path(uri: &str) -> &str {
-    let path = uri.split('?').next().unwrap_or_default();
-    // An absolute-form URI (`https://host/path`) carries the authority before the
-    // path; the origin form a server usually sees does not.
-    match path.find("://") {
-        Some(scheme_end) => match path[scheme_end + 3..].find('/') {
-            Some(authority_end) => &path[scheme_end + 3 + authority_end..],
-            None => "/",
-        },
-        None => path,
-    }
+    let claims = |segments: &[&str]| {
+        emulator_server::can_handle_based_on_route_key_and_path(
+            &request,
+            crate::ROUTE_KEY,
+            segments,
+        )
+    };
+    claims(crate::ROUTE_PATH_SEGMENTS) || claims(WEBSOCKET_PATH_SEGMENTS)
 }
 
 /// The `com-amazonaws-transcribestreaming-transcribe` emulated service: the generated [`ServiceDefinition`] plus
@@ -154,7 +152,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // literal first segments are what the generated `ROUTE_PATH_SEGMENTS` carries.
         // The control plane's path space (the root path its `POST /` traffic arrives on,
         // plus the literal segments of its inert `@http` bindings) is disjoint from this
-        // one, so each service answers only its own traffic.
+        // one, so each service answers only its own traffic. The WebSocket data-plane
+        // segments this service also claims are disjoint from the peer's for the same
+        // reason — no `transcribe` control-plane URI begins with a `-websocket` segment.
         can_handle_parts(parts)
     }
 
@@ -163,19 +163,38 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
         // The three event-stream operations the generated routing table cannot
-        // serve. Routed by the method and path the model gives each one, so a
-        // request the model does not name here still resolves through the generated
-        // table (`GET /medical-scribe-stream/{SessionId}`), and
+        // serve. Routed by the method and path each transport of the operation
+        // arrives on, so a request named here reaches the operation that owns it and
+        // nothing else is touched: a request the model routes itself still resolves
+        // through the generated table (`GET /medical-scribe-stream/{SessionId}`), and
         // `StartCallAnalyticsStreamTranscription` — which this slice does not
         // implement — keeps answering the framework's "modeled but not served"
         // response rather than being half-served here.
-        if req.method() != http::Method::POST.as_str() {
-            return None;
-        }
-        match request_path(req.uri()) {
-            "/stream-transcription" => Some(&self.start_stream_transcription),
-            "/medical-stream-transcription" => Some(&self.start_medical_stream_transcription),
-            "/medical-scribe-stream" => Some(&self.start_medical_scribe_stream),
+        //
+        // POST on the model's own URI is the HTTP/2 transport. GET on that URI plus
+        // `-websocket` is the WebSocket transport of the SAME operation: a protocol
+        // upgrade arrives as GET, so the method this seam accepts depends on the
+        // transport, and routing it here is what keeps a client of the WebSocket data
+        // plane from being answered the router's "no such service" 404 — the
+        // operation answers it with its own modeled errors instead. Every arm names
+        // its path through the owning operation's own const, so this table cannot
+        // drift from the paths those operations recognise.
+        match (req.method(), request_path(req.uri())) {
+            ("POST", start_stream_transcription::MODELED_PATH) => {
+                Some(&self.start_stream_transcription)
+            }
+            ("POST", start_medical_stream_transcription::MODELED_PATH) => {
+                Some(&self.start_medical_stream_transcription)
+            }
+            ("POST", start_medical_scribe_stream::MODELED_PATH) => {
+                Some(&self.start_medical_scribe_stream)
+            }
+            ("GET", start_stream_transcription::WEBSOCKET_PATH) => {
+                Some(&self.start_stream_transcription)
+            }
+            ("GET", start_medical_stream_transcription::WEBSOCKET_PATH) => {
+                Some(&self.start_medical_stream_transcription)
+            }
             _ => None,
         }
     }

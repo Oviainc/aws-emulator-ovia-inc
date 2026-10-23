@@ -175,6 +175,21 @@ impl Emulator {
             .await
     }
 
+    /// `UpdateIdNamespace` — `PUT /idnamespaces/{idNamespaceName}`, whose label is an
+    /// `EntityName` (a name, never an ARN), with the new configuration as the body.
+    pub(crate) async fn update_id_namespace(
+        &self,
+        id_namespace: &str,
+        request: &Value,
+    ) -> Reply {
+        self.call(
+            "PUT",
+            &format!("/idnamespaces/{id_namespace}"),
+            Some(request),
+        )
+        .await
+    }
+
     pub(crate) async fn get_matching_workflow(&self, workflow_name: &str) -> Reply {
         self.call("GET", &format!("/matchingworkflows/{workflow_name}"), None)
             .await

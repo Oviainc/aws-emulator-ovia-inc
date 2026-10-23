@@ -17,3 +17,5 @@ mod service_claim;
 mod state_roundtrip;
 #[path = "all/streaming_sessions.rs"]
 mod streaming_sessions;
+#[path = "all/websocket_data_plane.rs"]
+mod websocket_data_plane;

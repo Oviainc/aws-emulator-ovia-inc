@@ -58,6 +58,12 @@ use std::time::SystemTime;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-transcribestreaming-transcribe.json");
 
+/// The URI the model binds this operation to
+/// (smithy_query(query="operation", operation="StartMedicalScribeStream"):
+/// `POST /medical-scribe-stream`). AWS publishes no WebSocket transport for this
+/// operation, so there is no `-websocket` spelling of this path to claim.
+pub const MODELED_PATH: &str = "/medical-scribe-stream";
+
 /// The operation's MODELED errors; `#[operation_error]` accepts only variants the
 /// model declares for it.
 #[smithy_macros::operation_error("com.amazonaws.transcribestreaming#StartMedicalScribeStream")]

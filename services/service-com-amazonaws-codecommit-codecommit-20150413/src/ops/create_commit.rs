@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCommit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCommit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCommit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one commit on the tip of a branch from the file entries the request
+//! carries: the new tree is the parent commit's snapshot with the puts applied, the
+//! deletes removed and the mode changes set, and both the tree and the commit are
+//! stored, so `GetCommit`, `GetFile` and `GetBranch` report them afterwards. A
+//! branch the repository does not hold is refused with the modelled
+//! `BranchDoesNotExistException` and no commit is made.
 //!
 //! ## Shape of an operation
 //!
@@ -249,6 +247,294 @@ impl From<CreateCommitErrorModeled> for CreateCommitError {
     }
 }
 
+/// The canonical form of one entry's `filePath`, or the refusal the operation
+/// reports for it.
+fn normalized_path(raw: &str) -> Result<String, CreateCommitError> {
+    match crate::state::normalize_path(raw) {
+        Ok(path) => Ok(path),
+        Err(crate::state::PathProblem::Missing) => {
+            Err(CreateCommitErrorModeled::PathRequiredException(PathRequiredException {
+                message: Some("a file path is required for every file entry".to_string()),
+            })
+            .into())
+        }
+        Err(crate::state::PathProblem::Invalid) => {
+            Err(CreateCommitErrorModeled::InvalidPathException(InvalidPathException {
+                message: Some(format!("the path {raw} is not valid")),
+            })
+            .into())
+        }
+    }
+}
+
+/// A `fileMode` this service stores, or the refusal for one it does not model. A
+/// value outside `FileModeTypeEnum` is already refused at the boundary (as
+/// `InvalidFileModeException`, see `crate::service`); this keeps the handler's own
+/// invariant explicit.
+fn checked_file_mode(file_mode: &str) -> Result<String, CreateCommitError> {
+    if file_mode.is_empty() {
+        return Err(CreateCommitErrorModeled::FileModeRequiredException(
+            FileModeRequiredException {
+                message: Some("a file mode is required to update mode permissions".to_string()),
+            },
+        )
+        .into());
+    }
+    if ![
+        crate::state::FILE_MODE_NORMAL,
+        crate::state::FILE_MODE_EXECUTABLE,
+        crate::state::FILE_MODE_SYMLINK,
+    ]
+    .contains(&file_mode)
+    {
+        return Err(CreateCommitErrorModeled::InvalidFileModeException(
+            InvalidFileModeException {
+                message: Some(format!("the file mode {file_mode} is not valid")),
+            },
+        )
+        .into());
+    }
+    Ok(file_mode.to_string())
+}
+
+/// One tree entry as the modeled `FileMetadata` the output reports.
+fn file_metadata(path: &str, entry: &crate::state::FileEntry) -> FileMetadata {
+    FileMetadata {
+        absolute_path: Some(path.to_string()),
+        blob_id: Some(entry.blob_id.clone()),
+        file_mode: Some(entry.file_mode.clone()),
+    }
+}
+
+/// Every folder a path lives under, from its immediate parent outwards:
+/// `"a/b/c.txt"` lives under `"a/b"` and `"a"`. Empty for a path at the root of the
+/// tree, which is not a folder a commit can empty.
+fn ancestor_folders(path: &str) -> Vec<&str> {
+    let mut folders = Vec::new();
+    let mut rest = path;
+    while let Some((folder, _)) = rest.rsplit_once('/') {
+        folders.push(folder);
+        rest = folder;
+    }
+    folders
+}
+
+/// The entries of one commit request with every path in canonical form, after the
+/// cross-entry rules that need no stored state have been checked: at least one
+/// entry, no more than the per-commit maximum, one change per path, and no path
+/// used as both a file and a folder.
+struct Entries {
+    puts: Vec<(String, PutFileEntry)>,
+    deletes: Vec<String>,
+    mode_changes: Vec<(String, String)>,
+}
+
+/// Normalise and check this request's file entries. Nothing here reads the store,
+/// so a request that cannot be applied at all is refused before the lock is taken.
+fn normalized_entries(input: &CreateCommitInput) -> Result<Entries, CreateCommitError> {
+    let put_entries = input.put_files.clone().unwrap_or_default();
+    let delete_entries = input.delete_files.clone().unwrap_or_default();
+    let mode_entries = input.set_file_modes.clone().unwrap_or_default();
+
+    // "The commit cannot be created because no files have been specified as
+    // added, updated, or changed for the commit."
+    let entry_count = put_entries.len() + delete_entries.len() + mode_entries.len();
+    if entry_count == 0 {
+        return Err(CreateCommitErrorModeled::FileEntryRequiredException(
+            FileEntryRequiredException {
+                message: Some(
+                    "the commit cannot be created because no file entries were specified"
+                        .to_string(),
+                ),
+            },
+        )
+        .into());
+    }
+    // The entry lists are caller-sized and each entry is hashed into the new
+    // tree, so this is what bounds the per-request work.
+    if entry_count > crate::state::MAX_FILE_ENTRIES_PER_COMMIT {
+        return Err(CreateCommitErrorModeled::MaximumFileEntriesExceededException(
+            MaximumFileEntriesExceededException {
+                message: Some(format!(
+                    "the commit specifies {entry_count} file entries, more than the \
+                     maximum of {} that can be changed in a single commit",
+                    crate::state::MAX_FILE_ENTRIES_PER_COMMIT
+                )),
+            },
+        )
+        .into());
+    }
+
+    // Canonical paths first, so every later check and the stored tree address
+    // files the same way a git tree does.
+    let mut puts: Vec<(String, PutFileEntry)> = Vec::with_capacity(put_entries.len());
+    for entry in &put_entries {
+        puts.push((normalized_path(&entry.file_path)?, entry.clone()));
+    }
+    let mut deletes: Vec<String> = Vec::with_capacity(delete_entries.len());
+    for entry in &delete_entries {
+        deletes.push(normalized_path(&entry.file_path)?);
+    }
+    let mut mode_changes: Vec<(String, String)> = Vec::with_capacity(mode_entries.len());
+    for entry in &mode_entries {
+        mode_changes.push((
+            normalized_path(&entry.file_path)?,
+            checked_file_mode(&entry.file_mode)?,
+        ));
+    }
+
+    // A `sourceFile` that is MOVED changes its own path too (the file leaves
+    // it), so it is one of this commit's changed paths; a copy only reads it.
+    let mut move_sources: Vec<String> = Vec::new();
+    for (_, entry) in &puts {
+        if let Some(source) = &entry.source_file {
+            if source.is_move {
+                move_sources.push(normalized_path(&source.file_path)?);
+            }
+        }
+    }
+
+    // "one or more changes in this commit duplicate actions in the same file
+    // path": one path may be acted on at most once across the puts, the deletes,
+    // the mode changes and the paths a move empties.
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for path in puts
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .chain(deletes.iter().map(String::as_str))
+        .chain(mode_changes.iter().map(|(path, _)| path.as_str()))
+        .chain(move_sources.iter().map(String::as_str))
+    {
+        if !seen.insert(path) {
+            return Err(CreateCommitErrorModeled::SamePathRequestException(
+                SamePathRequestException {
+                    message: Some(format!(
+                        "the commit cannot be created because more than one change was \
+                         requested for the path {path}"
+                    )),
+                },
+            )
+            .into());
+        }
+    }
+
+    // "one or more files specified in the commit reference both a file and a
+    // folder": a git tree cannot hold a blob and a subtree under one name, so
+    // two entries where one path is a folder prefix of the other cannot both be
+    // written.
+    for (path, _) in &puts {
+        let prefix = format!("{path}/");
+        if seen
+            .iter()
+            .any(|other| *other != path.as_str() && other.starts_with(&prefix))
+        {
+            return Err(CreateCommitErrorModeled::PutFileEntryConflictException(
+                PutFileEntryConflictException {
+                    message: Some(format!(
+                        "the commit cannot be created because {path} is referenced as both \
+                         a file and a folder"
+                    )),
+                },
+            )
+            .into());
+        }
+    }
+
+    Ok(Entries {
+        puts,
+        deletes,
+        mode_changes,
+    })
+}
+
+/// The commit this one is built on: the tip of the named branch, which the caller
+/// must name in `parentCommitId`, or `None` for the first commit of an empty
+/// repository ("parentCommitId: Not required if this is an empty repository").
+///
+/// A branch the repository does not hold is refused with the modelled
+/// `BranchDoesNotExistException`; CodeCommit creates a branch here only for a
+/// repository that holds none.
+fn resolve_parent(
+    repository: &crate::state::Repository,
+    repository_name: &str,
+    branch_name: &str,
+    parent_commit_id: Option<&str>,
+) -> Result<Option<String>, CreateCommitError> {
+    let tip = repository
+        .branches
+        .get(branch_name)
+        .map(|branch| branch.commit_id.clone());
+    match (&tip, parent_commit_id) {
+        (Some(_), None) => Err(CreateCommitErrorModeled::ParentCommitIdRequiredException(
+            ParentCommitIdRequiredException {
+                message: Some(format!(
+                    "a parent commit id is required to commit to the branch {branch_name}"
+                )),
+            },
+        )
+        .into()),
+        (Some(tip), Some(parent)) => {
+            if !crate::state::is_object_id(parent) {
+                return Err(CreateCommitErrorModeled::InvalidParentCommitIdException(
+                    InvalidParentCommitIdException {
+                        message: Some(format!("the parent commit id {parent} is not valid")),
+                    },
+                )
+                .into());
+            }
+            if parent != tip {
+                return if repository.commits.contains_key(parent) {
+                    Err(CreateCommitErrorModeled::ParentCommitIdOutdatedException(
+                        ParentCommitIdOutdatedException {
+                            message: Some(format!(
+                                "the parent commit id {parent} is not the tip of the branch \
+                                 {branch_name}"
+                            )),
+                        },
+                    )
+                    .into())
+                } else {
+                    Err(CreateCommitErrorModeled::ParentCommitDoesNotExistException(
+                        ParentCommitDoesNotExistException {
+                            message: Some(format!(
+                                "the parent commit id {parent} does not exist in the \
+                                 repository {repository_name}"
+                            )),
+                        },
+                    )
+                    .into())
+                };
+            }
+            Ok(Some(parent.to_string()))
+        }
+        (None, parent) => {
+            if !repository.branches.is_empty() {
+                return Err(CreateCommitErrorModeled::BranchDoesNotExistException(
+                    BranchDoesNotExistException {
+                        message: Some(format!(
+                            "the branch {branch_name} does not exist in the repository \
+                             {repository_name}"
+                        )),
+                    },
+                )
+                .into());
+            }
+            if let Some(parent) = parent {
+                return Err(CreateCommitErrorModeled::ParentCommitDoesNotExistException(
+                    ParentCommitDoesNotExistException {
+                        message: Some(format!(
+                            "the parent commit id {parent} does not exist in the repository \
+                             {repository_name}"
+                        )),
+                    },
+                )
+                .into());
+            }
+            Ok(None)
+        }
+    }
+}
+
 /// The `CreateCommit` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -285,18 +571,380 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCommit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCommitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCommit"))
+        let _ = ctx;
+        let Entries {
+            puts,
+            deletes,
+            mode_changes,
+        } = normalized_entries(&input)?;
+
+        // "The maximum file size is 6 MB, and the combined file content change size
+        // is 7 MB." The per-file bound is `FileContent`'s modelled maximum; the
+        // combined one is checked below, over the content of EVERY put as it is
+        // resolved, because content pulled in through `sourceFile` counts towards it
+        // just as content sent inline does.
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        let repository = store
+            .repositories
+            .get_mut(&input.repository_name)
+            .ok_or_else(|| {
+                CreateCommitErrorModeled::RepositoryDoesNotExistException(
+                    RepositoryDoesNotExistException {
+                        message: Some(format!(
+                            "the repository {} does not exist",
+                            input.repository_name
+                        )),
+                    },
+                )
+            })?;
+
+        // Resolve the parent commit: the tip of the named branch, which the caller
+        // must name, or none for the first commit of an empty repository.
+        let parent = resolve_parent(
+            repository,
+            &input.repository_name,
+            &input.branch_name,
+            input.parent_commit_id.as_deref(),
+        )?;
+
+        // The tree this commit starts from: the parent's full snapshot, or empty.
+        let base = parent
+            .as_ref()
+            .and_then(|parent| repository.commits.get(parent))
+            .map(|commit| commit.files.clone())
+            .unwrap_or_default();
+        let base_tree_id = crate::state::tree_id(&base);
+        let mut files = base.clone();
+        let mut new_blobs: std::collections::BTreeMap<String, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        let mut added: Vec<FileMetadata> = Vec::new();
+        let mut updated: Vec<FileMetadata> = Vec::new();
+        let mut deleted: Vec<FileMetadata> = Vec::new();
+        // The combined size of the content this commit writes, inline or copied.
+        let mut combined = 0usize;
+
+        for (path, entry) in &puts {
+            let (content, file_mode) = match (&entry.file_content, &entry.source_file) {
+                (Some(_), Some(_)) => {
+                    return Err(
+                        CreateCommitErrorModeled::FileContentAndSourceFileSpecifiedException(
+                            FileContentAndSourceFileSpecifiedException {
+                                message: Some(format!(
+                                    "both file content and a source file were specified for \
+                                     {path}"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                (None, None) => {
+                    return Err(
+                        CreateCommitErrorModeled::SourceFileOrContentRequiredException(
+                            SourceFileOrContentRequiredException {
+                                message: Some(format!(
+                                    "neither file content nor a source file was specified for \
+                                     {path}"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                (Some(content), None) => (
+                    content.clone(),
+                    checked_file_mode(
+                        entry
+                            .file_mode
+                            .as_deref()
+                            .unwrap_or(crate::state::FILE_MODE_NORMAL),
+                    )?,
+                ),
+                (None, Some(source)) => {
+                    let source_path = normalized_path(&source.file_path)?;
+                    // "one of the changes specifies copying or moving a .gitkeep
+                    // file": the placeholder a kept empty folder holds is not a
+                    // file a commit may move.
+                    if source_path
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|name| name == crate::state::KEEP_EMPTY_FOLDERS_PLACEHOLDER)
+                    {
+                        return Err(CreateCommitErrorModeled::RestrictedSourceFileException(
+                            RestrictedSourceFileException {
+                                message: Some(format!(
+                                    "the commit cannot copy or move the {} file at {source_path}",
+                                    crate::state::KEEP_EMPTY_FOLDERS_PLACEHOLDER
+                                )),
+                            },
+                        )
+                        .into());
+                    }
+                    // `sourceFile` names a file in the BRANCH this commit is made
+                    // on, not one another entry of this same request writes: it is
+                    // resolved against the parent snapshot (`base`), so a copy
+                    // carries the content the branch holds, and a path that exists
+                    // only as another entry of this request does not exist as a
+                    // source.
+                    let source_entry = base.get(&source_path).cloned().ok_or_else(|| {
+                        CreateCommitErrorModeled::FileDoesNotExistException(
+                            FileDoesNotExistException {
+                                message: Some(format!(
+                                    "the source file {source_path} does not exist in this branch"
+                                )),
+                            },
+                        )
+                    })?;
+                    // The bytes behind a path the parent commit holds are in the
+                    // store by construction. If they are not, the store is
+                    // inconsistent — an internal fault, which this crate refuses
+                    // the same way an unreachable store is refused, rather than
+                    // writing an empty file and answering success.
+                    let content = repository
+                        .blobs
+                        .get(&source_entry.blob_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            crate::scaffolded::Scaffolded::validation(format!(
+                                "the content of the source file {source_path} is not in the \
+                                 repository store"
+                            ))
+                        })?;
+                    let file_mode = checked_file_mode(
+                        entry
+                            .file_mode
+                            .as_deref()
+                            .unwrap_or(source_entry.file_mode.as_str()),
+                    )?;
+                    if source.is_move {
+                        files.remove(&source_path);
+                        deleted.push(file_metadata(&source_path, &source_entry));
+                    }
+                    (content, file_mode)
+                }
+            };
+
+            // "the combined file content change size is 7 MB": every byte this
+            // commit writes counts, whether it came inline or from a source file.
+            combined = combined.saturating_add(content.len());
+            if combined > crate::state::MAX_COMBINED_CONTENT_BYTES {
+                return Err(CreateCommitErrorModeled::FileContentSizeLimitExceededException(
+                    FileContentSizeLimitExceededException {
+                        message: Some(format!(
+                            "the commit writes at least {combined} bytes of file content, more \
+                             than the combined change limit of {} bytes",
+                            crate::state::MAX_COMBINED_CONTENT_BYTES
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // A git tree cannot hold a blob and a subtree of the same name, so a
+            // path that collides with one already in the tree is refused rather
+            // than silently replacing a whole directory (or being shadowed).
+            let directory_prefix = format!("{path}/");
+            if files.keys().any(|other| other.starts_with(&directory_prefix)) {
+                return Err(
+                    CreateCommitErrorModeled::FileNameConflictsWithDirectoryNameException(
+                        FileNameConflictsWithDirectoryNameException {
+                            message: Some(format!(
+                                "the file name {path} is the name of a directory in this \
+                                 repository"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if path
+                .match_indices('/')
+                .any(|(index, _)| files.contains_key(&path[..index]))
+            {
+                return Err(
+                    CreateCommitErrorModeled::DirectoryNameConflictsWithFileNameException(
+                        DirectoryNameConflictsWithFileNameException {
+                            message: Some(format!(
+                                "a directory in the path {path} is the name of a file in this \
+                                 repository"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            let stored = crate::state::FileEntry {
+                blob_id: crate::state::blob_id(&content),
+                file_mode,
+                size: i64::try_from(content.len()).unwrap_or(i64::MAX),
+            };
+            new_blobs.insert(stored.blob_id.clone(), content);
+            let replaced = files.insert(path.clone(), stored.clone());
+            if replaced.is_some() {
+                updated.push(file_metadata(path, &stored));
+            } else {
+                added.push(file_metadata(path, &stored));
+            }
+        }
+
+        for path in &deletes {
+            let removed = files.remove(path).ok_or_else(|| {
+                CreateCommitErrorModeled::FileDoesNotExistException(FileDoesNotExistException {
+                    message: Some(format!("the file {path} does not exist in this branch"))
+                })
+            })?;
+            deleted.push(file_metadata(path, &removed));
+        }
+
+        // "If the commit contains deletions, whether to keep a folder or folder
+        // structure if the changes leave the folders empty. If true, a .gitkeep file
+        // is created for empty folders." Nothing else recreates a folder: a git tree
+        // holds no empty subtree. A deletion can empty a whole chain of folders
+        // ("a/b/c.txt" empties "a/b" and then "a"), so every ANCESTOR folder of a
+        // deleted path is considered, deepest first: the placeholder written in the
+        // deepest emptied folder is what keeps each folder above it non-empty, so the
+        // whole structure is kept with one placeholder.
+        if input.keep_empty_folders {
+            let mut candidates: Vec<&str> = deleted
+                .iter()
+                .filter_map(|entry| entry.absolute_path.as_deref())
+                .flat_map(ancestor_folders)
+                .collect();
+            candidates.sort_unstable_by_key(|folder| {
+                (std::cmp::Reverse(folder.matches('/').count()), *folder)
+            });
+            candidates.dedup();
+            for folder in candidates {
+                let prefix = format!("{folder}/");
+                if files.keys().any(|path| path.starts_with(&prefix)) {
+                    continue;
+                }
+                let path = format!("{prefix}{}", crate::state::KEEP_EMPTY_FOLDERS_PLACEHOLDER);
+                let stored = crate::state::FileEntry {
+                    blob_id: crate::state::blob_id(&[]),
+                    file_mode: crate::state::FILE_MODE_NORMAL.to_string(),
+                    size: 0,
+                };
+                new_blobs.insert(stored.blob_id.clone(), Vec::new());
+                files.insert(path.clone(), stored.clone());
+                added.push(file_metadata(&path, &stored));
+            }
+        }
+
+        for (path, file_mode) in &mode_changes {
+            let entry = files.get_mut(path).ok_or_else(|| {
+                CreateCommitErrorModeled::FileDoesNotExistException(FileDoesNotExistException {
+                    message: Some(format!("the file {path} does not exist in this branch")),
+                })
+            })?;
+            entry.file_mode = file_mode.clone();
+            updated.push(file_metadata(path, entry));
+        }
+
+        // "A commit must contain at least one change." The tree id is the object
+        // name of the whole snapshot, so an unchanged tree has the parent's id.
+        let tree_id = crate::state::tree_id(&files);
+        if tree_id == base_tree_id {
+            return Err(CreateCommitErrorModeled::NoChangeException(NoChangeException {
+                message: Some(
+                    "the commit cannot be created because it makes no change to the repository"
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        // Two bounds on what one repository can cost. The folder size is
+        // CodeCommit's documented 6 MB limit, checked for every folder this commit
+        // wrote into; the file count is the emulator's own bound on the snapshot
+        // each commit stores, which the model has no error for.
+        for path in puts
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .chain(added.iter().filter_map(|entry| entry.absolute_path.as_deref()))
+        {
+            if crate::state::folder_content_bytes(&files, path)
+                > crate::state::MAX_FOLDER_CONTENT_BYTES
+            {
+                return Err(CreateCommitErrorModeled::FolderContentSizeLimitExceededException(
+                    FolderContentSizeLimitExceededException {
+                        message: Some(format!(
+                            "the commit cannot be created because the folder holding {path} \
+                             would exceed the limit of {} bytes",
+                            crate::state::MAX_FOLDER_CONTENT_BYTES
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        if files.len() > crate::state::MAX_FILES_PER_TREE {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "this emulator holds at most {} files per repository tree",
+                crate::state::MAX_FILES_PER_TREE
+            )));
+        }
+
+        let now = std::time::SystemTime::now();
+        let user = UserInfo {
+            name: input.author_name.clone(),
+            email: input.email.clone(),
+            date: Some(crate::state::git_date(now)),
+        };
+        let parents: Vec<String> = parent.into_iter().collect();
+        let commit_id = crate::state::commit_id(
+            &tree_id,
+            &parents,
+            &user,
+            &user,
+            input.commit_message.as_deref(),
+        );
+
+        let sequence = repository.next_commit_sequence;
+        repository.next_commit_sequence = sequence.saturating_add(1);
+        repository.blobs.extend(new_blobs);
+        repository.commits.insert(
+            commit_id.clone(),
+            crate::state::Commit {
+                commit_id: commit_id.clone(),
+                tree_id: tree_id.clone(),
+                parents,
+                message: input.commit_message.clone(),
+                author: user.clone(),
+                committer: user,
+                files,
+                sequence,
+            },
+        );
+        repository.branches.insert(
+            input.branch_name.clone(),
+            crate::state::Branch {
+                name: input.branch_name.clone(),
+                commit_id: commit_id.clone(),
+            },
+        );
+        // The first branch a repository gets is its default branch.
+        if repository.default_branch.is_none() {
+            repository.default_branch = Some(input.branch_name.clone());
+        }
+        repository.last_modified_date = now;
+        // Keep the history bounded: the oldest non-tip commits, and the blobs only
+        // they referenced, are released here.
+        repository.prune_history();
+
+        Ok(CreateCommitOutput {
+            commit_id: Some(commit_id),
+            tree_id: Some(tree_id),
+            files_added: Some(added),
+            files_updated: Some(updated),
+            files_deleted: Some(deleted),
+        })
     }
 }

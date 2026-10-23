@@ -54,6 +54,13 @@ use crate::ops::types::{
     WorkflowStep,
 };
 
+/// The file location and the session details an execution record reports, named through
+/// their module rather than added to the shared `use` list above: that list is edited by
+/// every change this crate's services make, and an execution record is the only reader
+/// of these two shapes.
+use crate::ops::types::FileLocation as ExecutionFileLocation;
+use crate::ops::types::ServiceMetadata as ExecutionServiceMetadata;
+
 /// The region used for an ARN when the request carries no SigV4 credential scope to
 /// read one from. Matches the region the emulator's generated SDK profile uses.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -465,6 +472,24 @@ pub const DEFAULT_SOURCE_FILE_LOCATION: &str = "${previous.file}";
 /// name. The default is `FALSE`"). It is the `OverwriteExisting` enum's `FALSE` value
 /// (the enum is `[FALSE, TRUE]`).
 pub const DEFAULT_OVERWRITE_EXISTING: &str = "FALSE";
+
+/// The `ExecutionStatus` enum's values (`[IN_PROGRESS, COMPLETED, EXCEPTION,
+/// HANDLING_EXCEPTION]`), documented on `ListedExecution.Status` as "in progress,
+/// completed, exception encountered, or handling the exception".
+///
+/// `HANDLING_EXCEPTION` has no constant: it is the window in which a workflow is
+/// running its `OnExceptionSteps`, and this emulator runs no step, so no execution it
+/// holds is ever inside that window.
+pub const EXECUTION_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+pub const EXECUTION_STATUS_COMPLETED: &str = "COMPLETED";
+pub const EXECUTION_STATUS_EXCEPTION: &str = "EXCEPTION";
+
+/// The `CustomStepStatus` enum's values (`[SUCCESS, FAILURE]`) — the outcome a
+/// `SendWorkflowStepState` callback reports for the custom step its `Token` addresses,
+/// and so the two outcomes [`WorkflowExecution::reported_status`] reads back off a
+/// step.
+pub const CUSTOM_STEP_STATUS_SUCCESS: &str = "SUCCESS";
+pub const CUSTOM_STEP_STATUS_FAILURE: &str = "FAILURE";
 
 /// How many workflows the store holds before `CreateWorkflow` refuses with the
 /// modelled `ServiceUnavailableException` instead of growing.
@@ -2364,16 +2389,66 @@ impl WebAppCustomization {
 /// A custom workflow step hands its target resource an `ExecutionId`, a `WorkflowId`
 /// and a `Token`, and the step stays pending until `SendWorkflowStepState` reports an
 /// outcome for that token. An execution exists only while a workflow runs over an
-/// uploaded file, so this is the state that callback is resolved against.
+/// uploaded file, so this is the state that callback is resolved against — and the
+/// record `ListExecutions` projects one `ListedExecution` from.
 #[derive(Debug, Clone, Default)]
 pub struct WorkflowExecution {
     pub workflow_id: String,
     pub execution_id: String,
+    /// "the file location when the execution begins" (`ListedExecution`
+    /// `InitialFileLocation`) — the uploaded file the run started on. `None` for a run
+    /// recorded with no file location, which reports none rather than an empty
+    /// structure.
+    pub initial_file_location: Option<ExecutionFileLocation>,
+    /// "the session details that are associated with a workflow": the server, user and
+    /// session the upload that started this run arrived on. `None` when the record
+    /// carries none.
+    pub service_metadata: Option<ExecutionServiceMetadata>,
     /// The outcome reported for each pending custom step, by the `Token` that step was
     /// handed: `None` until its callback arrives, then the `CustomStepStatus` it
     /// carried. A token this map does not hold addresses no custom step of this
     /// execution.
     pub step_states: BTreeMap<String, Option<String>>,
+}
+
+impl WorkflowExecution {
+    /// The `ExecutionStatus` a reader reports for this run, DERIVED from the custom-step
+    /// callbacks recorded on it rather than stored — like `UserCount`, so it cannot go
+    /// stale when a callback arrives.
+    ///
+    /// The custom-step callbacks are the WHOLE of what a run waits on: a custom step is
+    /// the one step type that hands its target a `Token` and stays pending until
+    /// `SendWorkflowStepState` reports an outcome for it, while every other
+    /// `WorkflowStepType` (`COPY`, `TAG`, `DELETE`, `DECRYPT`) is applied by the service
+    /// itself with nothing to wait for. So:
+    ///
+    /// * a step that reported `FAILURE` is the "exception encountered" the
+    ///   `ExecutionStatus` value `EXCEPTION` names;
+    /// * a run whose every custom step has reported `SUCCESS` has nothing left to wait
+    ///   for, so it is `COMPLETED` — vacuously so for a run with no custom step at all,
+    ///   which is a workflow of non-custom steps alone;
+    /// * otherwise a step is still pending and the run is `IN_PROGRESS`.
+    ///
+    /// `HANDLING_EXCEPTION` is never reported: it is the window a run spends executing
+    /// its `OnExceptionSteps`, and this emulator executes no step, so no record it holds
+    /// is inside that window.
+    pub fn reported_status(&self) -> &'static str {
+        let reported_failure = self
+            .step_states
+            .values()
+            .any(|outcome| outcome.as_deref() == Some(CUSTOM_STEP_STATUS_FAILURE));
+        let every_step_succeeded = self
+            .step_states
+            .values()
+            .all(|outcome| outcome.as_deref() == Some(CUSTOM_STEP_STATUS_SUCCESS));
+        if reported_failure {
+            EXECUTION_STATUS_EXCEPTION
+        } else if every_step_succeeded {
+            EXECUTION_STATUS_COMPLETED
+        } else {
+            EXECUTION_STATUS_IN_PROGRESS
+        }
+    }
 }
 
 /// The first documented step requirement a submitted step LIST violates, worded as the
@@ -2627,6 +2702,22 @@ impl ComAmazonawsTransferTransferserviceState {
             .range((Bound::Included(lower), Bound::Unbounded))
             .take_while(move |((sid, _), _)| sid == server_id)
             .map(|(_, host_key)| host_key)
+    }
+
+    /// The executions stored for `workflow_id`, in `ListExecutions` paging order.
+    ///
+    /// A RANGE scan over that workflow's contiguous run of the execution map, on the
+    /// same rule as [`Self::users_of`].
+    pub fn executions_of<'a>(
+        &'a self,
+        workflow_id: &'a str,
+    ) -> impl Iterator<Item = &'a WorkflowExecution> + 'a {
+        use ::std::ops::Bound;
+        let lower = (workflow_id.to_string(), String::new());
+        self.workflow_executions
+            .range((Bound::Included(lower), Bound::Unbounded))
+            .take_while(move |((wid, _), _)| wid == workflow_id)
+            .map(|(_, execution)| execution)
     }
 
     /// Whether `server_id` can take another host key, i.e. is below

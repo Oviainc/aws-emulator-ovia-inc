@@ -481,6 +481,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 starts_at_ms: crate::state::deployment_start_due(create_time_ms),
                 completes_at_ms: crate::state::deployment_completion_due(create_time_ms)
                     + termination_wait_millis,
+                // Nothing has failed, and no lifecycle event hook has reported
+                // yet: both are written as the deployment runs.
+                error_information: None,
+                lifecycle_hook_executions: Vec::new(),
                 target_count,
                 terminates_original_instances,
                 termination_wait_millis,

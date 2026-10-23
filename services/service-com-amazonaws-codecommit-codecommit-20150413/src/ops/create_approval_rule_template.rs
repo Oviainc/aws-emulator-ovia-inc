@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApprovalRuleTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApprovalRuleTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApprovalRuleTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an approval rule template in this account's Region and persists it, so
+//! `GetApprovalRuleTemplate` and `ListApprovalRuleTemplates` report it afterwards.
+//! The content is a JSON approval rule document (see
+//! [`crate::state::validate_approval_rule_template_content`]), and content that is
+//! not one is refused with the modelled
+//! `InvalidApprovalRuleTemplateContentException` — no template is created.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +179,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApprovalRuleTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApprovalRuleTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApprovalRuleTemplate"))
+        // `approvalRuleTemplateName`'s and `approvalRuleTemplateContent`'s lengths
+        // are modelled, so the boundary validator already refused anything outside
+        // them. What is left are the rules the model cannot express.
+
+        // "Template names must be between 1 and 100 valid characters in length." A
+        // name of nothing but whitespace names no template, and neither does one
+        // carrying a control character.
+        if input.approval_rule_template_name.trim().is_empty()
+            || input
+                .approval_rule_template_name
+                .chars()
+                .any(char::is_control)
+        {
+            return Err(
+                CreateApprovalRuleTemplateErrorModeled::InvalidApprovalRuleTemplateNameException(
+                    InvalidApprovalRuleTemplateNameException {
+                        message: Some(format!(
+                            "the approval rule template name {} is not valid",
+                            input.approval_rule_template_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The content for the approval rule template is empty. You must provide
+        // some content for an approval rule template." The modelled minimum length
+        // is 1, so whitespace-only content reaches here.
+        if input.approval_rule_template_content.trim().is_empty() {
+            return Err(
+                CreateApprovalRuleTemplateErrorModeled::ApprovalRuleTemplateContentRequiredException(
+                    ApprovalRuleTemplateContentRequiredException {
+                        message: Some(
+                            "the content for the approval rule template is empty".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The content is an approval rule JSON document, not free text.
+        if let Err(reason) = crate::state::validate_approval_rule_template_content(
+            &input.approval_rule_template_content,
+        ) {
+            return Err(
+                CreateApprovalRuleTemplateErrorModeled::InvalidApprovalRuleTemplateContentException(
+                    InvalidApprovalRuleTemplateContentException {
+                        message: Some(format!(
+                            "the content of the approval rule template is not valid: {reason}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        // "Approval rule template names must be unique."
+        if store
+            .approval_rule_templates
+            .contains_key(&input.approval_rule_template_name)
+        {
+            return Err(
+                CreateApprovalRuleTemplateErrorModeled::ApprovalRuleTemplateNameAlreadyExistsException(
+                    ApprovalRuleTemplateNameAlreadyExistsException {
+                        message: Some(format!(
+                            "an approval rule template named {} already exists in this Region",
+                            input.approval_rule_template_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store holds at most `APPROVAL_RULE_TEMPLATE_QUOTA` templates: a caller
+        // creates one per request, so this is what bounds the map. Each is released
+        // by DeleteApprovalRuleTemplate.
+        if store.approval_rule_templates.len() >= crate::state::APPROVAL_RULE_TEMPLATE_QUOTA {
+            return Err(
+                CreateApprovalRuleTemplateErrorModeled::NumberOfRuleTemplatesExceededException(
+                    NumberOfRuleTemplatesExceededException {
+                        message: Some(format!(
+                            "the maximum number of approval rule templates has been exceeded \
+                             for this Region: this account already holds {}",
+                            crate::state::APPROVAL_RULE_TEMPLATE_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let template = crate::state::ApprovalRuleTemplateRecord::new(
+            &input.approval_rule_template_name,
+            input.approval_rule_template_content.clone(),
+            input.approval_rule_template_description.clone(),
+            crate::state::caller_identity_arn(ctx.parts()),
+            std::time::SystemTime::now(),
+        );
+        let modeled = template.to_modeled();
+        store
+            .approval_rule_templates
+            .insert(input.approval_rule_template_name.clone(), template);
+
+        Ok(CreateApprovalRuleTemplateOutput {
+            approval_rule_template: modeled,
+        })
     }
 }

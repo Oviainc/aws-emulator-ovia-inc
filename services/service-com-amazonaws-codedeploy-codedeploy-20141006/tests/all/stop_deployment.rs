@@ -394,6 +394,12 @@ async fn an_unusable_deployment_id_is_refused() {
             "DeploymentDoesNotExistException",
         ),
         (
+            // An id outside CodeDeploy's `d-` + uppercase-alphanumeric format is
+            // refused for its FORMAT, before the deployment is looked up: that is
+            // what `InvalidDeploymentIdException` ("At least one of the deployment
+            // IDs was specified in an invalid format") distinguishes from an id
+            // this account simply does not have, and every operation of this
+            // service taking a deployment id now shares that one check.
             "another form",
             json!({"deploymentId": "not-a-deployment-id"}),
             "InvalidDeploymentIdException",

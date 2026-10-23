@@ -257,9 +257,11 @@ pub struct AppMonitorRecord {
     /// The minted `AppMonitorId`: a UUID, as `AppMonitorId`'s 36-character pattern asks.
     pub id: String,
     /// `arn:aws:rum:<region>:<account>:appmonitor/<name>`, derived once at create time.
-    /// Nothing on the wire reports it yet — the tagging operations (`TagResource`,
-    /// `UntagResource`, `ListTagsForResource`, which take a `ResourceArn`) are still
-    /// scaffolded; it is stored now so those read one ARN rather than minting their own.
+    /// It is the identity the tagging operations name a resource by: `UntagResource`
+    /// resolves a `ResourceArn` against this ONE stored value (see
+    /// [`ComAmazonawsRumRumState::app_monitor_by_arn_mut`]) rather than minting its own,
+    /// so a tag call and a read of the monitor cannot disagree about which resource is
+    /// meant. (`TagResource` and `ListTagsForResource` are still scaffolded.)
     pub arn: String,
     pub domain: Option<String>,
     pub domain_list: Option<Vec<String>>,
@@ -277,7 +279,9 @@ pub struct AppMonitorRecord {
     pub app_monitor_configuration: AppMonitorConfiguration,
     pub custom_events: CustomEvents,
     pub deobfuscation_configuration: Option<DeobfuscationConfiguration>,
-    /// `Tags` as supplied at create time; the tagging operations are still scaffolded.
+    /// This monitor's tags: the map `CreateAppMonitor` seeds and `UntagResource` removes
+    /// keys from, and what `GetAppMonitor` reports as `AppMonitor$Tags`. A `BTreeMap` so
+    /// a read reports them in one stable order.
     pub tags: BTreeMap<String, String>,
     /// Events delivered by `PutRumEvents`, oldest first. Bounded by
     /// [`MAX_EVENTS_PER_APP_MONITOR`]; append through [`Self::record_events`].
@@ -474,6 +478,23 @@ impl ComAmazonawsRumRumState {
     pub fn app_monitor_by_id_mut(&mut self, id: &str) -> Option<&mut AppMonitorRecord> {
         let name = self.monitor_ids.get(id)?.clone();
         self.app_monitors.get_mut(&name)
+    }
+
+    /// The stored monitor whose ARN is exactly `arn`, for a caller that mutates it (the
+    /// tagging operations, which name a resource by `ResourceArn` and by nothing else).
+    ///
+    /// The comparison is against [`AppMonitorRecord::arn`] in full — partition, service,
+    /// region, account and resource segment — because that whole string is the resource's
+    /// identity: an ARN that differs in any component names a DIFFERENT resource, which
+    /// this emulator does not hold, so the caller renders `None` as
+    /// `ResourceNotFoundException` (see [`tagged_resource_not_found`]). App monitors are
+    /// the only taggable RUM resource (`TagResource`: "Currently, the only resources that
+    /// can be tagged app monitors"), so this one lookup covers every ARN a tag call can
+    /// name.
+    pub fn app_monitor_by_arn_mut(&mut self, arn: &str) -> Option<&mut AppMonitorRecord> {
+        self.app_monitors
+            .values_mut()
+            .find(|record| record.arn == arn)
     }
 }
 
@@ -693,6 +714,37 @@ pub fn app_monitor_not_found(name_or_id: &str) -> ResourceNotFoundException {
         message: format!("App monitor {name_or_id} does not exist."),
         resource_name: name_or_id.to_string(),
         resource_type: Some(APP_MONITOR_RESOURCE_TYPE.to_string()),
+    }
+}
+
+/// The whole message RUM's ARN-addressed tagging operations report for a resource they
+/// cannot find.
+///
+/// Unlike the app-monitor operations' not-found message, which is built from the request
+/// (it names the `Name` asked for), this one carries NOTHING from the request: the
+/// recorded corpus unit `rum.untag-resource-unknown-resource-rejected` pins the message
+/// for an unknown ARN as this exact sentence, and it is the same sentence whatever ARN the
+/// request carried — the ARN itself is reported in the `resourceName` member instead. So
+/// it is a constant here rather than a format string.
+pub const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// `ResourceNotFoundException` for a `ResourceArn` that names no resource this service
+/// holds — the not-found refusal every tagging operation answers (HTTP 404).
+///
+/// `message` is the service's own constant wording ([`TAGGED_RESOURCE_NOT_FOUND_MESSAGE`]).
+/// `resourceName` is the ARN the request carried, since the ARN is the only way the caller
+/// named the resource, and `resourceType` is reported only for an ARN whose resource
+/// segment names an app monitor — for any other ARN the type is not something this service
+/// knows.
+pub fn tagged_resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
+    let app_monitor = resource_arn
+        .split(':')
+        .nth(5)
+        .is_some_and(|resource| resource.starts_with(&format!("{APP_MONITOR_RESOURCE}/")));
+    ResourceNotFoundException {
+        message: TAGGED_RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+        resource_name: resource_arn.to_string(),
+        resource_type: app_monitor.then(|| APP_MONITOR_RESOURCE_TYPE.to_string()),
     }
 }
 

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSearchResultExportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSearchResultExportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports ONE export job out of [`crate::state`] — the record
+//! `StartSearchResultExportJob` persisted: its identifier and ARN, the status the clock
+//! has made due, the creation and completion instants, the `StatusMessage` a failed
+//! export carries, the `ExportSpecification` it was started with and the ARN of the
+//! search job whose results it exports. An `ExportJobIdentifier` that names no export
+//! job is a `ResourceNotFoundException` (404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSearchResultExportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation is `@readonly`: the only write it makes is materialising the status
+//! transition the clock already owed (`crate::state::ComAmazonawsBackupsearchCryobackupsearchserviceState::settle`),
+//! which was due whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +93,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::EXPORT_JOB_RESOURCE;
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -103,10 +107,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupsearch-cryobackup
 // here — hence the `GetSearchResultExportJobError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupsearch#GetSearchResultExportJob")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupsearch#GetSearchResultExportJob",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetSearchResultExportJobErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    /// Declared on the service, not on this operation: the store this emulator keeps
+    /// its jobs in could not be reached, which is a server fault.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -158,20 +168,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSearchResultExportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSearchResultExportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSearchResultExportJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSearchResultExportJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        // Materialise what the clock already owed this export job before reporting it;
+        // this writes nothing a later caller would not have seen anyway.
+        state.settle(SystemTime::now());
+
+        let job = state.export_job(&input.export_job_identifier).ok_or_else(|| {
+            GetSearchResultExportJobError::from(
+                GetSearchResultExportJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::RESOURCE_NOT_FOUND.to_string(),
+                        resource_id: input.export_job_identifier.clone(),
+                        resource_type: EXPORT_JOB_RESOURCE.to_string(),
+                    },
+                ),
+            )
+        })?;
+
+        Ok(GetSearchResultExportJobOutput {
+            export_job_identifier: job.identifier.clone(),
+            export_job_arn: Some(job.arn.clone()),
+            status: Some(job.status.clone()),
+            creation_time: Some(job.creation_time),
+            completion_time: job.completion_time,
+            // The model documents StatusMessage as the text a FAILED export carries, so
+            // it is reported only once the record holds one.
+            status_message: job.status_message.clone(),
+            export_specification: Some(job.export_specification.clone()),
+            search_job_arn: Some(job.search_job_arn.clone()),
+        })
     }
 }

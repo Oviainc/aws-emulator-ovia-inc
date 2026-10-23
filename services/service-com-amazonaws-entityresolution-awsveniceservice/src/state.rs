@@ -1106,6 +1106,15 @@ pub mod messages {
     /// [`GET_MATCHING_WORKFLOW_NOT_FOUND`] form rather than the templated delete one.
     pub const UPDATE_MATCHING_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
 
+    /// `UpdateIdNamespace`'s `ResourceNotFoundException$message` (HTTP 404) when no ID
+    /// namespace is stored under the `idNamespaceName` @httpLabel. Not itself recorded;
+    /// it is this operation's own constant, in the same constant, no-name form as the
+    /// recorded [`GET_SCHEMA_MAPPING_NOT_FOUND`] and spelled with the resource type the
+    /// API uses — the update addresses the SAME resource by the SAME key as
+    /// `GetIdNamespace`, whose text ([`GET_ID_NAMESPACE_NOT_FOUND`]) names no namespace
+    /// either.
+    pub const UPDATE_ID_NAMESPACE_NOT_FOUND: &str = "IdNamespace does not exist";
+
     /// `UpdateIdMappingWorkflow`'s `ResourceNotFoundException$message` (HTTP 404) when
     /// no ID mapping workflow carries the `workflowName` @httpLabel. Not itself
     /// recorded; it is this operation's own constant. `UpdateIdMappingWorkflow`

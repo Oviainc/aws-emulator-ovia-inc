@@ -21,14 +21,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Hex-encodes the opaque `ListImportFileTask` pagination cursor (see `state::encode_page_token`).
+# Hex-encodes the opaque pagination cursors this service's list operations issue
+# (`state::encode_page_token`, shared by ListImportFileTask and ListServers).
 hex = { workspace = true }
+# Fingerprints the selection a ListServers page was taken under, so its cursor stays
+# short and is only accepted back for the same list.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
 
 [lints]
 workspace = true
