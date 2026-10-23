@@ -36,7 +36,7 @@ type TemplateCase = (&'static str, Value, Value);
 
 /// The template as a client compares it: every member bar the two timestamps, which are
 /// per-call instants and are asserted on separately.
-fn without_timestamps(template: &Value) -> Value {
+pub fn without_timestamps(template: &Value) -> Value {
     let mut stripped = template.clone();
     let object = stripped
         .as_object_mut()
@@ -47,7 +47,7 @@ fn without_timestamps(template: &Value) -> Value {
 }
 
 /// The `createdAt`/`updatedAt` pair, each as the epoch seconds the wire carries.
-fn timestamps(case: &str, template: &Value) -> (f64, f64) {
+pub fn timestamps(case: &str, template: &Value) -> (f64, f64) {
     let read = |member: &str| {
         template[member].as_f64().unwrap_or_else(|| {
             panic!("case {case:?}: {member} must be a timestamp, got {:?}", template[member])

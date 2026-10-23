@@ -165,9 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(membership) = store.memberships.get(&input.membership_identifier) else {
             return Err(GetPrivacyBudgetTemplateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "membership {} not found",
-                        input.membership_identifier
+                    message: st::membership_not_found_message(
+                        &input.membership_identifier,
+                        st::caller_account_id(),
                     ),
                     resource_id: input.membership_identifier,
                     resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),

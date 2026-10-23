@@ -1113,6 +1113,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::IAM::Role",
     "AWS::Lambda::Function",
     "AWS::Logs::LogGroup",
+    "AWS::RUM::AppMonitor",
     "AWS::S3::Bucket",
     "AWS::SNS::Topic",
     "AWS::SQS::Queue",
@@ -1236,8 +1237,51 @@ fn return_values(
             );
             (name.to_string(), attributes)
         }
+        // "Ref returns the app monitor name"; Fn::GetAtt: Id ("The unique ID of the new
+        // app monitor"). CloudWatch RUM ASSIGNS that id — the template cannot name it —
+        // and its form is fixed by RUM's own Smithy model: `AppMonitorId` is
+        // `^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`,
+        // `length 36..36`, so the resource reports an identifier of THAT form rather than
+        // CloudFormation's `<stack>-<logical id>-<unique id>` name (the same case
+        // AWS::Transfer::Server is in above).
+        "AWS::RUM::AppMonitor" => {
+            attributes.insert("Id".to_string(), generated_uuid("rum/appmonitor", name));
+            (name.to_string(), attributes)
+        }
         _ => (name.to_string(), attributes),
     }
+}
+
+/// A service-assigned identifier of the canonical UUID form, derived from `name` under
+/// `domain`.
+///
+/// Some resource types report an identifier their owning service generates as a UUID (a
+/// CloudWatch RUM app monitor's `Id`). The 16 bytes come from a SHA-256 digest of the
+/// pair, with byte 6's high nibble set to `4` (the version) and byte 8's two high bits to
+/// `10` (the RFC 4122 variant), exactly the layout a version-4 generator writes. It is a
+/// function of the resource's own name — itself derived from the stack id and the logical
+/// id — so the id is stable across reads and across a later update of the same stack, and
+/// two resources of one stack never collide.
+fn generated_uuid(domain: &str, name: &str) -> String {
+    use ::sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update(b"/");
+    hasher.update(name.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hasher.finalize()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = ::hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -120,6 +120,22 @@ fn is_transfer_workflow_id(value: &str) -> bool {
     })
 }
 
+/// Whether `value` is a CloudWatch RUM `AppMonitorId`: the canonical UUID form RUM's own
+/// Smithy model fixes —
+/// `^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`,
+/// `length 36..36`.
+fn is_app_monitor_id(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    value.len() == 36
+        && groups.len() == 5
+        && [8, 4, 4, 4, 12]
+            .iter()
+            .zip(&groups)
+            .all(|(width, group)| {
+                group.len() == *width && group.chars().all(|c| c.is_ascii_hexdigit())
+            })
+}
+
 fn is_lower_hex(c: char) -> bool {
     c.is_ascii_digit() || ('a'..='f').contains(&c)
 }
@@ -442,6 +458,43 @@ fn output_cases() -> Vec<OutputCase> {
                             is_transfer_arn(value, "workflow", is_transfer_workflow_id)
                         },
                     },
+                ),
+            ],
+        },
+        OutputCase {
+            // The same rule on the type a CFN-driven RUM deployment reads its id from:
+            // "Ref returns the app monitor name", and `Fn::GetAtt: Id` is "the unique ID
+            // of the new app monitor" — an id RUM ASSIGNS, so the rule is its documented
+            // UUID form and not a literal any request fixes.
+            case: "a rum app monitor: !GetAtt of the id its service assigns, and its name",
+            stack_name: "rum-app-monitor",
+            template: concat!(
+                "Resources:\n",
+                "  AppMonitor:\n",
+                "    Type: AWS::RUM::AppMonitor\n",
+                "    Properties:\n",
+                "      Name: probe-monitor\n",
+                "      Domain: localhost\n",
+                "      CwLogEnabled: false\n",
+                "Outputs:\n",
+                "  AppMonitorId:\n",
+                "    Value: !GetAtt AppMonitor.Id\n",
+                "  AppMonitorName:\n",
+                "    Value: !Ref AppMonitor\n",
+            )
+            .to_string(),
+            parameters: vec![],
+            expected: vec![
+                (
+                    "AppMonitorId",
+                    Expected::Form {
+                        described: "an AppMonitorId of the modelled 36-character UUID form",
+                        check: is_app_monitor_id,
+                    },
+                ),
+                (
+                    "AppMonitorName",
+                    Expected::Value("probe-monitor".to_string()),
                 ),
             ],
         },
@@ -1319,6 +1372,14 @@ async fn a_service_assigned_resource_id_is_unique_per_resource_and_stable() {
         "    Type: AWS::Transfer::Server\n",
         "  Flow:\n",
         "    Type: AWS::Transfer::Workflow\n",
+        "  Monitor:\n",
+        "    Type: AWS::RUM::AppMonitor\n",
+        "    Properties:\n",
+        "      Name: assigned-ids-one\n",
+        "  OtherMonitor:\n",
+        "    Type: AWS::RUM::AppMonitor\n",
+        "    Properties:\n",
+        "      Name: assigned-ids-two\n",
         "Outputs:\n",
         "  FirstId:\n",
         "    Value: !GetAtt First.ServerId\n",
@@ -1326,6 +1387,10 @@ async fn a_service_assigned_resource_id_is_unique_per_resource_and_stable() {
         "    Value: !GetAtt Second.ServerId\n",
         "  FlowId:\n",
         "    Value: !GetAtt Flow.WorkflowId\n",
+        "  MonitorId:\n",
+        "    Value: !GetAtt Monitor.Id\n",
+        "  OtherMonitorId:\n",
+        "    Value: !GetAtt OtherMonitor.Id\n",
     );
     create_stack(&router, "assigned-ids", template, &[]).await;
     wait_for_the_transition().await;
@@ -1345,7 +1410,7 @@ async fn a_service_assigned_resource_id_is_unique_per_resource_and_stable() {
         described: &'static str,
         check: fn(&str) -> bool,
     }
-    let rows: [IdRow; 3] = [
+    let rows: [IdRow; 5] = [
         IdRow {
             case: "a transfer server",
             key: "FirstId",
@@ -1363,6 +1428,18 @@ async fn a_service_assigned_resource_id_is_unique_per_resource_and_stable() {
             key: "FlowId",
             described: "w- + 17 of [a-z0-9]",
             check: is_transfer_workflow_id,
+        },
+        IdRow {
+            case: "a rum app monitor",
+            key: "MonitorId",
+            described: "the modelled 36-character AppMonitorId UUID",
+            check: is_app_monitor_id,
+        },
+        IdRow {
+            case: "a second rum app monitor in the same stack",
+            key: "OtherMonitorId",
+            described: "the modelled 36-character AppMonitorId UUID",
+            check: is_app_monitor_id,
         },
     ];
     for IdRow {
@@ -1383,10 +1460,21 @@ async fn a_service_assigned_resource_id_is_unique_per_resource_and_stable() {
         read("SecondId", &first),
         "two resources of one type in one stack must not share an assigned id, got {body}"
     );
+    assert_ne!(
+        read("MonitorId", &first),
+        read("OtherMonitorId", &first),
+        "two app monitors in one stack must not share an assigned id, got {body}"
+    );
 
     let (_, body) = describe_stack(&router, "assigned-ids").await;
     let second = wire_outputs(&body);
-    for key in ["FirstId", "SecondId", "FlowId"] {
+    for key in [
+        "FirstId",
+        "SecondId",
+        "FlowId",
+        "MonitorId",
+        "OtherMonitorId",
+    ] {
         assert_eq!(
             read(key, &second),
             read(key, &first),
